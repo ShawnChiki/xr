@@ -142,11 +142,6 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     <hr>
     <h2>Surfaces</h2>
     <div class="row">
-      <div class="top"><label for="puffRange">Puff</label><span class="val" id="puffVal">0.00</span></div>
-      <input type="range" id="puffRange" min="-1" max="1" step="0.05" value="0">
-      <small>Inflates every skin away from the middle of the network.</small>
-    </div>
-    <div class="row">
       <div class="top"><label for="brushRange">Smooth brush size</label><span class="val" id="brushVal">1.2</span></div>
       <input type="range" id="brushRange" min="0.3" max="4" step="0.1" value="1.2">
     </div>
@@ -159,6 +154,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <input type="range" id="blendRange" min="0" max="1" step="0.05" value="0.6">
       <small>How far into each skin the smooth seams reach. Higher rolls the surface over curves more gently.</small>
     </div>
+    <label class="chk"><input type="checkbox" id="linesChk" checked> All lines (curves, dots, isocurves)</label>
     <label class="chk"><input type="checkbox" id="isoChk" checked> Isocurves</label>
     <label class="chk"><input type="checkbox" id="dropChk" checked> Drop lines to the ground</label>
     <label class="chk"><input type="checkbox" id="gridChk"> Ground grid</label>
@@ -178,8 +174,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   </aside>
 
   <div class="chips" id="chips" hidden>
-    <div class="seg" role="group" aria-label="How the skin follows this curve"><button id="cStrict" aria-pressed="true">Strict</button><button id="cGuide" aria-pressed="false">Guide</button></div>
-    <div class="seg" role="group" aria-label="How skins meet at this curve"><button id="cSmooth" aria-pressed="true">Smooth</button><button id="cCrease" aria-pressed="false">Crease</button></div>
+    <div class="seg" role="group" aria-label="How skins meet at this curve"><button id="cL0">Smooth 30%</button><button id="cL1">60%</button><button id="cL2">100%</button><button id="cL3">Crease</button><button id="cL4">Guide</button></div>
   </div>
   <div class="toast" id="toast"></div>
   <div class="modal" id="modal" hidden>
@@ -285,7 +280,7 @@ try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', read
 new MutationObserver(readTheme).observe(document.documentElement, {attributes:true, attributeFilter:['data-theme']});
 
 // ---------- state ----------
-const state = { tool:'draw', plane:'auto', K:6, snapR:22, puff:0, iso:true, drops:true, grid:false, brushR:1.2, brushS:0.4, blend:0.6 };
+const state = { tool:'draw', plane:'auto', K:6, snapR:22, puff:0, iso:true, drops:true, grid:false, brushR:1.2, brushS:0.4, blend:0.6, lines:true };
 let nodes = new Map(), edges = new Map(), suppressed = new Set(), nid = 1, eid = 1;
 let faces = [];
 let selected = null;       // selected edge id (edit)
@@ -427,6 +422,12 @@ function fitBSpline(pts, K, lam=0.015){
   const X=solve(A,B);
   return [P0.clone(), ...X.map(x=>new V3(x[0],x[1],x[2])), Pn.clone()];
 }
+// one curve's setting, as a single ladder you can step through
+const LEVELS=[{name:'Smooth 30%', blend:0.3},{name:'Smooth 60%', blend:0.6},{name:'Smooth 100%', blend:1},{name:'Crease'},{name:'Guide'}];
+const edgeBlend=e=> e.blend!=null ? e.blend : state.blend;
+function levelOf(e){ if (e.guide) return 4; if (e.crease) return 3; const b=edgeBlend(e); let bi=0, bd=9; for (let i=0;i<3;i++){ const d=Math.abs(LEVELS[i].blend-b); if (d<bd){ bd=d; bi=i; } } return bi; }
+function setLevel(e, i){ e.guide = i===4; e.crease = i===3; if (i<3) e.blend=LEVELS[i].blend; }
+function levelName(e){ return LEVELS[levelOf(e)].name; }
 function lineCps(a, b){ return [0,1,2,3].map(i=>a.clone().lerp(b,i/3)); }
 // move the point at parameter t by delta, spreading the move over the interior control points
 function dragCurvePoint(e, orig, t, delta){
@@ -442,7 +443,7 @@ function dragCurvePoint(e, orig, t, delta){
 function addNode(p){ const id=nid++; nodes.set(id,{id,p:p.clone()}); return id; }
 // guide: the skin is pulled toward this curve but may relax off it (strict pins the skin to it)
 // crease: skins meeting here may fold (smooth makes them flow into each other)
-function addEdge(a,b,cps,flags){ const id=eid++; const e={id,a,b,cps,s:null,scr:null,scrVer:-1,guide:!!(flags&&flags.guide),crease:!!(flags&&flags.crease),locked:!!(flags&&flags.locked)}; edges.set(id,e); syncEnds(e); return id; }
+function addEdge(a,b,cps,flags){ const id=eid++; const e={id,a,b,cps,s:null,scr:null,scrVer:-1,guide:!!(flags&&flags.guide),crease:!!(flags&&flags.crease),locked:!!(flags&&flags.locked),blend:(flags&&flags.blend!=null)?flags.blend:null}; edges.set(id,e); syncEnds(e); return id; }
 function dirty(e){ e.s=null; e.scr=null; }
 function syncEnds(e){ e.cps[0].copy(nodes.get(e.a).p); e.cps[e.cps.length-1].copy(nodes.get(e.b).p); dirty(e); }
 function samples(e){ if(!e.s) e.s=sampleCps(e.cps, 64); return e.s; }
@@ -456,7 +457,7 @@ function splitEdge(id, t){
   const KL=Math.max(4,Math.min(12,Math.round(K*t)+2)), KR=Math.max(4,Math.min(12,Math.round(K*(1-t))+2));
   const cl=fitBSpline(resample(left,40),KL), cr=fitBSpline(resample(right,40),KR);
   edges.delete(id);
-  const fl={guide:e.guide, crease:e.crease, locked:e.locked};
+  const fl={guide:e.guide, crease:e.crease, locked:e.locked, blend:e.blend};
   addEdge(e.a,n,cl,fl); addEdge(n,e.b,cr,fl);
   if (selected===id) selected=null;
   return n;
@@ -896,9 +897,9 @@ function buildDisk(f, sides, n, fr, N){
 }
 // make every smooth seam tangent: the rows either side of the seam curve line up through it
 function alignSeams(P, seams, pinned){
-  const D=Math.round(3+20*state.blend), ex=2.2-1.4*state.blend, dl=new Float32Array(P.length);
-  for (const [e,A,B] of seams){
-    const a=A[0], b=B[0];
+  const dl=new Float32Array(P.length);
+  for (const [e,A,B,bl] of seams){
+    const a=A[0], b=B[0], D=Math.round(3+20*bl), ex=2.2-1.4*bl;
     for (let d=0;d<3;d++){
       const t=(P[a*3+d]-P[b*3+d])/2, da=P[e*3+d]+t-P[a*3+d], db=P[e*3+d]-t-P[b*3+d];
       const n=Math.min(D, A.length, B.length);
@@ -948,7 +949,7 @@ function buildSurfaces(){
   const chains=new Map();
   for (const rec of recs) for (const [b,ch] of rec.r.inward){ const gb=rec.map[b]; if (kind[gb]!==1) continue; if (!chains.has(gb)) chains.set(gb,[]); chains.get(gb).push(Array.from(ch, li=>rec.map[li])); }
   const seams=[];
-  for (const [gb,list] of chains){ const e=edges.get(eOf[gb]); if (list.length===2 && e && !e.crease && list[0].length && list[1].length && list[0][0]!==list[1][0]) seams.push([gb, list[0], list[1]]); }
+  for (const [gb,list] of chains){ const e=edges.get(eOf[gb]); if (list.length===2 && e && !e.crease && list[0].length && list[1].length && list[0][0]!==list[1][0]) seams.push([gb, list[0], list[1], edgeBlend(e)]); }
   const mirror=Array.from({length:Ng},()=>[]);
   const pos=base.slice();
   // the smooth brush's stored amount: extra relaxing passes, replayed every rebuild so it always follows the curves
@@ -963,7 +964,7 @@ function buildSurfaces(){
   }
   alignSeams(pos, seams, pinned);
   const pre=pos;
-  GS={recs, ghosts, gkey, kind, pinned, spring, weldN, nbrs, mirror, base, pre, pos, seams};
+  GS={recs, ghosts, gkey, kind, eOf, gid, pinned, spring, weldN, nbrs, mirror, base, pre, pos, seams};
 }
 function makeSurfaceMeshes(){
   clearGroup(faceGroup); clearGroup(isoGroup);
@@ -1002,68 +1003,74 @@ function updateSurfaceMeshes(){
     rec.mesh.geometry.attributes.normal.needsUpdate=true; }
   requestRender();
 }
-// relax every free surface point within r of c; strength 0..1. Guide curves let their seam points move, with a pull back.
-// relax the black curves under the brush: control points move toward their neighbours,
-// and a kink where exactly two curves meet straightens out (the corner itself stays put)
-function brushCurves(c, r, strength){
+function lockedNode(id){ const n=nodes.get(id); if (!n || n.locked) return true; for (const e of edges.values()) if (e.locked && (e.a===id||e.b===id)) return true; return false; }
+// curves and dots that aren't part of any skin relax on their own, at the same rate as skins
+function brushCurves(c, r, strength, skipE, skipN){
   let changed=false;
-  const lockedNode=id=>{ const n=nodes.get(id); if (!n || n.locked) return true; for (const e of edges.values()) if (e.locked && (e.a===id||e.b===id)) return true; return false; };
-  // 1. curve shapes: control points move toward their neighbours
   for (const e of edges.values()){
-    if (e.locked) continue;
-    const K=e.cps.length, U=knots(K), orig=e.cps.map(q=>q.clone()); let moved=false;
-    for (let i=1;i<K-1;i++){
-      const q=evalAt(orig, U, (U[i+1]+U[i+2]+U[i+3])/3), d=q.distanceTo(c); if (d>=r) continue;
-      const avg=orig[i-1].clone().add(orig[i+1]).multiplyScalar(0.5);
-      if (avg.distanceToSquared(orig[i])<1e-12) continue;
-      e.cps[i].lerp(avg, sm(1-d/r)*strength*0.35); moved=true;
-    }
+    if (e.locked || (skipE && skipE.has(e.id))) continue;
+    const K=e.cps.length, U=knots(K); let moved=false;
+    for (let pass=0;pass<2;pass++){ const orig=e.cps.map(q=>q.clone());
+      for (let i=1;i<K-1;i++){
+        const q=evalAt(orig, U, (U[i+1]+U[i+2]+U[i+3])/3), d=q.distanceTo(c); if (d>=r) continue;
+        const avg=orig[i-1].clone().add(orig[i+1]).multiplyScalar(0.5); if (avg.distanceToSquared(orig[i])<1e-12) continue;
+        e.cps[i].lerp(avg, sm(1-d/r)*strength*0.5); moved=true; } }
     if (moved){ dirty(e); changed=true; }
   }
-  // 2. dots: joints and junctions drift toward the curves leaving them; a loose end follows its curve's own direction
   for (const n of nodes.values()){
+    if (skipN && skipN.has(n.id)) continue;
     const d=n.p.distanceTo(c); if (d>=r || lockedNode(n.id)) continue;
     const ends=[]; for (const e of edges.values()){ if (e.a===e.b) continue; const K=e.cps.length; if (e.a===n.id) ends.push([e,1,2]); if (e.b===n.id) ends.push([e,K-2,K-3]); }
     if (!ends.length) continue;
-    const w=sm(1-d/r)*strength;
-    // straighten the kink at a joint by turning the two curves' first control points into line
-    if (ends.length===2){
-      const [[e1,i1],[e2,i2]]=ends, P=n.p, a=e1.cps[i1], b=e2.cps[i2], la=a.distanceTo(P), lb=b.distanceTo(P);
-      if (la>1e-6 && lb>1e-6){
-        const dir=a.clone().sub(P).normalize().sub(b.clone().sub(P).normalize());
-        if (dir.lengthSq()>1e-9){ dir.normalize(); a.lerp(P.clone().addScaledVector(dir,la), w*0.25); b.lerp(P.clone().addScaledVector(dir,-lb), w*0.25); dirty(e1); dirty(e2); changed=true; }
-      }
-    }
     let target;
     if (ends.length===1){ const [e,i1,i2]=ends[0]; target=e.cps[i1].clone().multiplyScalar(2).sub(e.cps[i2]); }
     else { target=new V3(); for (const [e,i1] of ends) target.add(e.cps[i1]); target.multiplyScalar(1/ends.length); }
-    const delta=target.sub(n.p).multiplyScalar(w*0.12);
+    const delta=target.sub(n.p).multiplyScalar(sm(1-d/r)*strength*0.5);
     if (delta.lengthSq()>1e-12){ moveNodeDeform(n.id, delta); changed=true; }
-  }
-  if (changed){
-    if (GS){ const P=GS.pos; for (let g=0;g<GS.gkey.length;g++){ if (GS.pinned[g]) continue; const d=Math.hypot(P[g*3]-c.x,P[g*3+1]-c.y,P[g*3+2]-c.z); if (d<r){ const k=GS.gkey[g]; smoothAmt.set(k, Math.min(5,(smoothAmt.get(k)||0)+2*strength*sm(1-d/r)/30)); } } }
-    refreshCurves(); refreshNodes(); refreshFaces(); refreshCPs(); applyHover();
   }
   return changed;
 }
+// The smooth brush treats skins, curves and dots as one surface: every point inside the brush relaxes
+// toward its neighbours at the same rate, like smoothing a voxel blob. Curves are then refit through
+// their relaxed points, so they move together with the skin. Locked parts stay put.
 function brushSmooth(c, r, strength){
-  const curvesMoved = brushCurves(c, r, strength);
-  if (curvesMoved) return true;
-  if (!GS) return curvesMoved;
-  const P=GS.pos, Ng=GS.gkey.length, list=[];
-  for (let g=0;g<Ng;g++){ if (GS.pinned[g]) continue; const d=Math.hypot(P[g*3]-c.x, P[g*3+1]-c.y, P[g*3+2]-c.z); if (d<r) list.push(g, sm(1-d/r)); }
-  if (!list.length) return curvesMoved;
-  const t=[0,0,0];
-  for (let it=0;it<2;it++) for (let i=0;i<list.length;i+=2){
-    const g=list[i], fo=list[i+1], w=fo*strength*0.5;
-    if (!umbrella(P,g,t,GS.nbrs,GS.mirror)) continue;
-    for (let d=0;d<3;d++) P[g*3+d]+=w*(t[d]-P[g*3+d]);
-    if (GS.spring[g]) for (let d=0;d<3;d++) P[g*3+d]+=0.12*fo*(GS.base[g*3+d]-P[g*3+d]);
+  let changed=false, surf=false;
+  const skipE=new Set(), skipN=new Set();
+  if (GS){
+    const P=GS.pos, Ng=GS.gkey.length, list=[];
+    for (let g=0;g<Ng;g++){
+      const k=GS.kind[g]; if (k===1) skipE.add(GS.eOf[g]); else if (k===2) skipN.add(GS.eOf[g]);
+      let ok; if (k===0) ok=!GS.pinned[g]; else if (k===1){ const e=edges.get(GS.eOf[g]); ok=!!e && !e.locked; } else ok=!lockedNode(GS.eOf[g]);
+      if (!ok) continue;
+      const d=Math.hypot(P[g*3]-c.x, P[g*3+1]-c.y, P[g*3+2]-c.z); if (d<r) list.push(g, sm(1-d/r));
+    }
+    if (list.length){
+      const t=[0,0,0];
+      for (let it=0;it<2;it++) for (let i=0;i<list.length;i+=2){
+        const g=list[i], w=list[i+1]*strength*0.5; if (!umbrella(P,g,t,GS.nbrs,GS.mirror)) continue;
+        for (let d=0;d<3;d++) P[g*3+d]+=w*(t[d]-P[g*3+d]);
+      }
+      const tE=new Set(), tN=[];
+      for (let i=0;i<list.length;i+=2){ const g=list[i], k=GS.kind[g];
+        if (k===0){ const key=GS.gkey[g]; smoothAmt.set(key, Math.min(5,(smoothAmt.get(key)||0)+2*strength*list[i+1]/30)); }
+        else if (k===1) tE.add(GS.eOf[g]); else tN.push(g); }
+      for (const g of tN){ const id=GS.eOf[g], n=nodes.get(id); if (!n) continue;
+        const delta=new V3(P[g*3]-n.p.x, P[g*3+1]-n.p.y, P[g*3+2]-n.p.z); if (delta.lengthSq()>1e-14) moveNodeDeform(id, delta); }
+      for (const id of tE){
+        const e=edges.get(id); if (!e || e.locked) continue; const pts=[]; let ok=true;
+        for (let k=0;k<=G_SEG;k++){
+          if (k===0){ pts.push(nodes.get(e.a).p.clone()); continue; } if (k===G_SEG){ pts.push(nodes.get(e.b).p.clone()); continue; }
+          const g=GS.gid.get('e'+id+':'+k); if (g==null){ ok=false; break; } pts.push(new V3(P[g*3],P[g*3+1],P[g*3+2]));
+        }
+        if (ok){ e.cps=fitBSpline(pts, e.cps.length, 0.002); syncEnds(e); }
+      }
+      if (tE.size || tN.length) changed=true; else surf=true;
+    }
   }
-  alignSeams(P, GS.seams, GS.pinned);
-  for (let i=0;i<list.length;i+=2){ const k=GS.gkey[list[i]]; smoothAmt.set(k, Math.min(5, (smoothAmt.get(k)||0) + 2*strength*list[i+1]/30)); }
-  updateSurfaceMeshes();
-  return true;
+  if (brushCurves(c, r, strength, skipE, skipN)) changed=true;
+  if (changed){ refreshCurves(); refreshNodes(); refreshFaces(); refreshCPs(); applyHover(); return true; }
+  if (surf){ alignSeams(GS.pos, GS.seams, GS.pinned); updateSurfaceMeshes(); return true; }
+  return false;
 }
 // ---------- scene refresh ----------
 function clearGroup(g){ for (const c of [...g.children]){ g.remove(c); if (c.geometry && c.geometry!==nodeGeo && c.geometry!==cpGeo && c.geometry!==lockNodeGeo && c.geometry!==beadGeo) c.geometry.dispose(); } }
@@ -1071,7 +1078,7 @@ function refreshCurves(){
   clearGroup(curveGroup);
   for (const e of edges.values()){
     const s=samples(e); if (polyLen(s)<1e-4) continue;
-    const geo=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(s,false,'catmullrom',0.5), 96, e.guide ? TUBE*0.6 : TUBE, 7, false);
+    const geo=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(s,false,'catmullrom',0.5), 96, e.guide ? TUBE*0.6 : e.crease ? TUBE : TUBE*(0.75+0.4*edgeBlend(e)), 7, false);
     const m=new THREE.Mesh(geo, M.curve); m.userData.eid=e.id; curveGroup.add(m);
     if (e.locked){ const L=polyLen(s), nb=Math.max(2, Math.round(L/0.6)), rs=resample(s, nb+2);
       for (let i=1;i<=nb;i++){ const bd=new THREE.Mesh(beadGeo, M.lock); bd.position.copy(rs[i]); bd.userData.bead=true; curveGroup.add(bd); } }
@@ -1085,12 +1092,12 @@ function refreshNodes(){
     if (n.p.y>0.05){ dl.push(n.p.x,n.p.y,n.p.z, n.p.x,0,n.p.z, n.p.x-0.12,0,n.p.z, n.p.x+0.12,0,n.p.z, n.p.x,0,n.p.z-0.12, n.p.x,0,n.p.z+0.12); }
   }
   if (dl.length){ const g=new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(dl,3)); dropGroup.add(new THREE.LineSegments(g, M.drop)); }
-  dropGroup.visible=state.drops;
+  applyLines();
 }
 function refreshFaces(){
   netCentroid.set(0,0,0); if (nodes.size){ for (const n of nodes.values()) netCentroid.add(n.p); netCentroid.multiplyScalar(1/nodes.size); }
   buildSurfaces(); makeSurfaceMeshes();
-  isoGroup.visible=state.iso;
+  applyLines();
 }
 function refreshCPs(){
   clearGroup(cpGroup); updateChips();
@@ -1106,7 +1113,7 @@ function applyHover(){
     const hot = hover && hover.type==='edge' && hover.id===id;
     const e=edges.get(id), tl=state.tool;
     const baseM = !e ? M.curve : e.crease ? (e.guide ? M.creaseGuide : M.crease) : (e.guide ? M.curveGuide : M.curve);
-    m.material = (tl==='erase' && hot) ? M.curveDanger : (((tl==='edit' && (hot || selected===id)) || ((tl==='guide'||tl==='crease'||tl==='lock') && hot)) ? M.curveHi : baseM);
+    m.material = (tl==='erase' && hot) ? M.curveDanger : (((tl==='edit' && (hot || selected===id)) || ((tl==='edge'||tl==='lock') && hot)) ? M.curveHi : baseM);
   }
   for (const m of nodeGroup.children){
     const hot = hover && hover.type==='node' && hover.id===m.userData.nid;
@@ -1124,11 +1131,11 @@ function topoChanged(){ computeFaces(); refreshAll(); }
 
 // ---------- undo ----------
 const undoStack=[];
-function snapshot(){ return JSON.stringify({n:[...nodes.values()].map(n=>[n.id,n.p.x,n.p.y,n.p.z,n.locked?1:0]), e:[...edges.values()].map(e=>[e.id,e.a,e.b,e.cps.map(p=>[p.x,p.y,p.z]),e.guide?1:0,e.crease?1:0,e.locked?1:0]), s:[...suppressed], nid, eid, f:[...smoothAmt].map(([k,v])=>[k,+v.toFixed(4)])}); }
+function snapshot(){ return JSON.stringify({n:[...nodes.values()].map(n=>[n.id,n.p.x,n.p.y,n.p.z,n.locked?1:0]), e:[...edges.values()].map(e=>[e.id,e.a,e.b,e.cps.map(p=>[p.x,p.y,p.z]),e.guide?1:0,e.crease?1:0,e.locked?1:0,e.blend]), s:[...suppressed], nid, eid, f:[...smoothAmt].map(([k,v])=>[k,+v.toFixed(4)])}); }
 function restore(js){
   const d=JSON.parse(js);
   nodes=new Map(); for (const [id,x,y,z,lk] of d.n) nodes.set(id,{id,p:new V3(x,y,z),locked:!!lk});
-  edges=new Map(); for (const [id,a,b,c,gd,cr,lk] of d.e) edges.set(id,{id,a,b,cps:c.map(q=>new V3(q[0],q[1],q[2])),s:null,scr:null,scrVer:-1,guide:!!gd,crease:!!cr,locked:!!lk});
+  edges=new Map(); for (const [id,a,b,c,gd,cr,lk,bl] of d.e) edges.set(id,{id,a,b,cps:c.map(q=>new V3(q[0],q[1],q[2])),s:null,scr:null,scrVer:-1,guide:!!gd,crease:!!cr,locked:!!lk,blend:bl==null?null:bl});
   smoothAmt.clear(); for (const [k,v] of (d.f||[])) smoothAmt.set(k,v);
   suppressed=new Set(d.s); nid=d.nid; eid=d.eid;
   if (selected!=null && !edges.has(selected)) selected=null;
@@ -1390,8 +1397,7 @@ const hints = {
   edit:'<b>Drag a dot to move a corner, or drag a curve to bend it.</b> Tap a curve to show its control points and switch it between strict or guide, smooth or crease. Drop a dot on another dot to merge them.',
   lock:'<b>Click a dot or a curve to lock or unlock it.</b> The Smooth brush can\'t move locked parts: locked dots turn into cubes, locked curves get beads.',
   smooth:'<b>Drag across the model to smooth it.</b> Skins, curves and dots all relax, and kinks at joints straighten. Lock anything you want kept still. Brush size and strength are under More.',
-  guide:'<b>Tap a curve</b> to switch it between strict and guide.',
-  crease:'<b>Tap a curve</b> to switch it between smooth and crease.',
+  edge:'<b>Tap a curve</b> to step it through Smooth 30%, 60%, 100%, Crease and Guide.',
   erase:'<b>Tap a curve to delete it.</b> Tap a skin to open a hole there, and tap a faint one to fill it again.',
   orbit:'<b>Drag to orbit.</b> Shift-drag or two fingers to pan. Scroll or pinch to zoom.'
 };
@@ -1406,17 +1412,13 @@ function setTool(t){
 function updateChips(){
   const e = selected!=null ? edges.get(selected) : null, show = !!e && state.tool==='edit' && !(typeof XR!=='undefined' && XR.on);
   $('#chips').hidden = !show; if (!show) return;
-  $('#cStrict').setAttribute('aria-pressed', String(!e.guide)); $('#cGuide').setAttribute('aria-pressed', String(e.guide));
-  $('#cSmooth').setAttribute('aria-pressed', String(!e.crease)); $('#cCrease').setAttribute('aria-pressed', String(e.crease));
+  const lv=levelOf(e); for (let i=0;i<5;i++) $('#cL'+i).setAttribute('aria-pressed', String(i===lv));
 }
 function setEdgeFlag(flag, val){
   const e = selected!=null ? edges.get(selected) : null; if (!e || e[flag]===val) return;
   pushUndo(); e[flag]=val; refreshAll();
 }
-$('#cStrict').addEventListener('click',()=>setEdgeFlag('guide',false));
-$('#cGuide').addEventListener('click',()=>setEdgeFlag('guide',true));
-$('#cSmooth').addEventListener('click',()=>setEdgeFlag('crease',false));
-$('#cCrease').addEventListener('click',()=>setEdgeFlag('crease',true));
+for (let i=0;i<5;i++) $('#cL'+i).addEventListener('click',()=>{ const e = selected!=null ? edges.get(selected) : null; if (!e) return; pushUndo(); setLevel(e,i); refreshAll(); });
 $('#brushRange').addEventListener('input', e=>{ state.brushR=+e.target.value; $('#brushVal').textContent=state.brushR.toFixed(1); });
 $('#strRange').addEventListener('input', e=>{ state.brushS=+e.target.value; $('#strVal').textContent=Math.round(state.brushS*100)+'%'; });
 document.querySelectorAll('.tb[data-tool]').forEach(b=>b.addEventListener('click',()=>setTool(b.dataset.tool)));
@@ -1444,11 +1446,15 @@ $('#kRange').addEventListener('input', e=>{
 });
 $('#kRange').addEventListener('change', ()=>{ kBase=null; });
 $('#snapRange').addEventListener('input', e=>{ state.snapR=+e.target.value; $('#snapVal').textContent=state.snapR+' px'; });
-$('#puffRange').addEventListener('input', e=>{ state.puff=+e.target.value; $('#puffVal').textContent=state.puff.toFixed(2); refreshFaces(); applyHover(); });
-$('#isoChk').addEventListener('change', e=>{ state.iso=e.target.checked; isoGroup.visible=state.iso; requestRender(); });
+function applyLines(){
+  const on=state.lines; curveGroup.visible=on; nodeGroup.visible=on; cpGroup.visible=on;
+  dropGroup.visible=on && state.drops; isoGroup.visible=on && state.iso; requestRender();
+}
+$('#linesChk').addEventListener('change', e=>{ state.lines=e.target.checked; applyLines(); });
+$('#isoChk').addEventListener('change', e=>{ state.iso=e.target.checked; applyLines(); });
 $('#blendRange').addEventListener('input', e=>{ state.blend=+e.target.value; $('#blendVal').textContent=Math.round(state.blend*100)+'%'; refreshFaces(); applyHover(); });
 $('#gridChk').addEventListener('change', e=>{ state.grid=e.target.checked; gridGroup.visible=state.grid; requestRender(); });
-$('#dropChk').addEventListener('change', e=>{ state.drops=e.target.checked; dropGroup.visible=state.drops; requestRender(); });
+$('#dropChk').addEventListener('change', e=>{ state.drops=e.target.checked; applyLines(); });
 $('#sampleBtn').addEventListener('click', ()=>{ pushUndo(); loadSample(); toast('Sample loaded'); });
 $('#clearBtn').addEventListener('click', ()=>{ pushUndo(); nodes.clear(); edges.clear(); suppressed.clear(); smoothAmt.clear(); selected=null; topoChanged(); toast('Cleared. Undo brings it back.'); });
 
@@ -1731,9 +1737,9 @@ function startAction(h){
     const c=nearestCurve3D(p,R*0.8); if (c){ toggleLock({type:'edge', id:c.eid}); h.mode='lock'; buzz(h,.3,25); return; }
     startGrab1(h,'pinch'); return;
   }
-  if (state.tool==='guide' || state.tool==='crease'){
+  if (state.tool==='edge'){
     const c=nearestCurve3D(p,R*0.8);
-    if (c){ const e=edges.get(c.eid); pushUndo(); if (state.tool==='guide') e.guide=!e.guide; else e.crease=!e.crease; refreshAll(); h.mode='lock'; buzz(h,.3,25); return; }
+    if (c){ const e=edges.get(c.eid); pushUndo(); setLevel(e,(levelOf(e)+1)%5); refreshAll(); showLabel(levelName(e), h.pos, 1600); h.mode='lock'; buzz(h,.3,25); return; }
     startGrab1(h,'pinch'); return;
   }
   if (state.tool==='erase'){
@@ -1762,11 +1768,17 @@ function handleHand(h){
     if (Math.abs(h.ay)>0.15){ XR.brushR=Math.max(0.01, Math.min(0.3, XR.brushR*Math.exp(-h.ay*dt*1.6))); XR.panelDirty=1; }
     if (Math.abs(h.ax)>0.15){ XR.brushS=Math.max(0.05, Math.min(1, XR.brushS+h.ax*dt*0.9)); XR.panelDirty=1; }
   }
+  if (h.mode==='panel'){
+    if (h.pinch || h.grip){ panel.position.copy(h.pos).add(h.panelOff); h.was=h.pinch; h.gwas=h.grip; return; }
+    h.mode=null; XR.panelGrab=false; drawPanel();
+  }
   // panel poke
   const pl=panel.worldToLocal(h.tip.clone());
   h.nearPanel = !h.mode && Math.abs(pl.x)<PW/2+.01 && Math.abs(pl.y)<PH/2+.01 && pl.z>-.03 && pl.z<.08;
   if (h.nearPanel){
     const b=panelHit(pl.x,pl.y); if (b!==XR.hoverBtn){ XR.hoverBtn=b; drawPanel(); }
+    const cy=(0.5-pl.y/PH)*CH;
+    if (!b && cy<80 && ((h.pinch && !h.was) || (h.grip && !h.gwas))){ h.mode='panel'; h.panelOff=panel.position.clone().sub(h.pos); XR.panelPinned=true; XR.panelGrab=true; h.nearPanel=false; drawPanel(); buzz(h,.25,20); h.was=h.pinch; h.gwas=h.grip; return; }
     if (pl.z>.02) h.armed=true;
     if (h.armed && pl.z<.006){ h.armed=false; if (b){ pressButton(b); buzz(h,.35,20); } }
     if (h.kind==='ctrl' && h.pinch && !h.was && b){ pressButton(b); buzz(h,.35,20); }
@@ -1806,7 +1818,7 @@ function updateMarks(){
       if (h.mode==='drag'){ const d=h.drag; if (d && d.type==='node' && d.merge!=null && nodes.has(d.merge)) t={p:nodes.get(d.merge).p}; }
       else { t=pickEdit3D(p,R); if (t && !hv) hv=t; }
     } else if (state.tool==='erase'){ t=pickErase3D(p,R); danger=true; if (t && !hv) hv=t; }
-    else if (state.tool==='guide' || state.tool==='crease'){ const c=nearestCurve3D(p,R*0.8); if (c){ t={type:'edge', id:c.eid, p:c.q}; if (!hv) hv=t; } }
+    else if (state.tool==='edge'){ const c=nearestCurve3D(p,R*0.8); if (c){ t={type:'edge', id:c.eid, p:c.q}; if (!hv){ hv=t; if (!XR.labelUntil || performance.now()>XR.labelUntil) showLabel(levelName(edges.get(c.eid)), h.pos, 0); } } }
     else if (state.tool==='lock'){ const n=nearestNode3D(p,R); if (n!=null) t={type:'node', id:n, p:nodes.get(n).p}; else { const c=nearestCurve3D(p,R*0.8); if (c) t={type:'edge', id:c.eid, p:c.q}; } if (t && !hv) hv=t; }
     if (t){ h.mark.position.copy(t.p); h.mark.scale.setScalar(R*0.45); h.mark.material = danger ? markMatD : markMatA; h.mark.visible=true; }
   }
@@ -1814,19 +1826,30 @@ function updateMarks(){
   if (key!==old){ hover=hv?{type:hv.type, id:hv.id}:null; applyHover(); }
 }
 
+// ---- floating label (curve settings) ----
+const lc=document.createElement('canvas'); lc.width=512; lc.height=96; const lctx=lc.getContext('2d');
+const ltex=new THREE.CanvasTexture(lc);
+const labelSprite=new THREE.Sprite(new THREE.SpriteMaterial({map:ltex, transparent:true, depthTest:false}));
+labelSprite.scale.set(0.13,0.0244,1); labelSprite.renderOrder=70; labelSprite.visible=false; xrRoot.add(labelSprite);
+let labelText='';
+function showLabel(text, at, ms){
+  if (text!==labelText){ labelText=text; lctx.clearRect(0,0,512,96); rr(lctx,4,8,504,80,40); lctx.fillStyle='rgba(17,21,30,0.9)'; lctx.fill();
+    lctx.fillStyle='#e8ecf4'; lctx.font='600 44px system-ui, sans-serif'; lctx.textAlign='center'; lctx.textBaseline='middle'; lctx.fillText(text,256,50,480); ltex.needsUpdate=true; }
+  labelSprite.position.copy(at).add(new V3(0,0.05,0)); labelSprite.visible=true;
+  XR.labelUntil = performance.now() + (ms||250);
+}
+function updateLabel(){ if (labelSprite.visible && performance.now()>(XR.labelUntil||0)) labelSprite.visible=false; }
 // ---- tag-along panel ----
 const PW=0.26, CW=520, CH=410, PH=PW*CH/CW;
 const pc=document.createElement('canvas'); pc.width=CW; pc.height=CH; const pctx=pc.getContext('2d');
 const ptex=new THREE.CanvasTexture(pc);
 const panel=new THREE.Mesh(new THREE.PlaneGeometry(PW,PH), new THREE.MeshBasicMaterial({map:ptex, transparent:true, depthTest:false}));
 panel.renderOrder=50; xrRoot.add(panel);
-const PUFFS=[0,0.3,0.6,-0.3];
 const BTN=[
   {id:'draw', r:0,c:0, label:()=>'Draw'}, {id:'edit', r:0,c:1, label:()=>'Edit'}, {id:'smooth', r:0,c:2, label:()=>'Smooth'}, {id:'erase', r:0,c:3, label:()=>'Erase'},
-  {id:'guide', r:1,c:0, label:()=>'Guide'}, {id:'crease', r:1,c:1, label:()=>'Crease'}, {id:'lock', r:1,c:2, label:()=>'Lock'}, {id:'undo', r:1,c:3, label:()=>'Undo'},
-  {id:'puff', r:2,c:0, label:()=>'Puff '+(state.puff>0?'+':'')+state.puff.toFixed(1)}, {id:'iso', r:2,c:1, label:()=>state.iso?'Isos on':'Isos off'},
-  {id:'blend', r:2,c:2, label:()=>'Blend '+Math.round(state.blend*100)+'%'}, {id:'recenter', r:2,c:3, label:()=>'Recenter'},
-  {id:'room', r:-1,c:1, label:()=>XR.ar ? (XR.room?'Passthru':'Room') : 'Room'},
+  {id:'edge', r:1,c:0, label:()=>'Edge'}, {id:'lock', r:1,c:1, label:()=>'Lock'}, {id:'undo', r:1,c:2, label:()=>'Undo'}, {id:'recenter', r:1,c:3, label:()=>'Recenter'},
+  {id:'lines', r:2,c:0, label:()=>state.lines?'Lines on':'Lines off'}, {id:'iso', r:2,c:1, label:()=>state.iso?'Isos on':'Isos off'},
+  {id:'blend', r:2,c:2, label:()=>'Blend '+Math.round(state.blend*100)+'%'}, {id:'room', r:2,c:3, label:()=>XR.ar ? (XR.room?'Passthru':'Room') : 'Room'},
   {id:'exit', r:-1,c:0, label:()=>'Exit'}
 ];
 const XR_HINT={
@@ -1834,8 +1857,7 @@ const XR_HINT={
   edit:()=>['Pinch a dot or a curve and drag it.','Pinch a curve to show its control points.'],
   lock:()=>['Pinch a dot or a curve to lock it.','Smooth can\'t move locked parts.'],
   smooth:()=>['Pinch over the model to smooth it.','Brush '+Math.round(XR.brushR*100)+' cm, strength '+Math.round(XR.brushS*100)+'%. Stick: size, strength.'],
-  guide:()=>['Pinch a curve: strict or guide.','Strict pins the skin. Guide only pulls on it.'],
-  crease:()=>['Pinch a curve: smooth or crease.','Smooth lets skins flow across it.'],
+  edge:()=>['Pinch a curve to step its setting.','Smooth 30 > 60 > 100% > Crease > Guide.'],
   erase:()=>['Pinch a curve to delete it.','Pinch a skin to open or fill a hole.']
 };
 const BX0=16, BY0=150, BG=8, BWd=(CW-2*BX0-3*BG)/4, BHt=76;
@@ -1848,7 +1870,8 @@ function drawPanel(){
   const ww=c.measureText('Wire').width; c.fillStyle='#7a90ff'; c.fillText('skin', 22+ww, 54);
   const hint=(XR_HINT[state.tool]||XR_HINT.draw)();
   c.fillStyle='#c9cfdb'; c.font='500 20px system-ui, sans-serif'; c.fillText(hint[0], 22, 98, CW-44); c.fillText(hint[1], 22, 122, CW-44);
-  c.fillStyle='#8f99ad'; c.font='500 16px system-ui, sans-serif'; c.fillText('Both hands pinch: move, turn, scale.  B: undo.', 22, 143, CW-44);
+  c.fillStyle='#8f99ad'; c.font='500 16px system-ui, sans-serif'; c.fillText('Two hands: move, turn, scale.  B: undo.  Top bar: move panel.', 22, 143, CW-44);
+  rr(c, CW/2-46, 12, 92, 10, 5); c.fillStyle = XR.panelGrab ? '#7a90ff' : 'rgba(255,255,255,0.32)'; c.fill();
   for (const b of BTN){
     const r=btnRect(b), active=b.id===state.tool, hov=b.id===XR.hoverBtn, off=b.id==='room' && !XR.ar;
     rr(c,r.x,r.y,r.w,r.h,14);
@@ -1866,18 +1889,18 @@ function panelHit(x,y){
   return null;
 }
 function pressButton(id){
-  if (id==='draw'||id==='edit'||id==='erase'||id==='smooth'||id==='guide'||id==='crease'||id==='lock') setTool(id);
+  if (id==='draw'||id==='edit'||id==='erase'||id==='smooth'||id==='edge'||id==='lock') setTool(id);
   else if (id==='undo') undo();
-  else if (id==='puff'){ state.puff=PUFFS[(PUFFS.indexOf(state.puff)+1)%PUFFS.length]||0; $('#puffRange').value=state.puff; $('#puffVal').textContent=state.puff.toFixed(2); refreshFaces(); applyHover(); }
-  else if (id==='iso'){ state.iso=!state.iso; $('#isoChk').checked=state.iso; isoGroup.visible=state.iso; }
-  else if (id==='recenter'){ XR.placed=false; }
+  else if (id==='iso'){ state.iso=!state.iso; $('#isoChk').checked=state.iso; applyLines(); }
+  else if (id==='lines'){ state.lines=!state.lines; $('#linesChk').checked=state.lines; applyLines(); }
+  else if (id==='recenter'){ XR.placed=false; XR.panelPinned=false; }
   else if (id==='blend'){ const B=[0.3,0.6,1]; state.blend=B[(B.indexOf(state.blend)+1)%B.length] ?? 0.6; $('#blendRange').value=state.blend; $('#blendVal').textContent=Math.round(state.blend*100)+'%'; refreshFaces(); applyHover(); }
   else if (id==='room'){ if (XR.ar) setRoom(!XR.room); }
   else if (id==='exit'){ if (XR.session) XR.session.end(); }
   drawPanel();
 }
 function followPanel(){
-  if (HL.some(h=>h.nearPanel)) return;
+  if (HL.some(h=>h.nearPanel || h.mode==='panel') || XR.panelPinned){ panel.lookAt(head.pos); return; }
   const fwd=new V3(0,0,-1).applyQuaternion(head.q); fwd.y=0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
   const left=new V3(fwd.z,0,-fwd.x);
   const target=head.pos.clone().addScaledVector(fwd,0.4).addScaledVector(left,0.24); target.y=head.pos.y-0.24;
@@ -1914,6 +1937,7 @@ function xrTick(xf){
   updateGrab();
   if (XR.needRefresh){ XR.needRefresh=false; refreshAll(); }
   updateMarks();
+  updateLabel();
   followPanel();
   if (!HL.some(h=>h.nearPanel) && XR.hoverBtn){ XR.hoverBtn=null; drawPanel(); }
   if (XR.panelDirty && (XR.frameN++ % 6 === 0)){ XR.panelDirty=0; drawPanel(); }
@@ -1940,10 +1964,10 @@ function leaveXR(){
   XR.on=false; XR.session=null; XR.grab=null;
   setRoom(false); xrRoot.visible=false;
   world.position.set(0,0,0); world.quaternion.identity(); world.scale.setScalar(1); world.updateMatrixWorld(true);
-  if (state.tool==='guide'||state.tool==='crease') setTool('edit');
+  if (state.tool==='edge') setTool('edit');
   hover=null; resize(); topoChanged(); syncXrBtn();
 }
-window.__wsxr={XR,hands,handleHand,updateGrab,updateMarks,placeWorld,head,world,panel,drawPanel,pressButton,setTool,xrRoot,get nodes(){return nodes;},get edges(){return edges;},get faces(){return faces;},refreshAll,addNode,addEdge,lineCps,topoChanged,brushSmooth,loadSample};
+window.__wsxr={XR,hands,handleHand,updateGrab,updateMarks,placeWorld,head,world,panel,drawPanel,pressButton,setTool,xrRoot,get nodes(){return nodes;},get edges(){return edges;},get faces(){return faces;},refreshAll,addNode,addEdge,lineCps,topoChanged,brushSmooth,loadSample,levelName:e=>levelName(e)};
 const xrBtn=$('#xrBtn'); let xrName='MR';
 function syncXrBtn(){ xrBtn.textContent = XR.session ? 'Exit '+xrName : 'Enter '+xrName; }
 xrBtn.addEventListener('click', enterXR);
