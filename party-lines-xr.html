@@ -66,12 +66,13 @@ const KEY = 'partylines.v2';
 const COLORS = [0xff6b3d, 0x2fb3a5, 0xff5fa2, 0xf2c230, 0x4f8cff, 0x6fd16a, 0xa87bff, 0xe8463b];
 // board placement relative to the controller grip: 11.5 cm out along your fingers, deck across the two fingertips
 const DEFAULT_FIT = () => ({ p: [0, -0.07, 0], q: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2).toArray() });
-let store = { lines: [], strokes: [], surfaces: [], fit: {}, brush: 0.0022 };
+let store = { lines: [], strokes: [], surfaces: [], fit: {}, brush: 0.0022, ride: 'right', view: {} };
 try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.lines) store = Object.assign(store, s); } catch (e) {}
 if (store.fitVersion !== 3){ store.fit = {}; store.fitVersion = 3; }      // start everyone from the new close-in default
 for (const h of ['left', 'right']) if (!store.fit[h] || !store.fit[h].p) store.fit[h] = DEFAULT_FIT();
 store.strokes = store.strokes.map(s => Array.isArray(s) ? { r: 0.0022, a: s, used: false } : s);   // older saves
 store.surfaces = store.surfaces || [];
+store.view = Object.assign({ trails: true, ghosts: true, nets: true, sketches: true }, store.view);
 let saveTimer = 0;
 function save(){ clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) {} }, 300); }
 const r4 = v => Math.round(v * 10000) / 10000;
@@ -250,8 +251,9 @@ function buildLine(data){
   for (let i = 0; i < n; i++) pts.push(new THREE.Vector3(s[i*8+1], s[i*8+2], s[i*8+3]));
   const trailPts = pts.filter((p, i) => i % 2 === 0 || i === n - 1);
   if (trailPts.length >= 2){
-    group.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(trailPts), Math.min(900, trailPts.length * 3), 0.0018, 6, false),
-      new THREE.MeshStandardMaterial({ color, roughness: .5 })));
+    const tube = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(trailPts), Math.min(900, trailPts.length * 3), 0.0018, 6, false),
+      new THREE.MeshStandardMaterial({ color, roughness: .5 }));
+    tube.userData.trail = true; group.add(tube);
   }
   // timing dots every 0.1 s (spread out = fast, bunched = slow)
   const dotsAt = []; let next = 0;
@@ -259,7 +261,7 @@ function buildLine(data){
   const dots = new THREE.InstancedMesh(dotGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: color, emissiveIntensity: .4 }), Math.max(1, dotsAt.length));
   const m = new THREE.Matrix4();
   dotsAt.forEach((p, i) => dots.setMatrixAt(i, m.makeTranslation(p.x, p.y, p.z)));
-  dots.count = dotsAt.length; group.add(dots);
+  dots.count = dotsAt.length; dots.userData.trail = true; group.add(dots);
   const ghost = makeBoard(color); group.add(ghost);
   scene.add(group);
   const obj = { data, group, pts, ghost, dur: s[(n - 1) * 8], cursor: 0, t0: performance.now() / 1000 };
@@ -282,7 +284,7 @@ const _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion();
 function animateGhost(obj, now){
   const s = obj.data.s, n = s.length / 8, PAUSE = 0.8;
   const t = (now - obj.t0) % (obj.dur + PAUSE);
-  if (t > obj.dur){ obj.ghost.visible = false; return; }
+  if (t > obj.dur || !store.view.ghosts){ obj.ghost.visible = false; return; }
   obj.ghost.visible = true;
   if (s[obj.cursor * 8] > t) obj.cursor = 0;
   while (obj.cursor < n - 2 && s[(obj.cursor + 1) * 8] <= t) obj.cursor++;
@@ -422,21 +424,63 @@ function livePush(line, p){
 }
 function liveReset(line){ line.geometry.setDrawRange(0, 0); line.visible = false; }
 
-// ================= HUD (floats above your left controller) =================
-const hudCanvas = document.createElement('canvas'); hudCanvas.width = 640; hudCanvas.height = 300;
-const hudCtx = hudCanvas.getContext('2d');
-const hudTex = new THREE.CanvasTexture(hudCanvas); hudTex.colorSpace = THREE.SRGBColorSpace;
-const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.075), new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false }));
-hud.renderOrder = 10; hud.visible = false; scene.add(hud);
-let hudKey = '', flash = { text: '', until: 0 };
-function drawHud(title, lines, color){
-  const key = title + lines.join('|') + color; if (key === hudKey) return; hudKey = key;
-  const c = hudCtx; c.clearRect(0, 0, 640, 300);
-  c.fillStyle = 'rgba(22,24,29,0.88)'; c.beginPath(); c.roundRect(0, 0, 640, 300, 28); c.fill();
-  c.fillStyle = color || '#f1ece2'; c.font = '800 54px "Bricolage Grotesque", Arial Black, sans-serif'; c.fillText(title, 32, 72);
-  c.fillStyle = '#c9c1b4'; c.font = '500 27px "IBM Plex Sans", Arial, sans-serif';
-  lines.forEach((l, i) => c.fillText(l, 32, 126 + i * 42));
-  hudTex.needsUpdate = true;
+// ================= off-hand menu (point with your riding hand, pull the trigger) =================
+const MW = 1024, MH = 800;
+const menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH;
+const menuCtx = menuCanvas.getContext('2d');
+const menuTex = new THREE.CanvasTexture(menuCanvas); menuTex.colorSpace = THREE.SRGBColorSpace;
+const menu = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 0.2 * MH / MW), new THREE.MeshBasicMaterial({ map: menuTex, transparent: true, depthTest: false }));
+menu.renderOrder = 10; menu.visible = false; scene.add(menu);
+const laserGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]);
+const laser = new THREE.Line(laserGeo, new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false }));
+laser.renderOrder = 11; laser.frustumCulled = false; laser.visible = false; scene.add(laser);
+const raycaster = new THREE.Raycaster();
+let flash = { text: '', until: 0 }, menuKey = '', buttons = [];
+
+function layoutButtons(){
+  const W = 464, H = 92, GAP = 16, X0 = 40, B = [];
+  let y = 150;
+  const row = (a, b) => { [a, b].forEach((btn, i) => btn && B.push({ ...btn, x: X0 + i * (W + GAP), y, w: W, h: H })); y += H + GAP; };
+  const v = store.view;
+  row({ id: 'mode-record', label: 'Record', on: mode === 'record', tab: true }, { id: 'mode-compose', label: 'Compose', on: mode === 'compose', tab: true });
+  row({ id: 'undo', label: '↶  Undo' }, { id: 'redo', label: 'Redo  ↷' });
+  if (mode === 'record') row({ id: 'swap', label: 'Switch hand' }, { id: 'resetfit', label: 'Reset board fit' });
+  else row({ id: 'surface', label: 'Make surface' }, { id: 'nets', label: 'Control points', on: v.nets, toggle: true });
+  row({ id: 'trails', label: 'Trails', on: v.trails, toggle: true }, { id: 'ghosts', label: 'Ghost boards', on: v.ghosts, toggle: true });
+  row({ id: 'replay', label: 'Replay together' }, { id: 'sketches', label: 'Sketches', on: v.sketches, toggle: true });
+  return B;
+}
+function drawMenu(title, titleColor, hint, hoverId){
+  buttons = layoutButtons();
+  const key = [title, titleColor, hint, hoverId, buttons.map(b => b.id + b.on).join()].join('|');
+  if (key === menuKey) return; menuKey = key;
+  const c = menuCtx; c.clearRect(0, 0, MW, MH);
+  c.fillStyle = 'rgba(22,24,29,0.92)'; c.beginPath(); c.roundRect(0, 0, MW, MH, 40); c.fill();
+  c.fillStyle = titleColor || '#f1ece2'; c.font = '800 64px "Bricolage Grotesque", Arial Black, sans-serif'; c.fillText(title, 40, 100);
+  for (const b of buttons){
+    const hot = b.id === hoverId;
+    c.beginPath(); c.roundRect(b.x, b.y, b.w, b.h, 22);
+    if (b.on){ c.fillStyle = b.tab ? '#ff6b3d' : '#e9cfa3'; c.fill(); }
+    else if (b.toggle){ c.fillStyle = 'rgba(241,236,226,0.04)'; c.fill(); }
+    else { c.fillStyle = 'rgba(241,236,226,0.12)'; c.fill(); }
+    c.lineWidth = hot ? 6 : 2; c.strokeStyle = hot ? '#ffffff' : 'rgba(241,236,226,0.25)'; c.stroke();
+    c.fillStyle = b.on ? '#16181d' : '#f1ece2';
+    c.font = '600 40px "Bricolage Grotesque", Arial, sans-serif';
+    const label = b.toggle ? b.label + (b.on ? '  ·  on' : '  ·  off') : b.label;
+    c.fillText(label, b.x + 28, b.y + b.h / 2 + 14);
+  }
+  c.fillStyle = '#a59e92'; c.font = '500 32px "IBM Plex Sans", Arial, sans-serif'; c.fillText(hint, 40, MH - 36);
+  menuTex.needsUpdate = true;
+}
+function menuHit(st){
+  if (!menu.visible) return null;
+  st.ray.updateMatrixWorld();
+  _a.setFromMatrixPosition(st.ray.matrixWorld); _b.set(0, 0, -1).transformDirection(st.ray.matrixWorld);
+  raycaster.set(_a, _b);
+  const h = raycaster.intersectObject(menu, false)[0];
+  if (!h || h.distance > 1.5 || !h.uv) return null;
+  const px = h.uv.x * MW, py = (1 - h.uv.y) * MH;
+  return { point: h.point, origin: _a.clone(), btn: buttons.find(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) };
 }
 
 // ================= controllers =================
@@ -451,7 +495,7 @@ const inputs = [0, 1].map(i => {
   const pen = new THREE.Mesh(penGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x444444, transparent: true, opacity: .85 }));
   ray.add(pen);
   const st = { ray, grip, board, pen, source: null, hand: '', prev: [], rec: null, live: makeLive(0xff3b3b),
-    sketch: null, liveSketch: makeLive(0xe9e4d8), held: null, adjust: null, flick: 0 };
+    sketch: null, liveSketch: makeLive(0xe9e4d8), held: null, adjust: null, flick: 0, menuClick: false };
   ray.addEventListener('connected', e => { st.source = e.data; st.hand = e.data.handedness; applyFit(st); });
   ray.addEventListener('disconnected', () => { st.source = null; });
   return st;
@@ -469,6 +513,7 @@ function nearestLine(worldP, maxD){
   return best;
 }
 function nearestCP(worldP, maxD){
+  if (!store.view.nets) return null;
   let best = null, bd = maxD;
   for (const o of surfObjs){ const cp = o.data.cp;
     for (let k = 0; k < NC * NC; k++){ const d = _b.set(cp[k*3], cp[k*3+1], cp[k*3+2]).distanceTo(worldP); if (d < bd){ bd = d; best = { o, k }; } } }
@@ -500,39 +545,74 @@ function releaseHeld(st){
   if (h.type === 'line'){ const g = h.o.group; act(moveAct(h.o.data, h.from, { p: g.position.toArray().map(r4), q: g.quaternion.toArray().map(r4) })); }
   else act(cpAct(h.o.data, h.from, h.o.data.cp.map(r4)));
 }
+function settleAll(){ inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); releaseHeld(o);
+  if (o.sketch){ o.sketch = null; liveReset(o.liveSketch); } }); }
+function setMode(m){ settleAll(); mode = m; if (m === 'compose') syncReplay(); }
+
+function pressMenu(id, now){
+  const v = store.view;
+  if (id === 'mode-record') setMode('record');
+  else if (id === 'mode-compose') setMode('compose');
+  else if (id === 'undo') undo();
+  else if (id === 'redo') redo();
+  else if (id === 'swap'){ settleAll(); store.ride = (store.ride || 'right') === 'right' ? 'left' : 'right'; save(); }
+  else if (id === 'resetfit'){ const k = store.ride || 'right'; act(fitAct(k, store.fit[k], DEFAULT_FIT())); }
+  else if (id === 'surface'){ if (!makeSurfaceFromScribbles()) flash = { text: 'Scribble a bit more first', until: now + 1.5 }; }
+  else if (id === 'replay') syncReplay();
+  else if (id in v){ v[id] = !v[id]; save(); }
+}
 
 function updateInputs(now, dt){
   let hotCP = null;
+  const rider = inputs.find(s => s.source && rides(s)), off = inputs.find(s => s.source && !rides(s));
+
+  // menu floats above the off hand and turns to face you
+  menu.visible = !!off;
+  if (off){
+    off.grip.getWorldPosition(menu.position); menu.position.y += 0.13;
+    menu.lookAt(renderer.xr.getCamera().getWorldPosition(_b)); menu.updateMatrixWorld();
+  }
+
   for (const st of inputs){
     const gp = st.source && st.source.gamepad;
-    st.board.visible = !!gp && mode === 'record' && rides(st);
-    st.pen.visible = !!gp && mode === 'compose';
-    if (!gp) continue;
+    const isRider = st === rider;
+    st.board.visible = !!gp && mode === 'record' && isRider;
+    st.pen.visible = !!gp && mode === 'compose' && isRider;
+    if (!gp){ continue; }
     const pressed = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
     const down = i => pressed(i) && !st.prev[i], up = i => !pressed(i) && st.prev[i];
-
-    // stick flick: right = redo, left = undo (both modes)
     const ax = gp.axes[2] || 0, ay = gp.axes[3] || 0;
+
+    // either hand: stick flick right = redo, left = undo; stick click = switch mode
     if (st.flick === 0 && ax > 0.7){ st.flick = 1; redo(); }
     else if (st.flick === 0 && ax < -0.7){ st.flick = -1; undo(); }
     else if (Math.abs(ax) < 0.3) st.flick = 0;
+    if (down(3)) setMode(mode === 'record' ? 'compose' : 'record');
 
-    if (down(3)){                                    // click thumbstick: switch mode
-      inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); releaseHeld(o); });
-      mode = mode === 'record' ? 'compose' : 'record';
-      if (mode === 'compose') syncReplay();          // every run starts together when you come in to compose
+    if (!isRider){
+      // off hand just holds the menu; its face buttons are quick undo / redo
+      if (down(4)) undo();
+      if (down(5)) redo();
+      st.prev = gp.buttons.map(b => b.pressed); continue;
     }
-    else if (mode === 'record'){
-      if (rides(st)){
-        // riding hand. B / Y held: the board stays put in the air while you set your fingertips on it; let go to bolt it on
-        if (down(5) && !st.rec){ st.adjust = { owner: st, from: store.fit[fitKey(st)] }; scene.attach(st.board); }
-        if (up(5)) endFit(st);
-        if (down(4) && !st.adjust) st.rec = { s: [], t0: now, last: -1 };
-      } else {
-        // menu hand. A / X: switch which hand rides. B / Y: undo
-        if (down(4)){ inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); }); store.ride = st.hand === 'left' ? 'left' : 'right'; save(); }
-        if (down(5)) undo();
-      }
+
+    // riding hand: point at the menu and pull the trigger
+    const hit = st.held || st.sketch || st.rec ? null : menuHit(st);
+    laser.visible = !!hit;
+    if (hit){
+      laserGeo.attributes.position.setXYZ(0, hit.origin.x, hit.origin.y, hit.origin.z);
+      laserGeo.attributes.position.setXYZ(1, hit.point.x, hit.point.y, hit.point.z);
+      laserGeo.attributes.position.needsUpdate = true;
+      if (down(0) && hit.btn){ pressMenu(hit.btn.id, now); st.menuClick = true; }
+    }
+    st.hover = hit && hit.btn ? hit.btn.id : '';
+    if (up(0)) st.menuClick = false;
+
+    if (mode === 'record'){
+      // B / Y held: the board stays put in the air while you set your fingertips on it; let go to bolt it on
+      if (down(5) && !st.rec){ st.adjust = { owner: st, from: store.fit[fitKey(st)] }; scene.attach(st.board); }
+      if (up(5)) endFit(st);
+      if (down(4) && !st.adjust) st.rec = { s: [], t0: now, last: -1 };
       if (st.rec && pressed(4)){
         const t = now - st.rec.t0;
         if (t - st.rec.last >= 1 / 40){
@@ -580,7 +660,7 @@ function updateInputs(now, dt){
       }
       if (up(1)) releaseHeld(st);
       if (down(5) && !usedB && !st.held) undo();
-      if (down(0)) st.sketch = { r: store.brush, a: [], used: false };
+      if (down(0) && !st.menuClick) st.sketch = { r: store.brush, a: [], used: false };
       if (st.sketch && pressed(0)){
         st.pen.getWorldPosition(_a);
         const a = st.sketch.a, k = a.length;
@@ -596,27 +676,30 @@ function updateInputs(now, dt){
     }
     st.prev = gp.buttons.map(b => b.pressed);
   }
-  showNets(mode === 'compose');
+  if (!rider) laser.visible = false;
   surfObjs.forEach(o => o.handles.forEach(h => h.material = cpMat));
   if (hotCP) hotCP.o.handles[hotCP.k].material = cpHot;
 
-  // HUD above the left controller
-  const host = inputs.find(s => s.source && s.hand === 'left') || inputs.find(s => s.source);
-  hud.visible = !!host;
-  if (host){
-    host.grip.getWorldPosition(hud.position); hud.position.y += 0.1;
-    hud.lookAt(renderer.xr.getCamera().getWorldPosition(_b));
-    const rec = inputs.find(s => s.rec), fit = inputs.find(s => s.adjust);
-    if (rec) drawHud('● REC ' + (now - rec.rec.t0).toFixed(1) + ' s', ['Let go of A / X to save this line'], '#ff5a4a');
-    else if (fit) drawHud('Fit board', ['Set your two fingertips on the board', 'Let go of ' + (store.ride === 'left' ? 'Y' : 'B') + ' to bolt it on there'], '#e9cfa3');
-    else if (mode === 'record'){
-      const R = store.ride === 'left', rec1 = R ? 'X' : 'A', fit1 = R ? 'Y' : 'B', swap = R ? 'A' : 'X', und = R ? 'B' : 'Y';
-      drawHud('Record',
-        [(R ? 'Left' : 'Right') + ' hand rides  ·  hold ' + rec1 + ' to record', 'Hold ' + fit1 + ': fit board, set fingers, let go',
-         swap + ': ride with this hand  ·  ' + und + ': undo', 'Stick ← → undo / redo  ·  Click: Compose'], '');
-    }
-    else drawHud(now < flash.until ? flash.text : 'Compose', ['Trigger: sketch  ·  Stick ↕ brush size', 'A / X: new scribbles → surface', 'Grip: move a line, surface or orange point', 'B / Y undo  ·  Stick ← → undo / redo'], now < flash.until ? '#ff9a6a' : '');
+  // menu text
+  if (off){
+    const R = (store.ride || 'right') === 'left', A1 = R ? 'X' : 'A', B1 = R ? 'Y' : 'B';
+    const recSt = inputs.find(s => s.rec), fitSt = inputs.find(s => s.adjust);
+    let title = mode === 'record' ? 'Record' : 'Compose', color = '', hint;
+    if (mode === 'record') hint = (R ? 'Left' : 'Right') + ' hand rides  ·  hold ' + A1 + ': record  ·  hold ' + B1 + ': fit board';
+    else hint = 'Trigger: sketch  ·  Grip: move  ·  Stick ↕ brush size';
+    if (recSt){ title = '● REC ' + (now - recSt.rec.t0).toFixed(1) + ' s'; color = '#ff5a4a'; }
+    else if (fitSt){ title = 'Fit board'; color = '#e9cfa3'; hint = 'Set your fingertips on the board, then let go of ' + B1; }
+    else if (now < flash.until){ title = flash.text; color = '#ff9a6a'; }
+    drawMenu(title, color, hint, rider ? rider.hover : '');
   }
+}
+
+// ================= view toggles =================
+function applyView(){
+  const v = store.view;
+  lineObjs.forEach(o => o.group.children.forEach(c => { if (c.userData.trail) c.visible = v.trails; }));
+  strokeObjs.forEach(o => { o.mesh.visible = v.sketches; });
+  showNets(renderer.xr.isPresenting && mode === 'compose' && v.nets);
 }
 
 // ================= page buttons =================
@@ -659,7 +742,7 @@ async function start(kind){
   await renderer.xr.setSession(session);
   const btn = kind === 'immersive-ar' ? mrBtn : vrBtn; btn.disabled = false; btn.textContent = 'Exit';
   session.addEventListener('end', () => {
-    scene.background = BG; room.visible = true; hud.visible = false;
+    scene.background = BG; room.visible = true; menu.visible = false; laser.visible = false;
     inputs.forEach(s => { if (s.rec) finishRecording(s); endFit(s); releaseHeld(s); s.sketch = null; liveReset(s.liveSketch); });
     vrBtn.textContent = 'Enter VR'; mrBtn.textContent = 'Enter MR'; setupButtons();
   });
@@ -686,6 +769,7 @@ let last = performance.now() / 1000;
 renderer.setAnimationLoop(() => {
   const now = performance.now() / 1000, dt = Math.min(now - last, 0.05); last = now;
   if (renderer.xr.isPresenting) updateInputs(now, dt);
+  applyView();
   lineObjs.forEach(o => animateGhost(o, now));
   renderer.render(scene, camera);
 });
