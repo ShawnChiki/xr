@@ -519,6 +519,18 @@ function nearestCP(worldP, maxD){
     for (let k = 0; k < NC * NC; k++){ const d = _b.set(cp[k*3], cp[k*3+1], cp[k*3+2]).distanceTo(worldP); if (d < bd){ bd = d; best = { o, k }; } } }
   return best;
 }
+function rayCP(ro, rd){ // the orange point closest to where you're aiming
+  if (!store.view.nets) return null;
+  let best = null, bs = Infinity;
+  for (const o of surfObjs){ const cp = o.data.cp;
+    for (let k = 0; k < NC * NC; k++){
+      _b.set(cp[k*3], cp[k*3+1], cp[k*3+2]).sub(ro);
+      const t = _b.dot(rd); if (t < 0.03 || t > 3) continue;
+      const d = Math.sqrt(Math.max(0, _b.lengthSq() - t * t));
+      if (d < Math.max(0.012, t * 0.025) && d / t < bs){ bs = d / t; best = { o, k, t }; }
+    } }
+  return best;
+}
 function nearestSurf(worldP, maxD){
   let best = null, bd = maxD;
   for (const o of surfObjs){ const p = o.mesh.geometry.attributes.position;
@@ -625,13 +637,42 @@ function updateInputs(now, dt){
     }
     else { // compose
       // stick up/down: brush size, like Gravity Sketch
-      if (Math.abs(ay) > 0.25 && Math.abs(ax) < 0.5){
+      const dragging = st.held && st.held.type === 'raycp';
+      if (!dragging && Math.abs(ay) > 0.25 && Math.abs(ax) < 0.5){
         store.brush = THREE.MathUtils.clamp(store.brush * Math.exp(-ay * dt * 1.6), 0.001, 0.02); save();
       }
       st.pen.scale.setScalar(Math.max(store.brush, 0.003));
       let usedB = false;
+
+      // pointer: aim at an orange point and pull the trigger to drag it from a distance (stick ↕ pushes / pulls it)
+      st.ray.updateMatrixWorld();
+      const ro = new THREE.Vector3().setFromMatrixPosition(st.ray.matrixWorld), rd = new THREE.Vector3(0, 0, -1).transformDirection(st.ray.matrixWorld);
+      const aim = (!st.held && !st.sketch && !hit) ? rayCP(ro, rd) : null;
+      if (aim) hotCP = aim;
+      if (down(0) && aim && !st.menuClick){
+        const cp = aim.o.data.cp;
+        st.held = { type: 'raycp', o: aim.o, k: aim.k, from: cp.slice(), dist: aim.t,
+          off: new THREE.Vector3(cp[aim.k*3], cp[aim.k*3+1], cp[aim.k*3+2]).sub(ro.clone().addScaledVector(rd, aim.t)) };
+        st.menuClick = true;                          // this trigger pull drags, it doesn't sketch
+      }
+      let beam = aim ? _b.set(aim.o.data.cp[aim.k*3], aim.o.data.cp[aim.k*3+1], aim.o.data.cp[aim.k*3+2]).clone() : null;
+      if (st.held && st.held.type === 'raycp'){
+        const h = st.held;
+        if (pressed(0)){
+          if (Math.abs(ay) > 0.25) h.dist = THREE.MathUtils.clamp(h.dist * Math.exp(-ay * dt * 1.5), 0.05, 3);
+          const p = ro.clone().addScaledVector(rd, h.dist).add(h.off), cp = h.o.data.cp;
+          cp[h.k*3] = p.x; cp[h.k*3+1] = p.y; cp[h.k*3+2] = p.z; refreshSurface(h.o);
+          hotCP = { o: h.o, k: h.k }; beam = p;
+        } else releaseHeld(st);
+      }
+      if (beam && !hit){
+        laser.visible = true;
+        laserGeo.attributes.position.setXYZ(0, ro.x, ro.y, ro.z); laserGeo.attributes.position.setXYZ(1, beam.x, beam.y, beam.z);
+        laserGeo.attributes.position.needsUpdate = true;
+      }
+
       st.grip.getWorldPosition(_a);
-      if (!st.held){ const c = nearestCP(_a, 0.03); if (c) hotCP = c; }
+      if (!st.held && !aim){ const c = nearestCP(_a, 0.03); if (c) hotCP = c; }
       if (down(1)){
         const c = nearestCP(_a, 0.03);
         if (c) st.held = { type: 'cp', o: c.o, k: c.k, from: c.o.data.cp.slice(),
@@ -645,7 +686,7 @@ function updateInputs(now, dt){
             if (so) st.held = { type: 'surf', o: so, from: so.data.cp.slice(), inv: new THREE.Matrix4().copy(st.grip.matrixWorld).invert() }; }
         }
       }
-      if (st.held && pressed(1)){
+      if (st.held && st.held.type !== 'raycp' && pressed(1)){
         const h = st.held;
         if (h.type === 'line'){ _m.multiplyMatrices(st.grip.matrixWorld, h.offset); _m.decompose(h.o.group.position, h.o.group.quaternion, _s); }
         else if (h.type === 'cp'){ const p = _b.copy(_a).add(h.off), cp = h.o.data.cp; cp[h.k*3] = p.x; cp[h.k*3+1] = p.y; cp[h.k*3+2] = p.z; refreshSurface(h.o); }
@@ -658,7 +699,7 @@ function updateInputs(now, dt){
           else { setCP(h.o.data, h.from); act(delSurfAct(h.o.data)); }
         }
       }
-      if (up(1)) releaseHeld(st);
+      if (up(1) && !(st.held && st.held.type === 'raycp')) releaseHeld(st);
       if (down(5) && !usedB && !st.held) undo();
       if (down(0) && !st.menuClick) st.sketch = { r: store.brush, a: [], used: false };
       if (st.sketch && pressed(0)){
@@ -686,7 +727,7 @@ function updateInputs(now, dt){
     const recSt = inputs.find(s => s.rec), fitSt = inputs.find(s => s.adjust);
     let title = mode === 'record' ? 'Record' : 'Compose', color = '', hint;
     if (mode === 'record') hint = (R ? 'Left' : 'Right') + ' hand rides  ·  hold ' + A1 + ': record  ·  hold ' + B1 + ': fit board';
-    else hint = 'Trigger: sketch  ·  Grip: move  ·  Stick ↕ brush size';
+    else hint = 'Trigger: sketch, or aim at a point and drag  ·  Grip: move';
     if (recSt){ title = '● REC ' + (now - recSt.rec.t0).toFixed(1) + ' s'; color = '#ff5a4a'; }
     else if (fitSt){ title = 'Fit board'; color = '#e9cfa3'; hint = 'Set your fingertips on the board, then let go of ' + B1; }
     else if (now < flash.until){ title = flash.text; color = '#ff9a6a'; }
