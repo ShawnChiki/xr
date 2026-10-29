@@ -883,11 +883,41 @@ function updateSurfaceMeshes(){
   requestRender();
 }
 // relax every free surface point within r of c; strength 0..1. Guide curves let their seam points move, with a pull back.
+// relax the black curves under the brush: control points move toward their neighbours,
+// and a kink where exactly two curves meet straightens out (the corner itself stays put)
+function brushCurves(c, r, strength){
+  let changed=false;
+  for (const e of edges.values()){
+    const K=e.cps.length, U=knots(K), orig=e.cps.map(q=>q.clone()); let moved=false;
+    for (let i=1;i<K-1;i++){
+      const q=evalAt(orig, U, (U[i+1]+U[i+2]+U[i+3])/3), d=q.distanceTo(c); if (d>=r) continue;
+      const avg=orig[i-1].clone().add(orig[i+1]).multiplyScalar(0.5);
+      if (avg.distanceToSquared(orig[i])<1e-12) continue;
+      e.cps[i].lerp(avg, sm(1-d/r)*strength*0.35); moved=true;
+    }
+    if (moved){ dirty(e); changed=true; }
+  }
+  for (const n of nodes.values()){
+    const d=n.p.distanceTo(c); if (d>=r) continue;
+    const ends=[]; for (const e of edges.values()){ if (e.a===e.b) continue; if (e.a===n.id) ends.push([e,1]); if (e.b===n.id) ends.push([e,e.cps.length-2]); }
+    if (ends.length!==2) continue;
+    const [[e1,i1],[e2,i2]]=ends, P=n.p, a=e1.cps[i1], b=e2.cps[i2], la=a.distanceTo(P), lb=b.distanceTo(P);
+    if (la<1e-6 || lb<1e-6) continue;
+    const dir=a.clone().sub(P).normalize().sub(b.clone().sub(P).normalize()); if (dir.lengthSq()<1e-9) continue; dir.normalize();
+    const w=sm(1-d/r)*strength*0.25;
+    if (a.distanceTo(P.clone().addScaledVector(dir,la))<1e-5) continue;
+    a.lerp(P.clone().addScaledVector(dir,la), w); b.lerp(P.clone().addScaledVector(dir,-lb), w);
+    dirty(e1); dirty(e2); changed=true;
+  }
+  if (changed){ refreshCurves(); refreshFaces(); refreshCPs(); applyHover(); }
+  return changed;
+}
 function brushSmooth(c, r, strength){
-  if (!GS) return false;
+  const curvesMoved = brushCurves(c, r, strength);
+  if (!GS) return curvesMoved;
   const P=GS.pos, Ng=GS.gkey.length, list=[];
   for (let g=0;g<Ng;g++){ if (GS.pinned[g]) continue; const d=Math.hypot(P[g*3]-c.x, P[g*3+1]-c.y, P[g*3+2]-c.z); if (d<r) list.push(g, sm(1-d/r)); }
-  if (!list.length) return false;
+  if (!list.length) return curvesMoved;
   const t=[0,0,0];
   for (let it=0;it<2;it++) for (let i=0;i<list.length;i+=2){
     const g=list[i], fo=list[i+1], w=fo*strength*0.5;
@@ -1005,6 +1035,11 @@ function pickCurveT(x,y,tol){
   for (const e of edges.values()){ const S=scrSamples(e); for (let i=0;i<S.length-1;i++){ if (S[i].behind) continue; const [d,f]=segDist(x,y,S[i].x,S[i].y,S[i+1].x,S[i+1].y); if (d<bd){ bd=d; best={id:e.id, t:(i+f)/(S.length-1)}; } } }
   return best;
 }
+function brushTarget(x,y){
+  const hp=surfaceHit(x,y); if (hp) return hp;
+  const c=pickCurveT(x,y,Math.max(14,state.snapR)); if (!c) return null;
+  const e=edges.get(c.id); return evalAt(e.cps, knots(e.cps.length), c.t);
+}
 function surfaceHit(x,y){
   raycaster.setFromCamera(new THREE.Vector2(x/W*2-1, -(y/H)*2+1), camera);
   const hit=raycaster.intersectObjects(faceGroup.children.filter(m=>!m.userData.hidden),false)[0];
@@ -1059,7 +1094,7 @@ ov.addEventListener('pointerdown', e=>{
     orb={x:p.x,y:p.y,kind:e.shiftKey?'pan':'orbit',moved:false,tap:true,hit:h}; return;
   }
   if (state.tool==='smooth'){
-    const hp=surfaceHit(p.x,p.y);
+    const hp=brushTarget(p.x,p.y);
     if (hp){ brushing={pushed:false}; brushAt=p; brushPt=hp; doBrush(hp); drawOverlay(); return; }
     orb={x:p.x,y:p.y,kind:e.shiftKey?'pan':'orbit',moved:false,tap:false}; return;
   }
@@ -1078,7 +1113,7 @@ ov.addEventListener('pointermove', e=>{
     drawOverlay(); return;
   }
   if (drag){ moveDrag(p); return; }
-  if (brushing){ const hp=surfaceHit(p.x,p.y); brushAt=p; brushPt=hp; if (hp) doBrush(hp); drawOverlay(); return; }
+  if (brushing){ const hp=brushTarget(p.x,p.y); brushAt=p; brushPt=hp; if (hp) doBrush(hp); drawOverlay(); return; }
   if (orb){
     const dx=p.x-orb.x, dy=p.y-orb.y;
     if (!orb.moved && Math.hypot(dx,dy)<5) return;
@@ -1183,7 +1218,7 @@ function handleTap(p){
   }
 }
 function updateHover(p){
-  if (state.tool==='smooth'){ brushAt=p; brushPt=surfaceHit(p.x,p.y); drawOverlay(); ov.style.cursor = brushPt ? 'none' : 'default'; return; }
+  if (state.tool==='smooth'){ brushAt=p; brushPt=brushTarget(p.x,p.y); drawOverlay(); ov.style.cursor = brushPt ? 'none' : 'default'; return; }
   if (state.tool==='draw'){ const s=snapAt(p.x,p.y); const changed = JSON.stringify(s&&[s.type,s.id,s.eid,Math.round((s.t||0)*50)]) !== JSON.stringify(hoverSnap&&[hoverSnap.type,hoverSnap.id,hoverSnap.eid,Math.round((hoverSnap.t||0)*50)]); hoverSnap=s; if (changed || s) drawOverlay(); return; }
   let h=null;
   if (state.tool==='edit') h=pickEdit(p.x,p.y);
@@ -1201,7 +1236,7 @@ function setCursor(){
 const hints = {
   draw:'<b>Drag to sketch a curve.</b> Start or end on a dot or a curve to lock them together. Closed loops of 1 to 6 curves skin themselves. Trace over a curve to refine it.',
   edit:'<b>Drag a dot to move a corner, or drag a curve to bend it.</b> Tap a curve to show its control points and switch it between strict or guide, smooth or crease. Drop a dot on another dot to merge them.',
-  smooth:'<b>Drag across a skin to smooth it.</b> Strict curves hold the skin in place; guide curves let it relax off them. Brush size and strength are under More.',
+  smooth:'<b>Drag across skins and curves to smooth them.</b> Kinks where two curves meet straighten out; corners stay put. Brush size and strength are under More.',
   guide:'<b>Tap a curve</b> to switch it between strict and guide.',
   crease:'<b>Tap a curve</b> to switch it between smooth and crease.',
   erase:'<b>Tap a curve to delete it.</b> Tap a skin to open a hole there, and tap a faint one to fill it again.',
@@ -1634,7 +1669,7 @@ const BTN=[
 const XR_HINT={
   draw:()=>['Pinch and draw in the air.','Start or end on a dot to join curves.'],
   edit:()=>['Pinch a dot or a curve and drag it.','Pinch a curve to show its control points.'],
-  smooth:()=>['Pinch over a skin to smooth it.','Brush '+Math.round(XR.brushR*100)+' cm, strength '+Math.round(XR.brushS*100)+'%. Stick: size, strength.'],
+  smooth:()=>['Pinch over skins and curves to smooth them.','Brush '+Math.round(XR.brushR*100)+' cm, strength '+Math.round(XR.brushS*100)+'%. Stick: size, strength.'],
   guide:()=>['Pinch a curve: strict or guide.','Strict pins the skin. Guide only pulls on it.'],
   crease:()=>['Pinch a curve: smooth or crease.','Smooth lets skins flow across it.'],
   erase:()=>['Pinch a curve to delete it.','Pinch a skin to open or fill a hole.']
@@ -1743,7 +1778,7 @@ function leaveXR(){
   if (state.tool==='guide'||state.tool==='crease') setTool('edit');
   hover=null; resize(); topoChanged(); syncXrBtn();
 }
-window.__wsxr={XR,hands,handleHand,updateGrab,updateMarks,placeWorld,head,world,panel,drawPanel,pressButton,setTool,xrRoot,get nodes(){return nodes;},get edges(){return edges;},get faces(){return faces;},refreshAll,addNode,addEdge,lineCps,topoChanged};
+window.__wsxr={XR,hands,handleHand,updateGrab,updateMarks,placeWorld,head,world,panel,drawPanel,pressButton,setTool,xrRoot,get nodes(){return nodes;},get edges(){return edges;},get faces(){return faces;},refreshAll,addNode,addEdge,lineCps,topoChanged,brushSmooth};
 const xrBtn=$('#xrBtn'); let xrName='MR';
 function syncXrBtn(){ xrBtn.textContent = XR.session ? 'Exit '+xrName : 'Enter '+xrName; }
 xrBtn.addEventListener('click', enterXR);
