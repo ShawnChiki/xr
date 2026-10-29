@@ -62,9 +62,11 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 // ================= storage =================
 const KEY = 'partylines.v2';
 const COLORS = [0xff6b3d, 0x2fb3a5, 0xff5fa2, 0xf2c230, 0x4f8cff, 0x6fd16a, 0xa87bff, 0xe8463b];
-const DEFAULT_FIT = { d: 0.115, z: 0.01 };   // board: 11.5 cm out along your fingers
-let store = { lines: [], strokes: [], fit: { left: { ...DEFAULT_FIT }, right: { ...DEFAULT_FIT } } };
+// board placement relative to the controller grip: 11.5 cm out along your fingers, deck across the two fingertips
+const DEFAULT_FIT = () => ({ p: [0, -0.128, 0.01], q: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2).toArray() });
+let store = { lines: [], strokes: [], fit: {} };
 try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.lines) store = Object.assign(store, s); } catch (e) {}
+for (const h of ['left', 'right']) if (!store.fit[h] || !store.fit[h].p) store.fit[h] = DEFAULT_FIT();
 let saveTimer = 0;
 function save(){ clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) {} }, 300); }
 const r4 = v => Math.round(v * 10000) / 10000;
@@ -85,21 +87,65 @@ scene.add(new THREE.HemisphereLight(0xfff4e0, 0x30343c, 1.6));
 const sun = new THREE.DirectionalLight(0xffffff, 1.3); sun.position.set(1, 3, 1); scene.add(sun);
 const room = new THREE.Group(); room.add(new THREE.GridHelper(6, 24, 0x3a3f49, 0x262a31)); scene.add(room);
 
-// ================= fingerboard =================
-const wheelGeo = new THREE.CylinderGeometry(0.0045, 0.0045, 0.005, 14); wheelGeo.rotateX(Math.PI / 2);
-const wheelMat = new THREE.MeshStandardMaterial({ color: 0xf4f0e8, roughness: .5 });
-const gripMat = new THREE.MeshStandardMaterial({ color: 0x1b1b1b, roughness: 1 });
-function makeBoard(color, opacity = 1){
-  // origin = where the wheels touch; deck runs along local X (96 x 28 mm)
+// ================= fingerboard (96 x 28 mm, kicked nose and tail) =================
+function roundedRect(hw, hd, r){
+  // long edges get extra points so the kicks bend smoothly
+  const s = new THREE.Shape(), N = 16, x0 = -hw + r, x1 = hw - r;
+  s.moveTo(x0, -hd);
+  for (let i = 1; i <= N; i++) s.lineTo(x0 + (x1 - x0) * i / N, -hd);
+  s.quadraticCurveTo(hw, -hd, hw, -hd + r); s.lineTo(hw, hd - r); s.quadraticCurveTo(hw, hd, x1, hd);
+  for (let i = 1; i <= N; i++) s.lineTo(x1 - (x1 - x0) * i / N, hd);
+  s.quadraticCurveTo(-hw, hd, -hw, hd - r); s.lineTo(-hw, -hd + r); s.quadraticCurveTo(-hw, -hd, x0, -hd);
+  return s;
+}
+const KICK_START = 0.031, KICK_SLOPE = 0.36;
+function kick(geo){ // bend the ends up past the trucks, plus a hint of concave across the width
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++){
+    const x = p.getX(i), z = p.getZ(i), ax = Math.abs(x);
+    let y = p.getY(i) + (ax > KICK_START ? (ax - KICK_START) * KICK_SLOPE : 0) + z * z * 1.4;
+    p.setY(i, y);
+  }
+  geo.computeVertexNormals(); return geo;
+}
+function deckGeo(hw, hd, r, depth, y, bevel){
+  const g = new THREE.ExtrudeGeometry(roundedRect(hw, hd, r), {
+    depth, curveSegments: 12, steps: 1,
+    bevelEnabled: bevel, bevelThickness: 0.0003, bevelSize: 0.0003, bevelSegments: 2 });
+  g.rotateX(-Math.PI / 2); g.translate(0, y, 0);
+  // subdivide-free bend still reads fine because the rounded ends carry many vertices
+  return kick(g);
+}
+const DECK_GEO = deckGeo(0.048, 0.014, 0.012, 0.0014, 0.0098, true);
+const TAPE_GEO = deckGeo(0.0475, 0.0135, 0.0115, 0.0002, 0.0115, false);
+const metal = new THREE.MeshStandardMaterial({ color: 0xc9ccd2, metalness: .8, roughness: .35 });
+const tapeMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 1 });
+const plyMat = new THREE.MeshStandardMaterial({ color: 0xe2c494, roughness: .8 });
+const wheelMat = new THREE.MeshStandardMaterial({ color: 0xf6f2ea, roughness: .45 });
+const WHEEL_GEO = new THREE.CylinderGeometry(0.0045, 0.0045, 0.0042, 20); WHEEL_GEO.rotateX(Math.PI / 2);
+const BEARING_GEO = new THREE.CylinderGeometry(0.0018, 0.0018, 0.0045, 12); BEARING_GEO.rotateX(Math.PI / 2);
+const BASE_GEO = new THREE.BoxGeometry(0.010, 0.0012, 0.012);
+const HANGER_GEO = new THREE.CylinderGeometry(0.0022, 0.0028, 0.020, 12); HANGER_GEO.rotateX(Math.PI / 2);
+const KING_GEO = new THREE.CylinderGeometry(0.0016, 0.0016, 0.004, 10);
+const SHARED = new Set([DECK_GEO, TAPE_GEO, WHEEL_GEO, BEARING_GEO, BASE_GEO, HANGER_GEO, KING_GEO]);
+function makeBoard(color){
+  // origin = where the wheels touch; deck runs along local X
   const g = new THREE.Group();
-  const deckMat = new THREE.MeshStandardMaterial({ color, roughness: .6, transparent: opacity < 1, opacity });
-  const deck = new THREE.Mesh(new THREE.BoxGeometry(0.096, 0.003, 0.028), deckMat); deck.position.y = 0.011; g.add(deck);
-  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.094, 0.0006, 0.026), gripMat); grip.position.y = 0.0128; g.add(grip);
-  for (const x of [-0.032, 0.032]) for (const z of [-0.011, 0.011]) {
-    const w = new THREE.Mesh(wheelGeo, wheelMat); w.position.set(x, 0.0045, z); g.add(w);
+  const graphic = new THREE.MeshStandardMaterial({ color, roughness: .55 });
+  g.add(new THREE.Mesh(DECK_GEO, [graphic, plyMat]));          // caps get the graphic color, edges show ply
+  g.add(new THREE.Mesh(TAPE_GEO, tapeMat));
+  for (const x of [-0.029, 0.029]){
+    const base = new THREE.Mesh(BASE_GEO, metal); base.position.set(x, 0.0092, 0); g.add(base);
+    const king = new THREE.Mesh(KING_GEO, metal); king.position.set(x, 0.0072, 0); g.add(king);
+    const hanger = new THREE.Mesh(HANGER_GEO, metal); hanger.position.set(x, 0.0050, 0); g.add(hanger);
+    for (const z of [-0.0125, 0.0125]){
+      const w = new THREE.Mesh(WHEEL_GEO, wheelMat); w.position.set(x, 0.0045, z); g.add(w);
+      const b = new THREE.Mesh(BEARING_GEO, metal); b.position.set(x, 0.0045, z); g.add(b);
+    }
   }
   return g;
 }
+function disposeTree(obj){ obj.traverse(o => { if (o.geometry && !SHARED.has(o.geometry) && o.geometry !== dotGeo) o.geometry.dispose(); }); }
 
 // ================= bank of recorded lines =================
 // a line = samples [t, px,py,pz, qx,qy,qz,qw] in world space + a placement (group transform)
@@ -112,33 +158,35 @@ function buildLine(data){
   group.position.fromArray(data.p || [0, 0, 0]); group.quaternion.fromArray(data.q || [0, 0, 0, 1]);
   const pts = [];
   for (let i = 0; i < n; i++) pts.push(new THREE.Vector3(s[i*8+1], s[i*8+2], s[i*8+3]));
-  // trail tube
   const trailPts = pts.filter((p, i) => i % 2 === 0 || i === n - 1);
   if (trailPts.length >= 2){
-    const curve = new THREE.CatmullRomCurve3(trailPts);
-    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, Math.min(900, trailPts.length * 3), 0.0018, 6, false),
+    const tube = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(trailPts), Math.min(900, trailPts.length * 3), 0.0018, 6, false),
       new THREE.MeshStandardMaterial({ color, roughness: .5 }));
     group.add(tube);
   }
   // timing dots every 0.1 s (spread out = fast, bunched = slow)
   const dotsAt = []; let next = 0;
   for (let i = 0; i < n; i++) if (s[i*8] >= next){ dotsAt.push(pts[i]); next += 0.1; }
-  const dots = new THREE.InstancedMesh(dotGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: color, emissiveIntensity: .4 }), dotsAt.length);
+  const dots = new THREE.InstancedMesh(dotGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: color, emissiveIntensity: .4 }), Math.max(1, dotsAt.length));
   const m = new THREE.Matrix4();
   dotsAt.forEach((p, i) => dots.setMatrixAt(i, m.makeTranslation(p.x, p.y, p.z)));
-  group.add(dots);
-  // ghost board that replays the run with its real timing
+  dots.count = dotsAt.length; group.add(dots);
   const ghost = makeBoard(color); group.add(ghost);
   scene.add(group);
   const obj = { data, group, pts, ghost, dur: s[(n - 1) * 8], cursor: 0, t0: performance.now() / 1000 };
   lineObjs.push(obj);
   return obj;
 }
-function removeLine(obj){
-  scene.remove(obj.group);
-  obj.group.traverse(o => { if (o.geometry && o.geometry !== dotGeo && o.geometry !== wheelGeo) o.geometry.dispose(); });
-  lineObjs.splice(lineObjs.indexOf(obj), 1);
-  store.lines.splice(store.lines.indexOf(obj.data), 1);
+const objOf = data => lineObjs.find(o => o.data === data);
+function showLine(data){ if (!store.lines.includes(data)) store.lines.push(data); buildLine(data); save(); }
+function hideLine(data){
+  const o = objOf(data); if (o){ scene.remove(o.group); disposeTree(o.group); lineObjs.splice(lineObjs.indexOf(o), 1); }
+  const i = store.lines.indexOf(data); if (i >= 0) store.lines.splice(i, 1);
+  save();
+}
+function placeLine(data, p, q){
+  data.p = p; data.q = q; const o = objOf(data);
+  if (o){ o.group.position.fromArray(p); o.group.quaternion.fromArray(q); }
   save();
 }
 const _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion();
@@ -160,20 +208,34 @@ function syncReplay(){ const now = performance.now() / 1000; lineObjs.forEach(o 
 // ================= sketch strokes =================
 const strokeObjs = [];
 const strokeMat = new THREE.MeshStandardMaterial({ color: 0xe9e4d8, roughness: .7, emissive: 0x222018 });
-function buildStroke(arr){
+function showStroke(arr){
+  if (!store.strokes.includes(arr)) store.strokes.push(arr);
   const pts = []; for (let i = 0; i < arr.length; i += 3) pts.push(new THREE.Vector3(arr[i], arr[i+1], arr[i+2]));
-  if (pts.length < 2) return null;
-  const mesh = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), Math.min(600, pts.length * 3), 0.0022, 6, false), strokeMat);
-  scene.add(mesh); strokeObjs.push({ arr, mesh }); return mesh;
+  if (pts.length >= 2){
+    const mesh = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), Math.min(600, pts.length * 3), 0.0022, 6, false), strokeMat);
+    scene.add(mesh); strokeObjs.push({ arr, mesh });
+  }
+  save();
 }
-function undoStroke(){
-  const o = strokeObjs.pop(); if (!o) return;
-  scene.remove(o.mesh); o.mesh.geometry.dispose();
-  store.strokes.splice(store.strokes.indexOf(o.arr), 1); save();
+function hideStroke(arr){
+  const o = strokeObjs.find(s => s.arr === arr);
+  if (o){ scene.remove(o.mesh); o.mesh.geometry.dispose(); strokeObjs.splice(strokeObjs.indexOf(o), 1); }
+  const i = store.strokes.indexOf(arr); if (i >= 0) store.strokes.splice(i, 1);
+  save();
 }
 
 store.lines.forEach(buildLine);
-store.strokes.forEach(buildStroke);
+[...store.strokes].forEach(showStroke);
+
+// ================= undo / redo (covers lines, sketches, moves, deletes) =================
+const undoStack = [], redoStack = [];
+function act(a){ a.redo(); undoStack.push(a); redoStack.length = 0; }
+function undo(){ const a = undoStack.pop(); if (a){ a.undo(); redoStack.push(a); } }
+function redo(){ const a = redoStack.pop(); if (a){ a.redo(); undoStack.push(a); } }
+const addLineAct = d => ({ redo: () => showLine(d), undo: () => hideLine(d) });
+const delLineAct = d => ({ redo: () => hideLine(d), undo: () => showLine(d) });
+const addStrokeAct = a => ({ redo: () => showStroke(a), undo: () => hideStroke(a) });
+const moveAct = (d, from, to) => ({ redo: () => placeLine(d, to.p, to.q), undo: () => placeLine(d, from.p, from.q) });
 
 // live preview line used while recording or sketching
 function makeLive(color){
@@ -196,12 +258,12 @@ const hudTex = new THREE.CanvasTexture(hudCanvas); hudTex.colorSpace = THREE.SRG
 const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.065), new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false }));
 hud.renderOrder = 10; hud.visible = false; scene.add(hud);
 let hudKey = '';
-function drawHud(title, lines, recColor){
-  const key = title + lines.join('|') + recColor; if (key === hudKey) return; hudKey = key;
+function drawHud(title, lines, color){
+  const key = title + lines.join('|') + color; if (key === hudKey) return; hudKey = key;
   const c = hudCtx; c.clearRect(0, 0, 640, 260);
   c.fillStyle = 'rgba(22,24,29,0.88)'; c.beginPath(); c.roundRect(0, 0, 640, 260, 28); c.fill();
-  c.fillStyle = recColor || '#f1ece2'; c.font = '800 54px "Bricolage Grotesque", Arial Black, sans-serif'; c.fillText(title, 32, 72);
-  c.fillStyle = '#c9c1b4'; c.font = '500 30px "IBM Plex Sans", Arial, sans-serif';
+  c.fillStyle = color || '#f1ece2'; c.font = '800 54px "Bricolage Grotesque", Arial Black, sans-serif'; c.fillText(title, 32, 72);
+  c.fillStyle = '#c9c1b4'; c.font = '500 28px "IBM Plex Sans", Arial, sans-serif';
   lines.forEach((l, i) => c.fillText(l, 32, 128 + i * 42));
   hudTex.needsUpdate = true;
 }
@@ -212,20 +274,17 @@ const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _m = new THREE.Matrix4
 const inputs = [0, 1].map(i => {
   const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
   scene.add(ray, grip);
-  // board held under your fingertips: fingers run along grip -Y, the two tips sit side by side along grip Z
-  const holder = new THREE.Group(); grip.add(holder);
-  const board = makeBoard(0xe9cfa3); board.position.y = -0.013; board.rotation.y = -Math.PI / 2; holder.add(board);
+  const board = makeBoard(0xe9cfa3); grip.add(board);   // locked to the controller
   const pen = new THREE.Mesh(new THREE.SphereGeometry(0.005, 12, 8), new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x444444 }));
   ray.add(pen);
-  const nub = new THREE.Mesh(new THREE.SphereGeometry(0.008, 12, 8), new THREE.MeshStandardMaterial({ color: 0x8a8378 }));
-  grip.add(nub);
-  const st = { ray, grip, holder, board, pen, source: null, hand: '', prev: [], rec: null, live: makeLive(0xff3b3b), sketch: null, liveSketch: makeLive(0xe9e4d8), held: null };
+  const st = { ray, grip, board, pen, source: null, hand: '', prev: [], rec: null, live: makeLive(0xff3b3b),
+    sketch: null, liveSketch: makeLive(0xe9e4d8), held: null, fitting: false, flick: 0 };
   ray.addEventListener('connected', e => { st.source = e.data; st.hand = e.data.handedness; applyFit(st); });
   ray.addEventListener('disconnected', () => { st.source = null; });
   return st;
 });
-function fitOf(st){ return store.fit[st.hand === 'left' ? 'left' : 'right']; }
-function applyFit(st){ const f = fitOf(st); st.holder.position.set(0, -f.d, f.z); }
+const fitKey = st => (st.hand === 'left' ? 'left' : 'right');
+function applyFit(st){ const f = store.fit[fitKey(st)]; st.board.position.fromArray(f.p); st.board.quaternion.fromArray(f.q); }
 
 function nearestLine(worldP, maxD){
   let best = null, bd = maxD;
@@ -240,11 +299,16 @@ let nextColor = store.lines.length ? (Math.max(...store.lines.map(l => l.c)) + 1
 function finishRecording(st){
   const rec = st.rec; st.rec = null; liveReset(st.live);
   if (!rec || rec.s.length < 8 * 6 || rec.s[rec.s.length - 8] < 0.3) return;
-  const data = { c: nextColor++, s: rec.s.map(r4), p: [0, 0, 0], q: [0, 0, 0, 1] };
-  store.lines.push(data); buildLine(data); save();
+  act(addLineAct({ c: nextColor++, s: rec.s.map(r4), p: [0, 0, 0], q: [0, 0, 0, 1] }));
+}
+function endFit(st){
+  if (!st.fitting) return; st.fitting = false;
+  st.grip.attach(st.board);                         // keeps where it is now, relative to your hand
+  store.fit[fitKey(st)] = { p: st.board.position.toArray().map(r4), q: st.board.quaternion.toArray().map(r4) };
+  save();
 }
 
-function updateInputs(dt, now){
+function updateInputs(now){
   for (const st of inputs){
     const gp = st.source && st.source.gamepad;
     st.board.visible = !!gp && mode === 'record';
@@ -252,14 +316,22 @@ function updateInputs(dt, now){
     if (!gp) continue;
     const pressed = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
     const down = i => pressed(i) && !st.prev[i], up = i => !pressed(i) && st.prev[i];
-    const ax = gp.axes[2] || 0, ay = gp.axes[3] || 0;
+
+    // stick flick: right = redo, left = undo (both modes)
+    const ax = gp.axes[2] || 0;
+    if (st.flick === 0 && ax > 0.7){ st.flick = 1; redo(); }
+    else if (st.flick === 0 && ax < -0.7){ st.flick = -1; undo(); }
+    else if (Math.abs(ax) < 0.3) st.flick = 0;
 
     if (down(3)){                                    // click thumbstick: switch mode
-      inputs.forEach(o => { if (o.rec) finishRecording(o); o.held = null; });
+      inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); o.held = null; });
       mode = mode === 'record' ? 'compose' : 'record';
     }
     else if (mode === 'record'){
-      if (down(4)) st.rec = { s: [], t0: now, last: -1 };
+      // grip: pin the board in the air, set your fingertips on it, let go to lock it to the controller
+      if (down(1) && !st.rec){ st.fitting = true; scene.attach(st.board); }
+      if (up(1)) endFit(st);
+      if (down(4) && !st.fitting) st.rec = { s: [], t0: now, last: -1 };
       if (st.rec && pressed(4)){
         const t = now - st.rec.t0;
         if (t - st.rec.last >= 1 / 40){
@@ -268,30 +340,34 @@ function updateInputs(dt, now){
           st.live.visible = true; livePush(st.live, _a);
         }
       }
-      if (up(4)) finishRecording(st);
-      if (down(5) && !st.rec && lineObjs.length) removeLine(lineObjs[lineObjs.length - 1]);   // undo last line
-      if (!st.rec && (Math.abs(ax) > 0.25 || Math.abs(ay) > 0.25)){                          // fit board to fingertips
-        const f = fitOf(st);
-        f.d = THREE.MathUtils.clamp(f.d - ay * dt * 0.06, 0.04, 0.22);
-        f.z = THREE.MathUtils.clamp(f.z + ax * dt * 0.06, -0.1, 0.1);
-        applyFit(st); save();
-      }
+      if (up(4) && st.rec) finishRecording(st);
+      if (down(5) && !st.rec) undo();
     }
     else { // compose
+      let usedB = false;
       if (down(1)){
         st.grip.getWorldPosition(_a);
         const o = nearestLine(_a, 0.06);
-        if (o){ o.group.updateMatrixWorld(); st.held = { o, offset: new THREE.Matrix4().copy(st.grip.matrixWorld).invert().multiply(o.group.matrixWorld) }; }
+        if (o){
+          o.group.updateMatrixWorld();
+          st.held = { o, from: { p: o.data.p.slice(), q: o.data.q.slice() },
+            offset: new THREE.Matrix4().copy(st.grip.matrixWorld).invert().multiply(o.group.matrixWorld) };
+        }
       }
       if (st.held && pressed(1)){
         _m.multiplyMatrices(st.grip.matrixWorld, st.held.offset);
         _m.decompose(st.held.o.group.position, st.held.o.group.quaternion, _s);
-        if (down(5)){ removeLine(st.held.o); st.held = null; }
+        if (down(5)){                                 // delete the line you're holding
+          const h = st.held; st.held = null; usedB = true;
+          placeLine(h.o.data, h.from.p, h.from.q);
+          act(delLineAct(h.o.data));
+        }
       }
       if (up(1) && st.held){
-        const g = st.held.o.group; st.held.o.data.p = g.position.toArray().map(r4); st.held.o.data.q = g.quaternion.toArray().map(r4);
-        st.held = null; save();
+        const h = st.held, g = h.o.group; st.held = null;
+        act(moveAct(h.o.data, h.from, { p: g.position.toArray().map(r4), q: g.quaternion.toArray().map(r4) }));
       }
+      if (down(5) && !usedB && !st.held) undo();
       if (down(0)) st.sketch = [];
       if (st.sketch && pressed(0)){
         st.pen.getWorldPosition(_a);
@@ -301,10 +377,9 @@ function updateInputs(dt, now){
         }
       }
       if (up(0) && st.sketch){
-        if (st.sketch.length >= 6){ store.strokes.push(st.sketch); buildStroke(st.sketch); save(); }
-        st.sketch = null; liveReset(st.liveSketch);
+        const arr = st.sketch; st.sketch = null; liveReset(st.liveSketch);
+        if (arr.length >= 6) act(addStrokeAct(arr));
       }
-      if (down(5) && !st.held) undoStroke();
       if (down(4)) syncReplay();
     }
     st.prev = gp.buttons.map(b => b.pressed);
@@ -316,10 +391,11 @@ function updateInputs(dt, now){
   if (host){
     host.grip.getWorldPosition(hud.position); hud.position.y += 0.1;
     hud.lookAt(renderer.xr.getCamera().getWorldPosition(_b));
-    const rec = inputs.find(s => s.rec);
+    const rec = inputs.find(s => s.rec), fit = inputs.find(s => s.fitting);
     if (rec) drawHud('● REC ' + (now - rec.rec.t0).toFixed(1) + ' s', ['Let go of A / X to save this line'], '#ff5a4a');
-    else if (mode === 'record') drawHud('Record', ['Hold A / X: record a line', 'B / Y: undo  ·  Stick: fit board', 'Click stick: Compose'], '');
-    else drawHud('Compose', ['Grip: move a line  ·  Trigger: sketch', 'B / Y: undo sketch (or delete held line)', 'A / X: replay together  ·  Click stick: Record'], '');
+    else if (fit) drawHud('Fit board', ['Put your two fingertips on the board', 'Let go of grip to lock it to your hand'], '#e9cfa3');
+    else if (mode === 'record') drawHud('Record', ['Hold A / X: record a line', 'Grip: pin board, place fingers, let go', 'B / Y undo  ·  Stick ← undo  → redo'], '');
+    else drawHud('Compose', ['Grip: move a line  ·  Trigger: sketch', 'A / X: replay together', 'B / Y undo  ·  Stick ← undo  → redo'], '');
   }
 }
 
@@ -330,7 +406,8 @@ let clearArmed = false;
 clearBtn.onclick = () => {
   if (!clearArmed){ clearArmed = true; clearBtn.textContent = 'Tap again to clear'; clearBtn.className = 'warn';
     setTimeout(() => { clearArmed = false; clearBtn.textContent = 'Clear all'; clearBtn.className = 'ghost'; }, 3000); return; }
-  [...lineObjs].forEach(removeLine); while (strokeObjs.length) undoStroke();
+  [...store.lines].forEach(hideLine); [...store.strokes].forEach(hideStroke);
+  undoStack.length = 0; redoStack.length = 0;
   clearArmed = false; clearBtn.textContent = 'Clear all'; clearBtn.className = 'ghost'; save();
 };
 document.getElementById('save').onclick = () => {
@@ -363,7 +440,7 @@ async function start(kind){
   const btn = kind === 'immersive-ar' ? mrBtn : vrBtn; btn.disabled = false; btn.textContent = 'Exit';
   session.addEventListener('end', () => {
     scene.background = BG; room.visible = true; hud.visible = false;
-    inputs.forEach(s => { if (s.rec) finishRecording(s); s.held = null; s.sketch = null; liveReset(s.liveSketch); });
+    inputs.forEach(s => { if (s.rec) finishRecording(s); endFit(s); s.held = null; s.sketch = null; liveReset(s.liveSketch); });
     vrBtn.textContent = 'Enter VR'; mrBtn.textContent = 'Enter MR'; setupButtons();
   });
 }
@@ -383,10 +460,9 @@ setupButtons();
 })();
 
 // ================= loop =================
-const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
-  const dt = Math.min(clock.getDelta(), 0.05), now = performance.now() / 1000;
-  if (renderer.xr.isPresenting) updateInputs(dt, now);
+  const now = performance.now() / 1000;
+  if (renderer.xr.isPresenting) updateInputs(now);
   lineObjs.forEach(o => animateGhost(o, now));
   renderer.render(scene, camera);
 });
