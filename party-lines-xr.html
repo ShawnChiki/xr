@@ -72,7 +72,9 @@ if (store.fitVersion !== 3){ store.fit = {}; store.fitVersion = 3; }      // sta
 for (const h of ['left', 'right']) if (!store.fit[h] || !store.fit[h].p) store.fit[h] = DEFAULT_FIT();
 store.strokes = store.strokes.map(s => Array.isArray(s) ? { r: 0.0022, a: s, used: false } : s);   // older saves
 store.surfaces = store.surfaces || [];
-store.view = Object.assign({ trails: true, ghosts: true, nets: true, sketches: true }, store.view);
+store.tool = store.tool || 'sketch';
+store.view = Object.assign({ paths: true, trails: false, boards: true, hands: true, sketches: true, nets: true, labels: true }, store.view);
+delete store.view.ghosts;
 let saveTimer = 0;
 function save(){ clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) {} }, 300); }
 const r4 = v => Math.round(v * 10000) / 10000;
@@ -148,6 +150,24 @@ function makeBoard(color){
       const b = new THREE.Mesh(BEARING_GEO, metal); b.position.set(x, 0.0045, z); g.add(b);
     }
   }
+  return g;
+}
+// a little hand riding the board: index and middle fingers planted on the deck, the rest curled into the palm
+const PALM_GEO = new THREE.SphereGeometry(1, 16, 12);
+SHARED.add(PALM_GEO);
+function makeHand(color){
+  const g = new THREE.Group(), mat = new THREE.MeshStandardMaterial({ color, roughness: .55 });
+  const v = (x, y, z) => new THREE.Vector3(x, y, z), up = v(0, 1, 0);
+  const seg = (a, b, r) => {
+    const len = a.distanceTo(b), m2 = new THREE.Mesh(new THREE.CapsuleGeometry(r, len, 4, 8), mat);
+    m2.position.copy(a).lerp(b, .5); m2.quaternion.setFromUnitVectors(up, b.clone().sub(a).normalize()); g.add(m2);
+  };
+  const midI = v(0.021, 0.04, 0.004), midM = v(-0.021, 0.04, 0.004);
+  seg(v(0.025, 0.017, 0), midI, 0.0042); seg(midI, v(0.012, 0.066, 0.008), 0.0046);       // index on the nose bolts
+  seg(v(-0.027, 0.017, 0), midM, 0.0042); seg(midM, v(-0.010, 0.066, 0.008), 0.0046);     // middle on the tail
+  const palm = new THREE.Mesh(PALM_GEO, mat); palm.scale.set(0.03, 0.02, 0.024); palm.position.set(0, 0.08, 0.012); g.add(palm);
+  seg(v(0.012, 0.068, 0.03), v(-0.014, 0.068, 0.03), 0.0065);                               // curled ring + pinky
+  seg(v(0.016, 0.082, -0.008), v(0.03, 0.07, -0.022), 0.005);                                // thumb
   return g;
 }
 function disposeTree(obj){ obj.traverse(o => { if (o.geometry && !SHARED.has(o.geometry)) o.geometry.dispose(); }); }
@@ -253,7 +273,7 @@ function buildLine(data){
   if (trailPts.length >= 2){
     const tube = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(trailPts), Math.min(900, trailPts.length * 3), 0.0018, 6, false),
       new THREE.MeshStandardMaterial({ color, roughness: .5 }));
-    tube.userData.trail = true; group.add(tube);
+    tube.userData.view = 'paths'; group.add(tube);
   }
   // timing dots every 0.1 s (spread out = fast, bunched = slow)
   const dotsAt = []; let next = 0;
@@ -261,8 +281,16 @@ function buildLine(data){
   const dots = new THREE.InstancedMesh(dotGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: color, emissiveIntensity: .4 }), Math.max(1, dotsAt.length));
   const m = new THREE.Matrix4();
   dotsAt.forEach((p, i) => dots.setMatrixAt(i, m.makeTranslation(p.x, p.y, p.z)));
-  dots.count = dotsAt.length; dots.userData.trail = true; group.add(dots);
+  dots.count = dotsAt.length; dots.userData.view = 'paths'; group.add(dots);
+  // trails: see-through boards hanging in the air along the run
+  const trailAt = []; next = 0;
+  for (let i = 0; i < n; i++) if (s[i*8] >= next){ trailAt.push(i); next += 0.12; }
+  const trails = new THREE.InstancedMesh(DECK_GEO, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .2, depthWrite: false }), Math.max(1, trailAt.length));
+  const tq = new THREE.Quaternion(), one = new THREE.Vector3(1, 1, 1);
+  trailAt.forEach((i, k) => { tq.set(s[i*8+4], s[i*8+5], s[i*8+6], s[i*8+7]); trails.setMatrixAt(k, m.compose(pts[i], tq, one)); });
+  trails.count = trailAt.length; trails.userData.view = 'trails'; group.add(trails);
   const ghost = makeBoard(color); group.add(ghost);
+  const hand = makeHand(color); hand.userData.view = 'hands'; ghost.add(hand);
   scene.add(group);
   const obj = { data, group, pts, ghost, dur: s[(n - 1) * 8], cursor: 0, t0: performance.now() / 1000 };
   lineObjs.push(obj);
@@ -284,7 +312,7 @@ const _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion();
 function animateGhost(obj, now){
   const s = obj.data.s, n = s.length / 8, PAUSE = 0.8;
   const t = (now - obj.t0) % (obj.dur + PAUSE);
-  if (t > obj.dur || !store.view.ghosts){ obj.ghost.visible = false; return; }
+  if (t > obj.dur || !store.view.boards){ obj.ghost.visible = false; return; }
   obj.ghost.visible = true;
   if (s[obj.cursor * 8] > t) obj.cursor = 0;
   while (obj.cursor < n - 2 && s[(obj.cursor + 1) * 8] <= t) obj.cursor++;
@@ -384,9 +412,272 @@ function hideSurface(data){
 function setCP(data, cp){ data.cp = cp.slice(); const o = surfOf(data); if (o) refreshSurface(o); save(); }
 function showNets(on){ surfObjs.forEach(o => { o.net.visible = on; o.handles.forEach(h => h.visible = on); }); }
 
+// ================= edge cage: sketched edges, patches fill every 3- or 4-sided loop =================
+// nodes are shared corners; each edge is a curve between two nodes. Patches are Coons patches built straight from
+// their boundary edges, so neighbouring patches meet with a crisp crease along the edge you drew.
+if (!store.cage || !store.cage.nodes) store.cage = { nodes: [], edges: [], guides: [] };
+store.cage.guides = store.cage.guides || [];
+const cageGroup = new THREE.Group(); scene.add(cageGroup);
+const EDGE_COLOR = 0x35c2b0;
+const edgeMatC = new THREE.MeshStandardMaterial({ color: EDGE_COLOR, roughness: .4 });
+const nodeMatC = new THREE.MeshStandardMaterial({ color: EDGE_COLOR, roughness: .3 });
+const nodeHotC = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: EDGE_COLOR, emissiveIntensity: .7 });
+const nodeGeo = new THREE.SphereGeometry(0.007, 12, 8); SHARED.add(nodeGeo);
+const SNAP = 0.03, PATCH_RES = 20;
+const guideMatC = new THREE.MeshStandardMaterial({ color: 0xb79bff, roughness: .4 });
+let nodeMeshes = [];
+const cloneCage = () => JSON.parse(JSON.stringify(store.cage));
+const nodeV = k => new THREE.Vector3(...store.cage.nodes[k]);
+function edgeVecs(e){ const v = []; for (let i = 0; i < e.pts.length; i += 3) v.push(new THREE.Vector3(e.pts[i], e.pts[i+1], e.pts[i+2])); return v; }
+function edgeCurve(e){
+  const v = edgeVecs(e); if (v.length === 2) v.splice(1, 0, v[0].clone().lerp(v[1], 0.5));
+  return new THREE.CatmullRomCurve3(v, false, 'centripetal');
+}
+function findFaces(){
+  const E = store.cage.edges, adj = new Map();
+  E.forEach((e, i) => { if (e.a === e.b) return;
+    for (const [x, y] of [[e.a, e.b], [e.b, e.a]]){ if (!adj.has(x)) adj.set(x, []); adj.get(x).push({ to: y, ei: i }); } });
+  const nb = x => adj.get(x) || [], linked = (x, y) => nb(x).some(o => o.to === y);
+  const seen = new Set(), cands = [];
+  const tryAdd = (nodes, eis) => {
+    const key = [...eis].sort((p, q) => p - q).join(','); if (seen.has(key)) return; seen.add(key);
+    const n = nodes.length;                                      // skip loops cut through by another edge
+    for (let i = 0; i < n; i++) for (let j = i + 2; j < n; j++){ if (i === 0 && j === n - 1) continue; if (linked(nodes[i], nodes[j])) return; }
+    cands.push({ nodes, eis });
+  };
+  E.forEach((e, i) => {
+    if (e.a === e.b) return;
+    const path = [e.a, e.b], eis = [i];
+    const dfs = () => {
+      const last = path[path.length - 1];
+      for (const o of nb(last)){
+        if (eis.includes(o.ei)) continue;
+        if (o.to === path[0]){ if (path.length >= 3) tryAdd([...path], [...eis, o.ei]); continue; }
+        if (path.includes(o.to) || path.length >= 6) continue;
+        path.push(o.to); eis.push(o.ei); dfs(); path.pop(); eis.pop();
+      }
+    };
+    dfs();
+  });
+  // smallest loops first; an edge can border at most two patches, so a closed box doesn't grow faces through its middle
+  cands.sort((p, q) => p.nodes.length - q.nodes.length);
+  const use = new Map(), faces = [];
+  for (const f of cands){
+    if (f.eis.some(ei => (use.get(ei) || 0) >= 2)) continue;
+    f.eis.forEach(ei => use.set(ei, (use.get(ei) || 0) + 1)); faces.push(f);
+  }
+  return faces;
+}
+function sidePoints(ei, from){ const e = store.cage.edges[ei], v = edgeVecs(e); return e.a === from ? v : v.reverse(); }
+function faceSides(face){
+  // walk the loop as sides; with more than 4, join the sides that meet most smoothly (like Rhino picking 4 edges)
+  const sides = face.eis.map((ei, k) => sidePoints(ei, face.nodes[k]));
+  while (sides.length > 4){
+    let best = 0, bestA = Infinity;
+    for (let k = 0; k < sides.length; k++){
+      const A = sides[k], B = sides[(k + 1) % sides.length];
+      const t1 = A[A.length - 1].clone().sub(A[A.length - 2]).normalize(), t2 = B[1].clone().sub(B[0]).normalize();
+      const ang = t1.angleTo(t2); if (ang < bestA){ bestA = ang; best = k; }
+    }
+    const k2 = (best + 1) % sides.length, merged = sides[best].concat(sides[k2].slice(1));
+    if (k2 === 0){ sides[best] = merged; sides.shift(); } else sides.splice(best, 2, merged);
+  }
+  return sides;
+}
+function sampleSide(pts){
+  const v = pts.map(p => p.clone()); if (v.length === 2) v.splice(1, 0, v[0].clone().lerp(v[1], 0.5));
+  const c = new THREE.CatmullRomCurve3(v, false, 'centripetal');
+  return Array.from({ length: PATCH_RES + 1 }, (_, i) => c.getPointAt(i / PATCH_RES));
+}
+function coonsGeometry(face){
+  const S = faceSides(face), R = PATCH_RES, rev = a => [...a].reverse();
+  let c0, c1, d0, d1, P00, P10, P01, P11;
+  if (S.length === 4){
+    c0 = sampleSide(S[0]); d1 = sampleSide(S[1]); c1 = sampleSide(rev(S[2])); d0 = sampleSide(rev(S[3]));
+    P00 = S[0][0]; P10 = S[1][0]; P11 = S[2][0]; P01 = S[3][0];
+  } else {                                                       // triangle: one side shrinks to a point
+    c0 = sampleSide(S[0]); d1 = sampleSide(S[1]); c1 = sampleSide(rev(S[2]));
+    P00 = S[0][0]; P10 = S[1][0]; P11 = S[2][0]; P01 = P00; d0 = Array.from({ length: R + 1 }, () => P00);
+  }
+  const pos = new Float32Array((R + 1) * (R + 1) * 3), p = new THREE.Vector3();
+  for (let i = 0; i <= R; i++) for (let j = 0; j <= R; j++){
+    const u = i / R, v = j / R;
+    p.set(0, 0, 0)
+      .addScaledVector(c0[i], 1 - v).addScaledVector(c1[i], v).addScaledVector(d0[j], 1 - u).addScaledVector(d1[j], u)
+      .addScaledVector(P00, -(1 - u) * (1 - v)).addScaledVector(P10, -u * (1 - v)).addScaledVector(P01, -(1 - u) * v).addScaledVector(P11, -u * v);
+    pos.set([p.x, p.y, p.z], (i * (R + 1) + j) * 3);
+  }
+  applyGuides(pos, R);
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const idx = []; for (let i = 0; i < R; i++) for (let j = 0; j < R; j++){ const q = i * (R + 1) + j; idx.push(q, q + R + 1, q + 1, q + 1, q + R + 1, q + R + 2); }
+  geo.setIndex(idx); geo.computeVertexNormals(); return geo;
+}
+function rebuildCage(){
+  disposeTree(cageGroup); cageGroup.clear(); nodeMeshes = [];
+  for (const e of store.cage.edges){
+    const n = e.pts.length / 3;
+    cageGroup.add(new THREE.Mesh(new THREE.TubeGeometry(edgeCurve(e), Math.max(8, n * 2), 0.0025, 6, false), edgeMatC));
+  }
+  for (const g of store.cage.guides){
+    const v = []; for (let i = 0; i < g.length; i += 3) v.push(new THREE.Vector3(g[i], g[i+1], g[i+2]));
+    if (v.length >= 2) cageGroup.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(v), Math.max(8, v.length * 2), 0.0018, 6, false), guideMatC));
+  }
+  store.cage.nodes.forEach(n => { const m = new THREE.Mesh(nodeGeo, nodeMatC); m.position.set(...n); cageGroup.add(m); nodeMeshes.push(m); });
+  for (const f of findFaces()) cageGroup.add(new THREE.Mesh(coonsGeometry(f), surfMat));
+}
+function setCage(c){ store.cage = JSON.parse(JSON.stringify(c)); rebuildCage(); save(); }
+const cageAct = (before, after) => ({ redo: () => setCage(after), undo: () => setCage(before) });
+
+function nearestNode(p, max = SNAP){
+  let best = -1, bd = max;
+  store.cage.nodes.forEach((n, i) => { const d = _c.set(...n).distanceTo(p); if (d < bd){ bd = d; best = i; } });
+  return best;
+}
+function nearestEdgePoint(p, max = 0.025){
+  let best = null, bd = max;
+  store.cage.edges.forEach((e, ei) => { const n = e.pts.length / 3;
+    for (let i = 1; i < n - 1; i++){ const d = _c.set(e.pts[i*3], e.pts[i*3+1], e.pts[i*3+2]).distanceTo(p); if (d < bd){ bd = d; best = { ei, i }; } } });
+  return best;
+}
+const _c = new THREE.Vector3();
+function snapTo(p){ // join an existing corner, split an edge you landed on, or start a new corner
+  const C = store.cage; let k = nearestNode(p); if (k >= 0) return k;
+  const ep = nearestEdgePoint(p);
+  if (ep){
+    const e = C.edges[ep.ei];
+    C.nodes.push([e.pts[ep.i*3], e.pts[ep.i*3+1], e.pts[ep.i*3+2]]); k = C.nodes.length - 1;
+    C.edges.splice(ep.ei, 1, { a: e.a, b: k, pts: e.pts.slice(0, (ep.i + 1) * 3) }, { a: k, b: e.b, pts: e.pts.slice(ep.i * 3) });
+    return k;
+  }
+  C.nodes.push([r4(p.x), r4(p.y), r4(p.z)]); return C.nodes.length - 1;
+}
+function resample(pts, step){
+  const out = [pts[0].clone()]; let carry = 0;
+  for (let i = 1; i < pts.length; i++){
+    const a = pts[i - 1], b = pts[i], L = a.distanceTo(b); let t = step - carry;
+    while (t <= L){ out.push(a.clone().lerp(b, t / L)); t += step; }
+    carry = L - (t - step);
+  }
+  if (out[out.length - 1].distanceTo(pts[pts.length - 1]) > step * 0.3) out.push(pts[pts.length - 1].clone());
+  else out[out.length - 1] = pts[pts.length - 1].clone();
+  return out;
+}
+const flat = vs => vs.flatMap(v => [r4(v.x), r4(v.y), r4(v.z)]);
+function addEdgeStroke(arr){
+  let pts = []; for (let i = 0; i < arr.length; i += 3) pts.push(new THREE.Vector3(arr[i], arr[i+1], arr[i+2]));
+  if (pts.length < 2) return;
+  pts = resample(pts, 0.01);
+  let len = 0; for (let i = 1; i < pts.length; i++) len += pts[i].distanceTo(pts[i - 1]);
+  if (len < 0.03 || pts.length < 3) return;
+  const before = cloneCage(), C = store.cage;
+  if (pts[0].distanceTo(pts[pts.length - 1]) < 0.035 && len > 0.16){
+    // a closed loop becomes four edges with corners at quarter lengths, so it fills right away
+    pts[pts.length - 1] = pts[0].clone();
+    const cum = [0]; for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + pts[i].distanceTo(pts[i - 1]));
+    const cut = [0, 1, 2, 3].map(q => { if (!q) return 0; let i = 0; while (cum[i] < len * q / 4) i++; return i; });
+    cut.push(pts.length - 1);
+    const corners = cut.slice(0, 4).map(i => snapTo(pts[i]));
+    corners.push(corners[0]);
+    for (let s = 0; s < 4; s++){
+      const seg = pts.slice(cut[s], cut[s + 1] + 1);
+      seg[0] = nodeV(corners[s]); seg[seg.length - 1] = nodeV(corners[s + 1]);
+      C.edges.push({ a: corners[s], b: corners[s + 1], pts: flat(seg) });
+    }
+  } else {
+    const a = snapTo(pts[0]), b = snapTo(pts[pts.length - 1]);
+    if (a === b){ setCage(before); return; }
+    pts[0] = nodeV(a); pts[pts.length - 1] = nodeV(b);
+    C.edges.push({ a, b, pts: flat(pts) });
+  }
+  act(cageAct(before, cloneCage()));
+}
+// guides: curves drawn across a patch from one side to another. The patch bends smoothly through them (no crease).
+function applyGuides(pos, R){
+  if (!store.cage.guides.length) return;
+  const N = R + 1, at = (i, j) => (i * N + j) * 3;
+  const onBorder = p => { let bd = Infinity, best = null;
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++){
+      if (i && j && i !== R && j !== R) continue;
+      const k = at(i, j), d = (pos[k] - p[0]) ** 2 + (pos[k+1] - p[1]) ** 2 + (pos[k+2] - p[2]) ** 2;
+      if (d < bd){ bd = d; best = [i, j]; } }
+    return { ij: best, d: Math.sqrt(bd) }; };
+  const fix = new Map();
+  for (const g of store.cage.guides){
+    const n = g.length / 3; if (n < 3) continue;
+    const ea = onBorder(g.slice(0, 3)), eb = onBorder(g.slice((n - 1) * 3, n * 3));
+    if (ea.d > 0.04 || eb.d > 0.04) continue;                     // this guide doesn't start and end on this patch
+    const [ia, ja] = ea.ij, [ib, jb] = eb.ij;
+    if ((ia === ib && (ia === 0 || ia === R)) || (ja === jb && (ja === 0 || ja === R))) continue;   // runs along one side
+    const cum = [0];
+    for (let q = 1; q < n; q++) cum.push(cum[q - 1] + Math.hypot(g[q*3] - g[q*3-3], g[q*3+1] - g[q*3-2], g[q*3+2] - g[q*3-1]));
+    for (let q = 1; q < n - 1; q++){
+      const f = cum[q] / cum[n - 1], i = Math.round(ia + (ib - ia) * f), j = Math.round(ja + (jb - ja) * f);
+      if (i <= 0 || j <= 0 || i >= R || j >= R) continue;
+      const k = at(i, j), key = i * N + j, r = [g[q*3] - pos[k], g[q*3+1] - pos[k+1], g[q*3+2] - pos[k+2]];
+      const e = fix.get(key); if (e){ e.s[0] += r[0]; e.s[1] += r[1]; e.s[2] += r[2]; e.n++; } else fix.set(key, { s: r, n: 1 });
+    }
+  }
+  if (!fix.size) return;
+  // relax: sides stay put, cells under a guide hold its offset, everything between settles smoothly
+  let D = new Float32Array(N * N * 3), T = new Float32Array(N * N * 3);
+  fix.forEach((e, key) => { for (let c = 0; c < 3; c++){ D[key*3+c] = T[key*3+c] = e.s[c] / e.n; } });
+  for (let it = 0; it < 400; it++){
+    for (let i = 1; i < R; i++) for (let j = 1; j < R; j++){
+      const key = i * N + j; if (fix.has(key)) continue;
+      for (let c = 0; c < 3; c++) T[key*3+c] = (D[((i-1)*N+j)*3+c] + D[((i+1)*N+j)*3+c] + D[(i*N+j-1)*3+c] + D[(i*N+j+1)*3+c]) / 4;
+    }
+    [D, T] = [T, D];
+  }
+  for (let q = 0; q < N * N * 3; q++) pos[q] += D[q];
+}
+function addGuideStroke(arr){
+  let pts = []; for (let i = 0; i < arr.length; i += 3) pts.push(new THREE.Vector3(arr[i], arr[i+1], arr[i+2]));
+  if (pts.length < 2) return;
+  pts = resample(pts, 0.01); if (pts.length < 4) return;
+  const before = cloneCage();
+  for (const end of [0, pts.length - 1]){                         // land the ends exactly on the edges they touch
+    const nk = nearestNode(pts[end]);
+    if (nk >= 0) pts[end] = nodeV(nk);
+    else { const ep = nearestEdgePoint(pts[end], 0.04); if (ep){ const e = store.cage.edges[ep.ei]; pts[end].set(e.pts[ep.i*3], e.pts[ep.i*3+1], e.pts[ep.i*3+2]); } }
+  }
+  store.cage.guides.push(flat(pts));
+  act(cageAct(before, cloneCage()));
+}
+// drag a corner: the edges that meet there bend with it, most at the corner and fading to nothing at their far ends
+function moveNode(h, target){
+  const C = store.cage, base = h.base, d = target.clone().sub(new THREE.Vector3(...base.nodes[h.k]));
+  C.nodes[h.k] = [target.x, target.y, target.z];
+  C.edges.forEach((e, ei) => {
+    const be = base.edges[ei]; if (!be || (e.a !== h.k && e.b !== h.k)) return;
+    const n = be.pts.length / 3;
+    for (let i = 0; i < n; i++){
+      const s = n > 1 ? i / (n - 1) : 0, w = (e.a === h.k ? 1 - s : 0) + (e.b === h.k ? s : 0);
+      for (let c = 0; c < 3; c++) e.pts[i*3 + c] = be.pts[i*3 + c] + d.getComponent(c) * w;
+    }
+  });
+  rebuildCage();
+}
+function deleteNode(k){
+  const C = store.cage;
+  C.edges = C.edges.filter(e => e.a !== k && e.b !== k).map(e => ({ ...e, a: e.a > k ? e.a - 1 : e.a, b: e.b > k ? e.b - 1 : e.b }));
+  C.nodes.splice(k, 1);
+}
+function rayNode(ro, rd){
+  let best = null, bs = Infinity;
+  store.cage.nodes.forEach((n, k) => {
+    _c.set(...n).sub(ro); const t = _c.dot(rd); if (t < 0.03 || t > 3) return;
+    const d = Math.sqrt(Math.max(0, _c.lengthSq() - t * t));
+    if (d < Math.max(0.012, t * 0.025) && d / t < bs){ bs = d / t; best = { kind: 'node', k, t }; }
+  });
+  return best;
+}
+const snapMarker = new THREE.Mesh(new THREE.SphereGeometry(0.012, 16, 10), new THREE.MeshBasicMaterial({ color: EDGE_COLOR, transparent: true, opacity: .45, depthTest: false }));
+snapMarker.renderOrder = 9; snapMarker.visible = false; scene.add(snapMarker);
+
 store.lines.forEach(buildLine);
 [...store.strokes].forEach(showStroke);
 store.surfaces.forEach(buildSurface);
+rebuildCage();
 
 // ================= undo / redo =================
 const undoStack = [], redoStack = [];
@@ -425,7 +716,7 @@ function livePush(line, p){
 function liveReset(line){ line.geometry.setDrawRange(0, 0); line.visible = false; }
 
 // ================= off-hand menu (point with your riding hand, pull the trigger) =================
-const MW = 1024, MH = 800;
+const MW = 1024, MH = 1000;
 const menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH;
 const menuCtx = menuCanvas.getContext('2d');
 const menuTex = new THREE.CanvasTexture(menuCanvas); menuTex.colorSpace = THREE.SRGBColorSpace;
@@ -437,17 +728,49 @@ laser.renderOrder = 11; laser.frustumCulled = false; laser.visible = false; scen
 const raycaster = new THREE.Raycaster();
 let flash = { text: '', until: 0 }, menuKey = '', buttons = [];
 
+// small card above the riding controller that says what its buttons do right now
+const LW = 640, LH = 260;
+const labelCanvas = document.createElement('canvas'); labelCanvas.width = LW; labelCanvas.height = LH;
+const labelCtx = labelCanvas.getContext('2d');
+const labelTex = new THREE.CanvasTexture(labelCanvas); labelTex.colorSpace = THREE.SRGBColorSpace;
+const labelCard = new THREE.Mesh(new THREE.PlaneGeometry(0.12, 0.12 * LH / LW), new THREE.MeshBasicMaterial({ map: labelTex, transparent: true, depthTest: false }));
+labelCard.renderOrder = 10; labelCard.visible = false; scene.add(labelCard);
+let labelKey = '';
+function drawLabels(lines){
+  const key = lines.join('|'); if (key === labelKey) return; labelKey = key;
+  const c = labelCtx; c.clearRect(0, 0, LW, LH);
+  c.fillStyle = 'rgba(22,24,29,0.85)'; c.beginPath(); c.roundRect(0, 0, LW, LH, 26); c.fill();
+  lines.forEach((l, i) => {
+    const [k, ...rest] = l.split('  ');
+    c.font = '700 30px "Bricolage Grotesque", Arial, sans-serif'; c.fillStyle = '#ff9a6a'; c.fillText(k, 26, 54 + i * 56);
+    const w = c.measureText(k).width;
+    c.font = '500 28px "IBM Plex Sans", Arial, sans-serif'; c.fillStyle = '#f1ece2'; c.fillText(rest.join('  '), 26 + w + 16, 54 + i * 56);
+  });
+  labelTex.needsUpdate = true;
+}
+function riderLines(){
+  const L = (store.ride || 'right') === 'left', A1 = L ? 'X' : 'A', B1 = L ? 'Y' : 'B';
+  if (mode === 'record') return [A1 + ' hold  record a line', B1 + ' hold  fit board to your fingers', 'Trigger  press the menu', 'Stick  ← → undo / redo · click: mode'];
+  if (store.tool === 'edge') return ['Trigger  draw an edge (snaps to corners)', 'Loop or cross  it fills a patch', 'Grip / aim  drag a teal corner', B1 + '  undo · while holding: delete'];
+  if (store.tool === 'guide') return ['Trigger  draw a guide across a patch', 'Ends  start and finish on its edges', 'Grip / aim  drag a teal corner', B1 + '  undo'];
+  return ['Trigger  sketch · aim at a point: drag', 'Grip  move a path, patch or point', 'Stick ↕  brush size · ← → undo / redo', A1 + '  scribble → patch · ' + B1 + ': undo'];
+}
 function layoutButtons(){
-  const W = 464, H = 92, GAP = 16, X0 = 40, B = [];
-  let y = 150;
-  const row = (a, b) => { [a, b].forEach((btn, i) => btn && B.push({ ...btn, x: X0 + i * (W + GAP), y, w: W, h: H })); y += H + GAP; };
-  const v = store.view;
+  const W = 464, H = 84, GAP = 12, X0 = 40, B = [];
+  let y = 140;
+  const row = (l, r) => { [l, r].forEach((btn, i) => btn && B.push({ ...btn, x: X0 + i * (W + GAP), y, w: W, h: H })); y += H + GAP; };
+  const v = store.view, tog = (id, label) => ({ id, label, on: v[id], toggle: true }), tool = (id, label) => ({ id: 'tool-' + id, label, on: store.tool === id, tab: true });
   row({ id: 'mode-record', label: 'Record', on: mode === 'record', tab: true }, { id: 'mode-compose', label: 'Compose', on: mode === 'compose', tab: true });
   row({ id: 'undo', label: '↶  Undo' }, { id: 'redo', label: 'Redo  ↷' });
   if (mode === 'record') row({ id: 'swap', label: 'Switch hand' }, { id: 'resetfit', label: 'Reset board fit' });
-  else row({ id: 'surface', label: 'Make surface' }, { id: 'nets', label: 'Control points', on: v.nets, toggle: true });
-  row({ id: 'trails', label: 'Trails', on: v.trails, toggle: true }, { id: 'ghosts', label: 'Ghost boards', on: v.ghosts, toggle: true });
-  row({ id: 'replay', label: 'Replay together' }, { id: 'sketches', label: 'Sketches', on: v.sketches, toggle: true });
+  else {
+    row(tool('sketch', 'Pen: sketch'), tool('edge', 'Pen: edges'));
+    row(tool('guide', 'Pen: guides'), { id: 'surface', label: 'Scribble → patch' });
+  }
+  row(tog('paths', 'Paths'), tog('trails', 'Trails'));
+  row(tog('boards', 'Boards'), tog('hands', 'Hands'));
+  row(tog('sketches', 'Sketches'), mode === 'compose' ? tog('nets', 'Control points') : null);
+  row({ id: 'replay', label: 'Replay together' }, tog('labels', 'Button labels'));
   return B;
 }
 function drawMenu(title, titleColor, hint, hoverId){
@@ -465,9 +788,9 @@ function drawMenu(title, titleColor, hint, hoverId){
     else { c.fillStyle = 'rgba(241,236,226,0.12)'; c.fill(); }
     c.lineWidth = hot ? 6 : 2; c.strokeStyle = hot ? '#ffffff' : 'rgba(241,236,226,0.25)'; c.stroke();
     c.fillStyle = b.on ? '#16181d' : '#f1ece2';
-    c.font = '600 40px "Bricolage Grotesque", Arial, sans-serif';
+    c.font = '600 38px "Bricolage Grotesque", Arial, sans-serif';
     const label = b.toggle ? b.label + (b.on ? '  ·  on' : '  ·  off') : b.label;
-    c.fillText(label, b.x + 28, b.y + b.h / 2 + 14);
+    c.fillText(label, b.x + 26, b.y + b.h / 2 + 13);
   }
   c.fillStyle = '#a59e92'; c.font = '500 32px "IBM Plex Sans", Arial, sans-serif'; c.fillText(hint, 40, MH - 36);
   menuTex.needsUpdate = true;
@@ -495,7 +818,7 @@ const inputs = [0, 1].map(i => {
   const pen = new THREE.Mesh(penGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x444444, transparent: true, opacity: .85 }));
   ray.add(pen);
   const st = { ray, grip, board, pen, source: null, hand: '', prev: [], rec: null, live: makeLive(0xff3b3b),
-    sketch: null, liveSketch: makeLive(0xe9e4d8), held: null, adjust: null, flick: 0, menuClick: false };
+    sketch: null, liveSketch: makeLive(0xe9e4d8), liveEdge: makeLive(EDGE_COLOR), held: null, adjust: null, flick: 0, menuClick: false };
   ray.addEventListener('connected', e => { st.source = e.data; st.hand = e.data.handedness; applyFit(st); });
   ray.addEventListener('disconnected', () => { st.source = null; });
   return st;
@@ -555,10 +878,11 @@ const fitAct = (key, from, to) => ({
 function releaseHeld(st){
   const h = st.held; if (!h) return; st.held = null;
   if (h.type === 'line'){ const g = h.o.group; act(moveAct(h.o.data, h.from, { p: g.position.toArray().map(r4), q: g.quaternion.toArray().map(r4) })); }
+  else if (h.type === 'node' || h.type === 'raynode'){ store.cage.nodes[h.k] = store.cage.nodes[h.k].map(r4); act(cageAct(h.base, cloneCage())); }
   else act(cpAct(h.o.data, h.from, h.o.data.cp.map(r4)));
 }
 function settleAll(){ inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); releaseHeld(o);
-  if (o.sketch){ o.sketch = null; liveReset(o.liveSketch); } }); }
+  if (o.sketch){ o.sketch = null; liveReset(o.liveSketch); liveReset(o.liveEdge); } }); }
 function setMode(m){ settleAll(); mode = m; if (m === 'compose') syncReplay(); }
 
 function pressMenu(id, now){
@@ -571,11 +895,13 @@ function pressMenu(id, now){
   else if (id === 'resetfit'){ const k = store.ride || 'right'; act(fitAct(k, store.fit[k], DEFAULT_FIT())); }
   else if (id === 'surface'){ if (!makeSurfaceFromScribbles()) flash = { text: 'Scribble a bit more first', until: now + 1.5 }; }
   else if (id === 'replay') syncReplay();
+  else if (id.startsWith('tool-')){ store.tool = id.slice(5); save(); }
   else if (id in v){ v[id] = !v[id]; save(); }
 }
 
 function updateInputs(now, dt){
-  let hotCP = null;
+  let hotCP = null, hotNode = -1;
+  snapMarker.visible = false;
   const rider = inputs.find(s => s.source && rides(s)), off = inputs.find(s => s.source && !rides(s));
 
   // menu floats above the off hand and turns to face you
@@ -637,7 +963,8 @@ function updateInputs(now, dt){
     }
     else { // compose
       // stick up/down: brush size, like Gravity Sketch
-      const dragging = st.held && st.held.type === 'raycp';
+      const isRay = h => h && (h.type === 'raycp' || h.type === 'raynode');
+      const dragging = isRay(st.held);
       if (!dragging && Math.abs(ay) > 0.25 && Math.abs(ax) < 0.5){
         store.brush = THREE.MathUtils.clamp(store.brush * Math.exp(-ay * dt * 1.6), 0.001, 0.02); save();
       }
@@ -647,22 +974,24 @@ function updateInputs(now, dt){
       // pointer: aim at an orange point and pull the trigger to drag it from a distance (stick ↕ pushes / pulls it)
       st.ray.updateMatrixWorld();
       const ro = new THREE.Vector3().setFromMatrixPosition(st.ray.matrixWorld), rd = new THREE.Vector3(0, 0, -1).transformDirection(st.ray.matrixWorld);
-      const aim = (!st.held && !st.sketch && !hit) ? rayCP(ro, rd) : null;
-      if (aim) hotCP = aim;
+      const aim = (!st.held && !st.sketch && !hit) ? (rayNode(ro, rd) || rayCP(ro, rd)) : null;
+      if (aim && aim.kind === 'node') hotNode = aim.k; else if (aim) hotCP = aim;
+      const aimPos = a => a.kind === 'node' ? nodeV(a.k) : new THREE.Vector3(a.o.data.cp[a.k*3], a.o.data.cp[a.k*3+1], a.o.data.cp[a.k*3+2]);
       if (down(0) && aim && !st.menuClick){
-        const cp = aim.o.data.cp;
-        st.held = { type: 'raycp', o: aim.o, k: aim.k, from: cp.slice(), dist: aim.t,
-          off: new THREE.Vector3(cp[aim.k*3], cp[aim.k*3+1], cp[aim.k*3+2]).sub(ro.clone().addScaledVector(rd, aim.t)) };
+        const off = aimPos(aim).sub(ro.clone().addScaledVector(rd, aim.t));
+        st.held = aim.kind === 'node' ? { type: 'raynode', k: aim.k, base: cloneCage(), dist: aim.t, off }
+          : { type: 'raycp', o: aim.o, k: aim.k, from: aim.o.data.cp.slice(), dist: aim.t, off };
         st.menuClick = true;                          // this trigger pull drags, it doesn't sketch
       }
-      let beam = aim ? _b.set(aim.o.data.cp[aim.k*3], aim.o.data.cp[aim.k*3+1], aim.o.data.cp[aim.k*3+2]).clone() : null;
-      if (st.held && st.held.type === 'raycp'){
+      let beam = aim ? aimPos(aim) : null;
+      if (isRay(st.held)){
         const h = st.held;
         if (pressed(0)){
           if (Math.abs(ay) > 0.25) h.dist = THREE.MathUtils.clamp(h.dist * Math.exp(-ay * dt * 1.5), 0.05, 3);
-          const p = ro.clone().addScaledVector(rd, h.dist).add(h.off), cp = h.o.data.cp;
-          cp[h.k*3] = p.x; cp[h.k*3+1] = p.y; cp[h.k*3+2] = p.z; refreshSurface(h.o);
-          hotCP = { o: h.o, k: h.k }; beam = p;
+          const p = ro.clone().addScaledVector(rd, h.dist).add(h.off);
+          if (h.type === 'raynode'){ moveNode(h, p); hotNode = h.k; }
+          else { const cp = h.o.data.cp; cp[h.k*3] = p.x; cp[h.k*3+1] = p.y; cp[h.k*3+2] = p.z; refreshSurface(h.o); hotCP = { o: h.o, k: h.k }; }
+          beam = p;
         } else releaseHeld(st);
       }
       if (beam && !hit){
@@ -672,10 +1001,11 @@ function updateInputs(now, dt){
       }
 
       st.grip.getWorldPosition(_a);
-      if (!st.held && !aim){ const c = nearestCP(_a, 0.03); if (c) hotCP = c; }
-      if (down(1)){
-        const c = nearestCP(_a, 0.03);
-        if (c) st.held = { type: 'cp', o: c.o, k: c.k, from: c.o.data.cp.slice(),
+      if (!st.held && !aim){ const nk = nearestNode(_a); if (nk >= 0) hotNode = nk; else { const c = nearestCP(_a, 0.03); if (c) hotCP = c; } }
+      if (down(1) && !st.held){
+        const nk = nearestNode(_a), c = nk >= 0 ? null : nearestCP(_a, 0.03);
+        if (nk >= 0) st.held = { type: 'node', k: nk, base: cloneCage(), off: nodeV(nk).sub(_a) };
+        else if (c) st.held = { type: 'cp', o: c.o, k: c.k, from: c.o.data.cp.slice(),
           off: _b.set(c.o.data.cp[c.k*3], c.o.data.cp[c.k*3+1], c.o.data.cp[c.k*3+2]).sub(_a).clone() };
         else {
           const o = nearestLine(_a, 0.06);
@@ -686,9 +1016,10 @@ function updateInputs(now, dt){
             if (so) st.held = { type: 'surf', o: so, from: so.data.cp.slice(), inv: new THREE.Matrix4().copy(st.grip.matrixWorld).invert() }; }
         }
       }
-      if (st.held && st.held.type !== 'raycp' && pressed(1)){
+      if (st.held && !isRay(st.held) && pressed(1)){
         const h = st.held;
-        if (h.type === 'line'){ _m.multiplyMatrices(st.grip.matrixWorld, h.offset); _m.decompose(h.o.group.position, h.o.group.quaternion, _s); }
+        if (h.type === 'node'){ moveNode(h, _b.copy(_a).add(h.off).clone()); hotNode = h.k; }
+        else if (h.type === 'line'){ _m.multiplyMatrices(st.grip.matrixWorld, h.offset); _m.decompose(h.o.group.position, h.o.group.quaternion, _s); }
         else if (h.type === 'cp'){ const p = _b.copy(_a).add(h.off), cp = h.o.data.cp; cp[h.k*3] = p.x; cp[h.k*3+1] = p.y; cp[h.k*3+2] = p.z; refreshSurface(h.o); }
         else { _m.multiplyMatrices(st.grip.matrixWorld, h.inv); const cp = h.o.data.cp;
           for (let k = 0; k < NC * NC; k++){ _b.set(h.from[k*3], h.from[k*3+1], h.from[k*3+2]).applyMatrix4(_m); cp[k*3] = _b.x; cp[k*3+1] = _b.y; cp[k*3+2] = _b.z; }
@@ -696,22 +1027,30 @@ function updateInputs(now, dt){
         if (down(5)){                                 // delete what you're holding
           st.held = null; usedB = true;
           if (h.type === 'line'){ placeLine(h.o.data, h.from.p, h.from.q); act(delLineAct(h.o.data)); }
+          else if (h.type === 'node'){ setCage(h.base); deleteNode(h.k); act(cageAct(h.base, cloneCage())); }
           else { setCP(h.o.data, h.from); act(delSurfAct(h.o.data)); }
         }
       }
-      if (up(1) && !(st.held && st.held.type === 'raycp')) releaseHeld(st);
+      if (up(1) && !isRay(st.held)) releaseHeld(st);
       if (down(5) && !usedB && !st.held) undo();
-      if (down(0) && !st.menuClick) st.sketch = { r: store.brush, a: [], used: false };
+      if (down(0) && !st.menuClick) st.sketch = { r: store.brush, a: [], used: false, kind: store.tool };
+      if ((store.tool === 'edge' || store.tool === 'guide') && !st.held){ st.pen.getWorldPosition(_c); const nk = nearestNode(_c), ep = nk >= 0 ? null : nearestEdgePoint(_c);
+        if (nk >= 0){ snapMarker.position.copy(nodeV(nk)); snapMarker.visible = true; }
+        else if (ep){ const e = store.cage.edges[ep.ei]; snapMarker.position.set(e.pts[ep.i*3], e.pts[ep.i*3+1], e.pts[ep.i*3+2]); snapMarker.visible = true; } }
       if (st.sketch && pressed(0)){
         st.pen.getWorldPosition(_a);
         const a = st.sketch.a, k = a.length;
         if (!k || _b.set(a[k-3], a[k-2], a[k-1]).distanceTo(_a) > 0.004){
-          a.push(r4(_a.x), r4(_a.y), r4(_a.z)); st.liveSketch.visible = true; livePush(st.liveSketch, _a);
+          const live = st.sketch.kind === 'sketch' ? st.liveSketch : st.liveEdge;
+          a.push(r4(_a.x), r4(_a.y), r4(_a.z)); live.visible = true; livePush(live, _a);
         }
       }
       if (up(0) && st.sketch){
-        const sd = st.sketch; st.sketch = null; liveReset(st.liveSketch);
-        if (sd.a.length >= 6) act(addStrokeAct(sd));
+        const sd = st.sketch; st.sketch = null; liveReset(st.liveSketch); liveReset(st.liveEdge);
+        const kind = sd.kind; delete sd.kind;
+        if (kind === 'edge') addEdgeStroke(sd.a);
+        else if (kind === 'guide') addGuideStroke(sd.a);
+        else if (sd.a.length >= 6) act(addStrokeAct(sd));
       }
       if (down(4) && !makeSurfaceFromScribbles()) flash = { text: 'Scribble a bit more first', until: now + 1.5 };
     }
@@ -720,14 +1059,21 @@ function updateInputs(now, dt){
   if (!rider) laser.visible = false;
   surfObjs.forEach(o => o.handles.forEach(h => h.material = cpMat));
   if (hotCP) hotCP.o.handles[hotCP.k].material = cpHot;
+  nodeMeshes.forEach((m, k) => m.material = k === hotNode ? nodeHotC : nodeMatC);
 
+  // button labels above the riding controller
+  labelCard.visible = !!rider && store.view.labels;
+  if (labelCard.visible){
+    rider.grip.getWorldPosition(labelCard.position); labelCard.position.y += 0.09;
+    labelCard.lookAt(renderer.xr.getCamera().getWorldPosition(_b)); drawLabels(riderLines());
+  }
   // menu text
   if (off){
     const R = (store.ride || 'right') === 'left', A1 = R ? 'X' : 'A', B1 = R ? 'Y' : 'B';
     const recSt = inputs.find(s => s.rec), fitSt = inputs.find(s => s.adjust);
     let title = mode === 'record' ? 'Record' : 'Compose', color = '', hint;
     if (mode === 'record') hint = (R ? 'Left' : 'Right') + ' hand rides  ·  hold ' + A1 + ': record  ·  hold ' + B1 + ': fit board';
-    else hint = 'Trigger: sketch, or aim at a point and drag  ·  Grip: move';
+    else hint = store.tool === 'edge' ? 'Edges: close a loop or cross one and it fills' : store.tool === 'guide' ? 'Guides: the patch bends smoothly through them' : 'Sketch: trigger draws, stick ↕ sets brush size';
     if (recSt){ title = '● REC ' + (now - recSt.rec.t0).toFixed(1) + ' s'; color = '#ff5a4a'; }
     else if (fitSt){ title = 'Fit board'; color = '#e9cfa3'; hint = 'Set your fingertips on the board, then let go of ' + B1; }
     else if (now < flash.until){ title = flash.text; color = '#ff9a6a'; }
@@ -738,9 +1084,10 @@ function updateInputs(now, dt){
 // ================= view toggles =================
 function applyView(){
   const v = store.view;
-  lineObjs.forEach(o => o.group.children.forEach(c => { if (c.userData.trail) c.visible = v.trails; }));
+  lineObjs.forEach(o => o.group.traverse(c => { if (c.userData.view) c.visible = v[c.userData.view]; }));
   strokeObjs.forEach(o => { o.mesh.visible = v.sketches; });
   showNets(renderer.xr.isPresenting && mode === 'compose' && v.nets);
+  nodeMeshes.forEach(m => { m.visible = renderer.xr.isPresenting && mode === 'compose'; });
 }
 
 // ================= page buttons =================
@@ -783,7 +1130,7 @@ async function start(kind){
   await renderer.xr.setSession(session);
   const btn = kind === 'immersive-ar' ? mrBtn : vrBtn; btn.disabled = false; btn.textContent = 'Exit';
   session.addEventListener('end', () => {
-    scene.background = BG; room.visible = true; menu.visible = false; laser.visible = false;
+    scene.background = BG; room.visible = true; menu.visible = false; laser.visible = false; labelCard.visible = false;
     inputs.forEach(s => { if (s.rec) finishRecording(s); endFit(s); releaseHeld(s); s.sketch = null; liveReset(s.liveSketch); });
     vrBtn.textContent = 'Enter VR'; mrBtn.textContent = 'Enter MR'; setupButtons();
   });
@@ -799,6 +1146,7 @@ setupButtons();
   lineObjs.forEach(o => { o.group.updateMatrix(); o.pts.forEach(p => box.expandByPoint(p.clone().applyMatrix4(o.group.matrix))); });
   strokeObjs.forEach(o => box.expandByObject(o.mesh));
   surfObjs.forEach(o => box.expandByObject(o.mesh));
+  if (cageGroup.children.length) box.expandByObject(cageGroup);
   if (box.isEmpty()) return;
   const c = box.getCenter(new THREE.Vector3()), r = Math.max(0.2, box.getSize(new THREE.Vector3()).length());
   orbit.target.copy(c); camera.position.copy(c).add(new THREE.Vector3(0.6, 0.5, 0.8).multiplyScalar(r)); orbit.update();
