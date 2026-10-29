@@ -37,7 +37,7 @@
 <div class="card">
   <h1>Party Lines <span>XR</span></h1>
   <p><b>Record:</b> hold A or X and ride the board with your two fingers. Each run joins the bank with its timing.<br>
-     <b>Compose:</b> click the thumbstick, then grip to move lines and pull the trigger to sketch.</p>
+     <b>Compose:</b> click the thumbstick. Sketch with the trigger, then press A or X to turn your new scribbles into a surface you can pull into shape.</p>
   <div class="row">
     <button id="mr" disabled>Enter MR</button>
     <button id="vr" disabled>Enter VR</button>
@@ -63,10 +63,13 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 const KEY = 'partylines.v2';
 const COLORS = [0xff6b3d, 0x2fb3a5, 0xff5fa2, 0xf2c230, 0x4f8cff, 0x6fd16a, 0xa87bff, 0xe8463b];
 // board placement relative to the controller grip: 11.5 cm out along your fingers, deck across the two fingertips
-const DEFAULT_FIT = () => ({ p: [0, -0.128, 0.01], q: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2).toArray() });
-let store = { lines: [], strokes: [], fit: {} };
+const DEFAULT_FIT = () => ({ p: [0, -0.07, 0], q: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2).toArray() });
+let store = { lines: [], strokes: [], surfaces: [], fit: {}, brush: 0.0022 };
 try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.lines) store = Object.assign(store, s); } catch (e) {}
+if (store.fitVersion !== 3){ store.fit = {}; store.fitVersion = 3; }      // start everyone from the new close-in default
 for (const h of ['left', 'right']) if (!store.fit[h] || !store.fit[h].p) store.fit[h] = DEFAULT_FIT();
+store.strokes = store.strokes.map(s => Array.isArray(s) ? { r: 0.0022, a: s, used: false } : s);   // older saves
+store.surfaces = store.surfaces || [];
 let saveTimer = 0;
 function save(){ clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) {} }, 300); }
 const r4 = v => Math.round(v * 10000) / 10000;
@@ -103,8 +106,7 @@ function kick(geo){ // bend the ends up past the trucks, plus a hint of concave 
   const p = geo.attributes.position;
   for (let i = 0; i < p.count; i++){
     const x = p.getX(i), z = p.getZ(i), ax = Math.abs(x);
-    let y = p.getY(i) + (ax > KICK_START ? (ax - KICK_START) * KICK_SLOPE : 0) + z * z * 1.4;
-    p.setY(i, y);
+    p.setY(i, p.getY(i) + (ax > KICK_START ? (ax - KICK_START) * KICK_SLOPE : 0) + z * z * 1.4);
   }
   geo.computeVertexNormals(); return geo;
 }
@@ -113,7 +115,6 @@ function deckGeo(hw, hd, r, depth, y, bevel){
     depth, curveSegments: 12, steps: 1,
     bevelEnabled: bevel, bevelThickness: 0.0003, bevelSize: 0.0003, bevelSegments: 2 });
   g.rotateX(-Math.PI / 2); g.translate(0, y, 0);
-  // subdivide-free bend still reads fine because the rounded ends carry many vertices
   return kick(g);
 }
 const DECK_GEO = deckGeo(0.048, 0.014, 0.012, 0.0014, 0.0098, true);
@@ -127,7 +128,8 @@ const BEARING_GEO = new THREE.CylinderGeometry(0.0018, 0.0018, 0.0045, 12); BEAR
 const BASE_GEO = new THREE.BoxGeometry(0.010, 0.0012, 0.012);
 const HANGER_GEO = new THREE.CylinderGeometry(0.0022, 0.0028, 0.020, 12); HANGER_GEO.rotateX(Math.PI / 2);
 const KING_GEO = new THREE.CylinderGeometry(0.0016, 0.0016, 0.004, 10);
-const SHARED = new Set([DECK_GEO, TAPE_GEO, WHEEL_GEO, BEARING_GEO, BASE_GEO, HANGER_GEO, KING_GEO]);
+const dotGeo = new THREE.SphereGeometry(0.0028, 8, 6);
+const SHARED = new Set([DECK_GEO, TAPE_GEO, WHEEL_GEO, BEARING_GEO, BASE_GEO, HANGER_GEO, KING_GEO, dotGeo]);
 function makeBoard(color){
   // origin = where the wheels touch; deck runs along local X
   const g = new THREE.Group();
@@ -145,12 +147,98 @@ function makeBoard(color){
   }
   return g;
 }
-function disposeTree(obj){ obj.traverse(o => { if (o.geometry && !SHARED.has(o.geometry) && o.geometry !== dotGeo) o.geometry.dispose(); }); }
+function disposeTree(obj){ obj.traverse(o => { if (o.geometry && !SHARED.has(o.geometry)) o.geometry.dispose(); }); }
+
+// ================= surface math (cubic B-spline patch, 5 x 5 control net) =================
+const NC = 5, DEG = 3, KNOTS = [0, 0, 0, 0, 0.5, 1, 1, 1, 1], GREVILLE = [0, 1/6, 0.5, 5/6, 1];
+function basis(t){
+  t = Math.min(Math.max(t, 0), 1 - 1e-9);
+  const K = KNOTS, N = new Array(K.length - 1).fill(0);
+  for (let i = 0; i < K.length - 1; i++) N[i] = (t >= K[i] && t < K[i + 1]) ? 1 : 0;
+  for (let p = 1; p <= DEG; p++){
+    for (let i = 0; i < K.length - 1 - p; i++){
+      const a = K[i + p] - K[i] ? (t - K[i]) / (K[i + p] - K[i]) * N[i] : 0;
+      const b = K[i + p + 1] - K[i + 1] ? (K[i + p + 1] - t) / (K[i + p + 1] - K[i + 1]) * N[i + 1] : 0;
+      N[i] = a + b;
+    }
+  }
+  return N.slice(0, NC);
+}
+function evalSurf(cp, u, v, out){
+  const bu = basis(u), bv = basis(v); let x = 0, y = 0, z = 0;
+  for (let i = 0; i < NC; i++) for (let j = 0; j < NC; j++){
+    const w = bu[i] * bv[j], k = (i * NC + j) * 3; x += w * cp[k]; y += w * cp[k + 1]; z += w * cp[k + 2];
+  }
+  return out.set(x, y, z);
+}
+function eig3(A){ // Jacobi eigen-decomposition of a symmetric 3x3
+  const a = A.map(r => r.slice()), V = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 40; sweep++){
+    let p = 0, q = 1, max = Math.abs(a[0][1]);
+    if (Math.abs(a[0][2]) > max){ max = Math.abs(a[0][2]); p = 0; q = 2; }
+    if (Math.abs(a[1][2]) > max){ max = Math.abs(a[1][2]); p = 1; q = 2; }
+    if (max < 1e-14) break;
+    const th = 0.5 * Math.atan2(2 * a[p][q], a[q][q] - a[p][p]), c = Math.cos(th), s = Math.sin(th);
+    for (let k = 0; k < 3; k++){ const kp = a[k][p], kq = a[k][q]; a[k][p] = c * kp - s * kq; a[k][q] = s * kp + c * kq; }
+    for (let k = 0; k < 3; k++){ const pk = a[p][k], qk = a[q][k]; a[p][k] = c * pk - s * qk; a[q][k] = s * pk + c * qk; }
+    for (let k = 0; k < 3; k++){ const kp = V[k][p], kq = V[k][q]; V[k][p] = c * kp - s * kq; V[k][q] = s * kp + c * kq; }
+  }
+  return [0, 1, 2].map(i => ({ val: a[i][i], vec: new THREE.Vector3(V[0][i], V[1][i], V[2][i]) })).sort((x, y) => y.val - x.val);
+}
+function solve(A, b){ // Gaussian elimination with partial pivoting
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++){
+    let piv = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    const d = M[c][c] || 1e-12;
+    for (let r = c + 1; r < n; r++){ const f = M[r][c] / d; if (f) for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
+  }
+  const x = new Array(n).fill(0);
+  for (let r = n - 1; r >= 0; r--){ let s = M[r][n]; for (let k = r + 1; k < n; k++) s -= M[r][k] * x[k]; x[r] = s / (M[r][r] || 1e-12); }
+  return x;
+}
+// fit a smooth patch to scribble points: best plane, then heights solved as a least-squares B-spline with a smoothness term
+function fitSurface(points){
+  const n = points.length; if (n < 8) return null;
+  const c = new THREE.Vector3(); points.forEach(p => c.add(p)); c.multiplyScalar(1 / n);
+  const C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (const p of points){ const d = [p.x - c.x, p.y - c.y, p.z - c.z];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) C[i][j] += d[i] * d[j] / n; }
+  const E = eig3(C);
+  const U = E[0].vec.clone().normalize(), Nn = E[2].vec.clone().normalize();
+  if (Nn.y < 0) Nn.negate();                                   // face up, like a riding surface
+  const V = new THREE.Vector3().crossVectors(Nn, U).normalize();
+  const st = points.map(p => { const d = p.clone().sub(c); return [d.dot(U), d.dot(V), d.dot(Nn)]; });
+  let s0 = Infinity, s1 = -Infinity, t0 = Infinity, t1 = -Infinity;
+  st.forEach(([s, t]) => { s0 = Math.min(s0, s); s1 = Math.max(s1, s); t0 = Math.min(t0, t); t1 = Math.max(t1, t); });
+  if (s1 - s0 < 0.01 || t1 - t0 < 0.005) return null;
+  const ps = (s1 - s0) * 0.08, pt = (t1 - t0) * 0.08; s0 -= ps; s1 += ps; t0 -= pt; t1 += pt;
+  const M = NC * NC, A = Array.from({ length: M }, () => new Array(M).fill(0)), b = new Array(M).fill(0);
+  for (const [s, t, h] of st){
+    const bu = basis((s - s0) / (s1 - s0)), bv = basis((t - t0) / (t1 - t0)), row = new Array(M);
+    for (let i = 0; i < NC; i++) for (let j = 0; j < NC; j++) row[i * NC + j] = bu[i] * bv[j];
+    for (let i = 0; i < M; i++){ if (!row[i]) continue; b[i] += row[i] * h; for (let j = 0; j < M; j++) A[i][j] += row[i] * row[j]; }
+  }
+  const lam = 0.02 * n / M;                                    // bending penalty keeps it smooth where you didn't draw
+  for (let i = 0; i < NC; i++) for (let j = 0; j < NC - 2; j++){
+    for (const idx of [[i*NC+j, i*NC+j+1, i*NC+j+2], [j*NC+i, (j+1)*NC+i, (j+2)*NC+i]]){
+      const w = [1, -2, 1];
+      for (let a = 0; a < 3; a++) for (let bb = 0; bb < 3; bb++) A[idx[a]][idx[bb]] += lam * w[a] * w[bb];
+    }
+  }
+  for (let i = 0; i < M; i++) A[i][i] += 1e-6;
+  const hgt = solve(A, b), cp = [];
+  for (let i = 0; i < NC; i++) for (let j = 0; j < NC; j++){
+    const s = s0 + (s1 - s0) * GREVILLE[i], t = t0 + (t1 - t0) * GREVILLE[j];
+    const p = c.clone().addScaledVector(U, s).addScaledVector(V, t).addScaledVector(Nn, hgt[i * NC + j]);
+    cp.push(r4(p.x), r4(p.y), r4(p.z));
+  }
+  return cp;
+}
+// ================= end surface math =================
 
 // ================= bank of recorded lines =================
-// a line = samples [t, px,py,pz, qx,qy,qz,qw] in world space + a placement (group transform)
 const lineObjs = [];
-const dotGeo = new THREE.SphereGeometry(0.0028, 8, 6);
 function buildLine(data){
   const s = data.s, n = s.length / 8;
   const color = COLORS[data.c % COLORS.length];
@@ -160,9 +248,8 @@ function buildLine(data){
   for (let i = 0; i < n; i++) pts.push(new THREE.Vector3(s[i*8+1], s[i*8+2], s[i*8+3]));
   const trailPts = pts.filter((p, i) => i % 2 === 0 || i === n - 1);
   if (trailPts.length >= 2){
-    const tube = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(trailPts), Math.min(900, trailPts.length * 3), 0.0018, 6, false),
-      new THREE.MeshStandardMaterial({ color, roughness: .5 }));
-    group.add(tube);
+    group.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(trailPts), Math.min(900, trailPts.length * 3), 0.0018, 6, false),
+      new THREE.MeshStandardMaterial({ color, roughness: .5 })));
   }
   // timing dots every 0.1 s (spread out = fast, bunched = slow)
   const dotsAt = []; let next = 0;
@@ -207,35 +294,117 @@ function syncReplay(){ const now = performance.now() / 1000; lineObjs.forEach(o 
 
 // ================= sketch strokes =================
 const strokeObjs = [];
-const strokeMat = new THREE.MeshStandardMaterial({ color: 0xe9e4d8, roughness: .7, emissive: 0x222018 });
-function showStroke(arr){
-  if (!store.strokes.includes(arr)) store.strokes.push(arr);
-  const pts = []; for (let i = 0; i < arr.length; i += 3) pts.push(new THREE.Vector3(arr[i], arr[i+1], arr[i+2]));
+const freshMat = new THREE.MeshStandardMaterial({ color: 0xf3eee4, roughness: .7, emissive: 0x2a2620 });
+const usedMat = new THREE.MeshStandardMaterial({ color: 0x8f8a80, roughness: .8 });
+function showStroke(sd){
+  if (!store.strokes.includes(sd)) store.strokes.push(sd);
+  const a = sd.a, pts = []; for (let i = 0; i < a.length; i += 3) pts.push(new THREE.Vector3(a[i], a[i+1], a[i+2]));
   if (pts.length >= 2){
-    const mesh = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), Math.min(600, pts.length * 3), 0.0022, 6, false), strokeMat);
-    scene.add(mesh); strokeObjs.push({ arr, mesh });
+    const mesh = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), Math.min(600, pts.length * 3), sd.r, 8, false), sd.used ? usedMat : freshMat);
+    scene.add(mesh); strokeObjs.push({ sd, mesh });
   }
   save();
 }
-function hideStroke(arr){
-  const o = strokeObjs.find(s => s.arr === arr);
+function hideStroke(sd){
+  const o = strokeObjs.find(s => s.sd === sd);
   if (o){ scene.remove(o.mesh); o.mesh.geometry.dispose(); strokeObjs.splice(strokeObjs.indexOf(o), 1); }
-  const i = store.strokes.indexOf(arr); if (i >= 0) store.strokes.splice(i, 1);
+  const i = store.strokes.indexOf(sd); if (i >= 0) store.strokes.splice(i, 1);
+  save();
+}
+function markUsed(list, used){
+  list.forEach(sd => { sd.used = used; const o = strokeObjs.find(s => s.sd === sd); if (o) o.mesh.material = used ? usedMat : freshMat; });
   save();
 }
 
+// ================= surfaces =================
+const surfObjs = [];
+const RES = 24;
+const surfMat = new THREE.MeshStandardMaterial({ color: 0xe2c494, roughness: .8, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+const isoMat = new THREE.LineBasicMaterial({ color: 0x7a5a32 });
+const netMat = new THREE.LineBasicMaterial({ color: 0xff6b3d, transparent: true, opacity: .6 });
+const cpGeo = new THREE.SphereGeometry(0.0055, 12, 8);
+const cpMat = new THREE.MeshStandardMaterial({ color: 0xff6b3d, roughness: .4 });
+const cpHot = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xff6b3d, emissiveIntensity: .6 });
+SHARED.add(cpGeo);
+function buildSurface(data){
+  const group = new THREE.Group();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array((RES + 1) * (RES + 1) * 3), 3));
+  const idx = [];
+  for (let i = 0; i < RES; i++) for (let j = 0; j < RES; j++){
+    const a = i * (RES + 1) + j, b = a + 1, c2 = a + RES + 1, d = c2 + 1; idx.push(a, c2, b, b, c2, d);
+  }
+  geo.setIndex(idx);
+  const mesh = new THREE.Mesh(geo, surfMat); group.add(mesh);
+  const isoGeo = new THREE.BufferGeometry();
+  isoGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(10 * RES * 2 * 3), 3));
+  const iso = new THREE.LineSegments(isoGeo, isoMat); group.add(iso);
+  const netGeo = new THREE.BufferGeometry();
+  netGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(2 * NC * (NC - 1) * 2 * 3), 3));
+  const net = new THREE.LineSegments(netGeo, netMat); group.add(net);
+  const handles = [];
+  for (let k = 0; k < NC * NC; k++){ const h = new THREE.Mesh(cpGeo, cpMat); group.add(h); handles.push(h); }
+  scene.add(group);
+  const obj = { data, group, mesh, iso, net, handles };
+  surfObjs.push(obj); refreshSurface(obj);
+  return obj;
+}
+const _e = new THREE.Vector3();
+function refreshSurface(obj){
+  const cp = obj.data.cp;
+  const pos = obj.mesh.geometry.attributes.position;
+  for (let i = 0; i <= RES; i++) for (let j = 0; j <= RES; j++){ evalSurf(cp, i / RES, j / RES, _e); pos.setXYZ(i * (RES + 1) + j, _e.x, _e.y, _e.z); }
+  pos.needsUpdate = true; obj.mesh.geometry.computeVertexNormals(); obj.mesh.geometry.computeBoundingSphere();
+  // isocurves: 5 in each direction, like a NURBS wire view
+  const ip = obj.iso.geometry.attributes.position; let w = 0;
+  for (const dir of [0, 1]) for (let l = 0; l < 5; l++) for (let s = 0; s < RES; s++){
+    const f = l / 4;
+    for (const t of [s / RES, (s + 1) / RES]){ dir ? evalSurf(cp, f, t, _e) : evalSurf(cp, t, f, _e); ip.setXYZ(w++, _e.x, _e.y, _e.z); }
+  }
+  ip.needsUpdate = true; obj.iso.geometry.computeBoundingSphere();
+  const np = obj.net.geometry.attributes.position; w = 0;
+  for (let i = 0; i < NC; i++) for (let j = 0; j < NC - 1; j++){
+    for (const k of [i * NC + j, i * NC + j + 1]) np.setXYZ(w++, cp[k*3], cp[k*3+1], cp[k*3+2]);
+    for (const k of [j * NC + i, (j + 1) * NC + i]) np.setXYZ(w++, cp[k*3], cp[k*3+1], cp[k*3+2]);
+  }
+  np.needsUpdate = true; obj.net.geometry.computeBoundingSphere();
+  obj.handles.forEach((h, k) => h.position.set(cp[k*3], cp[k*3+1], cp[k*3+2]));
+}
+const surfOf = data => surfObjs.find(o => o.data === data);
+function showSurface(data){ if (!store.surfaces.includes(data)) store.surfaces.push(data); buildSurface(data); save(); }
+function hideSurface(data){
+  const o = surfOf(data); if (o){ scene.remove(o.group); disposeTree(o.group); surfObjs.splice(surfObjs.indexOf(o), 1); }
+  const i = store.surfaces.indexOf(data); if (i >= 0) store.surfaces.splice(i, 1);
+  save();
+}
+function setCP(data, cp){ data.cp = cp.slice(); const o = surfOf(data); if (o) refreshSurface(o); save(); }
+function showNets(on){ surfObjs.forEach(o => { o.net.visible = on; o.handles.forEach(h => h.visible = on); }); }
+
 store.lines.forEach(buildLine);
 [...store.strokes].forEach(showStroke);
+store.surfaces.forEach(buildSurface);
 
-// ================= undo / redo (covers lines, sketches, moves, deletes) =================
+// ================= undo / redo =================
 const undoStack = [], redoStack = [];
 function act(a){ a.redo(); undoStack.push(a); redoStack.length = 0; }
 function undo(){ const a = undoStack.pop(); if (a){ a.undo(); redoStack.push(a); } }
 function redo(){ const a = redoStack.pop(); if (a){ a.redo(); undoStack.push(a); } }
 const addLineAct = d => ({ redo: () => showLine(d), undo: () => hideLine(d) });
 const delLineAct = d => ({ redo: () => hideLine(d), undo: () => showLine(d) });
-const addStrokeAct = a => ({ redo: () => showStroke(a), undo: () => hideStroke(a) });
+const addStrokeAct = s => ({ redo: () => showStroke(s), undo: () => hideStroke(s) });
 const moveAct = (d, from, to) => ({ redo: () => placeLine(d, to.p, to.q), undo: () => placeLine(d, from.p, from.q) });
+const addSurfAct = (d, used) => ({ redo: () => { showSurface(d); markUsed(used, true); }, undo: () => { hideSurface(d); markUsed(used, false); } });
+const delSurfAct = d => ({ redo: () => hideSurface(d), undo: () => showSurface(d) });
+const cpAct = (d, from, to) => ({ redo: () => setCP(d, to), undo: () => setCP(d, from) });
+
+function makeSurfaceFromScribbles(){
+  const fresh = store.strokes.filter(s => !s.used); if (!fresh.length) return false;
+  let pts = [];
+  fresh.forEach(sd => { for (let i = 0; i < sd.a.length; i += 3) pts.push(new THREE.Vector3(sd.a[i], sd.a[i+1], sd.a[i+2])); });
+  if (pts.length > 500){ const k = Math.ceil(pts.length / 500); pts = pts.filter((p, i) => i % k === 0); }
+  const cp = fitSurface(pts); if (!cp) return false;
+  act(addSurfAct({ cp }, fresh)); return true;
+}
 
 // live preview line used while recording or sketching
 function makeLive(color){
@@ -252,33 +421,34 @@ function livePush(line, p){
 function liveReset(line){ line.geometry.setDrawRange(0, 0); line.visible = false; }
 
 // ================= HUD (floats above your left controller) =================
-const hudCanvas = document.createElement('canvas'); hudCanvas.width = 640; hudCanvas.height = 260;
+const hudCanvas = document.createElement('canvas'); hudCanvas.width = 640; hudCanvas.height = 300;
 const hudCtx = hudCanvas.getContext('2d');
 const hudTex = new THREE.CanvasTexture(hudCanvas); hudTex.colorSpace = THREE.SRGBColorSpace;
-const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.065), new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false }));
+const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.075), new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false }));
 hud.renderOrder = 10; hud.visible = false; scene.add(hud);
-let hudKey = '';
+let hudKey = '', flash = { text: '', until: 0 };
 function drawHud(title, lines, color){
   const key = title + lines.join('|') + color; if (key === hudKey) return; hudKey = key;
-  const c = hudCtx; c.clearRect(0, 0, 640, 260);
-  c.fillStyle = 'rgba(22,24,29,0.88)'; c.beginPath(); c.roundRect(0, 0, 640, 260, 28); c.fill();
+  const c = hudCtx; c.clearRect(0, 0, 640, 300);
+  c.fillStyle = 'rgba(22,24,29,0.88)'; c.beginPath(); c.roundRect(0, 0, 640, 300, 28); c.fill();
   c.fillStyle = color || '#f1ece2'; c.font = '800 54px "Bricolage Grotesque", Arial Black, sans-serif'; c.fillText(title, 32, 72);
-  c.fillStyle = '#c9c1b4'; c.font = '500 28px "IBM Plex Sans", Arial, sans-serif';
-  lines.forEach((l, i) => c.fillText(l, 32, 128 + i * 42));
+  c.fillStyle = '#c9c1b4'; c.font = '500 27px "IBM Plex Sans", Arial, sans-serif';
+  lines.forEach((l, i) => c.fillText(l, 32, 126 + i * 42));
   hudTex.needsUpdate = true;
 }
 
 // ================= controllers =================
 let mode = 'record';
 const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _m = new THREE.Matrix4(), _s = new THREE.Vector3(), _q = new THREE.Quaternion();
+const penGeo = new THREE.SphereGeometry(1, 16, 10);
 const inputs = [0, 1].map(i => {
   const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
   scene.add(ray, grip);
   const board = makeBoard(0xe9cfa3); grip.add(board);   // locked to the controller
-  const pen = new THREE.Mesh(new THREE.SphereGeometry(0.005, 12, 8), new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x444444 }));
+  const pen = new THREE.Mesh(penGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x444444, transparent: true, opacity: .85 }));
   ray.add(pen);
   const st = { ray, grip, board, pen, source: null, hand: '', prev: [], rec: null, live: makeLive(0xff3b3b),
-    sketch: null, liveSketch: makeLive(0xe9e4d8), held: null, fitting: false, flick: 0 };
+    sketch: null, liveSketch: makeLive(0xe9e4d8), held: null, adjust: null, flick: 0 };
   ray.addEventListener('connected', e => { st.source = e.data; st.hand = e.data.handedness; applyFit(st); });
   ray.addEventListener('disconnected', () => { st.source = null; });
   return st;
@@ -294,6 +464,18 @@ function nearestLine(worldP, maxD){
   }
   return best;
 }
+function nearestCP(worldP, maxD){
+  let best = null, bd = maxD;
+  for (const o of surfObjs){ const cp = o.data.cp;
+    for (let k = 0; k < NC * NC; k++){ const d = _b.set(cp[k*3], cp[k*3+1], cp[k*3+2]).distanceTo(worldP); if (d < bd){ bd = d; best = { o, k }; } } }
+  return best;
+}
+function nearestSurf(worldP, maxD){
+  let best = null, bd = maxD;
+  for (const o of surfObjs){ const p = o.mesh.geometry.attributes.position;
+    for (let i = 0; i < p.count; i += 3){ const d = _b.fromBufferAttribute(p, i).distanceTo(worldP); if (d < bd){ bd = d; best = o; } } }
+  return best;
+}
 
 let nextColor = store.lines.length ? (Math.max(...store.lines.map(l => l.c)) + 1) : 0;
 function finishRecording(st){
@@ -302,13 +484,21 @@ function finishRecording(st){
   act(addLineAct({ c: nextColor++, s: rec.s.map(r4), p: [0, 0, 0], q: [0, 0, 0, 1] }));
 }
 function endFit(st){
-  if (!st.fitting) return; st.fitting = false;
-  st.grip.attach(st.board);                         // keeps where it is now, relative to your hand
-  store.fit[fitKey(st)] = { p: st.board.position.toArray().map(r4), q: st.board.quaternion.toArray().map(r4) };
-  save();
+  const a = st.adjust; if (!a) return; st.adjust = null;
+  const o = a.owner; o.grip.attach(o.board);        // bolts on exactly where you let go, relative to that controller
+  act(fitAct(fitKey(o), a.from, { p: o.board.position.toArray().map(r4), q: o.board.quaternion.toArray().map(r4) }));
+}
+const fitAct = (key, from, to) => ({
+  redo: () => { store.fit[key] = to; inputs.forEach(s => { if (s.source && fitKey(s) === key) applyFit(s); }); save(); },
+  undo: () => { store.fit[key] = from; inputs.forEach(s => { if (s.source && fitKey(s) === key) applyFit(s); }); save(); } });
+function releaseHeld(st){
+  const h = st.held; if (!h) return; st.held = null;
+  if (h.type === 'line'){ const g = h.o.group; act(moveAct(h.o.data, h.from, { p: g.position.toArray().map(r4), q: g.quaternion.toArray().map(r4) })); }
+  else act(cpAct(h.o.data, h.from, h.o.data.cp.map(r4)));
 }
 
-function updateInputs(now){
+function updateInputs(now, dt){
+  let hotCP = null;
   for (const st of inputs){
     const gp = st.source && st.source.gamepad;
     st.board.visible = !!gp && mode === 'record';
@@ -318,20 +508,34 @@ function updateInputs(now){
     const down = i => pressed(i) && !st.prev[i], up = i => !pressed(i) && st.prev[i];
 
     // stick flick: right = redo, left = undo (both modes)
-    const ax = gp.axes[2] || 0;
+    const ax = gp.axes[2] || 0, ay = gp.axes[3] || 0;
     if (st.flick === 0 && ax > 0.7){ st.flick = 1; redo(); }
     else if (st.flick === 0 && ax < -0.7){ st.flick = -1; undo(); }
     else if (Math.abs(ax) < 0.3) st.flick = 0;
 
     if (down(3)){                                    // click thumbstick: switch mode
-      inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); o.held = null; });
+      inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); releaseHeld(o); });
       mode = mode === 'record' ? 'compose' : 'record';
+      if (mode === 'compose') syncReplay();          // every run starts together when you come in to compose
     }
     else if (mode === 'record'){
-      // grip: pin the board in the air, set your fingertips on it, let go to lock it to the controller
-      if (down(1) && !st.rec){ st.fitting = true; scene.attach(st.board); }
+      // grip with one hand near the other hand's board: grab it, move and tilt it, let go to bolt it on there
+      if (down(1) && !st.rec){
+        st.grip.getWorldPosition(_a);
+        const owner = inputs.find(o => o !== st && o.source && !o.rec && o.board.getWorldPosition(_b).distanceTo(_a) < 0.09);
+        if (owner){
+          owner.board.updateMatrixWorld();
+          st.adjust = { owner, from: store.fit[fitKey(owner)],
+            offset: new THREE.Matrix4().copy(st.grip.matrixWorld).invert().multiply(owner.board.matrixWorld) };
+          scene.attach(owner.board);
+        }
+      }
+      if (st.adjust && pressed(1)){
+        _m.multiplyMatrices(st.grip.matrixWorld, st.adjust.offset);
+        _m.decompose(st.adjust.owner.board.position, st.adjust.owner.board.quaternion, _s);
+      }
       if (up(1)) endFit(st);
-      if (down(4) && !st.fitting) st.rec = { s: [], t0: now, last: -1 };
+      if (down(4) && !inputs.some(o => o.adjust && o.adjust.owner === st)) st.rec = { s: [], t0: now, last: -1 };
       if (st.rec && pressed(4)){
         const t = now - st.rec.t0;
         if (t - st.rec.last >= 1 / 40){
@@ -344,46 +548,61 @@ function updateInputs(now){
       if (down(5) && !st.rec) undo();
     }
     else { // compose
+      // stick up/down: brush size, like Gravity Sketch
+      if (Math.abs(ay) > 0.25 && Math.abs(ax) < 0.5){
+        store.brush = THREE.MathUtils.clamp(store.brush * Math.exp(-ay * dt * 1.6), 0.001, 0.02); save();
+      }
+      st.pen.scale.setScalar(Math.max(store.brush, 0.003));
       let usedB = false;
+      st.grip.getWorldPosition(_a);
+      if (!st.held){ const c = nearestCP(_a, 0.03); if (c) hotCP = c; }
       if (down(1)){
-        st.grip.getWorldPosition(_a);
-        const o = nearestLine(_a, 0.06);
-        if (o){
-          o.group.updateMatrixWorld();
-          st.held = { o, from: { p: o.data.p.slice(), q: o.data.q.slice() },
-            offset: new THREE.Matrix4().copy(st.grip.matrixWorld).invert().multiply(o.group.matrixWorld) };
+        const c = nearestCP(_a, 0.03);
+        if (c) st.held = { type: 'cp', o: c.o, k: c.k, from: c.o.data.cp.slice(),
+          off: _b.set(c.o.data.cp[c.k*3], c.o.data.cp[c.k*3+1], c.o.data.cp[c.k*3+2]).sub(_a).clone() };
+        else {
+          const o = nearestLine(_a, 0.06);
+          if (o){ o.group.updateMatrixWorld();
+            st.held = { type: 'line', o, from: { p: o.data.p.slice(), q: o.data.q.slice() },
+              offset: new THREE.Matrix4().copy(st.grip.matrixWorld).invert().multiply(o.group.matrixWorld) }; }
+          else { const so = nearestSurf(_a, 0.05);
+            if (so) st.held = { type: 'surf', o: so, from: so.data.cp.slice(), inv: new THREE.Matrix4().copy(st.grip.matrixWorld).invert() }; }
         }
       }
       if (st.held && pressed(1)){
-        _m.multiplyMatrices(st.grip.matrixWorld, st.held.offset);
-        _m.decompose(st.held.o.group.position, st.held.o.group.quaternion, _s);
-        if (down(5)){                                 // delete the line you're holding
-          const h = st.held; st.held = null; usedB = true;
-          placeLine(h.o.data, h.from.p, h.from.q);
-          act(delLineAct(h.o.data));
+        const h = st.held;
+        if (h.type === 'line'){ _m.multiplyMatrices(st.grip.matrixWorld, h.offset); _m.decompose(h.o.group.position, h.o.group.quaternion, _s); }
+        else if (h.type === 'cp'){ const p = _b.copy(_a).add(h.off), cp = h.o.data.cp; cp[h.k*3] = p.x; cp[h.k*3+1] = p.y; cp[h.k*3+2] = p.z; refreshSurface(h.o); }
+        else { _m.multiplyMatrices(st.grip.matrixWorld, h.inv); const cp = h.o.data.cp;
+          for (let k = 0; k < NC * NC; k++){ _b.set(h.from[k*3], h.from[k*3+1], h.from[k*3+2]).applyMatrix4(_m); cp[k*3] = _b.x; cp[k*3+1] = _b.y; cp[k*3+2] = _b.z; }
+          refreshSurface(h.o); }
+        if (down(5)){                                 // delete what you're holding
+          st.held = null; usedB = true;
+          if (h.type === 'line'){ placeLine(h.o.data, h.from.p, h.from.q); act(delLineAct(h.o.data)); }
+          else { setCP(h.o.data, h.from); act(delSurfAct(h.o.data)); }
         }
       }
-      if (up(1) && st.held){
-        const h = st.held, g = h.o.group; st.held = null;
-        act(moveAct(h.o.data, h.from, { p: g.position.toArray().map(r4), q: g.quaternion.toArray().map(r4) }));
-      }
+      if (up(1)) releaseHeld(st);
       if (down(5) && !usedB && !st.held) undo();
-      if (down(0)) st.sketch = [];
+      if (down(0)) st.sketch = { r: store.brush, a: [], used: false };
       if (st.sketch && pressed(0)){
         st.pen.getWorldPosition(_a);
-        const k = st.sketch.length;
-        if (!k || _b.set(st.sketch[k-3], st.sketch[k-2], st.sketch[k-1]).distanceTo(_a) > 0.004){
-          st.sketch.push(r4(_a.x), r4(_a.y), r4(_a.z)); st.liveSketch.visible = true; livePush(st.liveSketch, _a);
+        const a = st.sketch.a, k = a.length;
+        if (!k || _b.set(a[k-3], a[k-2], a[k-1]).distanceTo(_a) > 0.004){
+          a.push(r4(_a.x), r4(_a.y), r4(_a.z)); st.liveSketch.visible = true; livePush(st.liveSketch, _a);
         }
       }
       if (up(0) && st.sketch){
-        const arr = st.sketch; st.sketch = null; liveReset(st.liveSketch);
-        if (arr.length >= 6) act(addStrokeAct(arr));
+        const sd = st.sketch; st.sketch = null; liveReset(st.liveSketch);
+        if (sd.a.length >= 6) act(addStrokeAct(sd));
       }
-      if (down(4)) syncReplay();
+      if (down(4) && !makeSurfaceFromScribbles()) flash = { text: 'Scribble a bit more first', until: now + 1.5 };
     }
     st.prev = gp.buttons.map(b => b.pressed);
   }
+  showNets(mode === 'compose');
+  surfObjs.forEach(o => o.handles.forEach(h => h.material = cpMat));
+  if (hotCP) hotCP.o.handles[hotCP.k].material = cpHot;
 
   // HUD above the left controller
   const host = inputs.find(s => s.source && s.hand === 'left') || inputs.find(s => s.source);
@@ -391,11 +610,11 @@ function updateInputs(now){
   if (host){
     host.grip.getWorldPosition(hud.position); hud.position.y += 0.1;
     hud.lookAt(renderer.xr.getCamera().getWorldPosition(_b));
-    const rec = inputs.find(s => s.rec), fit = inputs.find(s => s.fitting);
+    const rec = inputs.find(s => s.rec), fit = inputs.find(s => s.adjust);
     if (rec) drawHud('● REC ' + (now - rec.rec.t0).toFixed(1) + ' s', ['Let go of A / X to save this line'], '#ff5a4a');
-    else if (fit) drawHud('Fit board', ['Put your two fingertips on the board', 'Let go of grip to lock it to your hand'], '#e9cfa3');
-    else if (mode === 'record') drawHud('Record', ['Hold A / X: record a line', 'Grip: pin board, place fingers, let go', 'B / Y undo  ·  Stick ← undo  → redo'], '');
-    else drawHud('Compose', ['Grip: move a line  ·  Trigger: sketch', 'A / X: replay together', 'B / Y undo  ·  Stick ← undo  → redo'], '');
+    else if (fit) drawHud('Fit board', ['Move and tilt it under your fingertips', 'Let go of grip to bolt it on there'], '#e9cfa3');
+    else if (mode === 'record') drawHud('Record', ['Hold A / X: record a line', 'Other hand grip on board: move / tilt it', 'B / Y undo  ·  Stick ← undo  → redo', 'Click stick: Compose'], '');
+    else drawHud(now < flash.until ? flash.text : 'Compose', ['Trigger: sketch  ·  Stick ↕ brush size', 'A / X: new scribbles → surface', 'Grip: move a line, surface or orange point', 'B / Y undo  ·  Stick ← → undo / redo'], now < flash.until ? '#ff9a6a' : '');
   }
 }
 
@@ -406,7 +625,7 @@ let clearArmed = false;
 clearBtn.onclick = () => {
   if (!clearArmed){ clearArmed = true; clearBtn.textContent = 'Tap again to clear'; clearBtn.className = 'warn';
     setTimeout(() => { clearArmed = false; clearBtn.textContent = 'Clear all'; clearBtn.className = 'ghost'; }, 3000); return; }
-  [...store.lines].forEach(hideLine); [...store.strokes].forEach(hideStroke);
+  [...store.lines].forEach(hideLine); [...store.strokes].forEach(hideStroke); [...store.surfaces].forEach(hideSurface);
   undoStack.length = 0; redoStack.length = 0;
   clearArmed = false; clearBtn.textContent = 'Clear all'; clearBtn.className = 'ghost'; save();
 };
@@ -440,7 +659,7 @@ async function start(kind){
   const btn = kind === 'immersive-ar' ? mrBtn : vrBtn; btn.disabled = false; btn.textContent = 'Exit';
   session.addEventListener('end', () => {
     scene.background = BG; room.visible = true; hud.visible = false;
-    inputs.forEach(s => { if (s.rec) finishRecording(s); endFit(s); s.held = null; s.sketch = null; liveReset(s.liveSketch); });
+    inputs.forEach(s => { if (s.rec) finishRecording(s); endFit(s); releaseHeld(s); s.sketch = null; liveReset(s.liveSketch); });
     vrBtn.textContent = 'Enter VR'; mrBtn.textContent = 'Enter MR'; setupButtons();
   });
 }
@@ -454,15 +673,18 @@ setupButtons();
   const box = new THREE.Box3();
   lineObjs.forEach(o => { o.group.updateMatrix(); o.pts.forEach(p => box.expandByPoint(p.clone().applyMatrix4(o.group.matrix))); });
   strokeObjs.forEach(o => box.expandByObject(o.mesh));
+  surfObjs.forEach(o => box.expandByObject(o.mesh));
   if (box.isEmpty()) return;
   const c = box.getCenter(new THREE.Vector3()), r = Math.max(0.2, box.getSize(new THREE.Vector3()).length());
   orbit.target.copy(c); camera.position.copy(c).add(new THREE.Vector3(0.6, 0.5, 0.8).multiplyScalar(r)); orbit.update();
 })();
+showNets(false);
 
 // ================= loop =================
+let last = performance.now() / 1000;
 renderer.setAnimationLoop(() => {
-  const now = performance.now() / 1000;
-  if (renderer.xr.isPresenting) updateInputs(now);
+  const now = performance.now() / 1000, dt = Math.min(now - last, 0.05); last = now;
+  if (renderer.xr.isPresenting) updateInputs(now, dt);
   lineObjs.forEach(o => animateGhost(o, now));
   renderer.render(scene, camera);
 });
