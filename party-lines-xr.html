@@ -58,6 +58,8 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+const modelFactory = new XRControllerModelFactory();
 
 // ================= storage =================
 const KEY = 'partylines.v2';
@@ -444,6 +446,7 @@ const penGeo = new THREE.SphereGeometry(1, 16, 10);
 const inputs = [0, 1].map(i => {
   const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
   scene.add(ray, grip);
+  grip.add(modelFactory.createControllerModel(grip));   // shows exactly where the headset thinks your controller is
   const board = makeBoard(0xe9cfa3); grip.add(board);   // locked to the controller
   const pen = new THREE.Mesh(penGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x444444, transparent: true, opacity: .85 }));
   ray.add(pen);
@@ -454,6 +457,7 @@ const inputs = [0, 1].map(i => {
   return st;
 });
 const fitKey = st => (st.hand === 'left' ? 'left' : 'right');
+const rides = st => fitKey(st) === (store.ride || 'right');
 function applyFit(st){ const f = store.fit[fitKey(st)]; st.board.position.fromArray(f.p); st.board.quaternion.fromArray(f.q); }
 
 function nearestLine(worldP, maxD){
@@ -501,7 +505,7 @@ function updateInputs(now, dt){
   let hotCP = null;
   for (const st of inputs){
     const gp = st.source && st.source.gamepad;
-    st.board.visible = !!gp && mode === 'record';
+    st.board.visible = !!gp && mode === 'record' && rides(st);
     st.pen.visible = !!gp && mode === 'compose';
     if (!gp) continue;
     const pressed = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
@@ -519,23 +523,16 @@ function updateInputs(now, dt){
       if (mode === 'compose') syncReplay();          // every run starts together when you come in to compose
     }
     else if (mode === 'record'){
-      // grip with one hand near the other hand's board: grab it, move and tilt it, let go to bolt it on there
-      if (down(1) && !st.rec){
-        st.grip.getWorldPosition(_a);
-        const owner = inputs.find(o => o !== st && o.source && !o.rec && o.board.getWorldPosition(_b).distanceTo(_a) < 0.09);
-        if (owner){
-          owner.board.updateMatrixWorld();
-          st.adjust = { owner, from: store.fit[fitKey(owner)],
-            offset: new THREE.Matrix4().copy(st.grip.matrixWorld).invert().multiply(owner.board.matrixWorld) };
-          scene.attach(owner.board);
-        }
+      if (rides(st)){
+        // riding hand. B / Y held: the board stays put in the air while you set your fingertips on it; let go to bolt it on
+        if (down(5) && !st.rec){ st.adjust = { owner: st, from: store.fit[fitKey(st)] }; scene.attach(st.board); }
+        if (up(5)) endFit(st);
+        if (down(4) && !st.adjust) st.rec = { s: [], t0: now, last: -1 };
+      } else {
+        // menu hand. A / X: switch which hand rides. B / Y: undo
+        if (down(4)){ inputs.forEach(o => { if (o.rec) finishRecording(o); endFit(o); }); store.ride = st.hand === 'left' ? 'left' : 'right'; save(); }
+        if (down(5)) undo();
       }
-      if (st.adjust && pressed(1)){
-        _m.multiplyMatrices(st.grip.matrixWorld, st.adjust.offset);
-        _m.decompose(st.adjust.owner.board.position, st.adjust.owner.board.quaternion, _s);
-      }
-      if (up(1)) endFit(st);
-      if (down(4) && !inputs.some(o => o.adjust && o.adjust.owner === st)) st.rec = { s: [], t0: now, last: -1 };
       if (st.rec && pressed(4)){
         const t = now - st.rec.t0;
         if (t - st.rec.last >= 1 / 40){
@@ -545,7 +542,6 @@ function updateInputs(now, dt){
         }
       }
       if (up(4) && st.rec) finishRecording(st);
-      if (down(5) && !st.rec) undo();
     }
     else { // compose
       // stick up/down: brush size, like Gravity Sketch
@@ -612,8 +608,13 @@ function updateInputs(now, dt){
     hud.lookAt(renderer.xr.getCamera().getWorldPosition(_b));
     const rec = inputs.find(s => s.rec), fit = inputs.find(s => s.adjust);
     if (rec) drawHud('● REC ' + (now - rec.rec.t0).toFixed(1) + ' s', ['Let go of A / X to save this line'], '#ff5a4a');
-    else if (fit) drawHud('Fit board', ['Move and tilt it under your fingertips', 'Let go of grip to bolt it on there'], '#e9cfa3');
-    else if (mode === 'record') drawHud('Record', ['Hold A / X: record a line', 'Other hand grip on board: move / tilt it', 'B / Y undo  ·  Stick ← undo  → redo', 'Click stick: Compose'], '');
+    else if (fit) drawHud('Fit board', ['Set your two fingertips on the board', 'Let go of ' + (store.ride === 'left' ? 'Y' : 'B') + ' to bolt it on there'], '#e9cfa3');
+    else if (mode === 'record'){
+      const R = store.ride === 'left', rec1 = R ? 'X' : 'A', fit1 = R ? 'Y' : 'B', swap = R ? 'A' : 'X', und = R ? 'B' : 'Y';
+      drawHud('Record',
+        [(R ? 'Left' : 'Right') + ' hand rides  ·  hold ' + rec1 + ' to record', 'Hold ' + fit1 + ': fit board, set fingers, let go',
+         swap + ': ride with this hand  ·  ' + und + ': undo', 'Stick ← → undo / redo  ·  Click: Compose'], '');
+    }
     else drawHud(now < flash.until ? flash.text : 'Compose', ['Trigger: sketch  ·  Stick ↕ brush size', 'A / X: new scribbles → surface', 'Grip: move a line, surface or orange point', 'B / Y undo  ·  Stick ← → undo / redo'], now < flash.until ? '#ff9a6a' : '');
   }
 }
