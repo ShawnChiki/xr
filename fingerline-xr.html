@@ -460,7 +460,8 @@ function relink(){
   for (const st of W3.strokes.values()){
     if (st.t !== 'guide') continue;
     let acc = 0, k = 0;
-    for (const sg of st.segs){ for (let s = (20 - acc % 20) % 20; s < sg.len; s += 20) W3.beads.push({ key: st.id + ':' + k++, p: sg.a.clone().addScaledVector(sg.t, s), t: sg.t, st }); acc += sg.len; }
+    let prev = null;
+    for (const sg of st.segs){ for (let s = (20 - acc % 20) % 20; s < sg.len; s += 20){ const b = { key: st.id + ':' + k++, p: sg.a.clone().addScaledVector(sg.t, s), t: sg.t, st, next: null }; if (prev) prev.next = b; prev = b; W3.beads.push(b); } acc += sg.len; }
   }
   W3.floorY = W3.fixedFloor != null ? W3.fixedFloor : W3.minY - 60;
 }
@@ -608,7 +609,7 @@ function takeoff3(r, kind, popF, railSeg){
   let planF = null;
   if (r.forceJump && (kind === 'end' || kind === 'ollie')){ planF = r.forceJump.pop; if (r.forceJump.ang) vel.applyAxisAngle(n, r.forceJump.ang); popped = planF > 0; }
   else if (kind === 'lip' || kind === 'end') popped = wantPop3(r);
-  r.forceJump = null; r.flat = null; r.endPlan = null;
+  r.forceJump = null; r.flat = null; r.endPlan = null; r.brake = null; r.guideDep = null;
   if (popped){ const f = planF != null ? planF : kind === 'hop' ? 0.55 : kind === 'rail' ? popF : kind === 'lip' || kind === 'end' ? 0.8 : 1; vel.addScaledVector(n, (260 + 230 * g.pop) * f); }
   closeGrind(r); closeManual(r);
   r.mode = 'air'; r.vel.copy(vel); r.pos.addScaledVector(n, 0.6);
@@ -628,7 +629,7 @@ function evalJump3(r, popF){
 }
 function judgeJump3(r, pos, n, vel, skip, spd){
   const g = r.g, p = predict3(pos.clone().addScaledVector(n, 0.6), vel, skip, 0.07, r);
-  if (!p || p.floor) return { ok: false, score: -9, ret: 0, T: 0 };
+  if (!p || p.floor) return { ok: false, score: -9, ret: 0, T: 0, nothing: true };
   const coinB = (W3.coins.length ? coinsAlong3(r, p.pts) * (0.8 + 1.2 * visOf(g)) : 0) + (W3.beads && W3.beads.length ? Math.min(1.2, beadsAlong3(r, p.pts) * 0.12) : 0);
   const vn = Math.abs(p.vel.dot(p.n)), tang = Math.sqrt(Math.max(0, p.vel.lengthSq() - vn * vn));
   const vroll = Math.max(60, Math.sqrt(Math.max(0, spd * spd + 2 * G * (pos.y - p.pos.y))));
@@ -759,6 +760,15 @@ function groundStep3(r, dt){
     if (r.pumping){ r.u += sgU * (20 + 120 * (g.pump ?? 0.5)) * Math.min(1, down / 400) * dt; r.crouch = Math.max(r.crouch, 0.5); } }
   let fr = (14 + 0.00032 * r.u * r.u) * Sim.fric; if (r.manual) fr += 12 * Sim.fric;
   const f = fr * dt; r.u = Math.abs(r.u) <= f ? 0 : r.u - Math.sign(r.u) * f;
+  if (r.brake){
+    const bk = brakeOf(g) * dt; r.u = Math.abs(r.u) <= bk ? 0 : r.u - Math.sign(r.u) * bk; r.brake.t = (r.brake.t || 0) + dt; r.crouch = Math.max(r.crouch, 0.8);
+    if (Math.abs(r.u) < 18 || Math.sign(r.u) !== r.brake.dir){
+      const B = r.brake; r.brake = null; r.u = 0;
+      if (B.t > 0.2){ const pts = award(r, 'Powerslide', 30, 'tricks', false); emit(r, { type: 'trick', text: 'Powerslide', pts, small: true }); }
+      if (B.end && r.sense && r.sense.kind === 'end' && r.sense.d < 40 && rr() < 0.6) return startLip(r, END_STALLS);
+      r.flat = { name: 'Kickturn', base: 20, dur: 0.45, t: 0, turn: true, push: -B.dir };
+    }
+  }
   r.u = clamp(r.u, -3200, 3200);
   // sideways: banks pull riders down-slope, turns throw them outward; the wheels grip up to a limit
   // set by how hard they press into the surface, and good balance keeps them near the middle
@@ -776,7 +786,7 @@ function groundStep3(r, dt){
     const pin = () => { r.s = atEnd ? sg.len : 0; placeOn(r); };
     if (!nx){ pin();
       const key = sg.st.id + ':' + (atEnd ? 1 : 0), P = r.endPlan && r.endPlan.key === key ? r.endPlan : null;
-      if (P && P.stall) return startLip(r, END_STALLS);
+      if (P && P.stall && Math.abs(r.u) < 130) return startLip(r, END_STALLS);
       if (P && P.pop != null) r.forceJump = P;
       return takeoff3(r, 'end'); }
     const dOld = sg.t.clone().multiplyScalar(atEnd ? 1 : -1), dNew = nx.seg.t.clone().multiplyScalar(nx.fromStart ? 1 : -1), nOld = sg.n.clone().multiplyScalar(r.sigma);
@@ -817,10 +827,12 @@ function groundStep3(r, dt){
   // rolling tricks on flat ground: tic-tacs to pick up speed, pivots, spacewalks
   if (r.flat){
     const F = r.flat; F.t += dt;
-    if (F.name === 'Tic-Tac') r.u += (Math.sign(r.u) || F.dir) * (60 + 120 * (g.pump ?? 0.5)) * dt;
+    if (F.name === 'Kickturn') r.u = 0;
+    else if (F.name === 'Tic-Tac') r.u += (Math.sign(r.u) || F.dir) * (60 + 120 * (g.pump ?? 0.5)) * dt;
     if (F.t >= F.dur){
       r.flat = null; r.flatCool = 1.2 + rr();
       if (F.turn) r.nose.negate();
+      if (F.push) r.u = F.push * (70 + 70 * (g.pump ?? 0.5));
       const pts = award(r, F.name, F.base, 'tricks', false); emit(r, { type: 'trick', text: F.name, pts, small: F.base < 30 });
     }
   } else if (r.flatCool > 0) r.flatCool -= dt;
@@ -838,7 +850,8 @@ function groundStep3(r, dt){
     if (rr() < 0.25 + 0.6 * g.lip) return startLip(r, LIPS);
   }
   // read the road ahead: where it ends, where it hits a wall
-  r.senseT = (r.senseT || 0) - dt; if (r.senseT <= 0){ r.senseT = 0.1; senseAhead3(r); coinAim3(r); }
+  r.senseT = (r.senseT || 0) - dt; if (r.senseT <= 0){ r.senseT = 0.1; senseAhead3(r); coinAim3(r); guideScan3(r); }
+  if (r.guideDep && !r.brake && guideJump3(r)) return;
   // a coin hanging above the road ahead: ollie just high enough, just in time
   { const A = r.coinAim;
     if (A && A.h > (A.bead ? 24 : 16) && !r.manual && !r.lip && !aimTaken(r, A) && !r.reacted.has('aim' + A.key) && Math.abs(r.u) > 60){
@@ -849,13 +862,14 @@ function groundStep3(r, dt){
   const ev = r.sense;
   if (ev && Math.abs(r.u) > 40){
     const tE = ev.d / Math.abs(r.u);
-    if (ev.kind === 'end' && tE < 0.45 && (!r.endPlan || r.endPlan.key !== ev.key)) planEnd3(r, ev);
-    if (ev.kind === 'end' && tE < 0.3 && r.endPlan && r.endPlan.revert && r.endPlan.key === ev.key){ r.endPlan = null; powerslide3(r); return; }
+    const stopD = r.u * r.u / (2 * brakeOf(g)) + 14;
+    if (ev.kind === 'end' && (tE < 0.45 || ev.d < stopD + Math.abs(r.u) * 0.25) && (!r.endPlan || r.endPlan.key !== ev.key)) planEnd3(r, ev);
+    if (ev.kind === 'end' && !r.brake && r.endPlan && r.endPlan.brake && r.endPlan.key === ev.key && ev.d <= stopD){ r.brake = { dir: Math.sign(r.u), end: true }; r.manual = null; r.flat = null; }
     else if (ev.kind === 'slam' && tE < 0.25 && !r.reacted.has('slam' + ev.key)){
       r.reacted.add('slam' + ev.key);
       if (rr() < 0.25 + 0.75 * g.aware){
         const e = evalJump3(r, 1); if (e.ok) return takeoff3(r, 'obstacle');
-        if (Math.abs(r.u) < 420){ powerslide3(r); return; }
+        if (ev.d >= stopD * 0.8){ r.brake = { dir: Math.sign(r.u) }; r.manual = null; r.flat = null; }
       }
     }
   }
@@ -883,7 +897,7 @@ function grindStep3(r, dt){
     if (!nx || nx.seg.t.dot(sg.t) * (nx.fromStart === atEnd ? 1 : -1) < 0.6){
       r.s = atEnd ? sg.len : 0; placeOn(r);
       // reaching the end slowly: maybe stall right on the end before popping out
-      if (!r.endStalled && Math.abs(r.u) < 230 && rr() < 0.12 + 0.55 * r.g.lip * r.g.balance){
+      if (!r.endStalled && Math.abs(r.u) < 120 && rr() < 0.12 + 0.55 * r.g.lip * r.g.balance){
         const P = pickW(RSTALLS, r.g); r.endStalled = true;
         r.rstall = { name: P[0], base: P[1], dur: P[2] * (0.8 + 0.4 * rr()), t: 0, u: r.u, back: rr() < 0.4 }; r.u = 0; r.crouch = 0.7;
         emit(r, { type: 'land', hard: 0.15, rail: true, k: sg.st.k || 'round' }); return;
@@ -912,7 +926,8 @@ const END_STALLS = [['Tail Stall', 60, 0.6, g => 0.3 + 0.8 * g.manual, { end: 1 
 const RSTALLS = [['50-50 Stall', 60, 0.55, g => 0.2 + g.g5050, false], ['5-0 Stall', 70, 0.6, g => 0.2 + g.g50, false], ['Nose Stall', 80, 0.55, g => 0.15 + g.gNose, false],
   ['Feeble Stall', 110, 0.65, g => 0.1 + g.gBoard * 0.6 + g.g50 * 0.4, false], ['Smith Stall', 120, 0.65, g => 0.1 + g.gCrook * 0.5 + g.g50 * 0.5, false],
   ['Crooked Stall', 100, 0.6, g => 0.1 + g.gCrook, false], ['Blunt Stall', 150, 0.6, g => 0.05 + g.risk * g.gBoard, true]];
-function powerslide3(r){ r.u *= -0.45; r.nose.negate(); r.flat = { name: 'Powerslide', base: 35, dur: 0.32, t: 0 }; r.manual = null; }
+// how hard a rider can powerslide to a stop
+const brakeOf = g => 520 + 480 * g.balance;
 function pickW(list, g){
   let tot = 0; for (const L of list) tot += L[3](g);
   let x = rr() * tot; for (const L of list){ x -= L[3](g); if (x <= 0) return L; } return list[0];
@@ -920,7 +935,7 @@ function pickW(list, g){
 function startLip(r, list){
   const P = pickW(list, r.g), f = P[4] || {};
   r.lip = { name: P[0], base: P[1], dur: P[2] * (0.8 + 0.4 * rr()), t: 0, dir: Math.sign(r.u) || 1, turn: !!f.turn, inv: !!f.inv, end: !!f.end };
-  r.u = 0; r.v = 0; r.crouch = 0.7; r.manual = null; r.flat = null; r.endPlan = null; emit(r, { type: 'land', hard: 0.2 });
+  r.u = 0; r.v = 0; r.crouch = 0.7; r.manual = null; r.flat = null; r.endPlan = null; r.brake = null; emit(r, { type: 'land', hard: 0.2 });
 }
 // walk along the ribbon ahead (cheap: no ray casts) and note the first thing that matters
 function senseAhead3(r){
@@ -944,14 +959,16 @@ function planEnd3(r, ev){
   const g = r.g; r.endPlan = { key: ev.key };
   if (rr() > 0.25 + 0.75 * visOf(g)) return;
   const popV = 260 + 230 * g.pop, pops = visOf(g) > 0.5 ? [0, 0.5, 0.8, 1] : [0, 0.8], angs = [0, 0.13, -0.13];
-  let best = null;
+  let best = null, anyLand = false;
   for (const pop of pops) for (const ang of angs){
     const vel = ev.t.clone().applyAxisAngle(ev.n, ang).multiplyScalar(ev.spd).addScaledVector(ev.n, popV * pop);
     const e = judgeJump3(r, ev.p, ev.n, vel, ev.seg, ev.spd), sc = e.score - Math.abs(ang) * 0.6 + (pop ? 0.05 * g.ambition : 0);
+    if (!e.nothing) anyLand = true;
     if (!best || sc > best.sc) best = { sc, ok: e.ok, pop, ang };
   }
-  if (best.ok) Object.assign(r.endPlan, { pop: best.pop, ang: best.ang });
-  else if (rr() < 0.3 + 0.7 * g.judgment){ if (ev.spd < 340) r.endPlan.stall = true; else r.endPlan.revert = true; }
+  // jump if there's anywhere to come down; only brake when flying off would land on nothing at all
+  if (best.ok || anyLand) Object.assign(r.endPlan, { pop: best.pop, ang: best.ang });
+  else if (rr() < 0.3 + 0.7 * g.judgment) r.endPlan.brake = true;
 }
 function react3(r, id){ if (r.reacted.has(id)) return; r.reacted.add(id); if (rr() < 0.2 + 0.8 * r.g.aware) takeoff3(r, 'obstacle'); }
 function lookAhead3(r){
@@ -1098,7 +1115,7 @@ function poolVictim(e){
 }
 
 // ---------- guides: drawn arrows that pay a little for following them, in the direction drawn ----------
-const BEAD_R = 34, BEAD_PTS = 8;
+const BEAD_R = 34, BEAD_PTS = 20;
 const aimTaken = (r, A) => A.bead ? r.beads.has(A.c.key) : r.got.has(A.c.id);
 function followGuides3(r){
   const c0 = r.pos.clone().addScaledVector(r.up, 14), m = velOf3(r), sp = m.length(); if (sp < 20) return;
@@ -1123,6 +1140,46 @@ function beadsAlong3(r, pts){
   return k;
 }
 
+// a guide that leaves this road (up into the air, or across to another road): find where it departs...
+function guideScan3(r){
+  r.guideDep = null; const g = r.g;
+  if (!W3.beads || !W3.beads.length) return;
+  r.guideSense = true;   // everyone reads the guides you draw
+  const sp = Math.abs(r.u); if (!r.guideSense || sp < 50) return;
+  const d = motionDir(r).normalize(), n = surfNormal(r), sg = r.seg, reach = 30 + sp * (0.35 + 0.6 * visOf(g)), e = new V3();
+  let best = null;
+  for (const b of W3.beads){
+    if (r.reacted.has('gj' + b.key) || b.t.dot(d) < 0.2) continue;
+    e.subVectors(b.p, r.pos); const along = e.dot(d); if (along < -5 || along > reach) continue;
+    const h = e.dot(n), lat = r.w + e.dot(sg.bn); if (h < -20 || h > 45 || Math.abs(lat) > sg.W / 2 + 30) continue;
+    const b2 = b.next && b.next.next; if (!b2) continue;
+    e.subVectors(b2.p, r.pos); const h2 = e.dot(n), lat2 = r.w + e.dot(sg.bn);
+    if (h2 < 30 && Math.abs(lat2) < sg.W / 2 + 12) continue;      // still running along this road
+    if (!best || along < best.along) best = { b, along };
+  }
+  r.guideDep = best;
+}
+// ...and when we reach it, jump the way the guide goes
+function guideJump3(r){
+  const G0 = r.guideDep, b = G0.b; if (r.reacted.has('gj' + b.key) || r.manual || r.lip) return false;
+  const d = motionDir(r).normalize(), along = new V3().subVectors(b.p, r.pos).dot(d);
+  if (along > Math.abs(r.u) * 0.05 + 8) return false;
+  r.reacted.add('gj' + b.key); r.guideDep = null;
+  const g = r.g, n = surfNormal(r), popV = 260 + 230 * g.pop;
+  const tgt = new V3().subVectors((b.next.next.next || b.next.next).p, b.p); tgt.addScaledVector(n, -tgt.dot(n));
+  let ang = 0; if (tgt.lengthSq() > 1) { tgt.normalize(); ang = clamp(Math.atan2(new V3().crossVectors(d, tgt).dot(n), d.dot(tgt)), -0.65, 0.65); }
+  let best = null;
+  for (const a of [ang, ang * 0.6, ang * 1.25]) for (const f of [0.3, 0.6, 0.9, 1.15]){
+    const vel = motionDir(r).applyAxisAngle(n, a).addScaledVector(n, popV * f);
+    const p = predict3(r.pos.clone().addScaledVector(n, 0.6), vel, r.seg, 0.07, r); if (!p) continue;
+    const beads = beadsAlong3(r, p.pts), land = !p.floor && p.n.y > 0.15 && angleBetween(n, p.n) < 0.9;
+    const sc = beads + (land ? 3 : -4);
+    if (!best || sc > best.sc) best = { sc, beads, a, f };
+  }
+  if (!best || best.beads < 2) return false;
+  r.forceJump = { pop: best.f, ang: best.a }; takeoff3(r, 'ollie'); return true;
+}
+
 // ======================================================================
 // XR APP. The park group "dio" carries the park's placement in the room:
 // position, yaw, and a uniform scale in metres per park unit.
@@ -1132,7 +1189,7 @@ const S = { width: 56, batch: 3, cap: 10, limit: 60, fric: 60, smoothLv: 1, spee
 // park sizes: metres per park unit. A board is 40 units long.
 const SCALES = { finger: { name: 'Fingerboard', s: 0.0024, board: '10 cm' }, mini: { name: 'Mini', s: 0.0075, board: '30 cm' }, skate: { name: 'Skateboard', s: 0.02, board: '80 cm' } };
 // rewards: tricks first by default
-Object.assign(RW, { coins: 3, guides: 1.5, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 });
+Object.assign(RW, { coins: 3, guides: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 });
 const TILTS = { auto: 'Bank: auto', hand: 'Bank: hand', flat: 'Bank: flat' };
 const TILT_HINT = { auto: 'Turns bank themselves for the speed riders will have', hand: 'Twist your wrist to bank ramps', flat: 'Ramps stay level side to side' };
 const SPEEDS = [0.5, 1, 2, 4];
@@ -1148,7 +1205,7 @@ const TOOL_HELP = {
   curve: 'Click to place points; the road curves smoothly through them. Click the last point again or click the right stick to finish. B/Y takes back a point.',
   poly: 'Click to place points; straight runs with hard corners. Click the last point again or click the right stick to finish. B/Y takes back a point.',
   edit: 'Pull a dot to move it (twist to tilt). Grab the road between dots to add one. B/Y on a dot deletes it. Right stick click: smooth or sharp. Stick up/down near a ribbon: wider or narrower.',
-  guideTip: 'Guide: draw the way you want riders to go. Riders earn a little for each stretch they follow in the arrow direction.',
+  guideTip: 'Guide: draw the way you want riders to go, even off a road and through the air onto another. Riders earn points for every stretch they follow in the arrow direction, and sparkle cyan while they do.',
   eraser: 'Touch a path with the tip to cut that piece away; sweep along it to erase more. Touching a coin removes it.',
   coin: 'Click to place a coin where riders should go; on a road it floats just above it. Click a coin to remove it. Riders earn the most for grabbing coins. A coin few riders reach grows and is worth more, so one coin on each of three paths splits riders between them.',
   flag: 'Click where riders start, pointing the way they should head.' };
@@ -1240,7 +1297,7 @@ const M = {
   dash: mat(0xF6F5EF, { roughness: 0.6, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }),
   guide: new THREE.MeshBasicMaterial({ color: 0x2EC4E8, transparent: true, opacity: 0.55, depthWrite: false }),
   props: new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.8, metalness: 0.15, side: THREE.DoubleSide }),
-  graffiti: mat(0xffffff, { map: graffitiAtlas(), transparent: true, depthWrite: false, roughness: 0.75, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }),
+  graffiti: mat(0xffffff, { map: graffitiAtlas(), side: THREE.DoubleSide, transparent: true, depthWrite: false, roughness: 0.75, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }),
   earth: new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1, side: THREE.DoubleSide }),
 };
 const yCyl = new THREE.CylinderGeometry(1, 1, 1, 8, 1), sphGeo = new THREE.SphereGeometry(1, 12, 8);
@@ -1294,15 +1351,20 @@ function graffitiInto(st, L, Rt, NN, pos, uv, nor){
   const total = S[N - 1], W = st.W; if (total < W * 1.5) return;
   let seed = (st.id * 9301 + 49297) % 233280; const R = () => (seed = (seed * 9301 + 49297) % 233280) / 233280;
   const at = s => { let i = 0; while (i < N - 2 && S[i + 1] < s) i++; const f = clamp((s - S[i]) / Math.max(1e-6, S[i + 1] - S[i]), 0, 1); return [C[i].clone().lerp(C[i + 1], f), B[i].clone().lerp(B[i + 1], f).normalize(), NN[i].clone().lerp(NN[i + 1], f).normalize()]; };
-  for (let s0 = W * 0.4; s0 < total - W * 0.9; s0 += W * (0.75 + R() * 0.9)){
-    if (R() < 0.15) continue;
-    const len = W * (0.75 + R() * 0.5), wd = W * (0.6 + R() * 0.38), off = (R() - 0.5) * Math.max(0, W - wd), cell = Math.floor(R() * 16), flip = R() < 0.5;
-    const u0 = (cell % 4) / 4, v0 = 1 - (Math.floor(cell / 4) + 1) / 4, K = 5, ring = [];
-    for (let k = 0; k <= K; k++){ const [c, b, n] = at(s0 + len * k / K); const lift = n.clone().multiplyScalar(0.2); ring.push([c.clone().addScaledVector(b, off - wd / 2).add(lift), c.clone().addScaledVector(b, off + wd / 2).add(lift), n, k / K]); }
-    for (let k = 0; k < K; k++){
-      const [a0, a1, na, fa] = ring[k], [b0, b1, nb, fb] = ring[k + 1];
-      const U = (side, f) => flip ? [u0 + (1 - f) * 0.25, v0 + side * 0.25] : [u0 + f * 0.25, v0 + side * 0.25];
-      for (const [p, n, t] of [[a0, na, U(0, fa)], [a1, na, U(1, fa)], [b0, nb, U(0, fb)], [a1, na, U(1, fa)], [b1, nb, U(1, fb)], [b0, nb, U(0, fb)]]){ pos.push(p.x, p.y, p.z); nor.push(n.x, n.y, n.z); uv.push(t[0], t[1]); }
+  const count = Math.round(total / W * 2.2);
+  for (let q = 0; q < count; q++){
+    const len = W * (0.45 + R() * 0.8), wd = W * (0.35 + R() * 0.6), th = R() < 0.5 ? (R() - 0.5) * 0.6 : (R() - 0.5) * Math.PI * 2;
+    // how far it reaches across the road once turned; keep it on the road, anywhere side to side
+    const ext = Math.abs(len / 2 * Math.sin(th)) + Math.abs(wd / 2 * Math.cos(th)), room = W / 2 - 1 - ext;
+    const sc = room < 0 ? (W / 2 - 1) / ext : 1, L2 = len * sc, W2 = wd * sc, off = room > 0 ? (R() * 2 - 1) * room : 0;
+    const reach = Math.abs(L2 / 2 * Math.cos(th)) + Math.abs(W2 / 2 * Math.sin(th)), s0 = reach + R() * Math.max(1, total - 2 * reach);
+    const cell = Math.floor(R() * 16), u0 = (cell % 4) / 4, v0 = 1 - (Math.floor(cell / 4) + 1) / 4, lift = 0.12 + (q % 12) * 0.025, K = 4, grid = [];
+    for (let a = 0; a <= K; a++){ const row = []; for (let b = 0; b <= K; b++){
+      const x = (a / K - 0.5) * L2, y = (b / K - 0.5) * W2, sAt = s0 + x * Math.cos(th) - y * Math.sin(th), wAt = off + x * Math.sin(th) + y * Math.cos(th);
+      const [c, bv, nv] = at(clamp(sAt, 0, total)); row.push([c.clone().addScaledVector(bv, clamp(wAt, -W / 2 + 0.5, W / 2 - 0.5)).addScaledVector(nv, lift), nv, [u0 + a / K * 0.25, v0 + b / K * 0.25]]); } grid.push(row); }
+    for (let a = 0; a < K; a++) for (let b = 0; b < K; b++){
+      const A = grid[a][b], B = grid[a + 1][b], C = grid[a][b + 1], D = grid[a + 1][b + 1];
+      for (const [p, nv, t] of [A, B, C, B, D, C]){ pos.push(p.x, p.y, p.z); nor.push(nv.x, nv.y, nv.z); uv.push(t[0], t[1]); }
     }
   }
 }
@@ -1716,13 +1778,14 @@ const FLAT_POSE = {
   'Tic-Tac':      (p, t) => { p.tilt = -0.1; p.pivot = -13; p.pivYaw = 0.35 * Math.sin(t * 15); },
   'Spacewalk':    (p, t, d) => { const s = clamp(Math.min(t / 0.12, (d - t) / 0.12), 0, 1); p.tilt = -0.22 * s; p.pivot = -13; p.pivYaw = 0.55 * Math.sin(t * 10) * s; },
   'Pivot 180':    (p, t, d) => { p.body = Math.PI * ease(t / d); p.tilt = -0.15; p.pivot = -13; },
-  'Powerslide':   (p, t, d) => { p.body = Math.PI * (1 - ease(t / d)); p.crouch = 0.9; },
+  'Kickturn':     (p, t, d) => { p.body = Math.PI * ease(t / d); p.tilt = -0.3 * Math.sin(Math.PI * clamp(t / d, 0, 1)); p.pivot = -13; },
   'Casper Pivot': (p, t, d) => { const s = clamp(Math.min(t / 0.15, (d - t) / 0.15), 0, 1); p.flip = 2.4 * s; p.tilt = 0.25 * s; p.pivot = 13; p.pivYaw = 0.6 * Math.sin(t * 8) * s; },
 };
 function riderPose(r){
   const ph = r.mode === 'air' ? r.ph : ZERO;
   const p = { flip: ph.flip, yaw: ph.shuv, imp: ph.imp || 0, tilt: 0, pivot: 0, pivYaw: 0, dy: 0, lift: ph.sep * 8, crouch: clamp(r.crouch + ph.sep * 0.4, 0, 1), grab: ph.grab, body: ph.body, inv: ph.inv, invPivot: 0, handDy: 0 };
   if (r.mode === 'ground' && r.manual){ const t = clamp(r.manual.t / 0.12, 0, 1) * clamp((r.manual.dur - r.manual.t) / 0.12, 0, 1); p.tilt = (r.manual.nose ? 0.2 : -0.2) * t; p.pivot = r.manual.nose ? 13 : -13; }
+  if (r.mode === 'ground' && r.brake){ const k = clamp((r.brake.t || 0) / 0.15, 0, 1); p.body = r.brake.dir * 1.2 * k; p.crouch = 0.85; }
   if (r.mode === 'ground' && r.flat){ const F = FLAT_POSE[r.flat.name]; if (F) F(p, r.flat.t, r.flat.dur); }
   if (r.mode === 'ground' && r.lip){ const L = r.lip, s = ease(clamp(Math.min(L.t / 0.18, (L.dur - L.t) / 0.18), 0, 1)); (LIP_POSE[L.name] || (() => {}))(p, s, L.t / L.dur); }
   if (r.mode === 'grind' && r.grind){ const nm = r.grind.style[1], rk = r.seg.st.k; p.dy = rk === 'ledge' ? 2.4 : 4.5;
@@ -1942,6 +2005,7 @@ const SFX = {
     else if (k === 'square'){ metal(ac, t, o, 0.14); nHit(ac, t, o, 'bandpass', 2400, 1.5, 0.05, 0.22); tHit(ac, t, o, 260, 160, 0.08, 0.16, 'triangle'); }
     else if (k === 'coping'){ metal(ac, t, o, 0.12); for (let i = 0; i < 4; i++) nHit(ac, t + i * 0.022, o, 'bandpass', 2800 - i * 300, 3, 0.02, 0.16 - i * 0.03); }
     else { metal(ac, t, o, 0.22); nHit(ac, t, o, 'highpass', 3500, 0.8, 0.06, 0.08); } }),
+  blip: p => oneShot(p, (ac, t, o) => tHit(ac, t, o, 1568 + Math.random() * 200, 2093, 0.09, 0.05, 'sine', 0.003)),
   coin: p => oneShot(p, (ac, t, o) => { tHit(ac, t, o, 988, 988, 0.08, 0.1, 'square', 0.002); tHit(ac, t + 0.075, o, 1319, 1319, 0.34, 0.1, 'square', 0.002); }),
   // two riders running into each other: a cartoon bonk
   bonk: p => oneShot(p, (ac, t, o) => { tHit(ac, t, o, 880, 300, 0.16, 0.3, 'square', 0.002); tHit(ac, t + 0.02, o, 520, 1040, 0.35, 0.16, 'sine'); nHit(ac, t, o, 'lowpass', 300, 0.7, 0.18, 0.5); tHit(ac, t, o, 120, 50, 0.2, 0.35); }),
@@ -2004,7 +2068,7 @@ let bestDist = 0, seenTricks = new Set(), lastSting = 0;
 Sim.onEvent = (r, ev) => {
   const at = r.pos;
   if (ev.type === 'branch'){ if (following && followTarget() === r) callout(r, 'NEW MOVE', '', '#9A5CE0'); return; }
-  if (ev.type === 'guide') return;
+  if (ev.type === 'guide'){ burst(at.clone().addScaledVector(r.up, 18), 3 * ev.n, ['#2EC4E8', '#9BE7F7', '#ffffff'], 70, 30, 0.5, 40); if (clock - (r.blipT || 0) > 0.12){ r.blipT = clock; SFX.blip(at); } return; }
   if (ev.type === 'coin'){
     const c = ev.coin; c.pulse = 1; SFX.coin(c.p); burst(c.p.clone(), 22, ['#FFC83D', '#FFE08A', '#ffffff'], 200, 80, 0.7, 120);
     if (ev.all){ callout(r, 'ALL COINS!', '+' + ev.pts, '#F2A900', true); if (clock - lastSting > 1.2){ lastSting = clock; stinger(RECORD_STINGS[2], 0.45); } }
@@ -2497,11 +2561,11 @@ menuMesh.position.set(0, 0.03, -0.04 - MENU_W * MH / MW / 2); menuMesh.rotation.
 menuMesh.visible = false;
 let menuDirty = true, menuHover = null, menuPressed = null, flashText = '', flashT = 0, menuTab = 'draw', menuShown = true;
 function flash(t){ flashText = t; flashT = 2.4; menuDirty = true; const s = $('#status'); if (s && !renderer.xr.isPresenting) s.textContent = t; }
-const PRESETS = { tricks: { coins: 3, guides: 1.5, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 },
-  even: { coins: 3, guides: 1.5, tricks: 1, air: 1, grinds: 1, manuals: 1, distance: 1, variety: 1, bail: 0 },
-  grind: { coins: 3, guides: 1.5, tricks: 0.75, air: 0.5, grinds: 3, manuals: 1.5, distance: 0.5, variety: 1, bail: 100 },
-  safe: { coins: 3, guides: 1.5, tricks: 0.5, air: 0.5, grinds: 0.5, manuals: 0.5, distance: 3, variety: 0.5, bail: 600 },
-  style: { coins: 3, guides: 1.5, tricks: 1, air: 0.75, grinds: 1, manuals: 1, distance: 0.5, variety: 3, bail: 100 } };
+const PRESETS = { tricks: { coins: 3, guides: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 },
+  even: { coins: 3, guides: 3, tricks: 1, air: 1, grinds: 1, manuals: 1, distance: 1, variety: 1, bail: 0 },
+  grind: { coins: 3, guides: 3, tricks: 0.75, air: 0.5, grinds: 3, manuals: 1.5, distance: 0.5, variety: 1, bail: 100 },
+  safe: { coins: 3, guides: 3, tricks: 0.5, air: 0.5, grinds: 0.5, manuals: 0.5, distance: 3, variety: 0.5, bail: 600 },
+  style: { coins: 3, guides: 3, tricks: 1, air: 0.75, grinds: 1, manuals: 1, distance: 0.5, variety: 3, bail: 100 } };
 const PRESET_NAME = { tricks: 'Tricks', even: 'Even', grind: 'Grinds', safe: 'Go far', style: 'Variety' };
 const presetOn = k => Object.keys(PRESETS[k]).every(w => Math.abs(PRESETS[k][w] - RW[w]) < 1e-6);
 function weightsChanged(){ S.w = { ...RW }; rescorePool(); for (const r of riders) if (!r.done) refreshScore(r); save(); menuDirty = true; }
