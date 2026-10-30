@@ -508,10 +508,10 @@ function fitStep(M, samples, curves, o){
     const lapN = lx * n[0] + ly * n[1] + lz * n[2];
     // thin-plate term: extends the surface smoothly where there are no lines (no droop at the edges)
     // (next to the border the one-sided umbrella is lopsided, so there it falls back to plain smoothing)
-    let bx = -lx, by = -ly, bz = -lz, nearB = bnd[v]; for (const w of ring){ if (bnd[w]) nearB = 1; bx += U[3 * w] / ring.length; by += U[3 * w + 1] / ring.length; bz += U[3 * w + 2] / ring.length; }
+    let bx = -lx, by = -ly, bz = -lz, nearB = bnd[v]; for (const w of ring){ if (bnd[w] || sharpV(w)) nearB = 1; bx += U[3 * w] / ring.length; by += U[3 * w + 1] / ring.length; bz += U[3 * w + 2] / ring.length; }
     const bilN = nearB ? lapN : -(bx * n[0] + by * n[1] + bz * n[2]) * 0.35;
     const fairN = c * lapN + (1 - c) * bilN;
-    const fv = o.fair + (1 - o.fair) * 0.9 * pm, k = 1 - c * (1 - fv);
+    const fv = Math.min(0.75, o.fair + (1 - o.fair) * 0.9 * pm), k = 1 - c * (1 - fv);
     let offN = (1 - k) * dataN + k * fairN; offN = Math.max(-o.maxStep, Math.min(o.maxStep, offN));
     let tx = lx - lapN * n[0], ty = ly - lapN * n[1], tz = lz - lapN * n[2];
     if (bnd[v]){
@@ -542,6 +542,22 @@ function untangle(M, iters){
   }
 }
 
+// Relax: settles the finished mesh. Each pass pulls every vertex toward the middle of its neighbours
+// (which smooths bumps and evens out the spacing), then pushes back a little so the shape doesn't
+// shrink or sag. Every guide and crease vertex stays put, so nothing slides across or off a crease.
+function relaxMesh(M, passes){
+  for (let it = 0; it < passes * 2; it++){
+    const lam = it & 1 ? -0.53 : 0.5, nx = M.x.slice(), ny = M.y.slice(), nz = M.z.slice();
+    for (let v = 0; v < M.x.length; v++){
+      if (M.fc[v] >= 0 || !M.vt[v].length) continue;
+      const ring = M.nbrs(v), bn = ring.filter(w => M.edgeTris(v, w).length === 1);
+      const use = bn.length === 2 ? bn : bn.length ? null : ring; if (!use) continue;   // border: only along the border
+      let cx = 0, cy = 0, cz = 0; for (const w of use){ cx += M.x[w]; cy += M.y[w]; cz += M.z[w]; }
+      nx[v] += (cx / use.length - M.x[v]) * lam; ny[v] += (cy / use.length - M.y[v]) * lam; nz[v] += (cz / use.length - M.z[v]) * lam;
+    }
+    M.x = nx; M.y = ny; M.z = nz;
+  }
+}
 // find faces that flipped over (a fold) and relax them and their neighbours until the sheet lies flat again
 function unfold(M, iters){
   let worst = 0;
@@ -720,7 +736,7 @@ function creaseLines({ V, sharp }){
 // ---------------------------------------------------------------- the whole thing
 // strokes: [{ tag, pts: [x,y,z, x,y,z, ...] }]   (park metres, y up)
 //   tag 0 loose · 1 guide (averaged) · 2 strict guide (exact) · 3 crease (averaged, sharp) · 4 strict crease (exact, sharp)
-// prm: { detail, avg, lines, fair (0..1), reach, group, subd }
+// prm: { detail, avg, lines, fair (0..1), reach, group, subd, relax (0..10), dabs }
 function solve(strokes, prm, progress = () => {}){
   const L = Math.max(0.05, prm.detail), h = Math.max(prm.avg, L * 1.1), g = Math.max(prm.group, L * 0.5);
   const toPts = s => { const a = []; for (let i = 0; i + 2 < s.pts.length; i += 3) a.push([s.pts[i], s.pts[i + 1], s.pts[i + 2]]); return a; };
@@ -782,6 +798,7 @@ function solve(strokes, prm, progress = () => {}){
     }
   }
   progress(0.9, 'Smoothing out folds');
+  if (prm.relax > 0){ progress(0.91, 'Relaxing'); relaxMesh(M, Math.round(prm.relax * prm.relax * 0.8 + prm.relax * 2)); }
   const folds = unfold(M, 25);
   progress(0.93, 'Making quads');
   const cage = quadify(M, curves);
