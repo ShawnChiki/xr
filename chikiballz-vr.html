@@ -53,6 +53,7 @@
     <div class="row" style="margin-top:8px">
       <button class="ghost" data-view="0" aria-pressed="true">Follow</button>
       <button class="ghost" data-view="1" aria-pressed="false">Tabletop</button>
+      <button class="ghost" data-view="2" aria-pressed="false">Person</button>
       <button id="faces" class="ghost" aria-pressed="true">Wall faces: on</button>
       <button id="wins" class="ghost" aria-pressed="true">Windows: on</button>
       <button id="new" class="ghost">New world</button>
@@ -64,7 +65,8 @@
     <p><b>Left stick</b> rolls your ball the way the view faces · <b>right stick</b> looks around (push left to look left, up to look up) · <b>A/X</b> hop · <b>B</b> pop.</p>
     <p><b>Trigger:</b> hold and point to aim a FALL, let go to fall that way. The FALL and POP rings in the corner of your view fill up as they recharge.</p>
     <p><b>Tabletop:</b> grip grabs the model, two hands to scale it.</p>
-    <p><b>Desktop:</b> WASD roll · Q/E turn · Space hop · click a direction to FALL · F pop</p>
+    <p><b>Person:</b> left stick walks · right stick turns · A/X jumps (also off walls) · push into a wall to climb it and pull yourself over the top.</p>
+    <p><b>Desktop:</b> WASD roll or walk · Q/E turn · Space hop or jump · click a direction to FALL · F pop · Person: drag to look</p>
   </details>
   <div id="status">Building the world…</div>
 </div>
@@ -1870,8 +1872,8 @@ function gaFrame(dt){
 // Follow: the original game's camera. It sits behind and above your ball, its "up" swings to your ball's up when you
 // FALL, and it slowly turns to follow the way you're rolling. In VR your head is that camera; you can still look around.
 // Tabletop: the whole cube as a model on your table.
-const VIEWS = ['Follow', 'Tabletop'];
-const FOLLOW_S = 0.25, TABLE_S = 0.0125;          // metres per world unit
+const VIEWS = ['Follow', 'Tabletop', 'Person'];
+const FOLLOW_S = 0.25, TABLE_S = 0.0125, PERSON_S = 0.95;   // metres per world unit (Person: about your real size)
 let view = 0, xrKind = null, tablePlaced = false, anchorPending = 0;
 const xrOn = () => renderer.xr.isPresenting;
 const table = { pos: V3(0, 1.0, -0.6), quat: new THREE.Quaternion(), scale: TABLE_S };
@@ -1917,6 +1919,8 @@ function headPose(){
   return { p, yaw };
 }
 function setView(v){
+  const prev = view;
+  if (players.length && ROOMS.length && prev !== v && (prev === 2 || v === 2)) swapBody(v === 2, prev);
   view = v;
   for (const b of document.querySelectorAll('[data-view]')) b.setAttribute('aria-pressed', String(+b.dataset.view === v));
   if (xrOn()){
@@ -1924,6 +1928,7 @@ function setView(v){
     if (v === 1 && !tablePlaced){ table.pos.copy(p).addScaledVector(yaw, .62); table.pos.y = p.y - .4; tablePlaced = true; }
     if (v === 0){ anchor.copy(p); aFwd.copy(yaw); }
   } else {
+    if (v === 2){ camera.position.set(0, 1.6, 0); camera.rotation.set(deskPitch, 0, 0); orbit.enabled = false; }
     orbit.enabled = v === 1;
     if (v === 0){ anchor.set(0, 1.6, 0); aFwd.set(0, 0, -1); camera.position.copy(anchor); camera.rotation.set(-0.35, 0, 0); }
     if (v === 1){ orbit.minDistance = .2; orbit.maxDistance = 4; orbit.target.copy(table.pos); camera.position.copy(table.pos).add(V3(.5, .45, .75)); orbit.update(); }
@@ -1932,14 +1937,14 @@ function setView(v){
   applyEnv();
 }
 function applyEnv(){
-  const inAR = xrKind === 'ar', s = view === 0 ? FOLLOW_S : TABLE_S;
+  const inAR = xrKind === 'ar', s = view === 0 ? FOLLOW_S : view === 2 ? PERSON_S : TABLE_S;
   floorGrid.visible = view === 1 && !inAR;
   scene.background = inAR && view === 1 ? null : HAZE;
   scene.fog.near = view === 1 ? 1e4 : 30 * s; scene.fog.far = view === 1 ? 1e5 : 115 * s;
   camLight.distance = view === 1 ? 0 : 45 * s; camLight.intensity = view === 1 ? 0.2 : 0.45;
 }
 const mB = new THREE.Matrix4(), mS = new THREE.Matrix4(), qF = new THREE.Quaternion();
-function placeWorld(){
+function placeWorld(dt){
   if (GA.active){
     let pos;
     if (xrOn()){ if (!GA.xrPlaced && anchorPending === 0){ const { p, yaw } = headPose(); GA.at = p.clone().addScaledVector(yaw, .75); GA.at.y = p.y - .22; GA.xrPlaced = true; } pos = GA.at || V3(0, 1.2, -.8); }
@@ -1948,6 +1953,8 @@ function placeWorld(){
     return;
   }
   if (view === 1){ worldRoot.position.copy(table.pos); worldRoot.quaternion.copy(table.quat); worldRoot.scale.setScalar(table.scale); return; }
+  if (view === 2 && !player.portal){ placePerson(dt); return; }
+  if (view === 2){ anchor.copy(headScene()); }   // swallowed or falling through a window: ride along like the Follow view
   // turn the camera's frame (right, up, back) onto the room's (right, up, back) at the anchor
   const r = tv1.crossVectors(camFwd, camUp).normalize(), aR = V3().crossVectors(aFwd, YAX).normalize();
   mB.makeBasis(r, camUp, tv2.copy(camFwd).negate()); mS.makeBasis(aR, YAX, V3().copy(aFwd).negate());
@@ -1956,17 +1963,100 @@ function placeWorld(){
   worldRoot.position.copy(anchor).sub(V3().copy(camPos).multiplyScalar(FOLLOW_S).applyQuaternion(qF));
 }
 
+// ---------- Person: you walk, jump and climb at about your real size. Your body is a column of three round probes
+// (feet, chest, head) in the same world the balls roll in; player.b stays at your chest so tags, wall faces and
+// windows all still work. FALL still makes any wall your floor.
+const qP = new THREE.Quaternion();
+let deskPitch = -0.1;
+const PER = { ground: 0, wall: null, floorH: undefined, climbT: 0, jumpT: 0, spent: false };
+const BODY = [[-0.6, 0.42], [0, 0.42], [0.6, 0.38]];   // [offset from chest along "up", radius]
+const PG = 24, WALK = 6.5, JUMP = 9.2, CLIMB = 4.2, CLIMB_MAX = 3.4;
+function swapBody(toPerson, prev){
+  const b = player.b, up = upOf(b), k = 1.0 - b.R;
+  if (toPerson){
+    for (let n = 0; n < 3; n++) b.p[n] += up[n] * k;
+    if (prev === 0) qP.copy(worldRoot.quaternion); else qP.setFromUnitVectors(toV(b.g), DOWN);
+    PER.ground = 0; PER.floorH = undefined; PER.climbT = 0;
+  } else { for (let n = 0; n < 3; n++) b.p[n] -= up[n] * k; b.w = [0, 0, 0]; }
+  pushOut(b);
+}
+function pushOut(b){ for (let i = 0; i < 12; i++){ const f = fieldAt(b.p[0], b.p[1], b.p[2]); if (f >= b.R + 0.05) break; const g = sceneGrad(b.p[0], b.p[1], b.p[2]); for (let k = 0; k < 3; k++) b.p[k] += g[k] * (b.R + 0.05 - f); } }
+function personStep(dt, jump){
+  const b = player.b, g = b.g, up = upOf(b), v = b.v, frozen = player.freeze > 0;
+  // where you're looking, laid onto your floor
+  const fw = worldDir(camera.getWorldDirection(V3())), u = toV(up);
+  fw.addScaledVector(u, -fw.dot(u)); if (fw.lengthSq() < 1e-4) fw.copy(worldDir(V3(0, 1, 0).applyQuaternion(camera.getWorldQuaternion(new THREE.Quaternion())))).addScaledVector(u, -fw.dot(u));
+  fw.normalize(); const rt = V3().crossVectors(fw, u);
+  const sx = frozen ? 0 : stick[0], sy = frozen ? 0 : stick[1], wish = V3().addScaledVector(fw, -sy).addScaledVector(rt, sx);
+  const wl = Math.min(1, wish.length()); if (wl > 1e-3) wish.multiplyScalar(wl / wish.length());
+  const n = Math.max(1, Math.ceil(dt / 0.012)), h = dt / n;
+  let impact = 0;
+  for (let st = 0; st < n; st++){
+    const vu = dot3(v, up), vh = [v[0] - up[0] * vu, v[1] - up[1] * vu, v[2] - up[2] * vu];
+    const spd = WALK * seekBoost(player), acc = (PER.ground > 0 ? 40 : 10) * h;
+    for (let k = 0; k < 3; k++){ const want = wish.getComponent(k) * spd, dv = clamp(want - vh[k], -acc, acc); vh[k] += dv; }
+    let nu = vu - PG * h;
+    // jump off the floor, or kick off a wall
+    if (jump && st === 0 && !frozen){
+      if (PER.ground > 0){ nu = JUMP; PER.ground = 0; PER.jumpT = 0.25; SND.hop(); }
+      else if (PER.wall && PER.climbT <= 0){ const wn = PER.wall; for (let k = 0; k < 3; k++) vh[k] = wn[k] * 6; nu = JUMP * 0.85; PER.jumpT = 0.25; SND.hop(); }
+    }
+    // climb: keep pushing into a wall and you go up it, a bit over three times your ball's height, then you pull yourself over the top
+    const hgt = dot3(b.p, up);
+    if (PER.wall && wl > 0.3 && !frozen && PER.floorH !== undefined && PER.jumpT <= 0){
+      const into = -(PER.wall[0] * wish.x + PER.wall[1] * wish.y + PER.wall[2] * wish.z) / wl;
+      if (into > 0.45 && !PER.spent){ if (hgt - PER.floorH < CLIMB_MAX){ nu = Math.max(nu, CLIMB); PER.climbT = 0.25; } else PER.spent = true; }
+    }
+    for (let k = 0; k < 3; k++){ v[k] = vh[k] + up[k] * nu; b.p[k] += v[k] * h; }
+    // collide the three probes with the world
+    let ground = false, wall = null, headWall = false;
+    for (const [off, r] of BODY){
+      for (let it = 0; it < 2; it++){
+        const q = [b.p[0] + up[0] * off, b.p[1] + up[1] * off, b.p[2] + up[2] * off], d = fieldAt(q[0], q[1], q[2]);
+        if (d >= r) break;
+        const gr = sceneGrad(q[0], q[1], q[2]), push = r - d;
+        for (let k = 0; k < 3; k++) b.p[k] += gr[k] * push;
+        const vn = v[0] * gr[0] + v[1] * gr[1] + v[2] * gr[2];
+        if (vn < 0){ for (let k = 0; k < 3; k++) v[k] -= gr[k] * vn; impact = Math.max(impact, -vn); }
+        const gu = gr[0] * up[0] + gr[1] * up[1] + gr[2] * up[2];
+        if (gu > 0.6 && off < 0) ground = true;
+        else if (Math.abs(gu) < 0.6){ wall = [gr[0] - up[0] * gu, gr[1] - up[1] * gu, gr[2] - up[2] * gu]; const l = Math.hypot(...wall) || 1; wall = wall.map(x => x / l); if (off > 0) headWall = true; }
+      }
+    }
+    if (ground){ PER.ground = 0.12; if (!wall) PER.floorH = dot3(b.p, up); else if (PER.floorH === undefined) PER.floorH = dot3(b.p, up); }
+    else PER.ground = Math.max(0, PER.ground - h);
+    // the wall stopped at your head height while you climb: pull yourself over the top
+    if (PER.climbT > 0 && !wall && !ground && wl > 0.3){ for (let k = 0; k < 3; k++) v[k] += wish.getComponent(k) / wl * 3 + up[k] * 2.2; PER.climbT = 0; }
+    PER.wall = wall; PER.climbT = Math.max(0, PER.climbT - h); PER.jumpT = Math.max(0, PER.jumpT - h);
+    if (ground && PER.ground > 0){ PER.climbT = 0; PER.spent = false; }
+  }
+  b.impact = Math.max(b.impact, impact); b.grounded = PER.ground; b.lastN = up.slice(); b.w = [0, 0, 0];
+  if (impact > 9) SND.thud(impact * 0.6);
+}
+function placePerson(dt = 1 / 60){
+  // turn the world so your gravity points at your real floor, then stand your feet on the floor under your head
+  const mapped = toV(player.b.g).applyQuaternion(qP);
+  qP.premultiply(new THREE.Quaternion().slerp(new THREE.Quaternion().setFromUnitVectors(mapped, DOWN), 1 - Math.exp(-dt * 3))).normalize();
+  const H = xrOn() ? headScene() : camera.position, b = player.b, up = upOf(b);
+  const feet = V3(b.p[0] - up[0], b.p[1] - up[1], b.p[2] - up[2]);
+  worldRoot.quaternion.copy(qP); worldRoot.scale.setScalar(PERSON_S);
+  worldRoot.position.set(H.x, 0, H.z).sub(feet.multiplyScalar(PERSON_S).applyQuaternion(qP));
+}
+function turnPerson(a){ qP.premultiply(new THREE.Quaternion().setFromAxisAngle(YAX, a)); }
+
 // ---------- simulation step (the original's 240 Hz substeps, capped for the headset)
 let hopPressed = false;
 const stick = [0, 0];
 function simulate(dt, now){
-  const pctl = player.portal ? brake(player.b) : humanControl(dt, stick[0], stick[1], hopPressed);
+  const person = view === 2;
+  if (person && !player.portal){ const v0 = player.b.v; personStep(dt, hopPressed); player.b.v = v0; }
+  const pctl = player.portal || person ? brake(player.b) : humanControl(dt, stick[0], stick[1], hopPressed);
   hopPressed = false;
   const ctls = players.map((P, i) => i === 0 ? pctl : botControl(P, i, dt, now));
-  for (const P of players) P.b.impact = 0;
+  for (const P of players) if (!(P.isPlayer && person)) P.b.impact = 0;
   const n = Math.min(8, Math.ceil(dt * 200)), h = dt / n;
   for (let s = 0; s < n; s++){
-    for (let i = 0; i < players.length; i++){ if (players[i].portal) continue; stepBall(players[i].b, ctls[i], h); ctls[i].hop = false; }
+    for (let i = 0; i < players.length; i++){ if (players[i].portal || (i === 0 && person)) continue; stepBall(players[i].b, ctls[i], h); ctls[i].hop = false; }
     for (const P of players) P.b.pairs.length = 0;
     for (let i = 0; i < players.length; i++) for (let j = i + 1; j < players.length; j++) if (!players[i].portal && !players[j].portal) collidePair(players[i].b, players[j].b, h, () => tryInfect(i, j));
   }
@@ -2030,16 +2120,17 @@ function updateVisuals(dt){
     const key = mood + P.color; if (key !== V.key){ V.key = key; paintFace(P, mood); }
     V.sqV += (-140 * V.sq - 9 * V.sqV) * dt; V.sq = clamp(V.sq + V.sqV * dt, -.2, .3);
     const pk = V.portalK ?? 1;
-    V.holder.visible = !V.hidden; V.holder.position.set(b.p[0], b.p[1], b.p[2]);
+    const me = P.isPlayer && view === 2 && !P.portal;
+    V.holder.visible = !V.hidden && !me; V.holder.position.set(b.p[0], b.p[1], b.p[2]);
     V.squash.quaternion.setFromUnitVectors(YAX, V.sqN); V.squash.scale.set(b.R * pk * (1 + V.sq * .5), b.R * pk * (1 - V.sq), b.R * pk * (1 + V.sq * .5));
     V.mesh.quaternion.copy(V.squash.quaternion).invert().multiply(V.q);
-    V.ghost.scale.setScalar(b.R); V.ghost.visible = view === 1 || (view === 0 && !P.isPlayer);
+    V.ghost.scale.setScalar(b.R); V.ghost.visible = view === 1 || (view !== 1 && !P.isPlayer);
     V.ghost.material.color.set(seeker ? 0xffc23c : P.color);
-    V.ring.visible = seeker && !P.portal;
+    V.ring.visible = seeker && !P.portal && !me;
     if (seeker){ const k = b.R + 0.8; V.ring.position.set(b.p[0] + up[0] * k, b.p[1] + up[1] * k, b.p[2] + up[2] * k); V.ring.quaternion.setFromUnitVectors(ZAX, toV(up)); V.ring.scale.setScalar(Math.max(0.8, b.R) * 0.75 * (1 + 0.06 * Math.sin(elapsed * 6))); }
     let t = 0, hit = null;
     for (let i = 0; i < 24; i++){ const q = [b.p[0] + b.g[0] * t, b.p[1] + b.g[1] * t, b.p[2] + b.g[2] * t], f = fieldAt(q[0], q[1], q[2]); if (f < 0.04){ hit = q; break; } t += Math.max(0.1, f * 0.9); if (t > 10) break; }
-    V.shadow.visible = !!hit && !P.portal;
+    V.shadow.visible = !!hit && !P.portal && !me;
     if (hit){ const gr = sceneGrad(hit[0], hit[1], hit[2]); V.shadow.position.set(hit[0] + gr[0] * .03, hit[1] + gr[1] * .03, hit[2] + gr[2] * .03); V.shadow.quaternion.setFromUnitVectors(ZAX, toV(gr)); const k = 1 - clamp((t - b.R) / 9, 0, 1); V.shadow.scale.setScalar(b.R * (0.6 + 0.5 * k)); V.shadow.material.opacity = 0.6 * k; }
   }
   markerCone.visible = view === 1;
@@ -2154,7 +2245,8 @@ function updateHud(){
 
 // ---------- Settings, in VR: hold Y to open, point and pull the trigger to pick
 const SET_ROWS = [{ label: () => 'Resume', act: () => closeSettings() },
-  { label: () => 'View: Follow', act: () => setView(0), on: () => view === 0 }, { label: () => 'View: Tabletop', act: () => setView(1), on: () => view === 1 },
+  { label: () => 'Be a ball: Follow', act: () => setView(0), on: () => view === 0 }, { label: () => 'Be a ball: Tabletop', act: () => setView(1), on: () => view === 1 },
+  { label: () => 'Be a person', act: () => setView(2), on: () => view === 2 },
   { label: () => 'Wall faces: ' + (SET.faces ? 'on' : 'off'), act: () => setFaces(!SET.faces), on: () => !!SET.faces },
   { label: () => 'Windows: ' + (SET.windows ? 'on' : 'off'), act: () => setWindows(!SET.windows), on: () => !!SET.windows },
   { label: () => 'New world', act: () => newWorld() }];
@@ -2164,16 +2256,16 @@ function setFaces(on){ SET.faces = on ? 4 : 0; refreshProps(); syncFaceBtn(); se
 function setWindows(on){ SET.windows = on ? 1 : 0; refreshProps(); syncFaceBtn(); setPanel.key = ''; }
 function syncFaceBtn(){ const b = document.getElementById('faces'), w = document.getElementById('wins'); if (b){ b.textContent = 'Wall faces: ' + (SET.faces ? 'on' : 'off'); b.setAttribute('aria-pressed', String(!!SET.faces)); } if (w){ w.textContent = 'Windows: ' + (SET.windows ? 'on' : 'off'); w.setAttribute('aria-pressed', String(!!SET.windows)); } }
 const setPanel = (() => {
-  const c = document.createElement('canvas'); c.width = 640; c.height = 1000; const tex = new THREE.CanvasTexture(c);
-  const m = new THREE.Mesh(new THREE.PlaneGeometry(.4, .625), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
+  const c = document.createElement('canvas'); c.width = 640; c.height = 1120; const tex = new THREE.CanvasTexture(c);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(.4, .7), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
   m.renderOrder = 140; m.visible = false; scene.add(m);
   return { c, ctx: c.getContext('2d'), tex, m, hover: -1, key: '' };
 })();
 let settingsOpen = false;
 function drawSettings(){
   const key = setPanel.hover + '|' + view + SET.faces + SET.windows; if (key === setPanel.key) return; setPanel.key = key;
-  const c = setPanel.ctx; c.clearRect(0, 0, 640, 1000);
-  rr(c, 6, 6, 628, 988, 44); c.fillStyle = '#fff6e3'; c.fill(); c.lineWidth = 8; c.strokeStyle = '#1d1530'; c.stroke();
+  const c = setPanel.ctx; c.clearRect(0, 0, 640, 1120);
+  rr(c, 6, 6, 628, 1108, 44); c.fillStyle = '#fff6e3'; c.fill(); c.lineWidth = 8; c.strokeStyle = '#1d1530'; c.stroke();
   c.fillStyle = '#1d1530'; c.font = '700 56px Fredoka, "DM Sans", system-ui'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('Paused', 320, 80);
   SET_ROWS.forEach((r, i) => {
     const y = 160 + i * 120, on = r.on && r.on();
@@ -2181,7 +2273,7 @@ function drawSettings(){
     c.fillStyle = '#1d1530'; c.font = '600 42px Fredoka, "DM Sans", system-ui'; c.fillText(r.label() + (on ? '  ✓' : ''), 320, y + 50);
   });
   c.font = '500 26px "DM Sans", system-ui'; c.fillStyle = 'rgba(29,21,48,.65)';
-  c.fillText('L stick rolls · R stick looks around · A/X hop · B pop', 320, 902, 580); c.fillText('trigger: aim a FALL, let go to fall', 320, 942, 580);
+  c.fillText(view === 2 ? 'L stick walk · R stick turn · A/X jump · push into a wall to climb' : 'L stick rolls · R stick looks around · A/X hop · B pop', 320, 1022, 580); c.fillText('trigger: aim a FALL, let go to fall · B pop', 320, 1062, 580);
   setPanel.tex.needsUpdate = true;
 }
 function openSettings(){
@@ -2233,6 +2325,9 @@ function updateXRInputs(dt, now){
       if (pressed(5)){ st.holdY += dt; if (st.holdY > .6 && st.holdY - dt <= .6){ settingsOpen ? closeSettings() : openSettings(); buzz(.3, 40, st); } } else st.holdY = 0;
       // left stick rolls your ball
       spin = [ax, ay];
+    } else if (view === 2 && !settingsOpen){
+      // Person: right stick turns you (your head does the looking up and down)
+      if (Math.abs(ax) > .15) turnPerson(-ax * 2.2 * dt);
     } else if (view === 0 && !settingsOpen){
       // right stick steers the view: push left to look left, push up to look up
       if (Math.abs(ax) > .15){ turnFrame(camUp, -ax * 2.2 * dt); lastLook = now; }
@@ -2241,7 +2336,7 @@ function updateXRInputs(dt, now){
     if (settingsOpen){
       setRay.set(st.ctrl.getWorldPosition(V3()), dirS); const hit = setRay.intersectObject(setPanel.m)[0];
       st.laser.visible = true; st.laser.scale.z = hit ? hit.distance : .6;
-      if (hit){ const yy = (1 - hit.uv.y) * 1000 - 160, row = Math.floor(yy / 120); if (row >= 0 && row < SET_ROWS.length && yy % 120 < 96){ hover = row; if (down(0)){ SET_ROWS[row].act(); buzz(.3, 30, st); } } }
+      if (hit){ const yy = (1 - hit.uv.y) * 1120 - 160, row = Math.floor(yy / 120); if (row >= 0 && row < SET_ROWS.length && yy % 120 < 96){ hover = row; if (down(0)){ SET_ROWS[row].act(); buzz(.3, 30, st); } } }
     } else {
       // trigger: hold to aim a FALL, let go to fall
       if (pressed(0) && (st.aiming || down(0))){ st.aiming = true; aimGi = aimAxis(dirS); }
@@ -2277,7 +2372,9 @@ addEventListener('keyup', e => { keys[e.code] = false; });
 let downAt = null, mouseNdc = null;
 const raycaster = new THREE.Raycaster();
 renderer.domElement.addEventListener('pointerdown', e => { unlockAudio(); downAt = [e.clientX, e.clientY]; });
-renderer.domElement.addEventListener('pointermove', e => { mouseNdc = new THREE.Vector2(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1); });
+renderer.domElement.addEventListener('pointermove', e => { mouseNdc = new THREE.Vector2(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1);
+  // Person on a computer: drag to look around
+  if (view === 2 && !xrOn() && e.buttons){ turnPerson(-e.movementX * 0.004); deskPitch = clamp(deskPitch - e.movementY * 0.004, -1.4, 1.4); camera.rotation.set(deskPitch, 0, 0); } });
 renderer.domElement.addEventListener('pointerleave', () => { mouseNdc = null; });
 function mouseAxis(){ if (!mouseNdc) return -1; raycaster.setFromCamera(mouseNdc, camera); return aimAxis(raycaster.ray.direction); }
 renderer.domElement.addEventListener('pointerup', e => { if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return; tryFall(mouseAxis()); });
@@ -2286,6 +2383,7 @@ function updateDesktop(dt, now){
   stick[0] = k('KeyD') + k('ArrowRight') - k('KeyA') - k('ArrowLeft'); stick[1] = k('KeyS') + k('ArrowDown') - k('KeyW') - k('ArrowUp');
   const l = Math.hypot(stick[0], stick[1]); if (l > 1){ stick[0] /= l; stick[1] /= l; }
   const t = k('KeyQ') - k('KeyE'); if (t && view === 0){ turnFrame(camUp, t * 2.4 * dt); lastLook = now; }
+  if (t && view === 2) turnPerson(t * 2.4 * dt);
   showFall(mouseAxis());
 }
 
@@ -2363,7 +2461,7 @@ renderer.setAnimationLoop(() => {
     updateSteerFrame();
     if (!settingsOpen) simulate(dt, now * 1000);
     updateFollowCam(dt, now * 1000);
-    placeWorld();
+    placeWorld(dt);
     updateVisuals(dt); tunnel.frame(dt);
     if (!settingsOpen){ updateShards(dt); updateGoop(dt); updateSparks(dt); updateWind(dt); }
     sparks.material.size = 0.75 * worldRoot.scale.x;
