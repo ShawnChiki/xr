@@ -25,8 +25,8 @@
 </style>
 <script type="importmap">
 { "imports": {
-  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
   "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js"
 } }
 </script>
@@ -3095,23 +3095,27 @@ function enterWorld(mode) {
     hintEl.textContent = 'A funny mushroom is floating over the table. Click it to eat it.';
   }
 }
-// Read the room scan the Quest made in Space Setup, plus any pictures and windows it labeled.
+// Read the room scan the Quest made in Space Setup. The little people's world is the floor, walls and ceiling,
+// plus the pictures on the walls; tables, couches, storage and other furniture are left out on purpose.
+// Real furniture still hides them when they walk behind it, thanks to the headset's live depth camera.
 const ART_RE = /art|picture|painting|poster/i;
+const SKIP_RE = /table|desk|couch|sofa|storage|shelf|cabinet|bed|screen|monitor|lamp|plant|other|global|furniture|chair/i;
+const ROOM_RE = /floor|ceiling|wall|door|window/i;
 function readRoom(frame) {
   const ref = renderer.xr.getReferenceSpace(); if (!ref) return;
   const meshes = frame.detectedMeshes, planes = frame.detectedPlanes;
-  const useMeshes = !!(meshes && meshes.size), hasPlanes = !!(planes && planes.size);
-  if (!useMeshes && !hasPlanes) return;
+  const hasMeshes = !!(meshes && meshes.size), hasPlanes = !!(planes && planes.size);
+  if (!hasMeshes && !hasPlanes) return;
   let sig = '';
-  if (useMeshes) for (const x of meshes) sig += 'm' + (x.lastChangedTime | 0) + ':' + x.vertices.length + ';';
+  if (hasMeshes) for (const x of meshes) sig += 'm' + (x.lastChangedTime | 0) + ':' + x.vertices.length + ';';
   if (hasPlanes) for (const x of planes) sig += 'p' + (x.lastChangedTime | 0) + ':' + x.polygon.length + ';';
   if (sig === Room.sig) return;
   const t = performance.now();
   if (t - Room.builtAt < 2000 && (Room.kind === 'mesh' || Room.kind === 'planes')) return;
-  const pos = [], idx = [], feats = [], m = new THREE.Matrix4(), v = new V3(), pn = new V3(), a = new V3(), b = new V3(), c = new V3();
+  const feats = [], items = [];
   let anchor = null, anchorSize = -1;
   const featureFrom = (label, mat, xs, ys, zs, flatAxis) => {
-    const type = ART_RE.test(label) ? 'art' : null; if (!type) return;
+    if (!ART_RE.test(label)) return;
     const lo = [Math.min(...xs), Math.min(...ys), Math.min(...zs)], hi = [Math.max(...xs), Math.max(...ys), Math.max(...zs)];
     const ext = hi.map((h, i) => h - lo[i]);
     const ax = flatAxis != null ? flatAxis : ext.indexOf(Math.min(...ext));
@@ -3121,43 +3125,47 @@ function readRoom(frame) {
     const others = [0, 1, 2].filter(i => i !== ax), dirs = others.map(i => new V3().setComponent(i, 1).transformDirection(mat));
     const upI = Math.abs(dirs[0].y) > Math.abs(dirs[1].y) ? 0 : 1;
     if (n.dot(_v1.subVectors(camHead, center)) < 0) n.negate();
-    feats.push(makeFeature(type, center, n, ext[others[1 - upI]], ext[others[upI]], 'scan'));
+    feats.push(makeFeature('art', center, n, ext[others[1 - upI]], ext[others[upI]], 'scan'));
   };
-  if (useMeshes) for (const x of meshes) {
+  if (hasMeshes) for (const x of meshes) {
     const pose = frame.getPose(x.meshSpace, ref); if (!pose) return;
-    m.fromArray(pose.transform.matrix);
-    const V = x.vertices, I = x.indices, base = pos.length / 3;
-    for (let i = 0; i < V.length; i += 3) { v.set(V[i], V[i + 1], V[i + 2]).applyMatrix4(m); pos.push(v.x, v.y, v.z); }
-    for (let i = 0; i < I.length; i++) idx.push(base + I[i]);
+    const m = new THREE.Matrix4().fromArray(pose.transform.matrix), label = x.semanticLabel || '', V = x.vertices;
     if (V.length > anchorSize) { anchorSize = V.length; anchor = m.clone(); }
-    if (x.semanticLabel && V.length < 3000) {
-      const xs = [], ys = [], zs = []; for (let i = 0; i < V.length; i += 3) { xs.push(V[i]); ys.push(V[i + 1]); zs.push(V[i + 2]); }
-      featureFrom(x.semanticLabel, m, xs, ys, zs, null);
-    }
+    if (ART_RE.test(label)) { if (V.length < 3000) { const xs = [], ys = [], zs = []; for (let i = 0; i < V.length; i += 3) { xs.push(V[i]); ys.push(V[i + 1]); zs.push(V[i + 2]); } featureFrom(label, m, xs, ys, zs, null); } continue; }
+    items.push({ mesh: x, m, label, room: ROOM_RE.test(label) && !SKIP_RE.test(label), skip: SKIP_RE.test(label) });
   }
   if (hasPlanes) for (const x of planes) {
     const pose = frame.getPose(x.planeSpace, ref); if (!pose) return;
-    m.fromArray(pose.transform.matrix);
-    const poly = x.polygon; if (poly.length < 3) continue;
-    if (x.semanticLabel) featureFrom(x.semanticLabel, m, poly.map(p => p.x), poly.map(() => 0), poly.map(p => p.z), 1);
-    if (!anchor && /floor/i.test(x.semanticLabel || '')) anchor = m.clone();
-    if (useMeshes) continue;
+    const m = new THREE.Matrix4().fromArray(pose.transform.matrix), label = x.semanticLabel || '', poly = x.polygon;
+    if (poly.length < 3) continue;
+    if (/floor/i.test(label) && !anchor) anchor = m.clone();
+    if (ART_RE.test(label)) { featureFrom(label, m, poly.map(p => p.x), poly.map(() => 0), poly.map(p => p.z), 1); continue; }
+    items.push({ plane: x, m, label, room: !SKIP_RE.test(label) && (ROOM_RE.test(label) || !label), skip: SKIP_RE.test(label) });
+  }
+  // Walls and floor are usually planes. If this headset only gave us one big mesh, fall back to using it whole.
+  const structural = items.filter(it => it.room && /floor|wall/i.test(it.label));
+  const use = structural.length ? items.filter(it => it.room) : items.filter(it => it.mesh || !hasMeshes);
+  const pos = [], idx = [], v = new V3();
+  for (const it of use) {
     const base = pos.length / 3;
-    for (const p of poly) { v.set(p.x, p.y, p.z).applyMatrix4(m); pos.push(v.x, v.y, v.z); }
-    pn.set(0, 1, 0).transformDirection(m);
-    for (let i = 1; i < poly.length - 1; i++) {
-      a.fromArray(pos, base * 3); b.fromArray(pos, (base + i) * 3); c.fromArray(pos, (base + i + 1) * 3);
-      const flipIt = b.sub(a).cross(c.sub(a)).dot(pn) < 0;
-      idx.push(base, flipIt ? base + i + 1 : base + i, flipIt ? base + i : base + i + 1);
+    if (it.mesh) {
+      const V = it.mesh.vertices, I = it.mesh.indices;
+      for (let i = 0; i < V.length; i += 3) { v.set(V[i], V[i + 1], V[i + 2]).applyMatrix4(it.m); pos.push(v.x, v.y, v.z); }
+      for (let i = 0; i < I.length; i++) idx.push(base + I[i]);
+    } else {
+      const poly = it.plane.polygon;
+      for (const p of poly) { v.set(p.x, p.y, p.z).applyMatrix4(it.m); pos.push(v.x, v.y, v.z); }
+      for (const f of THREE.ShapeUtils.triangulateShape(poly.map(p => new THREE.Vector2(p.x, p.z)), [])) idx.push(base + f[0], base + f[1], base + f[2]);
     }
   }
   if (!idx.length) return;
   Room.sig = sig;
-  setRoom(geoFrom(pos, idx), useMeshes ? 'mesh' : 'planes');
+  setRoom(geoFrom(pos, idx), use.some(it => it.mesh) ? 'mesh' : 'planes');
   Room.anchor = anchor;
   Room.features = [...feats, ...loadMarks()];
   if (Room.features.length) buildRoomGeo();
   Room.builtAt = t;
+  if (Room.occluder && renderer.xr.hasDepthSensing && renderer.xr.hasDepthSensing()) Room.occluder.visible = false;
 }
 
 // ================= input =================
@@ -3221,9 +3229,14 @@ addBtn.addEventListener('click', () => { initAudio(); addElf(); });
 async function startMR() {
   initAudio();
   let session;
-  try {
-    session = await navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['local-floor'], optionalFeatures: ['mesh-detection', 'plane-detection', 'hand-tracking'] });
-  } catch (err) { noteEl.textContent = 'Could not start mixed reality: ' + err.message; return; }
+  const init = { requiredFeatures: ['local-floor'], optionalFeatures: ['mesh-detection', 'plane-detection', 'hand-tracking', 'depth-sensing'],
+    depthSensing: { usagePreference: ['gpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32', 'unsigned-short'] } };
+  try { session = await navigator.xr.requestSession('immersive-ar', init); }
+  catch (err) {
+    // older browsers: try again without the live depth camera
+    try { session = await navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['local-floor'], optionalFeatures: ['mesh-detection', 'plane-detection', 'hand-tracking'] }); }
+    catch (err2) { noteEl.textContent = 'Could not start mixed reality: ' + err2.message; return; }
+  }
   enterWorld('mr');
   await renderer.xr.setSession(session);
   session.addEventListener('end', () => enterWorld('preview'));
@@ -3241,6 +3254,7 @@ if (navigator.xr) {
 let last = 0;
 function xrStep(frame) {
   World.frames++;
+  if (Room.occluder && Room.occluder.visible && renderer.xr.hasDepthSensing && renderer.xr.hasDepthSensing()) Room.occluder.visible = false;
   if (World.frames % 15 === 1) readRoom(frame);
   if (!Room.collider && performance.now() - World.t0 > 6000) { setRoom(fallbackFloor, 'fallback'); World.noRoom = true; }
   if (!World.placed && World.frames > 20) {
@@ -3281,7 +3295,7 @@ renderer.setAnimationLoop((time, frame) => {
 });
 
 enterWorld('preview');
-window.littleElves = { ff: (secs) => { for (let i = 0; i < secs * 60; i++) { simT += 1 / 60; simulate(1 / 60, simT, false); } }, elves, visitors, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls, tryPeek, tryChase, startFlyer, start: { ...STARTERS, ring: startRing, giant: spawnGiant, gift: () => { const e = elves.find(x => x.free()); return e && e.startGift(); } }, acts, Gift, LOG, Flyer, Dir, Grab, Mouse, HS };
+window.littleElves = { renderer, readRoom, ff: (secs) => { for (let i = 0; i < secs * 60; i++) { simT += 1 / 60; simulate(1 / 60, simT, false); } }, elves, visitors, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls, tryPeek, tryChase, startFlyer, start: { ...STARTERS, ring: startRing, giant: spawnGiant, gift: () => { const e = elves.find(x => x.free()); return e && e.startGift(); } }, acts, Gift, LOG, Flyer, Dir, Grab, Mouse, HS };
 </script>
 <script src="../updated.js"></script>
 </body>
