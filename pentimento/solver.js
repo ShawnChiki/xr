@@ -105,10 +105,36 @@ function consensus(strokes, g, ds, sharp, tag){
     if (find(i) === find(j)) continue;
     if (Math.max(near(i, j), near(j, i)) > 0.35) par[find(i)] = find(j);
   }
-  const groups = new Map(); S.forEach((s, i) => { const r = find(i); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(s); });
-  const out = [];
-  for (const grp of groups.values()){ const C = principalCurve(grp, g, ds); if (C) out.push(makeCurve(C.pts, C.closed, sharp, tag)); }
-  return out;
+  // average each group, then merge groups whose averaged curves still run alongside each other
+  // (very loose passes can land as two parallel curves, which would make the surface zig-zag)
+  let found = [];
+  for (let round = 0; round < 3; round++){
+    const groups = new Map(); S.forEach((s, i) => { const r = find(i); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(i); });
+    found = [...groups.values()].map(ids => ({ ids, C: principalCurve(ids.map(i => S[i]), g, ds) })).filter(f => f.C && f.C.pts.length >= 2);
+    let merged = false;
+    for (let a = 0; a < found.length; a++) for (let b = a + 1; b < found.length; b++){
+      if (find(found[a].ids[0]) === find(found[b].ids[0])) continue;
+      if (alongside(found[a].C.pts, found[b].C.pts, g * 1.8) > 0.5 || alongside(found[b].C.pts, found[a].C.pts, g * 1.8) > 0.5){ par[find(found[a].ids[0])] = find(found[b].ids[0]); merged = true; }
+    }
+    if (!merged) break;
+  }
+  return found.map(f => makeCurve(f.C.pts, f.C.closed, sharp, tag));
+}
+// fraction of A's points that lie within r of B and run the same way
+function alongside(A, B, r){
+  if (A.length < 2 || B.length < 2) return 0;
+  const tA = i => norm([A[Math.min(i + 1, A.length - 1)][0] - A[Math.max(i - 1, 0)][0], A[Math.min(i + 1, A.length - 1)][1] - A[Math.max(i - 1, 0)][1], A[Math.min(i + 1, A.length - 1)][2] - A[Math.max(i - 1, 0)][2]]);
+  let k = 0;
+  A.forEach((p, i) => { let best = Infinity, bj = 0; B.forEach((q, j) => { const d = d2(p, q); if (d < best){ best = d; bj = j; } });
+    if (best < r * r){ const tb = norm([B[Math.min(bj + 1, B.length - 1)][0] - B[Math.max(bj - 1, 0)][0], B[Math.min(bj + 1, B.length - 1)][1] - B[Math.max(bj - 1, 0)][1], B[Math.min(bj + 1, B.length - 1)][2] - B[Math.max(bj - 1, 0)][2]]); if (Math.abs(dot(tA(i), tb)) > 0.7) k++; } });
+  return k / A.length;
+}
+// strict lines are used exactly as drawn: no grouping, no averaging
+function strictCurves(strokes, L, sharp, tag){
+  return strokes.map(s => {
+    const closed = s.length > 8 && d2(s[0], s[s.length - 1]) < sq(L * 0.6) && polyLen(s) > 4 * L;
+    const C = makeCurve(resample(closed ? s.slice(0, -1) : s, L * 0.25, closed), closed, sharp, tag); C.strict = true; return C;
+  }).filter(C => C.pts.length >= 2 && C.len > L * 0.5);
 }
 function principalCurve(grp, g, ds){
   const P = [].concat(...grp);
@@ -317,15 +343,18 @@ function remesh(M, L, flipDot){
   const hi2 = sq(L * 4 / 3), lo2 = sq(L * 0.8);
   // split long edges, longest first
   let E = M.edges(), list = [];
-  for (let i = 0; i < E.length; i += 2){ const l = M.len2(E[i], E[i + 1]); if (l > hi2) list.push([l, E[i], E[i + 1]]); }
+  const strictE = (a, b) => { const id = M.fe.get(M.ek(a, b)); return id !== undefined && M.strictIds && M.strictIds.has(id); };
+  const hiS = sq(L * 0.7), loS = sq(L * 0.3);
+  for (let i = 0; i < E.length; i += 2){ const l = M.len2(E[i], E[i + 1]); if (l > (strictE(E[i], E[i + 1]) ? hiS : hi2)) list.push([l, E[i], E[i + 1]]); }
   list.sort((p, q) => q[0] - p[0]);
-  for (const [, a, b] of list) if (M.len2(a, b) > hi2) M.split(a, b);
+  for (const [, a, b] of list) if (M.len2(a, b) > (strictE(a, b) ? hiS : hi2)) M.split(a, b);
   // collapse short edges
   E = M.edges(); list = [];
   for (let i = 0; i < E.length; i += 2){ const l = M.len2(E[i], E[i + 1]); if (l < lo2) list.push([l, E[i], E[i + 1]]); }
   list.sort((p, q) => p[0] - q[0]);
   for (const [, a0, b0] of list){
     if (M.dead[a0] || M.dead[b0] || !M.edgeTris(a0, b0).length || M.len2(a0, b0) >= lo2) continue;
+    if (strictE(a0, b0) && M.len2(a0, b0) >= loS) continue;
     let a = a0, b = b0, np;
     const fa = M.fc[a] >= 0, fb = M.fc[b] >= 0;
     if (M.corner[a] && M.corner[b]) continue;
@@ -475,6 +504,30 @@ function untangle(M, iters){
   }
 }
 
+// find faces that flipped over (a fold) and relax them and their neighbours until the sheet lies flat again
+function unfold(M, iters){
+  let worst = 0;
+  for (let it = 0; it < iters; it++){
+    const N = vertexNormals(M), nv = M.x.length, SN = N.map((n, v) => { const s = n.slice(); for (const w of M.nbrs(v)){ s[0] += N[w][0]; s[1] += N[w][1]; s[2] += N[w][2]; } return norm(s); });
+    const bad = new Set();
+    for (let t = 0; t < M.tdead.length; t++){ if (M.tdead[t]) continue; const n = norm(M.triN(t));
+      for (let i = 0; i < 3; i++){ const v = M.T[3 * t + i]; if (dot(n, SN[v]) < 0.25){ for (let j = 0; j < 3; j++) bad.add(M.T[3 * t + j]); break; } } }
+    if (it === 0) worst = bad.size;
+    if (!bad.size) break;
+    const zone = new Set(bad); for (const v of bad) for (const w of M.nbrs(v)) zone.add(w);
+    const nx = M.x.slice(), ny = M.y.slice(), nz = M.z.slice();
+    for (const v of zone){
+      if (M.fc[v] >= 0 || !M.vt[v].length) continue;
+      const ring = M.nbrs(v), bn = ring.filter(w => M.edgeTris(v, w).length === 1);
+      const use = bn.length === 2 ? bn : ring; let cx = 0, cy = 0, cz = 0;
+      for (const w of use){ cx += M.x[w]; cy += M.y[w]; cz += M.z[w]; }
+      nx[v] += (cx / use.length - M.x[v]) * 0.7; ny[v] += (cy / use.length - M.y[v]) * 0.7; nz[v] += (cz / use.length - M.z[v]) * 0.7;
+    }
+    M.x = nx; M.y = ny; M.z = nz;
+  }
+  return worst;
+}
+
 // ---------------------------------------------------------------- cutting a curve into the mesh
 function embedCurve(M, C, id, L){
   const S = resample(C.pts, L * 0.35, C.closed); if (S.length < 2) return 0;
@@ -560,10 +613,10 @@ function quadify(M, curves){
   for (let t = 0; t < nt; t++) if (!used[t]) F.push([T[3 * t], T[3 * t + 1], T[3 * t + 2]]);
   const V = []; for (let v = 0; v < M.x.length; v++) V.push(M.x[v], M.y[v], M.z[v]);
   const sharp = new Set(); for (const [k, id] of M.fe) if (curves[id] && curves[id].sharp) sharp.add(k);
-  return { V, F, sharp };
+  return { V, F, sharp, feat: new Map(M.fe) };
 }
 function ek(a, b){ return a < b ? a * 2097152 + b : b * 2097152 + a; }
-function catmullClark({ V, F, sharp }){
+function catmullClark({ V, F, sharp, feat }, curves){
   const nv = V.length / 3, eid = new Map(), E = [];
   F.forEach((f, fi) => { for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = ek(a, b); let e = eid.get(k); if (e === undefined){ e = E.length; eid.set(k, e); E.push({ a, b, f: [] }); } E[e].f.push(fi); } });
   const ne = E.length, nf = F.length, out = new Float64Array((nv + ne + nf) * 3);
@@ -590,7 +643,11 @@ function catmullClark({ V, F, sharp }){
   F.forEach((f, fi) => { const n = f.length; for (let i = 0; i < n; i++){ const a = f[i], b = f[(i + 1) % n], z = f[(i - 1 + n) % n];
     NF.push([a, nv + eid.get(ek(a, b)), nv + ne + fi, nv + eid.get(ek(z, a))]); } });
   E.forEach((e, i) => { if (e.sharp){ NS.add(ek(e.a, nv + i)); NS.add(ek(nv + i, e.b)); } });
-  return { V: Array.from(out), F: NF, sharp: NS };
+  // curve edges carry their curve down to the finer level; points on strict lines go back exactly onto them
+  const NFt = new Map();
+  if (feat) E.forEach((e, i) => { const id = feat.get(ek(e.a, e.b)); if (id === undefined) return; NFt.set(ek(e.a, nv + i), id); NFt.set(ek(nv + i, e.b), id);
+    const C = curves && curves[id]; if (C && C.strict) for (const v of [e.a, nv + i, e.b]){ const q = closestOnPoly(C, [out[3 * v], out[3 * v + 1], out[3 * v + 2]]); if (q.d2 < 1) out.set(q.p, 3 * v); } });
+  return { V: Array.from(out), F: NF, sharp: NS, feat: NFt };
 }
 // triangles for drawing, with normals that stay smooth except across sharp creases
 function shade({ V, F, sharp }){
@@ -623,18 +680,20 @@ function creaseLines({ V, sharp }){
 }
 
 // ---------------------------------------------------------------- the whole thing
-// strokes: [{ tag: 0 loose | 1 guide | 2 crease, pts: [x,y,z, x,y,z, ...] }]   (park metres, y up)
+// strokes: [{ tag, pts: [x,y,z, x,y,z, ...] }]   (park metres, y up)
+//   tag 0 loose · 1 guide (averaged) · 2 strict guide (exact) · 3 crease (averaged, sharp) · 4 strict crease (exact, sharp)
 // prm: { detail, avg, lines, fair (0..1), reach, group, subd }
 function solve(strokes, prm, progress = () => {}){
   const L = Math.max(0.05, prm.detail), h = Math.max(prm.avg, L * 1.1), g = Math.max(prm.group, L * 0.5);
   const toPts = s => { const a = []; for (let i = 0; i + 2 < s.pts.length; i += 3) a.push([s.pts[i], s.pts[i + 1], s.pts[i + 2]]); return a; };
-  const byTag = [[], [], []]; for (const s of strokes){ const p = toPts(s); if (p.length >= 2) byTag[s.tag || 0].push(p); }
+  const byTag = [[], [], [], [], []]; for (const s of strokes){ const p = toPts(s); if (p.length >= 2) byTag[Math.min(4, s.tag || 0)].push(p); }
   progress(0.02, 'Finding the guide and crease lines');
-  const curves = [...consensus(byTag[1], g, L * 0.5, false, 1), ...consensus(byTag[2], g, L * 0.5, true, 2)];
+  // strict lines first, so they get cut in first and the averaged ones fit around them
+  const curves = [...strictCurves(byTag[4], L, true, 4), ...strictCurves(byTag[2], L, false, 2), ...consensus(byTag[3], g, L * 0.5, true, 3), ...consensus(byTag[1], g, L * 0.5, false, 1)];
   const samples = [];
   const ds = Math.min(L, h) / 3;
   byTag[0].forEach((s, i) => { for (const p of resample(s, ds, false)) samples.push({ p, w: 1, sid: i }); });
-  curves.forEach((C, i) => { for (const p of resample(C.pts, ds, C.closed)) samples.push({ p, w: 3, curve: true, sid: -1 - i }); });
+  curves.forEach((C, i) => { for (const p of resample(C.pts, ds, C.closed)) samples.push({ p, w: C.strict ? 6 : 3, curve: true, sid: -1 - i }); });
   if (samples.length < 6) return { empty: true, curves: curves.map(C => ({ tag: C.tag, closed: C.closed, pts: C.pts.flat() })) };
   progress(0.08, 'Laying out the sheet');
   const aA = Math.max(L * 2, h * 0.9);
@@ -655,27 +714,31 @@ function solve(strokes, prm, progress = () => {}){
   }
   // cut the curves in
   M.compact();
+  M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0));
   curves.forEach((C, i) => embedCurve(M, C, i, L));
   untangle(M, 4);
   for (let it = 0; it < 8; it++){
     remesh(M, L, 0.8);
     if (it < 3) untangle(M, 2);
     fitStep(M, samples, curves, { ...base, L, h, hn: h * 1.8, maxStep: L * 0.8, parity: it & 1, reach2: h * 2.2 });
+    unfold(M, 3);
     if (prm.onStep) prm.onStep(M, "crease", it); progress(0.55 + 0.35 * it / 8, 'Sharpening the creases');
   }
   // last pass: settle without new splits so every vertex has been fitted
   fitStep(M, samples, curves, { ...base, L, h, hn: h * 1.8, maxStep: L * 0.8, parity: 0, reach2: h * 2.2 });
-  progress(0.92, 'Making quads');
+  progress(0.9, 'Smoothing out folds');
+  const folds = unfold(M, 25);
+  progress(0.93, 'Making quads');
   const cage = quadify(M, curves);
-  const quads = catmullClark(cage);
-  let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++) smooth = catmullClark(smooth);
+  const quads = catmullClark(cage, curves);
+  let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++) smooth = catmullClark(smooth, curves);
   const sh = shade(smooth);
   progress(1, 'Done');
   return {
     surface: sh, quadWire: wire(quads), creases: creaseLines(smooth),
     quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()) },
-    curves: curves.map(C => ({ tag: C.tag, closed: C.closed, pts: C.pts.flat() })),
-    nQuads: quads.F.length
+    curves: curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, pts: C.pts.flat() })),
+    nQuads: quads.F.length, folds
   };
 }
 
