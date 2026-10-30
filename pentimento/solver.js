@@ -426,6 +426,59 @@ function makePaint(dabs){
   dabs.forEach((d, i) => G.add(i, d.x, d.y, d.z));
   return (x, y, z) => { let m = 0; G.each(x, y, z, G.s ? 1 / G.s : 1, i => { const d = dabs[i], q = ((d.x - x) ** 2 + (d.y - y) ** 2 + (d.z - z) ** 2) / (d.r * d.r); if (q < 1) m += d.s * (1 - q) * (1 - q); }); return Math.min(1, m); };
 }
+// ---------------- the two sides of a sharp crease
+// Lines drawn on either side of a crease (the two walls of a spine, the deck and the bank at a lip) must never be
+// averaged together. Around each crease, the loose lines nearby fall into two fans (one per sheet that meets
+// there); every sample near the crease is labelled with its fan, a whole stroke votes so the bits right at the
+// crease follow the rest of their stroke, and while fitting each vertex only listens to samples on its own side.
+function creaseSides(curves, samples, h, L){
+  const rho = Math.max(h * 2.5, 0.9), ds = L * 0.5, pts = [], G = new Grid(Math.max(ds * 2, 0.2));
+  curves.forEach((C, cid) => { if (!C.sharp) return; const P = resample(C.pts, ds, C.closed), n = P.length; if (n < 3) return;
+    let e1 = null; const base = pts.length;
+    for (let j = 0; j < n; j++){ const a = P[C.closed ? (j - 1 + n) % n : Math.max(0, j - 1)], b = P[C.closed ? (j + 1) % n : Math.min(n - 1, j + 1)], t = norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
+      if (!e1) e1 = Math.abs(t[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0]; const k = dot(e1, t); e1 = norm([e1[0] - k * t[0], e1[1] - k * t[1], e1[2] - k * t[2]]);
+      const e2 = [t[1] * e1[2] - t[2] * e1[1], t[2] * e1[0] - t[0] * e1[2], t[0] * e1[1] - t[1] * e1[0]];
+      pts.push({ cid, j, p: P[j], t, e1, e2, psi: null, idx: base + j, n }); G.add(pts.length - 1, P[j][0], P[j][1], P[j][2]); } });
+  if (!pts.length) return null;
+  const near = q => { let bi = -1, bd = rho * rho; G.each(q[0], q[1], q[2], rho, i => { const d = d2(pts[i].p, q); if (d < bd){ bd = d; bi = i; } }); if (bi < 0) return null;
+    const c = pts[bi], d = [q[0] - c.p[0], q[1] - c.p[1], q[2] - c.p[2]], k = dot(d, c.t), pd = [d[0] - k * c.t[0], d[1] - k * c.t[1], d[2] - k * c.t[2]], r = Math.hypot(...pd);
+    return { c, r, phi: Math.atan2(dot(pd, c.e2), dot(pd, c.e1)) }; };
+  // where each loose sample sits around its nearest crease
+  const info = new Array(samples.length).fill(null);
+  samples.forEach((sm, k) => { if (sm.curve || sm.guide) return; const m = near(sm.p); if (m && m.r > L * 0.15) info[k] = m; });
+  // per crease point: split the nearby directions into two fans (only samples far enough out to have a clear direction)
+  const byC = new Map(); info.forEach((m, k) => { if (!m || m.r < Math.min(0.25, h * 0.5)) return; const key = m.c.cid; (byC.get(key) || byC.set(key, []).get(key)).push(m); });
+  const win = Math.max(3, Math.round(1.2 / ds));
+  for (const [cid, list] of byC){
+    const cp = pts.filter(c => c.cid === cid); let prev = null;
+    for (const c of cp){
+      const W = list.filter(m => Math.abs(m.c.j - c.j) <= win || (m.c.n === c.n && Math.abs(m.c.j - c.j) >= c.n - win && C_closed(curves[cid])));
+      if (W.length < 12){ c.psi = prev; continue; }
+      let best = null;
+      for (let q = 0; q < 36; q++){ const psi = q * Math.PI / 18, r = [[0, 0, 0, 0], [0, 0, 0, 0]];
+        for (const m of W){ const sd = Math.sin(m.phi - psi) >= 0 ? 0 : 1, w = Math.min(1, m.r / rho * 2); r[sd][0] += Math.cos(m.phi) * w; r[sd][1] += Math.sin(m.phi) * w; r[sd][2] += w; r[sd][3]++; }
+        const sc = Math.hypot(r[0][0], r[0][1]) + Math.hypot(r[1][0], r[1][1]); if (!best || sc > best.sc) best = { psi, sc, r }; }
+      // two real fans: both have weight, and they point clearly apart
+      const [a, b] = best.r, wa = a[2], wb = b[2], ma = Math.atan2(a[1], a[0]), mb = Math.atan2(b[1], b[0]);
+      const spread = (Math.hypot(a[0], a[1]) + Math.hypot(b[0], b[1])) / (wa + wb), apart = Math.acos(Math.max(-1, Math.min(1, Math.cos(ma - mb))));
+      if (Math.min(wa, wb) < 0.15 * (wa + wb) || apart < 0.35 || spread < 0.8){ c.psi = null; continue; }
+      // the split line runs between the two fans' middles; keep it continuous along the crease so sides don't swap
+      let psi = Math.atan2(Math.sin(ma) + Math.sin(mb), Math.cos(ma) + Math.cos(mb));                     // the split line runs along the bisector
+      if (Math.sin(ma - psi) < 0) psi += Math.PI;                                                         // side 0 = fan a
+      if (prev !== null && Math.cos(psi - prev) < 0) psi += Math.PI;
+      c.psi = psi; prev = psi;
+    }
+  }
+  const sideOf = m => { if (!m || m.c.psi === null) return -1; return Math.sin(m.phi - m.c.psi) >= 0 ? 0 : 1; };
+  // label the samples; a stroke votes for the bits of it right at the crease
+  const votes = new Map();
+  samples.forEach((sm, k) => { const m = info[k], sd = sideOf(m); if (sd < 0) return; sm.scid = m.c.cid; sm.side = sd;
+    if (m.r > Math.min(0.25, h * 0.5)){ const key = sm.sid + ':' + m.c.cid, v = votes.get(key) || [0, 0]; v[sd]++; votes.set(key, v); } });
+  samples.forEach((sm, k) => { const m = info[k]; if (sm.side === undefined || m.r > Math.min(0.25, h * 0.5)) return; const v = votes.get(sm.sid + ':' + sm.scid); if (!v) return;
+    const tot = v[0] + v[1]; if (v[0] > 0.8 * tot) sm.side = 0; else if (v[1] > 0.8 * tot) sm.side = 1; });
+  return { near, sideOf, rho };
+}
+const C_closed = C => !!(C && C.closed);
 function fitStep(M, samples, curves, o){
   const nv = M.x.length, N = vertexNormals(M), nb = [], bnd = new Uint8Array(nv);
   for (let v = 0; v < nv; v++) nb.push(M.nbrs(v));
@@ -438,6 +491,9 @@ function fitStep(M, samples, curves, o){
     VG.each(p[0], p[1], p[2], o.reach2, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } });
     if (best >= 0){ if (sharpV(best) && !samples[k].curve){ let b2 = -1, bd2 = Infinity; for (const w of nb[best]) if (!sharpV(w)){ const dd = sq(M.x[w] - p[0]) + sq(M.y[w] - p[1]) + sq(M.z[w] - p[2]); if (dd < bd2){ bd2 = dd; b2 = w; } } if (b2 >= 0) best = b2; } own[best].push(k); } }
   const stamp = new Int32Array(nv).fill(-1), R = o.h * o.grow, R2 = R * R, ihn2 = 1 / (o.hn * o.hn), h2 = o.h * o.h;
+  // which side of a sharp crease each vertex is on (vertices right on a crease listen to both)
+  const vsd = new Int8Array(nv).fill(-1), vsc = new Int32Array(nv).fill(-1);
+  if (o.sides) for (let v = 0; v < nv; v++){ if (!M.vt[v].length || M.fc[v] >= 0) continue; const m = o.sides.near(M.P(v)); if (!m || m.r < o.L * 0.3) continue; const sd = o.sides.sideOf(m); if (sd >= 0){ vsd[v] = sd; vsc[v] = m.c.cid; } }
   const nx = M.x.slice(), ny = M.y.slice(), nz = M.z.slice();
   // umbrella vectors, for the thin-plate smoothing that fills gaps between lines
   const U = new Float64Array(nv * 3);
@@ -461,6 +517,7 @@ function fitStep(M, samples, curves, o){
     while (st.length){
       const x = st.pop();
       for (const k of own[x]){ const s = samples[k], dx = s.p[0] - p[0], dy = s.p[1] - p[1], dz = s.p[2] - p[2];
+        if (s.side !== undefined && vsc[v] === s.scid && vsd[v] !== s.side) continue;      // the other side of a crease
         const dn = dx * n[0] + dy * n[1] + dz * n[2], dt2 = Math.max(0, dx * dx + dy * dy + dz * dz - dn * dn);
         if (dn * dn * ihn2 > 6) continue;
         gk.push(k); gn.push(dn); gt.push(dt2);
@@ -572,9 +629,11 @@ function relaxMesh(M, passes, F){
 function unfold(M, iters){
   let worst = 0;
   for (let it = 0; it < iters; it++){
-    const N = vertexNormals(M), nv = M.x.length, SN = N.map((n, v) => { const s = n.slice(); for (const w of M.nbrs(v)){ s[0] += N[w][0]; s[1] += N[w][1]; s[2] += N[w][2]; } return norm(s); });
+    // a crease is a fold on purpose: normals aren't averaged across one, and faces touching one aren't judged
+    const N = vertexNormals(M), nv = M.x.length, SN = N.map((n, v) => { const s = n.slice(); if (M.fc[v] < 0) for (const w of M.nbrs(v)){ if (M.fc[w] >= 0) continue; s[0] += N[w][0]; s[1] += N[w][1]; s[2] += N[w][2]; } return norm(s); });
     const bad = new Set();
     for (let t = 0; t < M.tdead.length; t++){ if (M.tdead[t]) continue; const n = norm(M.triN(t));
+      if (M.fc[M.T[3 * t]] >= 0 || M.fc[M.T[3 * t + 1]] >= 0 || M.fc[M.T[3 * t + 2]] >= 0) continue;
       for (let i = 0; i < 3; i++){ const v = M.T[3 * t + i]; if (dot(n, SN[v]) < 0.25){ for (let j = 0; j < 3; j++) bad.add(M.T[3 * t + j]); break; } } }
     if (it === 0) worst = bad.size;
     if (!bad.size) break;
@@ -595,8 +654,26 @@ function unfold(M, iters){
 // ---------------------------------------------------------------- cutting a curve into the mesh
 function embedCurve(M, C, id, L, cross){
   const S = resample(C.pts, L * 0.35, C.closed); if (S.length < 2) return 0;
+  // a strict crease the sheet hasn't reached yet (the thin top of a spine, rounded off by the first fit):
+  // pull the nearest bit of sheet up to it first, gently, a few times, so the crease can be cut in along its length
+  if (C.sharp && C.strict && !cross){
+    const Q = resample(C.pts, L * 0.5, C.closed), R0 = Math.max(L * 1.6, L * 4);
+    for (let pass = 0; pass < 6; pass++){
+      const G0 = new Grid(L); for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) G0.add(v, M.x[v], M.y[v], M.z[v]);
+      let far = 0; const mv = new Map();
+      for (const q of Q){ let bv = -1, bd = R0 * R0; G0.each(q[0], q[1], q[2], R0, v => { const dd = d2(M.P(v), q); if (dd < bd){ bd = dd; bv = v; } });
+        if (bv < 0 || bd < sq(Math.max(L * 0.6, 0.12)) || M.fc[bv] >= 0) continue; far++;
+        const ring1 = M.nbrs(bv), add = (v, w) => { const o = mv.get(v) || [0, 0, 0, 0]; o[0] += (q[0] - M.x[v]) * w; o[1] += (q[1] - M.y[v]) * w; o[2] += (q[2] - M.z[v]) * w; o[3] += w; mv.set(v, o); };
+        add(bv, 1); for (const w of ring1) add(w, 0.45); }
+      if (!far) break;
+      for (const [v, o] of mv){ if (M.fc[v] >= 0) continue; const k = 0.55 / Math.max(1, o[3]); M.x[v] += o[0] * k; M.y[v] += o[1] * k; M.z[v] += o[2] * k; }
+    }
+  }
   const VG = new Grid(L); for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
-  const near = p => { let best = -1, bd = sq(L * 1.6); VG.each(p[0], p[1], p[2], L * 1.6, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } }); return best; };
+  // a sharp crease reaches further for the sheet: where the surface rounded off below a thin top (a spine),
+  // the crease still gets cut in and pulls the sheet up to it
+  const RR = C.sharp && !cross ? L * 4 : L * 1.6;
+  const near = p => { let best = -1, bd = sq(RR); VG.each(p[0], p[1], p[2], RR, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } }); return best; };
   // runs of curve samples that lie over the mesh
   const runs = []; let cur = [];
   for (const p of S){ const v = near(p); if (v < 0){ if (cur.length) runs.push(cur); cur = []; continue; } if (cur[cur.length - 1] !== v) cur.push(v); }
@@ -609,7 +686,7 @@ function embedCurve(M, C, id, L, cross){
     for (let i = 1; i < run.length; i++){
       const u = path[path.length - 1], w = run[i]; if (u === w) continue;
       const sp = shortestPath(M, u, w, L * (cross ? 10 : 4), cross);
-      if (!sp){ if (cross){ if (path.length > 1) paths.push(path); path = [w]; continue; } break; }   // a guide that can't get through picks up again past the gap
+      if (!sp){ if (path.length > 1) paths.push(path); path = [w]; continue; }   // a line that can't get through picks up again past the gap
       for (let k = 1; k < sp.length; k++) path.push(sp[k]);
     }
     paths.push(path);
@@ -1297,6 +1374,7 @@ function creaseLines({ V, sharp }){
 //   5 edge (averaged, where the surface ends) · 6 strict edge (exact)
 // prm: { target (quads in the result, 0 = by quad size), hard (auto crease angle, 0 = off), detail, avg, lines, fair (0..1), reach, group, subd, relax (0..10), dabs }
 function solve(strokes, prm, progress = () => {}){
+  if (prm.__crash && (prm.__crash === 'all' || prm.sides !== false)) throw new Error('test crash');   // for testing the fallbacks
   const L = Math.max(0.05, prm.detail), h = Math.max(prm.avg, L * 1.1), g = Math.max(prm.group, L * 0.5);
   const toPts = s => { const a = []; for (let i = 0; i + 2 < s.pts.length; i += 3) a.push([s.pts[i], s.pts[i + 1], s.pts[i + 2]]); return a; };
   const byTag = [[], [], [], [], [], [], []];
@@ -1320,7 +1398,8 @@ function solve(strokes, prm, progress = () => {}){
   const M = startSheet(samples, aA, prm.reach, h);
   if (!M.tdead.length) return { empty: true, curves: [] };
   const paint = makePaint(prm.dabs);
-  const base = { paint, fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4, robust: prm.robust !== false };
+  const sides = prm.sides === false ? null : creaseSides(curves, samples, h, L);
+  const base = { sides, paint, fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4, robust: prm.robust !== false };
   // coarse fit
   for (let it = 0; it < 6; it++){
     remesh(M, aA, 0.6);
@@ -1443,7 +1522,17 @@ if (typeof importScripts === 'function' && typeof window === 'undefined'){
     const { id, strokes, prm } = e.data;
     try {
       let last = 0;
-      const r = solve(strokes, prm, (p, msg) => { const now = Date.now(); if (now - last > 120 || p >= 1){ last = now; self.postMessage({ type: 'progress', id, p, msg }); } });
+      const prog = (p, msg) => { const now = Date.now(); if (now - last > 120 || p >= 1){ last = now; self.postMessage({ type: 'progress', id, p, msg }); } };
+      // if a build breaks, try again more simply rather than showing nothing: first without the newer extras,
+      // then with strict lines treated as averaged ones, then with every crease and edge treated as a loose line
+      let r = null, why = '';
+      const tries = [
+        [strokes, prm, ''],
+        [strokes, { ...prm, sides: false, tipFade: 0, target: prm.target < 0 ? 0 : prm.target, hard: 0 }, 'Built a simpler way: guide layout, crease ends and smart creases were skipped this time.'],
+        [strokes.map(s => (s.tag === 2 || s.tag === 4 || s.tag === 6) ? { ...s, tag: s.tag - 1 } : s), { ...prm, sides: false, tipFade: 0, target: 0, hard: 0 }, 'Built a simpler way: strict lines were treated as averaged ones. One of them is likely the trouble.'],
+        [strokes.map(s => s.tag >= 3 ? { ...s, tag: 0 } : s), { ...prm, sides: false, tipFade: 0, target: 0, hard: 0 }, 'Built without creases or edges: one of them is the trouble. Undo your last crease, or press Back to last good.']];
+      for (const [st, pr, note] of tries){ try { r = solve(st, pr, prog); if (note && r && !r.empty) r.note = note + (why ? ' (' + why + ')' : ''); break; } catch (e){ if (!why) why = String((e && e.message) || e); } }
+      if (!r) throw new Error(why || 'unknown problem');
       const tr = r.surface ? [...(r.quads.C ? [r.quads.C.buffer] : []), ...(r.surface.paint ? [r.surface.paint.buffer] : []), r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, ...(r.fineWire ? [r.fineWire.buffer] : []), r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
       self.postMessage({ type: 'done', id, r }, tr);
     } catch (err){ self.postMessage({ type: 'error', id, msg: String((err && err.message) || err) }); }
