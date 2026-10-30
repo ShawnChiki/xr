@@ -791,7 +791,7 @@ function solve(strokes, prm, progress = () => {}){
   if (paint){ sh.paint = new Float32Array(sh.pos.length / 3); for (let i = 0; i < sh.paint.length; i++) sh.paint[i] = paint(sh.pos[3 * i], sh.pos[3 * i + 1], sh.pos[3 * i + 2]); }
   progress(1, 'Done');
   return {
-    surface: sh, quadWire: wire(quads), creases: creaseLines(smooth),
+    surface: sh, quadWire: wire(quads), fineWire: smooth === quads ? null : wire(smooth), creases: creaseLines(smooth),
     quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()) },
     curves: curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, pts: C.pts.flat() })),
     nQuads: quads.F.length, folds
@@ -808,7 +808,7 @@ if (typeof importScripts === 'function' && typeof window === 'undefined'){
     try {
       let last = 0;
       const r = solve(strokes, prm, (p, msg) => { const now = Date.now(); if (now - last > 120 || p >= 1){ last = now; self.postMessage({ type: 'progress', id, p, msg }); } });
-      const tr = r.surface ? [...(r.surface.paint ? [r.surface.paint.buffer] : []), r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
+      const tr = r.surface ? [...(r.surface.paint ? [r.surface.paint.buffer] : []), r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, ...(r.fineWire ? [r.fineWire.buffer] : []), r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
       self.postMessage({ type: 'done', id, r }, tr);
     } catch (err){ self.postMessage({ type: 'error', id, msg: String((err && err.message) || err) }); }
   };
