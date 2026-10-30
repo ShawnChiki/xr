@@ -280,6 +280,8 @@ const zebraMat=new THREE.ShaderMaterial({ side:THREE.DoubleSide, polygonOffset:t
   vertexShader:'varying vec3 vN; varying vec3 vW; void main(){ vec4 w=modelMatrix*vec4(position,1.0); vW=w.xyz; vN=normalize(mat3(modelMatrix)*normal); gl_Position=projectionMatrix*viewMatrix*w; }',
   fragmentShader:'varying vec3 vN; varying vec3 vW; void main(){ vec3 V=normalize(vW-cameraPosition); vec3 N=normalize(vN); if (!gl_FrontFacing) N=-N; vec3 R=reflect(V,N); float s=sin(R.y*42.0); float k=smoothstep(-0.18,0.18,s); gl_FragColor=vec4(mix(vec3(0.06),vec3(0.97),k),1.0); }' });
 const faceMat=()=> state.zebra ? zebraMat : M.face;
+// in the headset, lines and dots keep the same real size (3 mm tubes) whatever the model's scale
+function uiK(){ try{ return XR.on ? (0.003/world.scale.x)/TUBE : 1; }catch(e){ return 1; } }
 const nodeGeo = new THREE.SphereGeometry(0.105, 18, 12);
 const cpGeo = new THREE.BoxGeometry(0.13, 0.13, 0.13);
 const lockNodeGeo = new THREE.BoxGeometry(0.2, 0.2, 0.2);
@@ -878,13 +880,19 @@ function puffDir(fr){
 const G_SEG=24;              // samples along every edge, shared by the patches on both sides of it
 const smoothAmt=new Map();   // vertex key -> how much the smooth brush has relaxed that point
 const guideOff=new Map();    // vertex key -> offset left by a guide stroke
+let solveTimer=0, solveRefining=false;
+function refineSolve(){ if (interactiveNow()){ solveTimer=setTimeout(refineSolve,150); return; } if (!faces.length) return; solveRefining=true; try{ refreshFaces(); applyHover(); } finally { solveRefining=false; } }
 const solveCache=new Map();  // vertex key -> last solved offset, to start the next solve close to the answer
 // Conjugate gradients on  sum_v w_v |L(d)_v + c_v|^2 + sum lam_v |d_v|^2 + sum mu |d_k - t_k|^2  over the free vertices.
 // L is the umbrella Laplacian (mean of neighbours minus the point); minimising |L|^2 gives a fair, continuous surface.
 function cgSolve(Ng, nbrs, w, free, lam, c, cons, d, iters, tol){
   const N3=Ng*3, t=new Float64Array(N3), y=new Float64Array(N3);
-  const Lap=(x,out)=>{ for (let v=0;v<Ng;v++){ const o=v*3; if (!w[v]){ out[o]=out[o+1]=out[o+2]=0; continue; } const nb=nbrs[v], n=nb.length; let a=0,b=0,cc=0; for (const h of nb){ a+=x[h*3]; b+=x[h*3+1]; cc+=x[h*3+2]; } out[o]=a/n-x[o]; out[o+1]=b/n-x[o+1]; out[o+2]=cc/n-x[o+2]; } };
-  const LapT=(r,out)=>{ out.fill(0); for (let v=0;v<Ng;v++){ if (!w[v]) continue; const o=v*3, nb=nbrs[v], n=nb.length, rx=r[o]*w[v], ry=r[o+1]*w[v], rz=r[o+2]*w[v]; out[o]-=rx; out[o+1]-=ry; out[o+2]-=rz; for (const h of nb){ out[h*3]+=rx/n; out[h*3+1]+=ry/n; out[h*3+2]+=rz/n; } } };
+  // neighbours packed flat for speed
+  const off=new Int32Array(Ng+1); for (let v=0;v<Ng;v++) off[v+1]=off[v]+(w[v]?nbrs[v].length:0);
+  const nix=new Int32Array(off[Ng]), inv=new Float64Array(Ng);
+  for (let v=0;v<Ng;v++){ if (!w[v]) continue; const nb=nbrs[v]; inv[v]=1/nb.length; for (let k=0;k<nb.length;k++) nix[off[v]+k]=nb[k]; }
+  const Lap=(x,out)=>{ for (let v=0;v<Ng;v++){ const o=v*3; if (!w[v]){ out[o]=out[o+1]=out[o+2]=0; continue; } let a=0,b=0,cc=0; for (let k=off[v];k<off[v+1];k++){ const h=nix[k]*3; a+=x[h]; b+=x[h+1]; cc+=x[h+2]; } const iv=inv[v]; out[o]=a*iv-x[o]; out[o+1]=b*iv-x[o+1]; out[o+2]=cc*iv-x[o+2]; } };
+  const LapT=(r,out)=>{ out.fill(0); for (let v=0;v<Ng;v++){ if (!w[v]) continue; const o=v*3, rx=r[o]*w[v], ry=r[o+1]*w[v], rz=r[o+2]*w[v], iv=inv[v]; out[o]-=rx; out[o+1]-=ry; out[o+2]-=rz; const sx=rx*iv, sy=ry*iv, sz=rz*iv; for (let k=off[v];k<off[v+1];k++){ const h=nix[k]*3; out[h]+=sx; out[h+1]+=sy; out[h+2]+=sz; } } };
   const A=(x,out)=>{ Lap(x,t); LapT(t,out);
     for (let v=0;v<Ng;v++){ const o=v*3; if (!free[v]){ out[o]=out[o+1]=out[o+2]=0; continue; } out[o]+=lam[v]*x[o]; out[o+1]+=lam[v]*x[o+1]; out[o+2]+=lam[v]*x[o+2]; }
     if (cons) for (let k=0;k<cons.idx.length;k++){ const v=cons.idx[k]; if (!free[v]) continue; const o=v*3; out[o]+=cons.mu*x[o]; out[o+1]+=cons.mu*x[o+1]; out[o+2]+=cons.mu*x[o+2]; } };
@@ -892,20 +900,26 @@ function cgSolve(Ng, nbrs, w, free, lam, c, cons, d, iters, tol){
   if (c){ LapT(c,y); for (let i=0;i<N3;i++) b[i]=-y[i]; }
   if (cons) for (let k=0;k<cons.idx.length;k++){ const o=cons.idx[k]*3; b[o]+=cons.mu*cons.t[k*3]; b[o+1]+=cons.mu*cons.t[k*3+1]; b[o+2]+=cons.mu*cons.t[k*3+2]; }
   for (let v=0;v<Ng;v++) if (!free[v]){ b[v*3]=b[v*3+1]=b[v*3+2]=0; d[v*3]=d[v*3+1]=d[v*3+2]=0; }
-  const r=new Float64Array(N3), pp=new Float64Array(N3), Ap=new Float64Array(N3);
-  A(d,Ap); for (let i=0;i<N3;i++){ r[i]=b[i]-Ap[i]; pp[i]=r[i]; }
-  const rs=[0,0,0], bn=[0,0,0];
-  for (let i=0;i<N3;i++){ rs[i%3]+=r[i]*r[i]; bn[i%3]+=b[i]*b[i]; }
-  const lim=tol*tol*Math.max(1e-12, bn[0]+bn[1]+bn[2]);
+  // Jacobi preconditioner: the diagonal of the system
+  const dg=new Float64Array(Ng);
+  for (let h=0;h<Ng;h++){ if (!w[h]) continue; const nb=nbrs[h], n=nb.length; dg[h]+=w[h]; for (const v of nb) dg[v]+=w[h]/(n*n); }
+  for (let v=0;v<Ng;v++) dg[v]+=lam[v];
+  if (cons) for (let k=0;k<cons.idx.length;k++) dg[cons.idx[k]]+=cons.mu;
+  for (let v=0;v<Ng;v++) dg[v] = (free[v] && dg[v]>1e-14) ? 1/dg[v] : 0;
+  const r=new Float64Array(N3), z=new Float64Array(N3), pp=new Float64Array(N3), Ap=new Float64Array(N3);
+  A(d,Ap); for (let i=0;i<N3;i++){ r[i]=b[i]-Ap[i]; z[i]=r[i]*dg[(i/3)|0]; pp[i]=z[i]; }
+  const rz=[0,0,0], bn=[0,0,0];
+  for (let i=0;i<N3;i++){ rz[i%3]+=r[i]*z[i]; bn[i%3]+=b[i]*b[i]*dg[(i/3)|0]; }
+  const lim=tol*tol*Math.max(1e-30, bn[0]+bn[1]+bn[2]);
   let it=0;
   for (; it<iters; it++){
-    if (rs[0]+rs[1]+rs[2] <= lim) break;
+    if (rz[0]+rz[1]+rz[2] <= lim) break;
     A(pp,Ap); const pa=[0,0,0]; for (let i=0;i<N3;i++) pa[i%3]+=pp[i]*Ap[i];
-    const al=[0,1,2].map(k=> pa[k]>1e-300 ? rs[k]/pa[k] : 0), rn=[0,0,0];
-    for (let i=0;i<N3;i++){ const k=i%3; d[i]+=al[k]*pp[i]; r[i]-=al[k]*Ap[i]; rn[k]+=r[i]*r[i]; }
-    const be=[0,1,2].map(k=> rs[k]>1e-300 ? rn[k]/rs[k] : 0);
-    for (let i=0;i<N3;i++) pp[i]=r[i]+be[i%3]*pp[i];
-    rs[0]=rn[0]; rs[1]=rn[1]; rs[2]=rn[2];
+    const al=[0,1,2].map(k=> pa[k]>1e-300 ? rz[k]/pa[k] : 0), rn=[0,0,0];
+    for (let i=0;i<N3;i++){ const k=i%3; d[i]+=al[k]*pp[i]; r[i]-=al[k]*Ap[i]; z[i]=r[i]*dg[(i/3)|0]; rn[k]+=r[i]*z[i]; }
+    const be=[0,1,2].map(k=> rz[k]>1e-300 ? rn[k]/rz[k] : 0);
+    for (let i=0;i<N3;i++) pp[i]=z[i]+be[i%3]*pp[i];
+    rz[0]=rn[0]; rz[1]=rn[1]; rz[2]=rn[2];
   }
   return it;
 }
@@ -1042,7 +1056,8 @@ function buildSurfaces(){
   const pinned=new Uint8Array(Ng), spring=new Uint8Array(Ng), weldN=new Uint8Array(Ng);
   for (let g=0;g<Ng;g++){
     if (kind[g]===1){ const e=edges.get(eOf[g]); if (e && e.guide && !e.locked) spring[g]=1; else pinned[g]=1; weldN[g] = e && !e.crease ? 1 : 0; }
-    else if (kind[g]===2){ const nd=nodes.get(eOf[g]); if (allGuide(eOf[g]) && !(nd && nd.locked)) spring[g]=1; else pinned[g]=1; }
+    else if (kind[g]===2){ const nd=nodes.get(eOf[g]); if (allGuide(eOf[g]) && !(nd && nd.locked)) spring[g]=1; else pinned[g]=1;
+      let cr=false; for (const e of edges.values()) if ((e.a===eOf[g]||e.b===eOf[g]) && e.crease) cr=true; weldN[g]=cr?0:1; }
   }
   const nb=Array.from({length:Ng},()=>new Set());
   for (const rec of recs){ const ix=rec.r.idx, m=rec.map;
@@ -1050,6 +1065,16 @@ function buildSurfaces(){
       if (a!==b){ nb[a].add(b); nb[b].add(a); } if (b!==c){ nb[b].add(c); nb[c].add(b); } if (a!==c){ nb[a].add(c); nb[c].add(a); } } }
   const creaseAt=g=>{ if (kind[g]!==1) return false; const e=edges.get(eOf[g]); return !!(e && e.crease); };
   const nbrs=nb.map((set,g)=>{ let arr=[...set]; if (creaseAt(g)) arr=arr.filter(h=>kind[h]===2 || (kind[h]===1 && eOf[h]===eOf[g])); return arr; });
+  // what the smooth brush averages over: a curve point only along its own curve; a dot only along the
+  // straightest pair of curves through it (a corner sharper than 150 degrees stays put)
+  const snbrs=nb.map((set,g)=>{
+    if (kind[g]===0) return nbrs[g];
+    if (kind[g]===1){ const E=edges.get(eOf[g]); return [...set].filter(h=>(kind[h]===1 && eOf[h]===eOf[g]) || (kind[h]===2 && E && (eOf[h]===E.a||eOf[h]===E.b))); }
+    const pg=new V3(base[g*3],base[g*3+1],base[g*3+2]), cand=[...set].filter(h=>kind[h]===1).map(h=>({h, e:eOf[h], d:new V3(base[h*3],base[h*3+1],base[h*3+2]).sub(pg).normalize()}));
+    let best=null, bd=-0.87;
+    for (let i=0;i<cand.length;i++) for (let j=i+1;j<cand.length;j++){ if (cand[i].e===cand[j].e) continue; const dt=cand[i].d.dot(cand[j].d); if (dt<bd){ bd=dt; best=[cand[i].h,cand[j].h]; } }
+    return best || [];
+  });
   // ---- continuity: one fair surface across every smooth curve ----
   const faceCount=new Map(); for (const rec of recs) for (const x of rec.f.edges) faceCount.set(x.id,(faceCount.get(x.id)||0)+1);
   const free=new Uint8Array(Ng), lam=new Float32Array(Ng), w=new Float32Array(Ng);
@@ -1079,7 +1104,9 @@ function buildSurfaces(){
   for (let g=0;g<Ng;g++){ if (!w[g]) continue; const nb=nbrs[g], n=nb.length, o=g*3; let a=0,b=0,cc=0; for (const h of nb){ a+=base[h*3]; b+=base[h*3+1]; cc+=base[h*3+2]; } cvec[o]=a/n-base[o]; cvec[o+1]=b/n-base[o+1]; cvec[o+2]=cc/n-base[o+2]; }
   const dsol=new Float64Array(Ng*3);
   for (let g=0;g<Ng;g++){ if (!free[g]) continue; const c0=solveCache.get(gkey[g]); if (c0){ dsol[g*3]=c0[0]; dsol[g*3+1]=c0[1]; dsol[g*3+2]=c0[2]; } }
-  cgSolve(Ng, nbrs, w, free, lam, cvec, null, dsol, interactiveNow() ? 50 : 320, 2e-4);
+  // quick solve now, then a finer one a moment after you stop
+  cgSolve(Ng, nbrs, w, free, lam, cvec, null, dsol, solveRefining ? 220 : 40, 1e-6);
+  if (!solveRefining){ clearTimeout(solveTimer); solveTimer=setTimeout(refineSolve, 160); }
   const pos=new Float32Array(Ng*3);
   for (let g=0;g<Ng;g++){ for (let d=0;d<3;d++) pos[g*3+d]=base[g*3+d]+dsol[g*3+d]; if (free[g]) solveCache.set(gkey[g],[dsol[g*3],dsol[g*3+1],dsol[g*3+2]]); }
   for (let g=0;g<Ng;g++) pinned[g]=free[g]?0:1;
@@ -1087,20 +1114,20 @@ function buildSurfaces(){
   // the smooth brush's stored amount: extra relaxing passes, replayed every rebuild so it always follows the curves
   let maxS=0; const sAmt=new Float32Array(Ng);
   for (let g=0;g<Ng;g++){ if (pinned[g]) continue; const v=smoothAmt.get(gkey[g]); if (v){ sAmt[g]=v; if (v>maxS) maxS=v; } }
-  const passes=Math.min(150, Math.ceil(30*maxS)), t=[0,0,0];
+  const passes=Math.min(300, 2*Math.ceil(30*maxS)), t=[0,0,0];
   for (let k=0;k<passes;k++) for (let g=0;g<Ng;g++){
-    if (!sAmt[g]) continue; const wt=Math.max(0,Math.min(1,30*sAmt[g]-k))*0.5; if (!wt) continue;
+    if (!sAmt[g]) continue; const wt=Math.max(0,Math.min(1,30*sAmt[g]-(k>>1)))*(k%2 ? -0.53 : 0.5); if (!wt) continue;
     if (!umbrella(pos,g,t,nbrs,mirror)) continue;
     for (let d=0;d<3;d++) pos[g*3+d]+=wt*(t[d]-pos[g*3+d]);
     if (spring[g]) for (let d=0;d<3;d++) pos[g*3+d]+=0.12*wt*2*(base[g*3+d]-pos[g*3+d]);
   }
   const pre=pos;
-  GS={recs, ghosts, gkey, kind, eOf, gid, pinned, spring, weldN, nbrs, mirror, base, pre, pos, seams};
+  GS={recs, ghosts, gkey, kind, eOf, gid, pinned, spring, weldN, nbrs, snbrs, mirror, base, pre, pos, seams};
 }
 function makeSurfaceMeshes(){
   clearGroup(faceGroup); clearGroup(isoGroup);
   for (const rec of GS.recs){
-    const geo=new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(rec.r.keys.length*3),3)); geo.setIndex(rec.r.idx);
+    const geo=new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(rec.r.keys.length*3),3)); geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(rec.r.keys.length*3),3)); geo.setIndex(rec.r.idx);
     const m=new THREE.Mesh(geo, faceMat()); m.frustumCulled=false; m.userData={key:rec.f.key, hidden:false, face:rec.f}; faceGroup.add(m); rec.mesh=m;
     const ig=new THREE.BufferGeometry(); ig.setAttribute('position', new THREE.BufferAttribute(new Float32Array(rec.r.iso.length*3),3));
     const L=new THREE.LineSegments(ig, M.iso); L.frustumCulled=false; isoGroup.add(L); rec.isoGeo=ig;
@@ -1111,18 +1138,33 @@ function makeSurfaceMeshes(){
   }
   updateSurfaceMeshes();
 }
+// angle-weighted normals of one patch, from the welded positions
+function patchNormals(rec, P, out){
+  out.fill(0); const ix=rec.r.idx, m=rec.map, A=new V3(), B=new V3(), C=new V3(), e1=new V3(), e2=new V3(), e3=new V3(), n=new V3();
+  for (let t=0;t<ix.length;t+=3){
+    const a=ix[t], b=ix[t+1], c=ix[t+2];
+    A.set(P[m[a]*3],P[m[a]*3+1],P[m[a]*3+2]); B.set(P[m[b]*3],P[m[b]*3+1],P[m[b]*3+2]); C.set(P[m[c]*3],P[m[c]*3+1],P[m[c]*3+2]);
+    e1.subVectors(B,A); e2.subVectors(C,A); e3.subVectors(C,B); n.crossVectors(e1,e2); const l=n.length(); if (l<1e-14) continue; n.multiplyScalar(1/l);
+    const l1=e1.length(), l2=e2.length(), l3=e3.length(); if (!l1||!l2||!l3) continue;
+    const wa=Math.acos(Math.max(-1,Math.min(1,e1.dot(e2)/(l1*l2)))), wb=Math.acos(Math.max(-1,Math.min(1,-e1.dot(e3)/(l1*l3)))), wc=Math.PI-wa-wb;
+    out[a*3]+=n.x*wa; out[a*3+1]+=n.y*wa; out[a*3+2]+=n.z*wa;
+    out[b*3]+=n.x*wb; out[b*3+1]+=n.y*wb; out[b*3+2]+=n.z*wb;
+    out[c*3]+=n.x*wc; out[c*3+1]+=n.y*wc; out[c*3+2]+=n.z*wc;
+  }
+  for (let i=0;i<out.length;i+=3){ const l=Math.hypot(out[i],out[i+1],out[i+2])||1; out[i]/=l; out[i+1]/=l; out[i+2]/=l; }
+}
 function updateSurfaceMeshes(){
   const P=GS.pos, Ng=GS.gkey.length;
   for (const rec of GS.recs){
     const a=rec.mesh.geometry.attributes.position.array, m=rec.map;
     for (let li=0;li<m.length;li++){ const g=m[li]*3; a[li*3]=P[g]; a[li*3+1]=P[g+1]; a[li*3+2]=P[g+2]; }
-    rec.mesh.geometry.attributes.position.needsUpdate=true; rec.mesh.geometry.computeVertexNormals(); rec.mesh.geometry.computeBoundingSphere();
+    rec.mesh.geometry.attributes.position.needsUpdate=true; rec.mesh.geometry.computeBoundingSphere();
+    patchNormals(rec, P, rec.mesh.geometry.attributes.normal.array);
     const ia=rec.isoGeo.attributes.position.array, iso=rec.r.iso;
     for (let i=0;i<iso.length;i++){ const g=m[iso[i]]*3; ia[i*3]=P[g]; ia[i*3+1]=P[g+1]; ia[i*3+2]=P[g+2]; }
     rec.isoGeo.attributes.position.needsUpdate=true;
   }
-  // share normals along smooth seams so the shading flows across them (zebra view shows the true normals)
-  if (state.zebra){ requestRender(); return; }
+  // one shared normal wherever patches meet without a crease, so shading and zebra stripes run straight across
   const first=new Float32Array(Ng*3), sum=new Float32Array(Ng*3), seen=new Uint8Array(Ng);
   for (const rec of GS.recs){ const nr=rec.mesh.geometry.attributes.normal.array, m=rec.map;
     for (let li=0;li<m.length;li++){ const g=m[li]; if (!GS.weldN[g]) continue; const x=nr[li*3], y=nr[li*3+1], z=nr[li*3+2];
@@ -1142,11 +1184,11 @@ function brushCurves(c, r, strength, skipE, skipN){
   for (const e of edges.values()){
     if (e.locked || (skipE && skipE.has(e.id))) continue;
     const K=e.cps.length, U=knots(K); let moved=false;
-    for (let pass=0;pass<2;pass++){ const orig=e.cps.map(q=>q.clone());
+    for (let pass=0;pass<4;pass++){ const orig=e.cps.map(q=>q.clone()), fac = pass%2 ? -0.53 : 0.5;
       for (let i=1;i<K-1;i++){
         const q=evalAt(orig, U, (U[i+1]+U[i+2]+U[i+3])/3), d=q.distanceTo(c); if (d>=r) continue;
         const avg=orig[i-1].clone().add(orig[i+1]).multiplyScalar(0.5); if (avg.distanceToSquared(orig[i])<1e-12) continue;
-        e.cps[i].lerp(avg, sm(1-d/r)*strength*0.5); moved=true; } }
+        e.cps[i].addScaledVector(avg.sub(orig[i]), sm(1-d/r)*strength*fac); moved=true; } }
     if (moved){ dirty(e); changed=true; }
   }
   for (const n of nodes.values()){
@@ -1155,8 +1197,12 @@ function brushCurves(c, r, strength, skipE, skipN){
     const ends=[]; for (const e of edges.values()){ if (e.a===e.b) continue; const K=e.cps.length; if (e.a===n.id) ends.push([e,1,2]); if (e.b===n.id) ends.push([e,K-2,K-3]); }
     if (!ends.length) continue;
     let target;
-    if (ends.length===1){ const [e,i1,i2]=ends[0]; target=e.cps[i1].clone().multiplyScalar(2).sub(e.cps[i2]); }
-    else { target=new V3(); for (const [e,i1] of ends) target.add(e.cps[i1]); target.multiplyScalar(1/ends.length); }
+    if (ends.length===1){ const [e,i1,i2]=ends[0], dir=e.cps[i1].clone().sub(e.cps[i2]); if (dir.lengthSq()<1e-12) continue;
+      target=e.cps[i1].clone().addScaledVector(dir.normalize(), n.p.distanceTo(e.cps[i1])); }       // a loose end straightens, keeping its length
+    else { let best=null, bd=-0.87;                                                                   // a joint straightens; a corner stays
+      for (let i=0;i<ends.length;i++) for (let j=i+1;j<ends.length;j++){ const di=ends[i][0].cps[ends[i][1]].clone().sub(n.p).normalize(), dj=ends[j][0].cps[ends[j][1]].clone().sub(n.p).normalize(), dt=di.dot(dj); if (dt<bd){ bd=dt; best=[i,j]; } }
+      if (!best) continue;
+      target=ends[best[0]][0].cps[ends[best[0]][1]].clone().add(ends[best[1]][0].cps[ends[best[1]][1]]).multiplyScalar(0.5); }
     const delta=target.sub(n.p).multiplyScalar(sm(1-d/r)*strength*0.5);
     if (delta.lengthSq()>1e-12){ moveNodeDeform(n.id, delta); changed=true; }
   }
@@ -1178,8 +1224,9 @@ function brushSmooth(c, r, strength){
     }
     if (list.length){
       const t=[0,0,0];
-      for (let it=0;it<2;it++) for (let i=0;i<list.length;i+=2){
-        const g=list[i], w=list[i+1]*strength*0.5; if (!umbrella(P,g,t,GS.nbrs,GS.mirror)) continue;
+      // smooth then un-shrink (Taubin): bumps flatten, but straight lines and overall size stay
+      for (let it=0;it<2;it++) for (const fac of [0.5, -0.53]) for (let i=0;i<list.length;i+=2){
+        const g=list[i], w=list[i+1]*strength*fac; if (!umbrella(P,g,t,GS.snbrs,GS.mirror)) continue;
         for (let d=0;d<3;d++) P[g*3+d]+=w*(t[d]-P[g*3+d]);
       }
       const tE=new Set(), tN=[];
@@ -1210,10 +1257,10 @@ function refreshCurves(){
   clearGroup(curveGroup);
   for (const e of edges.values()){
     const s=samples(e); if (polyLen(s)<1e-4) continue;
-    const geo=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(s,false,'catmullrom',0.5), 96, e.guide ? TUBE*0.6 : e.crease ? TUBE : TUBE*(0.75+0.4*edgeBlend(e)), 7, false);
+    const geo=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(s,false,'catmullrom',0.5), 96, uiK()*(e.guide ? TUBE*0.6 : e.crease ? TUBE : TUBE*(0.75+0.4*edgeBlend(e))), 7, false);
     const m=new THREE.Mesh(geo, M.curve); m.userData.eid=e.id; curveGroup.add(m);
-    if (e.locked){ const L=polyLen(s), nb=Math.max(2, Math.round(L/0.6)), rs=resample(s, nb+2);
-      for (let i=1;i<=nb;i++){ const bd=new THREE.Mesh(beadGeo, M.lock); bd.position.copy(rs[i]); bd.userData.bead=true; curveGroup.add(bd); } }
+    if (e.locked){ const K=uiK(), L=polyLen(s), nb=Math.max(2, Math.min(60, Math.round(L/(0.6*K)))), rs=resample(s, nb+2);
+      for (let i=1;i<=nb;i++){ const bd=new THREE.Mesh(beadGeo, M.lock); bd.position.copy(rs[i]); bd.scale.setScalar(K); bd.userData.bead=true; curveGroup.add(bd); } }
   }
 }
 function refreshNodes(){
@@ -1221,7 +1268,7 @@ function refreshNodes(){
   const dl=[];
   for (const n of nodes.values()){
     const m=new THREE.Mesh(n.locked ? lockNodeGeo : nodeGeo, n.locked ? M.lock : M.node); m.position.copy(n.p); m.userData.nid=n.id; nodeGroup.add(m);
-    if (n.p.y>0.05){ dl.push(n.p.x,n.p.y,n.p.z, n.p.x,0,n.p.z, n.p.x-0.12,0,n.p.z, n.p.x+0.12,0,n.p.z, n.p.x,0,n.p.z-0.12, n.p.x,0,n.p.z+0.12); }
+    if (n.p.y>0.05){ const k=0.12*uiK(); dl.push(n.p.x,n.p.y,n.p.z, n.p.x,0,n.p.z, n.p.x-k,0,n.p.z, n.p.x+k,0,n.p.z, n.p.x,0,n.p.z-k, n.p.x,0,n.p.z+k); }
   }
   if (dl.length){ const g=new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(dl,3)); dropGroup.add(new THREE.LineSegments(g, M.drop)); }
   applyLines();
@@ -1249,9 +1296,9 @@ function applyHover(){
   }
   for (const m of nodeGroup.children){
     const hot = hover && hover.type==='node' && hover.id===m.userData.nid;
-    m.scale.setScalar(hot?1.45:1);
+    m.scale.setScalar((hot?1.45:1)*uiK());
   }
-  for (const m of cpGroup.children){ if (m.userData.cp!=null) m.scale.setScalar(hover && hover.type==='cp' && hover.id===m.userData.cp ? 1.5 : 1); }
+  for (const m of cpGroup.children){ if (m.userData.cp!=null) m.scale.setScalar((hover && hover.type==='cp' && hover.id===m.userData.cp ? 1.5 : 1)*uiK()); }
   for (const m of faceGroup.children){
     const hot = state.tool==='erase' && hover && hover.type==='face' && hover.id===m.userData.key;
     m.material = m.userData.hidden ? M.faceGhost : (hot ? M.faceDanger : faceMat());
@@ -1728,7 +1775,7 @@ const guideMat=new THREE.MeshStandardMaterial({roughness:.4, metalness:0, transp
 function clearGuide(){ if (!guide) return; guide=null; clearGroup(guideGroup); requestRender(); }
 function showGuideTube(){
   clearGroup(guideGroup); if (!guide) return;
-  const geo=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(guide.pts), Math.max(16, guide.pts.length*2), TUBE*0.8, 6, false);
+  const geo=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(guide.pts), Math.max(16, guide.pts.length*2), TUBE*0.8*uiK(), 6, false);
   guideGroup.add(new THREE.Mesh(geo, guideMat)); requestRender();
 }
 function drawGuide(P){
@@ -1932,7 +1979,7 @@ function loadSample(){
 }
 
 // ---------- XR (Quest browser: hands or controllers) ----------
-const XR = { on:false, session:null, ar:false, room:false, placed:false, grab:null, S0:0.07, panelMoving:true, frameN:0, needRefresh:false, hoverBtn:null, brushR:0.05, brushS:0.4, panelDirty:0, clayR:0.035, clayS:0.5, tableS:0.07 };
+const XR = { on:false, session:null, ar:false, room:false, placed:false, grab:null, S0:0.07, panelMoving:true, frameN:0, needRefresh:false, hoverBtn:null, brushR:0.12, brushS:0.4, panelDirty:0, clayR:0.25, clayS:0.5, tableS:0.07, nextScale:1, uiScale:0 };
 const xrRoot = new THREE.Group(); xrRoot.visible=false; scene.add(xrRoot);
 const room = new THREE.Group(); room.visible=false; scene.add(room);
 (function buildRoom(){
@@ -2078,7 +2125,7 @@ function updateLive(h){
   const pts=P.length>90 ? resample(P,90) : P;
   if (polyLen(pts)<1e-4) return;
   h.live.geometry.dispose();
-  h.live.geometry=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts.map(p=>p.clone())), Math.max(8,pts.length*2), TUBE*0.9, 6, false);
+  h.live.geometry=new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts.map(p=>p.clone())), Math.max(8,pts.length*2), TUBE*0.9*uiK(), 6, false);
   h.live.visible=true;
 }
 
@@ -2114,10 +2161,9 @@ function modelCenter(){ const c=new V3(); let n=0; for (const nd of nodes.values
   if (clayBox){ c.add(new V3(CORG.x+(clayBox[0]+clayBox[1])/2*CHS, CORG.y+(clayBox[2]+clayBox[3])/2*CHS, CORG.z+(clayBox[4]+clayBox[5])/2*CHS).multiplyScalar(Math.max(1,n))); n=n?2*n:1; }
   return n ? c.multiplyScalar(1/n) : c; }
 function lifeSize(){
-  if (Math.abs(world.scale.x-1)<0.003){ XR.placed=false; showLabel('Back to tabletop', panel.position, 1200); return; }
-  world.updateMatrixWorld(true); const c=modelCenter(), cw=c.clone().applyMatrix4(world.matrixWorld);
-  world.scale.setScalar(1); world.position.copy(cw).sub(c.clone().applyQuaternion(world.quaternion)); world.position.y=0;
-  showLabel('1:1  life size', panel.position, 1500);
+  const life=Math.abs(world.scale.x-1)<0.003;
+  XR.nextScale = life ? XR.S0 : 1; XR.placed=false;
+  showLabel(life ? 'Tabletop' : '1:1  life size', panel.position, 1300);
 }
 
 // ---- drag corners / control points ----
@@ -2152,12 +2198,13 @@ function xrEndDrag(h){
 function xrCancelDrag(h){ const d=h.drag; h.drag=null; if (d && d.moved){ restore(d.before); undoStack.pop(); } }
 
 // ---- per-hand action ----
+function clayRL(){ return Math.max(rLocal(XR.clayR), CHS*1.1); }
 function handQ(h){ return world.quaternion.clone().invert().multiply(h.q); }
 function startAction(h){
   const p=toLocal(h.pos), R=rLocal(0.03);
   if ((state.mode==='clay' || state.tool==='smooth') && h.side==='left'){ startGrab1(h,'pinch'); return; }   // brushes live on the right hand
   if (state.mode==='clay' && state.clayTool==='trace'){ const q=clayNearest(p, rLocal(0.08)); h.stroke={pts:[q||p]}; h.mode='trace'; return; }
-  if (state.mode==='clay'){ pushClayUndo(); h.mode='clay'; h.clayLast=p; clayStamp(p, rLocal(XR.clayR), state.clayTool, XR.clayS, handQ(h)); return; }
+  if (state.mode==='clay'){ pushClayUndo(); h.mode='clay'; h.clayLast=p; clayStamp(p, clayRL(), state.clayTool, XR.clayS, handQ(h)); return; }
   if (state.tool==='guide'){ h.stroke={pts:[p], snap:null, guide:true}; h.mode='stroke'; return; }
   if (state.tool==='draw'){ h.stroke={pts:[p], snap:snap3D(p,R)}; h.mode='stroke'; return; }
   if (state.tool==='edit'){
@@ -2203,7 +2250,7 @@ function handleHand(h){
   h.awas=h.a;
   if (h.kind==='ctrl' && (state.mode==='clay' || state.tool==='smooth')){
     const dt=1/72, cl=state.mode==='clay', rk=cl?'clayR':'brushR', sk=cl?'clayS':'brushS';
-    if (Math.abs(h.ay)>0.15){ XR[rk]=Math.max(0.01, Math.min(0.3, XR[rk]*Math.exp(-h.ay*dt*1.6))); XR.panelDirty=1; }
+    if (Math.abs(h.ay)>0.15){ XR[rk]=Math.max(0.01, Math.min(1.5, XR[rk]*Math.exp(-h.ay*dt*1.6))); XR.panelDirty=1; }
     if (Math.abs(h.ax)>0.15){ XR[sk]=Math.max(0.05, Math.min(1, XR[sk]+h.ax*dt*0.9)); XR.panelDirty=1; }
   }
   if (h.mode==='panel'){
@@ -2233,7 +2280,7 @@ function handleHand(h){
   if (h.mode==='trace' && h.stroke){ const p0=toLocal(h.pos), p=clayNearest(p0, rLocal(0.08))||p0, P=h.stroke.pts; if (p.distanceTo(P[P.length-1])>rLocal(0.003)) P.push(p); updateLive(h); }
   if (h.mode==='drag' && h.drag) xrUpdateDrag(h);
   if (h.mode==='clay'){
-    const q=toLocal(h.pos), t=state.clayTool, r=rLocal(XR.clayR);
+    const q=toLocal(h.pos), t=state.clayTool, r=clayRL();
     const hq=handQ(h);
     if (t==='add' || t==='carve'){ if (q.distanceTo(h.clayLast)>CHS*0.3){ claySegment(h.clayLast, q, r, t, XR.clayS, hq); h.clayLast=q; } }
     else { claySegment(h.clayLast, q, r, t, XR.clayS*0.5, hq); h.clayLast=q; clayStamp(q, r, t, XR.clayS*0.5, hq); }
@@ -2255,7 +2302,7 @@ function updateMarks(){
     h.mark.visible=false;
     const clayOn=state.mode==='clay', showBrush = (clayOn ? state.clayTool!=='trace' : state.tool==='smooth') && h.side==='right' && h.present && !h.nearPanel && h.mode!=='panel';
     h.brush.visible=showBrush;
-    if (showBrush){ const bR=clayOn?XR.clayR:XR.brushR, bS=clayOn?XR.clayS:XR.brushS, act=h.mode==='smooth'||h.mode==='clay';
+    if (showBrush){ const bR=clayOn?clayRL()*world.scale.x:XR.brushR, bS=clayOn?XR.clayS:XR.brushS, act=h.mode==='smooth'||h.mode==='clay';
       h.brush.geometry = clayOn ? brushGeos[state.clayShape] : brushGeos.sphere; h.brush.quaternion.copy(h.q);
       h.brush.position.copy(h.pos); h.brush.scale.setScalar(bR); h.brush.material.opacity = (act ? .2 : .1) + .3*bS; }
     if (clayOn) continue;
@@ -2326,7 +2373,7 @@ const XR_HINT={
   c_deflate:()=>['Pinch over the clay to shrink it.', clayBrushLine()],
   c_trace:()=>['Draw a loop on the clay with your right hand.','It becomes a NURBS patch fitted to the clay.']
 };
-function clayBrushLine(){ return SHAPE_NAMES[state.clayShape]+' '+Math.round(XR.clayR*100)+' cm, '+Math.round(XR.clayS*100)+'%. Stick: size, strength. A: add/carve.'; }
+function clayBrushLine(){ return SHAPE_NAMES[state.clayShape]+' '+Math.round(clayRL()*world.scale.x*100)+' cm, '+Math.round(XR.clayS*100)+'%. Stick: size, strength. A: add/carve.'; }
 const BX0=16, BY0=150, BG=8, BWd=(CW-2*BX0-3*BG)/4, BHt=76;
 function btnRect(b){ return b.r<0 ? {x:CW-16-104-(b.c?112:0), y:16, w:104, h:50} : {x:BX0+b.c*(BWd+BG), y:BY0+b.r*(BHt+BG), w:BWd, h:BHt}; }
 function rr(c,x,y,w,h,r){ c.beginPath(); c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r); c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath(); }
@@ -2367,7 +2414,7 @@ function pressButton(id){
   else if (id==='clear') clayClear();
   else if (id==='iso'){ state.iso=!state.iso; $('#isoChk').checked=state.iso; applyLines(); }
   else if (id==='lines'){ state.lines=!state.lines; $('#linesChk').checked=state.lines; applyLines(); }
-  else if (id==='recenter'){ XR.placed=false; XR.panelPinned=false; }
+  else if (id==='recenter'){ XR.nextScale=world.scale.x; XR.placed=false; XR.panelPinned=false; }
   else if (id==='blend'){ const B=[0.3,0.6,1]; state.blend=B[(B.indexOf(state.blend)+1)%B.length] ?? 1; $('#blendRange').value=state.blend; $('#blendVal').textContent=Math.round(state.blend*100)+'%'; refreshFaces(); applyHover(); }
   else if (id==='room'){ if (XR.ar) setRoom(!XR.room); }
   else if (id==='exit'){ if (XR.session) XR.session.end(); }
@@ -2383,17 +2430,29 @@ function followPanel(){
   if (XR.panelMoving){ panel.position.lerp(target, 0.12); if (panel.position.distanceTo(target)<0.02) XR.panelMoving=false; }
   panel.lookAt(head.pos);
 }
-function placeWorld(){
+function modelRadius(c){
+  let r=0; for (const n of nodes.values()) r=Math.max(r, n.p.distanceTo(c));
+  if (clayBox){ const a=new V3(CORG.x+clayBox[0]*CHS, CORG.y+clayBox[2]*CHS, CORG.z+clayBox[4]*CHS), b=new V3(CORG.x+clayBox[1]*CHS, CORG.y+clayBox[3]*CHS, CORG.z+clayBox[5]*CHS); r=Math.max(r, a.distanceTo(c), b.distanceTo(c)); }
+  return r;
+}
+// life size: the model stands on the floor in front of you; smaller: it sits on a virtual table
+function placeWorld(S){
+  if (S==null){ S = XR.nextScale || 1; XR.nextScale=null; }
   const fwd=new V3(0,0,-1).applyQuaternion(head.q); fwd.y=0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
-  const S=XR.S0, c=nodes.size ? netCentroid.clone() : new V3();
+  const c=modelCenter();
   const toUser=fwd.clone().negate(), view=new V3(Math.sin(cam.yaw),0,Math.cos(cam.yaw));
   world.quaternion.setFromAxisAngle(new V3(0,1,0), ang(toUser)-ang(view));
   world.scale.setScalar(S);
-  const T=head.pos.clone().addScaledVector(fwd,0.55); T.y=head.pos.y-0.38;
-  world.position.copy(T).sub(c.clone().applyQuaternion(world.quaternion).multiplyScalar(S));
-  world.updateMatrixWorld(true);
-  const left=new V3(fwd.z,0,-fwd.x);
-  panel.position.copy(head.pos).addScaledVector(fwd,0.4).addScaledVector(left,0.24); panel.position.y=head.pos.y-0.24; XR.panelMoving=false;
+  if (S>=0.5){
+    const T=head.pos.clone().addScaledVector(fwd, Math.max(0.8, modelRadius(c)*S+0.5));
+    world.position.copy(T).sub(new V3(c.x,0,c.z).applyQuaternion(world.quaternion).multiplyScalar(S)); world.position.y=0;
+  } else {
+    const T=head.pos.clone().addScaledVector(fwd,0.55); T.y=head.pos.y-0.38;
+    world.position.copy(T).sub(c.clone().applyQuaternion(world.quaternion).multiplyScalar(S));
+  }
+  world.updateMatrixWorld(true); XR.uiScale=0;
+  if (!XR.panelPinned){ const left=new V3(fwd.z,0,-fwd.x);
+    panel.position.copy(head.pos).addScaledVector(fwd,0.4).addScaledVector(left,0.24); panel.position.y=head.pos.y-0.24; XR.panelMoving=false; }
 }
 function setRoom(on){
   XR.room=on; room.visible=on; scene.background = on ? roomBg : null;
@@ -2409,6 +2468,7 @@ function xrTick(xf){
   readInputs(xf, ref);
   for (const h of HL) handleHand(h);
   updateGrab();
+  if (Math.abs(Math.log(world.scale.x/(XR.uiScale||1e-9)))>0.12 && !HL.some(h=>h.mode==='drag'||h.mode==='stroke')){ XR.uiScale=world.scale.x; refreshCurves(); refreshNodes(); refreshCPs(); applyHover(); showGuideTube(); }
   if (XR.needRefresh){ XR.needRefresh=false; refreshAll(); }
   clayTick();
   updateMarks();
@@ -2424,7 +2484,7 @@ async function enterXR(){
   const ar=await navigator.xr.isSessionSupported('immersive-ar').catch(()=>false);
   const s=await navigator.xr.requestSession(ar?'immersive-ar':'immersive-vr', {requiredFeatures:['local-floor'], optionalFeatures:['hand-tracking']}).catch(err=>{ toast('Could not start: '+err.message, 3000); return null; });
   xrStarting=false; if (!s) return;
-  XR.ar=ar; XR.session=s; XR.on=true; XR.placed=false; XR.grab=null;
+  XR.ar=ar; XR.session=s; XR.on=true; XR.placed=false; XR.grab=null; XR.nextScale=1; XR.panelPinned=false;
   if (state.tool==='orbit') setTool('draw');
   stroke=null; drag=null; orb=null; brushing=null; ghost.visible=false; drawOverlay(); $('#chips').hidden=true;
   renderer.xr.setReferenceSpaceType('local-floor');
@@ -2442,7 +2502,7 @@ function leaveXR(){
   if (state.tool==='edge') setTool('edit');
   hover=null; resize(); topoChanged(); syncXrBtn();
 }
-window.__wsxr={XR,hands,handleHand,updateGrab,updateMarks,placeWorld,head,world,panel,drawPanel,pressButton,setTool,xrRoot,get nodes(){return nodes;},get edges(){return edges;},get faces(){return faces;},refreshAll,addNode,addEdge,lineCps,topoChanged,brushSmooth,loadSample,levelName:e=>levelName(e),drawGuide,applyGuide,setZebra,traceToPatch,clayStamp,clayRemesh,lifeSize,state};
+window.__wsxr={XR,hands,handleHand,updateGrab,updateMarks,placeWorld,head,world,panel,drawPanel,pressButton,setTool,xrRoot,get nodes(){return nodes;},get edges(){return edges;},get faces(){return faces;},refreshAll,addNode,addEdge,lineCps,topoChanged,brushSmooth,loadSample,levelName:e=>levelName(e),drawGuide,applyGuide,setZebra,traceToPatch,clayStamp,clayRemesh,lifeSize,state,get GS(){return GS;}};
 const xrBtn=$('#xrBtn'); let xrName='MR';
 function syncXrBtn(){ xrBtn.textContent = XR.session ? 'Exit '+xrName : 'Enter '+xrName; }
 xrBtn.addEventListener('click', enterXR);
