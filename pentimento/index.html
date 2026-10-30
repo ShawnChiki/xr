@@ -49,7 +49,7 @@
 </head>
 <body>
 <div class="slab card">
-  <h1>PENTI<span>MENTO</span><small>XR</small></h1>
+  <h1>PENTI<span>MENTO</span><small id="ver">XR v1.2</small></h1>
   <p>Sketch skate terrain with as many loose lines as you like. Mark the sharp edges and the lines that matter, and one smooth quad surface is found through all of them.</p>
   <div class="types"><span><i style="background:var(--loose)"></i>Loose</span><span><i style="background:var(--guide)"></i>Guide</span><span><i style="background:var(--sguide)"></i>Strict guide</span><span><i style="background:var(--crease)"></i>Crease</span><span><i style="background:var(--screase)"></i>Strict crease</span></div>
   <div class="row">
@@ -89,7 +89,10 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
+// bump this with every change, and add a line to README.md
+const VERSION = '1.2';
 const $ = s => document.querySelector(s);
+$('#ver').textContent = 'XR v' + VERSION;
 const V3 = THREE.Vector3;
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 
@@ -183,22 +186,42 @@ function redo(){ if (!redoS.length) return flash('Nothing to redo'); undoS.push(
 let editOpen = false;
 function beginEdit(){ editOpen = true; undoS.push(strokes); redoS = []; }
 function endEdit(didChange){ if (!editOpen) return; editOpen = false; if (!didChange) undoS.pop(); else changed(); }
+// Erasing has to show up the same frame you do it. Rebuilding every line each frame is too slow on a
+// headset, so erased pieces are hidden straight away inside the lines already drawn (their triangles
+// collapsed to nothing); the lines are rebuilt properly once you let go of the trigger.
+// vis: for each drawn stroke, which layer mesh it's in, where its triangles start, and its first ring.
+const vis = new WeakMap(), SEG = 6 * 5;
+function hideSegs(s, a, b){
+  const v = vis.get(s); if (!v){ linesDirty = true; return; }
+  const idx = lineMeshes[v.t].geometry.index; if (!idx) return;
+  const lo = v.p0 + Math.max(0, a), hi = Math.min(v.p0 + b, v.last);
+  if (hi <= lo) return;
+  idx.array.fill(0, v.i0 + lo * SEG, v.i0 + hi * SEG);
+  idx.addUpdateRange(v.i0 + lo * SEG, (hi - lo) * SEG); idx.needsUpdate = true;
+}
 function cutAt(p, r){
-  let hit = false; const out = [];
+  let hit = 0; const out = [];
   for (const s of strokes){
     if (!editable(s) || !nearBox(s, p, r)){ out.push(s); continue; }
     const a = s.pts, n = a.length / 3, keep = new Uint8Array(n); let any = false;
     for (let i = 0; i < n; i++){ const k = (a[3 * i] - p.x) ** 2 + (a[3 * i + 1] - p.y) ** 2 + (a[3 * i + 2] - p.z) ** 2 >= r * r; keep[i] = k; if (!k) any = true; }
     if (!any){ out.push(s); continue; }
-    hit = true;
-    for (let i = 0; i < n;){ if (!keep[i]){ i++; continue; } let j = i; while (j < n && keep[j]) j++;
-      if (j - i >= 3) out.push(makeStroke(s.tag, s.raw.slice(3 * i, 3 * j), s.pts.slice(3 * i, 3 * j)));
+    const v = vis.get(s);
+    for (let i = 0; i < n;){
+      if (!keep[i]){ hit++; hideSegs(s, i - 1, i + 1); i++; continue; }
+      let j = i; while (j < n && keep[j]) j++;
+      if (j - i >= 3){ const piece = makeStroke(s.tag, s.raw.slice(3 * i, 3 * j), s.pts.slice(3 * i, 3 * j)); if (v) vis.set(piece, { ...v, p0: v.p0 + i }); out.push(piece); }
+      else hideSegs(s, i, j);                      // leftover crumbs too short to keep
       i = j; }
   }
-  if (hit){ strokes = out; linesDirty = true; }
+  if (hit) strokes = out;
+  return hit;                                      // how many points were rubbed out this frame
+}
+function eraseAt(p, r){
+  let hit = 0;
+  strokes = strokes.filter(s => { if (!(editable(s) && touches(s, p, r))) return true; hit++; hideSegs(s, 0, s.pts.length / 3); return false; });
   return hit;
 }
-function eraseAt(p, r){ const out = strokes.filter(s => !(editable(s) && touches(s, p, r))); if (out.length === strokes.length) return false; strokes = out; linesDirty = true; return true; }
 function markAt(p, r){
   let hit = false;
   strokes = strokes.map(s => { if (s.tag === S.tag || !editable(s) || !touches(s, p, r)) return s; hit = true; const n = { ...s, tag: S.tag }; const t = tubeCache.get(s); if (t && STRICT(s.tag) === STRICT(S.tag)) tubeCache.set(n, t); return n; });
@@ -214,14 +237,19 @@ function bendStart(p, r){
   for (let i = best.i + 1; i < n; i++) arc[i] = arc[i - 1] + Math.hypot(a[3 * i] - a[3 * i - 3], a[3 * i + 1] - a[3 * i - 2], a[3 * i + 2] - a[3 * i - 1]);
   for (let i = best.i - 1; i >= 0; i--) arc[i] = arc[i + 1] + Math.hypot(a[3 * i] - a[3 * i + 3], a[3 * i + 1] - a[3 * i + 4], a[3 * i + 2] - a[3 * i + 5]);
   const reach = r * 5, w = Float32Array.from(arc, d => d >= reach ? 0 : (Math.cos(Math.PI * d / reach) + 1) / 2);
-  return { base: best.s, id: best.s.id, p0: p.clone(), w };
+  hideSegs(best.s, 0, n);
+  const mesh = new THREE.Mesh(new THREE.BufferGeometry(), lineMats[best.s.tag]); mesh.frustumCulled = false; world.add(mesh);
+  return { base: best.s, id: best.s.id, p0: p.clone(), w, mesh };
 }
 function bendMove(b, p){
   const dx = p.x - b.p0.x, dy = p.y - b.p0.y, dz = p.z - b.p0.z, B = b.base, pts = B.pts.slice(), raw = B.raw.slice();
   for (let i = 0; i < b.w.length; i++){ const w = b.w[i]; if (!w) continue; pts[3 * i] += dx * w; pts[3 * i + 1] += dy * w; pts[3 * i + 2] += dz * w; raw[3 * i] += dx * w; raw[3 * i + 1] += dy * w; raw[3 * i + 2] += dz * w; }
   const n = { ...B, pts, raw, box: boxOf(pts) };
-  strokes = strokes.map(s => s.id === b.id ? n : s); linesDirty = true;
-  return Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 1e-6;
+  strokes = strokes.map(s => s.id === b.id ? n : s);
+  const t = tube(pts, HAND_R * N() * (STRICT(B.tag) ? 1.8 : 1)), g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(t.pos, 3)); g.setAttribute('normal', new THREE.BufferAttribute(t.nrm, 3)); g.setIndex(new THREE.BufferAttribute(t.idx, 1));
+  b.mesh.geometry.dispose(); b.mesh.geometry = g;
+  return Math.hypot(dx, dy, dz);
 }
 function setSmooth(lv){ S.smooth = lv; strokes = strokes.map(s => { const n = { ...s, pts: smoothed(s.raw, lv) }; n.box = boxOf(n.pts); return n; }); undoS = []; redoS = []; changed(); }
 
@@ -248,10 +276,10 @@ function tube(pts, r, sides = SIDES){
   return { pos, nrm, idx, r };
 }
 function tubeFor(s){ const r = HAND_R * N() * (STRICT(s.tag) ? 1.8 : 1); let t = tubeCache.get(s); if (!t || Math.abs(t.r / r - 1) > 0.2){ t = tube(s.pts, r); tubeCache.set(s, t); } return t; }
-function mergeInto(geo, list){
+function mergeInto(geo, list, layer){
   let nv = 0, ni = 0; const ts = list.map(tubeFor); for (const t of ts){ nv += t.pos.length; ni += t.idx.length; }
   const pos = new Float32Array(nv), nrm = new Float32Array(nv), idx = new Uint32Array(ni); let ov = 0, oi = 0;
-  for (const t of ts){ pos.set(t.pos, ov); nrm.set(t.nrm, ov); const base = ov / 3; for (let i = 0; i < t.idx.length; i++) idx[oi + i] = t.idx[i] + base; ov += t.pos.length; oi += t.idx.length; }
+  for (const [k, t] of ts.entries()){ if (layer !== undefined) vis.set(list[k], { t: layer, i0: oi, p0: 0, last: list[k].pts.length / 3 - 1 }); pos.set(t.pos, ov); nrm.set(t.nrm, ov); const base = ov / 3; for (let i = 0; i < t.idx.length; i++) idx[oi + i] = t.idx[i] + base; ov += t.pos.length; oi += t.idx.length; }
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3)); geo.setIndex(new THREE.BufferAttribute(idx, 1));
   geo.computeBoundingSphere();
 }
@@ -263,7 +291,7 @@ let hiKey = '';
 function setHighlight(list){ const key = list.map(s => s.id).join(','); if (key === hiKey) return; hiKey = key; hiMesh.visible = list.length > 0; if (list.length){ hiMesh.geometry.dispose(); hiMesh.geometry = new THREE.BufferGeometry(); mergeInto(hiMesh.geometry, list); } }
 function rebuildLines(){
   linesDirty = false;
-  for (let t = 0; t < NT; t++){ const me = lineMeshes[t]; me.geometry.dispose(); me.geometry = new THREE.BufferGeometry(); mergeInto(me.geometry, strokes.filter(s => s.tag === t)); }
+  for (let t = 0; t < NT; t++){ const me = lineMeshes[t]; me.geometry.dispose(); me.geometry = new THREE.BufferGeometry(); mergeInto(me.geometry, strokes.filter(s => s.tag === t), t); }
   applySurfView(); hiKey = '#'; setHighlight([]);
 }
 // the line being drawn right now
@@ -527,7 +555,8 @@ function drawMenu(){
   rr2(g, 0, 0, MW, MH, 48); g.fillStyle = '#1F2227'; g.fill();
   g.textBaseline = 'middle'; g.textAlign = 'left';
   g.font = '54px "Archivo Black","Arial Black",sans-serif'; g.fillStyle = '#EEF0F3'; g.fillText('PENTI', 44, 62);
-  const w1 = g.measureText('PENTI').width; g.fillStyle = '#FF8A1F'; g.fillText('MENTO', 44 + w1, 62);
+  const w1 = g.measureText('PENTI').width, w2 = g.measureText('MENTO').width; g.fillStyle = '#FF8A1F'; g.fillText('MENTO', 44 + w1, 62);
+  g.font = '500 26px "IBM Plex Mono",monospace'; g.fillStyle = '#6B7480'; g.fillText('v' + VERSION, 44 + w1 + w2 + 18, 66);
   for (const t of TXT) if (visibleEl(t) && t.kind === 'panel'){ rr2(g, t.x, t.y, t.w, t.h, 20); g.fillStyle = '#272A30'; g.fill(); }
   for (const b of BTN){
     if (!visibleEl(b)) continue;
@@ -600,10 +629,13 @@ function toolMove(id, d, p){
     if ((p.x - d.raw[L - 3]) ** 2 + (p.y - d.raw[L - 2]) ** 2 + (p.z - d.raw[L - 1]) ** 2 < step * step) return;
     d.raw.push(p.x, p.y, p.z); if (++d.n % 2 === 0) updateLive(d); return;
   }
-  if (d.kind === 'bend'){ if (d.b) d.did = bendMove(d.b, p) || d.did; return; }
-  if (d.kind === 'cut') d.did = cutAt(p, r) || d.did;
-  else if (d.kind === 'erase') d.did = eraseAt(p, r) || d.did;
-  else if (d.kind === 'mark') d.did = markAt(p, r) || d.did;
+  let amt = 0;
+  if (d.kind === 'bend'){ if (d.b){ amt = bendMove(d.b, p); if (amt > 1e-6) d.did = true; } return amt; }
+  if (d.kind === 'cut') amt = cutAt(p, r);
+  else if (d.kind === 'erase') amt = eraseAt(p, r);
+  else if (d.kind === 'mark') amt = markAt(p, r) ? 1 : 0;
+  if (amt) d.did = true;
+  return amt;
 }
 function toolUp(id, d){
   if (d.kind === 'draw'){
@@ -611,6 +643,7 @@ function toolUp(id, d){
     if (d.raw.length >= 12) commit([...strokes, makeStroke(S.tag, Float32Array.from(d.raw))]);
     return;
   }
+  if (d.kind === 'bend' && d.b){ world.remove(d.b.mesh); d.b.mesh.geometry.dispose(); linesDirty = true; }
   endEdit(d.did);
 }
 const drawing = () => hands.some(h => h.act) || !!mouseAct;
@@ -700,7 +733,17 @@ function updateXRInput(dt){
       if (mHit && mHit.b){ pressMenu(mHit.b); pulse(h, 0.5, 20); }
       else if (!mHit){ h.act = toolDown(h.i, p); pulse(h, 0.25, 10); }
     }
-    if (h.act && pressed(0)){ toolMove(h.i, h.act, p); if (h.act.kind === 'draw' && h.act.n % 8 === 0) pulse(h, 0.04, 4); else if (h.act.did && h.act.kind !== 'draw') pulse(h, 0.1, 6); }
+    if (h.act && pressed(0)){
+      const amt = toolMove(h.i, h.act, p) || 0, k = h.act.kind;
+      if (k === 'draw'){ if (h.act.n % 8 === 0) pulse(h, 0.04, 4); }
+      // the buzz follows the erasing: stronger the more you rub out this frame, a hard knock per whole line
+      else if (k === 'cut' && amt){ pulse(h, Math.min(1, 0.25 + amt * 0.04), 30); h.flash = 1; }
+      else if (k === 'erase' && amt){ pulse(h, Math.min(1, 0.7 + amt * 0.1), 45); h.flash = 1; }
+      else if (k === 'mark' && amt){ pulse(h, 0.35, 25); h.flash = 1; }
+      else if (k === 'bend' && h.act.b){ const d = amt - (h.act.lastPull || 0); if (Math.abs(d) > 0.004 * N()){ pulse(h, Math.min(0.6, 0.08 + Math.abs(d) / N() * 20), 12); h.act.lastPull = amt; } }
+    }
+    h.flash = Math.max(0, (h.flash || 0) - dt * 6);
+    h.brush.material.opacity = 0.35 + 0.6 * h.flash;
     if (h.act && up(0)){ toolUp(h.i, h.act); h.act = null; }
     // buttons
     const left = h.hand === 'left';
@@ -824,7 +867,7 @@ setupButtons();
 // ======================================================================
 applySurfView(); placeGrid();
 if (strokes.length) scheduleBuild();
-let last = performance.now();
+let last = performance.now(), lastLines = 0;
 renderer.setAnimationLoop(now => {
   const real = Math.min(1, (now - last) / 1000), dt = Math.min(0.05, real); last = now;   // timers use real time, motion uses capped time
   const xr = renderer.xr.isPresenting;
@@ -836,7 +879,7 @@ renderer.setAnimationLoop(now => {
   if (buildTimer > 0){ buildTimer -= real; if (buildTimer <= 0){ if (drawing()) buildTimer = 0.25; else startBuild(); } }
   if (saveT > 0){ saveT -= real; if (saveT <= 0) save(); }
   if (clearArmed > 0){ clearArmed -= real; if (clearArmed <= 0) menuDirty = true; }
-  if (linesDirty) rebuildLines();
+  if (linesDirty && (!editOpen || now - lastLines > 120)){ rebuildLines(); lastLines = now; }
   if (flashT > 0){ flashT -= real; if (flashT <= 0) menuDirty = true; }
   if (menuDirty) drawMenu();
   renderer.render(scene, camera);
