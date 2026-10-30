@@ -129,6 +129,21 @@ function alongside(A, B, r){
     if (best < r * r){ const tb = norm([B[Math.min(bj + 1, B.length - 1)][0] - B[Math.max(bj - 1, 0)][0], B[Math.min(bj + 1, B.length - 1)][1] - B[Math.max(bj - 1, 0)][1], B[Math.min(bj + 1, B.length - 1)][2] - B[Math.max(bj - 1, 0)][2]]); if (Math.abs(dot(tA(i), tb)) > 0.7) k++; } });
   return k / A.length;
 }
+// A line that goes round more than once (a circle drawn in two laps, a crease scrubbed back and forth)
+// is cut into one piece per lap: whenever the line comes back within tol of where it already went,
+// after travelling at least minArc since then, a new piece starts there.
+function sliceLoops(P, tol, minArc){
+  const n = P.length; if (n < 8) return [P];
+  const arc = new Float64Array(n); for (let i = 1; i < n; i++) arc[i] = arc[i - 1] + Math.sqrt(d2(P[i - 1], P[i]));
+  const out = [], t2 = tol * tol; let start = 0;
+  for (let i = start + 1; i < n; i++){
+    for (let j = start; j < i && arc[i] - arc[j] > minArc; j++){
+      if (d2(P[i], P[j]) < t2){ out.push(P.slice(start, i + 1)); start = i; break; }
+    }
+  }
+  out.push(P.slice(start));
+  return out.filter(q => q.length >= 3);
+}
 // strict lines are used exactly as drawn: no grouping, no averaging
 function strictCurves(strokes, L, sharp, tag){
   return strokes.map(s => {
@@ -402,6 +417,13 @@ function vertexNormals(M){
   return N.map(norm);
 }
 let WB = new Float64Array(64), GU = new Float64Array(64), GW = new Float64Array(64), RW = new Float64Array(64);
+// smooth paint: how strongly a spot was painted (0..1)
+function makePaint(dabs){
+  if (!dabs || !dabs.length) return null;
+  const G = new Grid(Math.max(...dabs.map(d => d.r)));
+  dabs.forEach((d, i) => G.add(i, d.x, d.y, d.z));
+  return (x, y, z) => { let m = 0; G.each(x, y, z, G.s ? 1 / G.s : 1, i => { const d = dabs[i], q = ((d.x - x) ** 2 + (d.y - y) ** 2 + (d.z - z) ** 2) / (d.r * d.r); if (q < 1) m += d.s * (1 - q) * (1 - q); }); return Math.min(1, m); };
+}
 function fitStep(M, samples, curves, o){
   const nv = M.x.length, N = vertexNormals(M), nb = [], bnd = new Uint8Array(nv);
   for (let v = 0; v < nv; v++) nb.push(M.nbrs(v));
@@ -446,8 +468,10 @@ function fitStep(M, samples, curves, o){
     }
     // widen the averaging until it spans at least `lines` different strokes, so one wobbly
     // stroke on its own can't put a bump in the surface
+    const pm = o.paint ? o.paint(p[0], p[1], p[2]) : 0;
     let r2 = h2;
     if (minT.size){ const ms = [...minT.values()].sort((a, b) => a - b); r2 = Math.max(h2, ms[Math.min(o.lines, ms.length) - 1] * 1.3); r2 = Math.min(r2, R2 * 0.5); }
+    if (pm) r2 = Math.min(r2 * (1 + 4 * pm), R2 * 0.6);   // painted smooth: average over a wider area
     const ir2 = 1 / r2;
     // fit a small plane to the nearby line samples (in the vertex's tangent frame) and take where it
     // crosses the normal. A plain average is biased wherever all the lines sit to one side (the edges).
@@ -487,7 +511,7 @@ function fitStep(M, samples, curves, o){
     let bx = -lx, by = -ly, bz = -lz, nearB = bnd[v]; for (const w of ring){ if (bnd[w]) nearB = 1; bx += U[3 * w] / ring.length; by += U[3 * w + 1] / ring.length; bz += U[3 * w + 2] / ring.length; }
     const bilN = nearB ? lapN : -(bx * n[0] + by * n[1] + bz * n[2]) * 0.35;
     const fairN = c * lapN + (1 - c) * bilN;
-    const k = 1 - c * (1 - o.fair);
+    const fv = o.fair + (1 - o.fair) * 0.9 * pm, k = 1 - c * (1 - fv);
     let offN = (1 - k) * dataN + k * fairN; offN = Math.max(-o.maxStep, Math.min(o.maxStep, offN));
     let tx = lx - lapN * n[0], ty = ly - lapN * n[1], tz = lz - lapN * n[2];
     if (bnd[v]){
@@ -700,7 +724,9 @@ function creaseLines({ V, sharp }){
 function solve(strokes, prm, progress = () => {}){
   const L = Math.max(0.05, prm.detail), h = Math.max(prm.avg, L * 1.1), g = Math.max(prm.group, L * 0.5);
   const toPts = s => { const a = []; for (let i = 0; i + 2 < s.pts.length; i += 3) a.push([s.pts[i], s.pts[i + 1], s.pts[i + 2]]); return a; };
-  const byTag = [[], [], [], [], []]; for (const s of strokes){ const p = toPts(s); if (p.length >= 2) byTag[Math.min(4, s.tag || 0)].push(p); }
+  const byTag = [[], [], [], [], []];
+  for (const s of strokes){ const p = toPts(s), t = Math.min(4, s.tag || 0); if (p.length < 2) continue;
+    if (t === 0) byTag[0].push(p); else for (const q of sliceLoops(p, g * 0.6, Math.max(g * 5, L * 4))) byTag[t].push(q); }
   progress(0.02, 'Finding the guide and crease lines');
   // strict lines first, so they get cut in first and the averaged ones fit around them
   const curves = [...strictCurves(byTag[4], L, true, 4), ...strictCurves(byTag[2], L, false, 2), ...consensus(byTag[3], g, L * 0.5, true, 3), ...consensus(byTag[1], g, L * 0.5, false, 1)];
@@ -713,7 +739,8 @@ function solve(strokes, prm, progress = () => {}){
   const aA = Math.max(L * 2, h * 0.9);
   const M = startSheet(samples, aA, prm.reach, h);
   if (!M.tdead.length) return { empty: true, curves: [] };
-  const base = { fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4, robust: prm.robust !== false };
+  const paint = makePaint(prm.dabs);
+  const base = { paint, fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4, robust: prm.robust !== false };
   // coarse fit
   for (let it = 0; it < 6; it++){
     remesh(M, aA, 0.6);
@@ -740,6 +767,20 @@ function solve(strokes, prm, progress = () => {}){
   }
   // last pass: settle without new splits so every vertex has been fitted
   fitStep(M, samples, curves, { ...base, L, h, hn: h * 1.8, maxStep: L * 0.8, parity: 0, reach2: h * 2.2 });
+  if (paint){
+    // painted areas get relaxed directly too (alternating shrink/grow steps, so they don't sink)
+    for (let it = 0; it < 24; it++){
+      const nx = M.x.slice(), ny = M.y.slice(), nz = M.z.slice(), lam = it & 1 ? -0.53 : 0.5;
+      for (let v = 0; v < M.x.length; v++){
+        if (M.fc[v] >= 0 || !M.vt[v].length) continue;
+        const m = paint(M.x[v], M.y[v], M.z[v]); if (!m) continue;
+        const ring = M.nbrs(v), bn = ring.filter(w => M.edgeTris(v, w).length === 1), use = bn.length === 2 ? bn : bn.length ? null : ring; if (!use) continue;
+        let cx = 0, cy = 0, cz = 0; for (const w of use){ cx += M.x[w]; cy += M.y[w]; cz += M.z[w]; }
+        nx[v] += (cx / use.length - M.x[v]) * lam * m; ny[v] += (cy / use.length - M.y[v]) * lam * m; nz[v] += (cz / use.length - M.z[v]) * lam * m;
+      }
+      M.x = nx; M.y = ny; M.z = nz;
+    }
+  }
   progress(0.9, 'Smoothing out folds');
   const folds = unfold(M, 25);
   progress(0.93, 'Making quads');
@@ -747,6 +788,7 @@ function solve(strokes, prm, progress = () => {}){
   const quads = catmullClark(cage, curves);
   let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++) smooth = catmullClark(smooth, curves);
   const sh = shade(smooth);
+  if (paint){ sh.paint = new Float32Array(sh.pos.length / 3); for (let i = 0; i < sh.paint.length; i++) sh.paint[i] = paint(sh.pos[3 * i], sh.pos[3 * i + 1], sh.pos[3 * i + 2]); }
   progress(1, 'Done');
   return {
     surface: sh, quadWire: wire(quads), creases: creaseLines(smooth),
@@ -756,7 +798,7 @@ function solve(strokes, prm, progress = () => {}){
   };
 }
 
-const api = { solve, consensus, resample, catmullClark };
+const api = { solve, consensus, resample, catmullClark, sliceLoops };
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 root.PentimentoSolver = api;
 // as a Web Worker: build in the background so the headset never stalls
@@ -766,7 +808,7 @@ if (typeof importScripts === 'function' && typeof window === 'undefined'){
     try {
       let last = 0;
       const r = solve(strokes, prm, (p, msg) => { const now = Date.now(); if (now - last > 120 || p >= 1){ last = now; self.postMessage({ type: 'progress', id, p, msg }); } });
-      const tr = r.surface ? [r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
+      const tr = r.surface ? [...(r.surface.paint ? [r.surface.paint.buffer] : []), r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
       self.postMessage({ type: 'done', id, r }, tr);
     } catch (err){ self.postMessage({ type: 'error', id, msg: String((err && err.message) || err) }); }
   };
