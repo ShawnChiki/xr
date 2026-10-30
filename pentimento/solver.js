@@ -440,7 +440,11 @@ function creaseSides(curves, samples, h, L){
       const e2 = [t[1] * e1[2] - t[2] * e1[1], t[2] * e1[0] - t[0] * e1[2], t[0] * e1[1] - t[1] * e1[0]];
       pts.push({ cid, j, p: P[j], t, e1, e2, psi: null, idx: base + j, n }); G.add(pts.length - 1, P[j][0], P[j][1], P[j][2]); } });
   if (!pts.length) return null;
-  const near = q => { let bi = -1, bd = rho * rho; G.each(q[0], q[1], q[2], rho, i => { const d = d2(pts[i].p, q); if (d < bd){ bd = d; bi = i; } }); if (bi < 0) return null;
+  // the nearest crease point that the sample sits beside (past a crease's end, around the corner where several
+  // creases meet, there are more than two sheets, so nothing there is split)
+  const beside = (i, q) => { const c = pts[i]; if (c.j > 0 && c.j < c.n - 1) return true; if (C_closed(curves[c.cid])) return true;
+    const k = (q[0] - c.p[0]) * c.t[0] + (q[1] - c.p[1]) * c.t[1] + (q[2] - c.p[2]) * c.t[2]; return c.j === 0 ? k > -ds * 0.5 : k < ds * 0.5; };
+  const near = q => { let bi = -1, bd = rho * rho; G.each(q[0], q[1], q[2], rho, i => { const d = d2(pts[i].p, q); if (d < bd && beside(i, q)){ bd = d; bi = i; } }); if (bi < 0) return null;
     const c = pts[bi], d = [q[0] - c.p[0], q[1] - c.p[1], q[2] - c.p[2]], k = dot(d, c.t), pd = [d[0] - k * c.t[0], d[1] - k * c.t[1], d[2] - k * c.t[2]], r = Math.hypot(...pd);
     return { c, r, phi: Math.atan2(dot(pd, c.e2), dot(pd, c.e1)) }; };
   // where each loose sample sits around its nearest crease
@@ -654,6 +658,9 @@ function unfold(M, iters){
 // ---------------------------------------------------------------- cutting a curve into the mesh
 function embedCurve(M, C, id, L, cross){
   const S = resample(C.pts, L * 0.35, C.closed); if (S.length < 2) return 0;
+  // an edge that jumps straight from one line to another (across an inside corner, say) blocks the way for the
+  // next line; give it a middle vertex the new line can pass through
+  if (!cross){ const E = M.edges(); for (let i = 0; i < E.length; i += 2){ const a = E[i], b = E[i + 1]; if (M.fc[a] >= 0 && M.fc[b] >= 0 && !M.fe.has(M.ek(a, b)) && M.edgeTris(a, b).length) M.split(a, b); } }
   // a strict crease the sheet hasn't reached yet (the thin top of a spine, rounded off by the first fit):
   // pull the nearest bit of sheet up to it first, gently, a few times, so the crease can be cut in along its length
   if (C.sharp && C.strict && !cross){
@@ -1262,7 +1269,7 @@ function squareQuads(cage, M, flow, iters, L, Mfit){
     }
   }
 }
-function catmullClark({ V, F, sharp, feat, corner, soft, chain, tips, fade }, curves){
+function catmullClark({ V, F, sharp, feat, corner, soft, chain, tips, fade, tipFade }, curves){
   const nv = V.length / 3, eid = new Map(), E = [];
   F.forEach((f, fi) => { for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = ek(a, b); let e = eid.get(k); if (e === undefined){ e = E.length; eid.set(k, e); E.push({ a, b, f: [] }); } E[e].f.push(fi); } });
   const ne = E.length, nf = F.length, out = new Float64Array((nv + ne + nf) * 3);
@@ -1305,19 +1312,21 @@ function catmullClark({ V, F, sharp, feat, corner, soft, chain, tips, fade }, cu
   if (feat) E.forEach((e, i) => { const id = feat.get(ek(e.a, e.b)); if (id === undefined) return; NFt.set(ek(e.a, nv + i), id); NFt.set(ek(nv + i, e.b), id);
     const C = curves && curves[id]; if (C && C.strict) for (const v of [e.a, nv + i, e.b]){ const q = closestOnPoly(C, [out[3 * v], out[3 * v + 1], out[3 * v + 2]]); if (q.d2 < 1) out.set(q.p, 3 * v); } });
   const NC = new Uint8Array(nv + ne + nf); if (corner) NC.set(corner.subarray(0, nv));
-  return { V: Array.from(out), F: NF, sharp: NS, feat: NFt, corner: NC, soft: NSoft, chain: NCh, tips, fade };
+  return { V: Array.from(out), F: NF, sharp: NS, feat: NFt, corner: NC, soft: NSoft, chain: NCh, tips, fade, tipFade };
 }
 // ---------------- soft crease ends: a sharp crease that stops in the open (not on another crease or the border)
 // fades out over its last stretch instead of ending in a hard notch
-function prepTips(cage, fade){
-  if (!(fade > 0)) return;
+function prepTips(cage, fade, ends, L){
+  if (!(fade > 0) && !(ends && ends.some(e => e.f > 0))) return;
   const { V, F, sharp } = cage, nv = V.length / 3, cnt = new Map();
   F.forEach(f => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); cnt.set(k, (cnt.get(k) || 0) + 1); }));
   const deg = new Int32Array(nv), inner = new Int32Array(nv), chain = new Set();
   for (const [k, c] of cnt){ const a = Math.floor(k / 2097152), b = k % 2097152; if (c !== 2 || sharp.has(k)){ deg[a]++; deg[b]++; } if (c === 2 && sharp.has(k)){ inner[a]++; inner[b]++; chain.add(k); } }
   const tips = []; for (let v = 0; v < nv; v++) if (deg[v] === 1 && inner[v] === 1) tips.push(v);
   if (!tips.length) return;
-  cage.tips = tips; cage.chain = chain; cage.fade = fade;
+  // an end you set yourself overrides the overall setting
+  const P = v => [V[3 * v], V[3 * v + 1], V[3 * v + 2]], tf = tips.map(v => { let f = fade || 0, bd = sq((L || 0.3) * 3); for (const e of ends || []){ const d = d2(P(v), e.p); if (d < bd){ bd = d; f = e.f; } } return f; });
+  cage.tips = tips; cage.chain = chain; cage.fade = fade; cage.tipFade = tf;
 }
 // before each subdivision step: edges of the crease near a free end get a sharpness that grows with distance from it
 function applyTips(m, rem){
@@ -1325,9 +1334,9 @@ function applyTips(m, rem){
   const V = m.V, adj = new Map(), len = (a, b) => Math.hypot(V[3 * a] - V[3 * b], V[3 * a + 1] - V[3 * b + 1], V[3 * a + 2] - V[3 * b + 2]);
   for (const k of m.chain){ const a = Math.floor(k / 2097152), b = k % 2097152; (adj.get(a) || adj.set(a, []).get(a)).push(b); (adj.get(b) || adj.set(b, []).get(b)).push(a); }
   const soft = m.soft = new Map(m.soft || []);
-  for (const t of m.tips){
+  for (let ti = 0; ti < m.tips.length; ti++){ const t = m.tips[ti];
     // the crease's own length caps the fade, so a short crease still keeps some sharpness in its middle
-    let D = m.fade; { let tot = 0, prev = -1, v = t, guard = 0; while (guard++ < 100000){ const nx = (adj.get(v) || []).filter(w => w !== prev); if (nx.length !== 1 || tot > 2 * D) break; tot += len(v, nx[0]); prev = v; v = nx[0]; } D = Math.min(D, tot * 0.45); }
+    let D = m.tipFade ? m.tipFade[ti] : m.fade; { let tot = 0, prev = -1, v = t, guard = 0; while (guard++ < 100000){ const nx = (adj.get(v) || []).filter(w => w !== prev); if (nx.length !== 1 || tot > 2 * D) break; tot += len(v, nx[0]); prev = v; v = nx[0]; } D = Math.min(D, tot * 0.45); }
     if (!(D > 0)) continue;
     let prev = -1, v = t, d = 0, guard = 0;
     while (d < D && guard++ < 100000){ const nx = (adj.get(v) || []).filter(w => w !== prev); if (nx.length !== 1) break; const w = nx[0], l = len(v, w), mid = d + l / 2;
@@ -1374,7 +1383,7 @@ function creaseLines({ V, sharp }){
 //   5 edge (averaged, where the surface ends) · 6 strict edge (exact)
 // prm: { target (quads in the result, 0 = by quad size), hard (auto crease angle, 0 = off), detail, avg, lines, fair (0..1), reach, group, subd, relax (0..10), dabs }
 function solve(strokes, prm, progress = () => {}){
-  if (prm.__crash && (prm.__crash === 'all' || prm.sides !== false)) throw new Error('test crash');   // for testing the fallbacks
+  if (prm.__crash && (prm.__crash === 'all' || (prm.__crash === 'line' ? strokes.some(s => s.tag === 4 && s.pts.length === 33) : prm.sides !== false))) throw new Error('test crash');   // for testing the fallbacks
   const L = Math.max(0.05, prm.detail), h = Math.max(prm.avg, L * 1.1), g = Math.max(prm.group, L * 0.5);
   const toPts = s => { const a = []; for (let i = 0; i + 2 < s.pts.length; i += 3) a.push([s.pts[i], s.pts[i + 1], s.pts[i + 2]]); return a; };
   const byTag = [[], [], [], [], [], [], []];
@@ -1383,6 +1392,7 @@ function solve(strokes, prm, progress = () => {}){
   progress(0.02, 'Finding the guide and crease lines');
   // Creases shape the surface (strict ones first, so they get cut in first and the averaged ones fit around them).
   // Guides don't compete with the loose lines: they're laid onto the surface afterwards and steer the quads.
+  const endFades = []; for (const s of strokes) if (s.ends && s.pts.length >= 6){ const n = s.pts.length; if (s.ends[0] != null) endFades.push({ p: [s.pts[0], s.pts[1], s.pts[2]], f: s.ends[0] }); if (s.ends[1] != null) endFades.push({ p: [s.pts[n - 3], s.pts[n - 2], s.pts[n - 1]], f: s.ends[1] }); }
   const curves = [...strictCurves(byTag[4], L, true, 4), ...strictCurves(byTag[6], L, false, 6), ...consensus(byTag[3], g, L * 0.5, true, 3), ...consensus(byTag[5], g, L * 0.5, false, 5)];
   curves.forEach(C => { if (C.tag >= 5) C.edge = true; C.corners = [...(C.user || []), ...curveCorners(C, L)]; });   // green: where the surface ends
   const guides0 = [...strictCurves(byTag[2], L, false, 2), ...consensus(byTag[1], g, L * 0.5, false, 1)];
@@ -1455,7 +1465,7 @@ function solve(strokes, prm, progress = () => {}){
     if (prm.hard > 0) autoCreases(cage, prm.hard);
     progress(0.95, 'Hugging the surface');
     hugCage(cage, info, M, curves, L, 8, 0.3);
-    const lv = Math.max(1, prm.subd | 0); prepTips(cage, prm.tipFade || 0); applyTips(cage, lv);
+    const lv = Math.max(1, prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
     let smooth = catmullClark(cage, curves); for (let i = 1; i < lv; i++){ applyTips(smooth, lv - i); smooth = catmullClark(smooth, curves); }
     smooth = hardView(smooth);
     progress(1, 'Done');
@@ -1496,7 +1506,7 @@ function solve(strokes, prm, progress = () => {}){
   if (prm.hard > 0) autoCreases(cage, prm.hard);
   progress(0.97, 'Hugging the surface');
   hugCage(cage, M, Mfit, curves, L, 6);
-  const lv = 1 + (prm.subd | 0); prepTips(cage, prm.tipFade || 0); applyTips(cage, lv);
+  const lv = 1 + (prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
   const quads = catmullClark(cage, curves);
   let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++){ applyTips(smooth, lv - 1 - i); smooth = catmullClark(smooth, curves); }
   smooth = hardView(smooth);
@@ -1531,7 +1541,26 @@ if (typeof importScripts === 'function' && typeof window === 'undefined'){
         [strokes, { ...prm, sides: false, tipFade: 0, target: prm.target < 0 ? 0 : prm.target, hard: 0 }, 'Built a simpler way: guide layout, crease ends and smart creases were skipped this time.'],
         [strokes.map(s => (s.tag === 2 || s.tag === 4 || s.tag === 6) ? { ...s, tag: s.tag - 1 } : s), { ...prm, sides: false, tipFade: 0, target: 0, hard: 0 }, 'Built a simpler way: strict lines were treated as averaged ones. One of them is likely the trouble.'],
         [strokes.map(s => s.tag >= 3 ? { ...s, tag: 0 } : s), { ...prm, sides: false, tipFade: 0, target: 0, hard: 0 }, 'Built without creases or edges: one of them is the trouble. Undo your last crease, or press Back to last good.']];
-      for (const [st, pr, note] of tries){ try { r = solve(st, pr, prog); if (note && r && !r.empty) r.note = note + (why ? ' (' + why + ')' : ''); break; } catch (e){ if (!why) why = String((e && e.message) || e); } }
+      try { r = solve(strokes, prm, prog); } catch (e){ why = String((e && e.message) || e); }
+      // it broke: build up to the line that breaks it. Add the newest lines back one batch at a time (halving the
+      // batch each try) to find the first one that makes it fail, build without it, and say which it is
+      if (!r){
+        const fresh = new Set(prm.fresh && prm.fresh.length ? prm.fresh : strokes.filter(s => s.tag >= 1).map(s => s.id));
+        const cand = strokes.filter(s => fresh.has(s.id)), bad = [];
+        const ok = list => { try { solve(list, prm, () => {}); return true; } catch (e){ return false; } };
+        for (let round = 0; round < 3 && cand.length; round++){
+          const skip = new Set([...bad, ...cand.map(c => c.id)]), base = strokes.filter(s => !skip.has(s.id));
+          self.postMessage({ type: 'progress', id, p: 0.05, msg: 'Finding the line that breaks it' });
+          if (!ok(base)) break;                                 // the trouble is somewhere else: a setting, or older lines
+          let lo = 0, hi = cand.length;
+          while (hi - lo > 1){ const mid = (lo + hi) >> 1; self.postMessage({ type: 'progress', id, p: 0.1 + 0.5 * (1 - (hi - lo) / cand.length), msg: 'Finding the line that breaks it' });
+            const keep = new Set(cand.slice(0, mid).map(c => c.id)); if (ok(strokes.filter(s => !bad.includes(s.id) && (!fresh.has(s.id) || keep.has(s.id))))) lo = mid; else hi = mid; }
+          bad.push(cand[hi - 1].id); cand.splice(hi - 1, 1);
+          try { r = solve(strokes.filter(s => !bad.includes(s.id)), prm, prog); break; } catch (e){}
+        }
+        if (r){ r.culprits = bad; r.note = (bad.length > 1 ? bad.length + ' lines' : 'One line') + ' made the build fail. ' + (bad.length > 1 ? 'They are' : 'It is') + ' flashing pink, and the surface is built without ' + (bad.length > 1 ? 'them' : 'it') + '. Erase or redraw ' + (bad.length > 1 ? 'them' : 'it') + '.'; }
+      }
+      if (!r) for (const [st, pr, note] of tries.slice(1)){ try { r = solve(st, pr, prog); if (note && r && !r.empty) r.note = note + (why ? ' (' + why + ')' : ''); break; } catch (e){ if (!why) why = String((e && e.message) || e); } }
       if (!r) throw new Error(why || 'unknown problem');
       const tr = r.surface ? [...(r.quads.C ? [r.quads.C.buffer] : []), ...(r.surface.paint ? [r.surface.paint.buffer] : []), r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, ...(r.fineWire ? [r.fineWire.buffer] : []), r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
       self.postMessage({ type: 'done', id, r }, tr);
