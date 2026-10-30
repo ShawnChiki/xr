@@ -4627,6 +4627,7 @@ addEventListener('keydown',ev=>{
 /* ---------- XR: play in the Quest browser with your hands (MR passthrough, or a VR room) ---------- */
 /* The headset browser slows or pauses page timers while you're in XR, and the bots run on timers.
    So each timeout is also kept in a list that the XR frame loop checks every frame; whichever fires first runs it, once. */
+const XR_VERSION='1.4';
 const TIMERS=(()=>{
   const nST=window.setTimeout.bind(window), nCT=window.clearTimeout.bind(window), list=new Map(); let next=1;
   function fire(id){ const e=list.get(id); if(!e) return; list.delete(id); nCT(e.n); try{ e.fn(...e.a); }catch(err){ console.warn(err); } }
@@ -4752,7 +4753,7 @@ const XR=(()=>{
   const txt=e=>e?(e.textContent||'').replace(/\s+/g,' ').trim():'';
   function status(){
     const S={title:'',dot:null,lines:[],hint:null};
-    if(!$('title').hidden){ S.title='ChikiBlox'; S.logo=true; S.lines=['M.C. Escher meets Tetris','Six bots are playing a demo. Press Quick play to join them.']; }
+    if(!$('title').hidden){ S.title='ChikiBlox'; S.logo=true; S.lines=['M.C. Escher meets Tetris','Six bots are playing a demo. Press Quick play to join them.','Version '+XR_VERSION]; }
     else if(state&&state.over&&!$('over').hidden){ S.title=txt($('winner')); S.lines=[txt($('overNote'))]; }
     else if(state&&!state.started){ S.title='Custom game'; S.lines=['Set the rules on the page, then press Start game here.']; }
     else if(state&&state.started){ S.title=txt($('turn')); S.dot=DCOL[cur().ci]; if(!(state.opts.game==='targets'&&state.dealt)){ const sp=txt($('spi')).replace(/Peek$/,'').trim(); if(sp) S.lines.push(sp); } }
@@ -4817,10 +4818,11 @@ const XR=(()=>{
     g.scale.setScalar(unit); return g;
   }
   const extent=cells=>Math.max(...[0,1,2].map(i=>Math.max(...cells.map(c=>c[i]))-Math.min(...cells.map(c=>c[i]))+1));
+  const stairReady=()=>state.pieceDone||state.phase!=='build'||!buildLeft().piece;      // the stair comes after your block (or when no block can go in)
   function trayList(){
     if(!state||!state.started||state.over||!human()) return [];
     const out=[], p=cur();
-    if(canStair()&&stairsLeft(p)>0&&!state.opts.climb) out.push({stair:true});
+    if(canStair()&&stairsLeft(p)>0&&!state.opts.climb&&stairReady()) out.push({stair:true});
     if(state.phase==='build') for(const id of hand()) out.push({id});
     return out;
   }
@@ -5113,6 +5115,18 @@ const XR=(()=>{
     applyT();
   }
 
+  let quietSince=0, quietKey='';
+  function botNudge(){
+    if(!state||!state.started||state.over||!cur().bot){ quietSince=0; return; }
+    const k=state.turnNo+':'+state.cur+':'+state.phase+':'+busy;
+    const quiet=!anims.length&&!ST.on&&!pending&&!cam.anim&&$('revealBtn').hidden&&$('credits').hidden;
+    if(!quiet||k!==quietKey){ quietKey=k; quietSince=quiet?performance.now():0; return; }
+    if(!quietSince){ quietSince=performance.now(); return; }
+    const idle=performance.now()-quietSince;
+    if(!busy&&['build','walk','spider'].includes(state.phase)&&idle>2500){ quietSince=0; console.warn('bot turn went quiet: starting its move again'); X.nudges=(X.nudges||0)+1; runPhase(); }
+    else if(idle>7000){ quietSince=0; console.warn('bot turn stuck: skipping ahead'); X.nudges=(X.nudges||0)+1; recover(); }
+  }
+
   /* panel dragging by its handle */
   let pdrag=null;
 
@@ -5151,7 +5165,7 @@ const XR=(()=>{
         if(pr.type==='panel'){ if(pr.b) press(pr.b,h); h.mode='used'; }
         else if(pr.type==='handle'){ h.mode='handle'; pdrag={h,off:panel.position.clone().sub(h.pos)}; }
         else if(pr.type==='tray'){ const it=pr.item;
-          if(it.stair){ if(!(sel&&sel.kind==='stair'&&!sel.from)) selectStair(); }
+          if(it.stair){ X.offered=state.turnNo+':'+state.cur; if(!(sel&&sel.kind==='stair'&&!sel.from)) selectStair(); }
           else if(!(sel&&sel.kind==='piece'&&sel.id===it.id)) selectPiece(it.id);
           if(park&&park.sel!==sel) dropPark();
           if(!startCarry(h,false)) h.mode='used'; }
@@ -5171,7 +5185,8 @@ const XR=(()=>{
     if(park&&(park.sel!==sel||!human())) dropPark();
     // after your block, the stair comes to you (once a turn; No stair or Cancel keeps it away)
     if(state&&state.started&&!state.over&&human()){ const tk=state.turnNo+':'+state.cur;
-      if(state.pieceDone&&!state.stairUsed&&X.declined!==tk&&!sel&&!liftMode&&X.offered!==tk&&canStair()&&stairsLeft(cur())>0&&!state.opts.climb&&buildLeft().stair){ X.offered=tk; selectStair(); } }
+      if(stairReady()&&!state.stairUsed&&X.declined!==tk&&!sel&&!liftMode&&X.offered!==tk&&canStair()&&stairsLeft(cur())>0&&!state.opts.climb&&buildLeft().stair){ X.offered=tk; selectStair(); } }
+    if(sel&&sel.kind==='stair'&&!sel.from&&human()&&!stairReady()&&X.offered!==state.turnNo+':'+state.cur&&!(carry&&!carry.hold)){ if(carry) endCarry(false); dropSel(); refreshGhost(); ui(); }   // the page hands you the stair first; in the headset it waits for your block
     if(!carry&&!park&&human()&&sel&&sel.kind==='stair'&&!sel.from){ const h=holdHand(); if(h&&!h.mode) startHold(h); }
     // cursors
     let hlOn=false;
@@ -5187,6 +5202,7 @@ const XR=(()=>{
     hlRing.visible=hlOn;
     let hov=null; for(const h of HL) if(h.probe&&h.probe.type==='panel'&&h.probe.b) hov=h.probe.b.id; hoverId=hov;
     if(!$('rotate').hidden) $('rotate').hidden=true;
+    botNudge();
     if(PREF.skip&&!cineSkip&&state&&state.started&&!state.over&&!$('cine').hidden&&$('cineEnd').hidden&&$('credits').hidden&&$('revealBtn').hidden&&shown($('cineSkip'))) $('cineSkip').click();   // cut scenes off: skip each one as it starts
     if(PREF.fast&&SPD===1&&state&&state.players.some(q=>q.bot)) setFast(true);
     handleMat.color.set(pdrag?'#5157E0':'#9599FF');
@@ -5235,6 +5251,7 @@ const XR=(()=>{
     renderer.autoClear=true; resetT(); hullMat.visible=true; sun.intensity=.5; xrSun.intensity=0;
     Object.assign(TIPS,TIPS0); resize(); if(state) refreshGhost(); syncBtn();
   }
+  { const t2=document.querySelector('.tag2'); if(t2) t2.textContent+=' · v'+XR_VERSION; }
   const btn=document.createElement('button'); btn.className='xrbtn'; btn.id='xrBtn'; btn.hidden=true; document.body.appendChild(btn);
   btn.addEventListener('click',enter);
   let modeName='MR';
@@ -5244,7 +5261,7 @@ const XR=(()=>{
     if(!vr&&!ar) return; modeName=ar?'MR':'VR'; syncBtn(); btn.hidden=false; })();
 
   X.tick=tick; X.render=render; X.enter=enter;
-  X.dbg={PREF,renderer,xrCam,scene,ui3,top3,T,hands,panel,head,toW,toL,hits:()=>hits,trayItems:()=>trayItems,carry:()=>carry,park:()=>park,PW,PH,CW,CH,room};
+  X.dbg={PREF,botNudge,renderer,xrCam,scene,ui3,top3,T,hands,panel,head,toW,toL,hits:()=>hits,trayItems:()=>trayItems,carry:()=>carry,park:()=>park,PW,PH,CW,CH,room};
   window.__xr=X;
   return X;
 })();
