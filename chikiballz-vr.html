@@ -54,6 +54,7 @@
       <button class="ghost" data-view="0" aria-pressed="true">Follow</button>
       <button class="ghost" data-view="1" aria-pressed="false">Tabletop</button>
       <button id="faces" class="ghost" aria-pressed="true">Wall faces: on</button>
+      <button id="wins" class="ghost" aria-pressed="true">Windows: on</button>
       <button id="new" class="ghost">New world</button>
     </div>
     <p style="margin-top:8px">In the headset, press the <b>menu button</b> on your left controller (or hold <b>Y</b>) to pause and open this menu.</p>
@@ -1045,7 +1046,7 @@ function wfBuild(spot,i,rnd){
 function placeWallFaces(){
   for(const F of WF.list){worldGroup.remove(F.g);F.g.traverse(o=>{if(o.material&&o.material.dispose)o.material.dispose();});}
   WF.list=[];const want=clamp(SET.faces===undefined?4:SET.faces|0,0,12);if(!want||!CR.on)return;
-  const rnd=mulberry(((CUR?CUR.seed:1)*131+17)>>>0),cand=wfCandidates();
+  const rnd=mulberry(((CUR?CUR.seed:1)*131+17)>>>0),cand=wfCandidates().filter(s=>!WIN.list.some(W=>W.R===s.R));
   // upright walls first, then spread them out: never two in one room, never too close together
   cand.forEach(s=>s.r=rnd()+(s.upright?0:0.6));cand.sort((a,b)=>a.r-b.r);
   const chosen=[];for(const s of cand){if(chosen.length>=want)break;if(chosen.some(o=>o.R===s.R||dist3(o.c,s.c)<14))continue;chosen.push(s);}
@@ -1189,7 +1190,7 @@ const game = { phase: 'hide', t: HIDE_T, searched: new Map(), firstRound: true, 
 const gravCD = () => 10;                         // the original's default gravity recharge for hiders
 const canFall = P => P.fallCool <= 0 && (P.isPlayer || P.b.grounded > 0);
 const orbFor = () => null;
-const SET = { faces: 4 };                        // wall faces, as in the original's default
+const SET = { faces: 4, windows: 1 };                        // wall faces, as in the original's default
 let players = [], player = null, CUR = null, building = false;
 const V3 = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
 const DOWN = V3(0, -1, 0), YAX = V3(0, 1, 0), ZAX = V3(0, 0, 1);
@@ -1264,21 +1265,25 @@ async function buildWorld(seed, onProg){
   for (const m of worldMeshes){ worldGroup.remove(m); m.geometry.dispose(); }
   worldMeshes = [];
   const L = genLayout(mulberry(seed), 4, true, 0); L.nAdd = 0; L.wseed = seed;
+  genAnimStart(L);
   SEED = L.seed; CUR = L; setWorldSize(L.S); FH = 0.12;
   const TRIES = 5;
   for (let attempt = 0; attempt < TRIES; attempt++){
     CR.on = false;
     const ops = buildPlan(L); buildRoomGrid();
     if (attempt > 0){ const rj = mulberry((L.seed + attempt * 7777) >>> 0); for (const op of ops){ op._poly = null; op.c = op.c.map(v => v + (rj() - 0.5) * 0.004); } for (const R of ROOMS) R.pr._poly = null; }
+    if (attempt === 0) GA.setOps(ops);
     const carves = ops.filter(o => o.op < 0);
     const cw = await crispBuild(carves, p => onProg(p * 0.8), async () => { await nextFrame(); return true; });
+    if (attempt === 0) GA.setCarve(cw);
     CR.ops = ops; for (const op of ops) if (op.op > 0){ op.poly = polyOf(op); op.clipPoly = op.clip ? polyOf(op.clip) : null; } buildCrispGrid();
     const walls = cw.slice(); ops.forEach((op, k) => { if (op.op > 0) for (const f of addFaces(op)) walls.push({ pts: f.pts, n: f.n, owner: k }); });
     CR.on = true; F = null; ORIGC = new Map();
     const groups = crispGroups(walls), bad = crispCheck(groups);
-    if (bad <= 1 || attempt === TRIES - 1){ await meshWorld(groups, p => onProg(0.8 + 0.2 * p)); onProg(1); break; }
+    if (bad <= 1 || attempt === TRIES - 1){ GA.setFinal(walls); await meshWorld(groups, p => onProg(0.8 + 0.2 * p)); onProg(1); break; }
     console.warn('crisp world: ' + bad + ' bad cuts, rerolling the cuts');
   }
+  await GA.finished; genAnimStop(); for (const m of worldMeshes) m.visible = true;
   building = false;
 }
 // the original's crispMesh, plus each face's own direction for the colour
@@ -1304,7 +1309,7 @@ async function meshWorld(groups, prog){
       geo.setAttribute('aPat', new THREE.Float32BufferAttribute(PA, 4)); geo.setAttribute('aRC', new THREE.Float32BufferAttribute(RC, 3));
       geo.setAttribute('aW', new THREE.Float32BufferAttribute(AW, 1)); geo.setAttribute('aSh', new THREE.Float32BufferAttribute(SH, 2));
       geo.computeBoundingSphere();
-      const m = new THREE.Mesh(geo, worldMat); worldGroup.add(m); worldMeshes.push(m);
+      const m = new THREE.Mesh(geo, worldMat); m.visible = !GA.active; worldGroup.add(m); worldMeshes.push(m);
     }
     gi++;
   }
@@ -1336,7 +1341,6 @@ function gulp(v = 1){ beep(180, 60, .25, 'sine', .16 * v); }
 function crunch(v = 1){ beep(140, 60, .07, 'square', .07 * v); }
 function ptoo(v = 1){ beep(520, 180, .16, 'square', .08 * v); }
 function woosh(v = 1, p = 1){ beep(160 * p, 640 * p, .6, 'sawtooth', .04 * v); }
-function burstFx(){}
 const inputs = [];
 function buzz(power = .5, ms = 60, only = null){ for (const st of inputs) if (!only || st === only) st.source?.gamepad?.hapticActuators?.[0]?.pulse?.(power, ms); }
 
@@ -1454,18 +1458,21 @@ function tryInfect(i, j){
   if (game.phase !== 'seek') return;
   const A = players[i], B = players[j]; if (A.role === B.role) return;
   const S = A.role === 'seeker' ? A : B, H = S === A ? B : A; if (S.freeze > 0) return;
+  burstFx(H.b.p, S.color, H.color, 40, 7);
   S.tags++; H.role = 'seeker'; H.fallCool = 0; H.freeze = 1.6; H.brain = newBrain(); setColor(H, S.color);
   if (H.isPlayer){ say(`${S.name} found you! Now you seek`); SND.infect(); buzz(1, 220); }
   else if (S.isPlayer){ say(`Found ${H.name}!`); SND.infect(); buzz(.8, 120); }
   else { say(`${S.name} found ${H.name}`); if (dist3(H.b.p, player.b.p) < 30) SND.infect(); }
 }
 function setGravity(P, gi){
-  const b = P.b, d = AXES[gi]; b.gi = gi; b.g = d.slice(); P.floorH = undefined; P.climbT = 0; P.climbDone = false;
+  const b = P.b, d = AXES[gi], g0 = b.g.slice(); b.gi = gi; b.g = d.slice(); P.floorH = undefined; P.climbT = 0; P.climbDone = false;
   const V = b.v;
   const kick = b.grounded > 0 ? 7 : 3, vn = V[0] * d[0] + V[1] * d[1] + V[2] * d[2];
   if (vn < kick) for (let k = 0; k < 3; k++) V[k] += d[k] * (kick - vn);
   P.fallCool = P.role === 'seeker' ? 0 : gravCD();
-  if (P.isPlayer){ SND.fall(); buzz(.35, 50); }
+  if (P.isPlayer){ buzz(.35, 50); if (dotv3(g0, d) < 0.9) windFx(P, g0, d); }
+  if (dotv3(g0, d) < 0.9 && dist3(b.p, player.b.p) < 40) goopBurst(P, g0, d);
+  gravFx(P);
 }
 // POP: everyone near you gets thrown back (in the crisp worlds the walls stay put)
 const blast = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false }));
@@ -1473,6 +1480,9 @@ blast.visible = false; worldGroup.add(blast); let blastT = -1, blastR = 1;
 function pop(P){
   if (P.pop < POP_CHARGE || building) return;
   const c = P.b.p, R = P.b.R, rad = R + 2, u = upOf(P.b); P.pop = 0;
+  for (let n = 0; n < 26; n++){ const d = randUnit(Math.random), rr = rad * Math.cbrt(Math.random()), x = c[0] + d[0] * rr, y = c[1] + d[1] * rr, z = c[2] + d[2] * rr;
+    if (fieldAt(x, y, z) >= 0) continue; const g = sceneGrad(x, y, z), col = tmpC.setRGB(g[0] * 0.5 + 0.5, g[1] * 0.5 + 0.5, g[2] * 0.5 + 0.5).getHex(), sp = 4 + Math.random() * 6;
+    spawnShard(x, y, z, d[0] * sp + u[0] * 4, d[1] * sp + u[1] * 4, d[2] * sp + u[2] * 4, 0.22 + Math.random() * 0.3, col, P.b.g); }
   for (const o of players){ if (o === P) continue; const dx = o.b.p[0] - c[0], dy = o.b.p[1] - c[1], dz = o.b.p[2] - c[2], d = Math.hypot(dx, dy, dz) || 1, pr = rad + 1.5;
     if (d < pr){ const k = (1 - d / pr) * 14; o.b.v[0] += dx / d * k; o.b.v[1] += dy / d * k; o.b.v[2] += dz / d * k; } }
   const V = P.b.v; for (let k = 0; k < 3; k++) V[k] += u[k] * 4;
@@ -1506,6 +1516,356 @@ function humanControl(dt, sx, sy, hop){
   return pctl;
 }
 
+// ============================================================ ORIGINAL: particles (shards, goop, sparkles, gravity wind)
+const ZERO=new THREE.Matrix4().makeScale(0,0,0),tmpM=new THREE.Matrix4(),tmpP=new THREE.Vector3(),tmpQ4=new THREE.Quaternion(),tmpS=new THREE.Vector3(),tmpC=new THREE.Color();
+// debris shards: they fall outward, toward the shell
+const MAXD=500;
+const debris=new THREE.InstancedMesh(new THREE.TetrahedronGeometry(1),new THREE.MeshPhongMaterial({color:0xffffff,flatShading:true,shininess:10}),MAXD);
+debris.frustumCulled=false;for(let i=0;i<MAXD;i++){debris.setMatrixAt(i,ZERO);debris.setColorAt(i,tmpC.set(0xffffff));}worldGroup.add(debris);
+const shards=[];let shardHead=0;
+function spawnShard(x,y,z,vx,vy,vz,size,color,g){
+  const i=shardHead;shardHead=(shardHead+1)%MAXD;
+  shards[i]={p:[x,y,z],v:[vx,vy,vz],g:g||[0,-1,0],size,life:1.4+Math.random()*1.2,age:0,ax:new THREE.Vector3(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).normalize(),ang:Math.random()*6,spin:4+Math.random()*10};
+  debris.setColorAt(i,tmpC.set(color));debris.instanceColor.needsUpdate=true;
+}
+function updateShards(dt){
+  let any=false;
+  for(let i=0;i<MAXD;i++){const s=shards[i];if(!s)continue;any=true;
+    s.age+=dt;if(s.age>s.life){debris.setMatrixAt(i,ZERO);shards[i]=null;continue;}
+    const G=PHYS.G*dt;s.v[0]+=s.g[0]*G;s.v[1]+=s.g[1]*G;s.v[2]+=s.g[2]*G;
+    s.p[0]+=s.v[0]*dt;s.p[1]+=s.v[1]*dt;s.p[2]+=s.v[2]*dt;
+    const bd=sceneSDF(s.p[0],s.p[1],s.p[2]);
+    if(bd<s.size*0.5){const g=sceneGrad(s.p[0],s.p[1],s.p[2]),nx=g[0],ny=g[1],nz=g[2],push=s.size*0.5-bd;
+      s.p[0]+=nx*push;s.p[1]+=ny*push;s.p[2]+=nz*push;const vn=s.v[0]*nx+s.v[1]*ny+s.v[2]*nz;
+      if(vn<0){s.v[0]-=1.35*vn*nx;s.v[1]-=1.35*vn*ny;s.v[2]-=1.35*vn*nz;}s.v[0]*=0.8;s.v[1]*=0.8;s.v[2]*=0.8;s.spin*=0.7;}
+    s.ang+=s.spin*dt;const k=s.size*Math.min(1,(s.life-s.age)/0.4);
+    tmpQ4.setFromAxisAngle(s.ax,s.ang);tmpM.compose(tmpP.set(s.p[0],s.p[1],s.p[2]),tmpQ4,tmpS.set(k,k,k));debris.setMatrixAt(i,tmpM);
+  }
+  if(any)debris.instanceMatrix.needsUpdate=true;
+}
+// goop: when a ball changes gravity it flings a few blobs of itself; they fall the new way, splat on whatever they
+// hit (flattened against it) and shrink away after a few seconds
+const MAXG=1600,goopMesh=new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1,1),new THREE.MeshPhongMaterial({color:0xffffff,shininess:90,specular:0x666666}),MAXG);
+goopMesh.frustumCulled=false;for(let i=0;i<MAXG;i++){goopMesh.setMatrixAt(i,ZERO);goopMesh.setColorAt(i,tmpC.set(0xffffff));}worldGroup.add(goopMesh);
+const goops=[];let goopHead=0;const gQ=new THREE.Quaternion(),gN=new THREE.Vector3(),gY=new THREE.Vector3(0,1,0);
+function spawnGoop(x,y,z,vx,vy,vz,size,color,g,life){const i=goopHead;goopHead=(goopHead+1)%MAXG;
+  goops[i]={p:[x,y,z],v:[vx,vy,vz],g:g.slice(),size,life:life||2.4+Math.random()*1.4,age:0,stuck:null};goopMesh.setColorAt(i,tmpC.set(color));goopMesh.instanceColor.needsUpdate=true;}
+function goopBurst(P,g0,g1){
+  const b=P.b,n=10+Math.floor(Math.random()*6);
+  for(let k=0;k<n;k++){const d=randUnit(Math.random),sp=2+Math.random()*4,s=b.R*(0.1+Math.random()*0.13);
+    spawnGoop(b.p[0]+d[0]*b.R*0.9,b.p[1]+d[1]*b.R*0.9,b.p[2]+d[2]*b.R*0.9,d[0]*sp-g1[0]*3-g0[0]*2+b.v[0]*0.5,d[1]*sp-g1[1]*3-g0[1]*2+b.v[1]*0.5,d[2]*sp-g1[2]*3-g0[2]*2+b.v[2]*0.5,s,P.color,g1);}
+}
+function updateGoop(dt){
+  let any=false;
+  for(let i=0;i<MAXG;i++){const s=goops[i];if(!s)continue;any=true;s.age+=dt;
+    if(s.age>s.life){goopMesh.setMatrixAt(i,ZERO);goops[i]=null;continue;}
+    const fade=Math.min(1,(s.life-s.age)/0.6);
+    if(!s.stuck){const G=PHYS.G*dt;s.v[0]+=s.g[0]*G;s.v[1]+=s.g[1]*G;s.v[2]+=s.g[2]*G;s.p[0]+=s.v[0]*dt;s.p[1]+=s.v[1]*dt;s.p[2]+=s.v[2]*dt;
+      const bd=sceneSDF(s.p[0],s.p[1],s.p[2]);
+      if(bd<s.size*0.4){const g=sceneGrad(s.p[0],s.p[1],s.p[2]),push=s.size*0.4-bd;s.p[0]+=g[0]*push;s.p[1]+=g[1]*push;s.p[2]+=g[2]*push;s.stuck=[g[0],g[1],g[2]];s.splat=0;}
+      const sp=Math.hypot(s.v[0],s.v[1],s.v[2]),st=1+Math.min(1.2,sp*0.08);
+      if(sp>0.01){gN.set(s.v[0]/sp,s.v[1]/sp,s.v[2]/sp);gQ.setFromUnitVectors(gY,gN);}else gQ.identity();
+      tmpM.compose(tmpP.set(s.p[0],s.p[1],s.p[2]),gQ,tmpS.set(s.size*fade/Math.sqrt(st),s.size*st*fade,s.size*fade/Math.sqrt(st)));}
+    else{s.splat=Math.min(1,s.splat+dt*9);const f=1-0.65*s.splat,w=1+0.7*s.splat;gN.set(s.stuck[0],s.stuck[1],s.stuck[2]);gQ.setFromUnitVectors(gY,gN);
+      tmpM.compose(tmpP.set(s.p[0],s.p[1],s.p[2]),gQ,tmpS.set(s.size*w*fade,s.size*f*fade,s.size*w*fade));}
+    goopMesh.setMatrixAt(i,tmpM);}
+  if(any)goopMesh.instanceMatrix.needsUpdate=true;
+}
+// sparkles: additive twinkly points for gravity changes and tags
+const SPARKN=1200,sparkPos=new Float32Array(SPARKN*3).fill(9999),sparkCol=new Float32Array(SPARKN*3),sparkData=[];let sparkHead=0;
+const sparkGeo=new THREE.BufferGeometry();sparkGeo.setAttribute('position',new THREE.BufferAttribute(sparkPos,3));sparkGeo.setAttribute('color',new THREE.BufferAttribute(sparkCol,3));
+const sparkTex=(function(){const cv=document.createElement('canvas');cv.width=cv.height=64;const g=cv.getContext('2d');
+  const gr=g.createRadialGradient(32,32,0,32,32,32);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(0.18,'rgba(255,255,255,0.85)');gr.addColorStop(0.45,'rgba(255,255,255,0.18)');gr.addColorStop(1,'rgba(255,255,255,0)');
+  g.fillStyle=gr;g.fillRect(0,0,64,64);g.strokeStyle='rgba(255,255,255,0.9)';g.lineWidth=2;g.beginPath();g.moveTo(32,4);g.lineTo(32,60);g.moveTo(4,32);g.lineTo(60,32);g.stroke();
+  return new THREE.CanvasTexture(cv);})();
+const sparks=new THREE.Points(sparkGeo,new THREE.PointsMaterial({size:0.75,map:sparkTex,vertexColors:true,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,sizeAttenuation:true}));
+sparks.frustumCulled=false;sparks.renderOrder=4;worldGroup.add(sparks);
+function spark(x,y,z,vx,vy,vz,col,life){
+  const i=sparkHead;sparkHead=(sparkHead+1)%SPARKN;
+  sparkData[i]={p:[x,y,z],v:[vx,vy,vz],c:[col.r,col.g,col.b],life,age:0,ph:Math.random()*6.28};
+}
+function updateSparks(dt){
+  let any=false;
+  for(let i=0;i<SPARKN;i++){const s=sparkData[i];if(!s)continue;any=true;
+    s.age+=dt;if(s.age>=s.life){sparkData[i]=null;sparkPos[i*3]=9999;sparkCol[i*3]=sparkCol[i*3+1]=sparkCol[i*3+2]=0;continue;}
+    const dmp=Math.exp(-dt*2.4);s.v[0]*=dmp;s.v[1]*=dmp;s.v[2]*=dmp;s.p[0]+=s.v[0]*dt;s.p[1]+=s.v[1]*dt;s.p[2]+=s.v[2]*dt;
+    const f=Math.pow(1-s.age/s.life,1.4)*(0.55+0.45*Math.sin(s.age*34+s.ph));
+    sparkPos[i*3]=s.p[0];sparkPos[i*3+1]=s.p[1];sparkPos[i*3+2]=s.p[2];sparkCol[i*3]=s.c[0]*f;sparkCol[i*3+1]=s.c[1]*f;sparkCol[i*3+2]=s.c[2]*f;}
+  if(any){sparkGeo.attributes.position.needsUpdate=true;sparkGeo.attributes.color.needsUpdate=true;}
+}
+const fxC=new THREE.Color(),fxW=new THREE.Color(0xffffff);
+// gravity change: a ring of sparkles around the ball plus a trail shooting the way it's about to fall
+function gravFx(P){
+  const b=P.b,g=b.g,a=Math.abs(g[0])<0.9?[1,0,0]:[0,1,0],t1=normv3(crossv3(g,a)),t2=crossv3(g,t1);
+  for(let k=0;k<34;k++){const th=k/34*Math.PI*2,c=Math.cos(th),s2=Math.sin(th),sp=5+Math.random()*3;
+    const d=[t1[0]*c+t2[0]*s2,t1[1]*c+t2[1]*s2,t1[2]*c+t2[2]*s2];fxC.set(P.color).lerp(fxW,Math.random()*0.6);
+    spark(b.p[0]+d[0]*b.R,b.p[1]+d[1]*b.R,b.p[2]+d[2]*b.R,d[0]*sp,d[1]*sp,d[2]*sp,fxC,0.5+Math.random()*0.4);}
+  for(let k=0;k<20;k++){const sp=8+Math.random()*10,j=()=>(Math.random()-0.5)*2.5;fxC.set(0xffffff).lerp(new THREE.Color(P.color),Math.random()*0.5);
+    spark(b.p[0]+j()*0.3,b.p[1]+j()*0.3,b.p[2]+j()*0.3,g[0]*sp+j(),g[1]*sp+j(),g[2]*sp+j(),fxC,0.4+Math.random()*0.5);}
+  const dd=dist3(b.p,player.b.p);
+  if(P.isPlayer)woosh(0.6,1);else if(dd<18)woosh(0.25*(1-dd/18),0.85+Math.random()*0.3);
+}
+// gravity whoosh: wind streaks rise from under you and swing round into the way you're now falling
+const WN=16,WM=12,WV=WN*(WM-1)*6,windPos=new Float32Array(WV*3),windCol=new Float32Array(WV*2);
+const windGeo=new THREE.BufferGeometry();windGeo.setAttribute('position',new THREE.BufferAttribute(windPos,3));windGeo.setAttribute('aw',new THREE.BufferAttribute(windCol,2));
+// soft white ribbons: bright in the middle, feathered at the edges, so they read over any colour
+const windMesh=new THREE.Mesh(windGeo,new THREE.ShaderMaterial({vertexShader:'attribute vec2 aw;varying vec2 vw;void main(){vw=aw;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
+  fragmentShader:'varying vec2 vw;void main(){float e=1.0-vw.y*vw.y;gl_FragColor=vec4(1.0,1.0,1.0,vw.x*e*e);}',transparent:true,depthWrite:false,side:THREE.DoubleSide}));
+windMesh.frustumCulled=false;windMesh.renderOrder=5;windMesh.visible=false;worldGroup.add(windMesh);
+const winds=[];let windT=-1,windP=null,windEnd=0;
+const projOff=(w,g)=>{const k=dotv3(w,g);return[w[0]-g[0]*k,w[1]-g[1]*k,w[2]-g[2]*k];};
+function windFx(P,g0,g1){
+  const R=P.b.R;winds.length=0;windEnd=0;
+  for(let k=0;k<WN;k++){let o0,o2;
+    for(let tries=0;tries<16;tries++){const w=randUnit(Math.random);o0=projOff(w,g0);o2=projOff(w,g1);if(Math.hypot(...o0)>0.4&&Math.hypot(...o2)>0.4)break;}
+    const r=R*(1.15+Math.random()*0.75),a=R+1.3+Math.random()*1.8,b=R+1.8+Math.random()*2.2;o0=normv3(o0);o2=normv3(o2);
+    const P0=[0,1,2].map(n=>g0[n]*a+o0[n]*r),P3=[0,1,2].map(n=>g1[n]*b+o2[n]*r);
+    const P1=[0,1,2].map(n=>P0[n]-g0[n]*a*0.95),P2=[0,1,2].map(n=>P3[n]-g1[n]*b*0.95);
+    const s={C:[P0,P1,P2,P3],d:Math.random()*0.16,L:0.42+Math.random()*0.2,w:R*(0.08+Math.random()*0.07)};winds.push(s);windEnd=Math.max(windEnd,s.d+s.L*1.4);}
+  windT=0;windP=P;windMesh.visible=true;
+}
+const bez=(C,s,o)=>{const u=1-s,a=u*u*u,b=3*u*u*s,c=3*u*s*s,d=s*s*s;for(let n=0;n<3;n++)o[n]=a*C[0][n]+b*C[1][n]+c*C[2][n]+d*C[3][n];return o;};
+const wA=[0,0,0],wB=[0,0,0],wT=new THREE.Vector3(),wS=new THREE.Vector3(),wV=new THREE.Vector3();
+function updateWind(dt){
+  if(windT<0)return;windT+=dt;
+  if(windT>windEnd+0.05||!windP){windT=-1;windMesh.visible=false;return;}
+  const c=windP.b.p,cam=worldGroup.worldToLocal(camera.getWorldPosition(new THREE.Vector3())),TL=0.4;let v=0;
+  const put=(x,y,z,a,u)=>{windPos[v*3]=x;windPos[v*3+1]=y;windPos[v*3+2]=z;windCol[v*2]=a;windCol[v*2+1]=u;v++;};
+  for(const st of winds){const u=(windT-st.d)/st.L,h=u<=0?0:1-Math.pow(1-Math.min(u,1.4)/1.4,2)*1;// the head races out, then slows
+    const env=u<=0?0:Math.sin(Math.PI*clamp(u/1.4,0,1));
+    let prev=null;
+    for(let j=0;j<WM;j++){const f=j/(WM-1),sp=clamp(h*1.4-TL+TL*f,0,1),live=h*1.4-TL+TL*f>=0&&h*1.4-TL+TL*f<=1;
+      bez(st.C,sp,wA);bez(st.C,Math.min(1,sp+0.02),wB);
+      const px=c[0]+wA[0],py=c[1]+wA[1],pz=c[2]+wA[2];
+      wT.set(wB[0]-wA[0],wB[1]-wA[1],wB[2]-wA[2]);if(wT.lengthSq()<1e-8)wT.set(st.C[3][0]-st.C[2][0],st.C[3][1]-st.C[2][1],st.C[3][2]-st.C[2][2]);
+      wV.set(px-cam.x,py-cam.y,pz-cam.z);wS.crossVectors(wT,wV).normalize().multiplyScalar(st.w*(0.35+0.65*f));
+      const al=live?Math.min(1,env*Math.sqrt(f)*1.15):0,cur={x:px,y:py,z:pz,sx:wS.x,sy:wS.y,sz:wS.z,a:al};
+      if(prev){const A=prev,B=cur;
+        put(A.x-A.sx,A.y-A.sy,A.z-A.sz,A.a,-1);put(A.x+A.sx,A.y+A.sy,A.z+A.sz,A.a,1);put(B.x+B.sx,B.y+B.sy,B.z+B.sz,B.a,1);
+        put(A.x-A.sx,A.y-A.sy,A.z-A.sz,A.a,-1);put(B.x+B.sx,B.y+B.sy,B.z+B.sz,B.a,1);put(B.x-B.sx,B.y-B.sy,B.z-B.sz,B.a,-1);}
+      prev=cur;}}
+  windGeo.attributes.position.needsUpdate=true;windGeo.attributes.aw.needsUpdate=true;
+}
+// a burst of sparkles in two colours (tags)
+function burstFx(p,c1,c2,n,speed){
+  for(let k=0;k<n;k++){const d=randUnit(Math.random),sp=speed*(0.4+Math.random()*0.8);fxC.set(Math.random()<0.5?c1:c2).lerp(fxW,Math.random()*0.4);
+    spark(p[0],p[1],p[2],d[0]*sp,d[1]*sp,d[2]*sp,fxC,0.6+Math.random()*0.7);}
+}
+function inPoly(poly,x,y){let c=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const a=poly[i],b=poly[j];if((a[1]>y)!==(b[1]>y)&&x<(b[0]-a[0])*(y-a[1])/(b[1]-a[1])+a[0])c=!c;}return c;}
+
+// ============================================================ WINDOWS (the original's two crooked windows; in VR each one is a
+// stencil portal: its little 3D world is drawn only where you can see the glass, from your own eyes, so it has real depth)
+const WIN={list:[]};
+const WIN_PTS=[[-2.45,-1.7],[2.25,-1.9],[2.05,1.45],[0.12,0.8],[-2.15,1.7]];// the top dips in the middle, like a scowl
+const WIN_MULL=[[[0.12,0.8],[-0.05,-1.8]],[[-2.3,-0.1],[2.15,0.18]],[[-2.2,0.95],[-1.0,-0.05]]];
+const woodTex=(function(){const cv=document.createElement('canvas');cv.width=64;cv.height=256;const g=cv.getContext('2d');g.fillStyle='#8a5328';g.fillRect(0,0,64,256);
+  for(let i=0;i<40;i++){g.strokeStyle=`rgba(${60+Math.random()*40},${30+Math.random()*20},10,${0.25+Math.random()*0.3})`;g.lineWidth=1+Math.random()*2;g.beginPath();const x=Math.random()*64;g.moveTo(x,0);for(let y=0;y<=256;y+=16)g.lineTo(x+Math.sin(y*0.05+i)*3,y);g.stroke();}
+  const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;})();
+function winBeam(g,a,b,w,d,z,mat){const dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy);const m=new THREE.Mesh(new THREE.BoxGeometry(L+w,w,d),mat);m.position.set((a[0]+b[0])/2,(a[1]+b[1])/2,z);m.rotation.z=Math.atan2(dy,dx);g.add(m);return m;}
+const spotBasis=s=>new THREE.Matrix4().makeBasis(new THREE.Vector3(...s.v),new THREE.Vector3(...s.u),new THREE.Vector3(...s.n));
+function buildWindowFrame(spot,kind,ref){
+  const g=new THREE.Group(),S=spot.size*1.05;g.position.set(spot.c[0]+spot.n[0]*0.01,spot.c[1]+spot.n[1]*0.01,spot.c[2]+spot.n[2]*0.01);
+  g.quaternion.setFromRotationMatrix(spotBasis(spot));g.scale.setScalar(S);worldGroup.add(g);
+  const wood=new THREE.MeshPhongMaterial({map:woodTex,color:0xffffff,shininess:30,emissive:0x2a1406,emissiveIntensity:0.6}),
+    trim=new THREE.MeshPhongMaterial({color:kind==='space'?0xff3d6e:0x2ec4b6,shininess:60,emissive:kind==='space'?0x401020:0x0a3a36,emissiveIntensity:0.7}),
+    paint=new THREE.MeshPhongMaterial({color:0xffd23f,shininess:60,emissive:0x403000,emissiveIntensity:0.6});
+  for(let i=0;i<WIN_PTS.length;i++){const a=WIN_PTS[i],b=WIN_PTS[(i+1)%WIN_PTS.length];winBeam(g,a,b,0.42,0.42,0.2,wood);
+    winBeam(g,[a[0]+a[0]*0.09,a[1]+a[1]*0.09],[b[0]+b[0]*0.09,b[1]+b[1]*0.09],0.2,0.3,0.12,trim);}
+  const mull=WIN_MULL.map(([a,b])=>winBeam(g,a,b,0.17,0.24,0.14,paint));
+  const sill=new THREE.Mesh(new THREE.BoxGeometry(5.6,0.28,0.95),wood);sill.position.set(-0.1,-2.05,0.42);sill.rotation.z=-0.04;g.add(sill);
+  for(const p of WIN_PTS){const k=new THREE.Mesh(new THREE.SphereGeometry(0.2,12,8),trim);k.position.set(p[0]*1.04,p[1]*1.04,0.42);g.add(k);}
+  const shapeGeo=new THREE.ShapeGeometry(new THREE.Shape(WIN_PTS.map(p=>new THREE.Vector2(p[0],p[1]))));
+  // the glass marks its pixels in the stencil buffer (only where nothing is in front of it)
+  const glass=new THREE.Mesh(shapeGeo,new THREE.MeshBasicMaterial({colorWrite:false,depthWrite:false,stencilWrite:true,stencilRef:ref,stencilFunc:THREE.AlwaysStencilFunc,stencilZPass:THREE.ReplaceStencilOp}));
+  glass.position.z=0.005;glass.renderOrder=50;g.add(glass);
+  return{g,glass,mull,shapeGeo,sc:S};
+}
+function starTex(){const cv=document.createElement('canvas');cv.width=1024;cv.height=512;const g=cv.getContext('2d');
+  const gr=g.createLinearGradient(0,0,1024,512);gr.addColorStop(0,'#05021a');gr.addColorStop(0.5,'#140636');gr.addColorStop(1,'#03030f');g.fillStyle=gr;g.fillRect(0,0,1024,512);
+  for(let i=0;i<6;i++){const x=Math.random()*1024,y=Math.random()*512,r=60+Math.random()*120,n=g.createRadialGradient(x,y,0,x,y,r);n.addColorStop(0,`hsla(${260+Math.random()*80},80%,55%,0.22)`);n.addColorStop(1,'rgba(0,0,0,0)');g.fillStyle=n;g.fillRect(0,0,1024,512);}
+  for(let i=0;i<1400;i++){const b=Math.random();g.fillStyle=`rgba(255,${230+Math.random()*25},${200+Math.random()*55},${0.3+b*0.7})`;g.fillRect(Math.random()*1024,Math.random()*512,b>0.97?2.5:1.2,b>0.97?2.5:1.2);}
+  return new THREE.CanvasTexture(cv);}
+function skyTex(){const cv=document.createElement('canvas');cv.width=16;cv.height=256;const g=cv.getContext('2d');const gr=g.createLinearGradient(0,0,0,256);
+  gr.addColorStop(0,'#2a6bd6');gr.addColorStop(0.42,'#7fb7ef');gr.addColorStop(0.5,'#ffd59a');gr.addColorStop(0.53,'#f6a96a');gr.addColorStop(1,'#d98a4e');g.fillStyle=gr;g.fillRect(0,0,16,256);return new THREE.CanvasTexture(cv);}
+function sandTex(){const cv=document.createElement('canvas');cv.width=cv.height=256;const g=cv.getContext('2d');g.fillStyle='#e2b46c';g.fillRect(0,0,256,256);
+  for(let i=0;i<3000;i++){g.fillStyle=`rgba(${150+Math.random()*80},${100+Math.random()*50},50,0.25)`;g.fillRect(Math.random()*256,Math.random()*256,2,2);}
+  for(let y=0;y<256;y+=14){g.strokeStyle='rgba(190,130,70,0.35)';g.lineWidth=2;g.beginPath();for(let x=0;x<=256;x+=8)g.lineTo(x,y+Math.sin(x*0.05+y)*4);g.stroke();}
+  const t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;t.repeat.set(20,20);return t;}
+// the little world behind the glass, built in the window's own frame (x across the wall, y up, z out of the wall)
+const PUNCH_VS='void main(){gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);gl_Position.z=gl_Position.w;}';
+function buildView(kind,spot,F,ref){
+  const S=new THREE.Scene(),mirror=new THREE.Group();mirror.matrixAutoUpdate=false;S.add(mirror);
+  const root=new THREE.Group();mirror.add(root);
+  root.position.set(...spot.c);root.quaternion.setFromRotationMatrix(spotBasis(spot));
+  const anim=[],pts=[];
+  // first, push the depth behind the glass all the way back, so this world shows through the wall
+  const punch=new THREE.Mesh(F.shapeGeo,new THREE.ShaderMaterial({vertexShader:PUNCH_VS,fragmentShader:'void main(){gl_FragColor=vec4(0.0);}',colorWrite:false,depthFunc:THREE.AlwaysDepth,depthWrite:true}));
+  punch.scale.setScalar(F.sc);punch.renderOrder=-100;punch.frustumCulled=false;root.add(punch);
+  const sunT=new THREE.Object3D();root.add(sunT);
+  if(kind==='space'){
+    S.add(new THREE.AmbientLight(0x8890ff,0.45));const sun=new THREE.DirectionalLight(0xffffff,1.1);sun.position.set(-50,60,30);root.add(sun);sun.target=sunT;
+    const sky=new THREE.Mesh(new THREE.SphereGeometry(140,40,20),new THREE.MeshBasicMaterial({map:starTex(),side:THREE.BackSide,fog:false}));sky.position.z=-60;root.add(sky);
+    const NS=260,pp=new Float32Array(NS*3);for(let i=0;i<NS;i++){pp[i*3]=(Math.random()-0.5)*70;pp[i*3+1]=(Math.random()-0.5)*50;pp[i*3+2]=-4-Math.random()*60;}
+    const pg=new THREE.BufferGeometry();pg.setAttribute('position',new THREE.BufferAttribute(pp,3));const stars=new THREE.Points(pg,new THREE.PointsMaterial({color:0xffffff,size:0.18}));root.add(stars);pts.push([stars,0.18]);
+    const planet=new THREE.Mesh(new THREE.SphereGeometry(7,40,24),new THREE.MeshPhongMaterial({color:0xff8a4c,emissive:0x3a1006,shininess:10}));planet.position.set(-13,7,-55);root.add(planet);
+    const ring=new THREE.Mesh(new THREE.RingGeometry(9,13,64),new THREE.MeshBasicMaterial({color:0xffd9a8,side:THREE.DoubleSide,transparent:true,opacity:0.6}));ring.position.copy(planet.position);ring.rotation.set(1.2,0.3,0.2);root.add(ring);
+    const moon=new THREE.Mesh(new THREE.SphereGeometry(1.6,24,16),new THREE.MeshPhongMaterial({color:0xccccdd}));root.add(moon);
+    const ufo=new THREE.Group();const hull=new THREE.Mesh(new THREE.SphereGeometry(1,32,16),new THREE.MeshPhongMaterial({color:0xb8c4d6,specular:0xffffff,shininess:120}));hull.scale.set(2.4,0.5,2.4);ufo.add(hull);
+    const dome=new THREE.Mesh(new THREE.SphereGeometry(0.95,24,12,0,Math.PI*2,0,Math.PI/2),new THREE.MeshPhongMaterial({color:0x7ff3ff,transparent:true,opacity:0.7,specular:0xffffff,shininess:200,emissive:0x0a4050}));dome.position.y=0.3;ufo.add(dome);
+    const alienHead=new THREE.Mesh(new THREE.SphereGeometry(0.35,16,12),new THREE.MeshPhongMaterial({color:0x8be33a,emissive:0x1a3a06}));alienHead.position.y=0.55;ufo.add(alienHead);
+    const lights=[];for(let k=0;k<10;k++){const a=k/10*Math.PI*2,l=new THREE.Mesh(new THREE.SphereGeometry(0.14,8,6),new THREE.MeshBasicMaterial({color:0xffee55}));l.position.set(Math.cos(a)*2.3,-0.05,Math.sin(a)*2.3);ufo.add(l);lights.push(l);}
+    const beam=new THREE.Mesh(new THREE.ConeGeometry(1.6,5,24,1,true),new THREE.MeshBasicMaterial({color:0x9ff3ff,transparent:true,opacity:0.18,side:THREE.DoubleSide,depthWrite:false}));beam.position.y=-2.6;ufo.add(beam);
+    root.add(ufo);
+    anim.push(t=>{ufo.position.set(Math.sin(t*0.23)*12,2+Math.sin(t*0.9)*0.9,-20+Math.cos(t*0.23)*7);ufo.rotation.set(0.15*Math.sin(t*0.5),t*1.5,0.12*Math.cos(t*0.6));
+      lights.forEach((l,k)=>l.material.color.setHSL(((k+Math.floor(t*6))%10)/10,1,0.6));beam.visible=Math.sin(t*0.4)>0.3;
+      planet.rotation.y=t*0.05;moon.position.set(planet.position.x+Math.cos(t*0.3)*12,planet.position.y+Math.sin(t*0.3)*3,planet.position.z+Math.sin(t*0.3)*12);});
+  }else{
+    S.add(new THREE.HemisphereLight(0xbfe0ff,0xd09050,0.75));const sun=new THREE.DirectionalLight(0xfff0d0,0.9);sun.position.set(30,60,-50);root.add(sun);sun.target=sunT;
+    const sky=new THREE.Mesh(new THREE.SphereGeometry(180,32,24),new THREE.MeshBasicMaterial({map:skyTex(),side:THREE.BackSide}));sky.position.set(0,0,-60);root.add(sky);
+    const gy=-4.2;
+    const ground=new THREE.Mesh(new THREE.PlaneGeometry(500,500),new THREE.MeshLambertMaterial({map:sandTex()}));ground.rotation.x=-Math.PI/2;ground.position.set(0,gy,-150);root.add(ground);
+    const sandM=new THREE.MeshLambertMaterial({color:0xe9bd78});
+    for(let k=0;k<6;k++){const d=new THREE.Mesh(new THREE.SphereGeometry(1,24,12),sandM);d.scale.set(10+k*4,2+k*0.6,7+k*2);d.position.set((k%2?1:-1)*(6+k*7),gy-0.4,-18-k*16);root.add(d);}
+    const mtM=new THREE.MeshLambertMaterial({color:0x9a6fa8,flatShading:true}),mtM2=new THREE.MeshLambertMaterial({color:0xb7849a,flatShading:true});
+    for(let k=0;k<9;k++){const h=14+Math.random()*16,m=new THREE.Mesh(new THREE.ConeGeometry(12+Math.random()*12,h,6+(k%3),1),k%2?mtM:mtM2);m.position.set(-110+k*27+Math.random()*10,gy+h/2-1,-150-Math.random()*30);m.rotation.y=Math.random()*3;root.add(m);}
+    const mesa=new THREE.Mesh(new THREE.CylinderGeometry(9,13,9,7),new THREE.MeshLambertMaterial({color:0xc0704a,flatShading:true}));mesa.position.set(24,gy+4,-95);root.add(mesa);
+    const sunDisc=new THREE.Mesh(new THREE.CircleGeometry(9,40),new THREE.MeshBasicMaterial({color:0xfff2b0}));sunDisc.position.set(-38,34,-170);root.add(sunDisc);
+    const cm=new THREE.MeshLambertMaterial({color:0x3f9a4a}),cact=(x,z,s)=>{const c=new THREE.Group();const tr=new THREE.Mesh(new THREE.CylinderGeometry(0.55,0.62,6,14),cm);tr.position.y=3;c.add(tr);
+      const top=new THREE.Mesh(new THREE.SphereGeometry(0.55,14,10),cm);top.position.y=6;c.add(top);
+      for(const sd of [-1,1]){const el=new THREE.Mesh(new THREE.CylinderGeometry(0.38,0.38,1.4,12),cm);el.rotation.z=Math.PI/2;el.position.set(sd*0.95,2.4+sd*0.5,0);c.add(el);
+        const up=new THREE.Mesh(new THREE.CylinderGeometry(0.36,0.38,2.2,12),cm);up.position.set(sd*1.6,3.5+sd*0.5,0);c.add(up);const tp=new THREE.Mesh(new THREE.SphereGeometry(0.36,12,8),cm);tp.position.set(sd*1.6,4.6+sd*0.5,0);c.add(tp);}
+      c.position.set(x,gy,z);c.scale.setScalar(s);root.add(c);return c;};
+    cact(4.5,-13,1);cact(-9,-30,0.8);cact(16,-55,1.1);
+    const tw=new THREE.Mesh(new THREE.IcosahedronGeometry(0.9,1),new THREE.MeshBasicMaterial({color:0x9a7040,wireframe:true}));root.add(tw);
+    anim.push(t=>{const k=((t*0.08)%1);tw.position.set(-25+k*50,gy+0.9+Math.abs(Math.sin(t*3))*0.8,-9);tw.rotation.z=-t*3;});
+  }
+  // a faint sheen on the glass
+  const sheen=new THREE.Mesh(F.shapeGeo,new THREE.ShaderMaterial({uniforms:{uSheen:{value:1}},transparent:true,depthWrite:false,
+    vertexShader:'varying vec2 vP;void main(){vP=position.xy;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
+    fragmentShader:'uniform float uSheen;varying vec2 vP;void main(){float sh=smoothstep(0.0,0.08,fract((vP.x+vP.y)*0.22))*smoothstep(0.16,0.08,fract((vP.x+vP.y)*0.22));gl_FragColor=vec4(vec3(1.0),(0.10*sh+0.04)*uSheen);}'}));
+  sheen.scale.setScalar(F.sc);sheen.position.z=0.006;sheen.renderOrder=200;root.add(sheen);
+  // everything in this world draws only through its own glass
+  const mats=[];root.traverse(o=>{if(o.material&&o!==punch)mats.push(o.material);});mats.push(punch.material);
+  const stencil=on=>{for(const m of mats){m.stencilWrite=on;m.stencilRef=ref;m.stencilFunc=THREE.EqualStencilFunc;m.stencilFail=m.stencilZFail=m.stencilZPass=THREE.KeepStencilOp;m.needsUpdate=true;}punch.visible=on;};
+  stencil(true);
+  return{S,mirror,root,anim,pts,sheen,stencil};
+}
+function clearWindows(){for(const W of WIN.list){worldGroup.remove(W.g);W.g.traverse(o=>{if(o.geometry&&o.geometry!==W.shapeGeo)o.geometry.dispose();});W.S.traverse(o=>{if(o.geometry)o.geometry.dispose();});}WIN.list=[];}
+function placeWindows(rnd,cand){
+  clearWindows();if(!SET.windows)return[];
+  const pool=cand.filter(s=>s.upright).map(s=>({s,k:rnd()})).sort((a,b)=>a.k-b.k).map(o=>o.s),chosen=[];
+  for(const s of pool){if(chosen.length>=2)break;if(chosen.some(o=>o.R===s.R||dist3(o.c,s.c)<16))continue;chosen.push(s);}
+  WIN.list=chosen.map((s,i)=>{const kind=i===0?'space':'desert',F=buildWindowFrame(s,kind,i+1),V=buildView(kind,s,F,i+1);return Object.assign(F,V,{kind,spot:s,R:s.R,brokenT:0});});
+  return chosen;
+}
+// draw each window's world, after the main picture, wherever its glass marked the stencil
+function renderWindows(){
+  if(!WIN.list.length||building)return;const t=performance.now()/1000,s=worldRoot.scale.x;
+  worldGroup.updateMatrixWorld();renderer.autoClear=false;
+  for(const W of WIN.list){if(!W.g.visible)continue;
+    if(!trapRide.on){const cp=worldGroup.worldToLocal(camera.getWorldPosition(V3())),c=W.spot.c,n=W.spot.n;if((cp.x-c[0])*n[0]+(cp.y-c[1])*n[1]+(cp.z-c[2])*n[2]<0.05)continue;}
+    else if(trapRide.W!==W)continue;
+    W.mirror.matrix.copy(worldGroup.matrixWorld);W.mirror.matrixWorldNeedsUpdate=true;
+    for(const [p,z] of W.pts)p.material.size=z*s;
+    for(const f of W.anim)f(t);
+    renderer.render(W.S,camera);}
+  renderer.autoClear=true;
+}
+// ---------- trapdoor windows: land on the glass hard enough (gravity pulling you into that wall, after a fall) and it
+// smashes; you tumble into that world for a moment, then burst out through the other window
+function winLocal(W,p){const S=W.spot,d=[p[0]-S.c[0],p[1]-S.c[1],p[2]-S.c[2]];return[dotv3(d,S.v)/W.sc,dotv3(d,S.u)/W.sc,dotv3(d,S.n)];}
+function winWorld(W,x,y,z){const S=W.spot;return[0,1,2].map(n=>S.c[n]+S.v[n]*x+S.u[n]*y+S.n[n]*z);}
+function chime(fs,step,vol){fs.forEach((f,i)=>setTimeout(()=>beep(f,f*1.01,.2,'triangle',vol),i*step*1000));}
+function smashWindow(W,out){W.brokenT=14;W.sheen.material.uniforms.uSheen.value=0;const S=W.spot,sg=out?1:-1;
+  for(let k=0;k<60;k++){const x=(Math.random()-0.5)*4.4,y=(Math.random()-0.5)*3.4;if(!inPoly(WIN_PTS,x,y))continue;const p=[0,1,2].map(n=>S.c[n]+(S.v[n]*x+S.u[n]*y)*W.sc+S.n[n]*0.1);
+    const r=randUnit(Math.random);spawnShard(p[0],p[1],p[2],S.n[0]*sg*(3+Math.random()*6)+r[0]*3,S.n[1]*sg*(3+Math.random()*6)+r[1]*3,S.n[2]*sg*(3+Math.random()*6)+r[2]*3,0.1+Math.random()*0.2,0xd8f6ff,player.b.g);}
+  const d=dist3(S.c,player.b.p);if(d<50){const v=Math.max(0.25,1-d/50);crunch(0.9*v);chime([3136,2637,3520,2349,2960],0.035,0.06*v);if(d<20)buzz(.6*v,120);}}
+function checkTrapdoors(P){if(!WIN.list.length||P.portal)return;const b=P.b;
+  for(const W of WIN.list){const S=W.spot;if(dotv3(b.g,S.n)>-0.6)continue;const [x,y,dn]=winLocal(W,b.p);
+    if(dn>b.R+0.6||dn<-0.5||!inPoly(WIN_PTS,x,y))continue;
+    if(W.brokenT>0||b.impact>18){if(!(W.brokenT>0))smashWindow(W,false);fallThrough(P,W);return;}}}
+function fallThrough(P,W){const others=WIN.list.filter(o=>o!==W),to=others.length?others[Math.floor(Math.random()*others.length)]:W;
+  const me=P===player;P.portal={trap:true,W,to,t:0,me,from:winLocal(W,P.b.p)};
+  if(me){trapRide.start(W);say(W.kind==='space'?'Whoa! Outer space!':'Whoa! A desert?!');woosh(1,0.7);}
+  else P.vis.hidden=true;}
+function trapFrame(P,dt){const E=P.portal,b=P.b,W=E.W;E.t+=dt;b.v=[0,0,0];b.w=[0,0,0];b.contacts=[];b.pairs=[];
+  if(E.me){const R=b.R,f=E.from,t=E.t,desert=W.kind==='desert';
+    // in the window's frame: x across, y up, z out of the wall. You fall in (z goes negative) and that world's gravity takes you
+    let x=f[0]*W.sc+Math.sin(t*2)*0.4,z=-(2+9*t+2.5*t*t),y=f[1]*W.sc-(desert?5.5:1.2)*t*t;
+    if(desert){const gy=-4.2+R;if(y<gy){const over=gy-y;y=gy+Math.abs(Math.sin(over*1.4))*Math.max(0,1.2-over*0.25);}}
+    b.p=winWorld(W,x,y,z);tmpQ.setFromAxisAngle(tv1.set(1,0.4,0.2).normalize(),dt*4);P.vis.q.premultiply(tmpQ);
+    // the camera tumbles in after you
+    camUp.set(...W.spot.u);const cw=winWorld(W,x*0.6,y+1.4+Math.max(0,1.5-t),z+4.5+Math.max(0,2-t*1.5));camPos.set(...cw);
+    camFwd.set(b.p[0]-cw[0],b.p[1]-cw[1],b.p[2]-cw[2]);fixFwd();}
+  if(E.t>=(E.me?2.6:1.8))trapExit(P,E.to);}
+function trapExit(P,W){if(P===player)trapRide.end();const S=W.spot,b=P.b,V=P.vis,r=b.R+0.7;
+  if(!(W.brokenT>0))smashWindow(W,true);else W.brokenT=14;
+  b.p=[S.c[0]+S.n[0]*r,S.c[1]+S.n[1]*r,S.c[2]+S.n[2]*r];
+  let gi=0,bd=-2;AXES.forEach((a,k)=>{const d=-dotv3(a,S.u);if(d>bd){bd=d;gi=k;}});b.gi=gi;b.g=AXES[gi].slice();
+  b.v=[S.n[0]*9+S.u[0]*4,S.n[1]*9+S.u[1]*4,S.n[2]*9+S.u[2]*4];b.w=[(Math.random()-0.5)*16,(Math.random()-0.5)*16,(Math.random()-0.5)*16];
+  V.hidden=false;V.portalK=1;P.freeze=0.3;P.portalCool=2;P.portal=null;if(!P.isPlayer)P.brain=newBrain();
+  if(P===player){reframeCam(P);camFwd.set(-S.n[0],-S.n[1],-S.n[2]);fixFwd();const D=camDist(b.R);camPos.set(b.p[0],b.p[1],b.p[2]).addScaledVector(camFwd,-D*Math.cos(camPitch)).addScaledVector(camUp,D*Math.sin(camPitch));}}
+function updateWindowsState(dt){for(const W of WIN.list)if(W.brokenT>0){W.brokenT-=dt;if(W.brokenT<=0){W.brokenT=0;W.sheen.material.uniforms.uSheen.value=1;if(dist3(W.spot.c,player.b.p)<30)chime([1568,2093],0.08,0.05);}}}
+// during the ride, the cube disappears and that window's world fills your view
+const trapRide={on:false,W:null,
+  start(W){this.on=true;this.W=W;W.stencil(false);for(const m of worldMeshes)m.visible=false;for(const F of WF.list)F.g.visible=false;for(const o of WIN.list)o.g.visible=o===W;},
+  end(){if(!this.on)return;this.on=false;this.W.stencil(true);for(const m of worldMeshes)m.visible=true;for(const o of WIN.list)o.g.visible=true;}};
+
+// ============================================================ THE BUILD (the original's: the spaces appear as solid shapes,
+// a block drops over them, the spaces are subtracted, then the beams and balls pop back in). Shown as a model in front of you.
+const GA={active:false};
+const gaInv={value:new THREE.Matrix4()};
+const GA_VS='uniform mat4 uInv;varying vec3 vWP;void main(){vec4 w=modelMatrix*vec4(position,1.0);vWP=(uInv*w).xyz;gl_Position=projectionMatrix*viewMatrix*w;}';
+const GA_FS=`uniform float uA;uniform float uSolid;varying vec3 vWP;
+void main(){
+  vec3 n=normalize(cross(dFdx(vWP),dFdy(vWP)));vec3 c=n*0.5+0.5;c=mix(vec3(dot(c,vec3(0.333))),c,1.35);c=clamp(c,0.0,1.0)*0.88+0.1;
+  if(!gl_FrontFacing||uSolid>0.5)c=vec3(0.95,0.91,0.84)*(0.78+0.14*n.y+0.08*n.x);
+  gl_FragColor=vec4(c,uA);
+}`;
+function gaMat(){return new THREE.ShaderMaterial({uniforms:{uA:{value:1},uSolid:{value:0},uInv:gaInv},vertexShader:GA_VS,fragmentShader:GA_FS,side:THREE.DoubleSide,transparent:true});}
+function gaGeo(polys,c){const P=[];for(const pts of polys)for(let i=1;i<pts.length-1;i++)for(const v of [pts[0],pts[i],pts[i+1]])P.push(v[0]-c[0],v[1]-c[1],v[2]-c[2]);
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(P,3));g.computeBoundingSphere();return g;}
+function genAnimStart(L){
+  genAnimStop();
+  const g=new THREE.Group();worldGroup.add(g);
+  const I=L.S*8-0.5;
+  const glass=new THREE.Mesh(new THREE.BoxGeometry(2*I,2*I,2*I),new THREE.MeshBasicMaterial({color:0xffffff,transparent:true,opacity:0,depthWrite:false,fog:false}));
+  const edges=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(2*I,2*I,2*I)),new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:0,fog:false}));
+  const cube=new THREE.Group();cube.add(glass,edges);cube.visible=false;g.add(cube);glass.renderOrder=4;edges.renderOrder=4;
+  Object.assign(GA,{active:true,L,I,group:g,cube,glass,edges,clock:0,air:[],adds:[],carveMesh:null,finalMesh:null,ops:null,carve:null,final:null,stage:-1,
+    airMat:gaMat(),wallMat:gaMat(),addMat:gaMat(),done:false,yaw:0.6,xrPlaced:false});
+  GA.wallMat.side=THREE.FrontSide;GA.addMat.side=THREE.FrontSide;GA.wallMat.transparent=false;GA.addMat.transparent=false;
+  GA.finished=new Promise(r=>{GA.resolve=r;});
+  GA.setOps=ops=>{GA.ops=ops;const carves=ops.filter(o=>o.op<0);
+    carves.forEach(op=>{const P=polyOf(op),m=new THREE.Mesh(gaGeo(P.faces.map(f=>f.pts),op.c),GA.airMat);m.position.set(op.c[0],op.c[1],op.c[2]);m.scale.setScalar(0.001);
+      const kind=ROOMS.some(R=>R.pr===op)?0:HALLS.some(H=>H.pr===op)?1:2;GA.air.push({m,delay:kind*0.75+Math.random()*0.6});g.add(m);});};
+  GA.setCarve=walls=>{GA.carve=walls;const m=new THREE.Mesh(gaGeo(walls.map(w=>w.pts),[0,0,0]),GA.wallMat);m.renderOrder=3;m.visible=false;GA.carveMesh=m;g.add(m);};
+  GA.setFinal=walls=>{GA.final=walls;const by=new Map();for(const w of walls){if(w.owner<0||!GA.ops)continue;const op=CR.ops[w.owner];if(!op||op.op<0)continue;let a=by.get(w.owner);if(!a){a=[];by.set(w.owner,a);}a.push(w.pts);}
+    let i=0;for(const [k,pl] of by){const op=CR.ops[k],m=new THREE.Mesh(gaGeo(pl,op.c),GA.addMat);m.renderOrder=3;m.position.set(op.c[0],op.c[1],op.c[2]);m.scale.setScalar(0.001);m.visible=false;GA.adds.push({m,delay:(i++/Math.max(1,by.size))*1.1});g.add(m);}
+    const fm=new THREE.Mesh(gaGeo(walls.map(w=>w.pts),[0,0,0]),GA.wallMat);fm.renderOrder=3;fm.visible=false;GA.finalMesh=fm;g.add(fm);};
+  return GA;
+}
+function genAnimStop(){if(!GA.group)return;worldGroup.remove(GA.group);GA.group.traverse(o=>{if(o.geometry)o.geometry.dispose();});GA.group=null;GA.active=false;
+  for(const m of [GA.airMat,GA.wallMat,GA.addMat])if(m)m.dispose();}
+const GA_STAGES=['Placing the spaces','Pouring the block','Subtracting','Adding back','Ready!'];
+function gaFrame(dt){
+  const A=GA;if(!A.active)return;
+  const gates=[2.6,3.7,5.2,6.6,7.3];// air · block · subtract · add · done
+  let next=A.clock+dt;
+  if(next>gates[1]&&!A.carve)next=Math.min(next,gates[1]);
+  if(next>gates[2]&&!A.final)next=Math.min(next,gates[2]);
+  A.clock=next;const t=A.clock;
+  A.stage=t<gates[0]?0:t<gates[1]?1:t<gates[2]?2:t<gates[3]?3:4;
+  for(const a of A.air){const k=easeBack((t-a.delay)/0.4),out=clamp((t-gates[1])/0.45,0,1);a.m.scale.setScalar(Math.max(0.001,k*(1-out*out)));a.m.visible=out<1;}
+  const kb=clamp((t-gates[0])/0.8,0,1);A.cube.visible=t>gates[0];A.cube.scale.setScalar(1+0.6*(1-easeBack(kb))*(1-kb));
+  const fade=1-clamp((t-gates[1]-0.5)/0.8,0,1);A.glass.material.opacity=0.32*kb*fade;A.edges.material.opacity=0.9*kb*(0.35+0.65*fade);
+  if(A.carveMesh)A.carveMesh.visible=t>=gates[1]&&t<gates[4]-0.3;
+  for(const a of A.adds){const k=easeBack((t-gates[2]-a.delay)/0.35);a.m.visible=t>gates[2]&&t<gates[4]-0.3;a.m.scale.setScalar(Math.max(0.001,k));}
+  if(A.finalMesh)A.finalMesh.visible=t>=gates[4]-0.3;
+  A.yaw+=dt*0.35;
+  if(t>=gates[4]+0.6&&!A.done){A.done=true;A.resolve();}
+}
+
 // ---------- views (picked in Settings)
 // Follow: the original game's camera. It sits behind and above your ball, its "up" swings to your ball's up when you
 // FALL, and it slowly turns to follow the way you're rolling. In VR your head is that camera; you can still look around.
@@ -1535,11 +1895,11 @@ function reframeCam(P){
 }
 // the original's updateCamera, minus mouse look and wall pull-in (from outside, walls between you and the ball aren't drawn)
 function updateFollowCam(dt, now){
+  if (trapRide.on) return;
   const pb = player.b, u = upOf(pb);
   tv1.set(u[0], u[1], u[2]); const dot = clamp(camUp.dot(tv1), -1, 1);
   if (dot < 0.99999){ axisV.crossVectors(camUp, tv1); if (axisV.lengthSq() < 1e-4) axisV.crossVectors(camFwd, camUp); axisV.normalize(); turnFrame(axisV, Math.acos(dot) * Math.min(1, dt * 2.0)); }
   const v = pb.v, vu = v[0] * camUp.x + v[1] * camUp.y + v[2] * camUp.z; tv2.set(v[0] - camUp.x * vu, v[1] - camUp.y * vu, v[2] - camUp.z * vu); const hs = tv2.length();
-  if (now - lastLook > 2200 && hs > 3 && pb.grounded > 0){ tv2.normalize(); const s = camUp.dot(axisV.crossVectors(camFwd, tv2)), c = camFwd.dot(tv2); turnFrame(camUp, Math.atan2(s, c) * Math.min(1, dt * 0.9 * Math.min(1, (hs - 3) / 6))); }
   const D = camDist(pb.R), tx = pb.p[0] + camUp.x * 0.9 * pb.R, ty = pb.p[1] + camUp.y * 0.9 * pb.R, tz = pb.p[2] + camUp.z * 0.9 * pb.R;
   const cp = Math.cos(camPitch), sp = Math.sin(camPitch);
   camView.set(camFwd.x * cp - camUp.x * sp, camFwd.y * cp - camUp.y * sp, camFwd.z * cp - camUp.z * sp).normalize();
@@ -1580,6 +1940,13 @@ function applyEnv(){
 }
 const mB = new THREE.Matrix4(), mS = new THREE.Matrix4(), qF = new THREE.Quaternion();
 function placeWorld(){
+  if (GA.active){
+    let pos;
+    if (xrOn()){ if (!GA.xrPlaced && anchorPending === 0){ const { p, yaw } = headPose(); GA.at = p.clone().addScaledVector(yaw, .75); GA.at.y = p.y - .22; GA.xrPlaced = true; } pos = GA.at || V3(0, 1.2, -.8); }
+    else pos = view === 1 ? table.pos : V3(0, 1.22, -1.25);
+    worldRoot.position.copy(pos); worldRoot.quaternion.setFromEuler(new THREE.Euler(0.32, GA.yaw, 0, 'XYZ')); worldRoot.scale.setScalar(0.011);
+    return;
+  }
   if (view === 1){ worldRoot.position.copy(table.pos); worldRoot.quaternion.copy(table.quat); worldRoot.scale.setScalar(table.scale); return; }
   // turn the camera's frame (right, up, back) onto the room's (right, up, back) at the anchor
   const r = tv1.crossVectors(camFwd, camUp).normalize(), aR = V3().crossVectors(aFwd, YAX).normalize();
@@ -1606,19 +1973,21 @@ function simulate(dt, now){
   for (const P of players){
     const b = P.b;
     if (P.portal){ portalFrame(P, dt); continue; }
+    checkTrapdoors(P); if (P.portal) continue;
     P.freeze = Math.max(0, P.freeze - dt); P.pop = Math.min(POP_CHARGE, P.pop + dt); P.fallCool = Math.max(0, P.fallCool - dt);
     if (sceneSDF(b.p[0], b.p[1], b.p[2]) < -b.R * 0.8){ const L = locate(b.p), s = findSpot(b.R, Math.random, L.room ?? L.near ?? 0, b.gi); b.p = s.p.slice(); b.v = [0, 0, 0]; }
     const ws = Math.hypot(b.w[0], b.w[1], b.w[2]);
     if (ws > 1e-6){ tmpQ.setFromAxisAngle(tv1.set(b.w[0] / ws, b.w[1] / ws, b.w[2] / ws), ws * dt); P.vis.q.premultiply(tmpQ).normalize(); }
     if (b.impact > 3.5){ P.vis.sqV += b.impact * 0.06; P.vis.sqN.set(b.lastN[0], b.lastN[1], b.lastN[2]); if (P.isPlayer) SND.thud(b.impact); }
   }
-  updateWallFaces(dt, now); updateBubbles(dt);
+  updateWallFaces(dt, now); updateBubbles(dt); updateWindowsState(dt);
   updateRound(dt);
 }
 const tmpQ = new THREE.Quaternion();
 
 // ---------- swallowed by a wall face: scooped by the tongue, chewed, then a ride through a rainbow tunnel
 function portalFrame(P, dt){
+  if (P.portal.trap) return trapFrame(P, dt);
   const E = P.portal, F = E.F, b = P.b, V = P.vis; E.t += dt; const t = E.t, me = P === player;
   const m = wfMouth(F);
   b.v = [0, 0, 0]; b.w = [0, 0, 0]; b.contacts = []; b.pairs = [];
@@ -1627,8 +1996,10 @@ function portalFrame(P, dt){
   else b.p = m.slice();
   V.portalK = Math.max(0.01, t < 0.5 ? 1 : t < 0.72 ? 1 - 0.75 * (t - 0.5) / 0.22 : 0.25); V.hidden = !(t < 0.74 || E.tele);
   const near = Math.max(0, 1 - dist3(F.c, player.b.p) / 40);
-  if (!E.gulped && t >= 0.72){ E.gulped = true; if (near > 0) gulp(0.4 + 0.6 * near); if (me) buzz(.8, 160); }
-  if (t > 0.75 && t < 1.55){ const c = Math.floor((t - 0.75) * 3.6); if (c !== E.chew){ E.chew = c; if (near > 0) crunch(0.3 * near + 0.1); if (me) buzz(.4, 50); } }
+  if (!E.gulped && t >= 0.72){ E.gulped = true; if (near > 0) gulp(0.4 + 0.6 * near); if (me) buzz(.8, 160);
+    if (near > 0) for (let k = 0, nn = me ? 50 : 25; k < nn; k++){ const d = randUnit(Math.random), sp = 2 + Math.random() * 6; spawnGoop(m[0], m[1], m[2], d[0] * sp + F.n[0] * 6, d[1] * sp + F.n[1] * 6, d[2] * sp + F.n[2] * 6, b.R * (0.1 + Math.random() * 0.18), P.color, b.g, 3 + Math.random() * 3); } }
+  if (t > 0.75 && t < 1.55){ const c = Math.floor((t - 0.75) * 3.6); if (c !== E.chew){ E.chew = c; if (near > 0) crunch(0.3 * near + 0.1); if (me) buzz(.4, 50);
+    for (let n = 0; n < 5; n++){ const d = randUnit(Math.random); spawnShard(m[0], m[1], m[2], d[0] * 3 + F.n[0] * 3, d[1] * 3 + F.n[1] * 3, d[2] * 3 + F.n[2] * 3, 0.07 + Math.random() * 0.08, P.color, b.g); } } }
   if (me && t >= 1.0 && !E.fx){ E.fx = true; tunnel.start(); woosh(1, 0.6); }
   portalTele(P, E, F, t, me);
 }
@@ -1714,7 +2085,7 @@ function say(t){ toastText = t; toastT = 2.4; }
 const fmt = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 function statusText(){
   const seek = player.role === 'seeker', left = players.filter(P => P.role === 'hider').length;
-  if (building) return 'Building world…';
+  if (building) return GA.active && GA.stage >= 0 ? GA_STAGES[GA.stage] : 'Building world…';
   if (game.phase === 'hide') return seek ? `Counting ${Math.max(1, Math.ceil(game.t))}` : `Hide! ${Math.max(1, Math.ceil(game.t))}`;
   if (game.phase === 'over') return 'Round over';
   return `${fmt(Math.max(0, game.t))} · ${left} hiding`;
@@ -1785,20 +2156,24 @@ function updateHud(){
 const SET_ROWS = [{ label: () => 'Resume', act: () => closeSettings() },
   { label: () => 'View: Follow', act: () => setView(0), on: () => view === 0 }, { label: () => 'View: Tabletop', act: () => setView(1), on: () => view === 1 },
   { label: () => 'Wall faces: ' + (SET.faces ? 'on' : 'off'), act: () => setFaces(!SET.faces), on: () => !!SET.faces },
+  { label: () => 'Windows: ' + (SET.windows ? 'on' : 'off'), act: () => setWindows(!SET.windows), on: () => !!SET.windows },
   { label: () => 'New world', act: () => newWorld() }];
-function setFaces(on){ SET.faces = on ? 4 : 0; if (!building){ placeWallFaces(); wfReset(); } syncFaceBtn(); setPanel.key = ''; }
-function syncFaceBtn(){ const b = document.getElementById('faces'); if (b){ b.textContent = 'Wall faces: ' + (SET.faces ? 'on' : 'off'); b.setAttribute('aria-pressed', String(!!SET.faces)); } }
+function placeProps(){ const rnd = mulberry(((CUR ? CUR.seed : 1) * 977 + 3) >>> 0); placeWindows(rnd, wfCandidates()); placeWallFaces(); }
+function refreshProps(){ if (building) return; trapRide.end(); tunnel.end(); for (const P of players) if (P.portal){ P.portal = null; P.vis.hidden = false; P.vis.portalK = 1; } placeProps(); wfReset(); }
+function setFaces(on){ SET.faces = on ? 4 : 0; refreshProps(); syncFaceBtn(); setPanel.key = ''; }
+function setWindows(on){ SET.windows = on ? 1 : 0; refreshProps(); syncFaceBtn(); setPanel.key = ''; }
+function syncFaceBtn(){ const b = document.getElementById('faces'), w = document.getElementById('wins'); if (b){ b.textContent = 'Wall faces: ' + (SET.faces ? 'on' : 'off'); b.setAttribute('aria-pressed', String(!!SET.faces)); } if (w){ w.textContent = 'Windows: ' + (SET.windows ? 'on' : 'off'); w.setAttribute('aria-pressed', String(!!SET.windows)); } }
 const setPanel = (() => {
-  const c = document.createElement('canvas'); c.width = 640; c.height = 880; const tex = new THREE.CanvasTexture(c);
-  const m = new THREE.Mesh(new THREE.PlaneGeometry(.4, .55), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
+  const c = document.createElement('canvas'); c.width = 640; c.height = 1000; const tex = new THREE.CanvasTexture(c);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(.4, .625), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
   m.renderOrder = 140; m.visible = false; scene.add(m);
   return { c, ctx: c.getContext('2d'), tex, m, hover: -1, key: '' };
 })();
 let settingsOpen = false;
 function drawSettings(){
-  const key = setPanel.hover + '|' + view + SET.faces; if (key === setPanel.key) return; setPanel.key = key;
-  const c = setPanel.ctx; c.clearRect(0, 0, 640, 880);
-  rr(c, 6, 6, 628, 868, 44); c.fillStyle = '#fff6e3'; c.fill(); c.lineWidth = 8; c.strokeStyle = '#1d1530'; c.stroke();
+  const key = setPanel.hover + '|' + view + SET.faces + SET.windows; if (key === setPanel.key) return; setPanel.key = key;
+  const c = setPanel.ctx; c.clearRect(0, 0, 640, 1000);
+  rr(c, 6, 6, 628, 988, 44); c.fillStyle = '#fff6e3'; c.fill(); c.lineWidth = 8; c.strokeStyle = '#1d1530'; c.stroke();
   c.fillStyle = '#1d1530'; c.font = '700 56px Fredoka, "DM Sans", system-ui'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('Paused', 320, 80);
   SET_ROWS.forEach((r, i) => {
     const y = 160 + i * 120, on = r.on && r.on();
@@ -1806,7 +2181,7 @@ function drawSettings(){
     c.fillStyle = '#1d1530'; c.font = '600 42px Fredoka, "DM Sans", system-ui'; c.fillText(r.label() + (on ? '  ✓' : ''), 320, y + 50);
   });
   c.font = '500 26px "DM Sans", system-ui'; c.fillStyle = 'rgba(29,21,48,.65)';
-  c.fillText('L stick rolls · R stick looks around · A/X hop · B pop', 320, 782, 580); c.fillText('trigger: aim a FALL, let go to fall', 320, 822, 580);
+  c.fillText('L stick rolls · R stick looks around · A/X hop · B pop', 320, 902, 580); c.fillText('trigger: aim a FALL, let go to fall', 320, 942, 580);
   setPanel.tex.needsUpdate = true;
 }
 function openSettings(){
@@ -1866,7 +2241,7 @@ function updateXRInputs(dt, now){
     if (settingsOpen){
       setRay.set(st.ctrl.getWorldPosition(V3()), dirS); const hit = setRay.intersectObject(setPanel.m)[0];
       st.laser.visible = true; st.laser.scale.z = hit ? hit.distance : .6;
-      if (hit){ const yy = (1 - hit.uv.y) * 880 - 160, row = Math.floor(yy / 120); if (row >= 0 && row < SET_ROWS.length && yy % 120 < 96){ hover = row; if (down(0)){ SET_ROWS[row].act(); buzz(.3, 30, st); } } }
+      if (hit){ const yy = (1 - hit.uv.y) * 1000 - 160, row = Math.floor(yy / 120); if (row >= 0 && row < SET_ROWS.length && yy % 120 < 96){ hover = row; if (down(0)){ SET_ROWS[row].act(); buzz(.3, 30, st); } } }
     } else {
       // trigger: hold to aim a FALL, let go to fall
       if (pressed(0) && (st.aiming || down(0))){ st.aiming = true; aimGi = aimAxis(dirS); }
@@ -1951,6 +2326,7 @@ async function start(kind){
 vrBtn.onclick = () => start('immersive-vr');
 mrBtn.onclick = () => start('immersive-ar');
 document.getElementById('faces').onclick = () => setFaces(!SET.faces);
+document.getElementById('wins').onclick = () => setWindows(!SET.windows);
 for (const b of document.querySelectorAll('[data-view]')) b.onclick = () => { unlockAudio(); setView(+b.dataset.view); };
 document.getElementById('new').onclick = () => { unlockAudio(); newWorld(); };
 navigator.xr?.addEventListener?.('devicechange', setupButtons);
@@ -1958,14 +2334,19 @@ setupButtons();
 
 async function newWorld(){
   if (building) return;
-  closeSettings();
+  closeSettings(); trapRide.end(); tunnel.end();
+  for (const F of WF.list) worldGroup.remove(F.g); WF.list = []; clearWindows();
   loadBar.hidden = false; status.textContent = 'Building the world…';
-  for (const P of players) P.vis.holder.visible = false;
+  for (const P of players){ P.portal = null; P.vis.hidden = false; P.vis.holder.visible = P.vis.shadow.visible = P.vis.ring.visible = false; }
   await buildWorld((Math.random() * 1e9) >>> 0, p => { loadFill.style.width = Math.round(p * 100) + '%'; });
   loadBar.hidden = true; status.textContent = headsetMsg;
-  placeWallFaces();
+  placeProps();
   startRound();
 }
+
+// ---------- HUD pieces stay on top of the window views: they reset the stencil where they draw
+for (const m of [pillHud.m.material, ringHud.m.material, setPanel.m.material, ...blind.g.children.map(c => c.material)]){
+  m.alphaTest = 0.02; m.stencilWrite = true; m.stencilRef = 0; m.stencilFunc = THREE.AlwaysStencilFunc; m.stencilZPass = THREE.ReplaceStencilOp; }
 
 // ---------- loop
 settings.size = 0.0625;                          // a smaller ball (radius 0.7) so the camera stays in the room
@@ -1974,7 +2355,7 @@ setView(0);
 newWorld();
 let last = performance.now() / 1000;
 renderer.setAnimationLoop(() => {
-  const now = performance.now() / 1000, dt = Math.min(now - last, .05); last = now; elapsed += dt;
+  const now = performance.now() / 1000, rawDt = Math.min(now - last, .25), dt = Math.min(rawDt, .05); last = now; elapsed += dt;
   if (xrOn() && anchorPending > 0 && --anchorPending === 0) setView(view);
   toastT -= dt;
   if (!building && players.length && ROOMS.length){
@@ -1984,10 +2365,14 @@ renderer.setAnimationLoop(() => {
     updateFollowCam(dt, now * 1000);
     placeWorld();
     updateVisuals(dt); tunnel.frame(dt);
-  } else placeWorld();
+    if (!settingsOpen){ updateShards(dt); updateGoop(dt); updateSparks(dt); updateWind(dt); }
+    sparks.material.size = 0.75 * worldRoot.scale.x;
+  } else { if (building) gaFrame(rawDt); placeWorld(); }
+  worldRoot.updateMatrixWorld(true); gaInv.value.copy(worldGroup.matrixWorld).invert();
   if (!xrOn() && view === 1) orbit.update();
   updateHud();
   renderer.render(scene, camera);
+  renderWindows();
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 </script>
