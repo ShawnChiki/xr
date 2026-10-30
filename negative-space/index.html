@@ -55,7 +55,7 @@
   <div class="sky">
     <span class="under" aria-hidden="true">Space</span>
     <p>Melt down to <b>your ruby</b>, buried somewhere below you. Guard the <span class="ruby">red ruby</span> floating in your sky before Black's towers swallow it.</p>
-    <p>Gold orbs boost your laser. Orbs with a red ring give you a compass to your ruby for 20 seconds.</p>
+    <p>Orbs change your laser for 15 seconds: <b>gold</b> is wide, <b>blue</b> is fast, <b>orange</b> fires bursts that blow out a sphere. White orbs with a red ring give you a compass to your ruby.</p>
     <div class="row">
       <button id="vr" disabled>Enter VR</button>
       <button id="desk" class="ghost">Play on desktop</button>
@@ -138,11 +138,12 @@ function initField(){
   }
 }
 
-const dirty = new Set();
+const dirty = new Set(), hot = new Set();
+let hotStamp = false;                         // set while the player's laser is stamping, so its chunks rebuild first
 function markDirty(i0, i1, j0, j1, k0, k1){
   const c = (v, n) => clamp(Math.floor(v / CH), 0, n - 1);
   for (let cz = c(k0 - 1, CW); cz <= c(k1 + 1, CW); cz++) for (let cy = c(j0 - 1, CY); cy <= c(j1 + 1, CY); cy++) for (let cx = c(i0 - 1, CW); cx <= c(i1 + 1, CW); cx++)
-    dirty.add(cx + CW * (cy + CY * cz));
+    { const ci = cx + CW * (cy + CY * cz); dirty.add(ci); if (hotStamp) hot.add(ci); }
 }
 // melt (raise=false) or fill (raise=true) a soft sphere; k is how far this step moves toward the target
 function stamp(cx, cy, cz, r, k, raise, guard){
@@ -294,6 +295,9 @@ const HEAD = new V3();
 function flushDirty(budgetMs){
   if (!dirty.size) return;
   const t0 = performance.now();
+  // your own melting always shows up this frame
+  for (const ci of hot){ rebuildChunk(ci); dirty.delete(ci); if (performance.now() - t0 > budgetMs * 3) break; }
+  hot.clear();
   const hx = HEAD.x / CELL / CH, hy = HEAD.y / CELL / CH, hz = HEAD.z / CELL / CH;
   const list = [...dirty].sort((a, b) => {
     const [ax, ay, az] = chunkOf(a), [bx, by, bz] = chunkOf(b);
@@ -321,7 +325,15 @@ function glowTexture(rgb){
   x.fillStyle = gr; x.fillRect(0, 0, 128, 128);
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
 }
-const TEX = { ruby: glowTexture('255,40,80'), gold: glowTexture('255,210,60'), hot: glowTexture('255,170,110') };
+const TEX = { ruby: glowTexture('255,40,80'), gold: glowTexture('255,210,60'), hot: glowTexture('255,170,110'), blue: glowTexture('90,160,255'), orange: glowTexture('255,120,30') };
+// laser power-ups: each lasts 15 seconds and they stack
+const POW = {
+  wide:  { color: 0xf5c518, tex: 'gold' },     // fat beam that melts a wider tunnel
+  fast:  { color: 0x4da3ff, tex: 'blue' },     // melts three times faster and sips charge
+  burst: { color: 0xff7a1a, tex: 'orange' },   // fires balls that blow out a sphere of rock
+};
+const powOn = k => S.pow[k] > 0;
+function powColor(){ return powOn('burst') ? POW.burst.color : powOn('fast') ? POW.fast.color : powOn('wide') ? POW.wide.color : 0; }
 const glowSprite = (tex, s, through) => {
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: !through, blending: THREE.AdditiveBlending, fog: false }));
   sp.scale.setScalar(s); if (through) sp.renderOrder = 20; return sp;
@@ -478,7 +490,7 @@ function showPanel(title, lines, dark, secs = 0){
 // ================================================================ game state
 const S = {
   mode: 'ready',            // ready (attract), play, won, lost
-  t: 0, charge: 1, over: 0, compass: 0, ghosts: false, held: null, threats: [], warn: 0, pingT: 0, lastWarnTick: 0,
+  t: 0, charge: 1, pow: { wide: 0, fast: 0, burst: 0 }, compass: 0, ghosts: false, held: null, threats: [], warn: 0, pingT: 0, lastWarnTick: 0,
 };
 const player = { vel: new V3(), grounded: false, climbV: new V3() };
 const skyFree = new V3(), skyVel = new V3(), _tg = new V3();
@@ -507,10 +519,18 @@ for (let i = 0; i < 6; i++) bots.push({ pos: new V3(), target: new V3(), heading
 
 // gold orbs supercharge the laser; white orbs with a red ring give a compass to your ruby
 const orbGeo = new THREE.SphereGeometry(0.09, 20, 14), orbRing = new THREE.TorusGeometry(0.17, 0.012, 8, 40);
-for (let i = 0; i < 8; i++){
-  const kind = i % 3 === 0 ? 'compass' : 'charge', g = new THREE.Group();
-  if (kind === 'charge') g.add(new THREE.Mesh(orbGeo, new THREE.MeshBasicMaterial({ color: 0xffd65a, fog: false })), glowSprite(TEX.gold, 0.8, false));
-  else {
+const orbShape = {
+  wide: (() => { const g = new THREE.SphereGeometry(0.11, 24, 12); g.scale(1.5, 0.5, 1.5); return g; })(),
+  fast: (() => { const g = new THREE.OctahedronGeometry(0.1, 0); g.scale(0.6, 1.7, 0.6); return g; })(),
+  burst: new THREE.IcosahedronGeometry(0.1, 0),
+};
+const ORB_KINDS = ['compass', 'wide', 'fast', 'burst'];
+for (let i = 0; i < 10; i++){
+  const kind = ORB_KINDS[i % 4], g = new THREE.Group();
+  if (kind !== 'compass'){
+    const m = new THREE.Mesh(orbShape[kind], new THREE.MeshBasicMaterial({ color: POW[kind].color, fog: false })); m.material.toneMapped = false;
+    g.add(m, glowSprite(TEX[POW[kind].tex], 0.85, false));
+  } else {
     const ring = new THREE.Mesh(orbRing, new THREE.MeshBasicMaterial({ color: 0xff2a50, fog: false }));
     g.add(new THREE.Mesh(orbGeo, new THREE.MeshBasicMaterial({ color: 0xf2f4f7, fog: false })), ring, glowSprite(TEX.ruby, 0.75, false));
     g.userData.ring = ring;
@@ -544,7 +564,7 @@ function newGame(mode = 'play'){
   initField();
   for (let ci = 0; ci < chunkMeshes.length; ci++) rebuildChunk(ci);
   dirty.clear();
-  Object.assign(S, { mode, t: 0, charge: 1, over: 0, compass: 0, held: null, threats: [], warn: 0, pingT: 0 });
+  Object.assign(S, { mode, t: 0, charge: 1, pow: { wide: 0, fast: 0, burst: 0 }, compass: 0, held: null, threats: [], warn: 0, pingT: 0 });
   skyVel.set(0, 0, 0); thread.visible = false;
   // your buried ruby, the floating one Black wants, and your start spot
   myRuby.position.set(rand(3, SIZE - 3), SURF - rand(3, 5.5), rand(3, SIZE - 3));
@@ -593,9 +613,9 @@ function makeGun(){
 }
 const _segOn = new THREE.Color(), _segOff = new THREE.Color(0x33363d);
 function updateGun(g, now){
-  const over = S.over > 0, low = S.charge < 0.18, lit = Math.ceil(S.charge * SEG - 0.001);
-  _segOn.setHex(over ? 0xf5c518 : low ? 0xff2a50 : 0xff6a8e);
-  const blink = low && !over && Math.sin(now * 0.02) < 0;
+  const pc = powColor(), low = S.charge < 0.18, lit = Math.ceil(S.charge * SEG - 0.001);
+  _segOn.setHex(low ? 0xff2a50 : pc || 0xff6a8e);
+  const blink = low && Math.sin(now * 0.02) < 0;
   g.userData.segs.forEach((m, i) => m.material.color.copy(i < lit && !blink ? _segOn : _segOff));
   g.userData.ring.material.color.copy(ringColor());
 }
@@ -731,31 +751,98 @@ function rayHit(o, d, max, out){
   }
   return null;
 }
-function placeBeam(beam, from, to, on, over){
+function placeBeam(beam, from, to, on){
   beam.g.visible = on; beam.tip.visible = on;
   if (!on) return;
   beam.g.position.copy(from); beam.g.lookAt(to);
-  const len = Math.max(0.01, from.distanceTo(to));
-  beam.core.scale.z = len; beam.glow.scale.set(over ? 0.04 : 0.022, over ? 0.04 : 0.022, len);
-  beam.glow.material.color.setHex(over ? 0xf5c518 : 0xff3d6e);
-  beam.tip.position.copy(to); beam.tip.scale.setScalar((over ? 0.6 : 0.36) * (0.85 + Math.random() * 0.3));
+  const len = Math.max(0.01, from.distanceTo(to)), wide = powOn('wide'), fast = powOn('fast');
+  const w = wide ? 0.042 : 0.022, c = wide ? 0.007 : 0.005;
+  beam.core.scale.set(c, c, len); beam.glow.scale.set(w, w, len);
+  beam.glow.material.color.setHex(fast ? POW.fast.color : wide ? POW.wide.color : 0xff3d6e);
+  beam.glow.material.opacity = fast ? 0.5 + Math.random() * 0.4 : 0.5;
+  beam.tip.position.copy(to); beam.tip.scale.setScalar((wide ? 0.75 : 0.36) * (0.85 + Math.random() * 0.3));
 }
-// fire one beam: aim ray (o,d), drawn from `from`. returns true if it melted rock
-function fire(o, d, from, beam, dt){
-  if (S.charge <= 0.01){ placeBeam(beam, from, _p.copy(from).addScaledVector(d, 0.3), Math.random() < 0.3, false); return false; }
-  const hit = rayHit(o, d, 26, _hit);
-  const over = S.over > 0;
-  const end = hit ? hit : _p.copy(o).addScaledVector(d, 26);
-  placeBeam(beam, from, end, true, over);
-  S.charge = Math.max(0, S.charge - dt * (over ? 0.03 : 0.085));
-  if (!hit) return false;
-  const n = stamp(hit.x, hit.y, hit.z, over ? 0.8 : 0.5, Math.min(1, (over ? 4.2 : 2.7) * dt), false);
-  sdf(hit.x, hit.y, hit.z, _n);
-  if (Math.random() < 0.8) spawnSparks(hit, _n, over ? 3 : 2);
-  // melting close to your ruby wakes a Black defender who refills your tunnel
-  if (S.mode === 'play' && hit.distanceTo(myRuby.position) < 3.6){
-    if (!S.threats.some(t => t.distanceTo(hit) < 0.5) && S.threats.length < 60) S.threats.push(hit.clone());
+function nearRuby(p){
+  if (S.mode === 'play' && p.distanceTo(myRuby.position) < 3.6 && !S.threats.some(t => t.distanceTo(p) < 0.5) && S.threats.length < 60) S.threats.push(p.clone());
+}
+// burst balls
+const shots = [];
+{
+  const geo = new THREE.SphereGeometry(0.06, 12, 8);
+  for (let i = 0; i < 12; i++){
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0xffd0a0, fog: false })); m.material.toneMapped = false;
+    m.add(glowSprite(TEX.orange, 0.5, false)); m.visible = false; scene.add(m);
+    shots.push({ m, vel: new V3(), life: 0 });
   }
+}
+const flashes = [];
+for (let i = 0; i < 5; i++){ const f = glowSprite(TEX.orange, 1, false); f.visible = false; scene.add(f); flashes.push({ f, t: 0, r: 1 }); }
+function shoot(from, d){
+  const s = shots.find(q => q.life <= 0) || shots[0];
+  s.m.position.copy(from); s.vel.copy(d).multiplyScalar(16); s.life = 2; s.m.visible = true;
+  tone(150, 0.12, 'square', 0.08, 90);
+}
+function explode(p){
+  const r = powOn('wide') ? 2.0 : 1.4;
+  hotStamp = true; stamp(p.x, p.y, p.z, r, 1, false); hotStamp = false;
+  const f = flashes.find(q => q.t <= 0) || flashes[0]; f.t = 0.4; f.r = r; f.f.position.copy(p); f.f.visible = true;
+  for (let i = 0; i < 6; i++) spawnSparks(p, _n.randomDirection(), 5);
+  nearRuby(p);
+  const d = p.distanceTo(HEAD), v = clamp(1 - d / 20, 0.15, 1);
+  if (AC){
+    const t = AC.currentTime, src = AC.createBufferSource(), g = AC.createGain(), lp = AC.createBiquadFilter();
+    const buf = AC.createBuffer(1, AC.sampleRate * 0.6, AC.sampleRate), ch = buf.getChannelData(0);
+    for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / ch.length, 2.5);
+    src.buffer = buf; lp.type = 'lowpass'; lp.frequency.value = 900; g.gain.value = 0.5 * v;
+    src.connect(lp).connect(g).connect(master); src.start(t);
+    tone(90, 0.4, 'sine', 0.3 * v, 40);
+  }
+  for (const h of hands) buzz(h, 0.7 * v, 90);
+}
+function updateShots(dt){
+  for (const s of shots){
+    if (s.life <= 0) continue;
+    s.life -= dt;
+    const steps = Math.ceil(s.vel.length() * dt / 0.1);
+    let boom = false;
+    for (let i = 0; i < steps && !boom; i++){
+      s.m.position.addScaledVector(s.vel, dt / steps);
+      if (sampleV(s.m.position) > 0.5) boom = true;
+    }
+    if (boom){ explode(s.m.position); s.life = 0; }
+    if (s.life <= 0) s.m.visible = false;
+  }
+  for (const f of flashes){
+    if (f.t <= 0) continue;
+    f.t -= dt; const a = clamp(f.t / 0.4, 0, 1);
+    f.f.scale.setScalar(f.r * (1 + (1 - a) * 2.2)); f.f.material.opacity = a;
+    if (f.t <= 0) f.f.visible = false;
+  }
+}
+// fire one shooter: aim ray (o,d), drawn from `from`. returns true if it melted rock
+function fire(o, d, from, beam, dt){
+  beam.cool = Math.max(0, (beam.cool || 0) - dt);
+  if (S.charge <= 0.01){                                 // empty: no beam, a dry click, the gauge blinks red
+    placeBeam(beam, from, from, false);
+    if (beam.cool <= 0){ beam.cool = 0.35; tone(1800, 0.03, 'square', 0.05); }
+    return false;
+  }
+  if (powOn('burst')){
+    placeBeam(beam, from, from, false);
+    if (beam.cool <= 0){ beam.cool = powOn('fast') ? 0.22 : 0.5; S.charge = Math.max(0, S.charge - 0.07); shoot(from, d); }
+    return false;
+  }
+  const hit = rayHit(o, d, 26, _hit);
+  const end = hit ? hit : _p.copy(o).addScaledVector(d, 26);
+  placeBeam(beam, from, end, true);
+  S.charge = Math.max(0, S.charge - dt * (powOn('fast') ? 0.035 : 0.06));
+  if (!hit) return false;
+  hotStamp = true;
+  const n = stamp(hit.x, hit.y, hit.z, powOn('wide') ? 0.95 : 0.5, Math.min(1, (powOn('fast') ? 8 : 2.7) * dt), false);
+  hotStamp = false;
+  sdf(hit.x, hit.y, hit.z, _n);
+  if (Math.random() < 0.8) spawnSparks(hit, _n, powOn('wide') ? 3 : 2);
+  nearRuby(hit);                                          // melting near your ruby wakes a Black defender
   return n > 0;
 }
 
@@ -872,7 +959,8 @@ function updateBots(dt){
     if (b.mode === 'dig'){
       _d.copy(b.target).sub(b.pos); const L = _d.length();
       if (L < 0.02) pickNext(b); else b.pos.addScaledVector(_d, Math.min(1, speed * dt / L));
-      stamp(b.pos.x, b.pos.y, b.pos.z, 0.55, Math.min(1, 3.2 * dt), true, inBody);
+      b.acc = (b.acc || 0) + dt;
+      if (b.acc >= 0.12){ stamp(b.pos.x, b.pos.y, b.pos.z, 0.55, Math.min(1, 3.2 * b.acc), true, inBody); b.acc = 0; }
       // you melted the rock around them: in Black's world their tunnel filled in
       if (sampleV(b.pos) < 0.35){ b.bt += dt; if (b.bt > 0.4){ bury(b); } } else b.bt = 0;
     } else if (b.mode === 'walk'){
@@ -888,7 +976,8 @@ function updateBots(dt){
         if (b.threat){ b.mode = 'walk'; continue; }
         spawnBot(b); continue;
       }
-      stamp(b.threat.x, b.threat.y, b.threat.z, 0.6, Math.min(1, 1.05 * dt), true, inBody);
+      b.acc = (b.acc || 0) + dt;
+      if (b.acc >= 0.12){ stamp(b.threat.x, b.threat.y, b.threat.z, 0.6, Math.min(1, 1.05 * b.acc), true, inBody); b.acc = 0; }
     }
   }
 }
@@ -1020,7 +1109,11 @@ function updateOrbs(dt, now){
     if (inXR()) for (const h of hands) if (h.src && handPos(h, _hp).distanceTo(o.g.position) < 0.3) got = true;
     if (got){
       o.g.visible = false; o.wait = 25;
-      if (o.kind === 'charge'){ S.charge = 1; S.over = 10; [660, 880, 1320].forEach((f, i) => tone(f, 0.18, 'triangle', 0.13, 0, i * 0.06)); }
+      if (o.kind !== 'compass'){
+        S.charge = 1; S.pow[o.kind] = 15;
+        const notes = { wide: [440, 554, 659], fast: [660, 880, 1320], burst: [196, 262, 392] }[o.kind];
+        notes.forEach((f, i) => tone(f, 0.18, o.kind === 'burst' ? 'sawtooth' : 'triangle', 0.12, 0, i * 0.06));
+      }
       else { S.compass = 20; [523, 784, 1046].forEach((f, i) => tone(f, 0.25, 'sine', 0.14, 0, i * 0.08)); }
       for (const h of hands) buzz(h, 0.7, 90);
     }
@@ -1096,7 +1189,7 @@ function xrFrame(dt){
       if (fire(_o, _d, tip, h.beam, dt)) melting = true;
       if (Math.random() < 0.25) buzz(h, 0.12, 16);
       if (introPending === 0 && panel.m.visible && panelT > 0) panelT = Math.min(panelT, 0.6);
-    } else placeBeam(h.beam, _o, _o, false);
+    } else { placeBeam(h.beam, _o, _o, false); h.beam.cool = Math.max(0, (h.beam.cool || 0) - dt); }
     h.mitt.material.color.setHex(h.anchor ? 0xf5c518 : 0xe6e9ec);
     h.mitt.scale.setScalar(pressed(h, 1) ? 0.85 : 1);
     updateGun(h.gun, performance.now());
@@ -1104,7 +1197,7 @@ function xrFrame(dt){
   laserSound(firing, melting);
 }
 const _rc = new THREE.Color(), _dim = new THREE.Color(0x3a3d44), _hotC = new THREE.Color(0xff3d6e), _goldC = new THREE.Color(0xf5c518);
-function ringColor(){ return S.over > 0 ? _rc.copy(_goldC) : _rc.copy(_dim).lerp(_hotC, S.charge); }
+function ringColor(){ const pc = powColor(); return pc ? _rc.setHex(pc) : _rc.copy(_dim).lerp(_hotC, S.charge); }
 
 function deskFrame(dt){
   camera.position.set(0, 1.6, 0);
@@ -1150,29 +1243,29 @@ renderer.setAnimationLoop(() => {
   if (S.mode === 'ready' && !inXR()) { S.t += dt; attractFrame(dt); updateRubies(dt, now); updateOrbs(dt, now); }
   else {
     if (S.mode === 'play') S.t += dt;
-    S.over = Math.max(0, S.over - dt);
+    for (const k in S.pow) S.pow[k] = Math.max(0, S.pow[k] - dt);
     const firing = inXR() ? hands.some(h => h.src?.gamepad?.buttons?.[0]?.value > 0.5) : desk.mouse;
-    if (!firing || S.mode !== 'play') S.charge = Math.min(1, S.charge + dt * 0.07);
+    if (!firing || S.mode !== 'play') S.charge = Math.min(1, S.charge + dt * 0.14);
     if (inXR()) xrFrame(dt); else deskFrame(dt);
     if (S.mode === 'play') updateBots(dt);
     updateRubies(dt, now);
     updateOrbs(dt, now);
     updateCompass(dt, now);
     if (introPending > 0 && --introPending === 0)
-      showPanel('Negative Space', ['Melt down to your ruby, buried below you.', '!Guard the red ruby floating in your sky.', 'Grip rock to climb. Let go mid-pull to fling.', 'Gold orbs: laser boost. Ringed orbs: compass.'], false, 14);
+      showPanel('Negative Space', ['Melt down to your ruby, buried below you.', '!Guard the red ruby floating in your sky.', 'Grip rock to climb. Let go mid-pull to fling.', 'Orbs: gold wide, blue fast, orange burst.', 'White orbs with a red ring give a compass.'], false, 14);
     if (panelT > 0){ panelT -= dt; if (panelT <= 0) panel.m.visible = false; }
   }
   for (const b of bots){
     b.ghost.visible = S.ghosts && S.mode !== 'ready';
     if (b.ghost.visible){ b.ghost.position.copy(b.mode === 'fill' && b.threat ? b.threat : b.pos); b.ghost.userData.line.color.setHex(b.mode === 'dig' ? 0xe6e9ec : 0xe0103a); }
   }
-  updateSparks(dt); updatePuffs(dt);
-  flushDirty(inXR() ? 4 : 8);
+  updateSparks(dt); updatePuffs(dt); updateShots(dt);
+  flushDirty(inXR() ? 5 : 8);
   renderer.render(scene, camera);
 });
 
 // for quick testing from the console
-window.NS = { dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
+window.NS = { explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
 </script>
 <script src="../updated.js"></script>
 </body>
