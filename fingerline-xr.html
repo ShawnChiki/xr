@@ -321,7 +321,7 @@ function judge(r){
 const V3 = THREE.Vector3;
 const UPW = new V3(0, 1, 0), G3 = new V3(0, -G, 0);
 const RIBBON_W = 56, LINK = 4;
-const W3 = { emptyY: 0, strokes: new Map(), grid: new Map(), nextId: 1, segId: 1, floorY: -400, stamp: 0, minY: 0 };
+const W3 = { emptyY: 0, coins: [], strokes: new Map(), grid: new Map(), nextId: 1, segId: 1, floorY: -400, stamp: 0, minY: 0 };
 const isRibbon = t => t === 'ground' || t === 'boost';
 // rail kinds: how high the board sits, how much they drag, how far to the side they still catch a rider
 const RAILK = { round: { h: 2.6, fr: 1, lat: 11 }, square: { h: 3.2, fr: 0.85, lat: 12 }, ledge: { h: 0.8, fr: 0.72, lat: 15 }, coping: { h: 3.4, fr: 1.3, lat: 11 } };
@@ -411,16 +411,28 @@ function easeTwist(pts, ups, W){
   }
   if (changed) for (let i = 1; i < n - 1; i++) ups[i].copy(ref[i]).applyAxisAngle(T[i], roll[i]).normalize();
 }
-function addStroke(t, pts, ups, id, W){
+function addStroke(t, pts, ups, id, W, k){
   if (isRibbon(t)) easeTwist(pts, ups, W || RIBBON_W);
-  const st = { id: id || W3.nextId++, t, pts, ups, W: W || RIBBON_W, segs: [], link: [null, null] };
+  const st = { id: id || W3.nextId++, t, k, pts, ups, W: W || RIBBON_W, segs: [], link: [null, null] };
   if (st.id >= W3.nextId) W3.nextId = st.id + 1;
   buildSegs(st); if (!st.segs.length) return null;
-  W3.strokes.set(st.id, st); gridAdd(st); relink(); return st;
+  W3.strokes.set(st.id, st); gridAdd(st); if (t === 'rail' && k === 'ledge') ledgeSolids(st); relink(); return st;
 }
-function removeStroke(id){ const st = W3.strokes.get(id); if (!st) return null; gridRemove(st); W3.strokes.delete(id); relink(); return st; }
-function clearWorld3(){ W3.strokes.clear(); W3.grid.clear(); relink(); }
+function removeStroke(id){ const st = W3.strokes.get(id); if (!st) return null; gridRemove(st); if (st.solids){ for (const x of st.solids) gridRemove(x); st.solids = null; } W3.strokes.delete(id); relink(); return st; }
+function clearWorld3(){ for (const st of W3.strokes.values()) st.solids = null; W3.strokes.clear(); W3.grid.clear(); relink(); }
 // ends that touch are joined, so riders roll from one stroke onto the next
+// a ledge is a solid block: its top is a little road and its sides are walls (hidden ribbons, physics only)
+function ledgeSolids(st){
+  const n = st.pts.length, T = [], up = [], side = [];
+  for (let i = 0; i < n; i++){
+    const t = new V3().subVectors(st.pts[Math.min(n - 1, i + 1)], st.pts[Math.max(0, i - 1)]).normalize();
+    const u = UPW.clone().addScaledVector(t, -t.y); if (u.lengthSq() < 1e-4) u.set(1, 0, 0); u.normalize();
+    T.push(t); up.push(u); side.push(new V3().crossVectors(t, u).normalize());
+  }
+  const mk = (pts, ups, W) => { const g = { id: st.id + 0.5, t: 'ground', pts, ups, W, segs: [], link: [null, null], solidOf: st }; buildSegs(g); gridAdd(g); return g; };
+  st.solids = [mk(st.pts.map(p => p.clone()), up.map(u => u.clone()), 26)];
+  for (const sg of [1, -1]) st.solids.push(mk(st.pts.map((p, i) => p.clone().addScaledVector(side[i], 13 * sg).addScaledVector(up[i], -10)), side.map(v => v.clone().multiplyScalar(sg)), 20));
+}
 function relink(){
   const ends = [];
   let minY = 1e9;
@@ -518,7 +530,7 @@ function makeRider3(genome, meta, fl){
     baseUp: UPW.clone(), up: UPW.clone(), nose: dir.clone(), target: UPW.clone(),
     airT: 0, trick: null, ph: ZERO, popped: false, skipSeg: null, skipT: 0, pred: null, predTimer: 0, fakieAtTakeoff: false,
     grind: null, manual: null, crouch: 0, lookT: 0, railT: 0, railMemo: new Map(), reacted: new Set(), kappa: 0, since: 0,
-    score: 0, parts: { tricks: 0, air: 0, grinds: 0, manuals: 0, distance: 0, variety: 0 }, counts: {}, best: null, landed: 0,
+    score: 0, parts: { tricks: 0, air: 0, grinds: 0, manuals: 0, distance: 0, variety: 0, coins: 0 }, got: new Set(), counts: {}, best: null, landed: 0,
     dist: 0, time: 0, stall: 0, done: false, endReason: '', bail: null, cells: new Set(), lastNew: 0, want: { rail: true } };
   r.seeds = (meta.seeds || []).slice(); r._ep = -1; r._ctr = 0; r.muts = meta.muts ?? null;
   ACT = r; decideGrind3(r);
@@ -564,7 +576,7 @@ function takeoff3(r, kind, popF, railSeg){
   if (r.aimAng){ vel.applyAxisAngle(n, r.aimAng); r.aimAng = 0; }
   let popped = kind === 'rail' ? popF > 0 : ['hop', 'ollie', 'obstacle'].includes(kind);
   let planF = null;
-  if (kind === 'end' && r.forceJump){ planF = r.forceJump.pop; if (r.forceJump.ang) vel.applyAxisAngle(n, r.forceJump.ang); popped = planF > 0; }
+  if (r.forceJump && (kind === 'end' || kind === 'ollie')){ planF = r.forceJump.pop; if (r.forceJump.ang) vel.applyAxisAngle(n, r.forceJump.ang); popped = planF > 0; }
   else if (kind === 'lip' || kind === 'end') popped = wantPop3(r);
   r.forceJump = null; r.flat = null; r.endPlan = null;
   if (popped){ const f = planF != null ? planF : kind === 'hop' ? 0.55 : kind === 'rail' ? popF : kind === 'lip' || kind === 'end' ? 0.8 : 1; vel.addScaledVector(n, (260 + 230 * g.pop) * f); }
@@ -587,11 +599,12 @@ function evalJump3(r, popF){
 function judgeJump3(r, pos, n, vel, skip, spd){
   const g = r.g, p = predict3(pos.clone().addScaledVector(n, 0.6), vel, skip, 0.07, r);
   if (!p || p.floor) return { ok: false, score: -9, ret: 0, T: 0 };
+  const coinB = W3.coins.length ? coinsAlong3(r, p.pts) * (0.8 + 1.2 * visOf(g)) : 0;
   const vn = Math.abs(p.vel.dot(p.n)), tang = Math.sqrt(Math.max(0, p.vel.lengthSq() - vn * vn));
   const vroll = Math.max(60, Math.sqrt(Math.max(0, spd * spd + 2 * G * (pos.y - p.pos.y))));
   const ret = Math.min(1.3, tang / vroll), need = angleBetween(n, p.n), tol = 0.26 + 0.30 * g.balance;
   const ok = (p.rail || p.n.y > 0.15) && vn < (950 + 650 * g.balance) * 0.85 && need < tol + airRate(g) * p.T * 0.8;
-  return { ok, ret, T: p.T, score: (ok ? 0 : -5) + ret + g.ambition * Math.min(p.T, 1.4) * 0.45 };
+  return { ok, ret, T: p.T, score: (ok ? 0 : -5) + ret + g.ambition * Math.min(p.T, 1.4) * 0.45 + coinB };
 }
 function wantOllie3(r){ if (rr() > 0.2 + 0.8 * visOf(r.g)) return true; const e = evalJump3(r, 1); return e.ok && e.ret > 0.9; }
 function wantPop3(r){
@@ -634,6 +647,7 @@ function stepRider3(r, dt){
   if (r.mode === 'bail'){ r.bail.t += dt; bodyStep3(r.bail.hand, dt); bodyStep3(r.bail.board, dt); r.pos.copy(r.bail.hand.p); if (r.bail.t > 2.2) finish(r, r.bail.reason); return; }
   if (r.mode === 'air') airStep3(r, dt); else if (r.mode === 'grind') grindStep3(r, dt); else groundStep3(r, dt);
   if (r.done || r.mode === 'bail') return;
+  if (W3.coins.length) grabCoins3(r);
   // keep the nose pointing along the way it's rolling (riding backwards = fakie)
   if (r.mode !== 'air'){ const m = motionDir(r); if (m.lengthSq() > 4){ m.normalize(); if (m.dot(r.nose) < 0) m.negate(); r.nose.lerp(m, 0.35).normalize(); } }
   // stuck checks
@@ -718,7 +732,9 @@ function groundStep3(r, dt){
   // sideways: banks pull riders down-slope, turns throw them outward; the wheels grip up to a limit
   // set by how hard they press into the surface, and good balance keeps them near the middle
   const press = Math.max(0, G * n.y + r.u * r.u * r.kappa), a = gb - r.u * r.u * sg.kg;
-  const want = -r.w * (6 + 10 * g.balance) - r.v * 4, grip = (0.9 + 0.5 * g.balance) * press;
+  let tw = 0; const CA = r.coinAim;
+  if (CA && !r.got.has(CA.c.id)) tw = clamp(r.w + new V3().subVectors(CA.c.p, r.pos).dot(sg.bn), -sg.W / 2 + 6, sg.W / 2 - 6);
+  const want = -(r.w - tw) * (6 + 10 * g.balance) - r.v * 4, grip = (0.9 + 0.5 * g.balance) * press;
   r.v += (a + clamp(want - a, -grip, grip)) * dt;
   r.s += r.u * dt; r.w += r.v * dt;
   if (Math.abs(r.w) > sg.W / 2){ placeOn(r); emit(r, { type: 'air', text: 'Rolled off the edge' }); return takeoff3(r, 'edge'); }
@@ -791,7 +807,14 @@ function groundStep3(r, dt){
     if (rr() < 0.25 + 0.6 * g.lip) return startLip(r, LIPS);
   }
   // read the road ahead: where it ends, where it hits a wall
-  r.senseT = (r.senseT || 0) - dt; if (r.senseT <= 0){ r.senseT = 0.1; senseAhead3(r); }
+  r.senseT = (r.senseT || 0) - dt; if (r.senseT <= 0){ r.senseT = 0.1; senseAhead3(r); coinAim3(r); }
+  // a coin hanging above the road ahead: ollie just high enough, just in time
+  { const A = r.coinAim;
+    if (A && A.h > 16 && !r.manual && !r.lip && !r.got.has(A.c.id) && !r.reacted.has('coin' + A.c.id) && Math.abs(r.u) > 60){
+      const popV = 260 + 230 * g.pop, need = Math.sqrt(2 * G * Math.max(0, A.h - 8)), f = clamp(need / popV, 0.3, 1.15), tA = f * popV / G;
+      const along = new V3().subVectors(A.c.p, r.pos).dot(motionDir(r).normalize());
+      if (along <= Math.abs(r.u) * tA + 4){ r.reacted.add('coin' + A.c.id); if (f * popV >= need * 0.9){ r.forceJump = { pop: f, ang: 0 }; return takeoff3(r, 'ollie'); } }
+    } }
   const ev = r.sense;
   if (ev && Math.abs(r.u) > 40){
     const tE = ev.d / Math.abs(r.u);
@@ -959,6 +982,46 @@ function collide3(list){
 }
 collide3.seen = new Set();
 
+// ---------- coins: the main thing riders hunt for ----------
+const COIN_R = 26, COIN_PTS = 250;
+function grabCoins3(r){
+  const c0 = r.pos.clone().addScaledVector(r.up, 14);
+  for (const c of W3.coins){
+    if (r.got.has(c.id) || c0.distanceToSquared(c.p) > COIN_R * COIN_R) continue;
+    r.got.add(c.id); r.parts.coins = (r.parts.coins || 0) + COIN_PTS; refreshScore(r);
+    emit(r, { type: 'coin', coin: c, pts: Math.round(COIN_PTS * RW.coins), all: W3.coins.length > 1 && W3.coins.every(k => r.got.has(k.id)) });
+  }
+}
+// the nearest coin up the road that this rider could reach by steering or an ollie
+function coinAim3(r){
+  r.coinAim = null; const g = r.g;
+  if (r.coinSense === undefined) r.coinSense = rr() < 0.35 + 0.65 * visOf(g);
+  const sp = Math.abs(r.u); if (!r.coinSense || sp < 30 || !W3.coins.length) return;
+  const d = motionDir(r).normalize(), n = surfNormal(r), reach = 60 + sp * (0.6 + 1.2 * visOf(g)), e = new V3();
+  let best = null;
+  for (const c of W3.coins){
+    if (r.got.has(c.id)) continue;
+    e.subVectors(c.p, r.pos); const along = e.dot(d); if (along < 10 || along > reach) continue;
+    const h = e.dot(n); if (h < -20 || h > 150) continue;
+    if (Math.abs(r.w + e.dot(r.seg.bn)) > r.seg.W / 2 + 10) continue;
+    if (!best || along < best.along) best = { c, along, h };
+  }
+  r.coinAim = best;
+}
+// how many coins a predicted flight passes through
+function coinsAlong3(r, pts){
+  let k = 0; const ab = new V3(), ap = new V3();
+  for (const c of W3.coins){
+    if (r.got.has(c.id)) continue;
+    for (let i = 1; i < pts.length; i++){
+      const a = pts[i - 1]; ab.subVectors(pts[i], a); ap.subVectors(c.p, a);
+      const t = clamp(ap.dot(ab) / Math.max(1e-6, ab.lengthSq()), 0, 1);
+      if (ap.addScaledVector(ab, -t).lengthSq() < (COIN_R + 4) * (COIN_R + 4)){ k++; break; }
+    }
+  }
+  return k;
+}
+
 // ======================================================================
 // XR APP. The park group "dio" carries the park's placement in the room:
 // position, yaw, and a uniform scale in metres per park unit.
@@ -968,7 +1031,7 @@ const S = { width: 56, batch: 3, cap: 10, limit: 60, fric: 60, smoothLv: 1, spee
 // park sizes: metres per park unit. A board is 40 units long.
 const SCALES = { finger: { name: 'Fingerboard', s: 0.0024, board: '10 cm' }, mini: { name: 'Mini', s: 0.0075, board: '30 cm' }, skate: { name: 'Skateboard', s: 0.02, board: '80 cm' } };
 // rewards: tricks first by default
-Object.assign(RW, { tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 });
+Object.assign(RW, { coins: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 });
 const TILTS = { auto: 'Bank: auto', hand: 'Bank: hand', flat: 'Bank: flat' };
 const TILT_HINT = { auto: 'Turns bank themselves for the speed riders will have', hand: 'Twist your wrist to bank ramps', flat: 'Ramps stay level side to side' };
 const SPEEDS = [0.5, 1, 2, 4];
@@ -978,13 +1041,14 @@ const TYPE_NAME = { ground: 'Ground', rail: 'Rail', boost: 'Boost', scenery: 'Sc
 const RAIL_KINDS = { round: 'Round', square: 'Square', ledge: 'Ledge', coping: 'Coping' };
 const RAIL_HELP = { round: 'a ringing steel tube', square: 'flat-topped, slides fast', ledge: 'a waxed concrete block', coping: 'diamond ribs that chatter' };
 const TYPE_COL = { ground: 0x2a2d33, rail: 0x3F6FC2, boost: 0xE2474C, scenery: 0x2F9B5A };
-const TOOL_NAME = { pen: 'Freehand', curve: 'Curve points', poly: 'Sharp points', edit: 'Edit points', eraser: 'Eraser', flag: 'Start flag' };
+const TOOL_NAME = { pen: 'Freehand', curve: 'Curve points', poly: 'Sharp points', edit: 'Edit points', eraser: 'Eraser', flag: 'Start flag', coin: 'Coins' };
 const TOOL_HELP = {
   pen: 'Hold the trigger and draw. The ribbon lies the way you hold the controller.',
   curve: 'Click to place points; the road curves smoothly through them. Click the last point again or click the right stick to finish. B/Y takes back a point.',
   poly: 'Click to place points; straight runs with hard corners. Click the last point again or click the right stick to finish. B/Y takes back a point.',
-  edit: 'Pull a dot to move it (twist to tilt). Grab the road between dots to add one. B/Y on a dot deletes it. Right stick click: smooth or sharp.',
-  eraser: 'Touch a ribbon or rail with the tip to erase it.',
+  edit: 'Pull a dot to move it (twist to tilt). Grab the road between dots to add one. B/Y on a dot deletes it. Right stick click: smooth or sharp. Stick up/down near a ribbon: wider or narrower.',
+  eraser: 'Touch a path with the tip to cut that piece away; sweep along it to erase more. Touching a coin removes it.',
+  coin: 'Click to place a coin where riders should go; on a road it floats just above it. Click a coin to remove it. Riders earn the most for grabbing coins.',
   flag: 'Click where riders start, pointing the way they should head.' };
 let ltype = 'ground', tool = 'pen', paused = false, autoEvolve = true, following = false;
 let riders = [], queue = 0, spawnT = 0, autoT = 0, acc = 0, undoStack = [];
@@ -1000,15 +1064,16 @@ const r1 = v => Math.round(v * 10) / 10, r3 = v => Math.round(v * 1000) / 1000;
 const ser = () => [...W3.strokes.values()].map(st => ({ id: st.id, t: st.t, w: st.W, m: st.mode || 'free', ...(st.k ? { k: st.k } : {}), ...(st.ctrl ? { c: st.ctrl.flatMap(p => [r1(p.x), r1(p.y), r1(p.z)]), cu: st.cups.flatMap(u => [r3(u.x), r3(u.y), r3(u.z)]) } : {}), p: st.pts.flatMap(p => [r1(p.x), r1(p.y), r1(p.z)]), u: st.ups.flatMap(u => [r3(u.x), r3(u.y), r3(u.z)]) }));
 const unflat = a => { const o = []; for (let i = 0; i < a.length; i += 3) o.push(new V3(a[i], a[i + 1], a[i + 2])); return o; };
 let saveT = 0;
-function save(){ clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify({ strokes: ser(), flag: flag3, pool: Pool.list, born: Pool.born, name: mapName, best: bestTrail, auto: autoEvolve, bestDist, seen: [...seenTricks], S: { ...S, w: { ...RW } } })); } catch (e) {} }, 400); }
+function save(){ clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify({ strokes: ser(), coins: W3.coins.map(c => [r1(c.p.x), r1(c.p.y), r1(c.p.z)]), flag: flag3, pool: Pool.list, born: Pool.born, name: mapName, best: bestTrail, auto: autoEvolve, bestDist, seen: [...seenTricks], S: { ...S, w: { ...RW } } })); } catch (e) {} }, 400); }
 let bootExtra = null;
 function boot(){
   let d = null, old = false;
   try { d = JSON.parse(localStorage.getItem(KEY) || 'null'); if (!d){ d = JSON.parse(localStorage.getItem('fingerline-xr.v3') || 'null'); old = !!d; } } catch (e) {}
   clearWorld3();
   if (d){
-    for (const s of d.strokes || []){ const st = addStroke(s.t, unflat(s.p), unflat(s.u), s.id, s.w); if (st){ st.mode = s.m || 'free'; if (s.k) st.k = s.k; if (s.c){ st.ctrl = unflat(s.c); st.cups = unflat(s.cu); } } }
+    for (const s of d.strokes || []){ const st = addStroke(s.t, unflat(s.p), unflat(s.u), s.id, s.w, s.k); if (st){ st.mode = s.m || 'free'; if (s.k) st.k = s.k; if (s.c){ st.ctrl = unflat(s.c); st.cups = unflat(s.cu); } } }
     bootExtra = { bestDist: d.bestDist || 0, seen: d.seen || [] };
+    W3.coins = (d.coins || []).map((a, i) => ({ id: i + 1, p: new V3(a[0], a[1], a[2]) })); W3.coinId = W3.coins.length + 1;
     flag3 = d.flag || flag3; Pool.list = d.pool || []; Pool.born = d.born || 0; bestTrail = d.best || null;
     if (d.S){ const { w, ...rest } = d.S; Object.assign(S, rest); if (w) Object.assign(RW, w); }
     if (old) S.scale = 'finger';                    // parks from the earlier version were drawn at fingerboard size
@@ -1069,17 +1134,18 @@ const M = {
     g.fillStyle = '#9AA1AA'; g.fillRect(0, 0, w, h); g.lineWidth = 5;
     for (const [c, o] of [['#6C737C', 0], ['#C4CAD2', 3]]){ g.strokeStyle = c; g.beginPath(); for (let k = -64; k <= 128; k += 16){ g.moveTo(k + o, 0); g.lineTo(k + 64 + o, 64); g.moveTo(k + o, 64); g.lineTo(k + 64 + o, 0); } g.stroke(); } });
     t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(1, 3); return t; })() }),
+  dash: mat(0xF6F5EF, { roughness: 0.6, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }),
   earth: new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1, side: THREE.DoubleSide }),
 };
 const yCyl = new THREE.CylinderGeometry(1, 1, 1, 8, 1), sphGeo = new THREE.SphereGeometry(1, 12, 8);
 const parkGroup = new THREE.Group(); track.add(parkGroup);
 let pickables = [], trackDirty = true;
-const THICK = 6;
+const THICK = 6, WMIN = 14, WMAX = 480;
 function rebuildTrack(){
   trackDirty = false;
   for (const c of [...parkGroup.children]){ parkGroup.remove(c); if (c.geometry) c.geometry.dispose(); }
   pickables = buildInto(parkGroup, W3.strokes.values());
-  placeFlag();
+  placeFlag(); syncCoins();
 }
 // a frame along a rail path: tangent, upright-ish up, and side
 function railFrames(pts){
@@ -1118,7 +1184,7 @@ function earthInto(st, pos, col){
     // taper to nothing at loose ends, stay full where the ribbon joins another
     const e0 = st.link && st.link[0] ? 1 : clamp(s / (1.1 * W), 0, 1), e1 = st.link && st.link[1] ? 1 : clamp((total - s) / (1.1 * W), 0, 1);
     const nz = 0.75 + 0.3 * Math.sin(s / 53 + ph[0]) + 0.18 * Math.sin(s / 21 + ph[1]) + 0.1 * Math.sin(s / 8.5 + ph[2]);
-    const D = W * (0.55 + 0.95 * nz) * Math.sqrt(Math.min(e0, e1)) * clamp((n.y + 0.5) / 1.0, 0.12, 1);
+    const D = Math.min(W, 130) * (0.55 + 0.95 * nz) * Math.sqrt(Math.min(e0, e1)) * clamp((n.y + 0.5) / 1.0, 0.12, 1);
     const dir = n.clone().multiplyScalar(-0.5).add(down).normalize(), ring = [];
     for (let k = 0; k < PROF.length; k++){
       const [f, prof] = PROF[k], j = (h(i * 0.37, k) - 0.5) * 0.17 * prof;
@@ -1135,7 +1201,7 @@ function earthInto(st, pos, col){
 }
 // ribbon, rail and scenery meshes for a set of strokes, added to a group
 function buildInto(group, strokes){
-  const top = [], topCol = [], topN = [], boost = [], boostN = [], side = [], rails = [], scen = [], posts = [], squares = [], ledges = [], edges = [], copings = [], earthP = [], earthC = [];
+  const dash = [], dashN = [], top = [], topCol = [], topN = [], boost = [], boostN = [], side = [], rails = [], scen = [], posts = [], squares = [], ledges = [], edges = [], copings = [], earthP = [], earthC = [];
   const cGround = new THREE.Color(TYPE_COL.ground);
   const P = (arr, ...vs) => { for (const v of vs) arr.push(v.x, v.y, v.z); };
   for (const st of strokes){
@@ -1159,6 +1225,18 @@ function buildInto(group, strokes){
         P(side, Lb[i], Rb[i], Lb[i + 1], Rb[i], Rb[i + 1], Lb[i + 1]);
       }
       for (const i of [0, N - 1]) P(side, L[i], Rt[i], Lb[i], Rt[i], Rb[i], Lb[i]);
+      // centre line: 12 on, 10 off, just above the surface
+      if (st.W >= 30){ let acc = 0; const per = 22, on = 12, hw = 0.9, C = i => L[i].clone().add(Rt[i]).multiplyScalar(0.5).addScaledVector(NN[i], 0.35);
+        for (let i = 0; i < N - 1; i++){
+          const a = C(i), b = C(i + 1), len = a.distanceTo(b), bnA = Rt[i].clone().sub(L[i]).normalize(), bnB = Rt[i + 1].clone().sub(L[i + 1]).normalize(); let t = 0;
+          while (t < len - 1e-6){
+            const ph = (acc + t) % per;
+            if (ph < on){ const e = Math.min(len, t + on - ph), u0 = t / len, u1 = e / len, p0 = a.clone().lerp(b, u0), p1 = a.clone().lerp(b, u1), s0 = bnA.clone().lerp(bnB, u0).multiplyScalar(hw), s1 = bnA.clone().lerp(bnB, u1).multiplyScalar(hw);
+              P(dash, p0.clone().sub(s0), p0.clone().add(s0), p1.clone().sub(s1), p0.clone().add(s0), p1.clone().add(s1), p1.clone().sub(s1)); P(dashN, NN[i], NN[i], NN[i + 1], NN[i], NN[i + 1], NN[i + 1]); t = e; }
+            else t += per - ph;
+          }
+          acc += len;
+        } }
       if (S.earth) earthInto(st, earthP, earthC);
     } else if (st.t === 'rail' && (st.k === 'square' || st.k === 'ledge')){
       if (st.k === 'square') squares.push(sweepBox(st.pts, 2.6, 2.6, -2.6));
@@ -1182,7 +1260,7 @@ function buildInto(group, strokes){
   if (ledges.length) group.add(new THREE.Mesh(mergeGeometries(ledges), M.ledge));
   if (edges.length) group.add(new THREE.Mesh(mergeGeometries(edges), M.edge));
   if (copings.length) group.add(new THREE.Mesh(mergeGeometries(copings), M.coping));
-  mk(earthP, M.earth, earthC);
+  mk(earthP, M.earth, earthC); mk(dash, M.dash, null, dashN);
   if (scen.length) group.add(new THREE.Mesh(mergeGeometries(scen), M.scen));
   return [tm, bm].filter(Boolean);
 }
@@ -1201,6 +1279,24 @@ const flagObj = new THREE.Group(); track.add(flagObj);
   const cloth = new THREE.Mesh(new THREE.ShapeGeometry(sh), yel); cloth.position.y = 40; flagObj.add(cloth);
   const arrow = new THREE.Mesh(new THREE.ConeGeometry(5, 16, 12), yel); arrow.rotation.z = -Math.PI / 2; arrow.position.set(22, 0, 0); flagObj.add(arrow);
   const halo = new THREE.Mesh(new THREE.SphereGeometry(18, 16, 12), new THREE.MeshBasicMaterial({ color: 0xFFC83D, transparent: true, opacity: 0.2, depthWrite: false })); halo.position.y = 20; flagObj.add(halo); }
+// coins: gold discs that spin in place
+const coinGroup = new THREE.Group(); track.add(coinGroup);
+const coinGeo = (() => { const g = new THREE.CylinderGeometry(10, 10, 2.6, 32); g.rotateX(Math.PI / 2); return g; })();
+const coinMat = mat(0xFFC83D, { metalness: 0.6, roughness: 0.25, emissive: 0x8A5A00, emissiveIntensity: 0.9 });
+const coinRim = (() => { const g = new THREE.TorusGeometry(10, 1.1, 8, 32); return g; })();
+function syncCoins(){
+  while (coinGroup.children.length > W3.coins.length){ const m = coinGroup.children.pop(); coinGroup.remove(m); }
+  while (coinGroup.children.length < W3.coins.length){ const m = new THREE.Mesh(coinGeo, coinMat); m.add(new THREE.Mesh(coinRim, coinMat)); coinGroup.add(m); }
+  W3.coins.forEach((c, i) => { const m = coinGroup.children[i]; m.position.copy(c.p); m.userData.c = c; });
+}
+function placeCoin(p){
+  // touching a road puts the coin just above it, where a rider rolling by would grab it
+  const q = p.clone(), h = sweep3(q.clone().add(new V3(0, 10, 0)), q.clone().add(new V3(0, -34, 0)));
+  if (h) q.copy(h.h).addScaledVector(facing(h.seg, q.clone().add(new V3(0, 10, 0))), 22);
+  const c = { id: W3.coinId = (W3.coinId || 1) + 1, p: q }; W3.coins.push(c); syncCoins(); save(); return c;
+}
+function removeCoin(c){ const i = W3.coins.indexOf(c); if (i >= 0) W3.coins.splice(i, 1); syncCoins(); save(); }
+function spinCoins(dt){ for (const m of coinGroup.children){ m.rotation.y += dt * 2.2; const c = m.userData.c; if (c && c.pulse > 0){ c.pulse = Math.max(0, c.pulse - dt * 2.5); m.scale.setScalar(1 + 0.6 * c.pulse); } else m.scale.setScalar(1); } }
 function placeFlag(){ flagObj.position.set(flag3.x, flag3.y - 20, flag3.z); flagObj.rotation.set(0, Math.atan2(-flag3.dz, flag3.dx), 0); }
 
 // ---------- riders in 3D ----------
@@ -1580,6 +1676,7 @@ const SFX = {
     else if (k === 'square'){ metal(ac, t, o, 0.14); nHit(ac, t, o, 'bandpass', 2400, 1.5, 0.05, 0.22); tHit(ac, t, o, 260, 160, 0.08, 0.16, 'triangle'); }
     else if (k === 'coping'){ metal(ac, t, o, 0.12); for (let i = 0; i < 4; i++) nHit(ac, t + i * 0.022, o, 'bandpass', 2800 - i * 300, 3, 0.02, 0.16 - i * 0.03); }
     else { metal(ac, t, o, 0.22); nHit(ac, t, o, 'highpass', 3500, 0.8, 0.06, 0.08); } }),
+  coin: p => oneShot(p, (ac, t, o) => { tHit(ac, t, o, 988, 988, 0.08, 0.1, 'square', 0.002); tHit(ac, t + 0.075, o, 1319, 1319, 0.34, 0.1, 'square', 0.002); }),
   // two riders running into each other: a cartoon bonk
   bonk: p => oneShot(p, (ac, t, o) => { tHit(ac, t, o, 880, 300, 0.16, 0.3, 'square', 0.002); tHit(ac, t + 0.02, o, 520, 1040, 0.35, 0.16, 'sine'); nHit(ac, t, o, 'lowpass', 300, 0.7, 0.18, 0.5); tHit(ac, t, o, 120, 50, 0.2, 0.35); }),
   bail: p => oneShot(p, (ac, t, o) => { for (let i = 0; i < 4; i++) nHit(ac, t + i * 0.075 + Math.random() * 0.04, o, 'bandpass', 900 + Math.random() * 1700, 2.5, 0.06, 0.3 - i * 0.05); tHit(ac, t, o, 170, 60, 0.2, 0.2, 'triangle'); }),
@@ -1641,6 +1738,12 @@ let bestDist = 0, seenTricks = new Set(), lastSting = 0;
 Sim.onEvent = (r, ev) => {
   const at = r.pos;
   if (ev.type === 'branch'){ if (following && followTarget() === r) callout(r, 'NEW MOVE', '', '#9A5CE0'); return; }
+  if (ev.type === 'coin'){
+    const c = ev.coin; c.pulse = 1; SFX.coin(c.p); burst(c.p.clone(), 22, ['#FFC83D', '#FFE08A', '#ffffff'], 200, 80, 0.7, 120);
+    if (ev.all){ callout(r, 'ALL COINS!', '+' + ev.pts, '#F2A900', true); if (clock - lastSting > 1.2){ lastSting = clock; stinger(RECORD_STINGS[2], 0.45); } }
+    else callout(r, 'COIN', '+' + ev.pts, '#F2A900');
+    return;
+  }
   if (ev.type === 'bump'){ SFX.bonk(at); callout(r, 'BONK!', '', '#FF7A00', true); burst(at.clone().addScaledVector(r.up, 26), 30, ['#FFC83D', '#ffffff', '#FF7A00'], 260, 120, 0.8, 300); return; }
   if (ev.type === 'land'){ if (ev.rail) SFX.rail(at, ev.k); else SFX.land(at, clamp(ev.hard || 0, 0, 1)); burst(at, ev.sketchy ? 10 : 5, '#8E97A3', 90, 40, 0.5); return; }
   if (ev.type === 'pop'){ SFX.pop(at); const tr = r.trick; if (tr && (tr.f || tr.s || tr.b || tr.inv)) SFX.flip(at); burst(at, 4, '#8E97A3', 50, 30, 0.35); return; }
@@ -1796,10 +1899,34 @@ function showPreview(id, pts){
 // ---------- stroke records (for undo, moving and editing) ----------
 const recOf = st => ({ id: st.id, t: st.t, k: st.k, pts: st.pts, ups: st.ups, W: st.W, mode: st.mode || 'free',
   ctrl: st.ctrl ? st.ctrl.map(v => v.clone()) : null, cups: st.cups ? st.cups.map(v => v.clone()) : null });
-function addRec(r, id){ const st = addStroke(r.t, r.pts, r.ups, id ?? r.id, r.W); if (st){ st.k = r.k || (st.t === 'rail' ? S.railKind : undefined); st.mode = r.mode || 'free'; st.ctrl = r.ctrl || null; st.cups = r.cups || null; } return st; }
-function eraseNear(p, pu, rec){
-  const st = strokeNear(p, Math.max(20 * pu, 10)); if (!st) return;
-  removeStroke(st.id); rec.push(recOf(st)); touchWorld();
+function addRec(r, id){ const st = addStroke(r.t, r.pts, r.ups, id ?? r.id, r.W, r.k || (r.t === 'rail' ? S.railKind : undefined)); if (st){ st.mode = r.mode || 'free'; st.ctrl = r.ctrl || null; st.cups = r.cups || null; } return st; }
+// the eraser cuts away only the piece of a path under the tip (and any coin it touches)
+function eraseNear(p, pu, d){
+  const R = Math.max(20 * pu, 10);
+  for (const c of [...W3.coins]) if (c.p.distanceTo(p) < R * 1.6){ removeCoin(c); d.coins.push(c); }
+  const st = strokeNear(p, R); if (!st) return;
+  const pts = st.pts, ups = st.ups, n = pts.length, Re = R + (isRibbon(st.t) ? st.W * 0.3 : 0);
+  const ins = pts.map(q => q.distanceTo(p) < Re);
+  if (!ins.some(Boolean)){ let bi = 0, bd = 1e9; pts.forEach((q, i) => { const dd = q.distanceTo(p); if (dd < bd){ bd = dd; bi = i; } }); ins[bi] = true; }
+  // where the path crosses the edge of the eraser, from a point outside (a) toward one inside (b)
+  const edge = (a, ua, b, ub) => { let lo = 0, hi = 1; for (let k = 0; k < 18; k++){ const m = (lo + hi) / 2; if (a.clone().lerp(b, m).distanceTo(p) < Re) hi = m; else lo = m; } return [a.clone().lerp(b, lo), ua.clone().lerp(ub, lo).normalize()]; };
+  const runs = []; let cur = null;
+  for (let i = 0; i < n; i++){
+    if (!ins[i]){
+      if (!cur){ cur = { pts: [], ups: [] }; if (i > 0){ const [q, u] = edge(pts[i], ups[i], pts[i - 1], ups[i - 1]); cur.pts.push(q); cur.ups.push(u); } }
+      cur.pts.push(pts[i].clone()); cur.ups.push(ups[i].clone());
+    } else if (cur){ const [q, u] = edge(pts[i - 1], ups[i - 1], pts[i], ups[i]); cur.pts.push(q); cur.ups.push(u); runs.push(cur); cur = null; }
+  }
+  if (cur) runs.push(cur);
+  removeStroke(st.id);
+  if (d.added.has(st.id)) d.added.delete(st.id); else d.rec.push(recOf(st));
+  for (const run of runs){
+    let len = 0; for (let i = 1; i < run.pts.length; i++) len += run.pts[i].distanceTo(run.pts[i - 1]);
+    if (run.pts.length < 2 || len < 16) continue;
+    const ns = addRec({ t: st.t, k: st.k, pts: run.pts, ups: run.ups, W: st.W, mode: st.mode === 'sharp' ? 'sharp' : 'free' });
+    if (ns) d.added.add(ns.id);
+  }
+  touchWorld();
 }
 
 // ---------- control points: every stroke can be reshaped by its points ----------
@@ -1955,7 +2082,13 @@ const isPointsTool = () => tool === 'curve' || tool === 'poly';
 
 // p: park-local point; up: park-local "up" of the hand; fwd: park-local pointing direction; pu: park units per millimetre-ish
 function toolStart(id, p, up, fwd, pu){
-  if (tool === 'eraser'){ const d = { kind: 'erase', rec: [], pu }; eraseNear(p, pu, d.rec); return d; }
+  if (tool === 'eraser'){ const d = { kind: 'erase', rec: [], added: new Set(), coins: [], pu }; eraseNear(p, pu, d); return d; }
+  if (tool === 'coin'){
+    const near = W3.coins.find(c => c.p.distanceTo(p) < Math.max(0.06 / sc(), 18));
+    if (near){ removeCoin(near); undoStack.push({ coinBack: [near] }); flash('Coin removed'); }
+    else { const c = placeCoin(p); undoStack.push({ coinAdd: c.id }); flash(W3.coins.length === 1 ? 'Riders go out of their way for coins' : W3.coins.length + ' coins'); }
+    return { kind: 'coin' };
+  }
   if (tool === 'flag'){
     const from = { ...flag3 }, h = new V3(fwd.x, 0, fwd.z); if (h.lengthSq() < 1e-4) h.set(1, 0, 0); h.normalize();
     flag3 = { x: p.x, y: p.y, z: p.z, dx: h.x, dz: h.z, placed: true, manual: true }; placeFlag();
@@ -1966,7 +2099,7 @@ function toolStart(id, p, up, fwd, pu){
 }
 function toolMove(id, d, p, up, fwd){
   if (d.kind === 'pen'){ if (p.distanceTo(d.raw[d.raw.length - 1]) >= 3 * d.pu){ d.raw.push(p.clone()); d.ups.push(up.clone()); showPreview(id, d.raw); } }
-  else if (d.kind === 'erase') eraseNear(p, d.pu, d.rec);
+  else if (d.kind === 'erase') eraseNear(p, d.pu, d);
   else if (d.kind === 'flag'){ const h = new V3(fwd.x, 0, fwd.z); if (h.lengthSq() > 1e-4){ h.normalize(); flag3 = { x: p.x, y: p.y, z: p.z, dx: h.x, dz: h.z, placed: true, manual: true }; placeFlag(); } }
 }
 function toolEnd(id, d){
@@ -1984,7 +2117,7 @@ function toolEnd(id, d){
       undoStack.push({ add: [st.id] }); touchWorld();
       if (isRibbon(st.t) && !flag3.manual && [...W3.strokes.values()].filter(x => isRibbon(x.t)).length === 1) flagOnTop(st);
     }
-  } else if (d.kind === 'erase'){ if (d.rec.length) undoStack.push({ remove: d.rec }); }
+  } else if (d.kind === 'erase'){ if (d.rec.length || d.added.size || d.coins.length) undoStack.push({ remove: d.rec, add: [...d.added], coinBack: d.coins }); }
   else if (d.kind === 'flag'){ undoStack.push({ flag: d.from }); save(); }
   else if (d.kind === 'edit') editEnd(d);
   if (undoStack.length > 200) undoStack.shift();
@@ -2003,13 +2136,17 @@ function undo(){
   if (a.add) for (const id of a.add) removeStroke(id);
   if (a.remove) for (const s of a.remove) addRec(s);
   if (a.flag){ flag3 = a.flag; placeFlag(); }
+  if (a.coinAdd){ const c = W3.coins.find(k => k.id === a.coinAdd); if (c) removeCoin(c); }
+  if (a.coinBack) for (const c of a.coinBack){ if (!W3.coins.includes(c)) W3.coins.push(c); } 
+  if (a.coinMove) a.coinMove.c.p.copy(a.coinMove.from);
+  if (a.coinAdd || a.coinBack || a.coinMove) syncCoins();
   touchWorld();
 }
 function clearRoom(){
-  const rec = [...W3.strokes.values()].map(recOf);
+  const rec = [...W3.strokes.values()].map(recOf), coins = W3.coins.slice(); W3.coins.length = 0; syncCoins();
   clearRiders(); clearGhosts(); clearWorld3(); flag3.manual = false; pstate.clear();
   Pool.list = []; Pool.born = 0; Pool.leaders.length = 0; bestTrail = null; setBestLine(); bestDist = 0; seenTricks = new Set();
-  if (rec.length) undoStack.push({ remove: rec });
+  if (rec.length || coins.length) undoStack.push({ remove: rec, coinBack: coins });
   touchWorld(); flash(rec.length ? 'Room cleared. Undo brings the ribbons back' : 'The room is already clear');
 }
 
@@ -2093,11 +2230,11 @@ menuMesh.position.set(0, 0.03, -0.04 - MENU_W * MH / MW / 2); menuMesh.rotation.
 menuMesh.visible = false;
 let menuDirty = true, menuHover = null, menuPressed = null, flashText = '', flashT = 0, menuTab = 'draw', menuShown = true;
 function flash(t){ flashText = t; flashT = 2.4; menuDirty = true; const s = $('#status'); if (s && !renderer.xr.isPresenting) s.textContent = t; }
-const PRESETS = { tricks: { tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 },
-  even: { tricks: 1, air: 1, grinds: 1, manuals: 1, distance: 1, variety: 1, bail: 0 },
-  grind: { tricks: 0.75, air: 0.5, grinds: 3, manuals: 1.5, distance: 0.5, variety: 1, bail: 100 },
-  safe: { tricks: 0.5, air: 0.5, grinds: 0.5, manuals: 0.5, distance: 3, variety: 0.5, bail: 600 },
-  style: { tricks: 1, air: 0.75, grinds: 1, manuals: 1, distance: 0.5, variety: 3, bail: 100 } };
+const PRESETS = { tricks: { coins: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 },
+  even: { coins: 3, tricks: 1, air: 1, grinds: 1, manuals: 1, distance: 1, variety: 1, bail: 0 },
+  grind: { coins: 3, tricks: 0.75, air: 0.5, grinds: 3, manuals: 1.5, distance: 0.5, variety: 1, bail: 100 },
+  safe: { coins: 3, tricks: 0.5, air: 0.5, grinds: 0.5, manuals: 0.5, distance: 3, variety: 0.5, bail: 600 },
+  style: { coins: 3, tricks: 1, air: 0.75, grinds: 1, manuals: 1, distance: 0.5, variety: 3, bail: 100 } };
 const PRESET_NAME = { tricks: 'Tricks', even: 'Even', grind: 'Grinds', safe: 'Go far', style: 'Variety' };
 const presetOn = k => Object.keys(PRESETS[k]).every(w => Math.abs(PRESETS[k][w] - RW[w]) < 1e-6);
 function weightsChanged(){ S.w = { ...RW }; rescorePool(); for (const r of riders) if (!r.done) refreshScore(r); save(); menuDirty = true; }
@@ -2136,7 +2273,7 @@ const BTN = [], TXT = [];
   text({ tab: 'draw', kind: 'label', x: P, y: 506, text: () => 'TOOL' });
   const tl = Object.keys(TOOL_NAME).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => tool === t, act: () => setTool(t) }));
   row('draw', 526, 72, tl.slice(0, 3)); row('draw', 608, 72, tl.slice(3));
-  stepper('draw', P, 696, W, 76, 'Ribbon width', widthText, () => { S.width = clamp(S.width / 1.15, 24, 160); save(); }, () => { S.width = clamp(S.width * 1.15, 24, 160); save(); });
+  stepper('draw', P, 696, W, 76, 'Ribbon width', widthText, () => { S.width = clamp(S.width / 1.2, WMIN, WMAX); save(); }, () => { S.width = clamp(S.width * 1.2, WMIN, WMAX); save(); });
   only = () => ltype === 'rail';
   row('draw', 782, 76, Object.keys(RAIL_KINDS).map(k => ({ id: 'rk-' + k, label: () => RAIL_KINDS[k], on: () => S.railKind === k, act: () => { S.railKind = k; flash(RAIL_KINDS[k] + ': ' + RAIL_HELP[k]); save(); } })));
   only = () => ltype !== 'rail';
@@ -2155,17 +2292,18 @@ const BTN = [], TXT = [];
     { id: 'fig-skater', label: () => 'Little skaters', on: () => S.figure === 'skater', act: () => { S.figure = 'skater'; refigure(); save(); } }]);
   row('riders', 872, 72, [...toggles('r'), { id: 'crash', label: () => 'Crashes', on: () => S.crash, act: () => { S.crash = !S.crash; flash(S.crash ? 'Riders can run into each other' : 'Riders pass through each other'); save(); } }, { id: 'forget-r', label: () => 'Forget all riders', style: 'danger', act: forgetRiders }]);
   // EVOLVE
-  row('evolve', 352, 80, [
+  row('evolve', 352, 72, [
     { id: 'evo-learn', label: () => 'Learn the track', on: () => S.evo === 'learn', act: () => setEvo('learn') },
     { id: 'evo-free', label: () => 'Free spirits', on: () => S.evo === 'free', act: () => setEvo('free') }]);
-  text({ tab: 'evolve', kind: 'note', x: P, y: 470, text: () => S.evo === 'learn' ? 'New riders replay a good run, then try something new.' : 'Every rider improvises. The best genes get bred.' });
-  text({ tab: 'evolve', kind: 'label', x: P, y: 530, text: () => 'REWARD MOST' });
-  row('evolve', 552, 72, Object.keys(PRESETS).map(k => ({ id: 'preset-' + k, label: () => PRESET_NAME[k], on: () => presetOn(k), act: () => { Object.assign(RW, PRESETS[k]); weightsChanged(); flash('Rewarding ' + PRESET_NAME[k].toLowerCase() + '. Pool re-scored.'); } })));
+  text({ tab: 'evolve', kind: 'note', x: P, y: 452, text: () => S.evo === 'learn' ? 'New riders replay a good run, then try something new.' : 'Every rider improvises. The best genes get bred.' });
+  text({ tab: 'evolve', kind: 'label', x: P, y: 506, text: () => 'REWARD MOST' });
+  row('evolve', 526, 66, Object.keys(PRESETS).map(k => ({ id: 'preset-' + k, label: () => PRESET_NAME[k], on: () => presetOn(k), act: () => { Object.assign(RW, PRESETS[k]); weightsChanged(); flash('Rewarding ' + PRESET_NAME[k].toLowerCase() + '. Pool re-scored.'); } })));
   const WROWS = [['tricks', 'Tricks'], ['air', 'Air'], ['grinds', 'Grinds'], ['manuals', 'Manuals'], ['distance', 'Distance'], ['variety', 'Variety']];
-  WROWS.forEach(([k, n], i) => stepper('evolve', P + (i % 2) * (half + G), 642 + Math.floor(i / 2) * 82, half, 72, n, () => fmtW(RW[k]),
+  stepper('evolve', P, 606, W, 66, 'Coins', () => fmtW(RW.coins), () => { RW.coins = Math.max(0, Math.round((RW.coins - 0.5) * 100) / 100); weightsChanged(); }, () => { RW.coins = Math.min(10, Math.round((RW.coins + 0.5) * 100) / 100); weightsChanged(); });
+  WROWS.forEach(([k, n], i) => stepper('evolve', P + (i % 2) * (half + G), 682 + Math.floor(i / 2) * 76, half, 66, n, () => fmtW(RW[k]),
     () => { RW[k] = Math.max(0, Math.round((RW[k] - 0.25) * 100) / 100); weightsChanged(); }, () => { RW[k] = Math.min(5, Math.round((RW[k] + 0.25) * 100) / 100); weightsChanged(); }));
-  stepper('evolve', P, 888, half, 72, 'Bail cost', () => RW.bail ? '−' + RW.bail : '0', () => { RW.bail = Math.max(0, RW.bail - 50); weightsChanged(); }, () => { RW.bail = Math.min(1000, RW.bail + 50); weightsChanged(); });
-  add({ tab: 'evolve', id: 'forget-e', style: 'danger', x: P + half + G, y: 888, w: half, h: 72, label: () => 'Forget all riders', act: forgetRiders });
+  stepper('evolve', P, 912, half, 66, 'Bail cost', () => RW.bail ? '−' + RW.bail : '0', () => { RW.bail = Math.max(0, RW.bail - 50); weightsChanged(); }, () => { RW.bail = Math.min(1000, RW.bail + 50); weightsChanged(); });
+  add({ tab: 'evolve', id: 'forget-e', style: 'danger', x: P + half + G, y: 912, w: half, h: 66, label: () => 'Forget all riders', act: forgetRiders });
   // SHAPES
   text({ tab: 'shapes', kind: 'label', x: P, y: 368, text: () => 'ADD A SHAPE' });
   const sk = Object.keys(SHAPES), mkS = k => ({ id: 'shape-' + k, label: () => SHAPES[k].name, sub: () => SHAPES[k].sub, act: () => addShape(k) });
@@ -2284,6 +2422,7 @@ const toLocalDir = (v) => v.clone().applyAxisAngle(_up, -dioYaw);
 function grabTarget(p){
   const fr = Math.max(0.12 / sc(), 30);
   if (p.distanceTo(new V3(flag3.x, flag3.y - 20, flag3.z)) < fr) return { kind: 'flag' };
+  const c = W3.coins.find(k => k.p.distanceTo(p) < Math.max(0.08 / sc(), 24)); if (c) return { kind: 'coin', c };
   const st = strokeNear(p, Math.max(0.07 / sc(), 12));
   return st ? { kind: 'stroke', st } : null;
 }
@@ -2291,6 +2430,7 @@ function ctrlMatrix(st){ st.grip.updateMatrixWorld(true); return st.grip.matrixW
 function pickUp(st, target){
   const held = { kind: target.kind, C0inv: ctrlMatrix(st).invert(), T0: track.matrixWorld.clone(), D: new THREE.Matrix4() };
   if (target.kind === 'flag') held.from = { ...flag3 };
+  else if (target.kind === 'coin'){ held.c = target.c; held.from = target.c.p.clone(); }
   else {
     const s = target.st; removeStroke(s.id); trackDirty = true;
     held.st = s; held.g = new THREE.Group(); held.g.matrixAutoUpdate = false; track.add(held.g); buildInto(held.g, [s]);
@@ -2306,11 +2446,13 @@ function moveHeld(st){
     const p = new V3(h.from.x, h.from.y, h.from.z).applyMatrix4(h.D), d = new V3(h.from.dx, 0, h.from.dz).transformDirection(h.D); d.y = 0;
     if (d.lengthSq() < 1e-6) d.set(h.from.dx, 0, h.from.dz); d.normalize();
     flag3 = { ...flag3, x: p.x, y: p.y, z: p.z, dx: d.x, dz: d.z, placed: true, manual: true }; placeFlag();
-  } else { h.g.matrix.copy(h.D); h.g.matrixWorldNeedsUpdate = true; }
+  } else if (h.kind === 'coin'){ h.c.p.copy(h.from).applyMatrix4(h.D); syncCoins(); }
+  else { h.g.matrix.copy(h.D); h.g.matrixWorldNeedsUpdate = true; }
 }
 function dropHeld(st){
   const h = st.held; if (!h) return; st.held = null;
   if (h.kind === 'flag'){ undoStack.push({ flag: h.from }); save(); return; }
+  if (h.kind === 'coin'){ undoStack.push({ coinMove: { c: h.c, from: h.from } }); save(); return; }
   track.remove(h.g); for (const c of h.g.children) c.geometry && c.geometry.dispose();
   const s = h.st, before = recOf(s), D = h.D;
   const n = addRec({ ...before, pts: s.pts.map(p => p.clone().applyMatrix4(D)), ups: s.ups.map(u => u.clone().transformDirection(D)),
@@ -2364,7 +2506,7 @@ function updateXRInput(dt){
     if (menuMesh.visible && menuOwner !== st && !st.draw && !st.held){ raycaster.ray.set(_o, _dir); const h = raycaster.intersectObject(menuMesh, false)[0]; if (h && h.uv) mHit = { b: menuButtonAt(h.uv), dist: h.distance }; }
     if (mHit){ hover = mHit.b || hover; st.beam.visible = true; st.beam.scale.z = mHit.dist; }
     st.tip.visible = st.stem.visible = !mHit;
-    st.tip.material.color.setHex(tool === 'eraser' ? 0xE5262C : tool === 'flag' || tool === 'edit' ? 0xFFC83D : TYPE_COL[ltype]);
+    st.tip.material.color.setHex(tool === 'eraser' ? 0xE5262C : tool === 'flag' || tool === 'edit' || tool === 'coin' ? 0xFFC83D : TYPE_COL[ltype]);
     st.tip.scale.setScalar(tool === 'eraser' ? 2.2 : 1);
     const p = penLocal(st), upL = toLocalDir(new V3(0, 1, 0).applyQuaternion(qW)), fwdL = toLocalDir(_dir);
     // what grip would pick up: a yellow glow around the tip (nothing nearby = grip moves the whole park)
@@ -2417,7 +2559,13 @@ function updateXRInput(dt){
     else if (Math.abs(ax) < 0.3) st.flick = 0;
     // stick up/down: ribbon width (like brush size in Party Lines)
     const ay = gp.axes[3] || 0;
-    if (Math.abs(ay) > 0.25 && Math.abs(ax) < 0.5 && isRibbon(ltype)){ S.width = clamp(S.width * Math.exp(-ay * dt * 1.4), 24, 160); st.widthMoved = true; menuDirty = true; }
+    if (tool === 'edit' && Math.abs(ay) > 0.25 && Math.abs(ax) < 0.5){
+      if (!st.widen){ const s2 = strokeNear(p, Math.max(0.1 / sc(), 20)); if (s2 && isRibbon(s2.t)) st.widen = { id: s2.id, before: recOf(s2), W: s2.W }; }
+      const wd = st.widen, cur = wd && W3.strokes.get(wd.id);
+      if (cur){ wd.W = clamp(wd.W * Math.exp(-ay * dt * 1.6), WMIN, WMAX); if (Math.abs(cur.W - wd.W) > 0.6){ removeStroke(cur.id); addRec({ ...recOf(cur), W: wd.W }, cur.id); trackDirty = true; }
+        const m = wd.W * sc(); flash('This ribbon: ' + (m >= 1 ? m.toFixed(1) + ' m' : Math.round(m * 100) + ' cm') + ' wide'); }
+    } else if (st.widen && Math.abs(ay) < 0.2){ undoStack.push({ add: [st.widen.id], remove: [st.widen.before] }); touchWorld(); st.widen = null; }
+    else if (Math.abs(ay) > 0.25 && Math.abs(ax) < 0.5 && isRibbon(ltype)){ S.width = clamp(S.width * Math.exp(-ay * dt * 1.6), WMIN, WMAX); st.widthMoved = true; menuDirty = true; }
     else if (st.widthMoved && Math.abs(ay) < 0.2){ st.widthMoved = false; save(); flash('Ribbon width ' + widthText()); }
     st.prev = gp.buttons.map(b => b.pressed);
   }
@@ -2584,6 +2732,7 @@ renderer.setAnimationLoop(now => {
   } else acc = 0;
   checkRecords();
   for (const r of riders) updateRider3D(r);
+  spinCoins(dtReal);
   if (!xr) desktopHandles();
   M.boost.emissiveIntensity = 0.35 + 0.25 * Math.sin(clock * 6);
   stepParticles(live ? dtReal : 0); stepCallouts(dtReal);
@@ -2611,7 +2760,7 @@ renderer.setAnimationLoop(now => {
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 // handy for poking at it from the browser console
-window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, setType, addRec, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
+window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
 </script>
 </body>
 </html>
