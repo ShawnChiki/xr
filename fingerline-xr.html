@@ -326,7 +326,10 @@ const W3 = { emptyY: 0, coins: [], strokes: new Map(), grid: new Map(), nextId: 
 const isRibbon = t => t === 'ground' || t === 'boost';
 // rail kinds: how high the board sits, how much they drag, how far to the side they still catch a rider
 const RAILK = { round: { h: 2.6, fr: 1, lat: 11 }, square: { h: 3.2, fr: 0.85, lat: 12 }, ledge: { h: 0.8, fr: 0.72, lat: 15 }, coping: { h: 3.4, fr: 1.3, lat: 11 } };
-const railK = st => RAILK[st.k] || RAILK.round;
+// skateable objects: half-width and height of the solid block; riders grind along the top middle
+const OBJ = { block: { hw: 16, h: 22 }, manualpad: { hw: 34, h: 10 }, jersey: { hw: 6, h: 30 }, pallet: { hw: 24, h: 9 }, bench: { hw: 10, h: 24 }, dumpster: { hw: 30, h: 48 }, hydrant: { hw: 7, h: 26 } };
+const railK = st => RAILK[st.k] || (OBJ[st.k] ? { h: 0.8, fr: st.k === 'bench' || st.k === 'pallet' ? 0.85 : 0.75, lat: OBJ[st.k].hw + 3 } : RAILK.round);
+const TUBE_R = 80;
 const ck = (x, y, z) => ((x + 4096) * 8192 + (y + 4096)) * 8192 + (z + 4096);
 const CELL3 = 80;
 function cellsOf(min, max, fn){
@@ -382,7 +385,7 @@ function autoBank(pts, ups, topY){
   return L.map((up, i) => { const d = D[i] || lastD; if (D[i]) lastD = D[i]; if (!d) return up; return up.clone().multiplyScalar(Math.cos(B[i])).addScaledVector(d, Math.sin(B[i])).normalize(); });
 }
 function gridAdd(st){
-  if (st.t === 'scenery' || st.t === 'guide') return;
+  if (st.t === 'scenery' || st.t === 'guide' || st.t === 'tree' || st.t === 'tube') return;
   for (const sg of st.segs){ segBox(sg, sg.W / 2 + 3); cellsOf(_bmin, _bmax, k => { let s = W3.grid.get(k); if (!s){ s = new Set(); W3.grid.set(k, s); } s.add(sg); sg.cells.push(k); }); }
 }
 function gridRemove(st){ for (const sg of st.segs){ for (const k of sg.cells){ const s = W3.grid.get(k); if (s){ s.delete(sg); if (!s.size) W3.grid.delete(k); } } sg.cells = []; } }
@@ -417,13 +420,13 @@ function addStroke(t, pts, ups, id, W, k){
   const st = { id: id || W3.nextId++, t, k, pts, ups, W: W || RIBBON_W, segs: [], link: [null, null] };
   if (st.id >= W3.nextId) W3.nextId = st.id + 1;
   buildSegs(st); if (!st.segs.length) return null;
-  W3.strokes.set(st.id, st); gridAdd(st); if (t === 'rail' && k === 'ledge') ledgeSolids(st); relink(); return st;
+  W3.strokes.set(st.id, st); gridAdd(st); if (t === 'rail' && k === 'ledge') ledgeSolids(st, 13, 20); else if (t === 'rail' && OBJ[k]) ledgeSolids(st, OBJ[k].hw, OBJ[k].h); else if (t === 'tube') tubeSolids(st); relink(); return st;
 }
 function removeStroke(id){ const st = W3.strokes.get(id); if (!st) return null; gridRemove(st); if (st.solids){ for (const x of st.solids) gridRemove(x); st.solids = null; } W3.strokes.delete(id); relink(); return st; }
 function clearWorld3(){ for (const st of W3.strokes.values()) st.solids = null; W3.strokes.clear(); W3.grid.clear(); relink(); }
 // ends that touch are joined, so riders roll from one stroke onto the next
 // a ledge is a solid block: its top is a little road and its sides are walls (hidden ribbons, physics only)
-function ledgeSolids(st){
+function ledgeSolids(st, hw, h){
   const n = st.pts.length, T = [], up = [], side = [];
   for (let i = 0; i < n; i++){
     const t = new V3().subVectors(st.pts[Math.min(n - 1, i + 1)], st.pts[Math.max(0, i - 1)]).normalize();
@@ -431,15 +434,28 @@ function ledgeSolids(st){
     T.push(t); up.push(u); side.push(new V3().crossVectors(t, u).normalize());
   }
   const mk = (pts, ups, W) => { const g = { id: st.id + 0.5, t: 'ground', pts, ups, W, segs: [], link: [null, null], solidOf: st }; buildSegs(g); gridAdd(g); return g; };
-  st.solids = [mk(st.pts.map(p => p.clone()), up.map(u => u.clone()), 26)];
-  for (const sg of [1, -1]) st.solids.push(mk(st.pts.map((p, i) => p.clone().addScaledVector(side[i], 13 * sg).addScaledVector(up[i], -10)), side.map(v => v.clone().multiplyScalar(sg)), 20));
+  st.solids = [mk(st.pts.map(p => p.clone()), up.map(u => u.clone()), hw * 2)];
+  for (const sg of [1, -1]) st.solids.push(mk(st.pts.map((p, i) => p.clone().addScaledVector(side[i], hw * sg).addScaledVector(up[i], -h / 2)), side.map(v => v.clone().multiplyScalar(sg)), h));
+  // end faces too, so nothing rolls straight through a block
+  for (const [i, sg] of [[0, -1], [n - 1, 1]]){ const c = st.pts[i].clone().addScaledVector(up[i], -h / 2), o = T[i].clone().multiplyScalar(sg); st.solids.push(mk([c.clone().addScaledVector(side[i], -hw), c.clone().addScaledVector(side[i], hw)], [o.clone(), o.clone()], h)); }
+}
+// a big concrete tube: strips around the inside, open at the top, so riders can roll through and carve the walls
+function tubeSolids(st){
+  const n = st.pts.length, N = 9, span = Math.PI * 4 / 3, w = 2 * TUBE_R * Math.sin(span / N / 2) + 2;
+  const t = new V3().subVectors(st.pts[n - 1], st.pts[0]).normalize(), up = UPW.clone().addScaledVector(t, -t.y).normalize(), side = new V3().crossVectors(t, up).normalize();
+  st.solids = [];
+  for (let j = 0; j < N; j++){
+    const a = -Math.PI / 2 - span / 2 + (j + 0.5) * span / N, radial = up.clone().multiplyScalar(Math.sin(a)).addScaledVector(side, Math.cos(a)), inward = radial.clone().negate();
+    const R2 = TUBE_R * Math.cos(span / N / 2), g = { id: st.id + 0.5, t: 'ground', pts: st.pts.map(p => p.clone().addScaledVector(radial, R2)), ups: st.pts.map(() => inward.clone()), W: w, segs: [], link: [null, null], solidOf: st };
+    buildSegs(g); gridAdd(g); st.solids.push(g);
+  }
 }
 function relink(){
   const ends = [];
   let minY = 1e9;
   for (const st of W3.strokes.values()){
     st.link = [null, null]; st.forks = [null, null];
-    if (st.t === 'scenery' || st.t === 'guide') continue;
+    if (st.t === 'scenery' || st.t === 'guide' || st.t === 'tree' || st.t === 'tube') continue;
     ends.push({ st, e: 0, p: st.segs[0].a }, { st, e: 1, p: st.segs[st.segs.length - 1].b });
     for (const p of st.pts) minY = Math.min(minY, p.y);
   }
@@ -519,7 +535,7 @@ function pickFork(r, sg, atEnd, fk){
     const s2 = L.e === 0 ? L.st.segs[0] : L.st.segs[L.st.segs.length - 1], dNew = s2.t.clone().multiplyScalar(L.e === 0 ? 1 : -1);
     if (dNew.dot(dOld) < 0.2) continue;
     let w = 1;
-    if (W3.beads && W3.beads.length){ const p0 = L.st.pts[L.e === 0 ? 0 : L.st.pts.length - 1]; let hits = 0; for (const b of W3.beads){ if (r.beads && r.beads.has(b.key) || b.p.distanceTo(p0) < 70) continue; for (let i = 0; i < L.st.pts.length; i += 3) if (L.st.pts[i].distanceTo(b.p) < L.st.W / 2 + 25){ hits++; break; } } w += Math.min(4, hits * 0.6); }
+    if (W3.beads && W3.beads.length){ const p0 = L.st.pts[L.e === 0 ? 0 : L.st.pts.length - 1]; let hits = 0; for (const b of W3.beads){ if (r.beads && r.beads.has(b.key) || b.p.distanceTo(p0) < 70) continue; for (let i = 0; i < L.st.pts.length; i += 3) if (L.st.pts[i].distanceTo(b.p) < L.st.W / 2 + 25 && b.t.dot(dNew) > 0){ hits++; break; } } if (hits >= 2){ F.set(key, { L, t: r.time }); return L; } }
     if (W3.coins.length && r.coinSense !== false) for (const c of W3.coins){ if (r.got && r.got.has(c.id)) continue; let near = false; for (let i = 0; i < L.st.pts.length && !near; i += 3) near = L.st.pts[i].distanceTo(c.p) < L.st.W / 2 + 40; if (near){ w += 3; break; } }
     opts.push([w, L]);
   }
@@ -854,7 +870,7 @@ function groundStep3(r, dt){
   if (r.guideDep && !r.brake && guideJump3(r)) return;
   // a coin hanging above the road ahead: ollie just high enough, just in time
   { const A = r.coinAim;
-    if (A && A.h > (A.bead ? 24 : 16) && !r.manual && !r.lip && !aimTaken(r, A) && !r.reacted.has('aim' + A.key) && Math.abs(r.u) > 60){
+    if (A && !A.bead && A.h > 16 && !r.manual && !r.lip && !aimTaken(r, A) && !r.reacted.has('aim' + A.key) && Math.abs(r.u) > 60){
       const popV = 260 + 230 * g.pop, need = Math.sqrt(2 * G * Math.max(0, A.h - 8)), f = clamp(need / popV, 0.3, 1.15), tA = f * popV / G;
       const along = new V3().subVectors(A.c.p, r.pos).dot(motionDir(r).normalize());
       if (along <= Math.abs(r.u) * tA + 4){ r.reacted.add('aim' + A.key); if (f * popV >= need * 0.9){ r.forceJump = { pop: f, ang: 0 }; return takeoff3(r, 'ollie'); } }
@@ -993,7 +1009,7 @@ function railScan3(r){
   });
   for (const st of [...cands.keys()].sort((a, b) => cands.get(a).ahead - cands.get(b).ahead).slice(0, 2)){
     const C = cands.get(st), sgn = Math.sign(C.lat), aims = Math.abs(C.lat) > 8 ? [0.14, 0.24, 0.34].map(a => a * sgn) : [0];
-    let want = r.railMemo.get(st.id); if (want === undefined){ want = rr() < 0.15 + 0.85 * g.grind; r.railMemo.set(st.id, want); }
+    let want = r.railMemo.get(st.id); if (want === undefined){ want = guidedRail3(st) || rr() < 0.15 + 0.85 * g.grind; r.railMemo.set(st.id, want); }
     if (!want) continue;
     const n = surfNormal(r), popV = 260 + 230 * g.pop;
     for (const aim of aims) for (const f of aims.length > 1 ? [0.55, 0.8, 1.05] : [0.35, 0.55, 0.75, 0.95, 1.1]){
@@ -1044,25 +1060,27 @@ function grabCoins3(r){
 function coinAim3(r){
   r.coinAim = null; const g = r.g;
   if (r.coinSense === undefined) r.coinSense = rr() < 0.35 + 0.65 * visOf(g);
-  const sp = Math.abs(r.u); if (!r.coinSense || sp < 30 || (!W3.coins.length && !(W3.beads && W3.beads.length))) return;
+  const sp = Math.abs(r.u); if (sp < 30 || (!W3.coins.length && !(W3.beads && W3.beads.length))) return;
+  const coinsOn = r.coinSense;
   const d = motionDir(r).normalize(), n = surfNormal(r), reach = 60 + sp * (0.6 + 1.2 * visOf(g)), e = new V3();
   let best = null;
-  for (const c of W3.coins){
+  if (coinsOn) for (const c of W3.coins){
     if (r.got.has(c.id)) continue;
     e.subVectors(c.p, r.pos); const along = e.dot(d); if (along < 10 || along > reach) continue;
     const h = e.dot(n); if (h < -20 || h > 150) continue;
     if (Math.abs(r.w + e.dot(r.seg.bn)) > r.seg.W / 2 + 10) continue;
     if (!best || along < best.along) best = { c, along, h, key: 'c' + c.id };
   }
-  // no coin in reach: follow a guide drawn ahead (only beads drawn the way we're heading)
-  if (!best && W3.beads) for (const b of W3.beads){
+  // a guide drawn ahead (the way we're heading) is a route to take: it wins over coins
+  let gbest = null;
+  if (W3.beads) for (const b of W3.beads){
     if (r.beads.has(b.key) || b.t.dot(d) < 0.3) continue;
     e.subVectors(b.p, r.pos); const along = e.dot(d); if (along < 10 || along > reach) continue;
     const h = e.dot(n); if (h < -20 || h > 150) continue;
     if (Math.abs(r.w + e.dot(r.seg.bn)) > r.seg.W / 2 + 10) continue;
-    if (!best || along < best.along) best = { c: b, along, h, key: 'g' + b.key, bead: true };
+    if (!gbest || along < gbest.along) gbest = { c: b, along, h, key: 'g' + b.key, bead: true };
   }
-  r.coinAim = best;
+  r.coinAim = gbest || best;
 }
 // how many coins a predicted flight passes through
 function coinsAlong3(r, pts){
@@ -1115,7 +1133,7 @@ function poolVictim(e){
 }
 
 // ---------- guides: drawn arrows that pay a little for following them, in the direction drawn ----------
-const BEAD_R = 34, BEAD_PTS = 20;
+const BEAD_R = 34;
 const aimTaken = (r, A) => A.bead ? r.beads.has(A.c.key) : r.got.has(A.c.id);
 function followGuides3(r){
   const c0 = r.pos.clone().addScaledVector(r.up, 14), m = velOf3(r), sp = m.length(); if (sp < 20) return;
@@ -1124,7 +1142,7 @@ function followGuides3(r){
     if (r.beads.has(b.key) || c0.distanceToSquared(b.p) > BEAD_R * BEAD_R || m.dot(b.t) < 0.3 * sp) continue;
     r.beads.add(b.key); n++;
   }
-  if (n){ r.parts.guides = (r.parts.guides || 0) + n * BEAD_PTS; refreshScore(r); emit(r, { type: 'guide', n }); }
+  if (n) emit(r, { type: 'guide', n });
 }
 function beadsAlong3(r, pts){
   let k = 0; const ab = new V3(), ap = new V3();
@@ -1173,11 +1191,17 @@ function guideJump3(r){
     const vel = motionDir(r).applyAxisAngle(n, a).addScaledVector(n, popV * f);
     const p = predict3(r.pos.clone().addScaledVector(n, 0.6), vel, r.seg, 0.07, r); if (!p) continue;
     const beads = beadsAlong3(r, p.pts), land = !p.floor && p.n.y > 0.15 && angleBetween(n, p.n) < 0.9;
-    const sc = beads + (land ? 3 : -4);
+    const sc = beads * 2 + (land ? 3 : -1);
     if (!best || sc > best.sc) best = { sc, beads, a, f };
   }
   if (!best || best.beads < 2) return false;
   r.forceJump = { pop: best.f, ang: best.a }; takeoff3(r, 'ollie'); return true;
+}
+
+function guidedRail3(st){
+  if (!W3.beads || !W3.beads.length) return false;
+  let k = 0; for (const b of W3.beads) for (let i = 0; i < st.pts.length; i += 2) if (st.pts[i].distanceTo(b.p) < 30){ k++; break; }
+  return k >= 2;
 }
 
 // ======================================================================
@@ -1189,7 +1213,7 @@ const S = { width: 56, batch: 3, cap: 10, limit: 60, fric: 60, smoothLv: 1, spee
 // park sizes: metres per park unit. A board is 40 units long.
 const SCALES = { finger: { name: 'Fingerboard', s: 0.0024, board: '10 cm' }, mini: { name: 'Mini', s: 0.0075, board: '30 cm' }, skate: { name: 'Skateboard', s: 0.02, board: '80 cm' } };
 // rewards: tricks first by default
-Object.assign(RW, { coins: 3, guides: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 });
+Object.assign(RW, { coins: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 });
 const TILTS = { auto: 'Bank: auto', hand: 'Bank: hand', flat: 'Bank: flat' };
 const TILT_HINT = { auto: 'Turns bank themselves for the speed riders will have', hand: 'Twist your wrist to bank ramps', flat: 'Ramps stay level side to side' };
 const SPEEDS = [0.5, 1, 2, 4];
@@ -1205,7 +1229,7 @@ const TOOL_HELP = {
   curve: 'Click to place points; the road curves smoothly through them. Click the last point again or click the right stick to finish. B/Y takes back a point.',
   poly: 'Click to place points; straight runs with hard corners. Click the last point again or click the right stick to finish. B/Y takes back a point.',
   edit: 'Pull a dot to move it (twist to tilt). Grab the road between dots to add one. B/Y on a dot deletes it. Right stick click: smooth or sharp. Stick up/down near a ribbon: wider or narrower.',
-  guideTip: 'Guide: draw the way you want riders to go, even off a road and through the air onto another. Riders earn points for every stretch they follow in the arrow direction, and sparkle cyan while they do.',
+  guideTip: 'Guide: a route riders must take, in the arrow direction. They take its branch at forks, hold its line, grind a rail it runs along, and jump where it leaves the road. They sparkle cyan while on it.',
   eraser: 'Touch a path with the tip to cut that piece away; sweep along it to erase more. Touching a coin removes it.',
   coin: 'Click to place a coin where riders should go; on a road it floats just above it. Click a coin to remove it. Riders earn the most for grabbing coins. A coin few riders reach grows and is worth more, so one coin on each of three paths splits riders between them.',
   flag: 'Click where riders start, pointing the way they should head.' };
@@ -1298,6 +1322,11 @@ const M = {
   guide: new THREE.MeshBasicMaterial({ color: 0x2EC4E8, transparent: true, opacity: 0.55, depthWrite: false }),
   props: new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.8, metalness: 0.15, side: THREE.DoubleSide }),
   graffiti: mat(0xffffff, { map: graffitiAtlas(), side: THREE.DoubleSide, transparent: true, depthWrite: false, roughness: 0.75, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }),
+  objs: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.7, metalness: 0.1 }),
+  curb: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9 }),
+  water: new THREE.MeshStandardMaterial({ color: 0xd8f2ff, emissive: 0x2d6a90, roughness: 0.15, transparent: true, depthWrite: false, side: THREE.DoubleSide,
+    map: (() => { const t = canvasTex(256, 64, (g, w, h) => { g.fillStyle = '#7fc4ec'; g.fillRect(0, 0, w, h); for (let i = 0; i < 90; i++){ g.fillStyle = Math.random() < 0.5 ? 'rgba(255,255,255,.8)' : 'rgba(170,225,255,.7)'; g.fillRect(Math.random() * w, Math.random() * h, 20 + Math.random() * 60, 1.5 + Math.random() * 3); } }); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(3, 1); return t; })(),
+    alphaMap: canvasTex(256, 4, (g, w, h) => { const gr = g.createLinearGradient(0, 0, w, 0); gr.addColorStop(0, '#fff'); gr.addColorStop(0.7, '#e6e6e6'); gr.addColorStop(1, '#000'); g.fillStyle = gr; g.fillRect(0, 0, w, h); }) }),
   earth: new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1, side: THREE.DoubleSide }),
 };
 const yCyl = new THREE.CylinderGeometry(1, 1, 1, 8, 1), sphGeo = new THREE.SphereGeometry(1, 12, 8);
@@ -1368,6 +1397,90 @@ function graffitiInto(st, L, Rt, NN, pos, uv, nor){
     }
   }
 }
+// ---------- curbs along both edges of every road ----------
+const WOOD = new THREE.Color('#B98A55'), CURB = new THREE.Color('#CFCBC2'), CURB_R = new THREE.Color('#C8312D'), CURB_W = new THREE.Color('#F2F0EA');
+function curbsInto(st, L, Rt, NN, pos, col){
+  const N = L.length, striped = ((st.id * 7919) % 10) < 3, cw = Math.min(5, st.W * 0.1), ch = 3;
+  let s = 0;
+  for (let i = 0; i < N - 1; i++){
+    const segLen = L[i].distanceTo(L[i + 1]); const c = striped ? (Math.floor(s / 16) % 2 ? CURB_R : CURB_W) : CURB; s += segLen;
+    for (const [E0, E1, sg] of [[L[i], L[i + 1], 1], [Rt[i], Rt[i + 1], -1]]){
+      const in0 = E0.clone().lerp(sg > 0 ? Rt[i] : L[i], cw / st.W), in1 = E1.clone().lerp(sg > 0 ? Rt[i + 1] : L[i + 1], cw / st.W);
+      const u0 = NN[i].clone().multiplyScalar(ch), u1 = NN[i + 1].clone().multiplyScalar(ch);
+      const a = E0.clone().add(u0), b = in0.clone().add(u0), c2 = E1.clone().add(u1), d = in1.clone().add(u1);
+      for (const v of [a, b, c2, b, d, c2, in0, b, in1, b, d, in1, E0, a, E1, a, c2, E1]){ pos.push(v.x, v.y, v.z); col.push(c.r, c.g, c.b); }
+    }
+  }
+}
+// ---------- skateable objects ----------
+const box = (lx, ly, lz) => new THREE.BoxGeometry(lx, ly, lz);
+function placeIn(out, g, F, p, color){ g.applyMatrix4(new THREE.Matrix4().makeBasis(F.t, F.up, F.side).setPosition(p)); out.push(propGeo(g, color)); }
+function objFrame(st){ const a = st.pts[0], b = st.pts[st.pts.length - 1], t = new V3().subVectors(b, a); const len = Math.max(1, t.length()); t.normalize(); const up = UPW.clone().addScaledVector(t, -t.y).normalize(); return { a, b, len, mid: a.clone().lerp(b, 0.5), t, up, side: new V3().crossVectors(t, up).normalize() }; }
+function objectInto(st, out){
+  const F = objFrame(st), { hw, h } = OBJ[st.k], L = F.len, at = (x, y, z) => F.mid.clone().addScaledVector(F.t, x).addScaledVector(F.up, y).addScaledVector(F.side, z);
+  const rnd = (() => { let q = (st.id * 48271) % 2147483647; return () => (q = (q * 48271) % 2147483647) / 2147483647; })();
+  const concrete = new THREE.Color().setHSL(0.1, 0.06, 0.62 + rnd() * 0.12), steelC = new THREE.Color('#8F969E');
+  if (st.k === 'block' || st.k === 'manualpad'){
+    placeIn(out, box(L, h, hw * 2), F, at(0, -h / 2, 0), st.k === 'manualpad' ? concrete.clone().offsetHSL(0, 0, 0.06) : concrete);
+    for (const z of [-1, 1]) placeIn(out, box(L, 1.6, 1.6), F, at(0, -0.6, z * (hw - 0.6)), steelC);
+  } else if (st.k === 'jersey'){
+    placeIn(out, box(L, 10, 30), F, at(0, -h + 5, 0), concrete); placeIn(out, box(L, 9, 20), F, at(0, -h + 14.5, 0), concrete); placeIn(out, box(L, 11, 12), F, at(0, -5.5, 0), concrete);
+    for (const z of [-1, 1]) placeIn(out, box(L * 0.9, 2.5, 0.6), F, at(0, -h + 13, z * 10.2), new THREE.Color(rnd() < 0.5 ? '#F2C230' : '#E8E8E8'));
+  } else if (st.k === 'pallet'){
+    const wood = WOOD.clone().offsetHSL(0, 0, (rnd() - 0.5) * 0.1);
+    for (let x = -L / 2 + 4; x <= L / 2 - 3; x += 10) placeIn(out, box(7, 2, hw * 2), F, at(x, -1, 0), wood);
+    for (const z of [-hw + 3, 0, hw - 3]) placeIn(out, box(L, h - 2, 5), F, at(0, -h / 2 - 1, z), wood.clone().multiplyScalar(0.85));
+  } else if (st.k === 'bench'){
+    const wood = WOOD.clone().offsetHSL(0, 0, (rnd() - 0.5) * 0.12), leg = new THREE.Color('#2B2D33');
+    for (const z of [-hw * 0.55, 0, hw * 0.55]) placeIn(out, box(L, 3, hw * 0.6), F, at(0, -1.5, z), wood);
+    for (const x of [-L / 2 + 8, L / 2 - 8]) placeIn(out, box(4, h - 3, hw * 2 - 2), F, at(x, -h / 2 - 1.5, 0), leg);
+  } else if (st.k === 'dumpster'){
+    const body = new THREE.Color(['#2E6B3F', '#2F5D9A', '#8A3B22', '#3D4248'][Math.floor(rnd() * 4)]);
+    placeIn(out, box(L, h - 6, hw * 2), F, at(0, -h / 2 - 3, 0), body);
+    placeIn(out, box(L + 2, 3, hw * 2 + 3), F, at(0, -1.5, 0), body.clone().multiplyScalar(0.6));
+    for (const x of [-L / 4, 0, L / 4]) placeIn(out, box(2.5, h - 10, hw * 2 + 2), F, at(x, -h / 2 - 3, 0), body.clone().multiplyScalar(0.8));
+    for (const x of [-L / 2 + 8, L / 2 - 8]) for (const z of [-hw + 5, hw - 5]){ const w = new THREE.CylinderGeometry(3, 3, 3, 10); w.rotateX(Math.PI / 2); placeIn(out, w, F, at(x, -h + 3, z), new THREE.Color('#1C1D21')); }
+  } else if (st.k === 'hydrant'){
+    const red = new THREE.Color(rnd() < 0.7 ? '#C8312D' : '#E6B422');
+    placeIn(out, new THREE.CylinderGeometry(hw * 0.8, hw * 0.9, h - 6, 12), F, at(0, -h / 2 - 3, 0), red);
+    placeIn(out, new THREE.SphereGeometry(hw * 0.85, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2), F, at(0, -6, 0), red);
+    placeIn(out, new THREE.CylinderGeometry(hw * 1.15, hw * 1.15, 2, 12), F, at(0, -h + 1, 0), red.clone().multiplyScalar(0.7));
+    for (const z of [-1, 1]){ const g = new THREE.CylinderGeometry(2.2, 2.2, 5, 8); g.rotateX(Math.PI / 2); placeIn(out, g, F, at(0, -12, z * (hw * 0.8 + 2)), red.clone().multiplyScalar(0.85)); }
+  }
+}
+// a cinder block holding up the high end of a plank
+function plankProps(st, out){
+  const a = st.pts[0], b = st.pts[st.pts.length - 1], hi = a.y > b.y ? a : b, lo = a.y > b.y ? b : a, F = objFrame(st), drop = hi.y - lo.y;
+  if (drop > 4) placeIn(out, box(16, drop, 30), F, hi.clone().addScaledVector(F.t, hi === b ? -8 : 8).add(new V3(0, -drop / 2 - THICK, 0)), new THREE.Color('#9A968E'));
+}
+// a big concrete tube you can ride through
+function tubeInto(st, out){
+  const F = objFrame(st), q = new THREE.Quaternion().setFromUnitVectors(UPW, F.t), c = new THREE.Color('#9D9A92');
+  for (const [r, col] of [[TUBE_R + 7, c], [TUBE_R, c.clone().multiplyScalar(0.72)]]){ const g = new THREE.CylinderGeometry(r, r, F.len, 32, 1, true); g.applyQuaternion(q); g.translate(F.mid.x, F.mid.y, F.mid.z); out.push(propGeo(g, col)); }
+  for (const end of [F.a, F.b]){ const g = new THREE.RingGeometry(TUBE_R, TUBE_R + 7, 32); g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(new V3(0, 0, 1), F.t)); g.translate(end.x, end.y, end.z); out.push(propGeo(g, c.clone().multiplyScalar(1.1))); }
+}
+// ---------- trees: scenery that sways ----------
+const TREE_M = { dirt: mat(0x76502F, { flatShading: true }), grass: mat(0x6E8B3D), bark: mat(0x6B4A2E), palmBark: mat(0x9C7A52), pine: mat(0x2F5E3A), oak: mat(0x4F8A3A), oak2: mat(0x6FA040), palm: mat(0x4C9A42, { side: THREE.DoubleSide }) };
+const treeList = [];
+function makeTree(st){
+  const base = st.pts[0], H = Math.max(60, st.pts[st.pts.length - 1].distanceTo(base)), g = new THREE.Group(), crown = new THREE.Group(); g.position.copy(base); g.add(crown);
+  let ps = (st.id * 16807) % 2147483647; const rnd = () => (ps = (ps * 16807) % 2147483647) / 2147483647;
+  const trunk = (r0, r1, h, m) => { const t = new THREE.Mesh(new THREE.CylinderGeometry(r1, r0, h, 8), m); t.position.y = h / 2; return t; };
+  if (st.k === 'pine'){ g.add(trunk(7, 4, H * 0.3, TREE_M.bark)); for (let i = 0; i < 4; i++){ const c = new THREE.Mesh(new THREE.ConeGeometry(H * (0.26 - i * 0.045), H * 0.32, 10), TREE_M.pine); c.position.y = H * (0.36 + i * 0.16); crown.add(c); } }
+  else if (st.k === 'palm'){
+    let p = new V3(), lean = (rnd() - 0.5) * 0.5; const segs = 8;
+    for (let i = 0; i < segs; i++){ const q = new V3(Math.sin(lean) * H * 0.12 * (i / segs) * (i + 1) / 2, H * 0.85 * (i + 1) / segs, 0); const t = new THREE.Mesh(new THREE.CylinderGeometry(5 - i * 0.3, 5.5 - i * 0.3, p.distanceTo(q) + 1, 8), TREE_M.palmBark); t.position.copy(p).lerp(q, 0.5); t.quaternion.setFromUnitVectors(UPW, q.clone().sub(p).normalize()); g.add(t); p = q; }
+    crown.position.copy(p); for (let i = 0; i < 8; i++){ const f = new THREE.Mesh(new THREE.ConeGeometry(9, H * 0.42, 4, 1, true), TREE_M.palm); f.scale.set(1, 1, 0.2); f.position.set(0, 0, 0); f.rotation.set(0, i * Math.PI / 4, 0); const piv = new THREE.Group(); piv.rotation.y = i * Math.PI / 4 + rnd() * 0.3; f.rotation.set(0, 0, -Math.PI / 2 - 0.5 - rnd() * 0.3); f.position.set(H * 0.2, -H * 0.05, 0); piv.add(f); crown.add(piv); }
+  } else { g.add(trunk(9, 6, H * 0.45, TREE_M.bark)); for (let i = 0; i < 6; i++){ const b = new THREE.Mesh(new THREE.IcosahedronGeometry(H * (0.16 + rnd() * 0.08), 0), i % 2 ? TREE_M.oak : TREE_M.oak2); b.position.set((rnd() - 0.5) * H * 0.35, H * (0.55 + rnd() * 0.3), (rnd() - 0.5) * H * 0.35); crown.add(b); } }
+  // standing on nothing: give it its own little floating clump of earth
+  if (!sweep3(base.clone().add(new V3(0, 6, 0)), base.clone().add(new V3(0, -30, 0)))){ const clump = new THREE.Mesh(new THREE.ConeGeometry(H * 0.22, H * 0.38, 7), TREE_M.dirt); clump.rotation.x = Math.PI; clump.position.y = -H * 0.19; g.add(clump); const lid = new THREE.Mesh(new THREE.CylinderGeometry(H * 0.22, H * 0.22, 3, 7), TREE_M.grass); lid.position.y = -1; g.add(lid); }
+  g.userData.sway = { crown, ph: rnd() * 6, amp: st.k === 'palm' ? 0.07 : 0.04, pivotY: st.k === 'palm' ? 0 : H * 0.3 };
+  if (st.k !== 'palm'){ const py = st.k === 'pine' ? H * 0.3 : H * 0.45; crown.position.y = py; for (const c of crown.children) c.position.y -= py; }
+  return g;
+}
+function swayTrees(t){
+  for (const c of parkGroup.children){ const s = c.userData && c.userData.sway; if (!s) continue; const k = Math.sin(t * 1.3 + s.ph) + 0.4 * Math.sin(t * 2.9 + s.ph * 2); s.crown.rotation.z = k * s.amp; s.crown.rotation.x = Math.sin(t * 0.9 + s.ph) * s.amp * 0.5; }
+}
 // ---------- broken pipes and rocks poking out of the floating earth ----------
 const PIPE_COLS = ['#8A4B2A', '#8C939B', '#4E8F7A', '#D9D4C7', '#2A2B2F', '#B3672E'].map(c => new THREE.Color(c)), ROCK_COLS = ['#7D7468', '#8E8A82', '#6B5E52', '#9A8F80'].map(c => new THREE.Color(c));
 function propGeo(g, color){ const n = g.index ? g.toNonIndexed() : g; if (n.attributes.uv) n.deleteAttribute('uv'); n.computeVertexNormals(); const c = new Float32Array(n.attributes.position.count * 3); for (let i = 0; i < c.length; i += 3){ c[i] = color.r; c[i + 1] = color.g; c[i + 2] = color.b; } n.setAttribute('color', new THREE.BufferAttribute(c, 3)); return n; }
@@ -1378,7 +1491,23 @@ function addPipe(out, at, dir, R, rnd){
   const pipe = new THREE.CylinderGeometry(r, r, len, 10, 1, true); pipe.applyQuaternion(q); pipe.translate(mid.x, mid.y, mid.z); out.push(propGeo(pipe, col));
   const tip = mid.clone().addScaledVector(d, len / 2);
   if (rnd() < 0.6){ const fl = new THREE.TorusGeometry(r * 1.15, r * 0.32, 6, 14); fl.rotateX(Math.PI / 2); fl.applyQuaternion(q); const fp = tip.clone().addScaledVector(d, -1.5); fl.translate(fp.x, fp.y, fp.z); out.push(propGeo(fl, col.clone().multiplyScalar(0.8))); }
+  if (out.falls && rnd() < 0.5){ const pts = []; for (let i = 0; i <= 12; i++) pts.push(tip.clone().addScaledVector(d, i * 4.5).add(new V3(0, -i * i * 1.6, 0)));
+    out.falls.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 24, r * 0.9, 8, false)); }
   const hole = new THREE.CircleGeometry(r * 0.92, 10); hole.rotateX(-Math.PI / 2); hole.applyQuaternion(q); const hp = tip.clone().addScaledVector(d, -0.8); hole.translate(hp.x, hp.y, hp.z); out.push(propGeo(hole, new THREE.Color('#121214')));
+}
+// a little skeleton half-buried in the dirt
+function addSkeleton(out, at, outD, along, s, rnd){
+  const bone = new THREE.Color('#E6DDC4'), dark = new THREE.Color('#1A1714'), side = new V3().crossVectors(outD, along).normalize(), base = at.clone().addScaledVector(outD, 1.2 * s);
+  const M4 = (x, y, z, p) => new THREE.Matrix4().makeBasis(x, y, z).setPosition(p), put = (g, m, c) => { g.applyMatrix4(m); out.push(propGeo(g, c)); };
+  const skull = base.clone().addScaledVector(along, 11 * s);
+  put(new THREE.SphereGeometry(4 * s, 8, 6), M4(along, outD, side, skull), bone);
+  for (const k of [-1, 1]) put(new THREE.SphereGeometry(1.2 * s, 6, 4), M4(along, outD, side, skull.clone().addScaledVector(outD, 3.2 * s).addScaledVector(side, 1.6 * k * s).addScaledVector(along, 0.8 * s)), dark);
+  put(new THREE.BoxGeometry(3 * s, 2 * s, 4 * s), M4(along, outD, side, skull.clone().addScaledVector(along, 3.6 * s).addScaledVector(outD, 1 * s)), bone);
+  for (let i = 0; i < 5; i++) put(new THREE.SphereGeometry(1.3 * s, 5, 4), M4(along, outD, side, base.clone().addScaledVector(along, (6 - i * 3.2) * s)), bone);
+  for (let i = 0; i < 3; i++){ const g = new THREE.TorusGeometry(3.4 * s, 0.55 * s, 4, 10, Math.PI); g.rotateZ(-Math.PI / 2); put(g, M4(outD, side, along, base.clone().addScaledVector(along, (3 - i * 2.6) * s)), bone); }
+  const limb = (from, dir, len) => { const g = new THREE.CylinderGeometry(0.7 * s, 0.7 * s, len * s, 5); g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(UPW, dir)); g.translate(from.x + dir.x * len * s / 2, from.y + dir.y * len * s / 2, from.z + dir.z * len * s / 2); out.push(propGeo(g, bone)); };
+  const sh = base.clone().addScaledVector(along, 4 * s), hip = base.clone().addScaledVector(along, -8 * s);
+  for (const k of [-1, 1]){ limb(sh, side.clone().multiplyScalar(k).addScaledVector(along, -0.4 - rnd() * 0.5).normalize(), 9); limb(hip, along.clone().negate().addScaledVector(side, k * (0.3 + rnd() * 0.4)).normalize(), 11); }
 }
 function addRock(out, at, s, rnd){
   const g = new THREE.IcosahedronGeometry(1, 0); g.scale(s * (0.7 + rnd() * 0.6), s * (0.6 + rnd() * 0.5), s * (0.7 + rnd() * 0.6));
@@ -1436,7 +1565,8 @@ function earthInto(st, pos, col, props){
       nextProp = s + W * (0.3 + rnd() * 0.6);
       const pipe = rnd() < 0.5, side = rnd() < 0.5, k = pipe ? (side ? 2 + Math.floor(rnd() * 2) : PROF.length - 4 + Math.floor(rnd() * 2)) : 3 + Math.floor(rnd() * (PROF.length - 6));
       const q = ring[k][0], axis = p.clone().addScaledVector(dir, D * 0.45), outD = q.clone().sub(axis).normalize();
-      if (pipe) addPipe(props, q, outD.clone().addScaledVector(bn, (k < PROF.length / 2 ? -1 : 1) * 0.8).normalize(), W, rnd); else addRock(props, q.clone().addScaledVector(outD, 2), 4 + rnd() * Math.min(10, W * 0.15), rnd);
+      if (rnd() < 0.07){ const tg = new V3().addVectors(a.t, b.t).normalize(); addSkeleton(props, q, outD, tg, Math.min(1.4, W / 60), rnd); }
+      else if (pipe) addPipe(props, q, outD.clone().addScaledVector(bn, (k < PROF.length / 2 ? -1 : 1) * 0.8).normalize(), W, rnd); else addRock(props, q.clone().addScaledVector(outD, 2), 4 + rnd() * Math.min(10, W * 0.15), rnd);
       if (rnd() < 0.3) addRock(props, p.clone().addScaledVector(dir, D * 1.1 + 8 + rnd() * 22).add(new V3((rnd() - 0.5) * 20, 0, (rnd() - 0.5) * 20)), 2.5 + rnd() * 5, rnd);
     }
   }
@@ -1447,7 +1577,8 @@ function earthInto(st, pos, col, props){
 }
 // ribbon, rail and scenery meshes for a set of strokes, added to a group
 function buildInto(group, strokes){
-  const dash = [], dashN = [], top = [], topCol = [], topN = [], boost = [], boostN = [], side = [], rails = [], scen = [], posts = [], squares = [], ledges = [], edges = [], copings = [], earthP = [], earthC = [], guides = [], props = [], gfP = [], gfU = [], gfN = [];
+  const dash = [], dashN = [], top = [], topCol = [], topN = [], boost = [], boostN = [], side = [], rails = [], scen = [], posts = [], squares = [], ledges = [], edges = [], copings = [], earthP = [], earthC = [], guides = [], props = [], gfP = [], gfU = [], gfN = [], objs = [], curbP = [], curbC = [];
+  props.falls = [];
   const cGround = new THREE.Color(TYPE_COL.ground);
   const P = (arr, ...vs) => { for (const v of vs) arr.push(v.x, v.y, v.z); };
   for (const st of strokes){
@@ -1465,12 +1596,14 @@ function buildInto(group, strokes){
       for (let i = 0; i < N - 1; i++){
         P(T, L[i], Rt[i], L[i + 1], Rt[i], Rt[i + 1], L[i + 1]);
         P(TN, NN[i], NN[i], NN[i + 1], NN[i], NN[i + 1], NN[i + 1]);
-        if (T === top) for (let k = 0; k < 6; k++) topCol.push(cGround.r, cGround.g, cGround.b);
+        if (T === top){ const cc = st.k === 'plank' ? WOOD : cGround; for (let k = 0; k < 6; k++) topCol.push(cc.r, cc.g, cc.b); }
         P(side, Lb[i], L[i + 1], L[i], Lb[i], Lb[i + 1], L[i + 1]);
         P(side, Rb[i], Rt[i], Rt[i + 1], Rb[i], Rt[i + 1], Rb[i + 1]);
         P(side, Lb[i], Rb[i], Lb[i + 1], Rb[i], Rb[i + 1], Lb[i + 1]);
       }
       for (const i of [0, N - 1]) P(side, L[i], Rt[i], Lb[i], Rt[i], Rb[i], Lb[i]);
+      if (st.k === 'plank'){ plankProps(st, objs); continue; }
+      curbsInto(st, L, Rt, NN, curbP, curbC);
       // centre line: 12 on, 10 off, just above the surface
       if (st.W >= 30){ let acc = 0; const per = 22, on = 12, hw = 0.9, C = i => L[i].clone().add(Rt[i]).multiplyScalar(0.5).addScaledVector(NN[i], 0.35);
         for (let i = 0; i < N - 1; i++){
@@ -1485,6 +1618,9 @@ function buildInto(group, strokes){
         } }
       if (st.t === 'ground' && st.W >= 24) graffitiInto(st, L, Rt, NN, gfP, gfU, gfN);
       if (S.earth) earthInto(st, earthP, earthC, props);
+    } else if (st.t === 'rail' && OBJ[st.k]){ objectInto(st, objs);
+    } else if (st.t === 'tube'){ tubeInto(st, objs);
+    } else if (st.t === 'tree'){ group.add(makeTree(st));
     } else if (st.t === 'rail' && (st.k === 'square' || st.k === 'ledge')){
       if (st.k === 'square') squares.push(sweepBox(st.pts, 2.6, 2.6, -2.6));
       else { ledges.push(sweepBox(st.pts, 13, 0, -20)); for (const z of [-12.6, 12.6]) edges.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(sidePts(st.pts, z, -0.6), false, 'centripetal'), Math.max(4, st.pts.length * 2), 1.1, 6, false)); }
@@ -1515,6 +1651,9 @@ function buildInto(group, strokes){
   mk(earthP, M.earth, earthC); mk(dash, M.dash, null, dashN);
   if (guides.length) group.add(new THREE.Mesh(mergeGeometries(guides.map(g => g.index ? g.toNonIndexed() : g).map(g => { g.deleteAttribute('uv'); return g; })), M.guide));
   if (props.length) group.add(new THREE.Mesh(mergeGeometries(props), M.props));
+  if (objs.length) group.add(new THREE.Mesh(mergeGeometries(objs), M.objs));
+  mk(curbP, M.curb, curbC);
+  if (props.falls.length) group.add(new THREE.Mesh(mergeGeometries(props.falls), M.water));
   if (gfP.length){ const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(gfP, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(gfU, 2)); g.setAttribute('normal', new THREE.Float32BufferAttribute(gfN, 3)); const m = new THREE.Mesh(g, M.graffiti); m.renderOrder = 1; group.add(m); }
   if (scen.length) group.add(new THREE.Mesh(mergeGeometries(scen), M.scen));
   return [tm, bm].filter(Boolean);
@@ -2203,7 +2342,7 @@ function processStroke(raw, rawUps, pu, startUp, endUp){
 function nearEnd(p, r, ribbon){
   let best = null, bd = r;
   for (const st of W3.strokes.values()){
-    if (st.t === 'scenery' || st.t === 'guide' || isRibbon(st.t) !== ribbon) continue;
+    if (st.t === 'scenery' || st.t === 'guide' || st.t === 'tree' || st.t === 'tube' || OBJ[st.k] || isRibbon(st.t) !== ribbon) continue;
     for (const [q, u] of [[st.pts[0], st.ups[0]], [st.pts[st.pts.length - 1], st.ups[st.ups.length - 1]]]){ const d = q.distanceTo(p); if (d < bd){ bd = d; best = { p: q.clone(), up: u.clone() }; } }
   }
   return best;
@@ -2481,6 +2620,36 @@ function clearRoom(){
   touchWorld(); flash(rec.length ? 'Room cleared. Undo brings the ribbons back' : 'The room is already clear');
 }
 
+// ---------- objects: things to skate, and scenery ----------
+const OBJECTS = { block: { name: 'Concrete block', sub: 'grind it' }, manualpad: { name: 'Manual pad', sub: 'low and wide' }, jersey: { name: 'Jersey barrier', sub: 'tall and thin' },
+  plank: { name: 'Plank ramp', sub: 'wood on a block' }, pallet: { name: 'Pallet', sub: 'wood slats' }, bench: { name: 'Bench', sub: 'grind the seat' },
+  dumpster: { name: 'Dumpster', sub: 'big metal box' }, hydrant: { name: 'Fire hydrant', sub: 'ollie over it' }, tube: { name: 'Concrete tube', sub: 'ride through it' },
+  pine: { name: 'Pine tree', sub: 'scenery' }, oak: { name: 'Leafy tree', sub: 'scenery' }, palm: { name: 'Palm tree', sub: 'scenery' } };
+const OBJ_LEN = { block: 120, manualpad: 200, jersey: 150, pallet: 60, bench: 110, dumpster: 80, hydrant: 12 };
+function addObject(key){
+  // where: the right hand's tip in the headset, the middle of the view on a computer
+  let p = null;
+  if (renderer.xr.isPresenting){ const h = hands.find(x => x.source && x.hand === 'right') || hands.find(x => x.source); if (h) p = penLocal(h); }
+  if (!p) p = track.worldToLocal(orbit.target.clone());
+  // facing: along the road underneath if there is one, otherwise across your view
+  let dir = new V3(1, 0, 0), base = p.clone();
+  const hit = sweep3(p.clone().add(new V3(0, 40, 0)), p.clone().add(new V3(0, -900, 0)));
+  if (hit){ base.copy(hit.h); dir.copy(hit.seg.t); dir.y = 0; }
+  else { const f = new V3(0, 0, -1).applyQuaternion(listenerQ); const right = new V3().crossVectors(f, UPW); const w = track.worldToLocal(track.localToWorld(p.clone()).add(right)).sub(p); w.y = 0; if (w.lengthSq() > 1e-6) dir.copy(w); }
+  if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0); dir.normalize();
+  const up = UPW.clone(), rec = { mode: 'sharp' };
+  if (OBJ[key]){ const L = OBJ_LEN[key], h = OBJ[key].h; Object.assign(rec, { t: 'rail', k: key, a: base.clone().addScaledVector(dir, -L / 2).addScaledVector(up, h), b: base.clone().addScaledVector(dir, L / 2).addScaledVector(up, h) }); }
+  else if (key === 'plank'){ Object.assign(rec, { t: 'ground', k: 'plank', W: 34, a: base.clone().addScaledVector(dir, -45).addScaledVector(up, 1), b: base.clone().addScaledVector(dir, 45).addScaledVector(up, 25) }); }
+  else if (key === 'tube'){ Object.assign(rec, { t: 'tube', k: 'tube', a: base.clone().addScaledVector(dir, -170).addScaledVector(up, TUBE_R - 3), b: base.clone().addScaledVector(dir, 170).addScaledVector(up, TUBE_R - 3) }); }
+  else Object.assign(rec, { t: 'tree', k: key, mode: 'free', a: base.clone(), b: base.clone().addScaledVector(up, { pine: 260, oak: 220, palm: 300 }[key]) });
+  const sl = new V3().subVectors(rec.b, rec.a).normalize(), cu = rec.t === 'ground' ? new V3().crossVectors(new V3().crossVectors(sl, UPW), sl).normalize().multiplyScalar(-1) : UPW.clone();
+  if (cu.y < 0) cu.negate();
+  const ctrl = [rec.a, rec.b], cups = [cu.clone(), cu.clone()], g = genFromCtrl(ctrl, cups, 'sharp');
+  const st = addRec({ t: rec.t, k: rec.k, pts: g.pts, ups: g.ups, W: rec.W, mode: rec.mode, ctrl, cups });
+  if (!st) return;
+  undoStack.push({ add: [st.id] }); touchWorld(); flash(OBJECTS[key].name + ' added');
+}
+
 // ---------- ready-made shapes ----------
 // profiles are drawn in (x along the run, y up); z is off to the side. They become ordinary point-edited strokes.
 const arcUp = (x0, R, deg, n) => { const o = []; for (let i = 0; i <= n; i++){ const f = deg * Math.PI / 180 * i / n; o.push([x0 + R * Math.sin(f), R * (1 - Math.cos(f))]); } return o; };
@@ -2561,11 +2730,11 @@ menuMesh.position.set(0, 0.03, -0.04 - MENU_W * MH / MW / 2); menuMesh.rotation.
 menuMesh.visible = false;
 let menuDirty = true, menuHover = null, menuPressed = null, flashText = '', flashT = 0, menuTab = 'draw', menuShown = true;
 function flash(t){ flashText = t; flashT = 2.4; menuDirty = true; const s = $('#status'); if (s && !renderer.xr.isPresenting) s.textContent = t; }
-const PRESETS = { tricks: { coins: 3, guides: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 },
-  even: { coins: 3, guides: 3, tricks: 1, air: 1, grinds: 1, manuals: 1, distance: 1, variety: 1, bail: 0 },
-  grind: { coins: 3, guides: 3, tricks: 0.75, air: 0.5, grinds: 3, manuals: 1.5, distance: 0.5, variety: 1, bail: 100 },
-  safe: { coins: 3, guides: 3, tricks: 0.5, air: 0.5, grinds: 0.5, manuals: 0.5, distance: 3, variety: 0.5, bail: 600 },
-  style: { coins: 3, guides: 3, tricks: 1, air: 0.75, grinds: 1, manuals: 1, distance: 0.5, variety: 3, bail: 100 } };
+const PRESETS = { tricks: { coins: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 },
+  even: { coins: 3, tricks: 1, air: 1, grinds: 1, manuals: 1, distance: 1, variety: 1, bail: 0 },
+  grind: { coins: 3, tricks: 0.75, air: 0.5, grinds: 3, manuals: 1.5, distance: 0.5, variety: 1, bail: 100 },
+  safe: { coins: 3, tricks: 0.5, air: 0.5, grinds: 0.5, manuals: 0.5, distance: 3, variety: 0.5, bail: 600 },
+  style: { coins: 3, tricks: 1, air: 0.75, grinds: 1, manuals: 1, distance: 0.5, variety: 3, bail: 100 } };
 const PRESET_NAME = { tricks: 'Tricks', even: 'Even', grind: 'Grinds', safe: 'Go far', style: 'Variety' };
 const presetOn = k => Object.keys(PRESETS[k]).every(w => Math.abs(PRESETS[k][w] - RW[w]) < 1e-6);
 function weightsChanged(){ S.w = { ...RW }; rescorePool(); for (const r of riders) if (!r.done) refreshScore(r); save(); menuDirty = true; }
@@ -2596,7 +2765,7 @@ const BTN = [], TXT = [];
    { id: 'undo', label: () => 'Undo', act: undo },
    { id: 'clear', label: () => 'Clear room', style: 'danger', act: clearRoom }].forEach((b, i) => add(Object.assign({ x: xs + i * (wr + G), y: 120, w: wr, h: 110 }, b)));
   // tabs
-  row(null, 254, 74, [['draw', 'Draw'], ['shapes', 'Shapes'], ['riders', 'Riders'], ['evolve', 'Evolve'], ['room', 'Room']].map(([t, n]) => ({ id: 'tab-' + t, style: 'tab', label: () => n, on: () => menuTab === t, act: () => { menuTab = t; } })));
+  row(null, 254, 74, [['draw', 'Draw'], ['objects', 'Objects'], ['riders', 'Riders'], ['evolve', 'Evolve'], ['room', 'Room']].map(([t, n]) => ({ id: 'tab-' + t, style: 'tab', label: () => n, on: () => menuTab === t, act: () => { menuTab = t; } })));
   const W = MW - 2 * P, half = (W - G) / 2;
   // DRAW
   text({ tab: 'draw', kind: 'label', x: P, y: 368, text: () => 'LINE TYPE' });
@@ -2629,18 +2798,18 @@ const BTN = [], TXT = [];
   text({ tab: 'evolve', kind: 'note', x: P, y: 452, text: () => S.evo === 'learn' ? 'New riders replay a good run, then try something new.' : 'Every rider improvises. The best genes get bred.' });
   text({ tab: 'evolve', kind: 'label', x: P, y: 506, text: () => 'REWARD MOST' });
   row('evolve', 526, 66, Object.keys(PRESETS).map(k => ({ id: 'preset-' + k, label: () => PRESET_NAME[k], on: () => presetOn(k), act: () => { Object.assign(RW, PRESETS[k]); weightsChanged(); flash('Rewarding ' + PRESET_NAME[k].toLowerCase() + '. Pool re-scored.'); } })));
-  const WROWS = [['guides', 'Guides'], ['tricks', 'Tricks'], ['air', 'Air'], ['grinds', 'Grinds'], ['manuals', 'Manuals'], ['distance', 'Distance'], ['variety', 'Variety']];
+  const WROWS = [['tricks', 'Tricks'], ['air', 'Air'], ['grinds', 'Grinds'], ['manuals', 'Manuals'], ['distance', 'Distance'], ['variety', 'Variety']];
   add({ tab: 'evolve', id: 'share', x: P + half + G, y: 606, w: half, h: 66, label: () => 'Spread riders out', on: () => S.coinShare,
     act: () => { S.coinShare = W3.coinShare = !S.coinShare; weightsChanged(); flash(S.coinShare ? 'Coins few riders reach are worth more, so riders split up' : 'Every coin is worth the same'); } });
   stepper('evolve', P, 606, half, 66, 'Coins', () => fmtW(RW.coins), () => { RW.coins = Math.max(0, Math.round((RW.coins - 0.5) * 100) / 100); weightsChanged(); }, () => { RW.coins = Math.min(10, Math.round((RW.coins + 0.5) * 100) / 100); weightsChanged(); });
   WROWS.forEach(([k, n], i) => stepper('evolve', P + (i % 2) * (half + G), 678 + Math.floor(i / 2) * 72, half, 64, n, () => fmtW(RW[k]),
     () => { RW[k] = Math.max(0, Math.round((RW[k] - 0.25) * 100) / 100); weightsChanged(); }, () => { RW[k] = Math.min(5, Math.round((RW[k] + 0.25) * 100) / 100); weightsChanged(); }));
-  stepper('evolve', P + half + G, 894, half, 64, 'Bail cost', () => RW.bail ? '−' + RW.bail : '0', () => { RW.bail = Math.max(0, RW.bail - 50); weightsChanged(); }, () => { RW.bail = Math.min(1000, RW.bail + 50); weightsChanged(); });
+  stepper('evolve', P, 894, half, 64, 'Bail cost', () => RW.bail ? '−' + RW.bail : '0', () => { RW.bail = Math.max(0, RW.bail - 50); weightsChanged(); }, () => { RW.bail = Math.min(1000, RW.bail + 50); weightsChanged(); });
   // SHAPES
-  text({ tab: 'shapes', kind: 'label', x: P, y: 368, text: () => 'ADD A SHAPE' });
-  const sk = Object.keys(SHAPES), mkS = k => ({ id: 'shape-' + k, label: () => SHAPES[k].name, sub: () => SHAPES[k].sub, act: () => addShape(k) });
-  row('shapes', 388, 116, sk.slice(0, 3).map(mkS)); row('shapes', 518, 116, sk.slice(3).map(mkS));
-  text({ tab: 'shapes', kind: 'note', x: P, y: 680, text: () => 'A shape appears in front of you, made of points you can reshape with Edit points. Grip it to move it. Undo takes it away.' });
+  text({ tab: 'objects', kind: 'label', x: P, y: 368, text: () => 'ADD TO THE PARK' });
+  const ok = Object.keys(OBJECTS), mkO = k => ({ id: 'obj-' + k, label: () => OBJECTS[k].name, sub: () => OBJECTS[k].sub, act: () => addObject(k) });
+  for (let i = 0; i < 4; i++) row('objects', 388 + i * 104, 92, ok.slice(i * 3, i * 3 + 3).map(mkO));
+  text({ tab: 'objects', kind: 'note', x: P, y: 832, text: () => 'Appears at your right hand, or sits on the road below it, lined up with the road. Grip to move it, Undo or the Eraser to remove it.' });
   // ROOM
   text({ tab: 'room', kind: 'label', x: P, y: 368, text: () => 'PARK SIZE · board ' + boardText() });
   row('room', 388, 116, Object.keys(SCALES).map(k => ({ id: 'scale-' + k, label: () => SCALES[k].name, sub: () => 'board ' + SCALES[k].board, on: () => Math.abs(sc() / SCALES[k].s - 1) < 0.03, act: () => setScalePreset(k) })));
@@ -3064,7 +3233,7 @@ renderer.setAnimationLoop(now => {
   } else acc = 0;
   checkRecords();
   for (const r of riders) updateRider3D(r);
-  spinCoins(dtReal);
+  spinCoins(dtReal); M.water.map.offset.x -= dtReal * 1.4; swayTrees(clock);
   if (!xr) desktopHandles();
   M.boost.emissiveIntensity = 0.35 + 0.25 * Math.sin(clock * 6);
   stepParticles(live ? dtReal : 0); stepCallouts(dtReal);
@@ -3092,7 +3261,7 @@ renderer.setAnimationLoop(now => {
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 // handy for poking at it from the browser console
-window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
+window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, addObject, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
 </script>
 </body>
 </html>
