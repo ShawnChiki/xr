@@ -148,7 +148,7 @@ function sliceLoops(P, tol, minArc){
 function strictCurves(strokes, L, sharp, tag){
   return strokes.map(s => {
     const closed = s.length > 8 && d2(s[0], s[s.length - 1]) < sq(L * 0.6) && polyLen(s) > 4 * L;
-    const C = makeCurve(resample(closed ? s.slice(0, -1) : s, L * 0.25, closed), closed, sharp, tag); C.strict = true; return C;
+    const C = makeCurve(resample(closed ? s.slice(0, -1) : s, L * 0.25, closed), closed, sharp, tag); C.strict = true; C.user = s.corners || []; return C;
   }).filter(C => C.pts.length >= 2 && C.len > L * 0.5);
 }
 function principalCurve(grp, g, ds){
@@ -276,6 +276,8 @@ class Mesh {
     if (this.fc[a] >= 0 && this.fc[b] < 0) this.fc[b] = this.fc[a];
     return true;
   }
+  clone(){ const M = new Mesh(); M.x = this.x.slice(); M.y = this.y.slice(); M.z = this.z.slice(); M.vt = this.vt.map(a => a.slice()); M.dead = this.dead.slice();
+    M.fc = this.fc.slice(); M.corner = this.corner.slice(); M.T = this.T.slice(); M.tdead = this.tdead.slice(); M.fe = new Map(this.fe); M.strictIds = this.strictIds; return M; }
   compact(){
     const map = new Int32Array(this.x.length).fill(-1), M = new Mesh();
     for (let t = 0; t < this.tdead.length; t++){ if (this.tdead[t]) continue;
@@ -630,9 +632,26 @@ function embedCurve(M, C, id, L){
     }
     for (let i = 0; i < (closed ? n : n - 1); i++){ const a = clean[i], b = clean[(i + 1) % n]; if (!M.fe.has(M.ek(a, b))) M.fe.set(M.ek(a, b), id); }
     if (!closed){ M.corner[clean[0]] = true; M.corner[clean[n - 1]] = true; }
+    // the line's own sharp corners pin the nearest chain vertex, exactly on the corner
+    for (const cp of (C.corners || [])){ let bv = -1, bd = sq(L * 1.2); for (const v of clean){ const dd = d2(M.P(v), cp); if (dd < bd){ bd = dd; bv = v; } } if (bv >= 0){ M.setP(bv, cp); M.corner[bv] = true; } }
     added += n;
   }
   return added;
+}
+// sharp corners of a line: where it turns more than ~40° within a short stretch
+function curveCorners(C, L){
+  const P = resample(C.pts, L * 0.08, C.closed), n = P.length, k = Math.max(2, Math.round(0.5 / 0.08 / 2)); if (n < 2 * k + 1) return [];
+  const at = i => P[C.closed ? ((i % n) + n) % n : Math.max(0, Math.min(n - 1, i))];
+  const T = P.map((p, i) => { if (!C.closed && (i < k || i >= n - k)) return 0; const a = at(i - k), c = at(i + k); return Math.acos(Math.max(-1, Math.min(1, dot(norm([p[0] - a[0], p[1] - a[1], p[2] - a[2]]), norm([c[0] - p[0], c[1] - p[1], c[2] - p[2]]))))); });
+  const out = []; for (let i = 0; i < n; i++){ if (T[i] < 0.7) continue; let mx = true; for (let j = -k; j <= k; j++){ const q = C.closed ? ((i + j) % n + n) % n : i + j; if (q >= 0 && q < n && T[q] > T[i]) mx = false; } if (mx) out.push(P[i]); }
+  return out;
+}
+function markTurns(M, chain, closed, L){
+  const n = chain.length; if (n < 3) return;
+  const at = i => chain[closed ? ((i % n) + n) % n : Math.max(0, Math.min(n - 1, i))];
+  const turn = i => { const a = M.P(at(i - 1)), b = M.P(at(i)), c = M.P(at(i + 1)); return Math.acos(Math.max(-1, Math.min(1, dot(norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]), norm([c[0] - b[0], c[1] - b[1], c[2] - b[2]]))))); };
+  const T = []; for (let i = 0; i < n; i++) T.push(!closed && (i === 0 || i === n - 1) ? 0 : turn(i));
+  for (let i = 0; i < n; i++){ if (T[i] < 0.6) continue; const l = T[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], r = T[closed ? (i + 1) % n : Math.min(n - 1, i + 1)]; if (T[i] >= l && T[i] >= r) M.corner[chain[i]] = true; }
 }
 function shortestPath(M, src, dst, maxLen){
   const dist = new Map([[src, 0]]), prev = new Map(), open = [src], done = new Set();
@@ -652,6 +671,105 @@ function shortestPath(M, src, dst, maxLen){
   if (!prev.has(dst)) return null;
   const path = [dst]; while (path[path.length - 1] !== src) path.push(prev.get(path[path.length - 1]));
   return path.reverse();
+}
+
+// ---------------- edges (green lines): where the surface ends
+// The sheet is cut along every edge line; pieces on the far side (where few loose lines are) are removed.
+function cutAtEdges(M, curves, samples, h){
+  const ids = new Set(); curves.forEach((C, i) => { if (C.edge) ids.add(i); }); if (!ids.size) return 0;
+  M.compact();
+  const nt = M.tdead.length, comp = new Int32Array(nt).fill(-1), T = M.T; let nc = 0;
+  for (let t = 0; t < nt; t++){ if (comp[t] >= 0) continue; const st = [t]; comp[t] = nc;
+    while (st.length){ const u = st.pop(); for (let k = 0; k < 3; k++){ const a = T[3 * u + k], b = T[3 * u + (k + 1) % 3]; if (ids.has(M.fe.get(M.ek(a, b)))) continue;
+      for (const t2 of M.edgeTris(a, b)) if (comp[t2] < 0){ comp[t2] = nc; st.push(t2); } } }
+    nc++; }
+  if (nc < 2) return 0;
+  // how many loose-line samples sit near each piece, per unit of area
+  const G = new Grid(h); samples.forEach((q, i) => { if (!q.curve && !q.guide) G.add(i, q.p[0], q.p[1], q.p[2]); });
+  const dens = new Float64Array(nc), area = new Float64Array(nc), edgeT = new Uint8Array(nc);
+  for (let t = 0; t < nt; t++){
+    const c = comp[t], a = Math.hypot(...M.triN(t)) / 2; area[c] += a;
+    const ctr = [0, 1, 2].map(k => (M.x[T[3 * t]] * (k === 0) + M.y[T[3 * t]] * (k === 1) + M.z[T[3 * t]] * (k === 2) + M.x[T[3 * t + 1]] * (k === 0) + M.y[T[3 * t + 1]] * (k === 1) + M.z[T[3 * t + 1]] * (k === 2) + M.x[T[3 * t + 2]] * (k === 0) + M.y[T[3 * t + 2]] * (k === 1) + M.z[T[3 * t + 2]] * (k === 2)) / 3);
+    let cnt = 0; G.each(ctr[0], ctr[1], ctr[2], h, i => { if (d2(samples[i].p, ctr) < h * h) cnt++; }); dens[c] += cnt * a;
+    for (let k = 0; k < 3; k++) if (ids.has(M.fe.get(M.ek(T[3 * t + k], T[3 * t + (k + 1) % 3])))) edgeT[c] = 1;
+  }
+  // a piece is "enclosed" when it doesn't reach the sheet's outer border: that's the inside of a closed green loop
+  const border = new Uint8Array(nc);
+  for (let t = 0; t < nt; t++) for (let k = 0; k < 3; k++){ const a = T[3 * t + k], b = T[3 * t + (k + 1) % 3]; if (M.edgeTris(a, b).length === 1 && !ids.has(M.fe.get(M.ek(a, b)))) border[comp[t]] = 1; }
+  const cand = []; for (let c = 0; c < nc; c++) if (edgeT[c] && area[c] > 0) cand.push(c);
+  const keep = new Uint8Array(nc).fill(1);
+  if (cand.some(c => !border[c])) cand.forEach(c => { if (border[c]) keep[c] = 0; });       // closed loop: keep what's inside
+  else if (cand.length > 1){                                                                   // open line: keep the side with more lines (or the bigger side)
+    const d = c => dens[c] / area[c], best = cand.reduce((a, b) => d(b) > d(a) ? b : a), lo = Math.min(...cand.map(d));
+    const byArea = d(best) < lo * 1.4, winner = byArea ? cand.reduce((a, b) => area[b] > area[a] ? b : a) : best;
+    cand.forEach(c => { if (c !== winner) keep[c] = 0; });
+  }
+  let removed = 0;
+  for (let t = 0; t < nt; t++){ if (keep[comp[t]]) continue; M.tdead[t] = true; for (let k = 0; k < 3; k++) rmv(M.vt[T[3 * t + k]], t); removed++; }
+  for (const [k, id] of [...M.fe]) if (ids.has(id)){ const a = Math.floor(k / 2097152), b = k % 2097152; if (!M.edgeTris(a, b).length) M.fe.delete(k); }
+  for (let v = 0; v < M.x.length; v++) if (!M.vt[v].length) M.fc[v] = -1;
+  fixBowties(M); dropSmallParts(M, 8); M.compact();
+  return removed;
+}
+
+// ---------------- simpler topology: remesh the fitted surface at a coarser size, staying on it
+function triArea(M){ let a = 0; for (let t = 0; t < M.tdead.length; t++) if (!M.tdead[t]) a += Math.hypot(...M.triN(t)) / 2; return a; }
+function projector(Mfit, L){
+  const VG = new Grid(L); for (let v = 0; v < Mfit.x.length; v++) if (Mfit.vt[v].length) VG.add(v, Mfit.x[v], Mfit.y[v], Mfit.z[v]);
+  return p => { for (const r of [L * 1.5, L * 4, L * 12]){ const c = closestOnMesh(Mfit, VG, p, r); if (c) return c.p; } return p; };
+}
+function coarsen(M, Mfit, curves, Lo, L, iters){
+  const proj = projector(Mfit, L);
+  for (let it = 0; it < iters; it++){
+    remesh(M, Lo, 0.75);
+    const N = vertexNormals(M), nx = M.x.slice(), ny = M.y.slice(), nz = M.z.slice();
+    for (let v = 0; v < M.x.length; v++){
+      if (!M.vt[v].length) continue;
+      let p = M.P(v);
+      if (M.fc[v] >= 0){ if (!M.corner[v]){ p = closestOnPoly(curves[M.fc[v]], p).p; } }
+      else {
+        if (!M.isBV(v)){ const ring = M.nbrs(v); let cx = 0, cy = 0, cz = 0; for (const w of ring){ cx += M.x[w]; cy += M.y[w]; cz += M.z[w]; }
+          const d = [cx / ring.length - p[0], cy / ring.length - p[1], cz / ring.length - p[2]], dn = dot(d, N[v]); p = [p[0] + (d[0] - dn * N[v][0]) * 0.5, p[1] + (d[1] - dn * N[v][1]) * 0.5, p[2] + (d[2] - dn * N[v][2]) * 0.5]; }
+        p = proj(p);
+      }
+      nx[v] = p[0]; ny[v] = p[1]; nz[v] = p[2];
+    }
+    M.x = nx; M.y = ny; M.z = nz;
+  }
+}
+// make the smooth (subdivided) surface hug the fitted one: nudge each cage vertex by how far its limit point is off
+function hugCage(cage, Mtopo, Mfit, curves, L, iters){
+  const { V, F, sharp } = cage, nv = V.length / 3, proj = projector(Mfit, L);
+  const eF = new Map(); F.forEach((f, fi) => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); (eF.get(k) || eF.set(k, []).get(k)).push(fi); }));
+  const nbr = Array.from({ length: nv }, () => []), diag = Array.from({ length: nv }, () => []), tri = new Uint8Array(nv), cre = Array.from({ length: nv }, () => []);
+  for (const [k, fs] of eF){ const a = Math.floor(k / 2097152), b = k % 2097152; nbr[a].push(b); nbr[b].push(a); if (fs.length !== 2 || sharp.has(k)){ cre[a].push(b); cre[b].push(a); } }
+  for (const f of F){ if (f.length !== 4){ f.forEach(v => tri[v] = 1); continue; } for (let i = 0; i < 4; i++) diag[f[i]].push(f[(i + 2) % 4]); }
+  const P = v => [V[3 * v], V[3 * v + 1], V[3 * v + 2]];
+  const limit = v => { const p = P(v), c = cre[v];
+    if (c.length > 2) return p;
+    if (c.length === 2){ if (cage.corner && cage.corner[v]) return p; const a = P(c[0]), b = P(c[1]); return [0, 1, 2].map(i => (4 * p[i] + a[i] + b[i]) / 6); }
+    const n = nbr[v].length; if (!n) return p;
+    if (tri[v]){ const s2 = [0, 0, 0]; for (const w of nbr[v]){ const q = P(w); for (let i = 0; i < 3; i++) s2[i] += q[i] / n; } return [0, 1, 2].map(i => (2 * p[i] + s2[i]) / 3); }
+    const e = [0, 0, 0], d = [0, 0, 0]; for (const w of nbr[v]){ const q = P(w); for (let i = 0; i < 3; i++) e[i] += q[i]; } for (const w of diag[v]){ const q = P(w); for (let i = 0; i < 3; i++) d[i] += q[i]; }
+    return [0, 1, 2].map(i => (n * n * p[i] + 4 * e[i] + d[i]) / (n * (n + 5))); };
+  for (let it = 0; it < iters; it++){
+    const moves = new Float64Array(nv * 3);
+    for (let v = 0; v < nv; v++){
+      if (Mtopo.corner[v]) continue;
+      const lim = limit(v), id = Mtopo.fc[v], tgt = id >= 0 && curves[id] ? closestOnPoly(curves[id], lim).p : proj(lim);
+      moves[3 * v] = (tgt[0] - lim[0]) * 0.8; moves[3 * v + 1] = (tgt[1] - lim[1]) * 0.8; moves[3 * v + 2] = (tgt[2] - lim[2]) * 0.8;
+    }
+    for (let i = 0; i < V.length; i++) V[i] += moves[i];
+  }
+}
+// hard edges found by angle: cage edges folded more than `deg` become sharp too
+function autoCreases(cage, deg){
+  const { V, F, sharp } = cage, fn = F.map(f => { const a = f[0], b = f[1], c = f[2], d = f[3] !== undefined ? f[3] : f[0];
+    return norm(cross3([0, 0, 0], [V[3 * c] - V[3 * a], V[3 * c + 1] - V[3 * a + 1], V[3 * c + 2] - V[3 * a + 2]], [V[3 * d] - V[3 * b], V[3 * d + 1] - V[3 * b + 1], V[3 * d + 2] - V[3 * b + 2]])); });
+  const eF = new Map(); F.forEach((f, fi) => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); (eF.get(k) || eF.set(k, []).get(k)).push(fi); }));
+  const lim = Math.cos(deg * Math.PI / 180); let n = 0;
+  for (const [k, fs] of eF) if (fs.length === 2 && !sharp.has(k) && dot(fn[fs[0]], fn[fs[1]]) < lim){ sharp.add(k); n++; }
+  return n;
 }
 
 // ---------------- guides: laid onto the surface, smoothed, and turned into a flow direction for the quads
@@ -776,14 +894,14 @@ function quadify(M, curves, FL){
   for (let t = 0; t < nt; t++) if (!used[t]) F.push([T[3 * t], T[3 * t + 1], T[3 * t + 2]]);
   const V = []; for (let v = 0; v < M.x.length; v++) V.push(M.x[v], M.y[v], M.z[v]);
   const sharp = new Set(); for (const [k, id] of M.fe) if (curves[id] && curves[id].sharp) sharp.add(k);
-  return { V, F, sharp, feat: new Map(M.fe) };
+  return { V, F, sharp, feat: new Map(M.fe), corner: Uint8Array.from(M.corner, c => c ? 1 : 0) };
 }
 function ek(a, b){ return a < b ? a * 2097152 + b : b * 2097152 + a; }
 // Square up the quads: each quad pulls its corners toward the nearest square of the same size, turned to
 // match the guide flow where there is one (or just its own best fit where there isn't). Vertices are then
 // put back onto the fitted surface, so the shape doesn't change, only the layout of the quads on it.
-function squareQuads(cage, M, flow, iters, L){
-  const { V, F } = cage, nv = V.length / 3, fixed = new Uint8Array(nv);
+function squareQuads(cage, M, flow, iters, L, Mfit){
+  const { V, F } = cage, nv = V.length / 3, fixed = new Uint8Array(nv), proj = projector(Mfit || M, L);
   for (let v = 0; v < nv; v++) if (M.fc[v] >= 0) fixed[v] = 1;
   const eCount = new Map(); for (const f of F) for (let i = 0; i < f.length; i++){ const k = ek(f[i], f[(i + 1) % f.length]); eCount.set(k, (eCount.get(k) || 0) + 1); }
   for (const [k, c] of eCount) if (c === 1){ fixed[Math.floor(k / 2097152)] = 1; fixed[k % 2097152] = 1; }
@@ -813,11 +931,11 @@ function squareQuads(cage, M, flow, iters, L){
     for (let v = 0; v < nv; v++){
       if (fixed[v] || !cnt[v]) continue;
       const t = [sum[3 * v] / cnt[v], sum[3 * v + 1] / cnt[v], sum[3 * v + 2] / cnt[v]], p = [V[3 * v] + (t[0] - V[3 * v]) * 0.5, V[3 * v + 1] + (t[1] - V[3 * v + 1]) * 0.5, V[3 * v + 2] + (t[2] - V[3 * v + 2]) * 0.5];
-      const on = closestOnMesh(M, VG, p, L * 3); const q = on ? on.p : p; V[3 * v] = q[0]; V[3 * v + 1] = q[1]; V[3 * v + 2] = q[2];
+      const q = proj(p); V[3 * v] = q[0]; V[3 * v + 1] = q[1]; V[3 * v + 2] = q[2];
     }
   }
 }
-function catmullClark({ V, F, sharp, feat }, curves){
+function catmullClark({ V, F, sharp, feat, corner }, curves){
   const nv = V.length / 3, eid = new Map(), E = [];
   F.forEach((f, fi) => { for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = ek(a, b); let e = eid.get(k); if (e === undefined){ e = E.length; eid.set(k, e); E.push({ a, b, f: [] }); } E[e].f.push(fi); } });
   const ne = E.length, nf = F.length, out = new Float64Array((nv + ne + nf) * 3);
@@ -837,7 +955,9 @@ function catmullClark({ V, F, sharp, feat }, curves){
       for (const fi of vf[v]) for (let c = 0; c < 3; c++) Fa[c] += FP[fi][c] / vf[v].length;
       for (const i of ve[v]){ const e = E[i]; for (let c = 0; c < 3; c++) Ra[c] += (V[3 * e.a + c] + V[3 * e.b + c]) / 2 / n; }
       q = [0, 1, 2].map(c => (Fa[c] + 2 * Ra[c] + (n - 3) * P[c]) / n); }
-    else if (cr.length === 2){ const o = cr.map(i => E[i].a === v ? E[i].b : E[i].a); q = [0, 1, 2].map(c => (6 * P[c] + V[3 * o[0] + c] + V[3 * o[1] + c]) / 8); }
+    else if (cr.length === 2){ const o = cr.map(i => E[i].a === v ? E[i].b : E[i].a);
+      const u = norm([V[3 * o[0]] - P[0], V[3 * o[0] + 1] - P[1], V[3 * o[0] + 2] - P[2]]), w = norm([V[3 * o[1]] - P[0], V[3 * o[1] + 1] - P[1], V[3 * o[1] + 2] - P[2]]);
+      q = corner && corner[v] ? P : [0, 1, 2].map(c => (6 * P[c] + V[3 * o[0] + c] + V[3 * o[1] + c]) / 8); }
     out.set(q, v * 3);
   }
   const NF = [], NS = new Set();
@@ -848,7 +968,8 @@ function catmullClark({ V, F, sharp, feat }, curves){
   const NFt = new Map();
   if (feat) E.forEach((e, i) => { const id = feat.get(ek(e.a, e.b)); if (id === undefined) return; NFt.set(ek(e.a, nv + i), id); NFt.set(ek(nv + i, e.b), id);
     const C = curves && curves[id]; if (C && C.strict) for (const v of [e.a, nv + i, e.b]){ const q = closestOnPoly(C, [out[3 * v], out[3 * v + 1], out[3 * v + 2]]); if (q.d2 < 1) out.set(q.p, 3 * v); } });
-  return { V: Array.from(out), F: NF, sharp: NS, feat: NFt };
+  const NC = new Uint8Array(nv + ne + nf); if (corner) NC.set(corner.subarray(0, nv));
+  return { V: Array.from(out), F: NF, sharp: NS, feat: NFt, corner: NC };
 }
 // triangles for drawing, with normals that stay smooth except across sharp creases
 function shade({ V, F, sharp }){
@@ -884,17 +1005,19 @@ function creaseLines({ V, sharp }){
 // strokes: [{ tag, pts: [x,y,z, x,y,z, ...] }]   (park metres, y up)
 //   tag 0 loose · 1 guide (averaged) · 2 strict guide (exact) · 3 crease (averaged, sharp) · 4 strict crease (exact, sharp)
 // guides (tags 1, 2) steer the quad flow and the Relax direction; they don't pull the surface
-// prm: { detail, avg, lines, fair (0..1), reach, group, subd, relax (0..10), dabs }
+//   5 edge (averaged, where the surface ends) · 6 strict edge (exact)
+// prm: { target (quads in the result, 0 = by quad size), hard (auto crease angle, 0 = off), detail, avg, lines, fair (0..1), reach, group, subd, relax (0..10), dabs }
 function solve(strokes, prm, progress = () => {}){
   const L = Math.max(0.05, prm.detail), h = Math.max(prm.avg, L * 1.1), g = Math.max(prm.group, L * 0.5);
   const toPts = s => { const a = []; for (let i = 0; i + 2 < s.pts.length; i += 3) a.push([s.pts[i], s.pts[i + 1], s.pts[i + 2]]); return a; };
-  const byTag = [[], [], [], [], []];
-  for (const s of strokes){ const p = toPts(s), t = Math.min(4, s.tag || 0); if (p.length < 2) continue;
-    if (t === 0) byTag[0].push(p); else for (const q of sliceLoops(p, g * 0.6, Math.max(g * 5, L * 4))) byTag[t].push(q); }
+  const byTag = [[], [], [], [], [], [], []];
+  for (const s of strokes){ const p = toPts(s), t = Math.min(6, s.tag || 0); if (p.length < 2) continue;
+    if (t === 0) byTag[0].push(p); else for (const q of sliceLoops(p, g * 0.6, Math.max(g * 5, L * 4))){ q.corners = s.corners; byTag[t].push(q); } }
   progress(0.02, 'Finding the guide and crease lines');
   // Creases shape the surface (strict ones first, so they get cut in first and the averaged ones fit around them).
   // Guides don't compete with the loose lines: they're laid onto the surface afterwards and steer the quads.
-  const curves = [...strictCurves(byTag[4], L, true, 4), ...consensus(byTag[3], g, L * 0.5, true, 3)];
+  const curves = [...strictCurves(byTag[4], L, true, 4), ...strictCurves(byTag[6], L, false, 6), ...consensus(byTag[3], g, L * 0.5, true, 3), ...consensus(byTag[5], g, L * 0.5, false, 5)];
+  curves.forEach(C => { if (C.tag >= 5) C.edge = true; C.corners = [...(C.user || []), ...curveCorners(C, L)]; });   // green: where the surface ends
   const guides0 = [...strictCurves(byTag[2], L, false, 2), ...consensus(byTag[1], g, L * 0.5, false, 1)];
   const samples = [];
   const ds = Math.min(L, h) / 3;
@@ -927,6 +1050,7 @@ function solve(strokes, prm, progress = () => {}){
   let flow = guides.length ? flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h) : null;
   M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0));
   curves.forEach((C, i) => embedCurve(M, C, i, L));
+  if (cutAtEdges(M, curves, samples, h)) progress(0.56, 'Trimming at the edges');
   untangle(M, 4);
   for (let it = 0; it < 8; it++){
     remesh(M, L, 0.8);
@@ -952,8 +1076,14 @@ function solve(strokes, prm, progress = () => {}){
       M.x = nx; M.y = ny; M.z = nz;
     }
   }
-  progress(0.9, 'Smoothing out folds');
+  progress(0.88, 'Smoothing out folds');
   M.compact();
+  // simpler topology: rebuild at the size that gives the quad count asked for, on the fitted surface
+  let Mfit = M;
+  if (prm.target > 0){
+    const Lo = 2 * Math.sqrt(triArea(M) / prm.target);
+    if (Lo > L * 1.2){ progress(0.89, 'Simplifying to about ' + prm.target + ' quads'); Mfit = M.clone(); coarsen(M, Mfit, curves, Lo, L, 14); M.compact(); }
+  }
   if (guides.length){
     flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h);
     // comb the mesh along the flow: slide vertices over the surface until their edges line up with it
@@ -977,7 +1107,10 @@ function solve(strokes, prm, progress = () => {}){
   progress(0.93, 'Making quads');
   const cage = quadify(M, curves, flow);
   progress(0.95, 'Squaring up the quads');
-  squareQuads(cage, M, flow, prm.squareIters ?? 32, L);
+  squareQuads(cage, M, flow, prm.squareIters ?? 32, L, Mfit);
+  if (prm.hard > 0) autoCreases(cage, prm.hard);
+  progress(0.97, 'Hugging the surface');
+  hugCage(cage, M, Mfit, curves, L, 6);
   const quads = catmullClark(cage, curves);
   let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++) smooth = catmullClark(smooth, curves);
   const sh = shade(smooth);
@@ -986,7 +1119,7 @@ function solve(strokes, prm, progress = () => {}){
   return {
     surface: sh, quadWire: wire(quads), fineWire: smooth === quads ? null : wire(smooth), creases: creaseLines(smooth),
     quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()) },
-    curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, pts: C.pts.flat() })),
+    curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })),
       ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
     nQuads: quads.F.length, folds
   };
