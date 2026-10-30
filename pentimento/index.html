@@ -49,7 +49,7 @@
 </head>
 <body>
 <div class="slab card">
-  <h1>PENTI<span>MENTO</span><small id="ver">XR v1.2</small></h1>
+  <h1>PENTI<span>MENTO</span><small id="ver">XR v1.3</small></h1>
   <p>Sketch skate terrain with as many loose lines as you like. Mark the sharp edges and the lines that matter, and one smooth quad surface is found through all of them.</p>
   <div class="types"><span><i style="background:var(--loose)"></i>Loose</span><span><i style="background:var(--guide)"></i>Guide</span><span><i style="background:var(--sguide)"></i>Strict guide</span><span><i style="background:var(--crease)"></i>Crease</span><span><i style="background:var(--screase)"></i>Strict crease</span></div>
   <div class="row">
@@ -58,11 +58,11 @@
   </div>
   <div class="row"><button id="sampleBtn">Try the sample sketch</button></div>
   <div id="status">Checking for a headset…</div>
-  <div class="keys">On this screen: drag to draw · right-drag to orbit · wheel to zoom · 1–5 line type · D draw · B bend · M mark · X erase bits · E erase lines · Space builds</div>
+  <div class="keys">On this screen: drag to draw · right-drag to orbit · wheel to zoom · 1–5 line type · D draw · B bend · F flatten · M mark · X erase bits · E erase lines · Space builds</div>
   <details>
     <summary>Headset controls</summary>
     <dl>
-      <dt>Trigger</dt><dd>Use the tool at the pen tip: draw, bend, mark, erase bits or erase whole lines. Point at the menu and pull to press a button.</dd>
+      <dt>Trigger</dt><dd>Use the tool at the pen tip: draw, bend, flatten, mark, erase bits or erase whole lines. Point at the menu and pull to press a button.</dd>
       <dt>Grip</dt><dd>Hold to move and turn the model. Hold both grips and pull apart or together to scale it.</dd>
       <dt>Stick ← →</dt><dd>Line type: Loose, Guide, Strict guide, Crease, Strict crease</dd>
       <dt>Stick ↑ ↓</dt><dd>Brush size for bending, marking and erasing</dd>
@@ -90,7 +90,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '1.2';
+const VERSION = '1.3';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'XR v' + VERSION;
 const V3 = THREE.Vector3;
@@ -106,11 +106,12 @@ const TAG_COL = [0xD5DAE1, 0x5CC8FF, 0x4A5BFF, 0xFF9A2E, 0xFF3348];
 const TAG_CSS = ['#D5DAE1', '#5CC8FF', '#4A5BFF', '#FF9A2E', '#FF3348'];
 const STRICT = t => t === 2 || t === 4;
 const NT = 5;
-const TOOLS = ['draw', 'bend', 'mark', 'cut', 'erase'];
-const TOOL_NAME = { draw: 'Draw', bend: 'Bend', mark: 'Mark', cut: 'Erase bits', erase: 'Erase lines' };
+const TOOLS = ['draw', 'bend', 'flatten', 'mark', 'cut', 'erase'];
+const TOOL_NAME = { draw: 'Draw', bend: 'Bend', flatten: 'Flatten', mark: 'Mark', cut: 'Erase bits', erase: 'Erase lines' };
 const TOOL_NOTE = {
   draw: 'Draw lines at the pen tip. Overlap them freely.',
   bend: 'Grab a line and pull. The pull fades out along the line; brush size sets how far.',
+  flatten: 'Sweep the sphere through your lines. It senses their average surface, curves included, and smoothly pulls the loose lines onto it.',
   mark: 'Brush over lines to make them the selected type.',
   cut: 'Brush over lines to rub out just those parts.',
   erase: 'Touch a line to remove the whole thing.'
@@ -251,6 +252,83 @@ function bendMove(b, p){
   b.mesh.geometry.dispose(); b.mesh.geometry = g;
   return Math.hypot(dx, dy, dz);
 }
+// ---------- flatten: sense the average surface of the lines inside a sphere and ease them onto it ----------
+const FLAT_K = 2.5;                                     // the flatten sphere is this many brush radii across
+const flatR = () => BRUSH[S.brush] * N() * FLAT_K;
+const movable = s => editable(s) && s.tag < 3 && !STRICT(s.tag);   // loose lines and averaged guides move
+const anchor = s => S.show[s.tag] && s.tag !== 3 && (STRICT(s.tag) || S.lock[s.tag]);   // strict and locked lines steer
+function jacobi3(A){ // eigenvectors of a symmetric 3x3, smallest eigenvalue first
+  const a = A.map(r => r.slice()), V = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 12; sweep++) for (const [p, q] of [[0, 1], [0, 2], [1, 2]]){
+    if (Math.abs(a[p][q]) < 1e-12) continue;
+    const th = 0.5 * Math.atan2(2 * a[p][q], a[q][q] - a[p][p]), c = Math.cos(th), s2 = Math.sin(th);
+    for (let k = 0; k < 3; k++){ const x = a[k][p], y = a[k][q]; a[k][p] = c * x - s2 * y; a[k][q] = s2 * x + c * y; }
+    for (let k = 0; k < 3; k++){ const x = a[p][k], y = a[q][k]; a[p][k] = c * x - s2 * y; a[q][k] = s2 * x + c * y; }
+    for (let k = 0; k < 3; k++){ const x = V[k][p], y = V[k][q]; V[k][p] = c * x - s2 * y; V[k][q] = s2 * x + c * y; }
+  }
+  return [0, 1, 2].map(i => ({ val: a[i][i], vec: [V[0][i], V[1][i], V[2][i]] })).sort((x, y) => x.val - y.val);
+}
+function solveN(A, b){ // Gaussian elimination with partial pivoting
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let i = 0; i < n; i++){ let pv = i; for (let k = i + 1; k < n; k++) if (Math.abs(M[k][i]) > Math.abs(M[pv][i])) pv = k; [M[i], M[pv]] = [M[pv], M[i]];
+    if (Math.abs(M[i][i]) < 1e-14) return null; for (let k = i + 1; k < n; k++){ const f = M[k][i] / M[i][i]; for (let j = i; j <= n; j++) M[k][j] -= f * M[i][j]; } }
+  const x = new Array(n).fill(0); for (let i = n - 1; i >= 0; i--){ let t = M[i][n]; for (let j = i + 1; j < n; j++) t -= M[i][j] * x[j]; x[i] = t / M[i][i]; }
+  return x;
+}
+// the local surface: a centre, a normal, and a gentle quadratic height over the tangent plane
+function senseSurface(c, R, prevN){
+  const pts = []; const R2 = R * R;
+  for (const s of strokes){ const mv = movable(s), an = anchor(s); if (!(mv || an) || !nearBox(s, c, R)) continue; const a = s.pts;
+    for (let i = 0; i < a.length; i += 3){ const dx = a[i] - c.x, dy = a[i + 1] - c.y, dz = a[i + 2] - c.z, d2 = dx * dx + dy * dy + dz * dz; if (d2 < R2){ const f = 1 - d2 / R2; pts.push([dx, dy, dz, f * f * (an ? 4 : 1)]); } } }
+  if (pts.length < 12) return null;
+  let W = 0; const m = [0, 0, 0]; for (const q of pts){ W += q[3]; m[0] += q[0] * q[3]; m[1] += q[1] * q[3]; m[2] += q[2] * q[3]; } m[0] /= W; m[1] /= W; m[2] /= W;
+  const C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (const q of pts){ const d = [q[0] - m[0], q[1] - m[1], q[2] - m[2]]; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) C[i][j] += q[3] * d[i] * d[j]; }
+  const E = jacobi3(C);
+  if (E[1].val < E[2].val * 0.04) return null;           // one line on its own: no surface to sense yet
+  let n = E[0].vec; if (prevN ? (n[0] * prevN[0] + n[1] * prevN[1] + n[2] * prevN[2]) < 0 : n[1] < 0) n = n.map(x => -x);
+  const t1 = E[2].vec, t2 = [n[1] * t1[2] - n[2] * t1[1], n[2] * t1[0] - n[0] * t1[2], n[0] * t1[1] - n[1] * t1[0]];
+  // weighted least squares for h(u,w) = a + b u + c w + d u² + e uw + f w², with the curvature kept gentle
+  const A = Array.from({ length: 6 }, () => new Array(6).fill(0)), b = new Array(6).fill(0);
+  for (const q of pts){ const u = q[0] * t1[0] + q[1] * t1[1] + q[2] * t1[2], w = q[0] * t2[0] + q[1] * t2[1] + q[2] * t2[2], h = q[0] * n[0] + q[1] * n[1] + q[2] * n[2];
+    const f = [1, u, w, u * u, u * w, w * w]; for (let i = 0; i < 6; i++){ b[i] += q[3] * f[i] * h; for (let j = 0; j < 6; j++) A[i][j] += q[3] * f[i] * f[j]; } }
+  const r2 = R * R; A[1][1] += 1e-3 * W * r2; A[2][2] += 1e-3 * W * r2; for (const i of [3, 4, 5]) A[i][i] += 0.006 * W * r2 * r2;
+  const k = solveN(A, b) || [b[0] / A[0][0], 0, 0, 0, 0, 0];
+  return { c, R, n, t1, t2, k, h: (u, w) => k[0] + k[1] * u + k[2] * w + k[3] * u * u + k[4] * u * w + k[5] * w * w };
+}
+// ease the movable lines toward the sensed surface; returns how far things moved (for the buzz)
+const flatCopies = new Map();
+function flattenAt(c, R, dt, prevN){
+  const F = senseSurface(c, R, prevN); if (!F) return { moved: 0, F: null };
+  const step = 1 - Math.pow(0.82, dt * 72), R2 = R * R; let moved = 0;
+  strokes = strokes.map(s => {
+    if (!movable(s) || !nearBox(s, c, R)) return s;
+    let t = flatCopies.get(s.id);
+    if (!t || t.src !== s){ const v = vis.get(s); t = { ...s, pts: s.pts.slice(), raw: s.raw.slice() }; if (v) vis.set(t, v); t.src = t; flatCopies.set(s.id, t); }
+    const a = t.pts, v = vis.get(t), geo = v && lineMeshes[v.t].geometry, pos = geo && geo.attributes.position;
+    let lo = Infinity, hi = -1;
+    for (let i = 0; i < a.length; i += 3){
+      const dx = a[i] - c.x, dy = a[i + 1] - c.y, dz = a[i + 2] - c.z, d2 = dx * dx + dy * dy + dz * dz; if (d2 >= R2) continue;
+      const u = dx * F.t1[0] + dy * F.t1[1] + dz * F.t1[2], w = dx * F.t2[0] + dy * F.t2[1] + dz * F.t2[2], hn = dx * F.n[0] + dy * F.n[1] + dz * F.n[2];
+      const f = (1 - d2 / R2) ** 2, off = (F.h(u, w) - hn) * f * step;
+      const mx = F.n[0] * off, my = F.n[1] * off, mz = F.n[2] * off;
+      a[i] += mx; a[i + 1] += my; a[i + 2] += mz; t.raw[i] += mx; t.raw[i + 1] += my; t.raw[i + 2] += mz; moved += Math.abs(off);
+      if (pos){ const j = i / 3, base = (v.v0 + (v.p0 + j) * SIDES) * 3; for (let k = 0; k < SIDES; k++){ pos.array[base + 3 * k] += mx; pos.array[base + 3 * k + 1] += my; pos.array[base + 3 * k + 2] += mz; } lo = Math.min(lo, base); hi = Math.max(hi, base + SIDES * 3); }
+    }
+    if (pos && hi > lo){ pos.addUpdateRange(lo, hi - lo); pos.needsUpdate = true; }
+    return t;
+  });
+  return { moved: moved / N(), F };
+}
+// a translucent disc showing the surface the flatten sphere senses
+const senseMesh = new THREE.Mesh(new THREE.CircleGeometry(1, 40), new THREE.MeshBasicMaterial({ color: 0xFFD23F, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false, depthTest: false }));
+senseMesh.renderOrder = 9; senseMesh.visible = false; world.add(senseMesh);
+function showSense(F){
+  if (!F){ senseMesh.visible = false; return; }
+  senseMesh.visible = true; senseMesh.scale.setScalar(F.R * 0.8);
+  const n = new V3(...F.n); senseMesh.position.set(F.c.x + n.x * F.k[0], F.c.y + n.y * F.k[0], F.c.z + n.z * F.k[0]);
+  senseMesh.quaternion.setFromUnitVectors(new V3(0, 0, 1), n);
+}
 function setSmooth(lv){ S.smooth = lv; strokes = strokes.map(s => { const n = { ...s, pts: smoothed(s.raw, lv) }; n.box = boxOf(n.pts); return n; }); undoS = []; redoS = []; changed(); }
 
 // ---------- drawing lines as thin tubes (1px lines vanish in a headset) ----------
@@ -279,7 +357,7 @@ function tubeFor(s){ const r = HAND_R * N() * (STRICT(s.tag) ? 1.8 : 1); let t =
 function mergeInto(geo, list, layer){
   let nv = 0, ni = 0; const ts = list.map(tubeFor); for (const t of ts){ nv += t.pos.length; ni += t.idx.length; }
   const pos = new Float32Array(nv), nrm = new Float32Array(nv), idx = new Uint32Array(ni); let ov = 0, oi = 0;
-  for (const [k, t] of ts.entries()){ if (layer !== undefined) vis.set(list[k], { t: layer, i0: oi, p0: 0, last: list[k].pts.length / 3 - 1 }); pos.set(t.pos, ov); nrm.set(t.nrm, ov); const base = ov / 3; for (let i = 0; i < t.idx.length; i++) idx[oi + i] = t.idx[i] + base; ov += t.pos.length; oi += t.idx.length; }
+  for (const [k, t] of ts.entries()){ if (layer !== undefined) vis.set(list[k], { t: layer, i0: oi, v0: ov / 3, p0: 0, last: list[k].pts.length / 3 - 1 }); pos.set(t.pos, ov); nrm.set(t.nrm, ov); const base = ov / 3; for (let i = 0; i < t.idx.length; i++) idx[oi + i] = t.idx[i] + base; ov += t.pos.length; oi += t.idx.length; }
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3)); geo.setIndex(new THREE.BufferAttribute(idx, 1));
   geo.computeBoundingSphere();
 }
@@ -468,7 +546,7 @@ menuMesh.position.set(0, 0.07 + MENU_H / 2 * Math.cos(0.55), -0.02 - MENU_H / 2 
 let menuDirty = true, menuHover = null, menuPressed = null, flashText = '', flashT = 0, menuTab = 'sketch', menuShown = true, clearArmed = 0;
 function flash(t){ flashText = t; flashT = 2.6; menuDirty = true; const s = $('#status'); if (s && !renderer.xr.isPresenting) s.textContent = t; }
 const BTN = [], TXT = [];
-function setTool(t){ S.tool = t; menuDirty = true; scheduleSave(); }
+function setTool(t){ S.tool = t; menuDirty = true; scheduleSave(); if (t !== 'flatten') showSense(null); }
 function setTag(t){ S.tag = t; menuDirty = true; scheduleSave(); }
 function cycleTag(d){ setTag((S.tag + d + NT) % NT); flash(TAG_NAME[S.tag] + ': ' + TAG_SUB[S.tag]); }
 function clearAll(){
@@ -476,7 +554,8 @@ function clearAll(){
   clearArmed = 0; commit([]); flash('Cleared. Undo brings it back.');
 }
 function loadSample(){
-  const st = window.PentimentoDemo.demoSketch(Math.floor(Math.random() * 1000));
+  const seed = +new URLSearchParams(location.search).get('seed') || Math.floor(Math.random() * 1000);
+  const st = window.PentimentoDemo.demoSketch(seed);
   commit(st.map(o => { const raw = Float32Array.from(o.pts); return makeStroke(o.tag, raw, smoothed(raw, Math.min(S.smooth, 2))); }));
   if (!renderer.xr.isPresenting){ if (world.scale.x > 0.2 || world.scale.x < 0.05) world.scale.setScalar(0.1); needsFit = true; }
   else { const xc = renderer.xr.getCamera(), p = new V3(), q = new THREE.Quaternion(); xc.getWorldPosition(p); xc.getWorldQuaternion(q); fitView({ p, q }); }
@@ -505,16 +584,17 @@ function loadSample(){
   row(null, 250, 74, [['sketch', 'Sketch'], ['layers', 'Layers'], ['surface', 'Surface']].map(([t, n]) => ({ id: 'tab-' + t, style: 'tab', label: () => n, on: () => menuTab === t, act: () => { menuTab = t; } })));
   // SKETCH
   text({ tab: 'sketch', kind: 'label', x: P, y: 360, text: () => 'TOOL' });
-  row('sketch', 382, 90, TOOLS.map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => S.tool === t, act: () => setTool(t) })));
-  text({ tab: 'sketch', kind: 'note', x: P, y: 500, text: () => TOOL_NOTE[S.tool] });
-  text({ tab: 'sketch', kind: 'label', x: P, y: 586, text: () => 'LINE TYPE' });
+  row('sketch', 382, 76, TOOLS.slice(0, 3).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => S.tool === t, act: () => setTool(t) })));
+  row('sketch', 468, 76, TOOLS.slice(3).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => S.tool === t, act: () => setTool(t) })));
+  text({ tab: 'sketch', kind: 'note', x: P, y: 572, text: () => TOOL_NOTE[S.tool] });
+  text({ tab: 'sketch', kind: 'label', x: P, y: 660, text: () => 'LINE TYPE' });
   const cw = (MW - 2 * P - 2 * G) / 3;
-  [0, 1, 3].forEach((t, i) => add({ tab: 'sketch', id: 'tag-' + t, x: P + i * (cw + G), y: 608, w: cw, h: 104, label: () => TAG_NAME[t], sub: () => TAG_SUB[t], swatch: t, on: () => S.tag === t, act: () => setTag(t) }));
-  [2, 4].forEach((t, i) => add({ tab: 'sketch', id: 'tag-' + t, x: P + (i + 1) * (cw + G), y: 722, w: cw, h: 104, label: () => TAG_NAME[t], sub: () => TAG_SUB[t], swatch: t, on: () => S.tag === t, act: () => setTag(t) }));
-  text({ tab: 'sketch', kind: 'note', x: P, y: 756, w: cw, text: () => 'Strict lines are used exactly as drawn.' });
-  stepper('sketch', 846, 82, 'Line smoothing', () => String(S.smooth), () => setSmooth(Math.max(0, S.smooth - 1)), () => setSmooth(Math.min(10, S.smooth + 1)));
-  stepper('sketch', 938, 82, 'Brush size', () => Math.round(BRUSH[S.brush] * 100 * 10) / 10 + ' cm', () => { S.brush = Math.max(0, S.brush - 1); scheduleSave(); }, () => { S.brush = Math.min(BRUSH.length - 1, S.brush + 1); scheduleSave(); });
-  stepper('sketch', 1030, 82, 'Model size', scaleText, () => stepScale(1), () => stepScale(-1));
+  [0, 1, 3].forEach((t, i) => add({ tab: 'sketch', id: 'tag-' + t, x: P + i * (cw + G), y: 682, w: cw, h: 96, label: () => TAG_NAME[t], sub: () => TAG_SUB[t], swatch: t, on: () => S.tag === t, act: () => setTag(t) }));
+  [2, 4].forEach((t, i) => add({ tab: 'sketch', id: 'tag-' + t, x: P + (i + 1) * (cw + G), y: 788, w: cw, h: 96, label: () => TAG_NAME[t], sub: () => TAG_SUB[t], swatch: t, on: () => S.tag === t, act: () => setTag(t) }));
+  text({ tab: 'sketch', kind: 'note', x: P, y: 818, w: cw, text: () => 'Strict lines are used exactly as drawn.' });
+  stepper('sketch', 900, 78, 'Line smoothing', () => String(S.smooth), () => setSmooth(Math.max(0, S.smooth - 1)), () => setSmooth(Math.min(10, S.smooth + 1)));
+  stepper('sketch', 986, 78, 'Brush size', () => Math.round(BRUSH[S.brush] * 100 * 10) / 10 + ' cm', () => { S.brush = Math.max(0, S.brush - 1); scheduleSave(); }, () => { S.brush = Math.min(BRUSH.length - 1, S.brush + 1); scheduleSave(); });
+  stepper('sketch', 1072, 78, 'Model size', scaleText, () => stepScale(1), () => stepScale(-1));
   // LAYERS: one row per line type, with show and lock
   for (let t = 0; t < NT; t++){
     const y = 352 + t * 100, h = 88, bw = 170;
@@ -620,6 +700,7 @@ function toolDown(id, p){
   if (S.tool === 'draw'){ const d = { kind: 'draw', raw: [p.x, p.y, p.z], mesh: liveMesh(), n: 0 }; return d; }
   beginEdit();
   if (S.tool === 'bend'){ const b = bendStart(p, BRUSH[S.brush] * N()); return { kind: 'bend', b, did: false }; }
+  if (S.tool === 'flatten'){ flatCopies.clear(); return { kind: 'flatten', did: false, n: null }; }
   const d = { kind: S.tool, did: false }; toolMove(id, d, p); return d;
 }
 function toolMove(id, d, p){
@@ -630,6 +711,7 @@ function toolMove(id, d, p){
     d.raw.push(p.x, p.y, p.z); if (++d.n % 2 === 0) updateLive(d); return;
   }
   let amt = 0;
+  if (d.kind === 'flatten'){ const r2 = flattenAt(p, flatR(), d.dt || 1 / 72, d.n); if (r2.F) d.n = r2.F.n; showSense(r2.F); if (r2.moved > 1e-5) d.did = true; return r2.moved; }
   if (d.kind === 'bend'){ if (d.b){ amt = bendMove(d.b, p); if (amt > 1e-6) d.did = true; } return amt; }
   if (d.kind === 'cut') amt = cutAt(p, r);
   else if (d.kind === 'erase') amt = eraseAt(p, r);
@@ -644,6 +726,7 @@ function toolUp(id, d){
     return;
   }
   if (d.kind === 'bend' && d.b){ world.remove(d.b.mesh); d.b.mesh.geometry.dispose(); linesDirty = true; }
+  if (d.kind === 'flatten'){ for (const t of flatCopies.values()){ t.box = boxOf(t.pts); delete t.src; } flatCopies.clear(); showSense(null); linesDirty = true; }
   endEdit(d.did);
 }
 const drawing = () => hands.some(h => h.act) || !!mouseAct;
@@ -717,12 +800,14 @@ function updateXRInput(dt){
     if (mHit){ hover = mHit.b || hover; h.beam.visible = true; h.beam.scale.z = mHit.dist; }
     h.tip.visible = h.stem.visible = !mHit;
     const pw = penWorld(h), p = toPark(pw);
-    h.tip.material.color.setHex(S.tool === 'cut' || S.tool === 'erase' ? 0xF04348 : S.tool === 'bend' ? 0xFFD23F : TAG_COL[S.tag]);
+    h.tip.material.color.setHex(S.tool === 'cut' || S.tool === 'erase' ? 0xF04348 : S.tool === 'bend' || S.tool === 'flatten' ? 0xFFD23F : TAG_COL[S.tag]);
+    if (S.tool === 'flatten' && (mHit || h.grab)) showSense(null);
     if (S.tool !== 'draw' && !mHit && !h.grab){
-      h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush]);
-      h.brush.material.color.setHex(S.tool === 'mark' ? TAG_COL[S.tag] : S.tool === 'bend' ? 0xFFD23F : 0xF04348);
+      h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush] * (S.tool === 'flatten' ? FLAT_K : 1));
+      h.brush.material.color.setHex(S.tool === 'mark' ? TAG_COL[S.tag] : S.tool === 'bend' || S.tool === 'flatten' ? 0xFFD23F : 0xF04348);
       const r = BRUSH[S.brush] * N();
-      if (S.tool === 'bend'){ const live = h.act && h.act.b ? strokes.find(s => s.id === h.act.b.id) : null; if (live) hi.push(live); else { const b = bendStart(p, r); if (b) hi.push(b.base); } }
+      if (S.tool === 'flatten'){ if (!h.act) showSense(senseSurface(p, flatR(), null)); }
+      else if (S.tool === 'bend'){ const live = h.act && h.act.b ? strokes.find(s => s.id === h.act.b.id) : null; if (live) hi.push(live); else { const b = bendStart(p, r); if (b) hi.push(b.base); } }
       else if (S.tool !== 'cut'){ for (const s of strokes) if (editable(s) && (S.tool === 'erase' || s.tag !== S.tag) && touches(s, p, r)) hi.push(s); }
     }
     // grip: move the model
@@ -734,12 +819,15 @@ function updateXRInput(dt){
       else if (!mHit){ h.act = toolDown(h.i, p); pulse(h, 0.25, 10); }
     }
     if (h.act && pressed(0)){
+      h.act.dt = dt;
       const amt = toolMove(h.i, h.act, p) || 0, k = h.act.kind;
       if (k === 'draw'){ if (h.act.n % 8 === 0) pulse(h, 0.04, 4); }
       // the buzz follows the erasing: stronger the more you rub out this frame, a hard knock per whole line
       else if (k === 'cut' && amt){ pulse(h, Math.min(1, 0.25 + amt * 0.04), 30); h.flash = 1; }
       else if (k === 'erase' && amt){ pulse(h, Math.min(1, 0.7 + amt * 0.1), 45); h.flash = 1; }
       else if (k === 'mark' && amt){ pulse(h, 0.35, 25); h.flash = 1; }
+      // flatten: you feel the lines settle, strong while they're far off and fading as they land
+      else if (k === 'flatten' && amt > 0.00002){ pulse(h, Math.min(0.9, 0.06 + amt * 6), 20); h.flash = Math.min(1, amt * 20); }
       else if (k === 'bend' && h.act.b){ const d = amt - (h.act.lastPull || 0); if (Math.abs(d) > 0.004 * N()){ pulse(h, Math.min(0.6, 0.08 + Math.abs(d) / N() * 20), 12); h.act.lastPull = amt; } }
     }
     h.flash = Math.max(0, (h.flash || 0) - dt * 6);
@@ -798,13 +886,14 @@ renderer.domElement.addEventListener('pointermove', e => {
   const ray = mouseRay(e);
   if (!mouseAct){
     if (!renderer.xr.isPresenting && S.tool !== 'draw' && S.tool !== 'cut'){ const p = nearestLinePoint(ray); const r = BRUSH[S.brush] * N();
-      if (S.tool === 'bend'){ const b = p && bendStart(p, r); setHighlight(b ? [b.base] : []); }
+      if (S.tool === 'flatten'){ showSense(p ? senseSurface(p, flatR(), null) : null); }
+      else if (S.tool === 'bend'){ const b = p && bendStart(p, r); setHighlight(b ? [b.base] : []); }
       else setHighlight(p ? strokes.filter(s => editable(s) && (S.tool === 'erase' || s.tag !== S.tag) && touches(s, p, r)) : []); }
     else if (!renderer.xr.isPresenting) setHighlight([]);
     return;
   }
   if (mouseAct.kind === 'draw' || mouseAct.kind === 'bend'){ const w = drawPlane && ray.intersectPlane(drawPlane, new V3()); if (w) toolMove('m', mouseAct, toPark(w)); }
-  else { const p = nearestLinePoint(ray); if (p) toolMove('m', mouseAct, p); }
+  else { const p = nearestLinePoint(ray); if (p){ mouseAct.dt = 1 / 30; toolMove('m', mouseAct, p); } }
 });
 const endMouse = () => { if (mouseAct){ toolUp('m', mouseAct); mouseAct = null; } };
 renderer.domElement.addEventListener('pointerup', endMouse); renderer.domElement.addEventListener('pointercancel', endMouse);
@@ -817,7 +906,7 @@ addEventListener('keydown', e => {
   else if (e.key >= '1' && e.key <= '5') setTag(+e.key - 1);
   else if (k === 'd') setTool('draw'); else if (k === 'b') setTool('bend'); else if (k === 'm') setTool('mark'); else if (k === 'x') setTool('cut'); else if (k === 'e') setTool('erase');
   else if (k === 's') setSurfView(S.surf === 'hide' ? 'shaded' : S.surf === 'shaded' ? 'quads' : 'hide');
-  else if (k === 'f') needsFit = true;
+  else if (k === 'f') setTool('flatten'); else if (k === 'v') needsFit = true;
 });
 // on a computer, the same menu sits at the right edge of the screen
 { const wrap = $('#menuWrap'); wrap.appendChild(menuCanvas);
@@ -865,6 +954,8 @@ setupButtons();
 // ======================================================================
 // Loop
 // ======================================================================
+// a small handle for automated testing
+window.pentimento = { get strokes(){ return strokes; }, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid();
 if (strokes.length) scheduleBuild();
 let last = performance.now(), lastLines = 0;

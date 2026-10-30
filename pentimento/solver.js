@@ -401,6 +401,7 @@ function vertexNormals(M){
   for (let t = 0; t < M.tdead.length; t++){ if (M.tdead[t]) continue; const n = M.triN(t); for (let i = 0; i < 3; i++){ const v = M.T[3 * t + i]; N[v][0] += n[0]; N[v][1] += n[1]; N[v][2] += n[2]; } }
   return N.map(norm);
 }
+let WB = new Float64Array(64), GU = new Float64Array(64), GW = new Float64Array(64), RW = new Float64Array(64);
 function fitStep(M, samples, curves, o){
   const nv = M.x.length, N = vertexNormals(M), nb = [], bnd = new Uint8Array(nv);
   for (let v = 0; v < nv; v++) nb.push(M.nbrs(v));
@@ -451,18 +452,31 @@ function fitStep(M, samples, curves, o){
     // fit a small plane to the nearby line samples (in the vertex's tangent frame) and take where it
     // crosses the normal. A plain average is biased wherever all the lines sit to one side (the edges).
     const t1 = norm(Math.abs(n[1]) < 0.9 ? [n[2], 0, -n[0]] : [0, -n[2], n[1]]), t2 = [n[1] * t1[2] - n[2] * t1[1], n[2] * t1[0] - n[0] * t1[2], n[0] * t1[1] - n[1] * t1[0]];
-    let W = 0, Su = 0, Sw = 0, Suu = 0, Suw = 0, Sww = 0, Sn = 0, Sun = 0, Swn = 0;
-    for (let i = 0; i < gk.length; i++){ const q = samples[gk[i]].p, w = samples[gk[i]].w * Math.exp(-gt[i] * ir2 - gn[i] * gn[i] * ihn2);
-      const dx = q[0] - p[0], dy = q[1] - p[1], dz = q[2] - p[2], u = dx * t1[0] + dy * t1[1] + dz * t1[2], ww = dx * t2[0] + dy * t2[1] + dz * t2[2];
-      W += w; Su += w * u; Sw += w * ww; Suu += w * u * u; Suw += w * u * ww; Sww += w * ww * ww; Sn += w * gn[i]; Sun += w * u * gn[i]; Swn += w * ww * gn[i]; }
-    let dataN = W > 1e-9 ? Sn / W : 0;
-    if (W > 1e-6){
+    // base weights, and each sample's position in the tangent frame
+    const m = gk.length; if (WB.length < m){ WB = new Float64Array(m * 2); GU = new Float64Array(m * 2); GW = new Float64Array(m * 2); RW = new Float64Array(m * 2); }
+    for (let i = 0; i < m; i++){ const q = samples[gk[i]].p, dx = q[0] - p[0], dy = q[1] - p[1], dz = q[2] - p[2];
+      WB[i] = samples[gk[i]].w * Math.exp(-gt[i] * ir2 - gn[i] * gn[i] * ihn2); GU[i] = dx * t1[0] + dy * t1[1] + dz * t1[2]; GW[i] = dx * t2[0] + dy * t2[1] + dz * t2[2]; RW[i] = 1; }
+    // plane fit: offset a0 plus slopes; then refit twice, trusting less the samples far off the plane
+    // (a line that floated up, an overshoot into the air), so the bulk of your lines decides
+    let W = 0, dataN = 0, a0 = 0, b1 = 0, b2 = 0;
+    for (let pass = 0; pass < (o.robust ? 3 : 1); pass++){
+      W = 0; let Su = 0, Sw = 0, Suu = 0, Suw = 0, Sww = 0, Sn = 0, Sun = 0, Swn = 0;
+      for (let i = 0; i < m; i++){ const w = WB[i] * RW[i], u = GU[i], ww = GW[i], dn = gn[i];
+        W += w; Su += w * u; Sw += w * ww; Suu += w * u * u; Suw += w * u * ww; Sww += w * ww * ww; Sn += w * dn; Sun += w * u * dn; Swn += w * ww * dn; }
+      if (W <= 1e-9) break;
+      dataN = Sn / W; a0 = dataN; b1 = b2 = 0;
       const lam = 0.03 * W * r2, a11 = Suu + lam, a22 = Sww + lam;
       const det = W * (a11 * a22 - Suw * Suw) - Su * (Su * a22 - Suw * Sw) + Sw * (Su * Suw - a11 * Sw);
       if (Math.abs(det) > 1e-12){
-        const a0 = (Sn * (a11 * a22 - Suw * Suw) - Su * (Sun * a22 - Suw * Swn) + Sw * (Sun * Suw - a11 * Swn)) / det;
-        if (isFinite(a0) && Math.abs(a0) < Math.sqrt(r2) * 2) dataN = a0;
+        const A0 = (Sn * (a11 * a22 - Suw * Suw) - Su * (Sun * a22 - Suw * Swn) + Sw * (Sun * Suw - a11 * Swn)) / det;
+        const B1 = (W * (Sun * a22 - Suw * Swn) - Sn * (Su * a22 - Suw * Sw) + Sw * (Su * Swn - Sun * Sw)) / det;
+        const B2 = (W * (a11 * Swn - Sun * Suw) - Su * (Su * Swn - Sun * Sw) + Sn * (Su * Suw - a11 * Sw)) / det;
+        if (isFinite(A0) && Math.abs(A0) < Math.sqrt(r2) * 2){ a0 = A0; b1 = B1; b2 = B2; dataN = A0; }
       }
+      if (!o.robust) break;
+      let rr = 0; for (let i = 0; i < m; i++){ const res = gn[i] - (a0 + b1 * GU[i] + b2 * GW[i]); rr += WB[i] * RW[i] * res * res; }
+      const sig = Math.max(Math.sqrt(rr / W), o.L * 0.15), c2 = 1 / (sig * sig * 1.5);
+      for (let i = 0; i < m; i++){ const res = gn[i] - (a0 + b1 * GU[i] + b2 * GW[i]); RW[i] = 1 / (1 + res * res * c2); }
     }
     const c = W / (W + 0.4);
     const ring = nb[v];
@@ -699,7 +713,7 @@ function solve(strokes, prm, progress = () => {}){
   const aA = Math.max(L * 2, h * 0.9);
   const M = startSheet(samples, aA, prm.reach, h);
   if (!M.tdead.length) return { empty: true, curves: [] };
-  const base = { fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4 };
+  const base = { fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4, robust: prm.robust !== false };
   // coarse fit
   for (let it = 0; it < 6; it++){
     remesh(M, aA, 0.6);
