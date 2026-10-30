@@ -41,6 +41,10 @@
   #banner{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);text-align:center;padding:22px 30px;border-radius:14px;
     background:var(--chalk);color:var(--ink);pointer-events:none;max-width:calc(100vw - 48px);box-sizing:border-box}
   #banner[hidden]{display:none}
+  #toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);padding:9px 16px;border-radius:999px;background:var(--chalk);color:var(--ink);
+    font:600 15px var(--body);border-left:8px solid var(--ruby);pointer-events:none}
+  #toast[hidden]{display:none}
+  button.toggle[aria-pressed="true"]{border-color:var(--ruby)}
   #banner strong{display:block;font:800 26px/1.1 var(--title)}
   #banner span{display:block;margin-top:8px;font-size:15px}
   @media (prefers-reduced-motion:reduce){ *{transition:none!important} }
@@ -54,14 +58,17 @@
   </div>
   <div class="sky">
     <span class="under" aria-hidden="true">Space</span>
-    <p>Melt down to <b>your ruby</b>, buried somewhere below you. Guard the <span class="ruby">red ruby</span> floating in your sky before Black's towers swallow it.</p>
-    <p>Orbs change your laser for 15 seconds: <b>gold</b> is wide, <b>blue</b> is fast, <b>orange</b> fires bursts that blow out a sphere. White orbs with a red ring give you a compass to your ruby.</p>
+    <p><b>Your ruby</b> is buried somewhere under the ground. Melt down to it and grab it to win.</p>
+    <p>The <span class="ruby">floating ruby</span> is Black's target. If one of their towers swallows it, you lose. Drag it away or melt the towers.</p>
+    <p>Orbs change your laser for 15 seconds: <b>gold</b> is wide, <b>blue</b> is fast, <b>orange</b> is a grenade launcher. White orbs with a red ring give you a compass to your ruby.</p>
     <div class="row">
       <button id="vr" disabled>Enter VR</button>
       <button id="desk" class="ghost">Play on desktop</button>
+      <button id="hide" class="ghost toggle" aria-pressed="true">I hide Black's ruby</button>
       <button id="again" class="ghost" hidden>New game</button>
     </div>
     <p id="status">Checking for a headset…</p>
+    <p>Hiding on: you get 45 seconds to place Black's ruby before they start digging.</p>
     <details>
       <summary>Controls</summary>
       <h2>Quest</h2>
@@ -73,6 +80,8 @@
         <dt>Grips</dt><dd>Grab rock to climb. Let go mid-pull to fling yourself.</dd>
         <dt>Grip ruby</dt><dd>Drag the floating ruby somewhere safer. It moves slowly, and slips if you pull too far.</dd>
         <dt>Y</dt><dd>Sense Black's diggers through the rock</dd>
+        <dt>B</dt><dd>How to play</dd>
+        <dt>Hiding</dt><dd>Hold the ruby out and pull a trigger to place it</dd>
       </dl>
       <h2>Desktop</h2>
       <dl>
@@ -82,11 +91,13 @@
         <dt>E</dt><dd>Drag or let go of the floating ruby</dd>
         <dt>Q</dt><dd>Sense Black's diggers</dd>
         <dt>R</dt><dd>New game</dd>
+        <dt>Hiding</dt><dd>Look where you want the ruby and click</dd>
       </dl>
     </details>
   </div>
 </div>
 <div id="cross"></div>
+<div id="toast" hidden></div>
 <div id="banner" hidden><strong></strong><span></span></div>
 
 <script type="importmap">
@@ -424,27 +435,54 @@ function updatePuffs(dt){
 }
 
 // ================================================================ audio
-let AC = null, master, laserGain, laserOsc, sizzleGain;
+let AC = null, master, laserGain, oscA, oscB, lfo, lfoGain, laserLP, sizzleGain, sizzleBP, noiseBuf;
 function unlockAudio(){
   if (AC){ AC.resume(); return; }
   try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
   master = AC.createGain(); master.gain.value = 0.55; master.connect(AC.destination);
-  laserOsc = AC.createOscillator(); laserOsc.type = 'sawtooth'; laserOsc.frequency.value = 90;
-  const lf = AC.createBiquadFilter(); lf.type = 'lowpass'; lf.frequency.value = 700;
+  // the laser voice: two oscillators, a wobble, a filter. Each power reshapes it
+  oscA = AC.createOscillator(); oscB = AC.createOscillator(); oscA.type = oscB.type = 'sawtooth';
+  lfo = AC.createOscillator(); lfoGain = AC.createGain(); lfoGain.gain.value = 0; lfo.connect(lfoGain);
+  lfoGain.connect(oscA.frequency); lfoGain.connect(oscB.frequency);
+  laserLP = AC.createBiquadFilter(); laserLP.type = 'lowpass'; laserLP.frequency.value = 700;
   laserGain = AC.createGain(); laserGain.gain.value = 0;
-  laserOsc.connect(lf).connect(laserGain).connect(master); laserOsc.start();
-  const buf = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate), d = buf.getChannelData(0);
-  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
-  const src = AC.createBufferSource(); src.buffer = buf; src.loop = true;
-  const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 3000; bp.Q.value = 0.7;
+  const mixB = AC.createGain(); mixB.gain.value = 0.6;
+  oscA.connect(laserLP); oscB.connect(mixB).connect(laserLP); laserLP.connect(laserGain).connect(master);
+  oscA.start(); oscB.start(); lfo.start();
+  noiseBuf = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate);
+  const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const src = AC.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+  sizzleBP = AC.createBiquadFilter(); sizzleBP.type = 'bandpass'; sizzleBP.frequency.value = 3000; sizzleBP.Q.value = 0.7;
   sizzleGain = AC.createGain(); sizzleGain.gain.value = 0;
-  src.connect(bp).connect(sizzleGain).connect(master); src.start();
+  src.connect(sizzleBP).connect(sizzleGain).connect(master); src.start();
 }
+const VOICE = {                 // f: pitch, f2: second oscillator, cut: filter, wob: wobble rate/depth, vol, hiss: sizzle pitch
+  base: { type: 'sawtooth', f: 92,  f2: 93,  cut: 700,  q: 1, wobR: 0,  wobD: 0,  vol: 0.09, hiss: 3000 },
+  wide: { type: 'sawtooth', f: 46,  f2: 69,  cut: 420,  q: 6, wobR: 5,  wobD: 3,  vol: 0.16, hiss: 1300 },
+  fast: { type: 'square',   f: 215, f2: 219, cut: 2600, q: 2, wobR: 22, wobD: 45, vol: 0.05, hiss: 5200 },
+  both: { type: 'square',   f: 110, f2: 165, cut: 1500, q: 5, wobR: 14, wobD: 25, vol: 0.08, hiss: 2600 },
+};
+let voiceNow = '';
 function laserSound(firing, melting){
   if (!AC) return; const t = AC.currentTime;
-  laserGain.gain.setTargetAtTime(firing ? 0.09 : 0, t, 0.03);
-  laserOsc.frequency.setTargetAtTime(firing ? 88 + Math.random() * 30 : 70, t, 0.05);
+  const k = powOn('fast') && powOn('wide') ? 'both' : powOn('fast') ? 'fast' : powOn('wide') ? 'wide' : 'base', v = VOICE[k];
+  if (k !== voiceNow){
+    voiceNow = k; oscA.type = oscB.type = v.type;
+    laserLP.Q.setTargetAtTime(v.q, t, 0.05); lfo.frequency.setTargetAtTime(v.wobR || 0.01, t, 0.05);
+    lfoGain.gain.setTargetAtTime(v.wobD, t, 0.05); sizzleBP.frequency.setTargetAtTime(v.hiss, t, 0.05);
+  }
+  const j = 1 + (Math.random() - 0.5) * 0.12;
+  oscA.frequency.setTargetAtTime(v.f * j, t, 0.05); oscB.frequency.setTargetAtTime(v.f2 * j, t, 0.05);
+  laserLP.frequency.setTargetAtTime(firing ? v.cut : 200, t, 0.04);
+  laserGain.gain.setTargetAtTime(firing ? v.vol : 0, t, 0.03);
   sizzleGain.gain.setTargetAtTime(melting ? 0.16 : 0, t, 0.05);
+}
+function noise(dur, vol, cutFrom, cutTo, type = 'lowpass', delay = 0){
+  if (!AC) return;
+  const t = AC.currentTime + delay, src = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  src.buffer = noiseBuf; f.type = type; f.frequency.setValueAtTime(cutFrom, t); f.frequency.exponentialRampToValueAtTime(cutTo, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f).connect(g).connect(master); src.start(t, Math.random()); src.stop(t + dur + 0.05);
 }
 function tone(freq, dur, type = 'sine', vol = 0.18, slideTo = 0, delay = 0){
   if (!AC) return;
@@ -478,6 +516,98 @@ function drawPanel(title, lines, dark){
   for (const l of lines){ x.fillStyle = l.startsWith('!') ? '#e0103a' : (dark ? '#c9cdd3' : '#2a2d33'); x.fillText(l.replace(/^!/, ''), 56, y); y += 52; }
   panel.tex.needsUpdate = true;
 }
+// small camera-facing text labels
+function makeLabel(w = 0.62){
+  const c = document.createElement('canvas'); c.width = 768; c.height = 160;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, fog: false }));
+  sp.material.toneMapped = false; sp.renderOrder = 90; sp.scale.set(w, w * 160 / 768, 1); sp.visible = false; scene.add(sp);
+  return { sp, c, tex, key: '' };
+}
+function setLabel(L, line1, line2 = '', accent = '#e0103a'){
+  const key = line1 + '|' + line2 + accent; if (L.key === key) return; L.key = key;
+  const x = L.c.getContext('2d'); x.clearRect(0, 0, 768, 160);
+  x.font = '600 46px "Instrument Sans", system-ui, sans-serif';
+  let w = x.measureText(line1).width;
+  if (line2){ x.font = '400 36px "Instrument Sans", system-ui, sans-serif'; w = Math.max(w, x.measureText(line2).width); }
+  w = Math.min(760, w + 80);
+  x.fillStyle = 'rgba(230,233,236,.94)'; x.beginPath(); x.roundRect((768 - w) / 2, line2 ? 4 : 40, w, line2 ? 152 : 80, 28); x.fill();
+  x.fillStyle = accent; x.fillRect((768 - w) / 2 + 22, line2 ? 30 : 64, 10, line2 ? 100 : 32);
+  x.textAlign = 'center'; x.fillStyle = '#16181c';
+  x.font = '600 46px "Instrument Sans", system-ui, sans-serif'; x.fillText(line1, 394, line2 ? 64 : 96);
+  if (line2){ x.font = '400 36px "Instrument Sans", system-ui, sans-serif'; x.fillStyle = '#3b3f46'; x.fillText(line2, 394, 120); }
+  L.tex.needsUpdate = true;
+}
+const skyLabel = makeLabel(0.75), gunLabel = makeLabel(0.5);
+let gunLabelT = 0;
+function toast(text, colorHex){
+  gunLabelT = 1.8;
+  const col = '#' + colorHex.toString(16).padStart(6, '0');
+  setLabel(gunLabel, text, '', col);
+  if (!inXR()){ const t = $('toast'); t.textContent = text; t.style.borderColor = col; t.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => t.hidden = true, 1800); }
+}
+
+// the how-to panel
+const help = (() => {
+  const c = document.createElement('canvas'); c.width = 1024; c.height = 820;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2 * 820 / 1024), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
+  m.material.toneMapped = false; m.renderOrder = 101; m.visible = false; scene.add(m);
+  return { m, c, tex };
+})();
+function wrap(x, text, X, Y, maxW, lh){
+  let line = '', y = Y;
+  for (const w of text.split(' ')){
+    const t = line ? line + ' ' + w : w;
+    if (x.measureText(t).width > maxW && line){ x.fillText(line, X, y); line = w; y += lh; } else line = t;
+  }
+  if (line) x.fillText(line, X, y);
+  return y + lh;
+}
+function gemIcon(x, cx, cy, s, glow){
+  if (glow){ const g = x.createRadialGradient(cx, cy, 0, cx, cy, s * 1.9); g.addColorStop(0, 'rgba(255,40,80,.55)'); g.addColorStop(1, 'rgba(255,40,80,0)'); x.fillStyle = g; x.fillRect(cx - s * 2, cy - s * 2, s * 4, s * 4); }
+  x.fillStyle = '#d80c34'; x.beginPath(); x.moveTo(cx, cy + s * 1.1); x.lineTo(cx + s * 0.85, cy - s * 0.15); x.lineTo(cx + s * 0.5, cy - s * 0.55);
+  x.lineTo(cx - s * 0.5, cy - s * 0.55); x.lineTo(cx - s * 0.85, cy - s * 0.15); x.closePath(); x.fill();
+}
+function drawHelp(){
+  const x = help.c.getContext('2d'), W = 1024, H = 820;
+  x.clearRect(0, 0, W, H);
+  x.fillStyle = '#e6e9ec'; x.beginPath(); x.roundRect(4, 4, W - 8, H - 8, 36); x.fill();
+  x.fillStyle = '#000'; x.beginPath(); x.roundRect(4, 520, W - 8, H - 524, [0, 0, 36, 36]); x.fill();
+  x.fillStyle = '#16181c'; x.font = '800 54px Unbounded, system-ui, sans-serif'; x.fillText('How to play', 56, 96);
+  const body = '400 30px "Instrument Sans", system-ui, sans-serif', bold = '600 32px "Instrument Sans", system-ui, sans-serif';
+  gemIcon(x, 92, 188, 26, false);
+  x.fillStyle = '#16181c'; x.font = bold; x.fillText('Your ruby is buried under the ground', 150, 180);
+  x.font = body; x.fillStyle = '#3b3f46';
+  let y = wrap(x, 'Melt down to it with your laser, then grip it to win. A red ping pulses through the rock when you are close.', 150, 222, 820, 40);
+  gemIcon(x, 92, y + 50, 26, true);
+  x.fillStyle = '#16181c'; x.font = bold; x.fillText('The floating ruby is Black\'s target', 150, y + 42);
+  x.font = body; x.fillStyle = '#3b3f46';
+  wrap(x, 'Black digs upside down under your ground, and every tunnel rises here as a tower. If a tower swallows this ruby, you lose. Grip it to drag it away, or melt the tower tips.', 150, y + 84, 820, 40);
+  const orbsRow = [['#f5c518', 'Gold', 'wide beam'], ['#4da3ff', 'Blue', 'fast beam'], ['#ff7a1a', 'Orange', 'grenades'], ['#f2f4f7', 'Ringed', 'compass']];
+  x.font = bold; x.fillStyle = '#e6e9ec'; x.fillText('Orbs float in the sky', 56, 580);
+  orbsRow.forEach(([col, a, b], i) => {
+    const cx = 80 + i * 232, cy = 640;
+    x.fillStyle = col; x.beginPath(); x.arc(cx, cy, 16, 0, 7); x.fill();
+    if (a === 'Ringed'){ x.strokeStyle = '#ff2a50'; x.lineWidth = 4; x.beginPath(); x.ellipse(cx, cy, 28, 10, -0.4, 0, 7); x.stroke(); }
+    x.fillStyle = '#e6e9ec'; x.font = '600 28px "Instrument Sans", system-ui, sans-serif'; x.fillText(a, cx + 36, cy - 4);
+    x.fillStyle = '#9aa0a8'; x.font = '400 26px "Instrument Sans", system-ui, sans-serif'; x.fillText(b, cx + 36, cy + 28);
+  });
+  x.fillStyle = '#9aa0a8'; x.font = body;
+  x.fillText('Grip rock to climb, let go mid-pull to fling. Y senses Black.', 56, 735);
+  x.fillStyle = '#e6e9ec'; x.fillText('B opens this again. Pull a trigger to close it.', 56, 780);
+  help.tex.needsUpdate = true;
+}
+function showHelp(on){
+  if (on){
+    drawHelp();
+    const f = headForward(new V3()); f.y = 0; f.normalize();
+    help.m.position.copy(HEAD).addScaledVector(f, 1.3); help.m.position.y = HEAD.y - 0.1;
+    help.m.lookAt(HEAD.x, help.m.position.y, HEAD.z);
+  }
+  help.m.visible = on;
+}
+
 let panelT = 0;
 function showPanel(title, lines, dark, secs = 0){
   drawPanel(title, lines, dark);
@@ -487,9 +617,18 @@ function showPanel(title, lines, dark, secs = 0){
   panel.m.visible = true; panelT = secs;
 }
 
+// ================================================================ settings
+const SET = { hide: true };
+try { const v = localStorage.getItem('ns-hide'); if (v !== null) SET.hide = v === '1'; } catch (e) {}
+function setHide(on){
+  SET.hide = on; try { localStorage.setItem('ns-hide', on ? '1' : '0'); } catch (e) {}
+  const b = $('hide'); b.setAttribute('aria-pressed', on); b.textContent = on ? 'I hide Black\'s ruby' : 'Random hiding spot';
+}
+
 // ================================================================ game state
 const S = {
-  mode: 'ready',            // ready (attract), play, won, lost
+  mode: 'ready',            // ready (attract), hide (you place Black's ruby), play, won, lost
+  hideT: 0,
   t: 0, charge: 1, pow: { wide: 0, fast: 0, burst: 0 }, compass: 0, ghosts: false, held: null, threats: [], warn: 0, pingT: 0, lastWarnTick: 0,
 };
 const player = { vel: new V3(), grounded: false, climbV: new V3() };
@@ -560,7 +699,8 @@ function spawnBot(b){
   b.heading = (Math.random() * 4) | 0; b.deep = rand(0.25, 0.55);
 }
 
-function newGame(mode = 'play'){
+function newGame(mode){
+  if (!mode) mode = SET.hide ? 'hide' : 'play';
   initField();
   for (let ci = 0; ci < chunkMeshes.length; ci++) rebuildChunk(ci);
   dirty.clear();
@@ -587,6 +727,37 @@ function newGame(mode = 'play'){
   for (const b of bots) spawnBot(b);
   for (const o of orbs) placeOrb(o);
   banner.hidden = true; panel.m.visible = false;
+  if (S.mode === 'hide') S.hideT = 45;
+  skyGem(true); skyLabel.sp.visible = false;
+}
+const HIDE_LO = SURF + 1.2, HIDE_HI = HY - 1.2;
+function hideSpotOK(p){ return p.y >= HIDE_LO && p.y <= HIDE_HI && p.x > 1.5 && p.x < SIZE - 1.5 && p.z > 1.5 && p.z < SIZE - 1.5 && sampleV(p) < 0.25; }
+function placeHidden(byTimeout){
+  if (!hideSpotOK(skyRuby.position)){
+    if (!byTimeout){ tone(200, 0.12, 'square', 0.06); return; }
+    skyRuby.position.copy(skyFree);                           // time ran out somewhere invalid: back to its random spot
+  }
+  skyGem(true); skyLabel.sp.visible = false;
+  S.mode = 'play'; S.t = 0;
+  [392, 523, 659].forEach((f, i) => tone(f, 0.2, 'triangle', 0.13, 0, i * 0.07));
+  for (const h of hands) buzz(h, 0.5, 70);
+}
+function skyGem(ok){ const m = skyRuby.userData.gem.material; m.color.setHex(ok ? 0xd80c34 : 0x5d6068); m.emissive.setHex(ok ? 0x5a0018 : 0x000000); }
+const _hq = new THREE.Quaternion();
+function updateHide(dt){
+  // the ruby rides just in front of your right hand (or the desktop camera)
+  const R = hand('right') || hands.find(h => h.src);
+  if (inXR() && R){ handPos(R, skyRuby.position); _d.set(0, 0, -0.18).applyQuaternion(_hq.copy(rig.quaternion).multiply(R.ctrl.quaternion)); skyRuby.position.add(_d); }
+  else { headForward(_d); skyRuby.position.copy(HEAD).addScaledVector(_d, 1.4); }
+  const ok = hideSpotOK(skyRuby.position);
+  skyGem(ok);
+  S.hideT -= dt;
+  const secs = Math.max(0, Math.ceil(S.hideT));
+  skyLabel.sp.visible = !help.m.visible;
+  skyLabel.sp.position.copy(skyRuby.position).add(_a.set(0, 0.3, 0));
+  setLabel(skyLabel, ok ? (inXR() ? 'Pull the trigger to hide it here' : 'Click to hide it here') : skyRuby.position.y < HIDE_LO ? 'Higher: hide it up in your sky' : 'Find open sky to hide it',
+    'Black will dig blindly for it. ' + Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0') + ' left', ok ? '#e0103a' : '#5d6068');
+  if (S.hideT <= 0) placeHidden(true);
 }
 
 // ================================================================ input: XR hands
@@ -651,6 +822,7 @@ addEventListener('keydown', e => {
   if (inXR()) return;
   if (e.code === 'KeyQ') toggleGhosts();
   if (e.code === 'KeyR') { if (S.mode !== 'ready') newGame(); }
+  if (e.code === 'KeyH' && (S.mode === 'won' || S.mode === 'lost')){ setHide(!SET.hide); drawEnd(); }
   if (e.code === 'KeyE') deskCarry();
   if (e.code === 'Space') e.preventDefault();
 });
@@ -658,6 +830,7 @@ addEventListener('keyup', e => desk.keys.delete(e.code));
 renderer.domElement.addEventListener('mousedown', e => {
   if (S.mode === 'ready' || inXR()) return;
   if (!desk.locked) renderer.domElement.requestPointerLock?.();
+  if (e.button === 0 && S.mode === 'hide'){ placeHidden(false); return; }
   if (e.button === 0) desk.mouse = true; desk.drag = true;
 });
 addEventListener('mouseup', () => { desk.mouse = false; desk.drag = false; });
@@ -677,7 +850,7 @@ addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; cam
 function startDesktop(){
   unlockAudio();
   camera.position.set(0, 1.6, 0); camera.rotation.set(0, 0, 0);
-  newGame('play');
+  newGame();
   card.hidden = true; cross.style.display = 'block';
   renderer.domElement.requestPointerLock?.();
 }
@@ -686,11 +859,13 @@ function setDeskButtons(){
   deskBtn.textContent = playing ? 'Resume' : 'Play on desktop';
   againBtn.hidden = !playing;
 }
+$('hide').onclick = () => setHide(!SET.hide);
+setHide(SET.hide);
 deskBtn.onclick = () => {
   if (S.mode === 'ready') return startDesktop();
   card.hidden = true; renderer.domElement.requestPointerLock?.();
 };
-againBtn.onclick = () => { newGame('play'); card.hidden = true; renderer.domElement.requestPointerLock?.(); };
+againBtn.onclick = () => { newGame(); card.hidden = true; renderer.domElement.requestPointerLock?.(); };
 
 function toggleGhosts(){ S.ghosts = !S.ghosts; tone(S.ghosts ? 330 : 220, 0.18, 'triangle', 0.12); }
 function deskCarry(){
@@ -722,7 +897,7 @@ vrBtn.onclick = async () => {
   await renderer.xr.setSession(session);
   vrBtn.disabled = false; vrBtn.textContent = 'Exit VR';
   camera.position.set(0, 1.6, 0); camera.rotation.set(0, 0, 0);
-  newGame('play'); deskGun.visible = false;
+  newGame(); deskGun.visible = false;
   introPending = 2;
   session.addEventListener('end', () => {
     vrBtn.textContent = 'Enter VR'; setupButtons(); laserSound(false, false);
@@ -779,8 +954,8 @@ const flashes = [];
 for (let i = 0; i < 5; i++){ const f = glowSprite(TEX.orange, 1, false); f.visible = false; scene.add(f); flashes.push({ f, t: 0, r: 1 }); }
 function shoot(from, d){
   const s = shots.find(q => q.life <= 0) || shots[0];
-  s.m.position.copy(from); s.vel.copy(d).multiplyScalar(16); s.life = 2; s.m.visible = true;
-  tone(150, 0.12, 'square', 0.08, 90);
+  s.m.position.copy(from); s.vel.copy(d).multiplyScalar(15); s.life = 3; s.m.visible = true;
+  tone(170, 0.2, 'sine', 0.35, 50); noise(0.12, 0.25, 2500, 400); tone(1400, 0.05, 'triangle', 0.04, 0, 0.09);   // thoomp, then the click
 }
 function explode(p){
   const r = powOn('wide') ? 2.0 : 1.4;
@@ -789,20 +964,17 @@ function explode(p){
   for (let i = 0; i < 6; i++) spawnSparks(p, _n.randomDirection(), 5);
   nearRuby(p);
   const d = p.distanceTo(HEAD), v = clamp(1 - d / 20, 0.15, 1);
-  if (AC){
-    const t = AC.currentTime, src = AC.createBufferSource(), g = AC.createGain(), lp = AC.createBiquadFilter();
-    const buf = AC.createBuffer(1, AC.sampleRate * 0.6, AC.sampleRate), ch = buf.getChannelData(0);
-    for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / ch.length, 2.5);
-    src.buffer = buf; lp.type = 'lowpass'; lp.frequency.value = 900; g.gain.value = 0.5 * v;
-    src.connect(lp).connect(g).connect(master); src.start(t);
-    tone(90, 0.4, 'sine', 0.3 * v, 40);
-  }
+  noise(1.3, 0.75 * v, 1600, 120); noise(0.25, 0.4 * v, 5000, 1500, 'highpass');
+  tone(85, 0.8, 'sine', 0.45 * v, 28);
+  for (let i = 0; i < 4; i++) noise(0.08, 0.15 * v, 3000, 900, 'bandpass', 0.15 + Math.random() * 0.35);   // rubble crackle
   for (const h of hands) buzz(h, 0.7 * v, 90);
 }
 function updateShots(dt){
   for (const s of shots){
     if (s.life <= 0) continue;
     s.life -= dt;
+    s.vel.y -= 7 * dt;                                   // shells arc like a grenade launcher
+    if (Math.random() < 0.6) spawnSparks(s.m.position, _n.set(0, 0, 0), 1);
     const steps = Math.ceil(s.vel.length() * dt / 0.1);
     let boom = false;
     for (let i = 0; i < steps && !boom; i++){
@@ -1004,11 +1176,15 @@ function lose(){
   [392, 330, 262, 196].forEach((f, i) => tone(f, 0.4, 'sawtooth', 0.09, 0, i * 0.13));
   endMessage('Black got their ruby', 'Their tower swallowed it after ' + fmt(S.t) + '.', true);
 }
+let lastEnd = null;
+function drawEnd(){ if (lastEnd) endMessage(...lastEnd); }
 function endMessage(title, line, dark){
-  if (inXR()) showPanel(title, [line, '', 'Press A for a new game.'], dark);
+  lastEnd = [title, line, dark];
+  const hideLine = SET.hide ? 'Next game you hide Black\'s ruby.' : 'Next game Black\'s ruby gets a random spot.';
+  if (inXR()) showPanel(title, [line, '', 'A: new game', 'X: ' + (SET.hide ? 'switch to a random spot' : 'switch to hiding it yourself'), hideLine], dark);
   else {
     banner.querySelector('strong').textContent = title;
-    banner.querySelector('span').textContent = line + ' Press R for a new game.';
+    banner.querySelector('span').textContent = line + ' Press R for a new game, H to ' + (SET.hide ? 'use a random spot.' : 'hide the ruby yourself.');
     banner.style.background = dark ? '#000' : ''; banner.style.color = dark ? '#e6e9ec' : '';
     banner.style.border = dark ? '1px solid rgba(230,233,236,.35)' : '';
     banner.hidden = false;
@@ -1111,10 +1287,11 @@ function updateOrbs(dt, now){
       o.g.visible = false; o.wait = 25;
       if (o.kind !== 'compass'){
         S.charge = 1; S.pow[o.kind] = 15;
+        toast({ wide: 'Wide beam', fast: 'Fast beam', burst: 'Grenade launcher' }[o.kind], POW[o.kind].color);
         const notes = { wide: [440, 554, 659], fast: [660, 880, 1320], burst: [196, 262, 392] }[o.kind];
         notes.forEach((f, i) => tone(f, 0.18, o.kind === 'burst' ? 'sawtooth' : 'triangle', 0.12, 0, i * 0.06));
       }
-      else { S.compass = 20; [523, 784, 1046].forEach((f, i) => tone(f, 0.25, 'sine', 0.14, 0, i * 0.08)); }
+      else { S.compass = 20; toast('Compass to your ruby', 0xff2a50); [523, 784, 1046].forEach((f, i) => tone(f, 0.25, 'sine', 0.14, 0, i * 0.08)); }
       for (const h of hands) buzz(h, 0.7, 90);
     }
   }
@@ -1122,7 +1299,7 @@ function updateOrbs(dt, now){
 
 // ================================================================ per-frame input
 const _f = new V3(), _r = new V3(), _up = new V3(0, 1, 0);
-let snapReady = true;
+let snapReady = true, trigBlock = 0;
 const _tipW = new V3();
 function xrFrame(dt){
   rig.updateMatrixWorld(); headWorld(HEAD);
@@ -1143,9 +1320,18 @@ function xrFrame(dt){
     rig.updateMatrixWorld(); headWorld(HEAD);
     for (const h of hands) if (h.anchor){ handPos(h, h.anchor); }
   } else if (Math.abs(rx) < 0.3) snapReady = true;
-  const jump = edge(R, 4) || edge(L, 4);
+  const aBtn = edge(R, 4), xBtn = edge(L, 4), jump = aBtn || xBtn;
   if (edge(L, 5)) toggleGhosts();
-  if (jump && S.mode !== 'play'){ newGame(); return; }
+  if (edge(R, 5)) showHelp(!help.m.visible);
+  const ended = S.mode === 'won' || S.mode === 'lost';
+  if (ended && xBtn){ setHide(!SET.hide); drawEnd(); }
+  if (ended && aBtn){ newGame(); return; }
+  // triggers: close the how-to panel first, then (in hide mode) place the ruby
+  let trigEdge = false;
+  for (const h of hands){ const v = h.src?.gamepad?.buttons?.[0]?.value > 0.5, was = !!h.prev.t; h.prev.t = v; if (v && !was) trigEdge = true; }
+  if (trigEdge && help.m.visible){ showHelp(false); trigBlock = 0.35; }
+  else if (trigEdge && S.mode === 'hide') placeHidden(false);
+  trigBlock = Math.max(0, trigBlock - dt);
 
   // grips: ruby, climbing
   for (const h of hands){
@@ -1176,19 +1362,18 @@ function xrFrame(dt){
       if (!hands.some(o => o !== h && o.anchor)) player.climbV.set(0, 0, 0);
     }
   }
-  physics(dt, _m, jump && S.mode === 'play');
+  physics(dt, _m, jump && (S.mode === 'play' || S.mode === 'hide'));
 
   // lasers
   let firing = false, melting = false;
   for (const h of hands){
-    const trig = h.src?.gamepad?.buttons?.[0]?.value > 0.5 && S.mode === 'play' && !h.hold;
+    const trig = h.src?.gamepad?.buttons?.[0]?.value > 0.5 && S.mode === 'play' && !h.hold && !help.m.visible && trigBlock <= 0;
     if (trig){
       handRay(h, _o, _d);
       firing = true;
       const tip = _tipW.copy(h.gun.userData.tip).applyMatrix4(h.ctrl.matrix).applyMatrix4(rig.matrixWorld);
       if (fire(_o, _d, tip, h.beam, dt)) melting = true;
       if (Math.random() < 0.25) buzz(h, 0.12, 16);
-      if (introPending === 0 && panel.m.visible && panelT > 0) panelT = Math.min(panelT, 0.6);
     } else { placeBeam(h.beam, _o, _o, false); h.beam.cool = Math.max(0, (h.beam.cool || 0) - dt); }
     h.mitt.material.color.setHex(h.anchor ? 0xf5c518 : 0xe6e9ec);
     h.mitt.scale.setScalar(pressed(h, 1) ? 0.85 : 1);
@@ -1211,7 +1396,8 @@ function deskFrame(dt){
   if (k.has('KeyD') || k.has('ArrowRight')) _m.add(_r);
   if (k.has('KeyA') || k.has('ArrowLeft')) _m.sub(_r);
   if (_m.lengthSq()) _m.normalize().multiplyScalar(MOVE);
-  physics(dt, _m, k.has('Space') && S.mode === 'play');
+  physics(dt, _m, k.has('Space') && (S.mode === 'play' || S.mode === 'hide'));
+  if (S.mode === 'hide' && desk.mouse){ desk.mouse = false; placeHidden(false); }
   camera.updateMatrixWorld();
   let firing = false, melting = false;
   if (desk.mouse && S.mode === 'play'){
@@ -1251,8 +1437,15 @@ renderer.setAnimationLoop(() => {
     updateRubies(dt, now);
     updateOrbs(dt, now);
     updateCompass(dt, now);
-    if (introPending > 0 && --introPending === 0)
-      showPanel('Negative Space', ['Melt down to your ruby, buried below you.', '!Guard the red ruby floating in your sky.', 'Grip rock to climb. Let go mid-pull to fling.', 'Orbs: gold wide, blue fast, orange burst.', 'White orbs with a red ring give a compass.'], false, 14);
+    if (introPending > 0 && --introPending === 0) showHelp(true);
+    if (S.mode === 'hide') updateHide(dt);
+    else if (S.mode === 'play' && S.t < 25 && !help.m.visible){
+      skyLabel.sp.visible = true; skyLabel.sp.position.copy(skyRuby.position).add(_a.set(0, 0.38, 0));
+      setLabel(skyLabel, 'Black wants this ruby', 'Keep their towers away from it');
+    } else skyLabel.sp.visible = false;
+    gunLabelT -= dt;
+    gunLabel.sp.visible = gunLabelT > 0 && inXR();
+    if (gunLabel.sp.visible){ const R = hand('right') || hands.find(h => h.src); if (R) handPos(R, gunLabel.sp.position).add(_a.set(0, 0.14, 0)); }
     if (panelT > 0){ panelT -= dt; if (panelT <= 0) panel.m.visible = false; }
   }
   for (const b of bots){
@@ -1265,7 +1458,7 @@ renderer.setAnimationLoop(() => {
 });
 
 // for quick testing from the console
-window.NS = { explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
+window.NS = { showHelp, explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
 </script>
 <script src="../updated.js"></script>
 </body>
