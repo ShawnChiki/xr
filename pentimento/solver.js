@@ -462,6 +462,7 @@ function fitStep(M, samples, curves, o){
         const dn = dx * n[0] + dy * n[1] + dz * n[2], dt2 = Math.max(0, dx * dx + dy * dy + dz * dz - dn * dn);
         if (dn * dn * ihn2 > 6) continue;
         gk.push(k); gn.push(dn); gt.push(dt2);
+        if (s.guide) continue;
         const m = minT.get(s.sid); if (m === undefined || dt2 < m) minT.set(s.sid, dt2); }
       if (x !== v && sharpV(x)) continue;
       for (const y of nb[x]){ if (stamp[y] === v) continue; if (sq(M.x[y] - p[0]) + sq(M.y[y] - p[1]) + sq(M.z[y] - p[2]) > R2) continue; stamp[y] = v; st.push(y); }
@@ -521,6 +522,9 @@ function fitStep(M, samples, curves, o){
         tx = ((M.x[bn[0]] + M.x[bn[1]]) / 2 - p[0]) * lam; ty = ((M.y[bn[0]] + M.y[bn[1]]) / 2 - p[1]) * lam; tz = ((M.z[bn[0]] + M.z[bn[1]]) / 2 - p[2]) * lam;
         const tn = tx * n[0] + ty * n[1] + tz * n[2]; tx -= tn * n[0]; ty -= tn * n[1]; tz -= tn * n[2];
       } else { tx = ty = tz = 0; }
+    } else if (o.flow && o.flow.conf[v] > 0.05 && v < o.flow.conf.length){
+      const c = o.flow.conf[v], al = alignTarget(M, o.flow, v, n);
+      tx = (tx * (1 - c) + al[0] * c) * o.relax; ty = (ty * (1 - c) + al[1] * c) * o.relax; tz = (tz * (1 - c) + al[2] * c) * o.relax;
     } else { tx *= o.relax; ty *= o.relax; tz *= o.relax; }
     nx[v] = p[0] + offN * n[0] * o.step + tx; ny[v] = p[1] + offN * n[1] * o.step + ty; nz[v] = p[2] + offN * n[2] * o.step + tz;
   }
@@ -545,15 +549,19 @@ function untangle(M, iters){
 // Relax: settles the finished mesh. Each pass pulls every vertex toward the middle of its neighbours
 // (which smooths bumps and evens out the spacing), then pushes back a little so the shape doesn't
 // shrink or sag. Every guide and crease vertex stays put, so nothing slides across or off a crease.
-function relaxMesh(M, passes){
+function relaxMesh(M, passes, F){
   for (let it = 0; it < passes * 2; it++){
     const lam = it & 1 ? -0.53 : 0.5, nx = M.x.slice(), ny = M.y.slice(), nz = M.z.slice();
     for (let v = 0; v < M.x.length; v++){
       if (M.fc[v] >= 0 || !M.vt[v].length) continue;
       const ring = M.nbrs(v), bn = ring.filter(w => M.edgeTris(v, w).length === 1);
       const use = bn.length === 2 ? bn : bn.length ? null : ring; if (!use) continue;   // border: only along the border
-      let cx = 0, cy = 0, cz = 0; for (const w of use){ cx += M.x[w]; cy += M.y[w]; cz += M.z[w]; }
-      nx[v] += (cx / use.length - M.x[v]) * lam; ny[v] += (cy / use.length - M.y[v]) * lam; nz[v] += (cz / use.length - M.z[v]) * lam;
+      let cx = 0, cy = 0, cz = 0, W = 0;
+      const fl = F && use === ring && v < F.conf.length && F.conf[v] > 0.05;
+      for (const w of use){ let wt = 1;
+        if (fl){ const e = norm([M.x[w] - M.x[v], M.y[w] - M.y[v], M.z[w] - M.z[v]]), al = Math.abs(dot(e, [F.d1[3 * v], F.d1[3 * v + 1], F.d1[3 * v + 2]])); wt = 1 + 3 * F.conf[v] * al * al; }
+        cx += M.x[w] * wt; cy += M.y[w] * wt; cz += M.z[w] * wt; W += wt; }
+      nx[v] += (cx / W - M.x[v]) * lam; ny[v] += (cy / W - M.y[v]) * lam; nz[v] += (cz / W - M.z[v]) * lam;
     }
     M.x = nx; M.y = ny; M.z = nz;
   }
@@ -646,8 +654,105 @@ function shortestPath(M, src, dst, maxLen){
   return path.reverse();
 }
 
-// ---------------------------------------------------------------- quads and subdivision
-function quadify(M, curves){
+// ---------------- guides: laid onto the surface, smoothed, and turned into a flow direction for the quads
+// closest point on the mesh to p (search the triangles around the nearest few vertices)
+function closestOnMesh(M, VG, p, r){
+  let best = null, bd = Infinity;
+  VG.each(p[0], p[1], p[2], r, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } });
+  if (best === null) return null;
+  let q = M.P(best), qd = bd;
+  for (const t of M.vt[best]){ const c = closestOnTri(p, M.P(M.T[3 * t]), M.P(M.T[3 * t + 1]), M.P(M.T[3 * t + 2])), dd = d2(p, c); if (dd < qd){ qd = dd; q = c; } }
+  return { p: q, d: Math.sqrt(qd) };
+}
+function closestOnTri(p, a, b, c){
+  const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]], ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+  const d1 = dot(ab, ap), d2_ = dot(ac, ap); if (d1 <= 0 && d2_ <= 0) return a;
+  const bp = [p[0] - b[0], p[1] - b[1], p[2] - b[2]], d3 = dot(ab, bp), d4 = dot(ac, bp); if (d3 >= 0 && d4 <= d3) return b;
+  const vc = d1 * d4 - d3 * d2_; if (vc <= 0 && d1 >= 0 && d3 <= 0){ const v = d1 / (d1 - d3); return lerp3(a, b, v); }
+  const cp = [p[0] - c[0], p[1] - c[1], p[2] - c[2]], d5 = dot(ab, cp), d6 = dot(ac, cp); if (d6 >= 0 && d5 <= d6) return c;
+  const vb = d5 * d2_ - d1 * d6; if (vb <= 0 && d2_ >= 0 && d6 <= 0){ const w = d2_ / (d2_ - d6); return lerp3(a, c, w); }
+  const va = d3 * d6 - d5 * d4; if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0){ const w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); return lerp3(b, c, w); }
+  const den = 1 / (va + vb + vc), v = vb * den, w = vc * den; return [a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w, a[2] + ab[2] * v + ac[2] * w];
+}
+// lay each guide onto the surface; averaged guides are also smoothed (strict ones keep their shape)
+function layGuides(M, guides, L, h){
+  const VG = new Grid(L); for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
+  const out = [];
+  for (const G of guides){
+    let P = resample(G.pts, L * 0.25, G.closed);
+    for (let pass = 0; pass < (G.strict ? 1 : 4); pass++){
+      const Q = []; for (const p of P){ const c = closestOnMesh(M, VG, p, h * 3); if (c && c.d < h * 3) Q.push(c.p); else if (!G.closed) Q.push(null); }
+      // keep the longest run that lies over the surface
+      let best = [], cur = []; for (const q of Q){ if (q) cur.push(q); else { if (cur.length > best.length) best = cur; cur = []; } } if (cur.length > best.length) best = cur;
+      P = best; if (P.length < 3) break;
+      if (!G.strict) P = smoothPoly(P, 6, G.closed && P.length === Q.length);
+    }
+    if (P.length >= 3) out.push(makeCurve(P, G.closed && P.length > 6 && d2(P[0], P[P.length - 1]) < sq(L), false, G.tag));
+  }
+  return out;
+}
+// The flow field: at every vertex, a direction for the quads to run (four-way symmetric, so a line and the
+// direction across it count the same) and how sure we are of it. It comes from the guides and the creases,
+// blended smoothly with distance, so between guides the quads turn gradually from one to the next.
+function flowField(M, sources, h){
+  const S = []; for (const { C, w } of sources){ const P = C.pts, n = P.length;
+    for (let i = 0; i < n; i++){ const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)], t = norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]); S.push({ p: P[i], t, w }); } }
+  if (!S.length) return null;
+  while (S.length > 2500){ for (let i = S.length - 1; i > 0; i -= 2) S.splice(i, 1); }
+  const N = vertexNormals(M), nv = M.x.length, d1 = new Float64Array(nv * 3), conf = new Float64Array(nv), r2 = sq(h * 1.5);
+  for (let v = 0; v < nv; v++){
+    if (!M.vt[v].length) continue;
+    const n = N[v], b1 = norm(Math.abs(n[1]) < 0.9 ? [n[2], 0, -n[0]] : [0, -n[2], n[1]]), b2 = [n[1] * b1[2] - n[2] * b1[1], n[2] * b1[0] - n[0] * b1[2], n[0] * b1[1] - n[1] * b1[0]];
+    let zr = 0, zi = 0, W = 0, near = 0;
+    for (const q of S){ const dd = sq(q.p[0] - M.x[v]) + sq(q.p[1] - M.y[v]) + sq(q.p[2] - M.z[v]), w = q.w / sq(dd + r2);
+      let c = dot(q.t, b1), s2 = dot(q.t, b2); const l = Math.hypot(c, s2); if (l < 0.2) continue; c /= l; s2 /= l;
+      const c2 = c * c - s2 * s2, s2b = 2 * c * s2, c4 = c2 * c2 - s2b * s2b, s4 = 2 * c2 * s2b;   // angle × 4
+      zr += w * c4; zi += w * s4; W += w; if (dd < sq(h * 4)) near += q.w; }
+    if (W <= 0) continue;
+    const a = Math.atan2(zi, zr) / 4, co = Math.cos(a), si = Math.sin(a);
+    d1[3 * v] = co * b1[0] + si * b2[0]; d1[3 * v + 1] = co * b1[1] + si * b2[1]; d1[3 * v + 2] = co * b1[2] + si * b2[2];
+    conf[v] = Math.min(1, Math.hypot(zr, zi) / W) * Math.min(1, near / 4);
+  }
+  return { d1, conf, N };
+}
+// flip an edge when the flipped one sits closer to the flow's directions (axis or 45° diagonal, as in a grid of squares split by diagonals)
+function flowFlips(M, F){
+  const E = M.edges(), N = vertexNormals(M);
+  const grid = (v, e, n) => { const d = [F.d1[3 * v], F.d1[3 * v + 1], F.d1[3 * v + 2]], d2v = [n[1] * d[2] - n[2] * d[1], n[2] * d[0] - n[0] * d[2], n[0] * d[1] - n[1] * d[0]];
+    const a = dot(e, d), b = dot(e, d2v), l = Math.hypot(a, b); if (l < 1e-12) return 0; const ang = Math.atan2(b, a); return Math.abs(Math.sin(4 * ang)); };   // 0 on axes and diagonals
+  for (let i = 0; i < E.length; i += 2){
+    const a = E[i], b = E[i + 1]; if (F.conf[a] < 0.1 || M.fe.has(M.ek(a, b))) continue;
+    const ts = M.edgeTris(a, b); if (ts.length !== 2) continue;
+    const c = M.T.slice(3 * ts[0], 3 * ts[0] + 3).find(v => v !== a && v !== b), d = M.T.slice(3 * ts[1], 3 * ts[1] + 3).find(v => v !== a && v !== b);
+    if (c === undefined || d === undefined) continue;
+    const e1 = norm([M.x[b] - M.x[a], M.y[b] - M.y[a], M.z[b] - M.z[a]]), e2 = norm([M.x[d] - M.x[c], M.y[d] - M.y[c], M.z[d] - M.z[c]]);
+    if (grid(a, e2, N[a]) + 0.15 < grid(a, e1, N[a]) && angleAt(M, c, a, b) + angleAt(M, d, a, b) > Math.PI * 0.75) M.flip(a, b, 0.8);
+  }
+}
+// how far an edge is from the flow's four directions: 0 lined up, 1 at 45°
+function misalign(F, v, e, n){
+  const d = [F.d1[3 * v], F.d1[3 * v + 1], F.d1[3 * v + 2]], d2v = [n[1] * d[2] - n[2] * d[1], n[2] * d[0] - n[0] * d[2], n[0] * d[1] - n[1] * d[0]];
+  const a = dot(e, d), b = dot(e, d2v), l = Math.hypot(a, b); if (l < 1e-12) return 0;
+  const c = a / l, s2 = b / l, c2 = c * c - s2 * s2, s2b = 2 * c * s2; return (1 - (c2 * c2 - s2b * s2b)) / 2;
+}
+// nudge a vertex so the edges around it line up with the flow (straight along it, across it, or on a 45° diagonal)
+function alignTarget(M, F, v, n){
+  const d = [F.d1[3 * v], F.d1[3 * v + 1], F.d1[3 * v + 2]], e2 = [n[1] * d[2] - n[2] * d[1], n[2] * d[0] - n[0] * d[2], n[0] * d[1] - n[1] * d[0]];
+  let tx = 0, ty = 0, tz = 0, k = 0; const p = M.P(v), ring = M.nbrs(v);
+  // grid spacing: sides of the squares are 1, their diagonals √2, so a grid turned 45° doesn't count as lined up
+  let mean = 0; for (const w of ring) mean += Math.hypot(M.x[w] - p[0], M.y[w] - p[1], M.z[w] - p[2]); const side = mean / ring.length / 1.14;
+  for (const w of ring){
+    const e = [M.x[w] - p[0], M.y[w] - p[1], M.z[w] - p[2]], a = dot(e, d), b = dot(e, e2), l = Math.hypot(a, b); if (l < 1e-9) continue;
+    const q = Math.round(Math.atan2(b, a) / (Math.PI / 4)), ang = q * (Math.PI / 4), len = 0.5 * l + 0.5 * side * (q & 1 ? Math.SQRT2 : 1), sa = Math.cos(ang) * len, sb = Math.sin(ang) * len;
+    tx += M.x[w] - (sa * d[0] + sb * e2[0]); ty += M.y[w] - (sa * d[1] + sb * e2[1]); tz += M.z[w] - (sa * d[2] + sb * e2[2]); k++;
+  }
+  if (!k) return [0, 0, 0];
+  let dx = tx / k - p[0], dy = ty / k - p[1], dz = tz / k - p[2]; const dn = dx * n[0] + dy * n[1] + dz * n[2];
+  return [dx - dn * n[0], dy - dn * n[1], dz - dn * n[2]];
+}
+
+// ---------------- quads and subdivision
+function quadify(M, curves, FL){
   M.compact();
   const T = M.T, nt = M.tdead.length, used = new Uint8Array(nt), cand = [];
   const E = M.edges();
@@ -659,17 +764,59 @@ function quadify(M, curves){
     const q = [a, d, b, c]; let worst = 0;
     for (let k = 0; k < 4; k++){ const ang = angleAt(M, q[k], q[(k + 3) % 4], q[(k + 1) % 4]); worst = Math.max(worst, Math.abs(ang - Math.PI / 2)); }
     const n1 = norm(M.triN(t1)), n2 = norm(M.triN(t2)); if (dot(n1, n2) < 0.85) continue;
-    cand.push([worst, t1, t2, q]);
+    let cost = worst;
+    if (FL && FL.conf[a] > 0.05){ const nn = norm([n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]]); let m = 0;
+      for (let k = 0; k < 4; k++){ const u = q[k], w = q[(k + 1) % 4]; m += misalign(FL, a, norm([M.x[w] - M.x[u], M.y[w] - M.y[u], M.z[w] - M.z[u]]), nn); }
+      cost += 2.5 * FL.conf[a] * m / 4; }
+    cand.push([cost, t1, t2, q, worst]);
   }
   cand.sort((p, q) => p[0] - q[0]);
   const F = [];
-  for (const [w, t1, t2, q] of cand){ if (w > 0.75 || used[t1] || used[t2]) continue; used[t1] = used[t2] = 1; F.push(q); }
+  for (const [, t1, t2, q, w] of cand){ if (w > 0.75 || used[t1] || used[t2]) continue; used[t1] = used[t2] = 1; F.push(q); }
   for (let t = 0; t < nt; t++) if (!used[t]) F.push([T[3 * t], T[3 * t + 1], T[3 * t + 2]]);
   const V = []; for (let v = 0; v < M.x.length; v++) V.push(M.x[v], M.y[v], M.z[v]);
   const sharp = new Set(); for (const [k, id] of M.fe) if (curves[id] && curves[id].sharp) sharp.add(k);
   return { V, F, sharp, feat: new Map(M.fe) };
 }
 function ek(a, b){ return a < b ? a * 2097152 + b : b * 2097152 + a; }
+// Square up the quads: each quad pulls its corners toward the nearest square of the same size, turned to
+// match the guide flow where there is one (or just its own best fit where there isn't). Vertices are then
+// put back onto the fitted surface, so the shape doesn't change, only the layout of the quads on it.
+function squareQuads(cage, M, flow, iters, L){
+  const { V, F } = cage, nv = V.length / 3, fixed = new Uint8Array(nv);
+  for (let v = 0; v < nv; v++) if (M.fc[v] >= 0) fixed[v] = 1;
+  const eCount = new Map(); for (const f of F) for (let i = 0; i < f.length; i++){ const k = ek(f[i], f[(i + 1) % f.length]); eCount.set(k, (eCount.get(k) || 0) + 1); }
+  for (const [k, c] of eCount) if (c === 1){ fixed[Math.floor(k / 2097152)] = 1; fixed[k % 2097152] = 1; }
+  const VG = new Grid(L); for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
+  const sum = new Float64Array(nv * 3), cnt = new Float64Array(nv);
+  for (let it = 0; it < iters; it++){
+    sum.fill(0); cnt.fill(0);
+    for (const f of F){
+      if (f.length !== 4) continue;
+      const P = f.map(v => [V[3 * v], V[3 * v + 1], V[3 * v + 2]]), c = [0, 1, 2].map(k => (P[0][k] + P[1][k] + P[2][k] + P[3][k]) / 4);
+      const n = norm(cross3([0, 0, 0], [P[2][0] - P[0][0], P[2][1] - P[0][1], P[2][2] - P[0][2]], [P[3][0] - P[1][0], P[3][1] - P[1][1], P[3][2] - P[1][2]]));
+      const u = norm(Math.abs(n[1]) < 0.9 ? [n[2], 0, -n[0]] : [0, -n[2], n[1]]), w = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+      const q = P.map(p => { const d = [p[0] - c[0], p[1] - c[1], p[2] - c[2]]; return [dot(d, u), dot(d, w)]; });
+      // best rotation of a square onto these corners (corner k sits at φ + k·90°)
+      let sn = 0, cs = 0, r2 = 0; q.forEach(([a, b], k) => { const t = k * Math.PI / 2, ct = Math.cos(t), st = Math.sin(t); cs += a * ct + b * st; sn += b * ct - a * st; r2 += a * a + b * b; });
+      let phi = Math.atan2(sn, cs); const r = Math.sqrt(r2 / 4);
+      const conf = flow ? Math.max(flow.conf[f[0]], flow.conf[f[1]], flow.conf[f[2]], flow.conf[f[3]]) : 0;
+      if (conf > 0.05){
+        const v0 = f.reduce((b, v) => flow.conf[v] > flow.conf[b] ? v : b, f[0]), d = [flow.d1[3 * v0], flow.d1[3 * v0 + 1], flow.d1[3 * v0 + 2]];
+        const fa = Math.atan2(dot(d, w), dot(d, u)) + Math.PI / 4;           // corners sit 45° off the edge directions
+        let best = fa, bd = Infinity; for (let m = -4; m <= 4; m++){ const t = fa + m * Math.PI / 2, dd = Math.abs(Math.atan2(Math.sin(t - phi), Math.cos(t - phi))); if (dd < bd){ bd = dd; best = t; } }
+        const dlt = Math.atan2(Math.sin(best - phi), Math.cos(best - phi)); phi += dlt * conf;
+      }
+      f.forEach((v, k) => { const t = phi + k * Math.PI / 2, a = r * Math.cos(t), b = r * Math.sin(t);
+        sum[3 * v] += c[0] + a * u[0] + b * w[0]; sum[3 * v + 1] += c[1] + a * u[1] + b * w[1]; sum[3 * v + 2] += c[2] + a * u[2] + b * w[2]; cnt[v]++; });
+    }
+    for (let v = 0; v < nv; v++){
+      if (fixed[v] || !cnt[v]) continue;
+      const t = [sum[3 * v] / cnt[v], sum[3 * v + 1] / cnt[v], sum[3 * v + 2] / cnt[v]], p = [V[3 * v] + (t[0] - V[3 * v]) * 0.5, V[3 * v + 1] + (t[1] - V[3 * v + 1]) * 0.5, V[3 * v + 2] + (t[2] - V[3 * v + 2]) * 0.5];
+      const on = closestOnMesh(M, VG, p, L * 3); const q = on ? on.p : p; V[3 * v] = q[0]; V[3 * v + 1] = q[1]; V[3 * v + 2] = q[2];
+    }
+  }
+}
 function catmullClark({ V, F, sharp, feat }, curves){
   const nv = V.length / 3, eid = new Map(), E = [];
   F.forEach((f, fi) => { for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = ek(a, b); let e = eid.get(k); if (e === undefined){ e = E.length; eid.set(k, e); E.push({ a, b, f: [] }); } E[e].f.push(fi); } });
@@ -736,6 +883,7 @@ function creaseLines({ V, sharp }){
 // ---------------------------------------------------------------- the whole thing
 // strokes: [{ tag, pts: [x,y,z, x,y,z, ...] }]   (park metres, y up)
 //   tag 0 loose · 1 guide (averaged) · 2 strict guide (exact) · 3 crease (averaged, sharp) · 4 strict crease (exact, sharp)
+// guides (tags 1, 2) steer the quad flow and the Relax direction; they don't pull the surface
 // prm: { detail, avg, lines, fair (0..1), reach, group, subd, relax (0..10), dabs }
 function solve(strokes, prm, progress = () => {}){
   const L = Math.max(0.05, prm.detail), h = Math.max(prm.avg, L * 1.1), g = Math.max(prm.group, L * 0.5);
@@ -744,13 +892,17 @@ function solve(strokes, prm, progress = () => {}){
   for (const s of strokes){ const p = toPts(s), t = Math.min(4, s.tag || 0); if (p.length < 2) continue;
     if (t === 0) byTag[0].push(p); else for (const q of sliceLoops(p, g * 0.6, Math.max(g * 5, L * 4))) byTag[t].push(q); }
   progress(0.02, 'Finding the guide and crease lines');
-  // strict lines first, so they get cut in first and the averaged ones fit around them
-  const curves = [...strictCurves(byTag[4], L, true, 4), ...strictCurves(byTag[2], L, false, 2), ...consensus(byTag[3], g, L * 0.5, true, 3), ...consensus(byTag[1], g, L * 0.5, false, 1)];
+  // Creases shape the surface (strict ones first, so they get cut in first and the averaged ones fit around them).
+  // Guides don't compete with the loose lines: they're laid onto the surface afterwards and steer the quads.
+  const curves = [...strictCurves(byTag[4], L, true, 4), ...consensus(byTag[3], g, L * 0.5, true, 3)];
+  const guides0 = [...strictCurves(byTag[2], L, false, 2), ...consensus(byTag[1], g, L * 0.5, false, 1)];
   const samples = [];
   const ds = Math.min(L, h) / 3;
   byTag[0].forEach((s, i) => { for (const p of resample(s, ds, false)) samples.push({ p, w: 1, sid: i }); });
+  // guides only fill in where there are no loose lines at all (a whisper of weight, and they don't count as strokes)
+  guides0.forEach(G => { for (const p of resample(G.pts, ds, G.closed)) samples.push({ p, w: 0.04, guide: true }); });
   curves.forEach((C, i) => { for (const p of resample(C.pts, ds, C.closed)) samples.push({ p, w: C.strict ? 6 : 3, curve: true, sid: -1 - i }); });
-  if (samples.length < 6) return { empty: true, curves: curves.map(C => ({ tag: C.tag, closed: C.closed, pts: C.pts.flat() })) };
+  if (samples.length < 6) return { empty: true, curves: [...curves, ...guides0].map(C => ({ tag: C.tag, closed: C.closed, pts: C.pts.flat() })) };
   progress(0.08, 'Laying out the sheet');
   const aA = Math.max(L * 2, h * 0.9);
   const M = startSheet(samples, aA, prm.reach, h);
@@ -769,15 +921,18 @@ function solve(strokes, prm, progress = () => {}){
     fitStep(M, samples, curves, { ...base, L, h, hn: h * 2.5, maxStep: L * 1.2, parity: it & 1, reach2: h * 2.5 });
     if (prm.onStep) prm.onStep(M, "fine", it); progress(0.35 + 0.2 * it / 3, 'Fitting the detail');
   }
-  // cut the curves in
+  // lay the guides on the surface found so far, and work out the flow they ask for
   M.compact();
+  const guides = layGuides(M, guides0, L, h);
+  let flow = guides.length ? flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h) : null;
   M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0));
   curves.forEach((C, i) => embedCurve(M, C, i, L));
   untangle(M, 4);
   for (let it = 0; it < 8; it++){
     remesh(M, L, 0.8);
     if (it < 3) untangle(M, 2);
-    fitStep(M, samples, curves, { ...base, L, h, hn: h * 1.8, maxStep: L * 0.8, parity: it & 1, reach2: h * 2.2 });
+    if (guides.length) flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h);
+    fitStep(M, samples, curves, { ...base, flow, L, h, hn: h * 1.8, maxStep: L * 0.8, parity: it & 1, reach2: h * 2.2 });
     unfold(M, 3);
     if (prm.onStep) prm.onStep(M, "crease", it); progress(0.55 + 0.35 * it / 8, 'Sharpening the creases');
   }
@@ -798,10 +953,31 @@ function solve(strokes, prm, progress = () => {}){
     }
   }
   progress(0.9, 'Smoothing out folds');
-  if (prm.relax > 0){ progress(0.91, 'Relaxing'); relaxMesh(M, Math.round(prm.relax * prm.relax * 0.8 + prm.relax * 2)); }
+  M.compact();
+  if (guides.length){
+    flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h);
+    // comb the mesh along the flow: slide vertices over the surface until their edges line up with it
+    progress(0.9, 'Lining up with the guides');
+    for (let it = 0; it < (prm.alignIters ?? 14); it++){
+      const N = vertexNormals(M), nx = M.x.slice(), ny = M.y.slice(), nz = M.z.slice();
+      for (let v = 0; v < M.x.length; v++){
+        if (M.fc[v] >= 0 || !M.vt[v].length || flow.conf[v] < 0.05 || M.isBV(v)) continue;
+        const a = alignTarget(M, flow, v, N[v]), k = 0.6 * flow.conf[v]; nx[v] += a[0] * k; ny[v] += a[1] * k; nz[v] += a[2] * k;
+      }
+      M.x = nx; M.y = ny; M.z = nz;
+      if (it % 4 === 3) unfold(M, 2);
+    }
+    // a light flip pass that prefers edges along the flow, then re-measure the flow on the combed mesh
+    flowFlips(M, flow);
+    M.compact();
+    flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h);
+  }
+  if (prm.relax > 0){ progress(0.91, 'Relaxing'); relaxMesh(M, Math.round(prm.relax * prm.relax * 0.8 + prm.relax * 2), flow); }
   const folds = unfold(M, 25);
   progress(0.93, 'Making quads');
-  const cage = quadify(M, curves);
+  const cage = quadify(M, curves, flow);
+  progress(0.95, 'Squaring up the quads');
+  squareQuads(cage, M, flow, prm.squareIters ?? 32, L);
   const quads = catmullClark(cage, curves);
   let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++) smooth = catmullClark(smooth, curves);
   const sh = shade(smooth);
@@ -810,7 +986,8 @@ function solve(strokes, prm, progress = () => {}){
   return {
     surface: sh, quadWire: wire(quads), fineWire: smooth === quads ? null : wire(smooth), creases: creaseLines(smooth),
     quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()) },
-    curves: curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, pts: C.pts.flat() })),
+    curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, pts: C.pts.flat() })),
+      ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
     nQuads: quads.F.length, folds
   };
 }
