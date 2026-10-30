@@ -52,9 +52,8 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 // ================= tuning =================
-const UNIT = 0.26;        // one model unit in meters; the little people stand about 30 cm (1 ft) tall with their hats
-const COM = 0.42;         // flip pivot height, in model units
-const G = 9.8 * 0.8;      // gravity for jumps
+const UNIT = 0.26;        // one model unit in meters; a medium little person is about 30 cm (1 ft) tall with a hat
+const G = 9.8 * 0.8;      // gravity for jumps and throws
 const STEEP = 0.55;       // |surface normal.y| below this = climbing a wall
 const CEIL = -0.4;        // normal.y below this = a ceiling; nobody walks up there
 const PROBE = 0.05;       // how far above a surface the feet feel ahead
@@ -66,8 +65,11 @@ const rand = (a, b) => a + Math.random() * (b - a);
 const pick = a => a[(Math.random() * a.length) | 0];
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const damp = (k, dt) => 1 - Math.exp(-k * dt);
+const easeIO = u => { u = clamp(u, 0, 1); return u * u * (3 - 2 * u); };
+const backOut = x => x >= 1 ? 1 : 1 + 2.7 * Math.pow(x - 1, 3) + 1.7 * Math.pow(x - 1, 2);
 const wrapPi = a => { a = (a + Math.PI) % TAU; if (a < 0) a += TAU; return a - Math.PI; };
 const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const wpick = obj => { const ks = Object.keys(obj); let r = Math.random() * ks.reduce((s, k) => s + obj[k].w, 0); for (const k of ks) { r -= obj[k].w; if (r <= 0) return k; } return ks[0]; };
 
 // ================= renderer / scene =================
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -75,6 +77,7 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
+renderer.localClippingEnabled = true;
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -84,8 +87,8 @@ const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.02, 6
 camera.position.set(2.3, 1.6, 2.7);
 scene.add(camera);
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(-0.3, 0.55, -0.4);
-controls.enableDamping = true; controls.minDistance = 0.4; controls.maxDistance = 7;
+controls.target.set(-0.3, 0.6, -0.4);
+controls.enableDamping = true; controls.minDistance = 0.3; controls.maxDistance = 7;
 controls.update();
 addEventListener('resize', () => {
   if (renderer.xr.isPresenting) return;
@@ -94,28 +97,57 @@ addEventListener('resize', () => {
 });
 scene.add(new THREE.HemisphereLight(0xfff6ea, 0x9a8a7a, 1.9));
 const sunLight = new THREE.DirectionalLight(0xffffff, 1.5); sunLight.position.set(1.5, 3, 1.2); scene.add(sunLight);
+const camFwd = new V3(), camUp = new V3(), camRight = new V3(), camFwdH = new V3();
+function updateCamVectors() {
+  camFwd.set(0, 0, -1).applyQuaternion(camera.quaternion); camUp.set(0, 1, 0).applyQuaternion(camera.quaternion);
+  camRight.set(1, 0, 0).applyQuaternion(camera.quaternion);
+  camFwdH.copy(camFwd).setY(0); if (camFwdH.lengthSq() < 1e-4) camFwdH.set(0, 0, -1); camFwdH.normalize();
+}
 
+// ================= materials & textures =================
 const grad = new THREE.DataTexture(new Uint8Array([110, 190, 255]), 3, 1, THREE.RedFormat);
 grad.minFilter = grad.magFilter = THREE.NearestFilter; grad.needsUpdate = true;
 const toonMat = new THREE.MeshToonMaterial({ vertexColors: true, gradientMap: grad });
+const toonMatDS = new THREE.MeshToonMaterial({ vertexColors: true, gradientMap: grad, side: THREE.DoubleSide });
+const wingMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.55, side: THREE.DoubleSide, depthWrite: false });
 const mouthMat = new THREE.MeshBasicMaterial({ color: '#3a1626' });
+const toonCache = new Map();
+const toon = (hex, ds) => { const k = hex + (ds ? 'd' : ''); if (!toonCache.has(k)) toonCache.set(k, new THREE.MeshToonMaterial({ color: hex, gradientMap: grad, side: ds ? THREE.DoubleSide : THREE.FrontSide })); return toonCache.get(k); };
 
-function radialTex(stops) {
-  const c = document.createElement('canvas'); c.width = c.height = 64;
-  const x = c.getContext('2d'), g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
-  for (const [o, col] of stops) g.addColorStop(o, col);
-  x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+function canvasTex(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h);
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
 }
+function radialTex(stops) {
+  return canvasTex(64, 64, x => { const g = x.createRadialGradient(32, 32, 0, 32, 32, 32); for (const [o, col] of stops) g.addColorStop(o, col); x.fillStyle = g; x.fillRect(0, 0, 64, 64); });
+}
 const dotTex = radialTex([[0, 'rgba(255,255,255,1)'], [0.35, 'rgba(255,255,255,.9)'], [1, 'rgba(255,255,255,0)']]);
+const softTex = radialTex([[0, 'rgba(255,255,255,.9)'], [0.6, 'rgba(255,255,255,.45)'], [1, 'rgba(255,255,255,0)']]);
 const shadowTex = radialTex([[0, 'rgba(0,0,0,.55)'], [0.5, 'rgba(0,0,0,.3)'], [1, 'rgba(0,0,0,0)']]);
+const ringTex = canvasTex(64, 64, x => { x.strokeStyle = 'rgba(255,255,255,.95)'; x.lineWidth = 5; x.beginPath(); x.arc(32, 32, 26, 0, TAU); x.stroke(); });
+const heartTex = canvasTex(128, 128, x => {
+  x.fillStyle = '#ff4f8b'; x.beginPath(); x.moveTo(64, 112);
+  x.bezierCurveTo(10, 72, 6, 30, 38, 22); x.bezierCurveTo(54, 18, 62, 30, 64, 40);
+  x.bezierCurveTo(66, 30, 74, 18, 90, 22); x.bezierCurveTo(122, 30, 118, 72, 64, 112); x.fill();
+  x.fillStyle = 'rgba(255,255,255,.7)'; x.beginPath(); x.ellipse(42, 42, 10, 6, -0.6, 0, TAU); x.fill();
+});
+const zTex = canvasTex(64, 64, x => { x.fillStyle = '#ffffff'; x.strokeStyle = '#5a4a8a'; x.lineWidth = 6; x.font = '700 52px Fredoka, sans-serif'; x.textAlign = 'center'; x.strokeText('z', 32, 48); x.fillText('z', 32, 48); });
+const glassTex = canvasTex(256, 256, (x, w, h) => {
+  const g = x.createLinearGradient(0, 0, w, h); g.addColorStop(0, 'rgba(200,225,255,.55)'); g.addColorStop(1, 'rgba(160,190,230,.35)');
+  x.fillStyle = g; x.fillRect(0, 0, w, h);
+  x.fillStyle = 'rgba(255,255,255,.45)';
+  for (const [a, b, s] of [[30, 0, 40], [90, 0, 16], [150, 0, 28]]) { x.beginPath(); x.moveTo(a, b); x.lineTo(a + s, b); x.lineTo(a + s - 140, h); x.lineTo(a - 140, h); x.fill(); }
+  x.fillStyle = 'rgba(255,255,255,.6)';
+  for (let i = 0; i < 26; i++) { x.beginPath(); x.ellipse(Math.random() * w, Math.random() * h, rand(1.5, 4), rand(2, 6), 0, 0, TAU); x.fill(); }
+});
 const shadowGeo = new THREE.CircleGeometry(0.075, 20);
 const shadowMat = new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
 const starGeo = new THREE.OctahedronGeometry(0.011);
 const starMat = new THREE.MeshBasicMaterial({ color: '#ffe14d' });
+const planeGeo = new THREE.PlaneGeometry(1, 1);
 
 // ================= sound =================
-// Everything is synthesized: babble is a buzzy voice pushed through two vowel filters, so it sounds like tiny gibberish talk.
+// Everything is synthesized. Each tribe has its own gibberish: different vowels, consonants, rhythm and buzz.
 const AU = { ctx: null, listener: null, noise: null, master: null };
 function initAudio() {
   if (AU.ctx) { AU.ctx.resume(); return; }
@@ -124,121 +156,177 @@ function initAudio() {
   const len = AU.ctx.sampleRate, buf = AU.ctx.createBuffer(1, len, len), d = buf.getChannelData(0);
   for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
   AU.noise = buf;
-  for (const e of elves) attachVoice(e);
+  for (const e of [...elves, ...visitors]) attachVoice(e);
+  if (Flyer.pilot) attachVoice(Flyer.pilot);
   AU.ctx.resume();
 }
 function attachVoice(e) {
   if (!AU.ctx || e.voiceIn) return;
-  const pa = new THREE.PositionalAudio(AU.listener);
-  const g = AU.ctx.createGain(); g.gain.value = 1.4;
-  pa.setNodeSource(g); pa.setRefDistance(0.7); pa.setRolloffFactor(1.1);
-  pa.position.y = 0.12; e.root.add(pa); e.audio = pa; e.voiceIn = g;
+  const c = AU.ctx, pa = new THREE.PositionalAudio(AU.listener), mix = c.createGain(); mix.gain.value = 1.4;
+  pa.setNodeSource(mix); pa.setRefDistance(0.6); pa.setRolloffFactor(1.1);
+  const voiceIn = c.createGain(), rawIn = c.createGain();
+  if (e.muffled) { const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 650; voiceIn.connect(lp); lp.connect(mix); }
+  else voiceIn.connect(mix);
+  rawIn.connect(mix);
+  pa.position.y = 0.12; e.root.add(pa); e.audio = pa; e.voiceIn = voiceIn; e.rawIn = rawIn;
 }
+const now = () => AU.ctx.currentTime;
 const VOW = { a: [800, 1200], e: [480, 1900], i: [310, 2300], o: [500, 880], u: [340, 780], y: [400, 1600] };
-const CONS = { t: [3500, 1.5, 0.025], k: [2200, 1.5, 0.03], p: [900, 1, 0.02], s: [5500, 2, 0.07], b: [400, 1, 0.02], h: [1600, 0.7, 0.05] };
-function noiseBurst(dest, t, dur, freq, q, vol) {
+const CONS = { t: [3500, 1.5, 0.025], k: [2200, 1.5, 0.03], p: [900, 1, 0.02], s: [5500, 2, 0.07], b: [400, 1, 0.02], h: [1600, 0.7, 0.05], d: [2800, 1.2, 0.02], g: [1500, 1.2, 0.03], z: [4200, 1.5, 0.08], f: [6000, 1, 0.06] };
+function noiseBurst(dest, t, dur, freq, q, vol, type = 'bandpass') {
   const c = AU.ctx, s = c.createBufferSource(); s.buffer = AU.noise; s.loop = true;
-  const f = c.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = q;
+  const f = c.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
   const g = c.createGain(); g.gain.setValueAtTime(0.0001, t);
   g.gain.exponentialRampToValueAtTime(vol, t + 0.008); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
   s.connect(f); f.connect(g); g.connect(dest); s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.02);
 }
-function syl(dest, t, dur, f0a, f0b, vow, fs, vol, cons, vib) {
-  const c = AU.ctx, o = c.createOscillator(); o.type = 'sawtooth';
+function tone(dest, t, dur, f0, f1, vol, type = 'sine', vib = 0) {
+  const c = AU.ctx, o = c.createOscillator(), g = c.createGain(); o.type = type;
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  if (vib) { const l = c.createOscillator(), lg = c.createGain(); l.frequency.value = vib; lg.gain.value = f0 * 0.05; l.connect(lg); lg.connect(o.frequency); l.start(t); l.stop(t + dur + 0.03); }
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(dest); o.start(t); o.stop(t + dur + 0.03);
+}
+function syl(dest, t, dur, f0a, f0b, vow, fs, vol, cons, vib, wave = 'sawtooth') {
+  const c = AU.ctx, o = c.createOscillator(); o.type = wave;
   o.frequency.setValueAtTime(f0a, t); o.frequency.linearRampToValueAtTime(f0b, t + dur);
   if (vib) { const l = c.createOscillator(), lg = c.createGain(); l.frequency.value = vib; lg.gain.value = f0a * 0.07; l.connect(lg); lg.connect(o.frequency); l.start(t); l.stop(t + dur + 0.03); }
-  const [F1, F2] = VOW[vow];
+  const [F1, F2] = VOW[vow] || VOW.a;
   const b1 = c.createBiquadFilter(); b1.type = 'bandpass'; b1.frequency.value = F1 * fs; b1.Q.value = 5;
   const b2 = c.createBiquadFilter(); b2.type = 'bandpass'; b2.frequency.value = F2 * fs; b2.Q.value = 7;
   const g = c.createGain(), g2 = c.createGain(); g2.gain.value = 0.7;
   g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
   g.gain.setValueAtTime(vol, t + dur * 0.6); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  o.connect(b1); o.connect(b2); b1.connect(g); b2.connect(g2); g2.connect(g); g.connect(dest);
+  let out = g;
+  if (cons === 'r') {   // rolled r: a quick flutter over the whole syllable
+    const am = c.createGain(), l = c.createOscillator(), lg = c.createGain(); am.gain.value = 0.6; l.frequency.value = 28; lg.gain.value = 0.4;
+    l.connect(lg); lg.connect(am.gain); g.connect(am); out = am; l.start(t); l.stop(t + dur + 0.03);
+  }
+  o.connect(b1); o.connect(b2); b1.connect(g); b2.connect(g2); g2.connect(g); out.connect(dest);
   o.start(t); o.stop(t + dur + 0.03);
-  if (cons && CONS[cons]) { const [f, q, d] = CONS[cons]; noiseBurst(dest, Math.max(c.currentTime, t - 0.012), d, f, q, vol * 0.7); }
+  if (cons === 'm') tone(dest, Math.max(c.currentTime, t - 0.05), 0.06, f0a * 0.9, f0a, vol * 0.25, 'triangle');
+  else if (cons && CONS[cons]) { const [f, q, d] = CONS[cons]; noiseBurst(dest, Math.max(c.currentTime, t - 0.012), d, f, q, vol * 0.7); }
 }
+const KINDS = {
+  gnome: { w: 3, size: [0.9, 1.15], voice: [150, 210], fs: [1.0, 1.15], lang: 'rumbly' },
+  elf: { w: 3, size: [0.85, 1.2], voice: [280, 380], fs: [1.25, 1.45], lang: 'tinkly' },
+  pixie: { w: 2, size: [0.62, 0.78], voice: [650, 900], fs: [1.6, 1.9], lang: 'chirp' },
+  bumble: { w: 2, size: [0.82, 1.02], voice: [105, 145], fs: [0.85, 0.95], lang: 'blub' },
+};
+const LANGS = {
+  rumbly: { vowels: 'ouoao', cons: 'bdgrmh', dur: [0.11, 0.2], gap: [0.03, 0.07], wave: 'sawtooth', contour: -0.35, vib: 0, laugh: { v: 'o', dur: 0.12, gap: 0.09, n: 4 } },
+  tinkly: { vowels: 'ieyie', cons: 'tkspf', dur: [0.06, 0.12], gap: [0.01, 0.04], wave: 'sawtooth', contour: 0.25, vib: 0, laugh: { v: 'i', dur: 0.07, gap: 0.05, n: 6 } },
+  chirp: { pure: true, dur: [0.04, 0.1], gap: [0.01, 0.035], glide: [0.6, 1.8], laugh: { chirp: true, n: 10 } },
+  blub: { vowels: 'uoua', cons: 'bpmz', dur: [0.12, 0.22], gap: [0.04, 0.08], wave: 'square', contour: -0.1, vib: 7, laugh: { v: 'u', dur: 0.1, gap: 0.08, n: 4, snort: true } },
+};
+function makeSyllables(L, n) {
+  return Array.from({ length: n }, () => ({ v: L.pure ? 'a' : pick(L.vowels), c: !L.pure && Math.random() < 0.55 ? pick(L.cons) : null, d: rand(...L.dur), r: rand(0.88, 1.15), g: L.pure ? rand(...L.glide) : rand(0.88, 1.15) }));
+}
+// Each little person has a catchphrase they keep coming back to.
+const makePhrase = L => makeSyllables(L, 3 + ((Math.random() * 3) | 0));
 function babble(e, n, question, delay = 0) {
   if (!e.voiceIn) return 0.6;
-  const t0 = AU.ctx.currentTime + 0.02 + delay; let t = t0;
+  const L = LANGS[e.lang], t0 = now() + 0.02 + delay; let t = t0;
   const base = e.pitch * rand(0.9, 1.15);
-  for (let i = 0; i < n; i++) {
-    const k = i / Math.max(1, n - 1), dur = rand(0.08, 0.17) * (i === n - 1 ? 1.6 : 1);
-    const f = base * (question ? 1 + 0.55 * k * k : 1.15 - 0.3 * k) * rand(0.9, 1.12);
-    syl(e.voiceIn, t, dur, f, f * rand(0.88, 1.15), pick('aeiouy'), e.fs, 0.9, Math.random() < 0.55 ? pick('tkpsbh') : null);
-    t += dur + rand(0.015, 0.05);
-  }
+  const sy = Math.random() < 0.3 ? e.phrase : makeSyllables(L, n);
+  sy.forEach((s, i) => {
+    const k = i / Math.max(1, sy.length - 1), last = i === sy.length - 1;
+    const f = base * (question ? 1 + 0.55 * k * k : 1 + (L.contour || 0) * k) * s.r, d = s.d * (last ? 1.5 : 1);
+    if (L.pure) tone(e.voiceIn, t, d, f, f * s.g, 0.45, 'sine');
+    else syl(e.voiceIn, t, d, f, f * s.g, s.v, e.fs, 0.9, s.c, L.vib, L.wave);
+    t += d + rand(...L.gap);
+  });
   const d = t - t0 + delay; e.talkT = Math.max(e.talkT, d); return d;
 }
 function laugh(e, n, delay = 0) {
   if (!e.voiceIn) return 1.2;
-  const t0 = AU.ctx.currentTime + 0.02 + delay; let t = t0;
-  const base = e.pitch * rand(1.2, 1.5), v = pick(['e', 'a', 'i']);
-  for (let i = 0; i < n; i++) {
-    const dur = rand(0.06, 0.09), f = base * (1 - i * 0.035);
-    noiseBurst(e.voiceIn, t, 0.04, 1700, 0.8, 0.35);
-    syl(e.voiceIn, t + 0.02, dur, f, f * 0.9, v, e.fs, 1.0, null);
-    t += dur + rand(0.045, 0.075);
+  const L = LANGS[e.lang].laugh, t0 = now() + 0.02 + delay; let t = t0;
+  const base = e.pitch * rand(1.15, 1.45);
+  if (L.chirp) {
+    for (let i = 0; i < n + 4; i++) { const f = base * (1 + i * 0.03); tone(e.voiceIn, t, 0.045, f, f * 1.5, 0.4); t += rand(0.03, 0.05); }
+  } else {
+    for (let i = 0; i < Math.max(n, L.n); i++) {
+      const f = base * (1 - i * 0.035);
+      noiseBurst(e.voiceIn, t, 0.04, 1700, 0.8, 0.35);
+      syl(e.voiceIn, t + 0.02, L.dur, f, f * 0.9, L.v, e.fs, 1.0, null, 0, LANGS[e.lang].wave);
+      if (L.snort && i % 2) noiseBurst(e.voiceIn, t + L.dur, 0.09, 260, 1.5, 0.9);
+      t += L.dur + L.gap * rand(0.8, 1.2);
+    }
+    syl(e.voiceIn, t + 0.05, 0.25, base * 1.3, base * 0.8, 'i', e.fs, 0.6, 'h');
   }
-  syl(e.voiceIn, t + 0.05, 0.25, base * 1.3, base * 0.8, 'i', e.fs, 0.6, 'h'); // little wheeze at the end
   const d = t - t0 + 0.3 + delay; e.talkT = Math.max(e.talkT, d); return d;
 }
 function say(e, w, delay = 0) {
   if (!e.voiceIn) return 0.2;
-  const t = AU.ctx.currentTime + 0.01 + delay, b = e.pitch, fs = e.fs, out = e.voiceIn; let d = 0.2;
+  const t = now() + 0.01 + delay, b = e.pitch, fs = e.fs, out = e.voiceIn, raw = e.rawIn, wave = LANGS[e.lang].wave || 'sawtooth'; let d = 0.2;
+  const pure = LANGS[e.lang].pure;
+  const S = (tt, dd, f0, f1, v, c, vib) => pure ? tone(out, tt, dd, f0, f1, 0.45, 'sine', vib) : syl(out, tt, dd, f0, f1, v, fs, 0.9, c, vib, wave);
   switch (w) {
-    case 'hup': syl(out, t, 0.11, b * 1.1, b * 1.5, 'u', fs, 0.9, 'h'); d = 0.12; break;
-    case 'whee': syl(out, t, 0.5, b * 1.2, b * 2.1, 'i', fs, 0.9, null, 6); d = 0.5; break;
-    case 'yip': syl(out, t, 0.08, b * 1.8, b * 2.2, 'i', fs, 0.9, null); syl(out, t + 0.11, 0.12, b * 2.0, b * 1.6, 'e', fs, 0.9, null); d = 0.25; break;
-    case 'waa': syl(out, t, 0.75, b * 1.5, b * 0.9, 'a', fs, 1.0, null, 9); d = 0.75; break;
-    case 'oof': syl(out, t, 0.18, b * 0.95, b * 0.6, 'u', fs, 0.9, 'p'); d = 0.2; break;
-    case 'ow': syl(out, t, 0.3, b * 1.6, b * 1.0, 'a', fs, 0.9, null); syl(out, t + 0.18, 0.15, b * 1.1, b * 0.9, 'u', fs, 0.7, null); d = 0.35; break;
-    case 'hey': syl(out, t, 0.28, b * 1.0, b * 1.45, 'e', fs, 0.9, 'h'); d = 0.3; break;
-    case 'pop': { const c = AU.ctx, o = c.createOscillator(), g = c.createGain();
-      o.frequency.setValueAtTime(300, t); o.frequency.exponentialRampToValueAtTime(1100, t + 0.09);
-      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.7, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
-      o.connect(g); g.connect(out); o.start(t); o.stop(t + 0.14); d = 0.1; break; }
-    case 'pat': noiseBurst(out, t, 0.05, 700, 1, 0.3); d = 0.05; break;
+    case 'hup': S(t, 0.11, b * 1.1, b * 1.5, 'u', 'h'); d = 0.12; break;
+    case 'whee': S(t, 0.5, b * 1.2, b * 2.1, 'i', null, 6); d = 0.5; break;
+    case 'yip': S(t, 0.08, b * 1.8, b * 2.2, 'i'); S(t + 0.11, 0.12, b * 2.0, b * 1.6, 'e'); d = 0.25; break;
+    case 'waa': S(t, 0.75, b * 1.5, b * 0.9, 'a', null, 9); d = 0.75; break;
+    case 'eee': S(t, 0.35, b * 2.0, b * 2.4, 'i', null, 11); d = 0.35; break;
+    case 'oof': S(t, 0.18, b * 0.95, b * 0.6, 'u', 'p'); d = 0.2; break;
+    case 'ow': S(t, 0.3, b * 1.6, b * 1.0, 'a'); S(t + 0.18, 0.15, b * 1.1, b * 0.9, 'u'); d = 0.35; break;
+    case 'uhoh': S(t, 0.14, b * 1.2, b * 1.25, 'u'); S(t + 0.2, 0.2, b * 1.0, b * 0.8, 'o'); d = 0.42; break;
+    case 'hey': S(t, 0.28, b * 1.0, b * 1.45, 'e', 'h'); d = 0.3; break;
+    case 'boo': S(t, 0.3, b * 0.9, b * 1.5, 'u', 'b'); d = 0.32; break;
+    case 'nono': for (let i = 0; i < 4; i++) S(t + i * 0.14, 0.1, b * (1.3 - i * 0.05), b * 1.1, 'o', 'm'); d = 0.6; break;
+    case 'hic': S(t, 0.06, b * 1.6, b * 2.4, 'i', 'h'); d = 0.08; break;
+    case 'mwah': S(t, 0.25, b * 1.0, b * 1.4, 'a', 'm'); noiseBurst(raw, t + 0.25, 0.025, 2200, 2, 0.6); d = 0.3; break;
+    case 'yawn': S(t, 0.9, b * 1.1, b * 0.6, 'a', 'h', 3); d = 0.9; break;
+    case 'achoo':
+      S(t, 0.22, b * 1.0, b * 1.3, 'a', 'h'); S(t + 0.4, 0.25, b * 1.15, b * 1.5, 'a', 'h');
+      noiseBurst(raw, t + 0.85, 0.22, 3200, 0.8, 1.1); S(t + 0.88, 0.2, b * 1.6, b * 1.0, 'u'); d = 1.1; break;
+    case 'pop': tone(raw, t, 0.1, 300, 1100, 0.7); d = 0.1; break;
+    case 'boing': tone(raw, t, 0.35, 180, 620, 0.55, 'sine', 24); d = 0.1; break;
+    case 'pat': noiseBurst(raw, t, 0.05, 700, 1, 0.3); d = 0.05; break;
   }
   e.talkT = Math.max(e.talkT, d); return d;
 }
+function step(e) { if (!e.rawIn) return; const t = now(); if (e.kind === 'bumble') tone(e.rawIn, t, 0.06, 140, 70, 0.25); else noiseBurst(e.rawIn, t, 0.018, e.kind === 'pixie' ? 6000 : 4200, 1.5, e.kind === 'pixie' ? 0.06 : 0.1); }
 function thud(e, big) {
-  if (!e.voiceIn) return;
-  const c = AU.ctx, t = c.currentTime + 0.005, o = c.createOscillator(), g = c.createGain();
-  o.frequency.setValueAtTime(130, t); o.frequency.exponentialRampToValueAtTime(38, t + 0.22);
-  g.gain.setValueAtTime(big ? 2.2 : 1.5, t); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
-  o.connect(g); g.connect(e.voiceIn); o.start(t); o.stop(t + 0.32);
-  noiseBurst(e.voiceIn, t, 0.1, 260, 0.7, big ? 1.3 : 0.9);
+  if (!e.rawIn) return;
+  const t = now() + 0.005;
+  tone(e.rawIn, t, 0.3, e.kind === 'bumble' ? 100 : 130, 38, big ? 2.2 : 1.5);
+  noiseBurst(e.rawIn, t, 0.12, 260, 0.7, big ? 1.3 : 0.9);
+  if (big) noiseBurst(e.rawIn, t, 0.18, 500, 0.5, 0.8, 'lowpass');
 }
+function snore(e) {
+  if (!e.rawIn) return;
+  const t = now();
+  noiseBurst(e.rawIn, t, 0.9, 300, 3, 0.45);
+  tone(e.voiceIn, t + 1.0, 0.7, e.pitch * 2.2, e.pitch * 1.6, 0.2, 'sine');
+}
+function whistle(e) {
+  if (!e.rawIn) return 2;
+  let t = now() + 0.05; const root = rand(700, 1100), scale = [1, 9 / 8, 5 / 4, 3 / 2, 5 / 3, 2];
+  const n = 5 + ((Math.random() * 4) | 0);
+  for (let i = 0; i < n; i++) { const f = root * pick(scale), d = pick([0.12, 0.18, 0.3]); tone(e.rawIn, t, d, f, f * 1.01, 0.18, 'sine', 6); t += d + 0.03; }
+  return t - now();
+}
+function knock(e) { if (!e.rawIn) return; const t = now(); noiseBurst(e.rawIn, t, 0.03, 2200, 3, 1.0); tone(e.rawIn, t, 0.08, 1150, 900, 0.5); }
 function chomp(t) {
   noiseBurst(AU.master, t, 0.09, rand(1400, 2600), 1.2, 0.5);
   noiseBurst(AU.master, t + 0.03, 0.07, rand(500, 900), 2, 0.45);
   syl(AU.master, t, 0.08, 95, 70, 'o', 1, 0.35, null);
 }
 function gulp(t) {
-  const c = AU.ctx, o = c.createOscillator(), g = c.createGain();
-  o.frequency.setValueAtTime(420, t); o.frequency.exponentialRampToValueAtTime(130, t + 0.2);
-  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.5, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
-  o.connect(g); g.connect(AU.master); o.start(t); o.stop(t + 0.27);
-  syl(AU.master, t + 0.45, 0.7, 170, 205, 'u', 0.8, 0.45, null, 5);  // "mmmm"
+  tone(AU.master, t, 0.25, 420, 130, 0.5);
+  syl(AU.master, t + 0.45, 0.7, 170, 205, 'u', 0.8, 0.45, null, 5);
 }
-function shimmer() {
-  const c = AU.ctx, t = c.currentTime;
-  [523, 659, 784, 988, 1175, 1568, 2093].forEach((f, i) => {
-    const o = c.createOscillator(), g = c.createGain(), s = t + i * 0.11;
-    o.frequency.setValueAtTime(f, s); o.frequency.linearRampToValueAtTime(f * 1.03, s + 1.4);
-    g.gain.setValueAtTime(0.0001, s); g.gain.exponentialRampToValueAtTime(0.1, s + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, s + 1.6);
-    o.connect(g); g.connect(AU.master); o.start(s); o.stop(s + 1.7);
-  });
-  const o = c.createOscillator(), g = c.createGain(); o.type = 'triangle';
-  o.frequency.setValueAtTime(110, t); o.frequency.exponentialRampToValueAtTime(880, t + 2.2);
-  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.12, t + 0.5); g.gain.exponentialRampToValueAtTime(0.0001, t + 2.4);
-  o.connect(g); g.connect(AU.master); o.start(t); o.stop(t + 2.5);
+function shimmer(n = 7, vol = 0.1) {
+  const t = now();
+  [523, 659, 784, 988, 1175, 1568, 2093].slice(0, n).forEach((f, i) => tone(AU.master, t + i * 0.11, 1.6, f, f * 1.03, vol));
+  if (n > 4) tone(AU.master, t, 2.4, 110, 880, 0.12, 'triangle');
 }
+function click() { if (AU.ctx) tone(AU.master, now(), 0.07, 1400, 1800, 0.15); }
 
 // ================= room =================
 // The room is one triangle mesh: your Quest's room scan in mixed reality, a pretend living room in the preview.
-// It is invisible in MR, but it still hides little people who walk behind your real furniture.
-const Room = { kind: '', geo: null, collider: null, occluder: null, scan: null, visual: null, spots: [], minY: 0, sig: '', builtAt: 0 };
+// Pictures on the wall get a thin invisible ledge so the little people can tightrope-walk along the top of the frame.
+const Room = { kind: '', baseGeo: null, geo: null, collider: null, occluder: null, scan: null, visual: null, spots: [], minY: 0, sig: '', builtAt: 0, features: [], anchor: null };
 const colliderMat = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
 const occluderMat = new THREE.MeshBasicMaterial({ colorWrite: false, side: THREE.DoubleSide });
 const scanMat = new THREE.ShaderMaterial({
@@ -267,31 +355,57 @@ function geoFrom(pos, idx) {
   if (idx) g.setIndex(idx);
   return g;
 }
+function disposeGeo(g) { if (g.boundsTree) g.disposeBoundsTree(); g.dispose(); }
 function clearRoom() {
   for (const k of ['occluder', 'scan', 'visual']) if (Room[k]) { scene.remove(Room[k]); Room[k] = null; }
-  if (Room.geo && Room.kind !== 'preview') { Room.geo.disposeBoundsTree(); Room.geo.dispose(); }
-  Room.geo = Room.collider = null; Room.spots = []; Room.kind = '';
+  if (Room.geo && Room.geo !== Room.baseGeo) disposeGeo(Room.geo);
+  if (Room.baseGeo && Room.kind !== 'preview' && Room.kind !== 'fallback') disposeGeo(Room.baseGeo);
+  Room.geo = Room.baseGeo = Room.collider = null; Room.spots = []; Room.kind = ''; Room.features = []; Room.anchor = null;
 }
-function setRoom(geo, kind, visual) {
+function setRoom(base, kind, visual) {
   clearRoom();
+  Room.baseGeo = base; Room.kind = kind;
+  if (visual) { Room.visual = visual; scene.add(visual); }
+  buildRoomGeo();
+}
+// Each picture becomes a thin wedge on the wall: a flat ledge on top, and a gentle slope underneath so climbers can get onto it.
+const WEDGE_TRIS = [1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 0, 4, 5, 0, 5, 1, 0, 1, 2, 0, 2, 3, 4, 7, 6, 4, 6, 5];
+function buildRoomGeo() {
+  const old = Room.geo, arts = Room.features.filter(f => f.type === 'art');
+  let geo = Room.baseGeo;
+  if (arts.length) {
+    const P = Array.from(geo.attributes.position.array);
+    const I = geo.index ? Array.from(geo.index.array) : [...Array(P.length / 3).keys()];
+    for (const f of arts) {
+      const W = f.w / 2 + 0.005, H = f.h / 2 + 0.005, D = 0.03, SL = 0.1, base = P.length / 3;
+      for (const [x, y, z] of [[-W, -H - SL, 0], [-W, -H, D], [-W, H, D], [-W, H, 0], [W, -H - SL, 0], [W, -H, D], [W, H, D], [W, H, 0]]) {
+        _t1.copy(f.c).addScaledVector(f.r, x).addScaledVector(f.u, y).addScaledVector(f.n, z); P.push(_t1.x, _t1.y, _t1.z);
+      }
+      for (const i of WEDGE_TRIS) I.push(base + i);
+    }
+    geo = geoFrom(P, I);
+  }
   if (!geo.boundsTree) geo.computeBoundsTree();
   geo.computeBoundingBox();
-  Room.geo = geo; Room.kind = kind;
+  Room.geo = geo;
   Room.collider = new THREE.Mesh(geo, colliderMat); Room.collider.updateMatrixWorld(true);
-  if (visual) { Room.visual = visual; scene.add(visual); }
-  else { Room.occluder = new THREE.Mesh(geo, occluderMat); Room.occluder.renderOrder = -10; scene.add(Room.occluder); }
-  Room.scan = new THREE.Mesh(geo, scanMat); Room.scan.renderOrder = 5; Room.scan.visible = false; Room.scan.frustumCulled = false;
-  scene.add(Room.scan);
+  if (!Room.visual) {
+    if (!Room.occluder) { Room.occluder = new THREE.Mesh(geo, occluderMat); Room.occluder.renderOrder = -10; scene.add(Room.occluder); }
+    else Room.occluder.geometry = geo;
+  }
+  if (!Room.scan) { Room.scan = new THREE.Mesh(geo, scanMat); Room.scan.renderOrder = 5; Room.scan.visible = false; Room.scan.frustumCulled = false; scene.add(Room.scan); }
+  else Room.scan.geometry = geo;
+  if (old && old !== geo && old !== Room.baseGeo) disposeGeo(old);
   Room.minY = geo.boundingBox.min.y;
   sampleSpots(geo);
 }
-// Random points spread over the room's surfaces, used to pick places to run to, jump to and appear at.
+// Random points spread over the room's surfaces: places to run to, jump to and appear at.
 function sampleSpots(geo) {
   const P = geo.attributes.position.array, I = geo.index ? geo.index.array : null;
   const tris = I ? I.length / 3 : P.length / 9, vi = (t, k) => (I ? I[t * 3 + k] : t * 3 + k) * 3;
   const a = new V3(), b = new V3(), c = new V3(), ab = new V3(), ac = new V3();
   const cum = new Float32Array(tris); let total = 0;
-  const top = Room.minY + 2.1;   // skip the ceiling
+  const top = Room.minY + 2.1;
   for (let t = 0; t < tris; t++) {
     a.fromArray(P, vi(t, 0)); b.fromArray(P, vi(t, 1)); c.fromArray(P, vi(t, 2));
     const area = ab.subVectors(b, a).cross(ac.subVectors(c, a)).length() * 0.5;
@@ -311,7 +425,6 @@ function sampleSpots(geo) {
   }
 }
 const randomSpot = () => Room.spots.length ? pick(Room.spots) : null;
-
 const rc = new THREE.Raycaster(); rc.firstHitOnly = true;
 // Hit point plus the surface normal turned to face where the ray came from (scan triangles can face either way).
 function cast(o, d, far) {
@@ -323,8 +436,36 @@ function cast(o, d, far) {
   if (n.dot(d) > 0) n.negate();
   return { p: h.point.clone(), n, d: h.distance };
 }
+function wallUp(n, out) {
+  out.copy(Y).addScaledVector(n, -n.y);
+  if (out.lengthSq() < 0.02) out.set(0, 0, 1).addScaledVector(n, -n.z);
+  return out.normalize();
+}
+// A picture or a window: center on the wall, normal pointing into the room, right and up along the wall.
+function makeFeature(type, c, n, w, h, src) {
+  const nn = n.clone().normalize(), u = wallUp(nn, new V3()), r = new V3().crossVectors(u, nn).normalize();
+  return { type, c: c.clone(), n: nn, u, r, w, h, src };
+}
+// Planes around a feature's box; inside the box is on every plane's negative side.
+function boxPlanes(f, depth) {
+  const mk = (n, p) => new THREE.Plane().setFromNormalAndCoplanarPoint(n, p);
+  return [
+    mk(f.r.clone(), f.c.clone().addScaledVector(f.r, f.w / 2)), mk(f.r.clone().negate(), f.c.clone().addScaledVector(f.r, -f.w / 2)),
+    mk(f.u.clone(), f.c.clone().addScaledVector(f.u, f.h / 2)), mk(f.u.clone().negate(), f.c.clone().addScaledVector(f.u, -f.h / 2)),
+    mk(f.n.clone(), f.c.clone().addScaledVector(f.n, depth)),
+  ];
+}
+const _t1 = new V3();
+function onArtTop(p) {
+  for (const f of Room.features) {
+    if (f.type !== 'art') continue;
+    _t1.subVectors(p, f.c);
+    if (Math.abs(_t1.dot(f.u) - f.h / 2) < 0.03 && Math.abs(_t1.dot(f.r)) < f.w / 2 + 0.02 && _t1.dot(f.n) > -0.01 && _t1.dot(f.n) < 0.05) return f;
+  }
+  return null;
+}
 
-// Pretend living room for the desktop preview.
+// Pretend living room for the desktop preview, with a picture on the wall and a window.
 function buildPreviewRoom() {
   const group = new THREE.Group(), pos = [], idx = [], v = new V3();
   function append(g, m) {
@@ -332,38 +473,60 @@ function buildPreviewRoom() {
     for (let i = 0; i < p.count; i++) { v.fromBufferAttribute(p, i).applyMatrix4(m); pos.push(v.x, v.y, v.z); }
     for (const i of g.index.array) idx.push(base + i);
   }
-  function add(g, col, x, y, z, ry = 0) {
+  function add(g, col, x, y, z, ry = 0, solid = true) {
     const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: col }));
-    m.position.set(x, y, z); m.rotation.y = ry; group.add(m); m.updateMatrixWorld(true); append(g, m.matrixWorld);
+    m.position.set(x, y, z); m.rotation.y = ry; group.add(m); m.updateMatrixWorld(true); if (solid) append(g, m.matrixWorld);
+    return m;
   }
-  const box = (w, h, d, x, y, z, col, ry) => add(new THREE.BoxGeometry(w, h, d), col, x, y, z, ry);
+  const box = (w, h, d, x, y, z, col, ry, solid) => add(new THREE.BoxGeometry(w, h, d), col, x, y, z, ry, solid);
   const cyl = (rt, rb, h, x, y, z, col) => add(new THREE.CylinderGeometry(rt, rb, h, 20), col, x, y, z);
   box(5, 0.1, 5, 0, -0.05, 0, '#d8b48c');
   box(5, 2.6, 0.1, 0, 1.3, -2.55, '#f4ead9');
   box(0.1, 2.6, 5, -2.55, 1.3, 0, '#efe3cf');
   box(1.8, 0.014, 1.3, 0.5, 0.007, 0.5, '#7fc8c0');
-  // couch against the back wall
   box(1.8, 0.4, 0.8, 0.6, 0.2, -2.05, '#ff8fa8'); box(1.8, 0.45, 0.2, 0.6, 0.62, -2.4, '#ff7a98');
   box(0.2, 0.25, 0.8, -0.2, 0.52, -2.05, '#ff7a98'); box(0.2, 0.25, 0.8, 1.4, 0.52, -2.05, '#ff7a98');
-  // coffee table
   box(1.0, 0.05, 0.55, 0.6, 0.42, -1.05, '#b5774a');
   for (const [x, z] of [[0.15, -1.27], [1.05, -1.27], [0.15, -0.83], [1.05, -0.83]]) box(0.05, 0.4, 0.05, x, 0.2, z, '#8f5a36');
-  // bookshelf on the left wall
   box(0.34, 1.8, 0.9, -2.33, 0.9, -1.2, '#7aa6e8');
-  // dining table
   box(1.0, 0.05, 0.7, -0.9, 0.73, 0.6, '#c99560');
   for (const [x, z] of [[-1.35, 0.3], [-0.45, 0.3], [-1.35, 0.9], [-0.45, 0.9]]) box(0.05, 0.71, 0.05, x, 0.355, z, '#9c6e42');
   cyl(0.17, 0.17, 0.45, 1.3, 0.225, 0.7, '#ffd23f');
   box(0.35, 0.35, 0.35, -1.9, 0.175, 1.4, '#a45cff'); box(0.25, 0.25, 0.25, -1.88, 0.475, 1.38, '#7ae04a', 0.4);
   cyl(0.15, 0.11, 0.32, 2.0, 0.16, -2.1, '#e86f3d');
+  // the picture (its ledge comes from the feature, so it is drawn here but not added to the scan)
+  box(0.81, 0.56, 0.03, 0.6, 1.55, -2.485, '#8a5a2b', 0, false);
+  const paint = new THREE.Mesh(new THREE.PlaneGeometry(0.72, 0.47), new THREE.MeshBasicMaterial({ map: canvasTex(256, 168, (x, w, h) => {
+    const g = x.createLinearGradient(0, 0, 0, h); g.addColorStop(0, '#9fd8ff'); g.addColorStop(1, '#fff3c9'); x.fillStyle = g; x.fillRect(0, 0, w, h);
+    x.fillStyle = '#ffd23f'; x.beginPath(); x.arc(200, 40, 18, 0, TAU); x.fill();
+    x.fillStyle = '#7ac85a'; x.beginPath(); x.ellipse(70, 170, 130, 70, 0, 0, TAU); x.fill(); x.fillStyle = '#5aa84a'; x.beginPath(); x.ellipse(210, 175, 110, 55, 0, 0, TAU); x.fill();
+    x.fillStyle = '#ff6b6b'; x.fillRect(100, 92, 36, 30); x.fillStyle = '#8a3a2a'; x.beginPath(); x.moveTo(94, 94); x.lineTo(118, 74); x.lineTo(142, 94); x.fill();
+  }) }));
+  paint.position.set(0.6, 1.55, -2.469); group.add(paint);
+  // the window: a deep frame with sky behind it
+  const wx = -2.5, wy = 1.35, wz = 0.9, ww = 0.9, wh = 0.8, dep = 0.17;
+  const sky = new THREE.Mesh(new THREE.PlaneGeometry(ww, wh), new THREE.MeshBasicMaterial({ map: canvasTex(128, 128, (x, w, h) => {
+    const g = x.createLinearGradient(0, 0, 0, h); g.addColorStop(0, '#6fb8ff'); g.addColorStop(1, '#d9f0ff'); x.fillStyle = g; x.fillRect(0, 0, w, h);
+    x.fillStyle = 'rgba(255,255,255,.9)'; for (const [a, b, r] of [[30, 30, 14], [46, 26, 18], [62, 32, 12], [90, 70, 12], [104, 66, 16]]) { x.beginPath(); x.arc(a, b, r, 0, TAU); x.fill(); }
+    x.fillStyle = '#7ac85a'; x.fillRect(0, 110, w, 18);
+  }) }));
+  sky.rotation.y = Math.PI / 2; sky.position.set(wx + 0.001, wy, wz); group.add(sky);
+  const fr = '#f7f1e6';
+  box(dep, 0.05, ww + 0.1, wx + dep / 2, wy + wh / 2 + 0.025, wz, fr, 0, false);
+  box(dep, 0.05, ww + 0.1, wx + dep / 2, wy - wh / 2 - 0.025, wz, fr, 0, false);
+  box(dep, wh, 0.05, wx + dep / 2, wy, wz - ww / 2 - 0.025, fr, 0, false);
+  box(dep, wh, 0.05, wx + dep / 2, wy, wz + ww / 2 + 0.025, fr, 0, false);
   const geo = geoFrom(pos, idx); geo.computeBoundsTree();
-  return { group, geo };
+  return { group, geo, features: [
+    makeFeature('art', new V3(0.6, 1.55, -2.5), new V3(0, 0, 1), 0.8, 0.55, 'scan'),
+    makeFeature('window', new V3(wx, wy, wz), new V3(1, 0, 0), ww, wh, 'scan'),
+  ] };
 }
 const preview = buildPreviewRoom();
 const fallbackFloor = (() => { const g = new THREE.PlaneGeometry(8, 8); g.rotateX(-Math.PI / 2); return g; })();
 
-// ================= sparkles =================
-const SPARK_N = 500;
+// ================= sparkles & decals =================
+const SPARK_N = 600;
 const sparkPos = new Float32Array(SPARK_N * 3).fill(-999), sparkCol = new Float32Array(SPARK_N * 3);
 const sparkVel = new Float32Array(SPARK_N * 3), sparkLife = new Float32Array(SPARK_N), sparkGrav = new Float32Array(SPARK_N);
 const sparkGeo = new THREE.BufferGeometry();
@@ -395,6 +558,26 @@ function updateSparks(dt) {
 const BRIGHT = ['#ff3d7f', '#ff8a1f', '#ffd23f', '#7ae04a', '#1fd1c1', '#3d8bff', '#a45cff', '#ff5cd6', '#ff4d4d', '#00b8ff', '#b6f23a', '#ff9ec4'];
 const DUST = ['#c9b79c', '#e8dcc4', '#a8977c'];
 const CRUMBS = ['#9a4b2a', '#e8c13a', '#f3e2bb'];
+const PINKS = ['#ff4f8b', '#ff9ec4', '#ffffff', '#ffd1e3'];
+// Short-lived flat or camera-facing images: knock ripples, breath fog, floating z's.
+const decals = [];
+function addDecal(pos, normal, tex, s0, s1, life, op, opts = {}) {
+  const m = normal
+    ? new THREE.Mesh(planeGeo, new THREE.MeshBasicMaterial({ map: tex, color: opts.color || '#ffffff', transparent: true, depthWrite: false, opacity: op }))
+    : new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, color: opts.color || '#ffffff', transparent: true, depthWrite: false, opacity: op }));
+  m.position.copy(pos); if (normal) m.quaternion.setFromUnitVectors(ZAX, normal);
+  m.renderOrder = opts.order || 7; m.scale.setScalar(s0); scene.add(m);
+  const d = { m, t: 0, life, s0, s1, op, hold: opts.hold || 0, vel: opts.vel || null }; decals.push(d); return d;
+}
+function updateDecals(dt) {
+  for (let i = decals.length - 1; i >= 0; i--) {
+    const d = decals[i]; d.t += dt; const k = clamp(d.t / d.life, 0, 1);
+    d.m.scale.setScalar(d.s0 + (d.s1 - d.s0) * (1 - Math.pow(1 - k, 2)));
+    d.m.material.opacity = d.op * (k < d.hold ? 1 : 1 - (k - d.hold) / (1 - d.hold));
+    if (d.vel) d.m.position.addScaledVector(d.vel, dt);
+    if (d.t >= d.life) { scene.remove(d.m); d.m.material.dispose(); decals.splice(i, 1); }
+  }
+}
 
 // rainbow sweep over the room scan (the mushroom kicking in)
 const Scan = { t: -1 };
@@ -408,19 +591,26 @@ function updateScan(dt, t) {
   if (Scan.t > 6.5) { Scan.t = -1; Room.scan.visible = false; }
 }
 
-// ================= little people =================
-const SKINS = ['#ffdcc4', '#f5c3a0', '#e0a477', '#b97a50', '#8a5636', '#ffe6d6', '#d9b08c'];
-const BEARDS = ['#ffffff', '#f1efe9', '#d9d4cc', '#ff9b54', '#c9c3ff'];
-const HAIR = ['#5a3825', '#2a1e2e', '#e8b04a', '#c44b2a', '#ff7ac2', '#7a5cff'];
-const GEO = { sphere: new THREE.SphereGeometry(1, 14, 10), cone: new THREE.ConeGeometry(1, 1, 12), cyl: new THREE.CylinderGeometry(1, 1, 1, 12) };
+// ================= building the little people =================
+const SKINS = ['#ffdcc4', '#f5c3a0', '#e0a477', '#b97a50', '#8a5636', '#ffe6d6', '#d9b08c', '#c9e8c0', '#d8d0ff'];
+const BEARDS = ['#ffffff', '#f1efe9', '#d9d4cc', '#ff9b54', '#c9c3ff', '#8a5a3a'];
+const HAIR = ['#5a3825', '#2a1e2e', '#e8b04a', '#c44b2a', '#ff7ac2', '#7a5cff', '#3fd1c1'];
+const HATS = { gnome: ['cone', 'cone', 'floppy', 'toadstool', 'tophat'], elf: ['cone', 'floppy', 'leaf', 'crown', 'beanie'], pixie: ['leaf', 'acorn', 'toadstool', 'propeller', 'floppy'], bumble: ['beanie', 'tophat', 'propeller', 'acorn', 'toadstool'] };
+const OUTFITS = { gnome: ['plain', 'overalls', 'vest', 'scarf'], elf: ['tunic', 'tunic', 'cape', 'stripes', 'scarf'], pixie: ['tunic', 'plain', 'stripes'], bumble: ['overalls', 'stripes', 'plain', 'scarf', 'cape'] };
+const GEO = {
+  sphere: new THREE.SphereGeometry(1, 14, 10), dome: new THREE.SphereGeometry(1, 14, 7, 0, TAU, 0, Math.PI / 2),
+  cone: new THREE.ConeGeometry(1, 1, 12), cyl: new THREE.CylinderGeometry(1, 1, 1, 12), box: new THREE.BoxGeometry(1, 1, 1),
+  torus: new THREE.TorusGeometry(1, 0.28, 6, 16),
+};
 const geoCache = new Map();
-const capsule = (r, l) => { const k = 'c' + r + ':' + l; if (!geoCache.has(k)) geoCache.set(k, new THREE.CapsuleGeometry(r, l, 3, 10)); return geoCache.get(k); };
-const hatBody = (r, h) => { const k = 'h' + r + ':' + h; if (!geoCache.has(k)) geoCache.set(k, new THREE.CylinderGeometry(0.045, r, h, 14)); return geoCache.get(k); };
-const flat = new Map();
-const nonIndexed = g => { if (!flat.has(g)) flat.set(g, g.index ? g.toNonIndexed() : g); return flat.get(g); };
+const cached = (k, make) => { if (!geoCache.has(k)) geoCache.set(k, make()); return geoCache.get(k); };
+const capsule = (r, l) => cached('c' + r.toFixed(3) + ':' + l.toFixed(3), () => new THREE.CapsuleGeometry(r, l, 3, 10));
+const frustum = (r0, r1, h) => cached('h' + r0 + ':' + r1 + ':' + h, () => new THREE.CylinderGeometry(r0, r1, h, 14));
+const flatG = new Map();
+const nonIndexed = g => { if (!flatG.has(g)) flatG.set(g, g.index ? g.toNonIndexed() : g); return flatG.get(g); };
 const qDir = (x, y, z) => new THREE.Quaternion().setFromUnitVectors(Y, new V3(x, y, z).normalize());
-// Merge a body part's pieces into one colored mesh, so each little person is only a dozen draw calls.
-function bake(pieces) {
+// Merge a body part's pieces into one colored mesh, so each little person is only a dozen or so draw calls.
+function bake(pieces, mat = toonMat) {
   const P = [], N = [], C = [], m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), nm = new THREE.Matrix3(), v = new V3(), col = new THREE.Color();
   for (const [g0, hex, p, r, s] of pieces) {
     const g = nonIndexed(g0);
@@ -438,89 +628,202 @@ function bake(pieces) {
   geo.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
   geo.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
-  const mesh = new THREE.Mesh(geo, toonMat); mesh.userData.own = true; return mesh;
+  const mesh = new THREE.Mesh(geo, mat); mesh.userData.own = true; return mesh;
+}
+// Hats, all in head space: the head is a ball of radius ~0.12 centered at y 0.1.
+function addHat(type, kind, c, H, head) {
+  const S = GEO.sphere, D = GEO.dome, CO = GEO.cone, CY = GEO.cyl, B = GEO.box, out = { tips: [], prop: null };
+  const R = { gnome: 0.145, elf: 0.132, pixie: 0.13, bumble: 0.14 }[kind], HH = { gnome: 0.25, elf: 0.2, pixie: 0.18, bumble: 0.22 }[kind];
+  switch (type) {
+    case 'cone': {
+      H.push([CY, c.accent, [0, 0.19, -0.005], null, [R + 0.007, 0.032, R + 0.007]]);
+      H.push([frustum(0.045, R, HH), c.hat, [0, 0.19 + HH / 2, -0.01]]);
+      const t = new THREE.Group(); t.position.set(0, 0.19 + HH, -0.01); t.rotation.x = -0.35; t.userData.rest = -0.35;
+      t.add(bake([[CO, c.hat, [0, 0.08, 0], null, [0.046, 0.16, 0.046]], [S, kind === 'gnome' ? '#ffffff' : '#ffd23f', [0, 0.165, 0], null, 0.03]]));
+      head.add(t); out.tips.push(t); break;
+    }
+    case 'floppy': {
+      const h1 = HH * 0.6;
+      H.push([CY, c.accent, [0, 0.19, -0.005], null, [R + 0.007, 0.032, R + 0.007]]);
+      H.push([frustum(0.06, R, h1), c.hat, [0, 0.19 + h1 / 2, -0.01]]);
+      const t1 = new THREE.Group(); t1.position.set(0, 0.19 + h1, -0.01); t1.rotation.x = -0.8; t1.userData.rest = -0.8;
+      t1.add(bake([[frustum(0.04, 0.06, 0.14), c.hat, [0, 0.07, 0]]]));
+      const t2 = new THREE.Group(); t2.position.y = 0.14; t2.rotation.x = -0.9; t2.userData.rest = -0.9;
+      t2.add(bake([[CO, c.hat, [0, 0.08, 0], null, [0.04, 0.16, 0.04]], [S, c.accent, [0, 0.17, 0], null, 0.032]]));
+      t1.add(t2); head.add(t1); out.tips.push(t1, t2); break;
+    }
+    case 'beanie':
+      H.push([D, c.hat, [0, 0.13, -0.005], null, [R * 0.98, 0.13, R * 0.98]]);
+      H.push([CY, c.accent, [0, 0.135, -0.005], null, [R * 0.99 + 0.004, 0.035, R * 0.99 + 0.004]]);
+      for (let i = 0; i < 3; i++) H.push([CY, i % 2 ? c.stripe : c.hat, [0, 0.175 + i * 0.03, -0.005], null, [R * (0.94 - i * 0.12), 0.012, R * (0.94 - i * 0.12)]]);
+      H.push([S, c.accent, [0, 0.27, -0.01], null, 0.04]); break;
+    case 'acorn':
+      H.push([D, '#8a5a2b', [0, 0.14, 0], null, [R * 1.05, 0.11, R * 1.05]]);
+      for (let i = 0; i < 10; i++) { const a = i / 10 * TAU; H.push([S, '#6b4220', [Math.cos(a) * R * 0.85, 0.17, Math.sin(a) * R * 0.85], null, 0.014]); }
+      H.push([CY, '#6b4220', [0.01, 0.27, 0], [0, 0, 0.3], [0.012, 0.05, 0.012]]); break;
+    case 'toadstool':
+      H.push([CY, '#fff3dc', [0, 0.19, 0], null, [0.19, 0.012, 0.19]]);
+      H.push([D, '#ff3b3b', [0, 0.195, 0], null, [0.2, 0.11, 0.2]]);
+      for (let i = 0; i < 7; i++) { const a = i / 7 * TAU + 0.3, el = i % 2 ? 0.55 : 1.0; H.push([S, '#ffffff', [Math.cos(el) * Math.cos(a) * 0.195, 0.195 + Math.sin(el) * 0.105, Math.cos(el) * Math.sin(a) * 0.195], null, [0.024, 0.016, 0.024]]); }
+      break;
+    case 'leaf':
+      H.push([S, '#5fcf4a', [0, 0.25, -0.02], [-0.45, 0, 0.15], [0.09, 0.012, 0.17]]);
+      H.push([S, '#3f9a33', [0, 0.254, -0.02], [-0.45, 0, 0.15], [0.006, 0.006, 0.16]]);
+      H.push([CY, '#3f9a33', [0, 0.235, 0.12], [0.9, 0, 0], [0.008, 0.06, 0.008]]); break;
+    case 'crown':
+      H.push([CY, '#ffcc33', [0, 0.205, 0], null, [0.095, 0.05, 0.095]]);
+      for (let i = 0; i < 5; i++) { const a = i / 5 * TAU; H.push([CO, '#ffcc33', [Math.cos(a) * 0.085, 0.255, Math.sin(a) * 0.085], null, [0.022, 0.05, 0.022]]); H.push([S, pick(BRIGHT), [Math.cos(a) * 0.096, 0.205, Math.sin(a) * 0.096], null, 0.012]); }
+      break;
+    case 'propeller': {
+      H.push([D, c.hat, [0, 0.13, -0.005], null, [R * 0.98, 0.13, R * 0.98]]);
+      for (let i = 0; i < 4; i++) H.push([D, i % 2 ? c.stripe : c.accent, [0, 0.131, -0.005], [0, i * Math.PI / 2, 0], [R * 0.985, 0.131, R * 0.3]]);
+      H.push([CY, '#888888', [0, 0.28, 0], null, [0.008, 0.05, 0.008]]);
+      const pr = new THREE.Group(); pr.position.set(0, 0.305, 0);
+      pr.add(bake([[B, c.accent, [0.055, 0, 0], [0.25, 0, 0], [0.11, 0.006, 0.03]], [B, c.stripe, [-0.055, 0, 0], [-0.25, 0, 0], [0.11, 0.006, 0.03]], [S, '#ffd23f', [0, 0.005, 0], null, 0.014]]));
+      head.add(pr); out.prop = pr; break;
+    }
+    case 'tophat':
+      H.push([CY, '#2a1e2e', [0, 0.19, 0], null, [0.17, 0.012, 0.17]]);
+      H.push([CY, '#2a1e2e', [0, 0.285, 0], null, [0.1, 0.18, 0.1]]);
+      H.push([CY, c.accent, [0, 0.215, 0], null, [0.102, 0.03, 0.102]]);
+      H.push([S, c.hat, [0.09, 0.225, 0.04], null, 0.025]); break;
+  }
+  return out;
 }
 function buildBody(kind) {
-  const gn = kind === 'gnome', S = GEO.sphere, CO = GEO.cone, CY = GEO.cyl;
+  const S = GEO.sphere, CO = GEO.cone, CY = GEO.cyl, B = GEO.box, TO = GEO.torus;
   const cols = shuffle([...BRIGHT]);
   const c = { hat: cols[0], shirt: cols[1], pants: cols[2], accent: cols[3], stripe: cols[4], shoe: cols[5],
     skin: pick(SKINS), beard: pick(BEARDS), hair: pick(HAIR), dark: '#2a1e2e', cheek: '#ff8fa3' };
+  const K = KINDS[kind], s = rand(...K.size);
+  const leg = kind === 'bumble' ? rand(0.62, 0.78) : kind === 'pixie' ? rand(0.78, 0.95) : rand(0.85, 1.25);
+  const hd = kind === 'pixie' ? rand(1.15, 1.4) : kind === 'bumble' ? rand(0.95, 1.15) : rand(0.88, 1.2);
+  const wide = kind === 'bumble' ? rand(1.35, 1.6) : kind === 'gnome' ? rand(1.0, 1.25) : rand(0.85, 1.1);
+  const armL = kind === 'bumble' ? 1.2 : rand(0.9, 1.1);
+  const hh = 0.30 * leg, com = hh + 0.12;
   const root = new THREE.Object3D();
-  const model = new THREE.Group(); model.scale.setScalar(UNIT); root.add(model);
-  const flip = new THREE.Group(); flip.position.y = COM; model.add(flip);
-  const pelvis = new THREE.Group(); pelvis.position.y = 0.30 - COM; flip.add(pelvis);
-  const tr = gn ? 0.13 : 0.09;
+  const model = new THREE.Group(); model.scale.setScalar(UNIT * s); root.add(model);
+  const flip = new THREE.Group(); flip.position.y = com; model.add(flip);
+  const pelvis = new THREE.Group(); pelvis.position.y = hh - com; flip.add(pelvis);
+  const outfit = pick(OUTFITS[kind]);
+  let tw, td, shY, headY;
   const T = [];
-  if (gn) {
-    T.push([S, c.shirt, [0, 0.13, 0], null, [0.15, 0.16, 0.135]]);
-    T.push([CY, c.dark, [0, 0.07, 0], null, [0.148, 0.035, 0.133]]);
-    T.push([S, '#ffd23f', [0, 0.07, 0.132], null, [0.03, 0.022, 0.012]]);
-    T.push([S, c.pants, [0, 0.01, 0], null, [0.135, 0.075, 0.12]]);
-  } else {
-    T.push([capsule(0.085, 0.12), c.shirt, [0, 0.16, 0]]);
-    T.push([CO, c.shirt, [0, 0.07, 0], null, [0.12, 0.13, 0.12]]);
-    T.push([CY, c.dark, [0, 0.11, 0], null, [0.09, 0.025, 0.09]]);
-    for (let i = 0; i < 7; i++) { const a = i / 7 * TAU; T.push([CO, i % 2 ? c.accent : c.hat, [Math.sin(a) * 0.08, 0.245, Math.cos(a) * 0.08], qDir(Math.sin(a) * 0.7, -1, Math.cos(a) * 0.7), [0.032, 0.07, 0.032]]); }
+  if (kind === 'gnome') { tw = 0.15 * wide; td = 0.135 * wide; shY = 0.2; headY = 0.27; T.push([S, c.shirt, [0, 0.13, 0], null, [tw, 0.16, td]]); T.push([S, c.pants, [0, 0.01, 0], null, [tw * 0.9, 0.075, td * 0.9]]); }
+  else if (kind === 'bumble') { tw = 0.12 * wide; td = 0.11 * wide; shY = 0.2; headY = 0.26; T.push([S, c.shirt, [0, 0.12, 0], null, [tw, 0.15, td]]); T.push([S, c.skin, [0, 0.1, td * 0.55], null, [tw * 0.55, 0.09, td * 0.5]]); }
+  else { tw = td = 0.085 * wide; shY = 0.22; headY = 0.29; T.push([capsule(0.085, 0.12), c.shirt, [0, 0.16, 0], null, [wide, 1, wide]]); }
+  switch (outfit) {
+    case 'tunic':
+      T.push([CO, c.shirt, [0, 0.07, 0], null, [tw * 1.4, 0.13, td * 1.4]]);
+      T.push([CY, c.dark, [0, 0.11, 0], null, [tw * 1.05, 0.025, td * 1.05]]);
+      for (let i = 0; i < 7; i++) { const a = i / 7 * TAU; T.push([CO, i % 2 ? c.accent : c.hat, [Math.sin(a) * tw * 0.95, 0.245, Math.cos(a) * td * 0.95], qDir(Math.sin(a) * 0.7, -1, Math.cos(a) * 0.7), [0.032, 0.07, 0.032]]); }
+      break;
+    case 'overalls':
+      T.push([CY, c.pants, [0, 0.06, 0], null, [tw * 1.03, 0.12, td * 1.03]]);
+      T.push([B, c.pants, [0, 0.16, td * 0.9], null, [tw * 1.1, 0.1, 0.03]]);
+      for (const sx of [-1, 1]) { T.push([B, c.pants, [sx * tw * 0.55, 0.22, 0], null, [0.025, 0.02, td * 2.05]]); T.push([S, '#ffd23f', [sx * tw * 0.5, 0.2, td * 0.95 + 0.012], null, 0.014]); }
+      break;
+    case 'vest':
+      for (const sx of [-1, 1]) T.push([B, c.accent, [sx * tw * 0.55, 0.15, td * 0.8], [0, sx * 0.4, 0], [tw * 0.7, 0.16, 0.03]]);
+      T.push([CY, c.dark, [0, 0.07, 0], null, [tw * 1.0, 0.03, td * 1.0]]);
+      break;
+    case 'stripes':
+      for (let i = 0; i < 3; i++) T.push([CY, c.accent, [0, 0.06 + i * 0.06, 0], null, [tw * 1.03, 0.022, td * 1.03]]);
+      break;
+    case 'scarf':
+      T.push([TO, c.accent, [0, 0.25, 0], [Math.PI / 2, 0, 0], [tw * 0.85, td * 0.85, 0.08]]);
+      T.push([B, c.accent, [tw * 0.4, 0.17, td * 0.95], [0, 0, 0.25], [0.035, 0.14, 0.014]]);
+      T.push([CY, c.dark, [0, 0.07, 0], null, [tw * 1.0, 0.03, td * 1.0]]);
+      break;
+    default:
+      T.push([CY, c.dark, [0, 0.07, 0], null, [tw * 1.0, 0.03, td * 1.0]]);
+      T.push([S, '#ffd23f', [0, 0.07, td + 0.002], null, [0.03, 0.022, 0.012]]);
   }
   pelvis.add(bake(T));
-  const head = new THREE.Group(); head.position.y = gn ? 0.27 : 0.29; pelvis.add(head);
+  let cape = null;
+  if (outfit === 'cape') {
+    cape = new THREE.Group(); cape.position.set(0, 0.25, -td * 0.6); pelvis.add(cape);
+    const cg = cached('cape', () => new THREE.CylinderGeometry(0.07, 0.16, 0.3, 14, 1, true, Math.PI / 2, Math.PI));
+    cape.add(bake([[cg, c.accent, [0, -0.15, 0], null, [wide, 1, wide * 0.8]]], toonMatDS));
+  }
+  let wings = null;
+  if (kind === 'pixie') {
+    wings = [];
+    const wc = pick(['#bdf4ff', '#ffd6f5', '#e6ffd0', '#fff2b0']);
+    for (const sx of [-1, 1]) {
+      const w = new THREE.Group(); w.position.set(sx * 0.03, 0.2, -td * 0.9); pelvis.add(w);
+      w.add(bake([[S, wc, [sx * 0.08, 0.05, 0], [0, 0, sx * 0.5], [0.09, 0.045, 0.004]], [S, wc, [sx * 0.06, -0.03, 0], [0, 0, -sx * 0.6], [0.06, 0.03, 0.004]]], wingMat));
+      wings.push(w);
+    }
+  }
+  const head = new THREE.Group(); head.position.y = headY; head.scale.setScalar(hd); pelvis.add(head);
   const Hd = [[S, c.skin, [0, 0.1, 0], null, [0.125, 0.12, 0.118]]];
+  const eye = kind === 'pixie' ? rand(1.2, 1.5) : rand(0.85, 1.35);
   for (const sx of [-1, 1]) {
-    Hd.push([S, c.dark, [sx * 0.045, 0.118, 0.1], null, [0.02, 0.026, 0.015]]);
-    Hd.push([S, '#ffffff', [sx * 0.045 - 0.006, 0.127, 0.113], null, 0.007]);
+    Hd.push([S, c.dark, [sx * 0.045, 0.118, 0.1], null, [0.02 * eye, 0.026 * eye, 0.015]]);
+    Hd.push([S, '#ffffff', [sx * 0.045 - 0.006, 0.127, 0.113], null, 0.007 * eye]);
     Hd.push([S, c.cheek, [sx * 0.074, 0.078, 0.088], null, [0.024, 0.016, 0.01]]);
   }
-  const hatR = gn ? 0.145 : 0.132, hatH = gn ? 0.25 : 0.2;
-  if (gn) {
+  if (Math.random() < 0.3) for (let i = 0; i < 6; i++) Hd.push([S, '#b06a4a', [(i < 3 ? -1 : 1) * (0.06 + (i % 3) * 0.012), 0.09 + (i % 2) * 0.01, 0.1], null, 0.004]);
+  if (kind !== 'pixie' && Math.random() < 0.2) {
+    for (const sx of [-1, 1]) Hd.push([TO, '#2a1e2e', [sx * 0.045, 0.118, 0.115], null, [0.03 * eye, 0.03 * eye, 0.05]]);
+    Hd.push([B, '#2a1e2e', [0, 0.12, 0.118], null, [0.03, 0.006, 0.006]]);
+  }
+  if (kind === 'gnome') {
     Hd.push([S, '#ff9d8a', [0, 0.088, 0.125], null, 0.038]);
     Hd.push([S, c.beard, [0, 0.02, 0.06], null, [0.11, 0.13, 0.08]]);
     Hd.push([CO, c.beard, [0, -0.1, 0.06], qDir(0, -1, 0.25), [0.07, 0.13, 0.05]]);
-    for (const sx of [-1, 1]) {
-      Hd.push([S, c.beard, [sx * 0.038, 0.064, 0.118], null, [0.042, 0.018, 0.02]]);
-      Hd.push([S, c.skin, [sx * 0.122, 0.1, 0], null, [0.02, 0.03, 0.022]]);
-    }
+    for (const sx of [-1, 1]) { Hd.push([S, c.beard, [sx * 0.038, 0.064, 0.118], null, [0.042, 0.018, 0.02]]); Hd.push([S, c.skin, [sx * 0.122, 0.1, 0], null, [0.02, 0.03, 0.022]]); }
+  } else if (kind === 'bumble') {
+    Hd.push([S, pick(['#ff8a7a', '#c97a5a', '#ff6fa8']), [0, 0.08, 0.13], null, rand(0.05, 0.065)]);
+    for (const sx of [-1, 1]) Hd.push([S, c.skin, [sx * 0.125, 0.1, 0], null, [0.03, 0.04, 0.025]]);
+    if (Math.random() < 0.4) for (const sx of [-1, 1]) Hd.push([S, c.hair, [sx * 0.035, 0.045, 0.125], null, [0.04, 0.015, 0.02]]);
+    Hd.push([S, c.hair, [0, 0.225, -0.01], null, [0.03, 0.04, 0.03]]);
   } else {
-    Hd.push([S, c.skin, [0, 0.092, 0.122], null, 0.019]);
+    Hd.push([S, c.skin, [0, 0.092, 0.122], null, kind === 'pixie' ? 0.013 : 0.019]);
     Hd.push([S, c.hair, [0, 0.12, -0.025], null, [0.129, 0.112, 0.112]]);
-    for (const sx of [-1, 1]) {
-      const d = new V3(sx, 0.55, -0.15).normalize();
-      Hd.push([CO, c.skin, [sx * 0.105 + d.x * 0.06, 0.11 + d.y * 0.06, d.z * 0.06], qDir(d.x, d.y, d.z), [0.03, 0.13, 0.022]]);
-    }
+    const el = kind === 'pixie' ? 0.09 : rand(0.11, 0.17);
+    for (const sx of [-1, 1]) { const d = new V3(sx, 0.55, -0.15).normalize(); Hd.push([CO, c.skin, [sx * 0.105 + d.x * el / 2, 0.11 + d.y * el / 2, d.z * el / 2], qDir(d.x, d.y, d.z), [0.03, el, 0.022]]); }
   }
-  Hd.push([CY, c.accent, [0, 0.19, -0.005], null, [hatR + 0.007, 0.032, hatR + 0.007]]);
-  Hd.push([hatBody(hatR, hatH), c.hat, [0, 0.19 + hatH / 2, -0.01]]);
+  const hat = addHat(pick(HATS[kind]), kind, c, Hd, head);
   head.add(bake(Hd));
   const mouth = new THREE.Mesh(GEO.sphere, mouthMat);
-  mouth.position.set(0, gn ? 0.043 : 0.05, gn ? 0.115 : 0.112); mouth.scale.set(0.026, 0.008, 0.012); head.add(mouth);
-  const tip = new THREE.Group(); tip.position.set(0, 0.19 + hatH, -0.01); head.add(tip);
-  tip.add(bake([[CO, c.hat, [0, 0.08, 0], null, [0.046, 0.16, 0.046]], [S, gn ? '#ffffff' : '#ffd23f', [0, 0.165, 0], null, 0.03]]));
+  mouth.position.set(0, kind === 'gnome' ? 0.043 : kind === 'bumble' ? 0.035 : 0.05, kind === 'gnome' ? 0.115 : 0.112); mouth.scale.set(0.026, 0.008, 0.012); head.add(mouth);
   function arm(sx) {
-    const sh = new THREE.Group(); sh.position.set(sx * (tr + 0.02), gn ? 0.2 : 0.22, 0); pelvis.add(sh);
-    sh.add(bake([[capsule(0.032, 0.08), c.shirt, [0, -0.06, 0]]]));
-    const el = new THREE.Group(); el.position.y = -0.125; sh.add(el);
-    el.add(bake([[capsule(0.029, 0.07), gn ? c.shirt : c.accent, [0, -0.05, 0]], [S, gn ? c.accent : c.skin, [0, -0.115, 0.005], null, 0.036]]));
+    const sh = new THREE.Group(); sh.position.set(sx * (tw + 0.02), shY, 0); pelvis.add(sh);
+    sh.add(bake([[capsule(0.032, 0.08 * armL), c.shirt, [0, -0.06 * armL, 0]]]));
+    const el = new THREE.Group(); el.position.y = -0.125 * armL; sh.add(el);
+    el.add(bake([[capsule(0.029, 0.07 * armL), kind === 'gnome' || kind === 'bumble' ? c.shirt : c.accent, [0, -0.05 * armL, 0]],
+      [S, kind === 'gnome' ? c.accent : c.skin, [0, -0.115 * armL, 0.005], null, kind === 'bumble' ? 0.042 : 0.036]]));
     return [sh, el];
   }
-  function leg(sx) {
-    const hip = new THREE.Group(); hip.position.set(sx * 0.055, 0, 0); pelvis.add(hip);
-    hip.add(bake([[capsule(0.038, 0.09), c.pants, [0, -0.07, 0]]]));
-    const kn = new THREE.Group(); kn.position.y = -0.15; hip.add(kn);
-    const L = [];
-    if (gn) {
-      L.push([capsule(0.036, 0.08), c.pants, [0, -0.06, 0]]);
-      L.push([S, c.shoe, [0, -0.135, 0.02], null, [0.05, 0.035, 0.07]]);
+  function legPart(sx) {
+    const hip = new THREE.Group(); hip.position.set(sx * Math.min(0.055 * wide, tw * 0.6), 0, 0); pelvis.add(hip);
+    hip.add(bake([[capsule(0.038, 0.09 * leg), c.pants, [0, -0.07 * leg, 0]]]));
+    const kn = new THREE.Group(); kn.position.y = -0.15 * leg; hip.add(kn);
+    const L = [], fy = -0.135 * leg;
+    if (kind === 'elf') {
+      for (let i = 0; i < 4; i++) L.push([CY, i % 2 ? c.stripe : '#ffffff', [0, -(0.016 + i * 0.031) * leg, 0], null, [0.034, 0.031 * leg, 0.034]]);
+      L.push([S, c.shoe, [0, fy, 0.015], null, [0.04, 0.03, 0.06]]);
+      L.push([CO, c.shoe, [0, fy + 0.015, 0.085], qDir(0, 0.6, 1), [0.022, 0.07, 0.022]]);
+      L.push([S, '#ffd23f', [0, fy + 0.04, 0.112], null, 0.016]);
+    } else if (kind === 'pixie') {
+      L.push([capsule(0.03, 0.08 * leg), c.pants, [0, -0.06 * leg, 0]]);
+      L.push([S, c.skin, [0, fy + 0.005, 0.012], null, [0.03, 0.022, 0.045]]);
+    } else if (kind === 'bumble') {
+      L.push([capsule(0.04, 0.07 * leg), c.pants, [0, -0.06 * leg, 0]]);
+      L.push([S, c.shoe, [0, fy, 0.03], null, [0.06, 0.03, 0.085]]);
     } else {
-      for (let i = 0; i < 4; i++) L.push([CY, i % 2 ? c.stripe : '#ffffff', [0, -0.016 - i * 0.031, 0], null, [0.034, 0.031, 0.034]]);
-      L.push([S, c.shoe, [0, -0.135, 0.015], null, [0.04, 0.03, 0.06]]);
-      L.push([CO, c.shoe, [0, -0.12, 0.085], qDir(0, 0.6, 1), [0.022, 0.07, 0.022]]);
-      L.push([S, '#ffd23f', [0, -0.095, 0.112], null, 0.016]);
+      L.push([capsule(0.036, 0.08 * leg), c.pants, [0, -0.06 * leg, 0]]);
+      L.push([S, c.shoe, [0, fy, 0.02], null, [0.05, 0.035, 0.07]]);
     }
     kn.add(bake(L)); return [hip, kn];
   }
-  const [shL, elL] = arm(1), [shR, elR] = arm(-1), [hipL, knL] = leg(1), [hipR, knR] = leg(-1);
-  return { root, model, flip, pelvis, head, tip, mouth, shL, elL, shR, elR, hipL, knL, hipR, knR };
+  const [shL, elL] = arm(1), [shR, elR] = arm(-1), [hipL, knL] = legPart(1), [hipR, knR] = legPart(-1);
+  return { root, model, flip, pelvis, head, tips: hat.tips, prop: hat.prop, wings, cape, mouth, shL, elL, shR, elR, hipL, knL, hipR, knR,
+    s, hd, hh, com, headY, grabH: hh + headY + 0.24 * hd };
 }
 
+// ================= moving around =================
 const KEYS = ['hipL', 'hipR', 'hipLz', 'hipRz', 'knL', 'knR', 'shL', 'shR', 'shLz', 'shRz', 'elL', 'elR', 'lean', 'bob', 'hy', 'hp', 'hr'];
 const _v1 = new V3(), _v2 = new V3(), _v3 = new V3(), _v4 = new V3(), _o = new V3(), _d = new V3(), _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _m = new THREE.Matrix4();
 function tangent(n) {
@@ -539,25 +842,19 @@ function basisQuat(up, fwd, out) {
   _bf.normalize(); _bx.crossVectors(up, _bf);
   _m.makeBasis(_bx, up, _bf); return out.setFromRotationMatrix(_m);
 }
-function wallUp(n, out) {
-  out.copy(Y).addScaledVector(n, -n.y);
-  if (out.lengthSq() < 0.02) out.set(0, 0, 1).addScaledVector(n, -n.z);
-  return out.normalize();
-}
-
 // Walk along whatever surface the feet are on: climb up into walls, roll over edges, mantle onto tabletops.
 function crawl(e, s) {
   const n = e.n, f = e.dir;
   _o.copy(e.p).addScaledVector(n, PROBE);
   let h = cast(_o, f, s + 0.04);
-  if (h && h.n.dot(f) < -0.5) {                      // something in front: start climbing it
+  if (h && h.n.dot(f) < -0.5) {
     if (h.n.y < CEIL) return 'blocked';
     const old = n.clone(); e.p.copy(h.p); e.n.copy(h.n); e.dir.copy(old); project(e.dir, e.n); return 'corner';
   }
   _o.copy(e.p).addScaledVector(f, s).addScaledVector(n, PROBE);
   _d.copy(n).negate();
   h = cast(_o, _d, PROBE * 2.6);
-  if (h) {                                            // ground continues
+  if (h) {
     if (h.n.y < CEIL) return 'blocked';
     e.p.copy(h.p);
     if (h.n.dot(n) > 0.8) e.n.lerp(h.n, 0.3).normalize(); else e.n.copy(h.n);
@@ -566,68 +863,142 @@ function crawl(e, s) {
   const q = _o.clone();
   _o.addScaledVector(n, -PROBE * 2.2); _d.copy(f).negate();
   h = cast(_o, _d, s + 0.14);
-  if (h && h.n.dot(f) > 0.3) {                        // an edge: wrap around it
+  if (h && h.n.dot(f) > 0.3) {
     if (h.n.y < CEIL) return 'blocked';
     const old = n.clone().negate(); e.p.copy(h.p); e.n.copy(h.n); e.dir.copy(old); project(e.dir, e.n); return 'edge';
   }
-  if (!cast(q, DOWN, 4)) return 'blocked';            // nothing below at all: turn back
+  if (!cast(q, DOWN, 4)) return 'blocked';
   return 'air';
 }
 
-const elves = [];
+const elves = [], visitors = [];
 const userPos = new V3(), camHead = new V3();
+const _p1 = new V3(), _p2 = new V3();
 class Elf {
-  constructor(p, n, kind) {
-    this.kind = kind || (Math.random() < 0.45 ? 'gnome' : 'elf');
+  constructor(p, n, kind, opts = {}) {
+    this.kind = kind || wpick(KINDS);
     Object.assign(this, buildBody(this.kind));
+    const K = KINDS[this.kind];
+    this.lang = K.lang; this.pitch = rand(...K.voice); this.fs = rand(...K.fs); this.phrase = makePhrase(LANGS[this.lang]);
+    this.muffled = !!opts.muffled;
     this.p = p.clone(); this.n = n.clone(); this.dir = tangent(this.n);
     this.state = 'ground'; this.b = 'cheer'; this.timer = rand(0.8, 1.4);
-    this.speed = 0; this.phase = Math.random() * TAU; this.vel = new V3(); this.flight = null; this.pending = null; this.target = null;
-    this.steepT = 0; this.cb = 0; this.landT = 0; this.lie = 0; this.lieSign = 1; this.pop = 0; this.cool = 0; this.talkT = 0;
-    this.chat = null; this.partner = null; this.dazed = 0; this.stars = null; this.side = 0; this.airFwd = new V3(0, 0, 1);
-    this.flipA = 0; this.flipAxis = 'x'; this.seed = Math.random() * 100; this.fromY = 0;
-    this.pitch = this.kind === 'gnome' ? rand(150, 210) : rand(280, 380);
-    this.fs = this.kind === 'gnome' ? rand(1.0, 1.15) : rand(1.25, 1.45);
+    this.speed = 0; this.phase = Math.random() * TAU; this.lastStep = 0; this.vel = new V3(); this.flight = null; this.pending = null; this.target = null;
+    this.steepT = 0; this.cb = 0; this.landT = 0; this.lie = 0; this.lieSign = 1; this.pop = 0; this.cool = 0; this.talkT = 0; this.mouthMode = '';
+    this.chat = null; this.partner = null; this.chase = null; this.dazed = 0; this.stars = null; this.side = 0; this.airFwd = new V3(0, 0, 1);
+    this.flipA = 0; this.flipAxis = 'x'; this.flipOverride = null; this.scriptLook = null; this.seed = Math.random() * 100; this.fromY = 0; this.tickle = 0; this.come = -1; this.artGoal = null;
+    this.hang = Y.clone(); this.holdKey = null; this.holdMood = 'love'; this.ride = null; this.script = null; this.act = {}; this.squishZ = 1;
     this.a = {}; this.tg = {}; for (const k of KEYS) this.a[k] = this.tg[k] = 0;
     this.hs = { x: 0, vx: 0, z: 0, vz: 0 }; this.prevPos = p.clone(); this.prevVel = new V3();
-    this.shadow = new THREE.Mesh(shadowGeo, shadowMat); scene.add(this.shadow);
+    this.hasShadow = opts.shadow !== false;
+    this.shadow = new THREE.Mesh(shadowGeo, shadowMat); this.shadow.visible = this.hasShadow; if (this.hasShadow) scene.add(this.shadow);
     basisQuat(this.n, this.dir, this.root.quaternion); this.root.position.copy(this.p); this.root.scale.setScalar(0.001);
     scene.add(this.root);
     attachVoice(this);
   }
+  get size() { return UNIT * this.s; }
   update(dt, t) {
     this.cool -= dt; if (this.pop < 1) this.pop = Math.min(1, this.pop + dt * 2.2);
-    if (this.state === 'air') this.updateAir(dt); else this.updateGround(dt, t);
+    switch (this.state) {
+      case 'air': this.updateAir(dt, t); break;
+      case 'held': this.updateHeld(dt, t); break;
+      case 'ride': this.updateRide(dt, t); break;
+      case 'script': if (this.script && this.script(dt, t)) this.script = null; break;
+      default: this.updateGround(dt, t);
+    }
     this.animate(dt, t); this.place(dt, t);
   }
-  // ---------- behavior ----------
+  headPos(out) { return this.head.getWorldPosition(out); }
+  centerPos(out) { return this.pelvis.getWorldPosition(out); }
+  free() { return this.state === 'ground' && this.pop >= 1 && !this.chat && !this.chase && this.come < 0 && ['wander', 'dance', 'land', 'cheer', 'shake', 'run', 'idle', 'whistle'].includes(this.b); }
+  grabbable() { return this.pop >= 1 && (this.state === 'ground' || this.state === 'air' || this.state === 'ride'); }
+  // ---------- on a surface ----------
   updateGround(dt, t) {
     const steep = Math.abs(this.n.y) < STEEP;
     this.steepT = steep ? this.steepT + dt : 0;
     if (this.n.y < CEIL) { this.slip(); return; }
     this.timer -= dt;
+    const k0 = this.act.k || 0;
     switch (this.b) {
       case 'prep': if (this.timer <= 0) this.launch(this.pending); break;
       case 'down': if (this.timer <= 0) { this.b = 'getup'; this.timer = 0.55; say(this, 'oof'); } break;
       case 'getup': if (this.timer <= 0) { this.b = 'shake'; this.timer = 0.5; if (Math.random() < 0.45) laugh(this, 5, 0.3); } break;
+      case 'nap':
+        this.act.snore = (this.act.snore || 0) - dt;
+        if (this.act.snore <= 0) { this.act.snore = 2.4; snore(this); }
+        this.act.z = (this.act.z || 0) - dt;
+        if (this.act.z <= 0) { this.act.z = 1.1; addDecal(this.headPos(_v1).addScaledVector(Y, 0.05), null, zTex, 0.025, 0.05, 2.2, 0.9, { vel: new V3(rand(-0.02, 0.02), 0.06, rand(-0.02, 0.02)) }); }
+        if (this.timer <= 0) { this.b = 'getup'; this.timer = 0.55; say(this, 'yawn'); }
+        break;
+      case 'sneeze': {
+        const k = 1 - this.timer / 1.3; this.act.k = k;
+        if (k0 < 0.72 && k >= 0.72) {
+          burst(this.headPos(_v1).addScaledVector(this.dir, 0.04), ['#ffffff', '#dff4ff'], 8, 0.4, 1);
+          if (Math.random() < 0.3) { this.b = 'down'; this.lieSign = -1; this.timer = 1.0; thud(this, false); return; }
+        }
+        if (this.timer <= 0) this.think();
+        break;
+      }
+      case 'hiccup':
+        this.act.h -= dt;
+        if (this.act.h <= 0 && this.act.n > 0) { this.act.h = rand(0.45, 0.7); this.act.n--; this.act.jolt = 0.15; say(this, 'hic'); }
+        if (this.act.jolt > 0) this.act.jolt -= dt;
+        if (this.timer <= 0) this.think();
+        break;
+      case 'wallsplat':
+        if (this.timer < 0.7) { wallUp(this.n, _v3); this.p.addScaledVector(_v3, -0.04 * dt); }
+        if (this.timer <= 0) { this.slip(); return; }
+        break;
       case 'chat': break;
+      case 'chase': case 'flee': if (!this.chase) { this.b = 'wander'; this.timer = 0.5; } break;
       default: if (this.timer <= 0) this.think();
     }
     let want = 0;
     switch (this.b) {
       case 'run': want = 0.75; if (this.target) { this.steerTo(this.target, 4, dt); if (this.p.distanceTo(this.target) < 0.12) this.timer = 0; } break;
       case 'wander': want = 0.3; this.turn(Math.sin(t * 1.7 + this.seed) * 1.6 * dt); break;
+      case 'whistle': want = 0.22; this.turn(Math.sin(t * 1.1 + this.seed) * 1.2 * dt); break;
       case 'climb':
         want = 0.17;
-        if (steep) { wallUp(this.n, _v3).addScaledVector(_v4.crossVectors(this.n, _v3), this.side).normalize(); this.steerDir(_v3, 2.5, dt); }
+        if (steep) {
+          if (this.artGoal) this.steerTo(_v3.copy(this.artGoal.c).addScaledVector(this.artGoal.u, this.artGoal.h / 2 + 0.02), 3, dt);
+          else { wallUp(this.n, _v3).addScaledVector(_v4.crossVectors(this.n, _v3), this.side).normalize(); this.steerDir(_v3, 2.5, dt); }
+        }
+        break;
+      case 'balance': {
+        const B = this.act;
+        if (B.f) this.steerDir(_v3.copy(B.f.r).multiplyScalar(B.sign), 4, dt);
+        want = 0.09;
+        if (Math.random() < dt * 0.1) { say(this, 'uhoh'); this.slip(); return; }
+        if (Math.random() < dt * 0.4) babble(this, 2, true);
+        if (!onArtTop(this.p)) { this.b = 'climb'; this.timer = rand(1, 2); }
+        break;
+      }
+      case 'come': {
+        const h = HS[this.come];
+        if (!h || !h.valid || h.dir.y < 0.6 || h.rider) { this.come = -1; this.b = 'wander'; this.timer = 0.6; break; }
+        _v3.set(h.palm.x, this.p.y, h.palm.z);
+        this.steerTo(_v3, 6, dt); want = 0.85;
+        const dh = Math.hypot(h.palm.x - this.p.x, h.palm.z - this.p.z);
+        if ((dh < 0.4 || this.timer <= 0.3) && !steep) { this.hopTo(this.come); return; }
+        break;
+      }
+      case 'chase': if (this.chase) { want = this.kind === 'bumble' ? 0.8 : 0.95; this.steerTo(this.chase.runner.p, 7, dt); } break;
+      case 'flee':
+        if (this.chase) {
+          want = this.kind === 'bumble' ? 0.75 : 0.85;
+          _v3.subVectors(this.p, this.chase.it.p); _v3.addScaledVector(_v4.crossVectors(this.n, _v3), Math.sin(t * 2 + this.seed) * 0.6);
+          this.steerDir(_v3, 5, dt);
+        }
         break;
       case 'wave': case 'dance': case 'cheer': this.steerTo(userPos, 4, dt); break;
       case 'chat': case 'laugh': this.steerTo(this.partner ? this.partner.p : userPos, 5, dt); break;
     }
     if (steep) want = Math.min(want, 0.2);
     this.speed += (want - this.speed) * damp(6, dt);
-    if (this.speed > 0.4 && !steep && Math.random() < dt * 0.06) { this.trip(); return; }
-    if (steep && this.b === 'climb' && Math.random() < dt * 0.035) { this.slip(); return; }
+    const running = this.b === 'run' || this.b === 'chase' || this.b === 'flee' || this.b === 'wander';
+    if (this.speed > 0.4 && !steep && running && Math.random() < dt * 0.05) { this.trip(); return; }
+    if (steep && (this.b === 'climb' || this.b === 'flee') && Math.random() < dt * 0.03) { say(this, 'uhoh'); this.slip(); return; }
     if (this.speed > 0.01) {
       const r = crawl(this, this.speed * dt);
       if (r === 'blocked') {
@@ -636,23 +1007,43 @@ class Elf {
       } else if (r === 'air') {
         this.vel.copy(this.dir).multiplyScalar(this.speed).addScaledVector(this.n, 0.4);
         this.toAir({ T: 0.6, style: 'flail', splat: true }); say(this, 'waa');
+        return;
       }
-      this.phase += this.speed * dt * TAU / (steep ? 0.12 : 0.22);
+      this.phase += this.speed * dt * TAU / ((steep ? 0.12 : 0.22) * this.s);
+      const st = Math.floor(this.phase / Math.PI);
+      if (st !== this.lastStep) { this.lastStep = st; if (!steep && this.p.distanceTo(userPos) < 2.2) step(this); }
     }
   }
   think() {
-    this.target = null; this.chat = null; this.partner = null;
+    const keepGoal = this.b === 'climb' || this.b === 'run';
+    this.target = null; this.chat = null; this.partner = null; this.act = {}; this.come = -1;
+    if (!keepGoal) this.artGoal = null;
     const steep = Math.abs(this.n.y) < STEEP, r = Math.random();
     if (steep) {
-      if (r < 0.5) { this.b = 'climb'; this.timer = rand(1.5, 4); this.side = rand(-0.7, 0.7); return; }
+      if (this.artGoal || r < 0.5) { this.b = 'climb'; this.timer = rand(1.5, 4); this.side = rand(-0.7, 0.7); return; }
       if (r < 0.82 && this.planJump()) return;
       this.kickoff(); return;
     }
+    this.artGoal = null;
+    const art = onArtTop(this.p);
+    if (art && Math.random() < 0.8) { this.b = 'balance'; this.act = { f: art, sign: Math.random() < 0.5 ? 1 : -1 }; this.timer = rand(3, 6); return; }
     const near = Math.hypot(this.p.x - userPos.x, this.p.z - userPos.z) < 1.5;
-    if (r < 0.3) { const s = runTarget(this.p); if (s) { this.b = 'run'; this.target = s; this.timer = rand(2.5, 5); if (Math.random() < 0.3) babble(this, 2 + ((Math.random() * 3) | 0)); return; } }
-    if (r < 0.55 && this.planJump()) return;
-    if (r < 0.63) { this.backflip(); return; }
-    if (r < 0.75) { this.b = near ? 'wave' : 'dance'; this.timer = rand(1.4, 2.4); if (near) say(this, 'hey'); else if (Math.random() < 0.5) babble(this, 3); return; }
+    if (r < 0.24) {
+      const arts = Room.features.filter(f => f.type === 'art');
+      if (arts.length && Math.random() < 0.18) {
+        const f = pick(arts); this.b = 'run'; this.artGoal = f; this.timer = rand(4, 7);
+        this.target = f.c.clone().addScaledVector(f.u, -f.h / 2 - 0.15); return;
+      }
+      const s = runTarget(this.p); if (s) { this.b = 'run'; this.target = s; this.timer = rand(2.5, 5); if (Math.random() < 0.3) babble(this, 2 + ((Math.random() * 3) | 0)); return; }
+    }
+    if (r < 0.44 && this.planJump()) return;
+    if (r < 0.5) { this.backflip(); return; }
+    if (r < 0.6) { this.b = near ? 'wave' : 'dance'; this.timer = rand(1.4, 2.4); if (near) say(this, 'hey'); else if (Math.random() < 0.5) babble(this, 3); return; }
+    if (r < 0.64) { this.b = 'sneeze'; this.timer = 1.3; this.act = { k: 0 }; say(this, 'achoo'); return; }
+    if (r < 0.665) { this.b = 'nap'; this.timer = rand(6, 10); this.lieSign = -1; return; }
+    if (r < 0.72) { this.b = 'whistle'; this.timer = whistle(this) + 0.3; this.mouthMode = 'o'; return; }
+    if (r < 0.75) { this.b = 'hiccup'; this.timer = 2.4; this.act = { n: 3, h: 0.2, jolt: 0 }; return; }
+    if (r < 0.78) { this.b = 'yawn'; this.timer = 1.6; say(this, 'yawn'); return; }
     this.b = 'wander'; this.timer = rand(1.5, 3.5);
     if (Math.random() < 0.25) babble(this, 2 + ((Math.random() * 3) | 0), Math.random() < 0.3);
   }
@@ -690,10 +1081,11 @@ class Elf {
   launch(j) {
     this.p.addScaledVector(this.n, 0.03); this.vel.copy(j.v);
     this.toAir(j);
-    if (j.style === 'leap') say(this, 'hup'); else if (Math.random() < 0.6) say(this, 'whee'); else say(this, 'hup');
+    const r = Math.random();
+    if (j.style === 'leap') say(this, 'hup'); else if (r < 0.45) say(this, 'whee'); else if (r < 0.7) say(this, 'boing'); else say(this, 'hup');
   }
   toAir(j) {
-    this.state = 'air'; this.b = 'air'; this.chat = null;
+    this.state = 'air'; this.b = 'air'; this.chat = null; this.come = -1;
     this.flight = Object.assign({ t: 0, flips: 1, sign: 1 }, j);
     if (j.style === 'back') this.flight.sign = -1;
     if (j.style === 'cart') this.flight.sign = Math.random() < 0.5 ? 1 : -1;
@@ -707,28 +1099,45 @@ class Elf {
     const up = 2.3;
     this.prep({ v: this.n.clone().multiplyScalar(up).addScaledVector(this.dir, 0.2), T: 2 * up * Math.max(0.3, this.n.y) / G, style: 'back' });
   }
-  kickoff() {   // push off a wall with a backflip
-    this.prep({ v: this.n.clone().multiplyScalar(1.5).addScaledVector(Y, 1.4), T: 0.55, style: 'back', faceBack: true });
-  }
-  trip() {      // faceplant while running
+  kickoff() { this.prep({ v: this.n.clone().multiplyScalar(1.5).addScaledVector(Y, 1.4), T: 0.55, style: 'back', faceBack: true }); }
+  trip() {
     this.vel.copy(this.dir).multiplyScalar(0.9).addScaledVector(this.n, 1.0);
     this.p.addScaledVector(this.n, 0.02);
     this.toAir({ T: 0.35, style: 'plant', splat: true }); say(this, 'yip');
   }
-  slip() {      // lose grip on a wall and fall off screaming
+  slip() {
     this.vel.copy(this.n).multiplyScalar(0.6);
     this.p.addScaledVector(this.n, 0.02);
     this.toAir({ T: 0.6, style: 'flail', splat: true }); say(this, 'waa');
   }
+  hopTo(i) {
+    const h = HS[i]; this.come = -1;
+    const d = this.p.distanceTo(h.palm);
+    this.vel.set(0, 1, 0); this.toAir({ style: 'homing', hand: i, T: 0.5 + d * 0.15, start: this.p.clone(), arc: 0.15 + d * 0.12 });
+    say(this, Math.random() < 0.5 ? 'boing' : 'hup');
+  }
+  // ---------- in the air ----------
   updateAir(dt) {
     const f = this.flight; f.t += dt;
-    this.vel.y -= G * dt;
-    const step = this.vel.length() * dt;
-    if (step > 1e-6) {
+    if (f.style === 'homing') {
+      const h = HS[f.hand];
+      if (!h || !h.valid || h.rider) { f.style = 'flail'; f.splat = true; this.vel.set(0, 0, 0); return; }
+      const u = clamp(f.t / f.T, 0, 1), e = easeIO(u);
+      _v1.copy(h.palm).addScaledVector(h.dir, 0.01);
+      _v2.copy(f.start).lerp(_v1, e).addScaledVector(Y, f.arc * 4 * u * (1 - u));
+      this.vel.subVectors(_v2, this.p).divideScalar(Math.max(dt, 1e-3)); this.p.copy(_v2);
+      if (u >= 1) this.startRide(f.hand);
+      return;
+    }
+    const glide = this.kind === 'pixie' && (f.style === 'flail' || f.style === 'drop' || f.style === 'tumble');
+    this.vel.y -= G * (glide ? 0.3 : 1) * dt;
+    if (glide) { const k = Math.exp(-1.5 * dt); this.vel.x *= k; this.vel.z *= k; this.vel.y = Math.max(this.vel.y, -0.7); }
+    const stepLen = this.vel.length() * dt;
+    if (stepLen > 1e-6) {
       _d.copy(this.vel).normalize();
-      const h = cast(this.p, _d, step + 0.02);
+      const h = cast(this.p, _d, stepLen + 0.02);
       if (h) {
-        if (h.n.y < CEIL) {   // bonked the ceiling
+        if (h.n.y < CEIL) {
           this.p.copy(h.p).addScaledVector(h.n, 0.02);
           this.vel.addScaledVector(h.n, -1.6 * this.vel.dot(h.n)).multiplyScalar(0.5);
           f.style = 'flail'; f.splat = true; return;
@@ -740,27 +1149,37 @@ class Elf {
     if (f.t > 6 || this.p.y < Room.minY - 1.5) this.respawn();
   }
   land(h) {
-    const f = this.flight, drop = this.fromY - h.p.y;
+    const f = this.flight, drop = this.fromY - h.p.y, impact = this.vel.length();
     this.state = 'ground'; this.p.copy(h.p); this.n.copy(h.n);
     this.dir.copy(this.vel); project(this.dir, this.n);
     this.flight = null;
-    const flatGround = h.n.y > 0.6;
-    if (flatGround && (f.splat || f.bonk || drop > 1.1 && Math.random() < 0.4)) {
+    const flatGround = h.n.y > 0.6, pixie = this.kind === 'pixie';
+    if (f.thrown && impact > 2.6 && !flatGround && !pixie) {    // splat flat on a wall
+      this.b = 'wallsplat'; this.timer = 1.4; this.steepT = 1; this.dazed = 1.6;
+      thud(this, true); say(this, 'ow', 0.1);
+      burst(_v1.copy(h.p).addScaledVector(h.n, 0.04), DUST, 16, 0.5, 3);
+      this.othersLaugh(1.6);
+      return;
+    }
+    if (flatGround && !pixie && (f.splat || f.bonk || (f.thrown && impact > 2.6) || drop > 1.1 && Math.random() < 0.4)) {
       this.b = 'down'; this.timer = rand(1.1, 2.0); this.dazed = this.timer + 0.9;
       this.lieSign = f.style === 'plant' || Math.random() < 0.6 ? 1 : -1;
-      thud(this, drop > 0.6); if (Math.random() < 0.5) say(this, 'ow', 0.12);
+      thud(this, drop > 0.6 || impact > 3); if (Math.random() < 0.5) say(this, 'ow', 0.12);
       burst(_v1.copy(h.p).addScaledVector(h.n, 0.03), DUST, 14, 0.5, 3);
-      for (const o of elves) if (o !== this && o.state === 'ground' && !o.chat && o.b !== 'down' && o.p.distanceTo(this.p) < 1.3 && Math.random() < 0.55) {
-        o.b = 'laugh'; o.partner = this; o.timer = 1.4; laugh(o, 5, rand(0.2, 0.5));
-      }
+      this.othersLaugh(1.3);
       return;
     }
     this.landT = 0.25; say(this, 'pat');
-    if (f.T > 0.6 && f.style !== 'leap' && f.style !== 'flail') {
+    if ((f.T > 0.6 && f.style !== 'leap' && f.style !== 'flail') || f.thrown) {
       this.b = 'cheer'; this.timer = 0.8;
       burst(_v1.copy(h.p).addScaledVector(h.n, 0.15), BRIGHT, 16, 0.7);
       if (Math.random() < 0.5) laugh(this, 4, 0.1);
     } else { this.b = 'land'; this.timer = 0.2; }
+  }
+  othersLaugh(r) {
+    for (const o of elves) if (o !== this && o.state === 'ground' && !o.chat && !o.chase && o.come < 0 && o.b !== 'down' && o.b !== 'nap' && o.p.distanceTo(this.p) < r && Math.random() < 0.55) {
+      o.b = 'laugh'; o.partner = this; o.timer = 1.4; laugh(o, 5, rand(0.2, 0.5));
+    }
   }
   respawn() {
     const s = spawnSpot(spawnCenter(), 0.5, 2.5, false); if (!s) return;
@@ -769,29 +1188,146 @@ class Elf {
     burst(_v1.copy(s.p).addScaledVector(s.n, 0.12), BRIGHT, 20, 0.8); say(this, 'pop');
   }
   poke(from) {
-    if (this.cool > 0 || this.pop < 1 || this.state === 'air') return;
+    if (this.cool > 0 || this.pop < 1 || this.state !== 'ground') return;
     this.cool = 1.2;
-    if (this.b === 'down') { this.timer = 0; say(this, 'yip'); return; }
+    if (this.b === 'down' || this.b === 'nap') { this.b = 'getup'; this.timer = 0.55; say(this, 'yip'); return; }
     _v1.copy(this.p).sub(from); _v1.addScaledVector(this.n, -_v1.dot(this.n));
     if (_v1.lengthSq() < 1e-4) _v1.copy(this.dir); _v1.normalize();
     const up = 2.1;
     this.vel.copy(_v1).multiplyScalar(0.7).addScaledVector(this.n, up);
     this.p.addScaledVector(this.n, 0.03);
+    this.chase = null;
     this.toAir({ T: 2 * up * Math.max(0.3, this.n.y) / G, style: pick(['back', 'front', 'twist']) });
     say(this, 'yip');
     burst(_v2.copy(this.p).addScaledVector(this.n, 0.1), BRIGHT, 18, 0.8);
-    for (const o of elves) if (o !== this && o.state === 'ground' && !o.chat && o.b !== 'down' && o.p.distanceTo(this.p) < 1.2 && Math.random() < 0.5) {
-      o.b = 'laugh'; o.partner = this; o.timer = 1.4; laugh(o, 5, rand(0.15, 0.4));
+    this.othersLaugh(1.2);
+  }
+  tickled() {
+    if (this.state !== 'ground' || this.cool > 0) return;
+    this.cool = 1.5; this.b = 'tickle'; this.timer = 1.4; this.chat = null; laugh(this, 7);
+  }
+  // ---------- picked up and thrown ----------
+  grab(key) {
+    if (this.state === 'ride' && this.ride) { HS[this.ride.hand].rider = null; this.ride = null; }
+    this.state = 'held'; this.holdKey = key; this.b = 'held'; this.chat = null; this.chase = null; this.come = -1; this.flight = null;
+    this.hang.copy(Y); this.holdMood = Math.random() < 0.65 ? 'love' : 'hate'; this.act = { talk: rand(0.8, 1.4) };
+    if (this.holdMood === 'love') laugh(this, 5); else say(this, 'nono');
+  }
+  updateHeld(dt, t) {
+    const gp = Grab.pos[this.holdKey];
+    if (!gp) { this.release(new V3()); return; }
+    const hv = velOf(this.holdKey);
+    _v1.copy(Y).addScaledVector(hv, -0.18).normalize();
+    this.hang.lerp(_v1, damp(5, dt)).normalize();
+    this.root.position.copy(gp).addScaledVector(this.hang, -this.grabH * this.size);
+    _v2.subVectors(camHead, this.root.position);
+    basisQuat(this.hang, _v2, _q1); this.root.quaternion.slerp(_q1, damp(10, dt));
+    this.p.copy(this.root.position);
+    this.act.talk -= dt;
+    if (this.act.talk <= 0) {
+      this.act.talk = rand(1.2, 2.4);
+      if (hv.length() > 1.2) say(this, 'whee');
+      else if (this.holdMood === 'love') { if (Math.random() < 0.6) laugh(this, 4); else babble(this, 3, true); }
+      else if (Math.random() < 0.5) say(this, 'nono'); else babble(this, 4);
+    }
+  }
+  release(vel) {
+    if (this.state !== 'held') return;
+    vel.clampLength(0, 8);
+    const speed = vel.length();
+    this.p.copy(this.root.position); this.holdKey = null;
+    for (let i = 0; i < 2; i++) {
+      const h = HS[i];
+      if (h.valid && h.dir.y > 0.5 && !h.rider && speed < 0.8 && h.palm.distanceTo(this.p) < 0.2) { this.startRide(i); return; }
+    }
+    this.vel.copy(vel);
+    const style = speed > 2.0 ? 'tumble' : 'drop';
+    this.toAir({ T: 0.8, style, thrown: true, spin: (speed * 2.5 + 3) * (Math.random() < 0.5 ? 1 : -1) });
+    this.fromY = this.p.y;
+    if (speed > 2.0) say(this, Math.random() < 0.5 ? 'whee' : 'waa'); else say(this, 'uhoh');
+  }
+  // ---------- riding on your hand, climbing up your arm, sitting on your shoulder ----------
+  startRide(i) {
+    const h = HS[i];
+    this.state = 'ride'; this.flight = null; this.come = -1; this.chat = null; this.chase = null;
+    this.ride = { hand: i, phase: 'palm', t: 0, mood: 'wave', moodT: 1.5, s: 0, slide: 0, say: 0.8, stay: rand(8, 14) };
+    h.rider = this; h.coming = null; this.landT = 0.25; this.b = 'ride';
+    laugh(this, 5, 0.15);
+  }
+  dropFromRide(vel, style = 'flail') {
+    const R = this.ride; if (R) HS[R.hand].rider = null; this.ride = null;
+    this.p.copy(this.root.position); this.vel.copy(vel);
+    this.toAir({ T: 0.8, style, splat: style === 'flail' });
+  }
+  armPath(h) {
+    const W = h.wrist, E = _p1.copy(W).addScaledVector(h.fwd, -0.26).addScaledVector(Y, -0.06);
+    const S = _p2.copy(camHead).addScaledVector(camUp, -0.2).addScaledVector(camRight, 0.17 * h.side).addScaledVector(camFwd, -0.04);
+    return [h.palm, W, E, S];
+  }
+  updateRide(dt, t) {
+    const R = this.ride, h = HS[R.hand];
+    if (!h.valid) { this.dropFromRide(new V3()); say(this, 'waa'); return; }
+    R.t += dt;
+    if (R.phase === 'palm') {
+      if (h.dir.y < 0.35) { R.slide += dt; if (R.slide > 0.25) { _v1.copy(h.dir).setY(0).normalize().multiplyScalar(0.5); this.dropFromRide(_v1.clone()); say(this, 'waa'); return; } } else R.slide = 0;
+      if (h.speedS > 1.8) { this.dropFromRide(h.vel.clone()); say(this, 'whee'); return; }
+      this.root.position.copy(h.palm).addScaledVector(h.dir, 0.006);
+      _v2.subVectors(camHead, this.root.position); basisQuat(h.dir, _v2, _q1); this.root.quaternion.slerp(_q1, damp(12, dt));
+      R.moodT -= dt;
+      if (R.moodT <= 0) {
+        R.mood = pick(['wave', 'dance', 'sit', 'chat', 'laugh', 'dance']); R.moodT = rand(1.5, 3);
+        if (R.mood === 'chat') babble(this, 4, Math.random() < 0.4); else if (R.mood === 'laugh') laugh(this, 6); else if (R.mood === 'wave') say(this, 'hey');
+      }
+      if (R.t > 6 && h.speedS < 0.5 && Math.random() < dt * 0.3) { R.phase = 'arm'; R.s = 0; babble(this, 3); }
+    } else if (R.phase === 'arm') {
+      if (h.speedS > 2.0) { this.dropFromRide(h.vel.clone()); say(this, 'waa'); return; }
+      const P = this.armPath(h); let total = 0; const L = [];
+      for (let i = 0; i < 3; i++) { L.push(P[i].distanceTo(P[i + 1])); total += L[i]; }
+      R.s += dt * 0.15;
+      if (R.s >= total) { R.phase = 'shoulder'; R.t = 0; babble(this, 4); return; }
+      let s = R.s, i = 0; while (i < 2 && s > L[i]) { s -= L[i]; i++; }
+      const k = L[i] > 1e-4 ? s / L[i] : 0;
+      _v1.copy(P[i]).lerp(P[i + 1], k).addScaledVector(Y, 0.02);
+      _v2.subVectors(P[i + 1], P[i]).normalize();
+      _v3.copy(Y).addScaledVector(_v2, -_v2.y); if (_v3.lengthSq() < 0.05) _v3.copy(camFwd).negate(); _v3.normalize();
+      this.root.position.lerp(_v1, damp(20, dt)); basisQuat(_v3, _v2, _q1); this.root.quaternion.slerp(_q1, damp(10, dt));
+      this.phase += dt * 9;
+    } else {
+      const P = this.armPath(h);
+      this.root.position.lerp(P[3], damp(20, dt));
+      basisQuat(camUp, camFwd, _q1); this.root.quaternion.slerp(_q1, damp(10, dt));
+      R.say -= dt;
+      if (R.say <= 0) { R.say = rand(1.4, 2.8); if (Math.random() < 0.55) babble(this, 3 + ((Math.random() * 3) | 0), Math.random() < 0.4); else laugh(this, 5); }
+      if (R.t > R.stay) { this.dropFromRide(camFwdH.clone().multiplyScalar(1.3).addScaledVector(Y, 1.6), 'front'); say(this, 'whee'); }
     }
   }
   // ---------- body animation ----------
   animate(dt, t) {
     const A = this.tg; for (const k of KEYS) A[k] = 0;
     A.hipL = A.hipR = 0.06; A.knL = A.knR = 0.12; A.shLz = A.shRz = 0.16; A.elL = A.elR = 0.3; A.shL = A.shR = 0.05;
-    let flipT = 0, axis = this.flipAxis, lieT = 0, look = null;
+    let flipT = 0, axis = this.flipAxis, lieT = 0, look = null, mouth = this.mouthMode;
     const s = Math.sin(this.phase), c = Math.cos(this.phase);
+    const sit = () => { A.hipL = A.hipR = 1.5; A.knL = A.knR = 1.5; A.bob = -this.hh * 0.78; A.shL = A.shR = 0.4; A.elL = A.elR = 1.0; };
+    const climbPose = (k) => {
+      const cs = s * k;
+      A.shL = 2.55 + cs * 0.45; A.shR = 2.55 - cs * 0.45; A.shLz = A.shRz = 0.35; A.elL = 0.9 - cs * 0.6; A.elR = 0.9 + cs * 0.6;
+      A.hipL = 0.95 - cs * 0.55; A.hipR = 0.95 + cs * 0.55; A.hipLz = A.hipRz = 0.35; A.knL = 1.5 - cs * 0.45; A.knR = 1.5 + cs * 0.45;
+      A.hp = -0.4; A.bob = cs * 0.01;
+    };
+    const runPose = (sp) => {
+      const r = clamp(sp / 0.75, 0, 1), amp = 0.35 + 0.65 * r;
+      A.hipL = s * 0.8 * amp; A.hipR = -s * 0.8 * amp; A.knL = Math.max(0, c) * 1.5 * amp + 0.1; A.knR = Math.max(0, -c) * 1.5 * amp + 0.1;
+      A.shL = -s * 0.95 * amp; A.shR = s * 0.95 * amp; A.elL = A.elR = 0.5 + 0.9 * r; A.lean = 0.1 + 0.25 * r; A.bob = Math.abs(c) * 0.04 * amp; A.hp = 0.05;
+    };
+    const wave = () => { A.shRz = 2.6; A.elR = 0.7 + Math.sin(t * 13) * 0.55; };
+    const dance = () => {
+      const d = Math.sin(t * 9 + this.seed);
+      A.bob = Math.abs(d) * 0.05; A.shL = 2.3 + d * 0.5; A.shR = 2.3 - d * 0.5; A.elL = A.elR = 1.1;
+      A.hipL = 0.2 + Math.max(0, d) * 0.7; A.hipR = 0.2 + Math.max(0, -d) * 0.7; A.knL = A.hipL * 1.3; A.knR = A.hipR * 1.3; A.hr = d * 0.25;
+    };
+    const laughPose = () => { A.lean = -0.22; A.shL = A.shR = 0.55; A.elL = A.elR = 1.9; A.shLz = A.shRz = 0.25; A.knL = A.knR = 0.25; A.bob = Math.abs(Math.sin(t * 26)) * 0.022; A.hp = -0.45; A.hr = Math.sin(t * 7) * 0.18; };
     if (this.state === 'air') {
-      const f = this.flight, u = clamp(f.t / f.T, 0, 1), e = u * u * (3 - 2 * u);
+      const f = this.flight, u = clamp(f.t / f.T, 0, 1), e = easeIO(u);
       axis = 'x';
       switch (f.style) {
         case 'front': case 'back': {
@@ -802,12 +1338,33 @@ class Elf {
         case 'twist': A.shL = A.shR = 2.9; A.shLz = A.shRz = 0.05; A.knL = A.knR = 0.05; axis = 'y'; flipT = TAU * f.flips * e; break;
         case 'cart': A.shLz = A.shRz = 2.6; A.elL = A.elR = 0.1; A.hipLz = A.hipRz = 0.55; A.knL = A.knR = 0.05; axis = 'z'; flipT = f.sign * TAU * e; break;
         case 'star': { const k = Math.sin(u * Math.PI); A.shLz = A.shRz = 0.3 + 2.5 * k; A.hipLz = A.hipRz = 0.05 + 0.65 * k; A.elL = A.elR = 0.1; A.knL = A.knR = 0.05; break; }
-        case 'leap': { const k = Math.sin(u * Math.PI); A.shL = A.shR = 1.4 + 1.2 * k; A.elL = A.elR = 0.2; A.hipL = 0.3 + 1.1 * k; A.hipR = 0.1 + 0.9 * k; A.knL = 0.3 + 1.4 * k; A.knR = 0.5 + 1.2 * k; A.lean = 0.15; break; }
+        case 'leap': case 'homing': { const k = Math.sin(u * Math.PI); A.shL = A.shR = 1.4 + 1.2 * k; A.elL = A.elR = 0.2; A.hipL = 0.3 + 1.1 * k; A.hipR = 0.1 + 0.9 * k; A.knL = 0.3 + 1.4 * k; A.knR = 0.5 + 1.2 * k; A.lean = 0.15; break; }
         case 'plant': A.shL = A.shR = 2.3; A.elL = A.elR = 0.15; A.hipL = A.hipR = -0.2; A.knL = A.knR = 0.4; A.hp = -0.5; flipT = Math.PI / 2 * clamp(f.t / 0.35, 0, 1); break;
-        default:  // flailing all the way down
+        case 'tumble': A.hipL = A.hipR = 1.2; A.knL = A.knR = 1.6; A.shLz = A.shRz = 1.8; A.elL = A.elR = 0.8; flipT = f.t * f.spin; mouth = 'yawn'; break;
+        default:
           A.shLz = 2.3 + Math.sin(t * 26) * 0.7; A.shRz = 2.3 + Math.cos(t * 23) * 0.7; A.shL = Math.sin(t * 19) * 0.8; A.shR = Math.cos(t * 21) * 0.8; A.elL = A.elR = 0.6;
           A.hipL = 0.7 + Math.sin(t * 22) * 0.7; A.hipR = 0.7 + Math.cos(t * 20) * 0.7; A.knL = A.knR = 0.9; A.hp = -0.45;
       }
+    } else if (this.state === 'held') {
+      const ph = t * 16;
+      A.hipL = 0.6 + Math.sin(ph) * 0.9; A.hipR = 0.6 - Math.sin(ph) * 0.9; A.knL = 1.0 + Math.cos(ph) * 0.6; A.knR = 1.0 - Math.cos(ph) * 0.6;
+      if (this.holdMood === 'love') { A.shLz = A.shRz = 2.5 + Math.sin(t * 7) * 0.3; A.elL = A.elR = 0.4; }
+      else { A.shL = 1.5 + Math.sin(t * 20) * 0.6; A.shR = 1.5 - Math.sin(t * 20) * 0.6; A.elL = A.elR = 0.6; }
+      look = camHead;
+    } else if (this.state === 'ride') {
+      const R = this.ride;
+      if (R.phase === 'arm') climbPose(1);
+      else if (R.phase === 'shoulder') { sit(); look = camHead; if (this.talkT > 0) { A.shR = 0.9 + Math.sin(t * 8) * 0.4; A.elR = 1.4; } }
+      else switch (R.mood) {
+        case 'wave': wave(); look = camHead; break;
+        case 'dance': dance(); look = camHead; break;
+        case 'sit': sit(); look = camHead; break;
+        case 'laugh': laughPose(); break;
+        default: A.shR = 0.7 + Math.sin(t * 8) * 0.5; A.elR = 1.3 + Math.sin(t * 11) * 0.5; look = camHead;
+      }
+      if (this.landT > 0) { const k = this.landT / 0.25; A.hipL += 0.9 * k; A.hipR += 0.9 * k; A.knL += 1.5 * k; A.knR += 1.5 * k; }
+    } else if (this.state === 'script') {
+      this.scriptPose(A, t); look = this.scriptLook;
     } else {
       const climb = this.cb > 0.5;
       switch (this.b) {
@@ -815,10 +1372,11 @@ class Elf {
         case 'down':
           lieT = 1; axis = 'x'; flipT = this.lieSign * Math.PI / 2;
           A.shLz = A.shRz = 1.2; A.hipLz = A.hipRz = 0.35; A.knL = A.knR = 0.15; A.hp = this.lieSign > 0 ? -0.35 : 0.2;
-          if (Math.sin(t * 3 + this.seed) > 0.85) { A.knL = 1.0; A.elR = 1.2; }   // little twitch
+          if (Math.sin(t * 3 + this.seed) > 0.85) { A.knL = 1.0; A.elR = 1.2; }
           break;
+        case 'nap': lieT = 1; axis = 'x'; flipT = -Math.PI / 2; A.shL = A.shR = 0.5; A.elL = A.elR = 1.9; A.knL = 0.6; A.hipL = 0.4; A.hp = 0.15; A.bob = Math.sin(t * 2.6) * 0.008; mouth = 'o'; break;
         case 'getup': {
-          const k = 1 - clamp(this.timer / 0.55, 0, 1), e = k * k * (3 - 2 * k);
+          const k = 1 - clamp(this.timer / 0.55, 0, 1), e = easeIO(k);
           lieT = 1 - e; axis = 'x'; flipT = this.lieSign * Math.PI / 2 * (1 - e);
           A.hipL = A.hipR = 1.0 * (1 - e) + 0.1; A.knL = A.knR = 1.5 * (1 - e) + 0.1; A.shL = A.shR = -0.4; A.lean = 0.3 * (1 - e); break;
         }
@@ -826,36 +1384,37 @@ class Elf {
           lieT = 1; axis = 'x'; flipT = -Math.PI / 2;
           A.hipL = 1.2 + Math.sin(t * 15) * 0.7; A.hipR = 1.2 - Math.sin(t * 15) * 0.7; A.knL = A.knR = 1.2;
           A.shL = A.shR = 0.7; A.elL = A.elR = 1.8; A.hy = Math.sin(t * 9) * 0.35; break;
-        case 'laugh':
-          A.lean = -0.22; A.shL = A.shR = 0.55; A.elL = A.elR = 1.9; A.shLz = A.shRz = 0.25; A.knL = A.knR = 0.25;
-          A.bob = Math.abs(Math.sin(t * 26)) * 0.022; A.hp = -0.45; A.hr = Math.sin(t * 7) * 0.18; break;
+        case 'laugh': laughPose(); break;
+        case 'tickle': laughPose(); A.hr = Math.sin(t * 22) * 0.35; A.lean = Math.sin(t * 17) * 0.2; A.bob = Math.abs(Math.sin(t * 30)) * 0.03; break;
         case 'cheer': A.shLz = A.shRz = 2.8; A.elL = A.elR = 0.2; A.bob = Math.abs(Math.sin(t * 16)) * 0.05; A.knL = A.knR = 0.3; look = camHead; break;
-        case 'wave': A.shRz = 2.6; A.elR = 0.7 + Math.sin(t * 13) * 0.55; A.bob = Math.abs(Math.sin(t * 8)) * 0.02; look = camHead; break;
-        case 'dance': {
-          const d = Math.sin(t * 9 + this.seed);
-          A.bob = Math.abs(d) * 0.05; A.shL = 2.3 + d * 0.5; A.shR = 2.3 - d * 0.5; A.elL = A.elR = 1.1;
-          A.hipL = 0.2 + Math.max(0, d) * 0.7; A.hipR = 0.2 + Math.max(0, -d) * 0.7; A.knL = A.hipL * 1.3; A.knR = A.hipR * 1.3; A.hr = d * 0.25; break;
-        }
+        case 'wave': wave(); A.bob = Math.abs(Math.sin(t * 8)) * 0.02; look = camHead; break;
+        case 'dance': dance(); break;
         case 'chat':
           if (this.talkT > 0) { A.shR = 0.7 + Math.sin(t * 8) * 0.5; A.elR = 1.3 + Math.sin(t * 11) * 0.5; A.shLz = 0.5 + Math.sin(t * 6) * 0.3; A.hp = Math.sin(t * 14) * 0.07; }
           else { A.hr = 0.22; A.shL = A.shR = 0.4; A.elL = A.elR = 1.6; }
           if (this.partner) look = this.partner.headPos(_v4);
           break;
         case 'shake': A.hy = Math.sin(t * 34) * 0.55; A.knL = A.knR = 0.3; break;
+        case 'sneeze': {
+          const k = this.act.k || 0;
+          if (k < 0.72) { A.hp = -0.6 * (k / 0.72); A.lean = -0.2 * (k / 0.72); A.shL = A.shR = 0.4; mouth = 'yawn'; }
+          else { const r = clamp((k - 0.72) / 0.1, 0, 1); A.hp = 0.6 * (1 - (k - 0.72) / 0.28); A.lean = 0.35 * r; A.bob = -0.03 * r; A.shL = A.shR = 1.0; A.elL = A.elR = 1.6; }
+          break;
+        }
+        case 'hiccup': A.bob = this.act.jolt > 0 ? 0.04 : 0; A.shL = A.shR = 0.3; A.elL = A.elR = 1.5; A.hp = this.act.jolt > 0 ? -0.2 : 0; look = camHead; break;
+        case 'yawn': A.shLz = A.shRz = 2.8 * Math.sin(Math.PI * clamp(1 - this.timer / 1.6, 0, 1)); A.elL = A.elR = 0.6; A.hp = -0.4; mouth = 'yawn'; break;
+        case 'balance':
+          runPose(this.speed); A.shL = A.shR = 0.1; A.shLz = 1.5 + Math.sin(t * 5 + this.seed) * 0.35; A.shRz = 1.5 - Math.sin(t * 5 + this.seed) * 0.35;
+          A.elL = A.elR = 0.2; A.hr = Math.sin(t * 3.3) * 0.15; A.hp = 0.35; A.lean = 0; break;
+        case 'wallsplat': A.shLz = A.shRz = 2.3; A.hipLz = A.hipRz = 0.6; A.knL = A.knR = 0.1; A.elL = A.elR = 0.1; break;
+        case 'flee':
+          runPose(this.speed); A.shLz = 2.3 + Math.sin(t * 24) * 0.5; A.shRz = 2.3 + Math.cos(t * 22) * 0.5; A.shL = A.shR = 0.2;
+          if (this.chase) look = this.chase.it.headPos(_v4);
+          break;
         default:
-          if (climb) {
-            const k = this.speed > 0.02 ? 1 : 0.25, cs = s * k;
-            A.shL = 2.55 + cs * 0.45; A.shR = 2.55 - cs * 0.45; A.shLz = A.shRz = 0.35; A.elL = 0.9 - cs * 0.6; A.elR = 0.9 + cs * 0.6;
-            A.hipL = 0.95 - cs * 0.55; A.hipR = 0.95 + cs * 0.55; A.hipLz = A.hipRz = 0.35; A.knL = 1.5 - cs * 0.45; A.knR = 1.5 + cs * 0.45;
-            A.hp = -0.4; A.bob = cs * 0.01;
-          } else if (this.speed > 0.05) {
-            const r = clamp(this.speed / 0.75, 0, 1), amp = 0.35 + 0.65 * r;
-            A.hipL = s * 0.8 * amp; A.hipR = -s * 0.8 * amp; A.knL = Math.max(0, c) * 1.5 * amp + 0.1; A.knR = Math.max(0, -c) * 1.5 * amp + 0.1;
-            A.shL = -s * 0.95 * amp; A.shR = s * 0.95 * amp; A.elL = A.elR = 0.5 + 0.9 * r; A.lean = 0.1 + 0.25 * r; A.bob = Math.abs(c) * 0.04 * amp; A.hp = 0.05;
-          } else {
-            A.bob = Math.sin(t * 2.2 + this.seed) * 0.006;
-            if (Math.sin(t * 0.5 + this.seed) > 0) look = camHead;
-          }
+          if (climb) climbPose(this.speed > 0.02 ? 1 : 0.25);
+          else if (this.speed > 0.05) runPose(this.speed);
+          else { A.bob = Math.sin(t * 2.2 + this.seed) * 0.006; if (Math.sin(t * 0.5 + this.seed) > 0) look = camHead; }
           if (this.landT > 0) {
             const k = this.landT / 0.25;
             A.hipL += 0.9 * k; A.hipR += 0.9 * k; A.knL += 1.5 * k; A.knR += 1.5 * k; A.bob -= 0.08 * k; A.shL -= 0.3 * k; A.shR -= 0.3 * k;
@@ -863,33 +1422,60 @@ class Elf {
       }
       if (this.b === 'laugh' && this.partner) look = this.partner.headPos(_v4);
     }
+    if (this.flipOverride) { axis = this.flipOverride.axis; flipT = this.flipOverride.a; }
     if (look && this.lie < 0.2) {
       this.pelvis.updateWorldMatrix(true, false);
       _v1.copy(look); this.pelvis.worldToLocal(_v1); _v1.sub(this.head.position);
       A.hy += clamp(Math.atan2(_v1.x, _v1.z), -1.2, 1.2);
       A.hp += clamp(-Math.atan2(_v1.y - 0.1, Math.hypot(_v1.x, _v1.z)), -0.7, 0.5);
     }
-    const k = damp(this.state === 'air' ? 20 : 14, dt), a = this.a;
+    const k = damp(this.state === 'air' || this.state === 'held' ? 20 : 14, dt), a = this.a;
     for (const key of KEYS) a[key] += (A[key] - a[key]) * k;
     this.hipL.rotation.set(-(a.hipL + a.lean), 0, a.hipLz);
     this.hipR.rotation.set(-(a.hipR + a.lean), 0, -a.hipRz);
     this.knL.rotation.x = a.knL; this.knR.rotation.x = a.knR;
     this.shL.rotation.set(-a.shL, 0, a.shLz); this.shR.rotation.set(-a.shR, 0, -a.shRz);
     this.elL.rotation.x = -a.elL; this.elR.rotation.x = -a.elR;
-    this.pelvis.rotation.x = a.lean; this.pelvis.position.y = 0.30 - COM + a.bob;
+    this.pelvis.rotation.x = a.lean; this.pelvis.position.y = this.hh - this.com + a.bob;
     this.head.rotation.set(a.hp, a.hy, a.hr);
-    // flips, and lying flat after a fall
     if (axis !== this.flipAxis) { this.flipA = 0; this.flipAxis = axis; }
-    if (this.state === 'air') this.flipA += (flipT - this.flipA) * damp(30, dt);
+    if (this.state === 'air' || this.flipOverride) this.flipA += (flipT - this.flipA) * damp(30, dt);
     else { this.flipA = wrapPi(this.flipA); this.flipA += (flipT - this.flipA) * damp(this.b === 'down' ? 24 : 12, dt); }
     this.flip.rotation.set(0, 0, 0); this.flip.rotation[axis] = this.flipA;
     this.lie += (lieT - this.lie) * damp(16, dt);
-    this.flip.position.y = COM - 0.29 * this.lie;
-    // mouth flaps while talking and laughing
+    this.flip.position.y = this.com - (this.com - 0.12) * this.lie;
+    // mouth: flaps while talking, round for whistling and snoring, wide open for yawns and screams
     this.talkT -= dt;
-    this.mouth.scale.y = this.talkT > 0 ? 0.01 + Math.abs(Math.sin(t * 27 + this.seed)) * 0.022 : 0.008;
+    const ms = this.mouth.scale;
+    if (mouth === 'o') ms.set(0.014, 0.015, 0.012);
+    else if (mouth === 'yawn') ms.set(0.024, 0.032, 0.012);
+    else ms.set(0.026, this.talkT > 0 ? 0.01 + Math.abs(Math.sin(t * 27 + this.seed)) * 0.022 : 0.008, 0.012);
+    if (this.b !== 'whistle') this.mouthMode = '';
+    // wings, propeller, cape
+    const flying = this.state === 'air' || this.state === 'held';
+    if (this.wings) { const w = (flying ? 0.7 : 0.25) * Math.sin(t * (flying ? 38 : 7) + this.seed); this.wings[0].rotation.y = -0.5 - w; this.wings[1].rotation.y = 0.5 + w; }
+    if (this.prop) this.prop.rotation.y += dt * (flying ? 45 : 6 + this.speed * 30);
+    if (this.cape) { const tgt = -clamp(this.speed * 1.3 + (flying ? 0.9 : 0), 0, 1.2) + Math.sin(t * 6 + this.seed) * 0.05; this.cape.rotation.x += (tgt - this.cape.rotation.x) * damp(8, dt); }
   }
-  headPos(out) { return this.head.getWorldPosition(out); }
+  scriptPose(A, t) {
+    const pilotSit = () => { A.hipL = A.hipR = 1.5; A.knL = A.knR = 1.5; A.bob = -this.hh * 0.78; A.shL = 1.2; A.elL = 1.0; };
+    this.scriptLook = camHead;
+    switch (this.b) {
+      case 'peek': {
+        if ((this.act.side || 1) > 0) { A.shLz = 1.3; A.elL = 1.3; A.shL = 0.6; } else { A.shRz = 1.3; A.elR = 1.3; A.shR = 0.6; }
+        break;
+      }
+      case 'sillUp': A.shL = A.shR = 2.0; A.elL = A.elR = 1.3; break;
+      case 'look': A.shL = A.shR = 2.0; A.elL = A.elR = 1.3; A.hy = Math.sin(t * 3) * 0.8; this.scriptLook = null; break;
+      case 'knock': A.shL = 1.9; A.elL = 1.3; A.shR = 1.55; A.elR = 0.4 + Math.abs(Math.sin(t * 8.9)) * 0.9; break;
+      case 'press': A.shL = A.shR = 1.7; A.shLz = A.shRz = 0.55; A.elL = A.elR = 0.5; break;
+      case 'wave': A.shRz = 2.6; A.elR = 0.7 + Math.sin(t * 13) * 0.55; A.shL = 1.9; A.elL = 1.3; break;
+      case 'pilot': pilotSit(); A.shR = 1.2; A.elR = 1.0; if (!this.act.lookCam) this.scriptLook = null; break;
+      case 'kissPrep': pilotSit(); A.shR = 2.3; A.elR = 2.5; A.shRz = 0.3; break;
+      case 'kissThrow': pilotSit(); A.shR = 1.7; A.elR = 0.1; A.shRz = 0.6; break;
+      case 'pilotWave': pilotSit(); A.shRz = 2.6; A.elR = 0.7 + Math.sin(t * 13) * 0.55; break;
+    }
+  }
   // ---------- place in the room ----------
   place(dt, t) {
     const r = this.root;
@@ -899,41 +1485,45 @@ class Elf {
       basisQuat(this.n, this.dir, _q1);
       if (this.cb > 0.01) { wallUp(this.n, _v3); _v4.copy(this.n).negate(); basisQuat(_v3, _v4, _q2); _q1.slerp(_q2, this.cb); }
       r.quaternion.slerp(_q1, damp(14, dt));
-      _v3.copy(this.p).addScaledVector(this.n, 0.12 * UNIT * this.cb);
+      _v3.copy(this.p).addScaledVector(this.n, 0.12 * this.size * this.cb);
       r.position.lerp(_v3, damp(30, dt));
-    } else {
+    } else if (this.state === 'air') {
       basisQuat(Y, this.airFwd, _q1); r.quaternion.slerp(_q1, damp(8, dt)); r.position.copy(this.p);
     }
-    const x = this.pop, sc = x >= 1 ? 1 : 1 + 2.7 * Math.pow(x - 1, 3) + 1.7 * Math.pow(x - 1, 2);
+    const sc = backOut(this.pop);
     r.scale.setScalar(Math.max(0.001, sc));
     const k = Math.max(0, this.landT) / 0.25; this.landT -= dt;
-    this.model.scale.set(UNIT * (1 + 0.12 * k), UNIT * (1 - 0.18 * k), UNIT * (1 + 0.12 * k));
-    // hat tip wobbles with the body's movement
+    const flat = this.b === 'wallsplat' ? 0.55 : 1;
+    this.model.scale.set(this.size * (1 + 0.12 * k), this.size * (1 - 0.18 * k), this.size * (1 + 0.12 * k) * flat * this.squishZ);
+    // hat tips wobble with the body's movement
     const idt = 1 / Math.max(dt, 1e-3);
-    _v1.copy(r.position).sub(this.prevPos).multiplyScalar(idt);
+    r.getWorldPosition(_v4);
+    _v1.copy(_v4).sub(this.prevPos).multiplyScalar(idt);
     _v2.copy(_v1).sub(this.prevVel).multiplyScalar(idt);
-    this.prevPos.copy(r.position); this.prevVel.copy(_v1);
-    _v2.applyQuaternion(_q2.copy(r.quaternion).invert()).clampLength(0, 30);
+    this.prevPos.copy(_v4); this.prevVel.copy(_v1);
+    r.getWorldQuaternion(_q2); _v2.applyQuaternion(_q2.invert()).clampLength(0, 30);
     const hs = this.hs;
     hs.vx += (-70 * hs.x - 7 * hs.vx - _v2.z * 0.8) * dt; hs.x += hs.vx * dt;
     hs.vz += (-70 * hs.z - 7 * hs.vz + _v2.x * 0.8) * dt; hs.z += hs.vz * dt;
-    this.tip.rotation.x = -0.35 + clamp(hs.x, -1, 1); this.tip.rotation.z = clamp(hs.z, -1, 1);
+    this.tips.forEach((tp, i) => { const g = i ? 0.6 : 1; tp.rotation.x = tp.userData.rest + clamp(hs.x * g, -1, 1); tp.rotation.z = clamp(hs.z * g, -1, 1); });
     // soft shadow
     const sh = this.shadow;
-    if (this.state === 'ground') {
-      sh.visible = true; sh.position.copy(this.p).addScaledVector(this.n, 0.004);
-      sh.quaternion.setFromUnitVectors(ZAX, this.n); sh.scale.setScalar((this.cb > 0.5 ? 0.6 : 1 + this.lie * 0.4) * sc);
-    } else {
-      const h = cast(this.p, DOWN, 3);
-      if (h) { sh.visible = true; sh.position.copy(h.p).addScaledVector(h.n, 0.004); sh.quaternion.setFromUnitVectors(ZAX, h.n); sh.scale.setScalar(1 / (1 + h.d * 2.5)); }
-      else sh.visible = false;
+    if (this.hasShadow) {
+      if (this.state === 'ground') {
+        sh.visible = true; sh.position.copy(this.p).addScaledVector(this.n, 0.004);
+        sh.quaternion.setFromUnitVectors(ZAX, this.n); sh.scale.setScalar((this.cb > 0.5 ? 0.6 : 1 + this.lie * 0.4) * sc * this.s);
+      } else if (this.state === 'air' || this.state === 'held') {
+        const h = cast(r.position, DOWN, 3);
+        if (h) { sh.visible = true; sh.position.copy(h.p).addScaledVector(h.n, 0.004); sh.quaternion.setFromUnitVectors(ZAX, h.n); sh.scale.setScalar(this.s / (1 + h.d * 2.5)); }
+        else sh.visible = false;
+      } else sh.visible = false;
     }
     // dizzy stars after a fall
     if (this.dazed > 0) {
       this.dazed -= dt;
       if (!this.stars) {
         this.stars = new THREE.Group();
-        for (let i = 0; i < 3; i++) { const m = new THREE.Mesh(starGeo, starMat); this.stars.add(m); }
+        for (let i = 0; i < 3; i++) this.stars.add(new THREE.Mesh(starGeo, starMat));
         scene.add(this.stars);
       }
       this.stars.visible = true;
@@ -942,47 +1532,64 @@ class Elf {
     } else if (this.stars) this.stars.visible = false;
   }
   dispose() {
-    scene.remove(this.root); scene.remove(this.shadow); if (this.stars) scene.remove(this.stars);
-    this.root.traverse(o => { if (o.userData.own) o.geometry.dispose(); });
+    if (this.root.parent) this.root.parent.remove(this.root);
+    scene.remove(this.shadow); if (this.stars) scene.remove(this.stars);
+    this.root.traverse(o => { if (o.userData.own) o.geometry.dispose(); if (o.userData.mat0) o.material.dispose(); });
     try { if (this.audio) this.audio.disconnect(); } catch (err) {}
   }
 }
+// Clipping hides part of a little person: behind a picture (peeking), or outside a window frame (visiting).
+function setClip(e, planes, intersect, tint) {
+  e.root.traverse(o => {
+    if (!o.isMesh) return;
+    if (!o.userData.mat0) o.userData.mat0 = o.material;
+    const m = o.userData.mat0.clone(); m.clippingPlanes = planes; m.clipIntersection = intersect;
+    if (tint && m.color) m.color.multiply(new THREE.Color(tint));
+    o.material = m;
+  });
+}
+function unclip(e) { e.root.traverse(o => { if (o.isMesh && o.userData.mat0) { o.material.dispose(); o.material = o.userData.mat0; delete o.userData.mat0; } }); }
+
 function runTarget(p) {
   for (let k = 0; k < 24; k++) {
     const s = randomSpot(); if (!s) return null;
     const d = s.p.distanceTo(p); if (d < 0.4 || d > 2.6) continue;
-    if (Math.abs(s.n.y) > 0.5 && Math.random() < 0.6) continue;  // prefer walls and furniture sides
+    if (Math.abs(s.n.y) > 0.5 && Math.random() < 0.6) continue;
     return s.p.clone();
   }
   return null;
 }
 function spawnSpot(center, rMin, rMax, inFront) {
-  const fwd = new V3(0, 0, -1).applyQuaternion(camera.quaternion).setY(0).normalize();
   for (let k = 0; k < 80; k++) {
     const s = randomSpot(); if (!s) return null;
     if (Math.abs(s.n.y) < 0.85) continue;
     const dx = s.p.x - center.x, dz = s.p.z - center.z, d = Math.hypot(dx, dz);
     if (d < rMin || d > rMax) continue;
-    if (inFront && k < 50 && (fwd.x * dx + fwd.z * dz) / (d || 1) < 0.25) continue;
+    if (inFront && k < 50 && (camFwdH.x * dx + camFwdH.z * dz) / (d || 1) < 0.25) continue;
     const h = cast(_o.copy(s.p).addScaledVector(Y, 0.35), DOWN, 0.6);
     if (h && h.n.y > 0.75) return { p: h.p, n: h.n };
   }
   return null;
 }
 const spawnCenter = () => World.mode === 'mr' ? userPos : controls.target;
-function addElf(at) {
+function addElf(at, kind) {
   if (!Room.collider) return null;
-  if (elves.length >= MAX_ELVES) removeElf(elves[0]);
+  if (elves.length >= MAX_ELVES) { const old = elves.find(e => e.state === 'ground' && !Grab.isHeld(e)); if (old) removeElf(old); else return null; }
   const s = at || spawnSpot(spawnCenter(), 0.5, 2.6, true) || spawnSpot(spawnCenter(), 0, 5, false);
   if (!s) return null;
-  const e = new Elf(s.p, s.n); elves.push(e);
+  const e = new Elf(s.p, s.n, kind); elves.push(e);
   burst(_v1.copy(s.p).addScaledVector(s.n, 0.12), BRIGHT, 26, 1.0);
   say(e, 'pop'); laugh(e, 4, 0.35);
   return e;
 }
-function removeElf(e) { const i = elves.indexOf(e); if (i >= 0) elves.splice(i, 1); e.chat = null; e.dispose(); }
+function removeElf(e) {
+  const i = elves.indexOf(e); if (i >= 0) elves.splice(i, 1);
+  if (e.ride) HS[e.ride.hand].rider = null;
+  for (const k in Grab.held) if (Grab.held[k] === e) delete Grab.held[k];
+  e.chat = null; e.chase = null; e.dispose();
+}
 
-// Every few seconds two nearby little people stop for a chat: they take turns babbling, then crack up.
+// ================= social life: chats and chases =================
 const chats = []; let chatClock = 2;
 function startChat(a, b) {
   const c = { a, b, turns: 2 + ((Math.random() * 4) | 0), next: 0.3, who: 0 };
@@ -993,14 +1600,14 @@ function directChats(dt) {
   chatClock -= dt;
   if (chatClock <= 0) {
     chatClock = rand(2.5, 5);
-    const free = shuffle(elves.filter(e => e.state === 'ground' && e.n.y > 0.75 && e.pop >= 1 && !e.chat && ['wander', 'dance', 'land', 'cheer', 'shake', 'run'].includes(e.b)));
+    const free = shuffle(elves.filter(e => e.free() && e.n.y > 0.75));
     outer: for (const a of free) for (const b of free) if (a !== b && a.p.distanceTo(b.p) < 1.0) { startChat(a, b); break outer; }
   }
   for (let i = chats.length - 1; i >= 0; i--) {
     const c = chats[i];
-    const ok = e => e.chat === c && e.b === 'chat';
+    const ok = e => e.chat === c && e.b === 'chat' && e.state === 'ground';
     if (!ok(c.a) || !ok(c.b)) {
-      for (const e of [c.a, c.b]) if (e.chat === c) { e.chat = null; e.b = 'wander'; e.timer = 0.5; }
+      for (const e of [c.a, c.b]) if (e.chat === c) { e.chat = null; if (e.state === 'ground') { e.b = 'wander'; e.timer = 0.5; } }
       chats.splice(i, 1); continue;
     }
     c.next -= dt;
@@ -1019,15 +1626,249 @@ function directChats(dt) {
     }
   }
 }
-const Spawn = { queue: 0, t: 0 };
-function updateSpawner(dt) {
-  if (Spawn.queue <= 0 || !Room.collider) return;
-  Spawn.t -= dt;
-  if (Spawn.t <= 0) { Spawn.t = rand(0.35, 0.7); Spawn.queue--; addElf(); if (Spawn.queue === 0) onBatchDone(); }
+// Tag: one chases, one runs away squealing. Sometimes they swap, sometimes it ends in a laughing pile-up.
+const chases = [];
+const CHASE_OK = ['land', 'cheer', 'wander', 'run', 'idle', 'whistle', 'dance'];
+function tryChase() {
+  const free = shuffle(elves.filter(e => e.free() && e.n.y > 0.75));
+  for (const a of free) for (const b of free) if (a !== b && a.p.distanceTo(b.p) < 2.2) {
+    const c = { it: a, runner: b, t: rand(7, 11), swaps: 0, cool: 0.8 };
+    a.chase = b.chase = c; a.b = 'chase'; b.b = 'flee'; a.timer = b.timer = 99;
+    say(b, 'eee'); laugh(a, 4, 0.2);
+    chases.push(c); return;
+  }
+}
+function updateChases(dt) {
+  for (let i = chases.length - 1; i >= 0; i--) {
+    const c = chases[i]; c.t -= dt; c.cool -= dt;
+    const ok = e => e.chase === c && (e.state === 'air' || e.state === 'ground');
+    const end = (laughing) => {
+      for (const e of [c.it, c.runner]) if (e.chase === c) { e.chase = null; if (e.state === 'ground') { e.b = laughing ? 'laugh' : 'wander'; e.timer = 1.4; if (laughing) laugh(e, 6, rand(0, 0.3)); } }
+      chases.splice(i, 1);
+    };
+    if (!ok(c.it) || !ok(c.runner)) { end(false); continue; }
+    if (c.t <= 0) { end(true); continue; }
+    if (c.it.state !== 'ground' || c.runner.state !== 'ground') continue;
+    if (CHASE_OK.includes(c.it.b)) { c.it.b = 'chase'; c.it.timer = 99; }
+    if (CHASE_OK.includes(c.runner.b)) { c.runner.b = 'flee'; c.runner.timer = 99; }
+    if (Math.random() < dt * 0.6) say(c.runner, Math.random() < 0.5 ? 'eee' : 'yip');
+    if (c.cool <= 0 && c.it.b === 'chase' && c.it.p.distanceTo(c.runner.p) < 0.14) {
+      if (Math.random() < 0.35 || c.swaps >= 3) {
+        for (const e of [c.it, c.runner]) { e.chase = null; e.b = 'rofl'; e.timer = 2.4; e.dazed = 1; laugh(e, 9, rand(0.1, 0.3)); }
+        thud(c.runner, false); chases.splice(i, 1); continue;
+      }
+      [c.it, c.runner] = [c.runner, c.it]; c.swaps++; c.cool = 1.2; c.t += 2;
+      c.it.b = 'chase'; c.runner.b = 'flee'; c.it.speed = 0; say(c.it, 'hey'); say(c.runner, 'eee', 0.2);
+    }
+  }
+}
+
+// ================= peeking from behind pictures =================
+function tryPeek() {
+  const arts = Room.features.filter(f => f.type === 'art');
+  if (!arts.length) return;
+  const f = pick(arts), pool = elves.filter(e => e.free());
+  if (!pool.length) return;
+  const frust = new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
+  const hidden = pool.filter(e => !frust.containsPoint(e.p));
+  const e = hidden.length ? pick(hidden) : pick(pool);
+  const fits = f.h >= e.grabH * e.size + 0.03 && f.w >= 0.2;
+  if (!fits) {    // too small to hide behind: walk over and climb onto it instead
+    e.b = 'run'; e.artGoal = f; e.timer = rand(5, 8); e.target = f.c.clone().addScaledVector(f.u, -f.h / 2 - 0.15); return;
+  }
+  if (!hidden.includes(e)) burst(e.centerPos(_v2), BRIGHT, 14, 0.6);
+  e.script = peekScript(e, f);
+}
+function peekScript(e, f) {
+  const eyeH = (e.hh + e.headY + 0.12 * e.hd) * e.size;
+  const bottom = f.c.clone().addScaledVector(f.u, -f.h / 2);
+  const inner = f.w / 2 - 0.05, yOver = f.h - eyeH + 0.035;
+  let side = Math.random() < 0.5 ? 1 : -1, T = 0;
+  const said = {};
+  e.state = 'script'; e.b = 'peek'; e.pop = 1; e.chat = null; e.chase = null; e.act = { side }; e.dazed = 0;
+  setClip(e, boxPlanes(f, 0.15), true);
+  const q = basisQuat(f.u, f.n, new THREE.Quaternion());
+  const put = (x, y) => { e.root.position.copy(bottom).addScaledVector(f.r, x).addScaledVector(f.u, y).addScaledVector(f.n, 0.045); e.root.quaternion.copy(q); };
+  return (dt) => {
+    T += dt;
+    let x = side * inner, y = 0.02, lean = 0;
+    if (T < 0.9) lean = easeIO(T / 0.9);
+    else if (T < 2.2) { lean = 1; if (!said.a) { said.a = 1; laugh(e, 4); } }
+    else if (T < 2.6) lean = 1 - easeIO((T - 2.2) / 0.4);
+    else if (T < 3.0) { if (!said.s) { said.s = 1; if (Math.random() < 0.6) { side = -side; e.act.side = side; } } x = side * inner; }
+    else if (T < 3.8) lean = easeIO((T - 3.0) / 0.8);
+    else if (T < 5.0) { lean = 1; if (!said.b) { said.b = 1; say(e, 'boo'); } }
+    else if (T < 5.4) lean = 1 - easeIO((T - 5.0) / 0.4);
+    else if (T < 6.6) { x = side * inner * (1 - easeIO((T - 5.4) / 0.5)); y = 0.02 + (yOver - 0.02) * easeIO((T - 5.4) / 1.2); }
+    else if (T < 7.6) { x = 0; y = yOver; if (!said.h) { said.h = 1; babble(e, 3, true); } }
+    else if (T < 8.4) { x = 0; y = yOver + (f.h - yOver) * easeIO((T - 7.6) / 0.8); }
+    else {
+      unclip(e); e.flipOverride = null; e.scriptLook = null;
+      e.state = 'ground'; e.p.copy(f.c).addScaledVector(f.u, f.h / 2 + 0.005).addScaledVector(f.n, 0.015);
+      e.n.copy(f.u); e.dir.copy(f.r).multiplyScalar(side); e.cb = 0; e.steepT = 0;
+      e.b = 'balance'; e.act = { f, sign: side }; e.timer = rand(4, 7); say(e, 'hup'); e.landT = 0.25;
+      return true;
+    }
+    e.flipOverride = { axis: 'z', a: -side * 0.5 * lean };
+    put(x, y);
+    return false;
+  };
+}
+
+// ================= a visitor knocking on the window =================
+function tryVisit() {
+  const wins = Room.features.filter(f => f.type === 'window');
+  if (!wins.length || visitors.length) return;
+  const f = pick(wins);
+  const v = new Elf(f.c, f.u, null, { muffled: true, shadow: false });
+  v.pop = 1; visitors.push(v);
+  // The "glass" sits a little into the room, so the visitor never sinks into the wall scan.
+  const glassD = 0.165;
+  setClip(v, boxPlanes(f, glassD).map(p => p.negate()), false, '#b4c8e6');
+  const glass = new THREE.Mesh(new THREE.PlaneGeometry(f.w, f.h), new THREE.MeshBasicMaterial({ map: glassTex, transparent: true, opacity: 0, depthWrite: false }));
+  glass.position.copy(f.c).addScaledVector(f.n, glassD); glass.quaternion.copy(basisQuat(f.u, f.n, new THREE.Quaternion())); glass.renderOrder = 4; scene.add(glass);
+  v.glass = glass; v.state = 'script'; v.script = visitScript(v, f, glass, glassD);
+}
+function visitScript(v, f, glass, glassD) {
+  const size = v.size, top = v.grabH * size, eye = (v.hh + v.headY + 0.12 * v.hd) * size;
+  const bottom = f.c.clone().addScaledVector(f.u, -f.h / 2);
+  const yHidden = -top - 0.03, yUp = -eye + 0.07;
+  const q = basisQuat(f.u, f.n, new THREE.Quaternion());
+  const x0 = rand(-0.2, 0.2) * f.w;
+  const knocks = [2.45, 2.8, 3.15]; let k = 0, T = 0, fog = null; const said = {};
+  const put = (y, d) => { v.root.position.copy(bottom).addScaledVector(f.r, x0).addScaledVector(f.u, y).addScaledVector(f.n, d); v.root.quaternion.copy(q); };
+  const onGlass = (p) => p.addScaledVector(f.n, f.n.dot(_v4.copy(f.c).addScaledVector(f.n, glassD - 0.002).sub(p)));
+  return (dt) => {
+    T += dt;
+    let y = yUp, d = 0.085, b = 'sillUp';
+    glass.material.opacity = 0.42 * clamp(T / 0.8, 0, 1) * clamp((9.2 - T) / 0.8, 0, 1);
+    if (T < 1.2) y = yHidden + (yUp - yHidden) * easeIO(T / 1.2);
+    else if (T < 2.3) { b = 'look'; if (!said.a) { said.a = 1; babble(v, 3, true); } }
+    else if (T < 3.5) {
+      b = 'knock';
+      if (k < 3 && T >= knocks[k]) {
+        k++; knock(v);
+        v.elR.getWorldPosition(_v1); _v1.addScaledVector(f.u, -0.03 * v.s);
+        addDecal(onGlass(_v1), f.n, ringTex, 0.015, 0.07, 0.5, 0.9, { order: 8 });
+      }
+    } else if (T < 4.1) { b = 'press'; d = 0.085 + 0.045 * easeIO((T - 3.5) / 0.6); v.squishZ = 1 - 0.15 * easeIO((T - 3.5) / 0.6); }
+    else if (T < 5.7) {
+      b = 'press'; d = 0.13;
+      if (!fog) { v.head.getWorldPosition(_v1); fog = addDecal(onGlass(_v1), f.n, softTex, 0.03, 0.1, 4, 0.55, { hold: 0.5, order: 8 }); }
+      if (!said.b) { said.b = 1; babble(v, 4, true); }
+      if (T > 4.9 && !said.l) { said.l = 1; laugh(v, 6); }
+    } else if (T < 7.1) { b = 'wave'; d = 0.13 - 0.045 * easeIO((T - 5.7) / 0.4); v.squishZ = 1; if (!said.w) { said.w = 1; say(v, 'hey'); } }
+    else if (T < 8.4) { b = 'wave'; y = yUp + (yHidden - yUp) * easeIO((T - 7.1) / 1.2); }
+    else if (T < 9.4) { y = yHidden; }
+    else { endVisit(v); return true; }
+    v.b = b; put(y, d);
+    return false;
+  };
+}
+function endVisit(v) {
+  if (v.glass) { scene.remove(v.glass); v.glass.geometry.dispose(); v.glass.material.dispose(); v.glass = null; }
+  const i = visitors.indexOf(v); if (i >= 0) visitors.splice(i, 1);
+  v.dispose();
+}
+
+// ================= the flying machine =================
+const Flyer = { active: false, group: null, prop: null, wings: [], flag: null, pilot: null, T: 0, inC: null, outC: null, heart: null, heartT: -1, heartFrom: new V3(), engine: null, said: {} };
+(function buildFlyer() {
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.08, 0.1, 16), toon('#c58b4a')));
+  for (let i = 0; i < 3; i++) { const band = new THREE.Mesh(new THREE.TorusGeometry(0.1 - i * 0.008, 0.006, 6, 24), toon('#8a5a2b')); band.rotation.x = Math.PI / 2; band.position.y = 0.04 - i * 0.035; g.add(band); }
+  for (const sx of [-1, 1]) { const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.28), toon('#8a5a2b')); pole.position.set(sx * 0.07, 0.17, 0); pole.rotation.z = -sx * 0.25; g.add(pole); }
+  const prop = new THREE.Group(); prop.position.y = 0.31; g.add(prop);
+  prop.add(new THREE.Mesh(new THREE.SphereGeometry(0.018, 10, 8), toon('#ffd23f')));
+  for (let i = 0; i < 3; i++) { const b = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.004, 0.035), toon(['#ff3d7f', '#3d8bff', '#7ae04a'][i])); b.position.x = 0.085; const h = new THREE.Group(); h.rotation.y = i * TAU / 3; h.add(b); prop.add(h); }
+  const wings = [];
+  for (const sx of [-1, 1]) {
+    const w = new THREE.Group(); w.position.set(sx * 0.1, 0.05, 0); g.add(w);
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.004, 0.09), toon('#fff2c9', true)); m.position.x = sx * 0.1; w.add(m);
+    for (let i = 0; i < 3; i++) { const rib = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.008, 0.09), toon('#8a5a2b')); rib.position.x = sx * (0.04 + i * 0.07); w.add(rib); }
+    wings.push(w);
+  }
+  const boom = new THREE.Mesh(new THREE.BoxGeometry(0.015, 0.015, 0.16), toon('#8a5a2b')); boom.position.set(0, 0.0, -0.17); g.add(boom);
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.004, 0.07, 0.05), toon('#ff3d7f')); fin.position.set(0, 0.035, -0.24); g.add(fin);
+  const flag = new THREE.Mesh(new THREE.PlaneGeometry(0.09, 0.04), new THREE.MeshBasicMaterial({ map: canvasTex(64, 32, (x) => { for (let i = 0; i < 8; i++) { x.fillStyle = i % 2 ? '#ffd23f' : '#ff3d7f'; x.fillRect(i * 8, 0, 8, 32); } }), side: THREE.DoubleSide }));
+  flag.position.set(0, 0.06, -0.3); flag.rotation.y = Math.PI / 2; g.add(flag);
+  g.visible = false; scene.add(g);
+  Object.assign(Flyer, { group: g, prop, wings, flag });
+})();
+function startFlyer() {
+  if (Flyer.active) return;
+  updateCamVectors();
+  const R = camRight.clone().setY(0).normalize(), F = camFwdH.clone(), H = camHead.clone();
+  const P = (r, f, y) => H.clone().addScaledVector(R, r).addScaledVector(F, f).addScaledVector(Y, y);
+  Flyer.inC = new THREE.CatmullRomCurve3([P(3.0, 1.8, 0.6), P(1.2, 1.5, 0.15), P(0, 0.75, -0.1)]);
+  Flyer.outC = new THREE.CatmullRomCurve3([P(0, 0.75, -0.1), P(-1.0, 1.2, 0.4), P(-3.4, 0.8, 1.4)]);
+  const pilot = new Elf(new V3(), Y, null, { shadow: false });
+  pilot.state = 'script'; pilot.b = 'pilot'; pilot.pop = 1; pilot.script = () => false;
+  scene.remove(pilot.root); Flyer.group.add(pilot.root); pilot.root.position.set(0, 0.0, -0.01); pilot.root.quaternion.identity();
+  Flyer.pilot = pilot; Flyer.T = 0; Flyer.said = {}; Flyer.active = true; Flyer.group.visible = true;
+  Flyer.group.position.copy(Flyer.inC.getPoint(0));
+  startEngine();
+}
+function startEngine() {
+  if (!AU.ctx) return;
+  const c = AU.ctx, pa = new THREE.PositionalAudio(AU.listener), mix = c.createGain(); mix.gain.value = 0.35;
+  pa.setNodeSource(mix); pa.setRefDistance(0.8); Flyer.group.add(pa);
+  const o = c.createOscillator(); o.type = 'square'; o.frequency.value = 42;
+  const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500;
+  const am = c.createGain(); am.gain.value = 0.5; const l = c.createOscillator(); l.frequency.value = 11; const lg = c.createGain(); lg.gain.value = 0.5;
+  l.connect(lg); lg.connect(am.gain); o.connect(lp); lp.connect(am); am.connect(mix);
+  const n = c.createBufferSource(); n.buffer = AU.noise; n.loop = true; const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1100; const ng = c.createGain(); ng.gain.value = 0.12;
+  n.connect(bp); bp.connect(ng); ng.connect(mix);
+  o.start(); l.start(); n.start();
+  Flyer.engine = { stop: () => { try { o.stop(); l.stop(); n.stop(); pa.disconnect(); } catch (e) {} Flyer.group.remove(pa); } };
+}
+function updateFlyer(dt, t) {
+  if (!Flyer.active) return;
+  const F = Flyer, g = F.group, pilot = F.pilot; F.T += dt;
+  const T = F.T, IN = 4.0, HOVER = 5.5, OUT = 3.6;
+  let pos, tan = null;
+  if (T < IN) { const u = easeIO(T / IN); pos = F.inC.getPoint(u); tan = F.inC.getTangent(u); }
+  else if (T < IN + HOVER) pos = F.inC.getPoint(1).addScaledVector(Y, Math.sin(t * 2.4) * 0.02);
+  else { const u = clamp((T - IN - HOVER) / OUT, 0, 1); pos = F.outC.getPoint(u * u); tan = F.outC.getTangent(Math.max(0.01, u * u)); }
+  g.position.copy(pos);
+  if (tan) { _v1.copy(tan).setY(0); if (_v1.lengthSq() > 1e-4) { basisQuat(Y, _v1.normalize(), _q1); g.quaternion.slerp(_q1, damp(4, dt)); } }
+  else { _v1.subVectors(camHead, g.position).setY(0); basisQuat(Y, _v1, _q1); g.quaternion.slerp(_q1, damp(3, dt)); }
+  F.prop.rotation.y += dt * 40;
+  const flap = Math.sin(t * 14) * 0.45; F.wings[0].rotation.z = flap; F.wings[1].rotation.z = -flap;
+  F.flag.rotation.x = Math.sin(t * 9) * 0.3;
+  if (Math.random() < dt * 5) burst(_v1.set(0, 0, -0.32).applyMatrix4(g.matrixWorld), ['#e8e8e8', '#cfcfcf'], 2, 0.1, -0.3);
+  // the blown kiss
+  pilot.act.lookCam = T > IN - 1.2;
+  if (T > IN + 0.5 && !F.said.prep) { F.said.prep = 1; pilot.b = 'kissPrep'; babble(pilot, 2); }
+  if (T > IN + 1.4 && !F.said.kiss) {
+    F.said.kiss = 1; pilot.b = 'kissThrow'; say(pilot, 'mwah');
+    pilot.elR.getWorldPosition(F.heartFrom);
+    F.heart = new THREE.Sprite(new THREE.SpriteMaterial({ map: heartTex, transparent: true, depthWrite: false })); F.heart.scale.setScalar(0.04); F.heart.position.copy(F.heartFrom); F.heart.renderOrder = 9; scene.add(F.heart);
+    F.heartT = 0;
+  }
+  if (T > IN + 3.4 && !F.said.wave) { F.said.wave = 1; pilot.b = 'pilotWave'; laugh(pilot, 5); }
+  if (T > IN + HOVER && !F.said.go) { F.said.go = 1; say(pilot, 'whee'); }
+  if (F.heart) {
+    F.heartT += dt; const u = clamp(F.heartT / 1.5, 0, 1);
+    _v2.copy(camHead).addScaledVector(camFwd, 0.14);
+    F.heart.position.copy(F.heartFrom).lerp(_v2, easeIO(u)).addScaledVector(Y, Math.sin(u * Math.PI) * 0.08);
+    F.heart.scale.setScalar(0.04 + 0.08 * u); F.heart.material.rotation = Math.sin(t * 6) * 0.2;
+    if (u >= 1) {
+      burst(F.heart.position, PINKS, 30, 0.6, 0.5);
+      if (AU.ctx) { tone(AU.master, now(), 0.12, 600, 1500, 0.3); shimmer(3, 0.06); }
+      scene.remove(F.heart); F.heart.material.dispose(); F.heart = null;
+    }
+  }
+  pilot.update(dt, t);
+  if (T > IN + HOVER + OUT) {
+    F.active = false; g.visible = false; if (F.engine) F.engine.stop(); F.engine = null;
+    pilot.dispose(); F.pilot = null;
+    if (F.heart) { scene.remove(F.heart); F.heart.material.dispose(); F.heart = null; }
+  }
 }
 
 // ================= the mushroom =================
-// A bolete with a little face. Grab it, bring it to your mouth, and four bites later the little people show up.
+// A bolete with a little face. Grab it, bring it to your mouth, and a few crunchy bites later the little people show up.
 const Mush = { group: null, wedges: [], stem: null, glow: null, state: 'hidden', key: null, bites: 0, biteT: 0, home: new V3(), eaten: 0, wait: 0, onset: -1, pop: 1 };
 (function buildMushroom() {
   const g = new THREE.Group(), capR = 0.05;
@@ -1040,8 +1881,7 @@ const Mush = { group: null, wedges: [], stem: null, glow: null, state: 'hidden',
     g.add(w); Mush.wedges.push(w);
   }
   const stem = new THREE.Group();
-  const stemMat = new THREE.MeshToonMaterial({ color: '#f3e2bb', gradientMap: grad });
-  const sm = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.03, 0.075, 16), stemMat); sm.position.y = -0.0375; stem.add(sm);
+  const sm = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.03, 0.075, 16), new THREE.MeshToonMaterial({ color: '#f3e2bb', gradientMap: grad })); sm.position.y = -0.0375; stem.add(sm);
   for (const sx of [-1, 1]) { const eye = new THREE.Mesh(GEO.sphere, mouthMat); eye.scale.setScalar(0.0045); eye.position.set(sx * 0.008, -0.022, 0.025); stem.add(eye); }
   const smile = new THREE.Mesh(new THREE.TorusGeometry(0.006, 0.0015, 4, 10, Math.PI), mouthMat); smile.position.set(0, -0.032, 0.027); smile.rotation.z = Math.PI; stem.add(smile);
   g.add(stem); Mush.stem = stem;
@@ -1052,41 +1892,31 @@ const Mush = { group: null, wedges: [], stem: null, glow: null, state: 'hidden',
 function placeMushroom() {
   const g = Mush.group;
   if (World.mode === 'mr') {
-    const fwd = new V3(0, 0, -1).applyQuaternion(camera.quaternion).setY(0);
-    if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
-    Mush.home.copy(camera.position).addScaledVector(fwd, 0.42); Mush.home.y = camera.position.y - 0.22;
+    updateCamVectors();
+    Mush.home.copy(camera.position).addScaledVector(camFwdH, 0.42); Mush.home.y = camera.position.y - 0.22;
   } else Mush.home.set(-0.9, 1.08, 0.6);
   g.position.copy(Mush.home); g.rotation.set(0, 0, 0);
   for (const w of Mush.wedges) w.visible = true;
   Mush.stem.visible = true; Mush.stem.scale.set(1, 1, 1); Mush.glow.visible = true;
   g.visible = true; Mush.state = 'float'; Mush.bites = 0; Mush.pop = 0; Mush.key = null;
-  if (AU.ctx) shimmerSmall();
-}
-function shimmerSmall() {
-  const c = AU.ctx, t = c.currentTime;
-  [1319, 1760, 2093].forEach((f, i) => { const o = c.createOscillator(), g = c.createGain(), s = t + i * 0.08;
-    g.gain.setValueAtTime(0.0001, s); g.gain.exponentialRampToValueAtTime(0.06, s + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, s + 0.6);
-    o.frequency.value = f; o.connect(g); g.connect(AU.master); o.start(s); o.stop(s + 0.7); });
+  if (AU.ctx) shimmer(3, 0.06);
 }
 const mouthPos = new V3();
 function updateMouthPos() {
-  const fwd = _v1.set(0, 0, -1).applyQuaternion(camera.quaternion), up = _v2.set(0, 1, 0).applyQuaternion(camera.quaternion);
-  mouthPos.copy(camera.position).addScaledVector(fwd, World.mode === 'mr' ? 0.13 : 0.3).addScaledVector(up, World.mode === 'mr' ? -0.07 : -0.05);
+  mouthPos.copy(camera.position).addScaledVector(camFwd, World.mode === 'mr' ? 0.13 : 0.3).addScaledVector(camUp, World.mode === 'mr' ? -0.07 : -0.05);
 }
-function startEating() {
-  Mush.state = 'eating'; Mush.bites = 0; Mush.biteT = 0.35; Mush.key = null; hideCard();
-}
+const nearMushroom = p => Mush.state === 'float' && p.distanceTo(Mush.group.position) < 0.12;
+function startEating() { Mush.state = 'eating'; Mush.bites = 0; Mush.biteT = 0.35; Mush.key = null; hideCard(); }
 function updateMushroom(dt, t, grabbers) {
   const g = Mush.group;
   if (Mush.pop < 1) Mush.pop = Math.min(1, Mush.pop + dt * 2);
-  const ps = Mush.pop >= 1 ? 1 : 1 + 2.7 * Math.pow(Mush.pop - 1, 3) + 1.7 * Math.pow(Mush.pop - 1, 2);
   switch (Mush.state) {
     case 'float': {
       g.position.copy(Mush.home); g.position.y += Math.sin(t * 1.6) * 0.02;
-      g.rotation.y += dt * 0.7; g.rotation.z = Math.sin(t * 1.1) * 0.12; g.scale.setScalar(ps);
+      g.rotation.y += dt * 0.7; g.rotation.z = Math.sin(t * 1.1) * 0.12; g.scale.setScalar(backOut(Mush.pop));
       Mush.glow.material.opacity = 0.35 + Math.sin(t * 3) * 0.12;
       if (Math.random() < dt * 6) burst(_v1.copy(g.position).add(_v2.set(rand(-0.06, 0.06), rand(-0.04, 0.05), rand(-0.06, 0.06))), ['#fff1b0', '#ffd23f', '#ffffff'], 1, 0.08, 0.05);
-      for (const gr of grabbers) if (gr.grip && gr.p.distanceTo(g.position) < 0.1) { Mush.state = 'held'; Mush.key = gr.key; hideCard(); if (AU.ctx) shimmerSmall(); break; }
+      if (!Mark.active) for (const gr of grabbers) if (gr.grip && gr.p.distanceTo(g.position) < 0.1 && !Grab.held[gr.key]) { Mush.state = 'held'; Mush.key = gr.key; hideCard(); if (AU.ctx) shimmer(3, 0.06); break; }
       break;
     }
     case 'held': {
@@ -1099,45 +1929,286 @@ function updateMushroom(dt, t, grabbers) {
     }
     case 'eating': {
       Mush.biteT -= dt;
-      const lunge = Math.max(0, Mush.biteT - 0.4) / 0.15;   // little jolt toward the mouth on each bite
+      const lunge = Math.max(0, Mush.biteT - 0.4) / 0.15;
       g.position.lerp(mouthPos, damp(10, dt)); g.scale.setScalar(1 - 0.12 * lunge);
       g.rotation.y += dt * 1.5;
       if (Mush.biteT <= 0) {
         Mush.biteT = 0.55;
-        const at = _v3.copy(g.position);
-        if (AU.ctx) { const tt = AU.ctx.currentTime; chomp(tt); chomp(tt + 0.25); }
+        if (AU.ctx) { const tt = now(); chomp(tt); chomp(tt + 0.25); }
         if (Mush.bites < 4) Mush.wedges[Mush.bites].visible = false;
         else if (Mush.bites === 4) Mush.stem.scale.set(1, 0.45, 1);
         else { Mush.stem.visible = false; Mush.glow.visible = false; }
-        burst(at, CRUMBS, 12, 0.35, 3);
+        burst(g.position, CRUMBS, 12, 0.35, 3);
         Mush.bites++;
-        if (Mush.bites > 5) {
-          g.visible = false; Mush.state = 'gone'; Mush.onset = 1.6;
-          if (AU.ctx) gulp(AU.ctx.currentTime + 0.1);
-        }
+        if (Mush.bites > 5) { g.visible = false; Mush.state = 'gone'; Mush.onset = 1.6; if (AU.ctx) gulp(now() + 0.1); }
       }
       break;
     }
-    case 'gone': {
+    case 'gone':
       if (Mush.onset > 0) {
         Mush.onset -= dt;
-        if (Mush.onset <= 0) {     // here they come
+        if (Mush.onset <= 0) {
           startScan(World.mode === 'mr' ? camera.position : controls.target);
           if (AU.ctx) shimmer();
           Spawn.queue += Mush.eaten === 0 ? FIRST_BATCH : NEXT_BATCH; Spawn.t = 1.2;
-          Mush.eaten++; Mush.wait = 40; onAte();
+          if (Mush.eaten === 0) Object.assign(Dir, { chase: 12, peek: 14, visit: 26, fly: 60 });
+          Mush.eaten++; Mush.wait = 45; onAte();
         }
       } else if (Spawn.queue === 0 && elves.length <= MAX_ELVES - 2) {
         Mush.wait -= dt;
         if (Mush.wait <= 0) placeMushroom();
       }
       break;
+  }
+}
+const Spawn = { queue: 0, t: 0 };
+function updateSpawner(dt) {
+  if (Spawn.queue <= 0 || !Room.collider) return;
+  Spawn.t -= dt;
+  if (Spawn.t <= 0) { Spawn.t = rand(0.35, 0.7); Spawn.queue--; addElf(); if (Spawn.queue === 0) onBatchDone(); }
+}
+// The little world's schedule: chases, peeks, window visits and the flying machine every so often.
+const Dir = { chase: 12, peek: 14, visit: 26, fly: 60 };
+function director(dt) {
+  directChats(dt);
+  updateChases(dt);
+  if (!elves.length || Mush.eaten === 0) return;
+  Dir.chase -= dt; if (Dir.chase <= 0) { Dir.chase = rand(12, 22); tryChase(); }
+  Dir.peek -= dt; if (Dir.peek <= 0) { Dir.peek = rand(22, 38); tryPeek(); }
+  Dir.visit -= dt; if (Dir.visit <= 0) { Dir.visit = rand(45, 75); tryVisit(); }
+  Dir.fly -= dt; if (Dir.fly <= 0) { Dir.fly = rand(150, 220); startFlyer(); }
+}
+
+// ================= hands: grabbing, throwing, poking, tickling, palm rides =================
+const HS = [0, 1].map(() => ({ valid: false, palm: new V3(), dir: new V3(), fwd: new V3(), wrist: new V3(), prev: new V3(), vel: new V3(), speedS: 0, side: 1, upT: 0, faceT: 0, rider: null, coming: null, tip: new V3(), grip: false, grabP: new V3() }));
+const Grab = { prev: {}, hist: {}, held: {}, pos: {}, isHeld: e => Object.values(Grab.held).includes(e) };
+const _a = new V3(), _b = new V3(), _c = new V3();
+function readHands(dt) {
+  hands.forEach((h, i) => {
+    const s = HS[i], j = h.joints;
+    const w = j && j['wrist'], im = j && j['index-finger-metacarpal'], pm = j && j['pinky-finger-metacarpal'], mm = j && j['middle-finger-metacarpal'];
+    const it = j && j['index-finger-tip'], tt = j && j['thumb-tip'], mt = j && j['middle-finger-tip'];
+    if (!w || !im || !pm || !mm || !it || !tt || !w.visible || !it.visible) { s.valid = false; s.upT = s.faceT = 0; return; }
+    const src = ctrls[i].userData.src, handed = src && src.handedness ? src.handedness : (i === 0 ? 'left' : 'right');
+    s.side = handed === 'right' ? 1 : -1;
+    w.getWorldPosition(s.wrist); im.getWorldPosition(_a); pm.getWorldPosition(_b); mm.getWorldPosition(_c);
+    s.dir.crossVectors(_a.sub(s.wrist), _b.sub(s.wrist)).normalize().multiplyScalar(s.side);
+    s.fwd.copy(_c).sub(s.wrist).normalize();
+    const was = s.valid; s.palm.copy(s.wrist).lerp(_c, 0.6);
+    if (was) { s.vel.subVectors(s.palm, s.prev).divideScalar(Math.max(dt, 1e-3)); s.speedS += (s.vel.length() - s.speedS) * damp(8, dt); } else { s.vel.set(0, 0, 0); s.speedS = 0; }
+    s.prev.copy(s.palm); s.valid = true;
+    it.getWorldPosition(s.tip); tt.getWorldPosition(_a);
+    const pinch = s.tip.distanceTo(_a) < 0.035;
+    let fist = false;
+    if (mt && mt.visible) { mt.getWorldPosition(_b); fist = _b.distanceTo(s.wrist) < 0.105; }
+    s.grip = pinch || fist;
+    if (fist) s.grabP.copy(_c).lerp(s.wrist, 0.3); else s.grabP.copy(s.tip).add(_a).multiplyScalar(0.5);
+    s.upT = s.dir.y > 0.8 && s.speedS < 0.3 && !s.grip ? s.upT + dt : 0;
+    _b.subVectors(camHead, s.palm); const dh = _b.length(); _b.normalize();
+    s.faceT = s.side < 0 && s.dir.dot(_b) > 0.65 && s.dir.y < 0.6 && dh < 0.65 ? s.faceT + dt : 0;
+  });
+}
+function readGrabbers(xr) {
+  const out = [];
+  if (xr) {
+    HS.forEach((s, i) => { if (s.valid) out.push({ key: 'h' + i, grip: s.grip, p: s.grabP.clone(), tip: s.tip.clone() }); });
+    ctrls.forEach((c, i) => {
+      const s = c.userData.src; if (!s || s.hand) return;
+      const p = c.getWorldPosition(new V3());
+      out.push({ key: 'c' + i, grip: c.userData.grip, p, tip: p.clone() });
+    });
+  } else if (Mouse.active) {
+    out.push({ key: 'm', grip: Mouse.grip, p: Mouse.p.clone(), tip: Mouse.p.clone() });
+    if (!Mouse.grip) Mouse.active = false;
+  }
+  for (const g of out) {
+    const h = Grab.hist[g.key] || (Grab.hist[g.key] = []);
+    h.push({ p: g.p.clone(), tip: g.tip.clone(), t: performance.now() / 1000 }); while (h.length > 12) h.shift();
+    g.rise = g.grip && !Grab.prev[g.key]; Grab.prev[g.key] = g.grip;
+  }
+  return out;
+}
+function velOf(key, which = 'p', win = 0.1) {
+  const h = Grab.hist[key]; if (!h || h.length < 2) return new V3();
+  const a = h[h.length - 1]; let b = h[0];
+  for (let i = h.length - 2; i >= 0; i--) { b = h[i]; if (a.t - h[i].t >= win) break; }
+  const dtt = a.t - b.t; return dtt > 1e-3 ? a[which].clone().sub(b[which]).divideScalar(dtt) : new V3();
+}
+function updateGrabs(grabbers) {
+  const present = new Set(grabbers.map(g => g.key));
+  for (const g of grabbers) {
+    Grab.pos[g.key] = g.p;
+    if (g.rise && !Mark.active && !Menu.visible && !nearMushroom(g.p) && Mush.key !== g.key && !Grab.held[g.key]) {
+      let best = null, bd = 0.11;
+      for (const e of elves) {
+        if (!e.grabbable() || Grab.isHeld(e)) continue;
+        const d = Math.min(e.headPos(_v1).distanceTo(g.p), e.centerPos(_v2).distanceTo(g.p));
+        if (d < bd) { bd = d; best = e; }
+      }
+      if (best) { Grab.held[g.key] = best; best.grab(g.key); }
+    }
+    if (!g.grip && Grab.held[g.key]) { const e = Grab.held[g.key]; delete Grab.held[g.key]; e.release(g.key === 'm' && Mouse.throwV ? Mouse.throwV.clone().multiplyScalar(1.4) : velOf(g.key).multiplyScalar(1.1)); }
+  }
+  for (const k in Grab.held) if (!present.has(k)) { const e = Grab.held[k]; delete Grab.held[k]; e.release(new V3()); }
+  for (const k in Grab.pos) if (!present.has(k)) delete Grab.pos[k];
+}
+// A quick jab is a poke (they flip away). A slow finger resting on them is a tickle.
+function updatePokes(grabbers, dt) {
+  for (const g of grabbers) {
+    if (g.grip || g.key === 'm' || Grab.held[g.key]) continue;
+    const sp = velOf(g.key, 'tip', 0.06).length();
+    for (const e of elves) {
+      if (e.state !== 'ground' || e.pop < 1) continue;
+      const d = g.tip.distanceTo(e.centerPos(_v3));
+      if (d < 0.075) { if (sp > 0.35) e.poke(g.tip); else { e.tickle += dt; if (e.tickle > 0.35) { e.tickle = 0; e.tickled(); } } }
+      else e.tickle = Math.max(0, e.tickle - dt);
     }
   }
 }
+// Hold a hand flat, palm up, and keep it still: someone runs over and hops on.
+function updateInvites() {
+  HS.forEach((h, i) => {
+    if (!h.valid || h.rider || h.grip) return;
+    if (h.coming && (h.coming.come !== i || !elves.includes(h.coming))) h.coming = null;
+    if (h.upT > 0.9 && !h.coming) {
+      let best = null, bd = 3.5;
+      for (const e of elves) { if (!e.free() || Math.abs(e.n.y) < 0.75) continue; const d = Math.hypot(e.p.x - h.palm.x, e.p.z - h.palm.z); if (d < bd) { bd = d; best = e; } }
+      if (best) { h.coming = best; best.come = i; best.b = 'come'; best.timer = 5; best.chat = null; say(best, 'hey'); }
+    }
+  });
+}
+
+// ================= wrist menu & marking pictures and windows =================
+// Turn your left palm toward your face for a little menu; poke a button with your right index finger.
+function buttonTex(label, hot) {
+  return canvasTex(256, 112, (x, w, h) => {
+    x.fillStyle = hot ? '#ff3d7f' : '#ffd23f'; x.beginPath(); x.roundRect(4, 4, w - 8, h - 8, 40); x.fill();
+    x.fillStyle = hot ? '#ffffff' : '#2b2140'; x.font = '700 40px Fredoka, system-ui, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.fillText(label, w / 2, h / 2 + 2);
+  });
+}
+const Menu = { group: new THREE.Group(), buttons: [], visible: false, hideT: 0, cool: 0 };
+(function buildMenu() {
+  const g = Menu.group;
+  const bg = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 0.135), new THREE.MeshBasicMaterial({ map: canvasTex(400, 270, (x, w, h) => {
+    x.fillStyle = 'rgba(255,253,248,.95)'; x.beginPath(); x.roundRect(4, 4, w - 8, h - 8, 36); x.fill();
+    x.fillStyle = '#ff3d7f'; x.font = '700 38px Fredoka, system-ui, sans-serif'; x.textAlign = 'center'; x.fillText('Little Elves', w / 2, 52);
+  }), transparent: true, depthTest: false }));
+  bg.renderOrder = 110; g.add(bg);
+  [['art', 'Picture', -0.047, 0.006], ['window', 'Window', 0.047, 0.006], ['mush', 'Mushroom', -0.047, -0.04], ['forget', 'Clear marks', 0.047, -0.04]].forEach(([id, label, x, y]) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(0.088, 0.039), new THREE.MeshBasicMaterial({ map: buttonTex(label, false), transparent: true, depthTest: false }));
+    m.position.set(x, y, 0.001); m.renderOrder = 111; g.add(m);
+    Menu.buttons.push({ id, label, mesh: m, x, y, hot: 0 });
+  });
+  g.visible = false; scene.add(g);
+})();
+function updateMenu(dt) {
+  Menu.cool -= dt;
+  const L = HS.find(h => h.valid && h.side < 0);
+  let show = false, poker = null;
+  if (L && L.faceT > 0.25 && !Mark.active) {
+    show = true; Menu.group.position.copy(L.palm).addScaledVector(L.dir, 0.05).addScaledVector(camUp, 0.07);
+    const R = HS.find(h => h.valid && h.side > 0); poker = R ? R.tip : null;
+  } else {
+    const lc = ctrls.find(c => c.userData.src && !c.userData.src.hand && c.userData.src.handedness === 'left');
+    if (lc && !Mark.active) {
+      const p = lc.getWorldPosition(_v1);
+      if (p.distanceTo(camHead) < 0.42) {
+        show = true; Menu.group.position.copy(p).addScaledVector(camUp, 0.1);
+        const rcn = ctrls.find(c => c.userData.src && !c.userData.src.hand && c.userData.src.handedness === 'right'); poker = rcn ? rcn.getWorldPosition(new V3()) : null;
+      }
+    }
+  }
+  Menu.hideT = show ? 0 : Menu.hideT + dt;
+  Menu.visible = show || (Menu.visible && Menu.hideT < 0.3);
+  Menu.group.visible = Menu.visible;
+  if (!Menu.visible) return;
+  Menu.group.lookAt(camHead);
+  for (const b of Menu.buttons) { if (b.hot > 0) { b.hot -= dt; if (b.hot <= 0) { b.mesh.material.map.dispose(); b.mesh.material.map = buttonTex(b.label, false); } } }
+  if (!poker || Menu.cool > 0) return;
+  _v2.copy(poker); Menu.group.worldToLocal(_v2);
+  for (const b of Menu.buttons) {
+    if (Math.abs(_v2.x - b.x) < 0.044 && Math.abs(_v2.y - b.y) < 0.02 && _v2.z < 0.015 && _v2.z > -0.03) {
+      Menu.cool = 0.8; click();
+      b.mesh.material.map.dispose(); b.mesh.material.map = buttonTex(b.label, true); b.hot = 0.35;
+      menuAction(b.id); break;
+    }
+  }
+}
+function menuAction(id) {
+  if (id === 'art' || id === 'window') startMark(id);
+  else if (id === 'mush') { if (Mush.state === 'hidden' || Mush.state === 'gone') { Mush.onset = -1; placeMushroom(); } }
+  else if (id === 'forget') {
+    Room.features = Room.features.filter(f => f.src !== 'mark'); saveMarks(); buildRoomGeo();
+    showCard(['Marks cleared'], 2);
+  }
+}
+const Mark = { active: false, type: '', step: 0, p1: null, n1: null, ctrl: null, hit: null, line: null, reticle: null, flashT: 0 };
+(function buildMarkVisuals() {
+  Mark.reticle = new THREE.Mesh(new THREE.RingGeometry(0.012, 0.018, 24), new THREE.MeshBasicMaterial({ color: '#ff3d7f', depthTest: false, side: THREE.DoubleSide }));
+  Mark.reticle.renderOrder = 120; Mark.reticle.visible = false; scene.add(Mark.reticle);
+  Mark.line = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(), new V3(), new V3()]), new THREE.LineBasicMaterial({ color: '#ff3d7f', depthTest: false, transparent: true }));
+  Mark.line.renderOrder = 120; Mark.line.visible = false; Mark.line.frustumCulled = false; scene.add(Mark.line);
+})();
+function startMark(type) {
+  Mark.active = true; Mark.type = type; Mark.step = 0; Mark.hit = null;
+  Mark.ctrl = ctrls.find(c => c.userData.src && c.userData.src.handedness === 'right') || ctrls.find(c => c.userData.src) || null;
+  showCard([type === 'art' ? 'Mark a picture' : 'Mark a window', 'Point at its top-left corner and pinch,', 'then at its bottom-right corner and pinch.'], 9999);
+}
+function rectCorners(p1, p2, n) {
+  const u = wallUp(n, new V3()), r = new V3().crossVectors(u, n).normalize(), d = p2.clone().sub(p1);
+  const du = u.clone().multiplyScalar(d.dot(u)), dr = r.clone().multiplyScalar(d.dot(r));
+  return [p1.clone(), p1.clone().add(dr), p1.clone().add(dr).add(du), p1.clone().add(du)];
+}
+function updateMark(dt) {
+  if (Mark.flashT > 0) { Mark.flashT -= dt; Mark.line.material.opacity = clamp(Mark.flashT, 0, 1); Mark.line.material.color.setHSL((performance.now() / 600) % 1, 0.9, 0.6); if (Mark.flashT <= 0) Mark.line.visible = false; }
+  if (!Mark.active || !Mark.ctrl) { Mark.reticle.visible = false; return; }
+  const c = Mark.ctrl, o = c.getWorldPosition(new V3()), d = new V3(0, 0, -1).applyQuaternion(c.getWorldQuaternion(new THREE.Quaternion()));
+  let hit = null;
+  if (Mark.step === 0) { const h = cast(o, d, 8); if (h && Math.abs(h.n.y) < 0.5) hit = { p: h.p, n: h.n }; }
+  else { const pl = new THREE.Plane().setFromNormalAndCoplanarPoint(Mark.n1, Mark.p1), p = new V3(); if (new THREE.Ray(o, d).intersectPlane(pl, p)) hit = { p, n: Mark.n1 }; }
+  Mark.hit = hit;
+  Mark.reticle.visible = !!hit;
+  if (hit) { Mark.reticle.position.copy(hit.p).addScaledVector(hit.n, 0.005); Mark.reticle.quaternion.setFromUnitVectors(ZAX, hit.n); }
+  if (Mark.step === 1 && hit) {
+    const cs = rectCorners(Mark.p1, hit.p, Mark.n1).map(p => p.addScaledVector(Mark.n1, 0.006));
+    Mark.line.geometry.setFromPoints(cs); Mark.line.visible = true; Mark.line.material.opacity = 1; Mark.line.material.color.set('#ff3d7f');
+  }
+}
+function onSelect(i) {
+  if (!Mark.active || ctrls[i] !== Mark.ctrl || !Mark.hit) return;
+  if (Mark.step === 0) {
+    Mark.p1 = Mark.hit.p.clone(); Mark.n1 = Mark.hit.n.clone();
+    if (Mark.n1.dot(_v1.subVectors(camHead, Mark.p1)) < 0) Mark.n1.negate();
+    Mark.step = 1; click();
+    showCard(['Now the bottom-right corner', 'Point at it and pinch.'], 9999);
+  } else {
+    const cs = rectCorners(Mark.p1, Mark.hit.p, Mark.n1), w = cs[0].distanceTo(cs[1]), h = cs[0].distanceTo(cs[3]);
+    if (w < 0.1 || h < 0.1) { showCard(['That one is too small', 'Try again: top-left corner first.'], 4); Mark.step = 0; Mark.line.visible = false; return; }
+    const c = cs[0].clone().add(cs[2]).multiplyScalar(0.5);
+    Room.features.push(makeFeature(Mark.type, c, Mark.n1, w, h, 'mark'));
+    saveMarks(); if (Mark.type === 'art') buildRoomGeo();
+    Mark.active = false; Mark.flashT = 2.5; click(); if (AU.ctx) shimmer(4, 0.06);
+    showCard(['Got it!', Mark.type === 'art' ? 'Keep an eye on that picture...' : 'Keep an eye on that window...'], 4);
+    if (Mark.type === 'art') Dir.peek = Math.min(Dir.peek, 4); else Dir.visit = Math.min(Dir.visit, 5);
+  }
+}
+// Marks are saved relative to the room scan itself, so they line up again next time even if you start somewhere else.
+const MARK_KEY = 'little-elves-marks-v1';
+function saveMarks() {
+  if (!Room.anchor) return;
+  const inv = Room.anchor.clone().invert();
+  const data = Room.features.filter(f => f.src === 'mark').map(f => ({ type: f.type, c: f.c.clone().applyMatrix4(inv).toArray(), n: f.n.clone().transformDirection(inv).toArray(), w: f.w, h: f.h }));
+  try { localStorage.setItem(MARK_KEY, JSON.stringify(data)); } catch (e) {}
+}
+function loadMarks() {
+  if (!Room.anchor) return [];
+  let d = []; try { d = JSON.parse(localStorage.getItem(MARK_KEY) || '[]'); } catch (e) {}
+  return d.map(m => makeFeature(m.type, new V3().fromArray(m.c).applyMatrix4(Room.anchor), new V3().fromArray(m.n).transformDirection(Room.anchor), m.w, m.h, 'mark'));
+}
 
 // ================= floating text card in the headset =================
-const Card = { mesh: null, tex: null, life: 0, fade: 0 };
+const Card = { mesh: null, life: 0, fade: 0 };
 function showCard(lines, secs = 9999) {
   const c = document.createElement('canvas'); c.width = 1024; c.height = 120 + lines.length * 62;
   const x = c.getContext('2d');
@@ -1151,8 +2222,8 @@ function showCard(lines, secs = 9999) {
   const w = 0.44, h = w * c.height / c.width;
   Card.mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false }));
   Card.mesh.renderOrder = 100; scene.add(Card.mesh);
-  const fwd = new V3(0, 0, -1).applyQuaternion(camera.quaternion).setY(0); if (fwd.lengthSq() < 1e-4) fwd.set(0, 0, -1); fwd.normalize();
-  Card.mesh.position.copy(camera.position).addScaledVector(fwd, 0.8); Card.mesh.position.y += 0.08;
+  updateCamVectors();
+  Card.mesh.position.copy(camera.position).addScaledVector(camFwdH, 0.8); Card.mesh.position.y += 0.08;
   Card.mesh.lookAt(camera.position);
   Card.life = secs; Card.fade = 1; Card.mesh.visible = World.mode === 'mr';
 }
@@ -1168,64 +2239,97 @@ const World = { mode: 'preview', t0: 0, frames: 0, placed: false, noRoom: false 
 const hintEl = document.getElementById('hint'), noteEl = document.getElementById('note');
 const mrBtn = document.getElementById('mr'), addBtn = document.getElementById('add');
 function onAte() {
-  if (World.mode === 'preview') { hintEl.textContent = 'Click a little person to poke them. Click the floor or furniture to add one. Drag to look around.'; addBtn.hidden = false; }
+  if (World.mode === 'preview') { hintEl.textContent = 'Drag a little person to pick them up and throw them. Click one to poke it, or click the floor to add one. Drag empty space to look around.'; addBtn.hidden = false; }
 }
 function onBatchDone() {
-  if (World.mode === 'mr' && Mush.eaten === 1) showCard(['Poke them!', 'Tap a little person with your finger.', 'Another mushroom floats by in a bit.'], 8);
+  if (World.mode === 'mr' && Mush.eaten === 1) showCard(['Pick them up!', 'Pinch one to grab it, then throw.', 'Hold your palm up and still: one hops on.', 'Left palm to your face: menu.'], 10);
+}
+function resetWorld() {
+  for (const e of [...elves]) removeElf(e);
+  for (const v of [...visitors]) endVisit(v);
+  if (Flyer.active) { Flyer.T = 1e9; updateFlyer(0, 0); }
+  chats.length = 0; chases.length = 0; Spawn.queue = 0; Mush.state = 'hidden'; Mush.group.visible = false; Mush.eaten = 0; Mush.onset = -1;
+  for (const k in Grab.held) delete Grab.held[k];
+  HS.forEach(h => { h.rider = null; h.coming = null; });
+  Scan.t = -1; hideCard(); if (Card.mesh) Card.mesh.visible = false; Mark.active = false;
 }
 function enterWorld(mode) {
   World.mode = mode;
-  for (const e of [...elves]) removeElf(e);
-  chats.length = 0; Spawn.queue = 0; Mush.state = 'hidden'; Mush.group.visible = false; Mush.eaten = 0; Mush.onset = -1;
-  Scan.t = -1; hideCard(); if (Card.mesh) Card.mesh.visible = false;
+  resetWorld();
   if (mode === 'mr') {
     scene.background = null; renderer.setClearColor(0x000000, 0);
     clearRoom(); Room.sig = ''; World.t0 = performance.now(); World.frames = 0; World.placed = false; World.noRoom = false;
   } else {
     scene.background = PREVIEW_BG;
     setRoom(preview.geo, 'preview', preview.group);
+    Room.features = preview.features.slice(); buildRoomGeo();
     placeMushroom(); addBtn.hidden = true;
     hintEl.textContent = 'A funny mushroom is floating over the table. Click it to eat it.';
   }
 }
-
-// Read the room scan the Quest made in Space Setup (the global room mesh plus furniture blocks).
+// Read the room scan the Quest made in Space Setup, plus any pictures and windows it labeled.
+const ART_RE = /art|picture|painting|poster/i, WIN_RE = /window/i;
 function readRoom(frame) {
   const ref = renderer.xr.getReferenceSpace(); if (!ref) return;
   const meshes = frame.detectedMeshes, planes = frame.detectedPlanes;
-  const useMeshes = !!(meshes && meshes.size);
-  const set = useMeshes ? meshes : (planes && planes.size ? planes : null);
-  if (!set) return;
-  let sig = useMeshes ? 'm' : 'p';
-  for (const x of set) sig += (x.lastChangedTime | 0) + ':' + (useMeshes ? x.vertices.length : x.polygon.length) + ';';
+  const useMeshes = !!(meshes && meshes.size), hasPlanes = !!(planes && planes.size);
+  if (!useMeshes && !hasPlanes) return;
+  let sig = '';
+  if (useMeshes) for (const x of meshes) sig += 'm' + (x.lastChangedTime | 0) + ':' + x.vertices.length + ';';
+  if (hasPlanes) for (const x of planes) sig += 'p' + (x.lastChangedTime | 0) + ':' + x.polygon.length + ';';
   if (sig === Room.sig) return;
-  const now = performance.now();
-  if (now - Room.builtAt < 2000 && (Room.kind === 'mesh' || Room.kind === 'planes')) return;
-  const pos = [], idx = [], m = new THREE.Matrix4(), v = new V3(), pn = new V3(), a = new V3(), b = new V3(), c = new V3();
-  for (const x of set) {
-    const pose = frame.getPose(useMeshes ? x.meshSpace : x.planeSpace, ref);
-    if (!pose) return;   // not ready yet; try again later
+  const t = performance.now();
+  if (t - Room.builtAt < 2000 && (Room.kind === 'mesh' || Room.kind === 'planes')) return;
+  const pos = [], idx = [], feats = [], m = new THREE.Matrix4(), v = new V3(), pn = new V3(), a = new V3(), b = new V3(), c = new V3();
+  let anchor = null, anchorSize = -1;
+  const featureFrom = (label, mat, xs, ys, zs, flatAxis) => {
+    const type = WIN_RE.test(label) ? 'window' : ART_RE.test(label) ? 'art' : null; if (!type) return;
+    const lo = [Math.min(...xs), Math.min(...ys), Math.min(...zs)], hi = [Math.max(...xs), Math.max(...ys), Math.max(...zs)];
+    const ext = hi.map((h, i) => h - lo[i]);
+    const ax = flatAxis != null ? flatAxis : ext.indexOf(Math.min(...ext));
+    const center = new V3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2).applyMatrix4(mat);
+    const n = new V3().setComponent(ax, 1).transformDirection(mat);
+    if (Math.abs(n.y) > 0.5) return;
+    const others = [0, 1, 2].filter(i => i !== ax), dirs = others.map(i => new V3().setComponent(i, 1).transformDirection(mat));
+    const upI = Math.abs(dirs[0].y) > Math.abs(dirs[1].y) ? 0 : 1;
+    if (n.dot(_v1.subVectors(camHead, center)) < 0) n.negate();
+    feats.push(makeFeature(type, center, n, ext[others[1 - upI]], ext[others[upI]], 'scan'));
+  };
+  if (useMeshes) for (const x of meshes) {
+    const pose = frame.getPose(x.meshSpace, ref); if (!pose) return;
     m.fromArray(pose.transform.matrix);
+    const V = x.vertices, I = x.indices, base = pos.length / 3;
+    for (let i = 0; i < V.length; i += 3) { v.set(V[i], V[i + 1], V[i + 2]).applyMatrix4(m); pos.push(v.x, v.y, v.z); }
+    for (let i = 0; i < I.length; i++) idx.push(base + I[i]);
+    if (V.length > anchorSize) { anchorSize = V.length; anchor = m.clone(); }
+    if (x.semanticLabel && V.length < 3000) {
+      const xs = [], ys = [], zs = []; for (let i = 0; i < V.length; i += 3) { xs.push(V[i]); ys.push(V[i + 1]); zs.push(V[i + 2]); }
+      featureFrom(x.semanticLabel, m, xs, ys, zs, null);
+    }
+  }
+  if (hasPlanes) for (const x of planes) {
+    const pose = frame.getPose(x.planeSpace, ref); if (!pose) return;
+    m.fromArray(pose.transform.matrix);
+    const poly = x.polygon; if (poly.length < 3) continue;
+    if (x.semanticLabel) featureFrom(x.semanticLabel, m, poly.map(p => p.x), poly.map(() => 0), poly.map(p => p.z), 1);
+    if (!anchor && /floor/i.test(x.semanticLabel || '')) anchor = m.clone();
+    if (useMeshes) continue;
     const base = pos.length / 3;
-    if (useMeshes) {
-      const V = x.vertices, I = x.indices;
-      for (let i = 0; i < V.length; i += 3) { v.set(V[i], V[i + 1], V[i + 2]).applyMatrix4(m); pos.push(v.x, v.y, v.z); }
-      for (let i = 0; i < I.length; i++) idx.push(base + I[i]);
-    } else {
-      const poly = x.polygon; if (poly.length < 3) continue;
-      for (const p of poly) { v.set(p.x, p.y, p.z).applyMatrix4(m); pos.push(v.x, v.y, v.z); }
-      pn.set(0, 1, 0).transformDirection(m);
-      for (let i = 1; i < poly.length - 1; i++) {
-        a.fromArray(pos, base * 3); b.fromArray(pos, (base + i) * 3); c.fromArray(pos, (base + i + 1) * 3);
-        const flipIt = b.sub(a).cross(c.sub(a)).dot(pn) < 0;
-        idx.push(base, flipIt ? base + i + 1 : base + i, flipIt ? base + i : base + i + 1);
-      }
+    for (const p of poly) { v.set(p.x, p.y, p.z).applyMatrix4(m); pos.push(v.x, v.y, v.z); }
+    pn.set(0, 1, 0).transformDirection(m);
+    for (let i = 1; i < poly.length - 1; i++) {
+      a.fromArray(pos, base * 3); b.fromArray(pos, (base + i) * 3); c.fromArray(pos, (base + i + 1) * 3);
+      const flipIt = b.sub(a).cross(c.sub(a)).dot(pn) < 0;
+      idx.push(base, flipIt ? base + i + 1 : base + i, flipIt ? base + i : base + i + 1);
     }
   }
   if (!idx.length) return;
   Room.sig = sig;
   setRoom(geoFrom(pos, idx), useMeshes ? 'mesh' : 'planes');
-  Room.builtAt = now;
+  Room.anchor = anchor;
+  Room.features = [...feats, ...loadMarks()];
+  if (Room.features.length) buildRoomGeo();
+  Room.builtAt = t;
 }
 
 // ================= input =================
@@ -1233,48 +2337,55 @@ const ctrls = [0, 1].map(i => {
   const c = renderer.xr.getController(i); c.userData.grip = false; c.userData.src = null;
   c.addEventListener('connected', ev => { c.userData.src = ev.data; });
   c.addEventListener('disconnected', () => { c.userData.src = null; c.userData.grip = false; });
-  for (const [ev, on] of [['selectstart', true], ['selectend', false], ['squeezestart', true], ['squeezeend', false]]) c.addEventListener(ev, () => { c.userData.grip = on; });
+  for (const [ev, on] of [['selectstart', true], ['selectend', false], ['squeezestart', true], ['squeezeend', false]]) c.addEventListener(ev, () => { c.userData.grip = Mark.active ? false : on; });
+  c.addEventListener('selectstart', () => onSelect(i));
   scene.add(c); return c;
 });
 const hands = [0, 1].map(i => { const h = renderer.xr.getHand(i); scene.add(h); return h; });
-function readGrabbers() {
-  const out = [];
-  hands.forEach((h, i) => {
-    const j = h.joints, it = j && j['index-finger-tip'], tt = j && j['thumb-tip'];
-    if (!it || !tt || !it.visible) return;
-    const ip = it.getWorldPosition(new V3()), tp = tt.getWorldPosition(new V3());
-    let p = ip.clone().add(tp).multiplyScalar(0.5), fist = false;
-    const mt = j['middle-finger-tip'], wr = j['wrist'];
-    if (mt && wr && mt.visible) {
-      const mp = mt.getWorldPosition(new V3()), wp = wr.getWorldPosition(new V3());
-      if (mp.distanceTo(wp) < 0.105) { fist = true; p = mp.add(wp).multiplyScalar(0.5); }
-    }
-    out.push({ key: 'h' + i, grip: ip.distanceTo(tp) < 0.035 || fist, p, tip: ip });
-  });
-  ctrls.forEach((c, i) => {
-    const s = c.userData.src; if (!s || s.hand) return;
-    const p = c.getWorldPosition(new V3());
-    out.push({ key: 'c' + i, grip: c.userData.grip, p, tip: p });
-  });
-  return out;
-}
-const pointer = new THREE.Vector2(), down = { x: 0, y: 0 };
-renderer.domElement.addEventListener('pointerdown', ev => { initAudio(); down.x = ev.clientX; down.y = ev.clientY; });
-renderer.domElement.addEventListener('pointerup', ev => {
-  if (renderer.xr.isPresenting || Math.hypot(ev.clientX - down.x, ev.clientY - down.y) > 6) return;
-  pointer.set(ev.clientX / innerWidth * 2 - 1, -(ev.clientY / innerHeight) * 2 + 1);
-  const ray = new THREE.Raycaster(); ray.setFromCamera(pointer, camera);
-  if (Mush.state === 'float' && ray.intersectObject(Mush.group, true).length) { startEating(); return; }
+
+// Desktop preview: click to poke, drag a little person to carry and throw them.
+const Mouse = { active: false, grip: false, p: new V3(), depth: 1, down: null, target: null, trail: [], throwV: null };
+const pointer = new THREE.Vector2(), mray = new THREE.Raycaster();
+function setRay(ev) { pointer.set(ev.clientX / innerWidth * 2 - 1, -(ev.clientY / innerHeight) * 2 + 1); mray.setFromCamera(pointer, camera); }
+function elfUnder() {
   let best = null, bestD = 0.12;
-  for (const e of elves) {
-    const c = e.headPos(new V3()).addScaledVector(e.n, -0.05);
-    const d = ray.ray.distanceToPoint(c); if (d < bestD) { bestD = d; best = e; }
+  for (const e of elves) { if (!e.grabbable()) continue; const c = e.centerPos(new V3()); const d = mray.ray.distanceToPoint(c) / Math.max(1, c.distanceTo(camera.position) / 3); if (d < bestD) { bestD = d; best = e; } }
+  return best;
+}
+renderer.domElement.addEventListener('pointerdown', ev => {
+  initAudio(); if (renderer.xr.isPresenting) return;
+  setRay(ev);
+  Mouse.down = { x: ev.clientX, y: ev.clientY };
+  if (Mush.state === 'float' && mray.intersectObject(Mush.group, true).length) { startEating(); Mouse.down = null; return; }
+  const e = elfUnder();
+  if (e) { Mouse.target = e; Mouse.depth = e.centerPos(new V3()).distanceTo(camera.position); controls.enabled = false; }
+});
+renderer.domElement.addEventListener('pointermove', ev => {
+  if (!Mouse.down || !Mouse.target) return;
+  setRay(ev);
+  const moved = Math.hypot(ev.clientX - Mouse.down.x, ev.clientY - Mouse.down.y);
+  if (!Mouse.active && moved > 6) { Mouse.active = true; Mouse.grip = true; Mouse.trail = []; Mouse.throwV = null; Grab.prev.m = false; Grab.hist.m = []; }
+  if (Mouse.active) {
+    Mouse.p.copy(mray.ray.origin).addScaledVector(mray.ray.direction, Mouse.depth);
+    Mouse.trail.push({ p: Mouse.p.clone(), t: performance.now() / 1000 }); while (Mouse.trail.length > 8) Mouse.trail.shift();
   }
-  if (best) { best.poke(camera.position); return; }
-  if (Mush.eaten > 0) {
-    const h = cast(ray.ray.origin, ray.ray.direction, 30);
+});
+addEventListener('pointerup', ev => {
+  if (renderer.xr.isPresenting || !Mouse.down) { Mouse.down = null; return; }
+  setRay(ev);
+  const moved = Math.hypot(ev.clientX - Mouse.down.x, ev.clientY - Mouse.down.y);
+  if (Mouse.active) {
+    Mouse.grip = false;
+    const tr = Mouse.trail, a = tr[tr.length - 1], nowT = performance.now() / 1000;
+    let b = tr[0]; for (let i = tr.length - 2; i >= 0; i--) { b = tr[i]; if (a && a.t - tr[i].t >= 0.08) break; }
+    Mouse.throwV = a && nowT - a.t < 0.12 && a.t - b.t > 1e-3 ? a.p.clone().sub(b.p).divideScalar(a.t - b.t) : new V3();
+  }
+  else if (Mouse.target && moved < 6) Mouse.target.poke(camera.position);
+  else if (moved < 6 && Mush.eaten > 0) {
+    const h = cast(mray.ray.origin, mray.ray.direction, 30);
     if (h && h.n.y > CEIL) addElf({ p: h.p, n: h.n });
   }
+  Mouse.down = null; Mouse.target = null; controls.enabled = true;
 });
 addBtn.addEventListener('click', () => { initAudio(); addElf(); });
 
@@ -1307,38 +2418,40 @@ function xrStep(frame) {
     World.placed = true; placeMushroom();
     showCard(['Little Elves', 'for Eliza', 'Grab the floating mushroom with your hand', 'and bring it up to your mouth.']);
   }
-  if (World.noRoom && World.noRoom !== 'told') {
+  if (World.noRoom === true) {
     World.noRoom = 'told';
     showCard(['No room scan found', 'The little people will stay on the floor.', 'To fix it: Quest Settings > Physical space', '> Space setup. Then come back!'], 9);
   }
 }
-renderer.setAnimationLoop((time, frame) => {
-  const dt = Math.min(0.05, last ? (time - last) / 1000 : 0.016); last = time;
-  const t = time / 1000;
-  let grabbers = [];
-  if (renderer.xr.isPresenting) {
-    if (frame) xrStep(frame);
-    userPos.copy(camera.position); camHead.copy(camera.position);
-    grabbers = readGrabbers();
-    for (const e of elves) {
-      const c = _v4.copy(e.root.position).addScaledVector(e.n, 0.08);
-      for (const gr of grabbers) if (gr.tip.distanceTo(c) < 0.09) e.poke(gr.tip);
-    }
-  } else {
-    controls.update();
-    userPos.copy(camera.position); camHead.copy(camera.position);
-  }
+function simulate(dt, t, xr) {
+  updateCamVectors();
+  userPos.copy(camera.position); camHead.copy(camera.position);
   updateMouthPos();
+  if (xr) readHands(dt);
+  const grabbers = readGrabbers(xr);
+  if (xr) { updateMenu(dt); updateMark(dt); }
+  updateGrabs(grabbers);
+  updatePokes(grabbers, dt);
+  if (xr) updateInvites();
   updateMushroom(dt, t, grabbers);
   updateSpawner(dt);
+  director(dt);
   for (const e of elves) e.update(dt, t);
-  directChats(dt);
-  updateSparks(dt); updateScan(dt, t); updateCard(dt);
+  for (const v of [...visitors]) v.update(dt, t);
+  updateFlyer(dt, t);
+  updateSparks(dt); updateDecals(dt); updateScan(dt, t); updateCard(dt);
+}
+let simT = 0;
+renderer.setAnimationLoop((time, frame) => {
+  const dt = Math.min(0.05, last ? (time - last) / 1000 : 0.016); last = time;
+  const xr = renderer.xr.isPresenting;
+  if (xr) { if (frame) xrStep(frame); } else controls.update();
+  simT += dt; simulate(dt, simT, xr);
   renderer.render(scene, camera);
 });
 
 enterWorld('preview');
-window.littleElves = { elves, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls };
+window.littleElves = { ff: (secs) => { for (let i = 0; i < secs * 60; i++) { simT += 1 / 60; simulate(1 / 60, simT, false); } }, elves, visitors, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls, tryPeek, tryVisit, tryChase, startFlyer, Flyer, Dir, Grab, Mouse, HS };
 </script>
 <script src="../updated.js"></script>
 </body>
