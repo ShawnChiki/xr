@@ -593,7 +593,7 @@ function unfold(M, iters){
 }
 
 // ---------------------------------------------------------------- cutting a curve into the mesh
-function embedCurve(M, C, id, L){
+function embedCurve(M, C, id, L, cross){
   const S = resample(C.pts, L * 0.35, C.closed); if (S.length < 2) return 0;
   const VG = new Grid(L); for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
   const near = p => { let best = -1, bd = sq(L * 1.6); VG.each(p[0], p[1], p[2], L * 1.6, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } }); return best; };
@@ -605,36 +605,40 @@ function embedCurve(M, C, id, L){
   let added = 0;
   for (const run of runs){
     if (run.length < 2) continue;
-    let path = [run[0]];
+    const paths = []; let path = [run[0]];
     for (let i = 1; i < run.length; i++){
       const u = path[path.length - 1], w = run[i]; if (u === w) continue;
-      const sp = shortestPath(M, u, w, L * 4); if (!sp){ break; }
+      const sp = shortestPath(M, u, w, L * (cross ? 10 : 4), cross);
+      if (!sp){ if (cross){ if (path.length > 1) paths.push(path); path = [w]; continue; } break; }   // a guide that can't get through picks up again past the gap
       for (let k = 1; k < sp.length; k++) path.push(sp[k]);
     }
-    const closed = C.closed && path.length > 3 && path[0] === path[path.length - 1];
-    // cut out any loops the walk made
-    const seen = new Map(), clean = [];
-    for (let i = 0; i < path.length; i++){ const v = path[i];
-      if (closed && i === path.length - 1) break;
-      if (seen.has(v)){ const j = seen.get(v); for (const u of clean.splice(j + 1)) seen.delete(u); continue; }
-      seen.set(v, clean.length); clean.push(v); }
-    if (clean.length < 2) continue;
-    // spread the chain evenly along the stretch of curve it covers
-    const s0 = closestOnPoly(C, M.P(clean[0])).s, s1 = closestOnPoly(C, M.P(clean[clean.length - 1])).s;
-    let a0 = s0, a1 = s1;
-    if (closed){ a1 = a0 + C.len * (clean.length) / clean.length; }
-    else { if (a0 < L) a0 = 0; if (C.len - a1 < L) a1 = C.len; if (a1 < a0 && !C.closed){ const t = a0; a0 = a1; a1 = t; clean.reverse(); } }
-    const n = clean.length, denom = closed ? n : n - 1;
-    for (let i = 0; i < n; i++){
-      const v = clean[i], q = pointAt(C, a0 + (a1 - a0) * i / denom);
-      if (M.fc[v] >= 0 && M.fc[v] !== id){ M.corner[v] = true; continue; }
-      M.setP(v, q); M.fc[v] = id;
+    paths.push(path);
+    for (const path of paths){
+      const closed = C.closed && path.length > 3 && path[0] === path[path.length - 1];
+      // cut out any loops the walk made
+      const seen = new Map(), clean = [];
+      for (let i = 0; i < path.length; i++){ const v = path[i];
+        if (closed && i === path.length - 1) break;
+        if (seen.has(v)){ const j = seen.get(v); for (const u of clean.splice(j + 1)) seen.delete(u); continue; }
+        seen.set(v, clean.length); clean.push(v); }
+      if (clean.length < 2) continue;
+      // spread the chain evenly along the stretch of curve it covers
+      const s0 = closestOnPoly(C, M.P(clean[0])).s, s1 = closestOnPoly(C, M.P(clean[clean.length - 1])).s;
+      let a0 = s0, a1 = s1;
+      if (closed){ a1 = a0 + C.len * (clean.length) / clean.length; }
+      else { if (a0 < L) a0 = 0; if (C.len - a1 < L) a1 = C.len; if (a1 < a0 && !C.closed){ const t = a0; a0 = a1; a1 = t; clean.reverse(); } }
+      const n = clean.length, denom = closed ? n : n - 1;
+      for (let i = 0; i < n; i++){
+        const v = clean[i], q = pointAt(C, a0 + (a1 - a0) * i / denom);
+        if (M.fc[v] >= 0 && M.fc[v] !== id){ if (cross) (M.cross || (M.cross = new Set())).add(v); else M.corner[v] = true; continue; }
+        M.setP(v, q); M.fc[v] = id;
+      }
+      for (let i = 0; i < (closed ? n : n - 1); i++){ const a = clean[i], b = clean[(i + 1) % n]; if (!M.fe.has(M.ek(a, b))) M.fe.set(M.ek(a, b), id); }
+      if (!closed){ M.corner[clean[0]] = true; M.corner[clean[n - 1]] = true; }
+      // the line's own sharp corners pin the nearest chain vertex, exactly on the corner
+      for (const cp of (C.corners || [])){ let bv = -1, bd = sq(L * 1.2); for (const v of clean){ const dd = d2(M.P(v), cp); if (dd < bd){ bd = dd; bv = v; } } if (bv >= 0){ M.setP(bv, cp); M.corner[bv] = true; } }
+      added += n;
     }
-    for (let i = 0; i < (closed ? n : n - 1); i++){ const a = clean[i], b = clean[(i + 1) % n]; if (!M.fe.has(M.ek(a, b))) M.fe.set(M.ek(a, b), id); }
-    if (!closed){ M.corner[clean[0]] = true; M.corner[clean[n - 1]] = true; }
-    // the line's own sharp corners pin the nearest chain vertex, exactly on the corner
-    for (const cp of (C.corners || [])){ let bv = -1, bd = sq(L * 1.2); for (const v of clean){ const dd = d2(M.P(v), cp); if (dd < bd){ bd = dd; bv = v; } } if (bv >= 0){ M.setP(bv, cp); M.corner[bv] = true; } }
-    added += n;
   }
   return added;
 }
@@ -653,17 +657,17 @@ function markTurns(M, chain, closed, L){
   const T = []; for (let i = 0; i < n; i++) T.push(!closed && (i === 0 || i === n - 1) ? 0 : turn(i));
   for (let i = 0; i < n; i++){ if (T[i] < 0.6) continue; const l = T[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], r = T[closed ? (i + 1) % n : Math.min(n - 1, i + 1)]; if (T[i] >= l && T[i] >= r) M.corner[chain[i]] = true; }
 }
-function shortestPath(M, src, dst, maxLen){
+function shortestPath(M, src, dst, maxLen, cross){
   const dist = new Map([[src, 0]]), prev = new Map(), open = [src], done = new Set();
   const goal = M.P(dst), h = v => Math.sqrt(sq(M.x[v] - goal[0]) + sq(M.y[v] - goal[1]) + sq(M.z[v] - goal[2]));
   let guard = 0;
-  while (open.length && guard++ < 600){
+  while (open.length && guard++ < (cross ? 4000 : 600)){
     let bi = 0; for (let i = 1; i < open.length; i++) if (dist.get(open[i]) + h(open[i]) < dist.get(open[bi]) + h(open[bi])) bi = i;
     const u = open[bi]; open.splice(bi, 1); if (u === dst) break; if (done.has(u)) continue; done.add(u);
     if (dist.get(u) > maxLen) continue;
     for (const w of M.nbrs(u)){
       if (M.fe.has(M.ek(u, w))) continue;          // don't run along another curve
-      if (w !== dst && M.fc[w] >= 0) continue;       // or through it
+      if (w !== dst && M.fc[w] >= 0 && !cross) continue;       // or through it (unless crossings are wanted)
       const nd = dist.get(u) + Math.sqrt(M.len2(u, w));
       if (!dist.has(w) || nd < dist.get(w)){ dist.set(w, nd); prev.set(w, u); open.push(w); }
     }
@@ -738,7 +742,7 @@ function coarsen(M, Mfit, curves, Lo, L, iters){
   }
 }
 // make the smooth (subdivided) surface hug the fitted one: nudge each cage vertex by how far its limit point is off
-function hugCage(cage, Mtopo, Mfit, curves, L, iters){
+function hugCage(cage, Mtopo, Mfit, curves, L, iters, leash){   // Mtopo: anything with .fc[v] and .corner[v] per cage vertex
   const { V, F, sharp } = cage, nv = V.length / 3, proj = projector(Mfit, L);
   const eF = new Map(); F.forEach((f, fi) => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); (eF.get(k) || eF.set(k, []).get(k)).push(fi); }));
   const nbr = Array.from({ length: nv }, () => []), diag = Array.from({ length: nv }, () => []), tri = new Uint8Array(nv), cre = Array.from({ length: nv }, () => []);
@@ -752,6 +756,8 @@ function hugCage(cage, Mtopo, Mfit, curves, L, iters){
     if (tri[v]){ const s2 = [0, 0, 0]; for (const w of nbr[v]){ const q = P(w); for (let i = 0; i < 3; i++) s2[i] += q[i] / n; } return [0, 1, 2].map(i => (2 * p[i] + s2[i]) / 3); }
     const e = [0, 0, 0], d = [0, 0, 0]; for (const w of nbr[v]){ const q = P(w); for (let i = 0; i < 3; i++) e[i] += q[i]; } for (const w of diag[v]){ const q = P(w); for (let i = 0; i < 3; i++) d[i] += q[i]; }
     return [0, 1, 2].map(i => (n * n * p[i] + 4 * e[i] + d[i]) / (n * (n + 5))); };
+  const V0 = leash ? V.slice() : null, cap = leash ? new Float64Array(nv) : null;
+  if (leash){ const cnt = new Float64Array(nv); for (const [k] of eF){ const a = Math.floor(k / 2097152), b = k % 2097152, l = Math.sqrt(d2(P(a), P(b))); cap[a] += l; cap[b] += l; cnt[a]++; cnt[b]++; } for (let v = 0; v < nv; v++) cap[v] = leash * cap[v] / (cnt[v] || 1); }
   for (let it = 0; it < iters; it++){
     const moves = new Float64Array(nv * 3);
     for (let v = 0; v < nv; v++){
@@ -759,8 +765,252 @@ function hugCage(cage, Mtopo, Mfit, curves, L, iters){
       const lim = limit(v), id = Mtopo.fc[v], tgt = id >= 0 && curves[id] ? closestOnPoly(curves[id], lim).p : proj(lim);
       moves[3 * v] = (tgt[0] - lim[0]) * 0.8; moves[3 * v + 1] = (tgt[1] - lim[1]) * 0.8; moves[3 * v + 2] = (tgt[2] - lim[2]) * 0.8;
     }
-    for (let i = 0; i < V.length; i++) V[i] += moves[i];
+    for (let i = 0; i < V.length; i++) V[i] += moves[i] * (leash ? 0.6 : 1);
+    if (leash) for (let v = 0; v < nv; v++){ const dx = V[3 * v] - V0[3 * v], dy = V[3 * v + 1] - V0[3 * v + 1], dz = V[3 * v + 2] - V0[3 * v + 2], dl = Math.hypot(dx, dy, dz);
+      if (dl > cap[v]){ const f = cap[v] / dl; V[3 * v] = V0[3 * v] + dx * f; V[3 * v + 1] = V0[3 * v + 1] + dy * f; V[3 * v + 2] = V0[3 * v + 2] + dz * f; } }
   }
+}
+// ---------------- a cage drawn by you: guides + creases + the border cut the surface into patches, one face each
+// The surface is flattened onto a disc (Tutte), every line is mapped onto that disc, and the lines are intersected
+// there, so crossings are exact and never depend on how the triangles happen to run.
+function flattenDisc(M){
+  const nv = M.x.length, T = M.T, nxt = new Map();
+  for (let t = 0; t < M.tdead.length; t++){ if (M.tdead[t]) continue; for (let k = 0; k < 3; k++){ const a = T[3 * t + k], b = T[3 * t + (k + 1) % 3]; if (M.edgeTris(a, b).length === 1) nxt.set(a, b); } }
+  if (!nxt.size) return null;
+  let best = null, bl = 0; const seen = new Set();
+  for (const s of nxt.keys()){ if (seen.has(s)) continue; const loop = []; let v = s, len = 0;
+    while (!seen.has(v) && nxt.has(v)){ seen.add(v); loop.push(v); const w = nxt.get(v); len += Math.sqrt(M.len2(v, w)); v = w; }
+    if (len > bl){ bl = len; best = loop; } }
+  const uv = new Float64Array(2 * nv), fixed = new Uint8Array(nv);
+  let s = 0; for (let i = 0; i < best.length; i++){ const v = best[i], a = 2 * Math.PI * s / bl; uv[2 * v] = Math.cos(a); uv[2 * v + 1] = Math.sin(a); fixed[v] = 1; s += Math.sqrt(M.len2(v, best[(i + 1) % best.length])); }
+  const nb = Array.from({ length: nv }, (_, v) => M.vt[v].length ? M.nbrs(v) : []);
+  // uniform Laplacian, solved by conjugate gradients for each coordinate
+  const free = []; for (let v = 0; v < nv; v++) if (!fixed[v] && nb[v].length) free.push(v);
+  const idx = new Int32Array(nv).fill(-1); free.forEach((v, i) => idx[v] = i); const n = free.length;
+  for (let c = 0; c < 2; c++){
+    const b = new Float64Array(n), x = new Float64Array(n);
+    free.forEach((v, i) => { for (const w of nb[v]) if (fixed[w]) b[i] += uv[2 * w + c]; });
+    const A = (p, out) => { for (let i = 0; i < n; i++){ const v = free[i]; let s2 = nb[v].length * p[i]; for (const w of nb[v]){ const j = idx[w]; if (j >= 0) s2 -= p[j]; } out[i] = s2; } };
+    const r = b.slice(), p = r.slice(), Ap = new Float64Array(n); let rr = 0; for (let i = 0; i < n; i++) rr += r[i] * r[i];
+    for (let it = 0; it < 2000 && rr > 1e-18; it++){ A(p, Ap); let pAp = 0; for (let i = 0; i < n; i++) pAp += p[i] * Ap[i]; const al = rr / pAp;
+      let rr2 = 0; for (let i = 0; i < n; i++){ x[i] += al * p[i]; r[i] -= al * Ap[i]; rr2 += r[i] * r[i]; } const be = rr2 / rr; rr = rr2; for (let i = 0; i < n; i++) p[i] = r[i] + be * p[i]; }
+    free.forEach((v, i) => uv[2 * v + c] = x[i]);
+  }
+  return { uv, border: best, borderLen: bl };
+}
+function guideCage(Mfit, curves, guides, L, level){
+  const M = Mfit.clone(); M.compact();
+  const D = flattenDisc(M); if (!D) return null;
+  const { uv } = D, T = M.T, nv = M.x.length;
+  const VG = new Grid(L); for (let v = 0; v < nv; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
+  // a point on the surface -> where it lands on the disc
+  const toUV = p => {
+    let bv = -1, bd = Infinity; VG.each(p[0], p[1], p[2], L * 2.5, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; bv = v; } });
+    if (bv < 0) return null;
+    let best = null, qd = Infinity;
+    for (const t of M.vt[bv]){ const a = M.P(T[3 * t]), b = M.P(T[3 * t + 1]), c = M.P(T[3 * t + 2]), q = closestOnTri(p, a, b, c), dd = d2(p, q); if (dd < qd){ qd = dd; best = { t, q, a, b, c }; } }
+    const { t, q, a, b, c } = best, v0 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], v1 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]], v2 = [q[0] - a[0], q[1] - a[1], q[2] - a[2]];
+    const d00 = dot(v0, v0), d01 = dot(v0, v1), d11 = dot(v1, v1), d20 = dot(v2, v0), d21 = dot(v2, v1), den = d00 * d11 - d01 * d01 || 1e-12;
+    const wb = (d11 * d20 - d01 * d21) / den, wc = (d00 * d21 - d01 * d20) / den, wa = 1 - wb - wc, i0 = T[3 * t], i1 = T[3 * t + 1], i2 = T[3 * t + 2];
+    return { uv: [wa * uv[2 * i0] + wb * uv[2 * i1] + wc * uv[2 * i2], wa * uv[2 * i0 + 1] + wb * uv[2 * i1 + 1] + wc * uv[2 * i2 + 1]], p: q, d: Math.sqrt(qd) };
+  };
+  // ---- the lines, as polylines on the disc (kind: 0 border, 1 crease, 2 guide)
+  const lines = [];
+  { const B = D.border; lines.push({ kind: 0, cid: -1, closed: true, P: B.map(v => M.P(v)), U: B.map(v => [uv[2 * v], uv[2 * v + 1]]) }); }
+  const addLine = (C, kind, cid) => {
+    const S = resample(C.pts, L * 0.3, C.closed); let P = [], U = [];
+    const flush = () => { if (P.length >= 2) lines.push({ kind, cid, closed: false, P, U }); P = []; U = []; };
+    let all = true;
+    for (const p of S){ const m = toUV(p); if (!m || m.d > L * 1.5){ all = false; flush(); continue; } P.push(m.p); U.push(m.uv); }
+    if (all && C.closed && P.length > 3){ lines.push({ kind, cid, closed: true, P, U }); return; }
+    flush();
+  };
+  curves.forEach((C, i) => { if (!C.edge) addLine(C, 1, i); });
+  guides.forEach(G => addLine(G, 2, -1));
+  // ---- segment intersection on the disc
+  const segX = (a, b, c, d) => { const r = [b[0] - a[0], b[1] - a[1]], s = [d[0] - c[0], d[1] - c[1]], den = r[0] * s[1] - r[1] * s[0]; if (Math.abs(den) < 1e-14) return null;
+    const qp = [c[0] - a[0], c[1] - a[1]], t = (qp[0] * s[1] - qp[1] * s[0]) / den, u = (qp[0] * r[1] - qp[1] * r[0]) / den; return [t, u]; };
+  const nSeg = l => l.closed ? l.U.length : l.U.length - 1;
+  const segU = (l, i) => [l.U[i], l.U[(i + 1) % l.U.length]];
+  const at3 = (l, i, t) => lerp3(l.P[i], l.P[(i + 1) % l.P.length], t), atU = (l, i, t) => { const [a, b] = segU(l, i); return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; };
+  // ---- loose ends reach over to the nearest line in the direction they were heading (or are trimmed off later)
+  const reach = Math.max(0.35, L * 4);
+  for (const l of lines){ if (l.closed || l.kind === 0) continue;
+    for (const end of [0, 1]){
+      const n = l.U.length, e = end ? n - 1 : 0, k = end ? Math.max(0, n - 4) : Math.min(n - 1, 3);
+      const o = l.U[e], dU = [o[0] - l.U[k][0], o[1] - l.U[k][1]], dl = Math.hypot(dU[0], dU[1]); if (dl < 1e-9) continue;
+      const far = [o[0] + dU[0] / dl * 3, o[1] + dU[1] / dl * 3];
+      let hit = null, ht = Infinity;
+      for (const m of lines){ for (let i = 0; i < nSeg(m); i++){ if (m === l && Math.abs(i - (end ? n - 2 : 0)) < 4) continue; const [c, d] = segU(m, i), x = segX(o, far, c, d);
+        if (x && x[0] > 1e-9 && x[1] >= 0 && x[1] <= 1 && x[0] < ht){ ht = x[0]; hit = { m, i, u: x[1] }; } } }
+      if (!hit) continue;
+      const hp = at3(hit.m, hit.i, hit.u); if (Math.sqrt(d2(hp, l.P[e])) > reach) continue;
+      const hu = atU(hit.m, hit.i, hit.u), over = [hu[0] + dU[0] / dl * 1e-5, hu[1] + dU[1] / dl * 1e-5];
+      if (end){ l.U.push(over); l.P.push(hp); } else { l.U.unshift(over); l.P.unshift(hp); }
+    }
+  }
+  // ---- all crossings
+  const nodes = []; // {u:[x,y], p:[x,y,z], cids:Set, corner}
+  const ev = lines.map(() => []);   // per line: [param, node]
+  const cell = 0.03, gh = new Map(), gk = (x, y) => (x + 1000) * 4096 + (y + 1000);
+  lines.forEach((l, li) => { for (let i = 0; i < nSeg(l); i++){ const [a, b] = segU(l, i);
+    for (let x = Math.floor(Math.min(a[0], b[0]) / cell); x <= Math.floor(Math.max(a[0], b[0]) / cell); x++) for (let y = Math.floor(Math.min(a[1], b[1]) / cell); y <= Math.floor(Math.max(a[1], b[1]) / cell); y++){ const k = gk(x, y); (gh.get(k) || gh.set(k, []).get(k)).push(li, i); } } });
+  const done = new Set();
+  for (const arr of gh.values()) for (let p = 0; p < arr.length; p += 2) for (let q = p + 2; q < arr.length; q += 2){
+    const la = arr[p], ia = arr[p + 1], lb = arr[q], ib = arr[q + 1]; if (la === lb) continue;
+    const key = la < lb ? `${la},${ia},${lb},${ib}` : `${lb},${ib},${la},${ia}`; if (done.has(key)) continue; done.add(key);
+    const A = lines[la], B = lines[lb], [a, b] = segU(A, ia), [c, d] = segU(B, ib), x = segX(a, b, c, d); if (!x || x[0] < 0 || x[0] > 1 || x[1] < 0 || x[1] > 1) continue;
+    // where two lines cross, the crease (or the border) decides the exact spot
+    const pa = at3(A, ia, x[0]), pb = at3(B, ib, x[1]), pr = A.kind === 0 ? pa : B.kind === 0 ? pb : A.kind === 1 ? pa : B.kind === 1 ? pb : lerp3(pa, pb, 0.5);
+    const ni = nodes.length; nodes.push({ u: atU(A, ia, x[0]), p: pr, cids: new Set([A.cid, B.cid].filter(c2 => c2 >= 0)), border: A.kind === 0 || B.kind === 0, corner: false });
+    ev[la].push([ia + x[0], ni]); ev[lb].push([ib + x[1], ni]);
+  }
+  // a crease's own sharp corners are cage corners too
+  lines.forEach((l, li) => { if (l.kind !== 1) return; const C = curves[l.cid];
+    for (const cp of (C.corners || [])){ let bi = -1, bt = 0, bd = sq(L); for (let i = 0; i < nSeg(l); i++){ const a = l.P[i], b = l.P[(i + 1) % l.P.length], ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], t = Math.max(0, Math.min(1, dot([cp[0] - a[0], cp[1] - a[1], cp[2] - a[2]], ab) / (dot(ab, ab) || 1))), dd = d2(lerp3(a, b, t), cp); if (dd < bd){ bd = dd; bi = i; bt = t; } }
+      if (bi < 0) continue; const ni = nodes.length; nodes.push({ u: atU(l, bi, bt), p: at3(l, bi, bt), cids: new Set([l.cid]), corner: true }); ev[li].push([bi + bt, ni]); } });
+  if (!ev[0].length){ nodes.push({ u: lines[0].U[0], p: lines[0].P[0], cids: new Set(), border: true, corner: false }); ev[0].push([0, nodes.length - 1]); }
+  // ---- crossings that nearly coincide become one
+  const mtol = Math.max(0.05, L * 0.7), par = nodes.map((_, i) => i), fd = i => par[i] === i ? i : (par[i] = fd(par[i]));
+  { const NG = new Grid(mtol); nodes.forEach((n, i) => NG.add(i, n.p[0], n.p[1], n.p[2]));
+    nodes.forEach((n, i) => NG.each(n.p[0], n.p[1], n.p[2], mtol, j => { if (j > i && d2(n.p, nodes[j].p) < mtol * mtol){ const a = fd(i), b = fd(j); if (a !== b) par[b] = a; } })); }
+  nodes.forEach((n, i) => { const r = fd(i); if (r !== i){ const R = nodes[r]; n.cids.forEach(c => R.cids.add(c)); R.corner = R.corner || n.corner; R.border = R.border || n.border; } });
+  // ---- graph edges: the pieces of each line between its crossings
+  const edges = []; // {a, b, P, U, kind, cid}
+  const piece = (l, s0, s1) => { const P = [at3(l, Math.floor(s0) % nSeg(l), s0 - Math.floor(s0))], U = [atU(l, Math.floor(s0) % nSeg(l), s0 - Math.floor(s0))];
+    for (let i = Math.floor(s0) + 1; i <= Math.floor(s1 - 1e-12); i++){ const j = i % l.P.length; P.push(l.P[j]); U.push(l.U[j]); }
+    const f = Math.floor(s1 - 1e-12) % nSeg(l); P.push(at3(l, f, s1 - Math.floor(s1 - 1e-12))); U.push(atU(l, f, s1 - Math.floor(s1 - 1e-12))); return { P, U }; };
+  lines.forEach((l, li) => { const E = ev[li].sort((a, b) => a[0] - b[0]); if (!E.length) return;
+    const ns = l.closed ? E.length : E.length - 1;
+    for (let k = 0; k < ns; k++){ const [s0, a] = E[k], [s1r, b] = E[(k + 1) % E.length], s1 = k + 1 < E.length ? s1r : s1r + nSeg(l);
+      const ra = fd(a), rb = fd(b); if (s1 - s0 < 1e-9 && E.length > 1) continue; const g = piece(l, s0, s1);
+      let len = 0; for (let i = 1; i < g.P.length; i++) len += Math.sqrt(d2(g.P[i - 1], g.P[i]));
+      if (ra === rb && len < mtol * 4) continue;               // a crumb between merged crossings
+      edges.push({ a: ra, b: rb, P: g.P, U: g.U, kind: l.kind, cid: l.cid, len }); } });
+  // ---- loose ends go
+  let alive = edges.map(() => true);
+  const degree = () => { const dg = new Int32Array(nodes.length); edges.forEach((e, i) => { if (alive[i]){ dg[e.a]++; dg[e.b]++; } }); return dg; };
+  for (let ch = true; ch;){ ch = false; const dg = degree(); edges.forEach((e, i) => { if (alive[i] && (dg[e.a] === 1 || dg[e.b] === 1)){ alive[i] = false; ch = true; } }); }
+  let E = edges.filter((_, i) => alive[i]);
+  let lost = 0;
+  // lines that touch nothing else (a crease loop no guide crosses) can't be part of the cage
+  { const adj = new Map(); E.forEach(e => { (adj.get(e.a) || adj.set(e.a, []).get(e.a)).push(e.b); (adj.get(e.b) || adj.set(e.b, []).get(e.b)).push(e.a); });
+    const start = E.find(e => e.kind === 0); if (!start) return null; const seen = new Set([start.a]), st = [start.a];
+    while (st.length){ const v = st.pop(); for (const w of adj.get(v) || []) if (!seen.has(w)){ seen.add(w); st.push(w); } }
+    lost = E.filter(e => !seen.has(e.a)).length; E = E.filter(e => seen.has(e.a)); }
+  // ---- nodes where just two pieces meet, with no corner, join those pieces
+  const join = () => { for (let ch = true; ch;){ ch = false; const inc = new Map(); E.forEach((e, i) => { for (const v of [e.a, e.b]) (inc.get(v) || inc.set(v, []).get(v)).push(i); });
+    for (const [v, es] of inc){ if (es.length !== 2 || es[0] === es[1] || nodes[v].corner || nodes[v].split) continue; const e1 = E[es[0]], e2 = E[es[1]]; if (e1.kind !== e2.kind || e1.cid !== e2.cid) continue;
+      const f1 = e1.b === v ? e1 : rev(e1), f2 = e2.a === v ? e2 : rev(e2);
+      const ne = { a: f1.a, b: f2.b, P: [...f1.P, ...f2.P.slice(1)], U: [...f1.U, ...f2.U.slice(1)], kind: e1.kind, cid: e1.cid, len: e1.len + e2.len };
+      E = E.filter((_, i) => i !== es[0] && i !== es[1]); E.push(ne); ch = true; break; } } };
+  const rev = e => ({ ...e, a: e.b, b: e.a, P: e.P.slice().reverse(), U: e.U.slice().reverse() });
+  join();
+  // two pieces that run between the same crossings along the same path are one (a guide traced over a crease)
+  { const hd = (e1, e2) => { let m = 0; for (const p of e1.P){ let b = Infinity; for (const q of e2.P) b = Math.min(b, d2(p, q)); m = Math.max(m, b); } return Math.sqrt(m); };
+    const drop = new Set();
+    for (let i = 0; i < E.length; i++) for (let j = i + 1; j < E.length; j++){ const a = E[i], b = E[j]; if (drop.has(i) || drop.has(j)) continue;
+      if (!((a.a === b.a && a.b === b.b) || (a.a === b.b && a.b === b.a))) continue; if (hd(a, b) > mtol * 1.5) continue; drop.add(a.kind >= b.kind ? i : j); }
+    if (drop.size){ E = E.filter((_, i) => !drop.has(i)); join(); } }
+  // ---- faces: walk the planar graph on the disc
+  const faces = () => {
+    const out = new Map(); // node -> [{e, fwd, ang}]
+    const ang = (e, fwd) => { const U = fwd ? e.U : e.U.slice().reverse(), P = fwd ? e.P : e.P.slice().reverse(); const o = nodes[fwd ? e.a : e.b].u;
+      let s = 0, j = 1; for (; j < P.length - 1; j++){ s += Math.sqrt(d2(P[j - 1], P[j])); if (s > Math.min(mtol * 1.5, e.len * 0.4)) break; } const q = U[Math.min(j, U.length - 1)]; return Math.atan2(q[1] - o[1], q[0] - o[0]); };
+    E.forEach((e, i) => { for (const fwd of [true, false]){ const v = fwd ? e.a : e.b; (out.get(v) || out.set(v, []).get(v)).push({ i, fwd, ang: ang(e, fwd) }); } });
+    for (const l of out.values()) l.sort((a, b) => a.ang - b.ang);
+    const used = new Set(), F = [];
+    for (const [v0, l0] of out) for (const h0 of l0){ const hk = h0.i * 2 + (h0.fwd ? 0 : 1); if (used.has(hk)) continue;
+      const cyc = []; let h = h0, guard = 0;
+      while (guard++ < 10000){ const k = h.i * 2 + (h.fwd ? 0 : 1); if (used.has(k)) break; used.add(k); cyc.push(h);
+        const e = E[h.i], v = h.fwd ? e.b : e.a, lst = out.get(v), ti = lst.findIndex(x => x.i === h.i && x.fwd !== h.fwd && (e.a !== e.b || x !== h));
+        h = lst[(ti - 1 + lst.length) % lst.length]; }
+      let area = 0; for (const hh of cyc){ const e = E[hh.i], U = hh.fwd ? e.U : e.U.slice().reverse(); for (let i = 1; i < U.length; i++) area += U[i - 1][0] * U[i][1] - U[i][0] * U[i - 1][1]; }
+      if (area > 1e-9) F.push(cyc); }
+    return F; };
+  // ---- every patch wants 4 corners: split sides at their sharpest bend (borders and creases first), and split creases
+  // that bend away from a straight side so the cage can still follow them
+  const turnAt = (P, i, k) => { const a = P[Math.max(0, i - k)], b = P[i], c = P[Math.min(P.length - 1, i + k)]; return Math.acos(Math.max(-1, Math.min(1, dot(norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]), norm([c[0] - b[0], c[1] - b[1], c[2] - b[2]]))))); };
+  const bestSplit = e => { const k = Math.max(1, Math.round(L * 1.2 / (L * 0.3))); let bi = -1, bt = -1; for (let i = 2; i < e.P.length - 2; i++){ const t = turnAt(e.P, i, k); if (t > bt){ bt = t; bi = i; } } return { i: bi, turn: bt }; };
+  const splitE = (ei, i, sharpTurn) => { const e = E[ei], ni = nodes.length; nodes.push({ u: e.U[i], p: e.P[i], cids: new Set(e.cid >= 0 ? [e.cid] : []), border: e.kind === 0, corner: false });
+    let l1 = 0; for (let j = 1; j <= i; j++) l1 += Math.sqrt(d2(e.P[j - 1], e.P[j]));
+    E.splice(ei, 1, { ...e, b: ni, P: e.P.slice(0, i + 1), U: e.U.slice(0, i + 1), len: l1 }, { ...e, a: ni, P: e.P.slice(i), U: e.U.slice(i), len: e.len - l1 }); nodes[ni].corner = !!sharpTurn; nodes[ni].split = true; };
+  for (let pass = 0; pass < 6; pass++){
+    let did = false;
+    // creases that bow away from their chord
+    for (let ei = 0; ei < E.length; ei++){ const e = E[ei]; if (e.kind !== 1 || e.P.length < 5) continue;
+      const a = e.P[0], b = e.P[e.P.length - 1], ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], ch = Math.hypot(...ab) || 1e-9;
+      let md = 0, mi = -1; for (let i = 1; i < e.P.length - 1; i++){ const t = Math.max(0, Math.min(1, dot([e.P[i][0] - a[0], e.P[i][1] - a[1], e.P[i][2] - a[2]], ab) / (ch * ch))), dd = Math.sqrt(d2(e.P[i], lerp3(a, b, t))); if (dd > md){ md = dd; mi = i; } }
+      if (md > Math.max(0.06, ch * 0.18) && mi > 1 && mi < e.P.length - 2){ const s = bestSplit(e); splitE(ei, s.turn > 0.5 ? s.i : mi, s.turn > 1.0); did = true; ei++; } }
+    const F = faces(), want = new Map();
+    for (const cyc of F){ if (cyc.length >= 4) continue;
+      const cand = cyc.map(h => { const s = bestSplit(E[h.i]); return { h, ...s, score: s.turn + (E[h.i].kind < 2 ? 0.6 : 0) + (cyc.length < 3 ? E[h.i].len : 0) }; }).filter(c => c.i > 0).sort((x, y) => y.score - x.score);
+      const c = cand[0]; if (!c || (cyc.length === 3 && c.turn < 0.5 && E[c.h.i].kind === 2)) continue;
+      if (!want.has(c.h.i)) want.set(c.h.i, c); }
+    [...want.keys()].sort((a, b) => b - a).forEach(ei => { const c = want.get(ei); splitE(ei, c.i, c.turn > 1.0); did = true; });
+    if (!did) break;
+  }
+  // ---- the cage
+  const F0 = faces(); if (!F0.length) return null;
+  // the disc, back onto the surface: find the triangle a disc point falls in
+  const tg = new Map(), tc = 0.025, tk = (x, y) => (x + 1000) * 4096 + (y + 1000);
+  for (let t = 0; t < M.tdead.length; t++){ if (M.tdead[t]) continue; const i = [T[3 * t], T[3 * t + 1], T[3 * t + 2]];
+    const xs = i.map(v => uv[2 * v]), ys = i.map(v => uv[2 * v + 1]);
+    for (let x = Math.floor(Math.min(...xs) / tc); x <= Math.floor(Math.max(...xs) / tc); x++) for (let y = Math.floor(Math.min(...ys) / tc); y <= Math.floor(Math.max(...ys) / tc); y++){ const k = tk(x, y); (tg.get(k) || tg.set(k, []).get(k)).push(t); } }
+  const uvTo3D = u => { let bt = -1, bw = null, worst = -Infinity;
+    for (const t of tg.get(tk(Math.floor(u[0] / tc), Math.floor(u[1] / tc))) || []){ const [a, b, c] = [T[3 * t], T[3 * t + 1], T[3 * t + 2]];
+      const ax = uv[2 * a], ay = uv[2 * a + 1], bx = uv[2 * b], by = uv[2 * b + 1], cx = uv[2 * c], cy = uv[2 * c + 1], den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy); if (Math.abs(den) < 1e-18) continue;
+      const wa = ((by - cy) * (u[0] - cx) + (cx - bx) * (u[1] - cy)) / den, wb = ((cy - ay) * (u[0] - cx) + (ax - cx) * (u[1] - cy)) / den, wc = 1 - wa - wb, mn = Math.min(wa, wb, wc);
+      if (mn > worst){ worst = mn; bt = t; bw = [wa, wb, wc]; } if (mn >= 0) break; }
+    if (bt < 0) return null; const w = bw.map(x => Math.max(0, x)), sw = w[0] + w[1] + w[2] || 1, p = [0, 0, 0];
+    for (let k = 0; k < 3; k++){ const v = T[3 * bt + k]; p[0] += M.x[v] * w[k] / sw; p[1] += M.y[v] * w[k] / sw; p[2] += M.z[v] * w[k] / sw; } return p; };
+  // which creases each corner really sits on (pieces trimmed away no longer count)
+  { const inc = new Map(); E.forEach(e => { if (e.kind === 1) for (const v of [e.a, e.b]) (inc.get(v) || inc.set(v, new Set()).get(v)).add(e.cid); });
+    nodes.forEach((N, i) => { N.cids = inc.get(i) || new Set(); }); }
+  // cage vertices, faces, and what each side runs along
+  const Vs = [], vmap = new Map(), G = new Map();
+  const vOf = n => { if (!vmap.has(n)){ const N = nodes[n], cs = [...N.cids]; vmap.set(n, Vs.length); Vs.push({ u: N.u, p: N.p, fc: cs.length === 1 ? cs[0] : -1, corner: N.corner || cs.length > 1 }); } return vmap.get(n); };
+  let Fs = [], bad = 0;
+  for (const cyc of F0){ if (cyc.length < 3){ bad++; continue; }
+    const f = cyc.map(h => vOf(h.fwd ? E[h.i].a : E[h.i].b));
+    cyc.forEach((h, q) => { const e = E[h.i], a = f[q], b = f[(q + 1) % f.length], P = h.fwd ? e.P : e.P.slice().reverse(), U = h.fwd ? e.U : e.U.slice().reverse();
+      if (!G.has(ek(a, b))) G.set(ek(a, b), { a, P, U, kind: e.kind, cid: e.cid, sharp: e.kind === 1 && !!curves[e.cid].sharp }); });
+    Fs.push(f); }
+  // more detail between the guides: split every patch like one step of subdivision, with the new points on the surface
+  for (let lv = 0; lv < level; lv++){
+    const mid = new Map(), NG = new Map(), NF = [];
+    const getMid = (a, b) => { const k = ek(a, b); if (mid.has(k)) return mid.get(k); const g = G.get(k); let m;
+      if (!g || g.straight){ const u = [(Vs[a].u[0] + Vs[b].u[0]) / 2, (Vs[a].u[1] + Vs[b].u[1]) / 2]; m = { u, p: uvTo3D(u) || lerp3(Vs[a].p, Vs[b].p, 0.5), fc: -1, corner: false }; }
+      else { let tot = 0; for (let i = 1; i < g.P.length; i++) tot += Math.sqrt(d2(g.P[i - 1], g.P[i]));
+        let acc = 0, i = 1; for (; i < g.P.length - 1; i++){ const l = Math.sqrt(d2(g.P[i - 1], g.P[i])); if (acc + l >= tot / 2) break; acc += l; }
+        const l = Math.sqrt(d2(g.P[i - 1], g.P[i])) || 1e-9, t = Math.max(0, Math.min(1, (tot / 2 - acc) / l)), p = lerp3(g.P[i - 1], g.P[i], t), u = [g.U[i - 1][0] + (g.U[i][0] - g.U[i - 1][0]) * t, g.U[i - 1][1] + (g.U[i][1] - g.U[i - 1][1]) * t];
+        m = { u, p, fc: g.kind === 1 ? g.cid : -1, corner: false }; }
+      const mi = Vs.push(m) - 1; mid.set(k, mi);
+      if (!g || g.straight){ NG.set(ek(a, mi), { straight: true }); NG.set(ek(mi, b), { straight: true }); }
+      else { const first = g.a, other = first === a ? b : a; let acc = 0, i = 1;
+        let tot = 0; for (let j = 1; j < g.P.length; j++) tot += Math.sqrt(d2(g.P[j - 1], g.P[j]));
+        for (; i < g.P.length - 1; i++){ const l = Math.sqrt(d2(g.P[i - 1], g.P[i])); if (acc + l >= tot / 2) break; acc += l; }
+        const base = { kind: g.kind, cid: g.cid, sharp: g.sharp };
+        NG.set(ek(first, mi), { ...base, a: first, P: [...g.P.slice(0, i), m.p], U: [...g.U.slice(0, i), m.u] });
+        NG.set(ek(mi, other), { ...base, a: mi, P: [m.p, ...g.P.slice(i)], U: [m.u, ...g.U.slice(i)] }); }
+      return mi; };
+    for (const f of Fs){ const n = f.length, u = [0, 0]; f.forEach(v => { u[0] += Vs[v].u[0] / n; u[1] += Vs[v].u[1] / n; });
+      let p = uvTo3D(u); if (!p){ p = [0, 0, 0]; f.forEach(v => { for (let k = 0; k < 3; k++) p[k] += Vs[v].p[k] / n; }); }
+      const ci = Vs.push({ u, p, fc: -1, corner: false }) - 1, ms = f.map((v, i) => getMid(v, f[(i + 1) % n]));
+      for (let i = 0; i < n; i++){ NF.push([f[i], ms[i], ci, ms[(i - 1 + n) % n]]); NG.set(ek(ms[i], ci), { straight: true }); } }
+    Fs = NF; G.clear(); for (const [k, g] of NG) G.set(k, g);
+  }
+  const V = [], fc = [], corner = []; Vs.forEach(v => { V.push(...v.p); fc.push(v.fc); corner.push(!!v.corner); });
+  const sharp = new Set(); for (const [k, g] of G) if (g.sharp) sharp.add(k);
+  const Fo = Fs;
+  // the disc keeps the surface's winding, but make sure
+  { let agree = 0;
+    for (const f of Fo){ const P0 = [V[3 * f[0]], V[3 * f[0] + 1], V[3 * f[0] + 2]]; const n = [0, 0, 0];
+      for (let i = 1; i + 1 < f.length; i++){ const c = cross3(P0, [V[3 * f[i]], V[3 * f[i] + 1], V[3 * f[i] + 2]], [V[3 * f[i + 1]], V[3 * f[i + 1] + 1], V[3 * f[i + 1] + 2]]); n[0] += c[0]; n[1] += c[1]; n[2] += c[2]; }
+      let bv = -1, bd = Infinity; VG.each(P0[0], P0[1], P0[2], L * 3, v => { const dd = d2(M.P(v), P0); if (dd < bd){ bd = dd; bv = v; } }); if (bv < 0) continue;
+      const m = [0, 0, 0]; for (const t of M.vt[bv]){ const c = M.triN(t); m[0] += c[0]; m[1] += c[1]; m[2] += c[2]; } agree += Math.sign(dot(n, m)); }
+    if (agree < 0) Fo.forEach(f => f.reverse()); }
+  return { cage: { V, F: Fo, sharp, feat: null, corner: Uint8Array.from(corner, c => c ? 1 : 0) }, info: { fc, corner }, bad, lost, patches: F0.length };
 }
 // hard edges found by angle: cage edges folded more than `deg` become sharp too
 function autoCreases(cage, deg){
@@ -829,7 +1079,7 @@ function flowField(M, sources, h){
     if (W <= 0) continue;
     const a = Math.atan2(zi, zr) / 4, co = Math.cos(a), si = Math.sin(a);
     d1[3 * v] = co * b1[0] + si * b2[0]; d1[3 * v + 1] = co * b1[1] + si * b2[1]; d1[3 * v + 2] = co * b1[2] + si * b2[2];
-    conf[v] = Math.min(1, Math.hypot(zr, zi) / W) * Math.min(1, near / 4);
+    conf[v] = Math.min(1, Math.hypot(zr, zi) / W) * Math.min(1, near / 2);
   }
   return { d1, conf, N };
 }
@@ -885,7 +1135,7 @@ function quadify(M, curves, FL){
     let cost = worst;
     if (FL && FL.conf[a] > 0.05){ const nn = norm([n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]]); let m = 0;
       for (let k = 0; k < 4; k++){ const u = q[k], w = q[(k + 1) % 4]; m += misalign(FL, a, norm([M.x[w] - M.x[u], M.y[w] - M.y[u], M.z[w] - M.z[u]]), nn); }
-      cost += 2.5 * FL.conf[a] * m / 4; }
+      cost += 4 * FL.conf[a] * m / 4; }
     cand.push([cost, t1, t2, q, worst]);
   }
   cand.sort((p, q) => p[0] - q[0]);
@@ -1047,7 +1297,7 @@ function solve(strokes, prm, progress = () => {}){
   // lay the guides on the surface found so far, and work out the flow they ask for
   M.compact();
   const guides = layGuides(M, guides0, L, h);
-  let flow = guides.length ? flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h) : null;
+  let flow = guides.length ? flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h) : null;
   M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0));
   curves.forEach((C, i) => embedCurve(M, C, i, L));
   if (cutAtEdges(M, curves, samples, h)) progress(0.56, 'Trimming at the edges');
@@ -1055,7 +1305,7 @@ function solve(strokes, prm, progress = () => {}){
   for (let it = 0; it < 8; it++){
     remesh(M, L, 0.8);
     if (it < 3) untangle(M, 2);
-    if (guides.length) flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h);
+    if (guides.length) flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h);
     fitStep(M, samples, curves, { ...base, flow, L, h, hn: h * 1.8, maxStep: L * 0.8, parity: it & 1, reach2: h * 2.2 });
     unfold(M, 3);
     if (prm.onStep) prm.onStep(M, "crease", it); progress(0.55 + 0.35 * it / 8, 'Sharpening the creases');
@@ -1080,12 +1330,27 @@ function solve(strokes, prm, progress = () => {}){
   M.compact();
   // simpler topology: rebuild at the size that gives the quad count asked for, on the fitted surface
   let Mfit = M;
+  let gc = null;
+  if (prm.target < 0 && guides.length){ progress(0.9, 'Building the cage from your guides'); try { gc = guideCage(M, curves, guides, L, -1 - prm.target); } catch (e){ gc = null; } }
+  if (gc){
+    const { cage, info } = gc;
+    if (prm.hard > 0) autoCreases(cage, prm.hard);
+    progress(0.95, 'Hugging the surface');
+    hugCage(cage, info, M, curves, L, 8, 0.3);
+    let smooth = catmullClark(cage, curves); for (let i = 1; i < Math.max(1, prm.subd | 0); i++) smooth = catmullClark(smooth, curves);
+    progress(1, 'Done');
+    return { surface: shade(smooth), quadWire: wire(cage), fineWire: wire(smooth), creases: creaseLines(smooth),
+      quads: { V: new Float32Array(cage.V), F: new Int32Array(cage.F.flat()), C: new Int32Array(cage.F.map(f => f.length)) },
+      curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })), ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
+      nQuads: cage.F.length, cageMode: true, note: gc.lost ? 'A line no guide crosses was left out: draw a guide across it' : gc.bad ? gc.bad + ' patch' + (gc.bad > 1 ? 'es' : '') + ' left open: close them with more guides' : '' };
+  }
+  
   if (prm.target > 0){
     const Lo = 2 * Math.sqrt(triArea(M) / prm.target);
     if (Lo > L * 1.2){ progress(0.89, 'Simplifying to about ' + prm.target + ' quads'); Mfit = M.clone(); coarsen(M, Mfit, curves, Lo, L, 14); M.compact(); }
   }
   if (guides.length){
-    flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h);
+    flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h);
     // comb the mesh along the flow: slide vertices over the surface until their edges line up with it
     progress(0.9, 'Lining up with the guides');
     for (let it = 0; it < (prm.alignIters ?? 14); it++){
@@ -1100,7 +1365,7 @@ function solve(strokes, prm, progress = () => {}){
     // a light flip pass that prefers edges along the flow, then re-measure the flow on the combed mesh
     flowFlips(M, flow);
     M.compact();
-    flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.6 }))], h);
+    flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h);
   }
   if (prm.relax > 0){ progress(0.91, 'Relaxing'); relaxMesh(M, Math.round(prm.relax * prm.relax * 0.8 + prm.relax * 2), flow); }
   const folds = unfold(M, 25);
@@ -1118,10 +1383,11 @@ function solve(strokes, prm, progress = () => {}){
   progress(1, 'Done');
   return {
     surface: sh, quadWire: wire(quads), fineWire: smooth === quads ? null : wire(smooth), creases: creaseLines(smooth),
-    quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()) },
+    quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()), C: new Int32Array(quads.F.map(f => f.length)) },
     curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })),
       ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
-    nQuads: quads.F.length, folds
+    nQuads: quads.F.length, folds,
+    note: prm.target < 0 ? (guides.length ? 'Couldn\'t lay quads along your guides here, so Auto was used. Make sure guides cross each other or reach the border.' : 'Draw guides on the surface to lay out the quads (Auto until then)') : ''
   };
 }
 
@@ -1135,7 +1401,7 @@ if (typeof importScripts === 'function' && typeof window === 'undefined'){
     try {
       let last = 0;
       const r = solve(strokes, prm, (p, msg) => { const now = Date.now(); if (now - last > 120 || p >= 1){ last = now; self.postMessage({ type: 'progress', id, p, msg }); } });
-      const tr = r.surface ? [...(r.surface.paint ? [r.surface.paint.buffer] : []), r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, ...(r.fineWire ? [r.fineWire.buffer] : []), r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
+      const tr = r.surface ? [...(r.quads.C ? [r.quads.C.buffer] : []), ...(r.surface.paint ? [r.surface.paint.buffer] : []), r.surface.pos.buffer, r.surface.nrm.buffer, r.quadWire.buffer, ...(r.fineWire ? [r.fineWire.buffer] : []), r.creases.buffer, r.quads.V.buffer, r.quads.F.buffer] : [];
       self.postMessage({ type: 'done', id, r }, tr);
     } catch (err){ self.postMessage({ type: 'error', id, msg: String((err && err.message) || err) }); }
   };
