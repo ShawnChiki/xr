@@ -4625,8 +4625,17 @@ addEventListener('keydown',ev=>{
 });
 
 /* ---------- XR: play in the Quest browser with your hands (MR passthrough, or a VR room) ---------- */
+/* The headset browser slows or pauses page timers while you're in XR, and the bots run on timers.
+   So each timeout is also kept in a list that the XR frame loop checks every frame; whichever fires first runs it, once. */
+const TIMERS=(()=>{
+  const nST=window.setTimeout.bind(window), nCT=window.clearTimeout.bind(window), list=new Map(); let next=1;
+  function fire(id){ const e=list.get(id); if(!e) return; list.delete(id); nCT(e.n); try{ e.fn(...e.a); }catch(err){ console.warn(err); } }
+  window.setTimeout=function(fn,ms,...a){ if(typeof fn!=='function') return nST(fn,ms,...a); const id=next++; const e={fn,a,at:performance.now()+(+ms||0)}; e.n=nST(()=>fire(id),ms); list.set(id,e); return id; };
+  window.clearTimeout=function(id){ const e=list.get(id); if(e){ nCT(e.n); list.delete(id); } else nCT(id); };
+  return {pump(){ const now=performance.now(); for(const [id,e] of [...list]) if(e.at<=now) fire(id); }};
+})();
 const XR=(()=>{
-  const X={on:false,session:null,ar:false,room:false,placed:false,drawn:false,turnKey:'',anim:null,grab:null};
+  const X={uiT:0,uiHover:null,on:false,session:null,ar:false,room:false,placed:false,drawn:false,turnKey:'',anim:null,grab:null};
   const W3=new V3(), Q3=new Quat();
   const ui3=new THREE.Scene(), top3=new THREE.Scene();
   const xrCam=new THREE.PerspectiveCamera(70,1,.01,60);
@@ -4682,7 +4691,10 @@ const XR=(()=>{
   const LBL={tFilms:'Cut scenes',hintOff:'No more tips',quitBtn:'New game',homeBtn:'Home',homeBtn2:'Home'};
   function shown(e){ if(!e||e.disabled||e.hidden||e.closest('[hidden]')) return false; if(e.checkVisibility) return e.checkVisibility({checkVisibilityCSS:true}); return e.getClientRects().length>0; }
   function label(e){ if(LBL[e.id]) return LBL[e.id]; const t=[...e.childNodes].filter(n=>n.nodeType===3).map(n=>n.textContent).join('').trim(); return t||e.getAttribute('aria-label')||e.id; }
-  function gameButtons(){ const out=[]; for(const id of BTN_IDS){ const e=$(id); if(shown(e)) out.push({id,label:label(e),primary:e.classList.contains('primary')||e.classList.contains('qp'),go:()=>e.click()}); } return out; }
+  function gameButtons(){ const out=[]; for(const id of BTN_IDS){ const e=$(id); if(shown(e)) out.push({id,label:label(e),primary:e.classList.contains('primary')||e.classList.contains('qp'),go:()=>e.click()}); }
+    if(state&&state.started&&!state.over&&human()&&state.phase==='build'&&!state.opts.require&&!(sel&&(sel.from||sel.kind==='stair')))       // the page does this with its Move tab
+      out.push({id:'x-move',label:'Skip to Move',go:()=>{ const li=document.querySelector('#steps li[data-p="walk"]'); if(li) li.click(); }});
+    return out; }
   const PREF=(()=>{ try{ return Object.assign({fast:false,skip:false,vr:false,autoTurn:true},JSON.parse(localStorage.getItem('chikiblox.xr')||'{}')); }catch(e){ return {fast:false,skip:false,vr:false,autoTurn:true}; } })();
   function savePref(){ try{ localStorage.setItem('chikiblox.xr',JSON.stringify(PREF)); }catch(e){} }
   function setFast(on){ PREF.fast=on; SPD=on?4:1; $('ffBtn').setAttribute('aria-pressed',String(on)); savePref(); }
@@ -4794,7 +4806,9 @@ const XR=(()=>{
     ptex.needsUpdate=true;
   }
   function panelHit(lx,ly){ const u=(lx/PW+.5)*CW, v=(.5-ly/PH)*CH; return hits.find(b=>u>=b.x&&u<=b.x+b.w&&v>=b.y&&v<=b.y+b.h)||null; }
-  function press(b,h){ const now=performance.now(); if(now-(lastClick[b.id]||0)<350) return; lastClick[b.id]=now; sfx.snap&&sfx.snap(); buzz(h,.5,30); try{ b.go(); }catch(e){ console.warn(e); } panelSig=''; }
+  function press(b,h){ const now=performance.now(); if(now-(lastClick[b.id]||0)<350) return; lastClick[b.id]=now;
+    if(b.id==='cancelBtn'&&sel&&sel.kind==='stair'&&state) X.declined=state.turnNo+':'+state.cur;      // No stair means no stair this turn
+    sfx.snap&&sfx.snap(); buzz(h,.5,30); try{ b.go(); }catch(e){ console.warn(e); } panelSig=''; }
 
   /* the tray: pinch a piece (or the stair) to pick it up */
   function pieceGroup(cells,col,unit,mat){
@@ -5006,6 +5020,7 @@ const XR=(()=>{
   function carryMat(col){ return new THREE.MeshLambertMaterial({color:col,transparent:true,opacity:.6,depthWrite:false}); }
   function startCarry(h,fromGhost){
     if(!sel) return false;
+    if(carry&&carry.hold){ gXR.remove(carry.vis); carry=null; }
     const pL=toL(h.pos);
     if(park&&park.sel===sel){ const c=park; park=null;                  // pick a floating piece up again with a fresh grip
       Object.assign(c,{h,key:'',QL0:T.q.clone().invert().multiply(h.q),base:c.vis.quaternion.clone(),off0:c.vis.position.clone().sub(pL)});
@@ -5023,6 +5038,7 @@ const XR=(()=>{
       c.b0=sel.b; c.r0=sel.r; c.vis=new THREE.Group(); c.vis.add(makeStair([0,0,0],c.b0,c.r0,carryMat(stairCol(cur()))));
       c.off0=fromGhost&&sel.target?v3(sel.target).sub(pL):new V3();
     }
+    c.hold=false; X.lastHand=h.side;
     gXR.add(c.vis); carry=c; h.mode='carry'; updateCarry(); return true;
   }
   function updateCarry(){
@@ -5050,6 +5066,7 @@ const XR=(()=>{
       const cp=[center.x,center.y,center.z], cand=near(cp,1.9);
       const fills=[]; for(const cl of cand){ if(!okAt(cl,b,r)) continue; const ex=solid.get(kc(cl)), d=Math.hypot(cl[0]-cp[0],cl[1]-cp[1],cl[2]-cp[2])+(ex?.8:0); fills.push({cl,d}); }   // an empty cube beats filling a stair
       if(fills.length){ fills.sort((a,b)=>a.d-b.d); found=fills[0].cl; }
+      if(!found&&c.hold){ c.key=''; return; }               // in your hand away from the structure: keep the suggested spot
       if(!found) for(const cl of cand.slice(0,6)){ if(solid.get(kc(cl))) continue; for(let bb=0;bb<6&&!found;bb++) for(let rr_=0;rr_<6&&!found;rr_++) if((bb>>1)!==(rr_>>1)&&okAt(cl,bb,rr_)){ found=cl; b=bb; r=rr_; } if(found) break; }
       sel.target=found||[0,1,2].map(i=>Math.round([center.x,center.y,center.z][i])); sel.b=b; sel.r=r; syncStairQ();
     }
@@ -5059,11 +5076,18 @@ const XR=(()=>{
   function near(p,R){ const out=[]; const lo=p.map(v=>Math.floor(v-R)), hi=p.map(v=>Math.ceil(v+R));
     for(let x=lo[0];x<=hi[0];x++) for(let y=lo[1];y<=hi[1];y++) for(let z=lo[2];z<=hi[2];z++){ const d=Math.hypot(x-p[0],y-p[1],z-p[2]); if(d<=R) out.push({c:[x,y,z],d}); }
     return out.sort((a,b)=>a.d-b.d).slice(0,60).map(o=>o.c); }
+  /* holding: the stair rides at your pinch without pinching; pinch at the green spot to place it, pinch anywhere else to hold the world as usual */
+  function startHold(h){
+    const c={h,kind:'stair',sel,Mi:ID_R,key:'',base:new Quat(),QL0:T.q.clone().invert().multiply(h.q),b0:sel.b,r0:sel.r,off0:new V3(),hold:true};
+    c.vis=new THREE.Group(); c.vis.add(makeStair([0,0,0],c.b0,c.r0,carryMat(stairCol(cur())))); gXR.add(c.vis); carry=c; updateCarry();
+  }
+  function holdHand(){ const pref=hands[X.lastHand||'right']; if(pref.present) return pref; return HL.find(h=>h.present)||null; }
   function endCarry(place){
     const c=carry; if(!c) return; carry=null; if(c.h.mode==='carry') c.h.mode=null;
+    if(c.hold&&!place){ gXR.remove(c.vis); return; }
     const gc=ghostCenter();
     if(place&&sel&&sel.ok&&human()&&gc&&gc.distanceTo(c.vis.position)<PLACE_D){ gXR.remove(c.vis); buzz(c.h,.6,40); commitSel(); return; }
-    if(place&&sel&&human()&&sel===c.sel){ park=c; c.vis.traverse(o=>{ if(o.material&&o.material.opacity!==undefined) o.material.opacity=.5; }); return; }   // let go in the air: it floats there
+    if(place&&sel&&human()&&sel===c.sel&&!c.hold){ park=c; c.vis.traverse(o=>{ if(o.material&&o.material.opacity!==undefined) o.material.opacity=.5; }); return; }   // let go in the air: it floats there
     gXR.remove(c.vis);
   }
 
@@ -5120,6 +5144,9 @@ const XR=(()=>{
       if(h.pinch&&!h.was){                                       // closing your fingers moves them: act on what you were pointing at a moment ago
         let use=pr; if((!use||use.type==='grab'||(use.type==='panel'&&!use.b))&&h.lastPr&&now-h.lastPrT<450) use=h.lastPr;
         pr=use; }
+      if(h.pinch&&!h.was&&carry&&carry.hold&&carry.h===h&&(!pr||pr.type!=='panel'&&pr.type!=='tray'&&pr.type!=='handle')){
+        const gc=ghostCenter(); if(sel&&sel.ok&&gc&&gc.distanceTo(carry.vis.position)<PLACE_D){ buzz(h,.6,40); gXR.remove(carry.vis); carry=null; commitSel(); h.mode='used'; pr=null; }
+      }
       if(h.pinch&&!h.was&&pr){
         if(pr.type==='panel'){ if(pr.b) press(pr.b,h); h.mode='used'; }
         else if(pr.type==='handle'){ h.mode='handle'; pdrag={h,off:panel.position.clone().sub(h.pos)}; }
@@ -5139,13 +5166,18 @@ const XR=(()=>{
     if(regrab) startGrab();
     updateGrab();
     if(pdrag){ panel.position.copy(pdrag.h.pos).add(pdrag.off); panel.lookAt(head.p); }
+    if(carry&&carry.hold&&(!carry.h.present||sel!==carry.sel)){ endCarry(false); }
     if(carry) updateCarry();
     if(park&&(park.sel!==sel||!human())) dropPark();
+    // after your block, the stair comes to you (once a turn; No stair or Cancel keeps it away)
+    if(state&&state.started&&!state.over&&human()){ const tk=state.turnNo+':'+state.cur;
+      if(state.pieceDone&&!state.stairUsed&&X.declined!==tk&&!sel&&!liftMode&&X.offered!==tk&&canStair()&&stairsLeft(cur())>0&&!state.opts.climb&&buildLeft().stair){ X.offered=tk; selectStair(); } }
+    if(!carry&&!park&&human()&&sel&&sel.kind==='stair'&&!sel.from){ const h=holdHand(); if(h&&!h.mode) startHold(h); }
     // cursors
     let hlOn=false;
     for(const h of HL){
       const show=h.present; h.cur.visible=show; h.dot.visible=false; h.line.visible=false; if(!show) continue;
-      const pr=h.mode?{type:h.mode==='carry'?'piece':h.mode}:h.probe;
+      const pr=h.mode?{type:h.mode==='carry'?'piece':h.mode}:(carry&&carry.hold&&carry.h===h?{type:'piece'}:h.probe);
       h.cur.position.copy(h.pos); h.cur.material.color.set(COL[pr&&pr.type]||'#FFFFFF'); h.cur.scale.setScalar(h.pinch?.0045:.0062);
       if(pr&&pr.type==='mark'&&!h.mode){ hlOn=true; hlRing.position.copy(pr.m.pos); hlRing.quaternion.setFromUnitVectors(new V3(0,0,1),v3(neg(DIRS[pr.m.gi]))); }
       const pp=h.mode?null:h.pp;
@@ -5158,7 +5190,9 @@ const XR=(()=>{
     if(PREF.skip&&!cineSkip&&state&&state.started&&!state.over&&!$('cine').hidden&&$('cineEnd').hidden&&$('credits').hidden&&$('revealBtn').hidden&&shown($('cineSkip'))) $('cineSkip').click();   // cut scenes off: skip each one as it starts
     if(PREF.fast&&SPD===1&&state&&state.players.some(q=>q.bot)) setFast(true);
     handleMat.color.set(pdrag?'#5157E0':'#9599FF');
-    drawPanel(); syncTray(performance.now()); syncTV(); syncChase(); syncMarkers(performance.now());
+    const nowT=performance.now();
+    if(nowT-X.uiT>110||hoverId!==X.uiHover){ X.uiT=nowT; X.uiHover=hoverId; drawPanel(); syncChase(); }      // the panels read the page, which is slow: ~9 times a second is plenty
+    syncTray(nowT); syncTV(); syncMarkers(nowT);
     // a light that comes from over your shoulder
     const hl_=toL(head.p.clone().add(new V3(-.3,.6,.1))), C=centerL(); xrSun.position.copy(hl_); xrSun.target.position.copy(C);
   }
@@ -5173,7 +5207,7 @@ const XR=(()=>{
   const TIPS0={...TIPS};
   const XR_TIPS={
     build:['Building','Pinch a block in the tray under the panel and carry it to the structure. A green ghost shows the nearest spot it fits. Turn your hand to turn it. Let go at the ghost to place it, or let go in the air to leave it floating and grab it again with a new grip.'],
-    stair:['Your stair','A stair waits next to you. Press Place to keep it there, or pinch it and carry it somewhere else. Let go at the green ghost to place it. No stair skips it.'],
+    stair:['Your stair','The stair is in your hand. Bring it to the structure: the green ghost shows where it goes. Pinch to place it. Turn your hand to turn it. Place puts it at the suggested spot; No stair skips it.'],
     walk:['Walking','Pinch a white dot to walk there. Small dots are stair steps: you can cross them but not stop.'],
     reach:['You can take someone out','A big red dot means you could end your walk in their square. Pinch it to take them out.'],
     look:['Holding the world','Pinch the air to pick the structure up and turn it. Pinch with both hands to turn it and pull your hands apart to make it bigger.']
@@ -5186,19 +5220,20 @@ const XR=(()=>{
     const s=await navigator.xr.requestSession(ar?'immersive-ar':'immersive-vr',{requiredFeatures:['local-floor'],optionalFeatures:['hand-tracking']}).catch(err=>{ toast('Could not start: '+err.message); return null; });
     starting=false; if(!s) return;
     X.ar=ar; X.room=!ar||PREF.vr; room.visible=X.room; X.settings=false;
-    renderer.xr.setReferenceSpaceType('local-floor');
+    renderer.xr.setReferenceSpaceType('local-floor'); renderer.xr.setFramebufferScaleFactor(.9);
     await renderer.xr.setSession(s);
+    try{ const gl=renderer.getContext(), L=s.renderState.baseLayer; if(L&&'fixedFoveation' in L) L.fixedFoveation=.5; }catch(e){}
     X.session=s; X.on=true; X.placed=false; X.turnKey=''; renderer.autoClear=false;
     sun.intensity=0; xrSun.intensity=.55;
-    hullT=.045; gBlocks.traverse(o=>{ if(o.userData.hull) setHull(o); }); hullU.persp.value=1;
+    hullMat.visible=false;                                   // no dark outline shells in the headset: a third fewer things to draw each frame
     Object.assign(TIPS,XR_TIPS); gGizmo.visible=false; panelSig=''; traySig=''; chaseSig='';
     s.addEventListener('end',leave); syncBtn();
   }
   function leave(){
     if(carry) endCarry(false); dropPark(); for(const h of HL){ h.mode=null; h.was=false; h.pinch=false; }
     X.on=false; X.session=null; X.grab=null; X.anim=null; pdrag=null;
-    renderer.autoClear=true; resetT(); hullU.persp.value=0; hullU.push.value=.4; sun.intensity=.5; xrSun.intensity=0;
-    Object.assign(TIPS,TIPS0); hullT=1; resize(); if(state) refreshGhost(); syncBtn();
+    renderer.autoClear=true; resetT(); hullMat.visible=true; sun.intensity=.5; xrSun.intensity=0;
+    Object.assign(TIPS,TIPS0); resize(); if(state) refreshGhost(); syncBtn();
   }
   const btn=document.createElement('button'); btn.className='xrbtn'; btn.id='xrBtn'; btn.hidden=true; document.body.appendChild(btn);
   btn.addEventListener('click',enter);
@@ -5214,7 +5249,7 @@ const XR=(()=>{
   return X;
 })();
 function drawScene(sc,cm){ if(XR.on) XR.render(sc===ST.scene); else renderer.render(sc,cm); }
-function xrLoop(t,xf){ const now=performance.now(); XR.drawn=false; if(XR.on&&xf){ try{ XR.tick(xf); }catch(e){ if(!xrLoop.warned){ xrLoop.warned=1; console.warn('xr tick',e); } } } frame(now); if(XR.on&&!XR.drawn) XR.render(false); }
+function xrLoop(t,xf){ const now=performance.now(); XR.drawn=false; if(XR.on) TIMERS.pump(); if(XR.on&&xf){ try{ XR.tick(xf); }catch(e){ if(!xrLoop.warned){ xrLoop.warned=1; console.warn('xr tick',e); } } } frame(now); if(XR.on&&!XR.drawn) XR.render(false); }
 renderer.xr.enabled=true;
 
 /* ---------- boot (state survives a republish) ---------- */
