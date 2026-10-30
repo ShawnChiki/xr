@@ -6,6 +6,7 @@ Open in the Quest browser: https://shawnchiki.github.io/xr/pentimento/
 
 ## Versions
 
+- **v1.9** — Dial menus on the right hand. Hold A for the tool dial (Draw, Bend, Flatten, Smooth, Mark, Erase bits, Erase lines); hold B for the panel dial (Sketch, Layers, Surface and View panels, plus show/hide tips, surface, lines and see room / full VR). Push the stick toward a slice, or move your hand that way, and let go of the button to pick. Undo and redo moved to X and Y on the left hand.
 - **v1.8** — Creases take priority over smoothing: Smoothness, smooth paint (built and live preview) and Relax no longer round a crease off (at Smoothness 10 a test ridge kept 81–85° of its 84° fold, where before it flattened to 5°). Smoothness at its highest still listens to your lines. New Relax slider (Surface tab, 0–10, default 2) settles the finished mesh while every guide and crease stays put.
 - **v1.7** — Mesh edges view (View tab, Surface tab or Q key): Off, Quads (the new quad layout that Save OBJ exports, with edges running along the creases) or Fine (the subdivided mesh you see). Works over Shaded and Zebra.
 - **v1.6** — Switch between MR and VR any time from the Room button at the top of the menu (or View → Background → Your room); both Enter buttons open the same kind of session, so there's no leaving and re-entering. Surface on/off button in the menu's top row (S key): while it's off nothing rebuilds, so sketching and flattening run at full speed, and turning it on builds once. Auto/Manual build moved to the Surface tab. Faster smooth-paint tinting.
