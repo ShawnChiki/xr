@@ -1185,42 +1185,81 @@ function squareQuads(cage, M, flow, iters, L, Mfit){
     }
   }
 }
-function catmullClark({ V, F, sharp, feat, corner }, curves){
+function catmullClark({ V, F, sharp, feat, corner, soft, chain, tips, fade }, curves){
   const nv = V.length / 3, eid = new Map(), E = [];
   F.forEach((f, fi) => { for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = ek(a, b); let e = eid.get(k); if (e === undefined){ e = E.length; eid.set(k, e); E.push({ a, b, f: [] }); } E[e].f.push(fi); } });
   const ne = E.length, nf = F.length, out = new Float64Array((nv + ne + nf) * 3);
   const FP = F.map(f => { const c = [0, 0, 0]; for (const v of f){ c[0] += V[3 * v]; c[1] += V[3 * v + 1]; c[2] += V[3 * v + 2]; } return c.map(x => x / f.length); });
   FP.forEach((c, i) => out.set(c, (nv + ne + i) * 3));
-  E.forEach((e, i) => { const k = ek(e.a, e.b); e.crease = e.f.length !== 2 || sharp.has(k); e.sharp = sharp.has(k);
+  // sharpness: sharp edges are fully sharp unless `soft` gives them a value; below 1 an edge is only partly sharp
+  E.forEach((e, i) => { const k = ek(e.a, e.b), bd = e.f.length !== 2; e.s = bd ? Infinity : sharp.has(k) ? (soft && soft.has(k) ? soft.get(k) : Infinity) : 0;
+    e.crease = bd || e.s >= 1; e.sharp = sharp.has(k) && e.s > 0;
     const m = [0, 1, 2].map(c => (V[3 * e.a + c] + V[3 * e.b + c]) / 2);
-    const p = e.crease ? m : [0, 1, 2].map(c => (V[3 * e.a + c] + V[3 * e.b + c] + FP[e.f[0]][c] + FP[e.f[1]][c]) / 4);
+    let p = e.crease ? m : [0, 1, 2].map(c => (V[3 * e.a + c] + V[3 * e.b + c] + FP[e.f[0]][c] + FP[e.f[1]][c]) / 4);
+    if (!e.crease && e.s > 0) p = p.map((x, c) => x + (m[c] - x) * e.s);
     out.set(p, (nv + i) * 3); });
   const vf = Array.from({ length: nv }, () => []), ve = Array.from({ length: nv }, () => []);
   F.forEach((f, fi) => f.forEach(v => vf[v].push(fi))); E.forEach((e, i) => { ve[e.a].push(i); ve[e.b].push(i); });
   for (let v = 0; v < nv; v++){
-    const P = [V[3 * v], V[3 * v + 1], V[3 * v + 2]], cr = ve[v].filter(i => E[i].crease);
+    const P = [V[3 * v], V[3 * v + 1], V[3 * v + 2]], cr = ve[v].filter(i => E[i].s > 0);
     let q = P;
-    if (!ve[v].length){ q = P; }
-    else if (cr.length < 2){ const n = ve[v].length, Fa = [0, 0, 0], Ra = [0, 0, 0];
+    if (ve[v].length && cr.length < 2 || (cr.length >= 2 && cr.some(i => E[i].s < 1) && vf[v].length)){
+      const n = ve[v].length, Fa = [0, 0, 0], Ra = [0, 0, 0];
       for (const fi of vf[v]) for (let c = 0; c < 3; c++) Fa[c] += FP[fi][c] / vf[v].length;
       for (const i of ve[v]){ const e = E[i]; for (let c = 0; c < 3; c++) Ra[c] += (V[3 * e.a + c] + V[3 * e.b + c]) / 2 / n; }
       q = [0, 1, 2].map(c => (Fa[c] + 2 * Ra[c] + (n - 3) * P[c]) / n); }
-    else if (cr.length === 2){ const o = cr.map(i => E[i].a === v ? E[i].b : E[i].a);
-      const u = norm([V[3 * o[0]] - P[0], V[3 * o[0] + 1] - P[1], V[3 * o[0] + 2] - P[2]]), w = norm([V[3 * o[1]] - P[0], V[3 * o[1] + 1] - P[1], V[3 * o[1] + 2] - P[2]]);
-      q = corner && corner[v] ? P : [0, 1, 2].map(c => (6 * P[c] + V[3 * o[0] + c] + V[3 * o[1] + c]) / 8); }
+    if (cr.length >= 2){
+      let hq = P;
+      if (cr.length === 2){ const o = cr.map(i => E[i].a === v ? E[i].b : E[i].a); hq = corner && corner[v] ? P : [0, 1, 2].map(c => (6 * P[c] + V[3 * o[0] + c] + V[3 * o[1] + c]) / 8); }
+      const vs = cr.reduce((a, i) => a + Math.min(E[i].s, 1), 0) / cr.length;   // partly sharp edges blend toward the smooth rule
+      q = vs >= 1 ? hq : q.map((x, c) => x + (hq[c] - x) * vs);
+    }
     out.set(q, v * 3);
   }
   const NF = [], NS = new Set();
   F.forEach((f, fi) => { const n = f.length; for (let i = 0; i < n; i++){ const a = f[i], b = f[(i + 1) % n], z = f[(i - 1 + n) % n];
     NF.push([a, nv + eid.get(ek(a, b)), nv + ne + fi, nv + eid.get(ek(z, a))]); } });
-  E.forEach((e, i) => { if (e.sharp){ NS.add(ek(e.a, nv + i)); NS.add(ek(nv + i, e.b)); } });
+  const NSoft = new Map(), NCh = chain ? new Set() : null;
+  E.forEach((e, i) => { const k1 = ek(e.a, nv + i), k2 = ek(nv + i, e.b);
+    if (e.sharp && e.s - 1 > 0){ NS.add(k1); NS.add(k2); if (e.s !== Infinity){ NSoft.set(k1, e.s - 1); NSoft.set(k2, e.s - 1); } }
+    if (NCh && chain.has(ek(e.a, e.b))){ NCh.add(k1); NCh.add(k2); } });
   // curve edges carry their curve down to the finer level; points on strict lines go back exactly onto them
   const NFt = new Map();
   if (feat) E.forEach((e, i) => { const id = feat.get(ek(e.a, e.b)); if (id === undefined) return; NFt.set(ek(e.a, nv + i), id); NFt.set(ek(nv + i, e.b), id);
     const C = curves && curves[id]; if (C && C.strict) for (const v of [e.a, nv + i, e.b]){ const q = closestOnPoly(C, [out[3 * v], out[3 * v + 1], out[3 * v + 2]]); if (q.d2 < 1) out.set(q.p, 3 * v); } });
   const NC = new Uint8Array(nv + ne + nf); if (corner) NC.set(corner.subarray(0, nv));
-  return { V: Array.from(out), F: NF, sharp: NS, feat: NFt, corner: NC };
+  return { V: Array.from(out), F: NF, sharp: NS, feat: NFt, corner: NC, soft: NSoft, chain: NCh, tips, fade };
 }
+// ---------------- soft crease ends: a sharp crease that stops in the open (not on another crease or the border)
+// fades out over its last stretch instead of ending in a hard notch
+function prepTips(cage, fade){
+  if (!(fade > 0)) return;
+  const { V, F, sharp } = cage, nv = V.length / 3, cnt = new Map();
+  F.forEach(f => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); cnt.set(k, (cnt.get(k) || 0) + 1); }));
+  const deg = new Int32Array(nv), inner = new Int32Array(nv), chain = new Set();
+  for (const [k, c] of cnt){ const a = Math.floor(k / 2097152), b = k % 2097152; if (c !== 2 || sharp.has(k)){ deg[a]++; deg[b]++; } if (c === 2 && sharp.has(k)){ inner[a]++; inner[b]++; chain.add(k); } }
+  const tips = []; for (let v = 0; v < nv; v++) if (deg[v] === 1 && inner[v] === 1) tips.push(v);
+  if (!tips.length) return;
+  cage.tips = tips; cage.chain = chain; cage.fade = fade;
+}
+// before each subdivision step: edges of the crease near a free end get a sharpness that grows with distance from it
+function applyTips(m, rem){
+  if (!m.tips || !m.chain) return;
+  const V = m.V, adj = new Map(), len = (a, b) => Math.hypot(V[3 * a] - V[3 * b], V[3 * a + 1] - V[3 * b + 1], V[3 * a + 2] - V[3 * b + 2]);
+  for (const k of m.chain){ const a = Math.floor(k / 2097152), b = k % 2097152; (adj.get(a) || adj.set(a, []).get(a)).push(b); (adj.get(b) || adj.set(b, []).get(b)).push(a); }
+  const soft = m.soft = new Map(m.soft || []);
+  for (const t of m.tips){
+    // the crease's own length caps the fade, so a short crease still keeps some sharpness in its middle
+    let D = m.fade; { let tot = 0, prev = -1, v = t, guard = 0; while (guard++ < 100000){ const nx = (adj.get(v) || []).filter(w => w !== prev); if (nx.length !== 1 || tot > 2 * D) break; tot += len(v, nx[0]); prev = v; v = nx[0]; } D = Math.min(D, tot * 0.45); }
+    if (!(D > 0)) continue;
+    let prev = -1, v = t, d = 0, guard = 0;
+    while (d < D && guard++ < 100000){ const nx = (adj.get(v) || []).filter(w => w !== prev); if (nx.length !== 1) break; const w = nx[0], l = len(v, w), mid = d + l / 2;
+      if (mid < D){ const k = ek(v, w), sv = (rem + 0.5) * mid / D; m.sharp.add(k); soft.set(k, Math.min(soft.has(k) ? soft.get(k) : Infinity, sv)); }
+      d += l; prev = v; v = w; }
+  }
+}
+// what to draw as hard: partly sharp edges left at the end are drawn smooth
+const hardView = m => (m.soft && m.soft.size ? { ...m, sharp: new Set([...m.sharp].filter(k => !m.soft.has(k) || m.soft.get(k) >= 1)) } : m);
 // triangles for drawing, with normals that stay smooth except across sharp creases
 function shade({ V, F, sharp }){
   const nv = V.length / 3, fn = F.map(f => { const a = f[0], b = f[1], c = f[2], d = f[3] !== undefined ? f[3] : f[0];
@@ -1337,7 +1376,9 @@ function solve(strokes, prm, progress = () => {}){
     if (prm.hard > 0) autoCreases(cage, prm.hard);
     progress(0.95, 'Hugging the surface');
     hugCage(cage, info, M, curves, L, 8, 0.3);
-    let smooth = catmullClark(cage, curves); for (let i = 1; i < Math.max(1, prm.subd | 0); i++) smooth = catmullClark(smooth, curves);
+    const lv = Math.max(1, prm.subd | 0); prepTips(cage, prm.tipFade || 0); applyTips(cage, lv);
+    let smooth = catmullClark(cage, curves); for (let i = 1; i < lv; i++){ applyTips(smooth, lv - i); smooth = catmullClark(smooth, curves); }
+    smooth = hardView(smooth);
     progress(1, 'Done');
     return { surface: shade(smooth), quadWire: wire(cage), fineWire: wire(smooth), creases: creaseLines(smooth),
       quads: { V: new Float32Array(cage.V), F: new Int32Array(cage.F.flat()), C: new Int32Array(cage.F.map(f => f.length)) },
@@ -1376,8 +1417,10 @@ function solve(strokes, prm, progress = () => {}){
   if (prm.hard > 0) autoCreases(cage, prm.hard);
   progress(0.97, 'Hugging the surface');
   hugCage(cage, M, Mfit, curves, L, 6);
+  const lv = 1 + (prm.subd | 0); prepTips(cage, prm.tipFade || 0); applyTips(cage, lv);
   const quads = catmullClark(cage, curves);
-  let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++) smooth = catmullClark(smooth, curves);
+  let smooth = quads; for (let i = 0; i < (prm.subd | 0); i++){ applyTips(smooth, lv - 1 - i); smooth = catmullClark(smooth, curves); }
+  smooth = hardView(smooth);
   const sh = shade(smooth);
   if (paint){ sh.paint = new Float32Array(sh.pos.length / 3); for (let i = 0; i < sh.paint.length; i++) sh.paint[i] = paint(sh.pos[3 * i], sh.pos[3 * i + 1], sh.pos[3 * i + 2]); }
   progress(1, 'Done');
