@@ -41,9 +41,6 @@
   #banner{position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);text-align:center;padding:22px 30px;border-radius:14px;
     background:var(--chalk);color:var(--ink);pointer-events:none;max-width:calc(100vw - 48px);box-sizing:border-box}
   #banner[hidden]{display:none}
-  #toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);padding:9px 16px;border-radius:999px;background:var(--chalk);color:var(--ink);
-    font:600 15px var(--body);border-left:8px solid var(--ruby);pointer-events:none}
-  #toast[hidden]{display:none}
   button.toggle[aria-pressed="true"]{border-color:var(--ruby)}
   #banner strong{display:block;font:800 26px/1.1 var(--title)}
   #banner span{display:block;margin-top:8px;font-size:15px}
@@ -65,6 +62,7 @@
       <button id="vr" disabled>Enter VR</button>
       <button id="desk" class="ghost">Play on desktop</button>
       <button id="hide" class="ghost toggle" aria-pressed="true">I hide Black's ruby</button>
+      <button id="bg" class="ghost">Backdrop: Space</button>
       <button id="again" class="ghost" hidden>New game</button>
     </div>
     <p id="status">Checking for a headset…</p>
@@ -81,6 +79,7 @@
         <dt>Grip ruby</dt><dd>Drag the floating ruby somewhere safer. It moves slowly, and slips if you pull too far.</dd>
         <dt>Y</dt><dd>Sense Black's diggers through the rock</dd>
         <dt>B</dt><dd>How to play</dd>
+        <dt>Click right stick</dt><dd>Change the backdrop</dd>
         <dt>Hiding</dt><dd>Hold the ruby out and pull a trigger to place it</dd>
       </dl>
       <h2>Desktop</h2>
@@ -91,13 +90,13 @@
         <dt>E</dt><dd>Drag or let go of the floating ruby</dd>
         <dt>Q</dt><dd>Sense Black's diggers</dd>
         <dt>R</dt><dd>New game</dd>
+        <dt>B</dt><dd>Change the backdrop</dd>
         <dt>Hiding</dt><dd>Look where you want the ruby and click</dd>
       </dl>
     </details>
   </div>
 </div>
 <div id="cross"></div>
-<div id="toast" hidden></div>
 <div id="banner" hidden><strong></strong><span></span></div>
 
 <script type="importmap">
@@ -252,17 +251,18 @@ renderer.xr.setFoveation?.(1);
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x000000);
+scene.background = new THREE.Color(0x000000);  // set by applyBackdrop
 scene.fog = new THREE.FogExp2(0x040508, 0.022);
 const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.03, 220);
 const rig = new THREE.Group(); rig.add(camera); scene.add(rig);
 
-scene.add(new THREE.HemisphereLight(0xf4f6ff, 0x2a2622, 1.1));
+const hemi = new THREE.HemisphereLight(0xf4f6ff, 0x2a2622, 1.1); scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff6ea, 1.7); sun.position.set(0.45, 1, 0.3); scene.add(sun);
 const rim = new THREE.DirectionalLight(0x9fb4ff, 0.35); rim.position.set(-0.6, -0.2, -0.7); scene.add(rim);
 // a dark dome with a faint cold glow along the horizon
+let dome;
 {
-  const dome = new THREE.Mesh(new THREE.SphereGeometry(160, 32, 16), new THREE.ShaderMaterial({
+  dome = new THREE.Mesh(new THREE.SphereGeometry(160, 32, 16), new THREE.ShaderMaterial({
     side: THREE.BackSide, depthWrite: false, fog: false,
     uniforms: { c: { value: new THREE.Vector3(0, SURF, 0) } },
     vertexShader: 'varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
@@ -318,15 +318,78 @@ function flushDirty(budgetMs){
 }
 
 // stars and a faint outline of the plot
+let stars, edges;
 {
   const p = [];
   for (let i = 0; i < 900; i++){ const v = new V3().randomDirection().multiplyScalar(80 + Math.random() * 30); p.push(v.x + SIZE / 2, v.y + SURF, v.z + SIZE / 2); }
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
-  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8d929b, size: 1.6, sizeAttenuation: false, fog: false })));
+  stars = new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8d929b, size: 1.6, sizeAttenuation: false, fog: false })); scene.add(stars);
   const box = new THREE.Box3(new V3(0, 0, 0), new V3(SIZE, HY, SIZE));
-  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(SIZE, HY, SIZE)),
+  edges = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(SIZE, HY, SIZE)),
     new THREE.LineBasicMaterial({ color: 0xe6e9ec, transparent: true, opacity: 0.08, fog: false }));
   box.getCenter(edges.position); scene.add(edges);
+}
+
+// the grey box test facility: a huge gridded hangar, ceiling light strips, hazard band at the base
+const facility = new THREE.Group();
+{
+  const RW = 76, RH = 34, cx = SIZE / 2, cz = SIZE / 2;
+  const room = new THREE.Mesh(new THREE.BoxGeometry(RW, RH, RW), new THREE.ShaderMaterial({
+    side: THREE.BackSide, fog: false,
+    vertexShader: `varying vec3 vW; varying vec3 vN;
+      void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vN = -normal; gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: `varying vec3 vW; varying vec3 vN;
+      float line(float v, float w){ float f = abs(fract(v) - 0.5); return 1.0 - smoothstep(0.5 - w, 0.5, f); }
+      float h2(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+      void main(){
+        vec3 n = abs(vN);
+        vec2 uv = n.y > 0.5 ? vW.xz : (n.x > 0.5 ? vW.zy : vW.xy);
+        float tile = h2(floor(uv / 4.0));
+        vec3 base = vec3(0.47 + 0.035 * tile);
+        if (vN.y > 0.5) base *= 1.12;            // floor
+        else if (vN.y < -0.5) base *= 0.62;      // ceiling
+        base *= 1.0 - 0.13 * line(uv.x, 0.02) - 0.13 * line(uv.y, 0.02);
+        base *= 1.0 - 0.28 * line(uv.x / 4.0, 0.006) - 0.28 * line(uv.y / 4.0, 0.006);
+        if (abs(vN.y) < 0.5 && vW.y < 1.4){         // yellow and black hazard band on the walls
+          float st = step(0.5, fract((uv.x + vW.y) * 0.8));
+          base = mix(vec3(0.95, 0.72, 0.08), vec3(0.08), st);
+          if (vW.y > 1.25) base = vec3(0.12);
+        }
+        if (abs(vN.y) < 0.5) base *= 0.85 + 0.15 * smoothstep(0.0, 24.0, vW.y);
+        gl_FragColor = vec4(base, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`
+  }));
+  room.position.set(cx, RH / 2 - 0.02, cz); facility.add(room);
+  const strip = new THREE.BoxGeometry(0.5, 0.12, RW - 10), lit = new THREE.MeshBasicMaterial({ color: 0xffffff, fog: false });
+  for (let i = -3; i <= 3; i++){ const m = new THREE.Mesh(strip, lit); m.position.set(cx + i * 9, RH - 0.1, cz); facility.add(m); }
+  // a plinth outline where the plot meets the hangar floor
+  const pl = new THREE.Mesh(new THREE.BoxGeometry(SIZE + 1.2, 0.3, SIZE + 1.2), new THREE.MeshLambertMaterial({ color: 0x2d2f33 }));
+  pl.position.set(cx, 0.1, cz); facility.add(pl);
+  facility.visible = false; scene.add(facility);
+}
+const BACKDROPS = {
+  space:    { name: 'Space',         bg: 0x000000, fog: 0x040508, dens: 0.022, hemi: 1.1, sun: 1.7, edge: 0.08, dome: true,  stars: true,  room: false },
+  facility: { name: 'Test facility', bg: 0x77797d, fog: 0x8a8c90, dens: 0.009, hemi: 1.35, sun: 1.3, edge: 0,   dome: false, stars: false, room: true  },
+  void:     { name: 'White void',    bg: 0xe9e6e0, fog: 0xe9e6e0, dens: 0.03,  hemi: 1.5, sun: 1.2, edge: 0,    dome: false, stars: false, room: false },
+};
+const BD_KEYS = Object.keys(BACKDROPS);
+let backdrop = 'space';
+try { const v = localStorage.getItem('ns-bg'); if (BACKDROPS[v]) backdrop = v; } catch (e) {}
+function applyBackdrop(k){
+  backdrop = k; const B = BACKDROPS[k];
+  try { localStorage.setItem('ns-bg', k); } catch (e) {}
+  scene.background.setHex(B.bg); scene.fog.color.setHex(B.fog); scene.fog.density = B.dens;
+  hemi.intensity = B.hemi; sun.intensity = B.sun;
+  edges.visible = B.edge > 0; edges.material.opacity = B.edge;
+  dome.visible = B.dome; stars.visible = B.stars; facility.visible = B.room;
+  const btn = document.getElementById('bg'); if (btn) btn.textContent = 'Backdrop: ' + B.name;
+}
+function nextBackdrop(){
+  const k = BD_KEYS[(BD_KEYS.indexOf(backdrop) + 1) % BD_KEYS.length];
+  applyBackdrop(k); tone(520, 0.1, 'triangle', 0.1);
+  wordBurst(BACKDROPS[k].name, 'backdrop', k === 'void' ? 0x16181c : 0xe6e9ec, null);
 }
 
 function glowTexture(rgb){
@@ -538,20 +601,91 @@ function setLabel(L, line1, line2 = '', accent = '#e0103a'){
   if (line2){ x.font = '400 36px "Instrument Sans", system-ui, sans-serif'; x.fillStyle = '#3b3f46'; x.fillText(line2, 394, 120); }
   L.tex.needsUpdate = true;
 }
-const skyLabel = makeLabel(0.75), gunLabel = makeLabel(0.5);
-let gunLabelT = 0;
-function toast(text, colorHex){
-  gunLabelT = 1.8;
-  const col = '#' + colorHex.toString(16).padStart(6, '0');
-  setLabel(gunLabel, text, '', col);
-  if (!inXR()){ const t = $('toast'); t.textContent = text; t.style.borderColor = col; t.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => t.hidden = true, 1800); }
+const skyLabel = makeLabel(0.75);
+
+// pickups spell their name in particles: they burst out of the orb, form the words, hold, then drift up and away
+const WB_MAX = 5000;
+const wb = (() => {
+  const pos = new Float32Array(WB_MAX * 3), from = new Float32Array(WB_MAX * 3), to = new Float32Array(WB_MAX * 3), jit = new Float32Array(WB_MAX);
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setDrawRange(0, 0);
+  const dot = document.createElement('canvas'); dot.width = dot.height = 32;
+  const dx = dot.getContext('2d'); dx.fillStyle = '#4a4a4a'; dx.beginPath(); dx.arc(16, 16, 15, 0, 7); dx.fill();
+  dx.fillStyle = '#fff'; dx.beginPath(); dx.arc(16, 16, 10, 0, 7); dx.fill();       // a darker rim keeps the word readable on light backdrops
+  const tex = new THREE.CanvasTexture(dot);
+  const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.011, map: tex, alphaTest: 0.4, transparent: true, depthTest: false, depthWrite: false, fog: false });
+  mat.toneMapped = false;
+  const pts = new THREE.Points(g, mat); pts.frustumCulled = false; pts.renderOrder = 95;
+  const grp = new THREE.Group(); grp.add(pts); grp.visible = false; scene.add(grp);
+  const cv = document.createElement('canvas'); cv.width = 640; cv.height = 200;
+  return { pos, from, to, jit, g, mat, grp, cv, n: 0, t: 99 };
+})();
+const WB_IN = 0.5, WB_HOLD = 1.6, WB_OUT = 0.7;
+const wordCache = new Map();
+function wordPoints(title, sub){
+  const key = title + '|' + sub; if (wordCache.has(key)) return wordCache.get(key);
+  const x = wb.cv.getContext('2d', { willReadFrequently: true }), W = 640, H = 200;
+  x.clearRect(0, 0, W, H); x.fillStyle = '#fff'; x.textAlign = 'center';
+  x.font = '800 92px Unbounded, system-ui, sans-serif'; x.fillText(title, W / 2, 104);
+  x.font = '600 40px "Instrument Sans", system-ui, sans-serif'; x.fillText(sub, W / 2, 172);
+  const img = x.getImageData(0, 0, W, H).data, cand = [];
+  for (let y = 0; y < H; y += 2) for (let i = 0; i < W; i += 2) if (img[(y * W + i) * 4 + 3] > 140) cand.push(i, y);
+  wordCache.set(key, cand); return cand;
 }
+// build every pickup word ahead of time, once the fonts have loaded
+document.fonts?.ready?.then(() => setTimeout(() => { for (const k in POW_WORDS) wordPoints(...POW_WORDS[k]); for (const k in BACKDROPS) wordPoints(BACKDROPS[k].name, 'backdrop'); }, 300));
+function wordBurst(title, sub, color, origin){
+  const W = 640, H = 200, cand = wordPoints(title, sub);
+  let step = 1; while (cand.length / 2 / step > WB_MAX) step++;
+  // measure the ink so long words scale down to fit
+  let minX = W, maxX = 0; for (let i = 0; i < cand.length; i += 2){ minX = Math.min(minX, cand[i]); maxX = Math.max(maxX, cand[i]); }
+  const wM = Math.min(1.15, (maxX - minX) * 0.0026), k = wM / Math.max(1, maxX - minX), cxp = (minX + maxX) / 2;
+  wb.mat.size = Math.max(0.006, k * 2 * 1.5 * Math.sqrt(step));
+  // place the word in front of you, a little above eye level, facing you
+  const f = headForward(new V3()); f.y = 0; if (f.lengthSq() < 1e-4) f.set(0, 0, -1); f.normalize();
+  wb.grp.position.copy(HEAD).addScaledVector(f, 1.7); wb.grp.position.y = HEAD.y + 0.22;
+  wb.grp.lookAt(HEAD.x, wb.grp.position.y, HEAD.z); wb.grp.updateMatrixWorld();
+  const o = origin ? wb.grp.worldToLocal(origin.clone()) : new V3(0, -0.6, 0.4);
+  o.z = Math.min(o.z, 0.9);                 // never start the burst inside your face
+  let n = 0;
+  for (let i = 0; i < cand.length / 2 && n < WB_MAX; i += step, n++){
+    const px = cand[i * 2], py = cand[i * 2 + 1];
+    wb.to[n * 3] = (px - cxp) * k; wb.to[n * 3 + 1] = (H * 0.55 - py) * k; wb.to[n * 3 + 2] = (Math.random() - 0.5) * 0.02;
+    const r = Math.random() * 0.08;
+    _a.randomDirection().multiplyScalar(r);
+    wb.from[n * 3] = o.x + _a.x; wb.from[n * 3 + 1] = o.y + _a.y; wb.from[n * 3 + 2] = o.z + _a.z;
+    wb.jit[n] = Math.random();
+  }
+  wb.n = n; wb.g.setDrawRange(0, n); wb.mat.color.setHex(color); wb.t = 0; wb.grp.visible = true;
+}
+function updateWords(dt){
+  if (!wb.grp.visible) return;
+  wb.t += dt;
+  const T = wb.t, P = wb.pos, n = wb.n;
+  if (T > WB_IN + WB_HOLD + WB_OUT){ wb.grp.visible = false; return; }
+  for (let i = 0; i < n; i++){
+    const j = wb.jit[i], i3 = i * 3;
+    const a = clamp((T - j * 0.18) / WB_IN, 0, 1), e = 1 - Math.pow(1 - a, 3);
+    let x = wb.from[i3] + (wb.to[i3] - wb.from[i3]) * e, y = wb.from[i3 + 1] + (wb.to[i3 + 1] - wb.from[i3 + 1]) * e, z = wb.from[i3 + 2] + (wb.to[i3 + 2] - wb.from[i3 + 2]) * e;
+    if (a >= 1){ const sh = 0.0025; x += Math.sin(T * 9 + j * 40) * sh; y += Math.cos(T * 7 + j * 31) * sh; }
+    const o = T - WB_IN - WB_HOLD - j * 0.25;
+    if (o > 0){ x += (j - 0.5) * o * 0.5; y += o * (0.35 + j * 0.5); z += Math.sin(j * 50) * o * 0.4; }
+    P[i3] = x; P[i3 + 1] = y; P[i3 + 2] = z;
+  }
+  wb.g.attributes.position.needsUpdate = true;
+  wb.mat.opacity = 1 - clamp((T - WB_IN - WB_HOLD) / WB_OUT, 0, 1);
+}
+const POW_WORDS = {
+  wide:    ['Wide beam', 'melts a wider tunnel'],
+  fast:    ['Fast beam', 'melts three times faster'],
+  burst:   ['Grenades', 'shots blow out a sphere'],
+  compass: ['Compass', 'points at your buried ruby'],
+};
 
 // the how-to panel
 const help = (() => {
-  const c = document.createElement('canvas'); c.width = 1024; c.height = 820;
+  const c = document.createElement('canvas'); c.width = 1024; c.height = 870;
   const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
-  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2 * 820 / 1024), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2 * 870 / 1024), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
   m.material.toneMapped = false; m.renderOrder = 101; m.visible = false; scene.add(m);
   return { m, c, tex };
 })();
@@ -570,7 +704,7 @@ function gemIcon(x, cx, cy, s, glow){
   x.lineTo(cx - s * 0.5, cy - s * 0.55); x.lineTo(cx - s * 0.85, cy - s * 0.15); x.closePath(); x.fill();
 }
 function drawHelp(){
-  const x = help.c.getContext('2d'), W = 1024, H = 820;
+  const x = help.c.getContext('2d'), W = 1024, H = 870;
   x.clearRect(0, 0, W, H);
   x.fillStyle = '#e6e9ec'; x.beginPath(); x.roundRect(4, 4, W - 8, H - 8, 36); x.fill();
   x.fillStyle = '#000'; x.beginPath(); x.roundRect(4, 520, W - 8, H - 524, [0, 0, 36, 36]); x.fill();
@@ -595,7 +729,8 @@ function drawHelp(){
   });
   x.fillStyle = '#9aa0a8'; x.font = body;
   x.fillText('Grip rock to climb, let go mid-pull to fling. Y senses Black.', 56, 735);
-  x.fillStyle = '#e6e9ec'; x.fillText('B opens this again. Pull a trigger to close it.', 56, 780);
+  x.fillText('Click the right stick to change the backdrop.', 56, 780);
+  x.fillStyle = '#e6e9ec'; x.fillText('B opens this again. Pull a trigger to close it.', 56, 830);
   help.tex.needsUpdate = true;
 }
 function showHelp(on){
@@ -821,6 +956,7 @@ addEventListener('keydown', e => {
   desk.keys.add(e.code);
   if (inXR()) return;
   if (e.code === 'KeyQ') toggleGhosts();
+  if (e.code === 'KeyB') nextBackdrop();
   if (e.code === 'KeyR') { if (S.mode !== 'ready') newGame(); }
   if (e.code === 'KeyH' && (S.mode === 'won' || S.mode === 'lost')){ setHide(!SET.hide); drawEnd(); }
   if (e.code === 'KeyE') deskCarry();
@@ -861,6 +997,8 @@ function setDeskButtons(){
 }
 $('hide').onclick = () => setHide(!SET.hide);
 setHide(SET.hide);
+$('bg').onclick = () => { const k = BD_KEYS[(BD_KEYS.indexOf(backdrop) + 1) % BD_KEYS.length]; applyBackdrop(k); };
+applyBackdrop(backdrop);
 deskBtn.onclick = () => {
   if (S.mode === 'ready') return startDesktop();
   card.hidden = true; renderer.domElement.requestPointerLock?.();
@@ -1287,11 +1425,11 @@ function updateOrbs(dt, now){
       o.g.visible = false; o.wait = 25;
       if (o.kind !== 'compass'){
         S.charge = 1; S.pow[o.kind] = 15;
-        toast({ wide: 'Wide beam', fast: 'Fast beam', burst: 'Grenade launcher' }[o.kind], POW[o.kind].color);
+        wordBurst(...POW_WORDS[o.kind], POW[o.kind].color, o.g.position);
         const notes = { wide: [440, 554, 659], fast: [660, 880, 1320], burst: [196, 262, 392] }[o.kind];
         notes.forEach((f, i) => tone(f, 0.18, o.kind === 'burst' ? 'sawtooth' : 'triangle', 0.12, 0, i * 0.06));
       }
-      else { S.compass = 20; toast('Compass to your ruby', 0xff2a50); [523, 784, 1046].forEach((f, i) => tone(f, 0.25, 'sine', 0.14, 0, i * 0.08)); }
+      else { S.compass = 20; wordBurst(...POW_WORDS.compass, 0xff2a50, o.g.position); [523, 784, 1046].forEach((f, i) => tone(f, 0.25, 'sine', 0.14, 0, i * 0.08)); }
       for (const h of hands) buzz(h, 0.7, 90);
     }
   }
@@ -1322,6 +1460,7 @@ function xrFrame(dt){
   } else if (Math.abs(rx) < 0.3) snapReady = true;
   const aBtn = edge(R, 4), xBtn = edge(L, 4), jump = aBtn || xBtn;
   if (edge(L, 5)) toggleGhosts();
+  if (edge(R, 3)) nextBackdrop();
   if (edge(R, 5)) showHelp(!help.m.visible);
   const ended = S.mode === 'won' || S.mode === 'lost';
   if (ended && xBtn){ setHide(!SET.hide); drawEnd(); }
@@ -1443,22 +1582,19 @@ renderer.setAnimationLoop(() => {
       skyLabel.sp.visible = true; skyLabel.sp.position.copy(skyRuby.position).add(_a.set(0, 0.38, 0));
       setLabel(skyLabel, 'Black wants this ruby', 'Keep their towers away from it');
     } else skyLabel.sp.visible = false;
-    gunLabelT -= dt;
-    gunLabel.sp.visible = gunLabelT > 0 && inXR();
-    if (gunLabel.sp.visible){ const R = hand('right') || hands.find(h => h.src); if (R) handPos(R, gunLabel.sp.position).add(_a.set(0, 0.14, 0)); }
     if (panelT > 0){ panelT -= dt; if (panelT <= 0) panel.m.visible = false; }
   }
   for (const b of bots){
     b.ghost.visible = S.ghosts && S.mode !== 'ready';
     if (b.ghost.visible){ b.ghost.position.copy(b.mode === 'fill' && b.threat ? b.threat : b.pos); b.ghost.userData.line.color.setHex(b.mode === 'dig' ? 0xe6e9ec : 0xe0103a); }
   }
-  updateSparks(dt); updatePuffs(dt); updateShots(dt);
+  updateSparks(dt); updatePuffs(dt); updateShots(dt); updateWords(dt);
   flushDirty(inXR() ? 5 : 8);
   renderer.render(scene, camera);
 });
 
 // for quick testing from the console
-window.NS = { showHelp, explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
+window.NS = { wordBurst, applyBackdrop, nextBackdrop, orbs, showHelp, explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
 </script>
 <script src="../updated.js"></script>
 </body>
