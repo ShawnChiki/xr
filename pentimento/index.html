@@ -51,7 +51,7 @@
 </head>
 <body>
 <div class="slab card">
-  <h1>PENTI<span>MENTO</span><small id="ver">XR v2.16</small></h1>
+  <h1>PENTI<span>MENTO</span><small id="ver">XR v2.17</small></h1>
   <p>Sketch skate terrain with as many loose lines as you like. Mark the sharp edges and the lines that matter, and one smooth quad surface is found through all of them.</p>
   <div class="types"><span><i style="background:var(--loose)"></i>Loose</span><span><i style="background:var(--guide)"></i>Guide</span><span><i style="background:var(--crease)"></i>Crease</span><span><i style="background:var(--screase)"></i>Strict crease</span><span><i style="background:var(--edge)"></i>Edge</span><span><i style="background:var(--sedge)"></i>Strict edge</span></div>
   <div class="row">
@@ -84,7 +84,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=2.16"></script>
+<script src="demo.js?v=2.17"></script>
+<script src="solver.js?v=2.17"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -97,7 +98,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.16';
+const VERSION = '2.17';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'XR v' + VERSION;
 const V3 = THREE.Vector3;
@@ -899,13 +900,14 @@ const hasSurface = () => !!surfMesh;
 const GUIDE_LAYOUT = { '-3': 'Guides ×1', '-2': 'Guides ×4', '-1': 'Guides ×16' };
 const targetVal = () => (S.target || 0) < 0 ? -1 - ((S.target || 0) + 3) : TARGETS[S.target || 0];   // -1: one face per patch, -2: 4, -3: 16
 function params(){ const q = QUAD[S.quad]; return { detail: q, avg: q * 1.6, lines: S.avg, fair: S.fair / 10, reach: REACH[S.reach], group: GROUP[S.group], subd: S.subd, relax: S.relax || 0, target: targetVal(), hard: HARD[S.hard || 0], tipFade: TIPS_FADE[S.tipSoft ?? 1], rows: S.rows ?? 1 }; }
-function scheduleBuild(){ stale = true; menuDirty = true; if (building) cancelBuild(); if (S.auto && S.surf !== 'hide') buildTimer = 0.6; }
+function scheduleBuild(){ stale = true; menuDirty = true; if (building) cancelBuild(); if (cageEd) return; if (S.auto && S.surf !== 'hide') buildTimer = 0.6; }
 // stop a build that's out of date, so the next one can start straight away with the new lines
 function cancelBuild(){ if (!building) return; if (worker){ worker.terminate(); worker = null; } building = false; pending = false; buildId++; menuDirty = true; }
 // with the surface off nothing gets rebuilt, so sketching and flattening run at full speed; turning it on catches up once
 function resumeBuild(){ if (S.surf !== 'hide' && stale && !building) buildTimer = 0.05; }
 function toggleSurface(){ setSurfView(S.surf === 'hide' ? (S.surfWas || 'shaded') : (S.surfWas = S.surf, 'hide')); flash(S.surf === 'hide' ? 'Surface off: nothing rebuilds while you sketch and flatten' : 'Surface on'); }
 function startBuild(){
+  if (cageEd){ buildTimer = -1; return askUser('Rebuild from your lines? Your cage edits go.', [{ label: 'Rebuild', act: () => { cageEd = null; cageEditing = false; showCage(); scheduleSave(); startBuild(); } }, { label: 'Keep edits', act: () => {} }]); }
   buildTimer = -1;
   if (!strokes.length){ if (building){ buildId++; building = false; pending = false; } clearSurface(); stale = false; menuDirty = true; return; }
   if (building) cancelBuild();
@@ -914,6 +916,7 @@ function startBuild(){
     worker.onmessage = e => {
       const m = e.data; if (m.id !== buildId) return;
       if (m.type === 'progress'){ buildP = m.p; buildMsg = m.msg; buildStart = performance.now(); menuDirty = true; }
+      else if (m.type === 'done' && cageEd){ building = false; }
       else if (m.type === 'done'){ building = false; if (m.r && m.r.cache) fitCache = m.r.cache; applyResult(m.r); setBad(m.r && m.r.culprits || []); if (m.r && m.r.surface && buildSnap) lastGood = { s: buildSnap.s.filter(x => !badIds.has(x.id)), d: buildSnap.d }; menuDirty = true; if (pending){ pending = false; startBuild(); } }
       else if (m.type === 'error'){ building = false; pending = false; buildErr = m.msg; flash('Could not build (' + m.msg + '). Your last surface is kept. Press Last good (top of the menu) to go back to the last sketch that built.', 8); }
     };
@@ -934,6 +937,7 @@ function applyResult(r){
   if (r.note) flash(r.note, r.culprits && r.culprits.length ? 10 : 6);
   lastResult = r;
   try { makeFoldGrid(r); updateFolds(); } catch (e){}
+  if (pendingSettle && runs.length){ pendingSettle = false; setTimeout(() => { settleRuns(); scheduleSave(); }, 0); }
   let g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(r.surface.pos, 3)); g.setAttribute('normal', new THREE.BufferAttribute(r.surface.nrm, 3));
   const nv = r.surface.pos.length / 3, col = new Float32Array(nv * 3).fill(1); g.setAttribute('color', new THREE.BufferAttribute(col, 3));
   surfMesh = new THREE.Mesh(g, surfMat); surf.add(surfMesh); applySurfMaterial(); placeSun();
@@ -1028,7 +1032,7 @@ function applySurfView(){
   // edges show up on stripes or a light surface in blue, otherwise in dark grey
   const ec = S.zebra ? 0x38B6FF : 0x2C3038; wireMat.color.set(ec); fineMat.color.set(ec); wireMat.opacity = S.zebra ? 0.75 : 0.55; fineMat.opacity = S.zebra ? 0.22 : 0.3;
   if (foundGroup){ foundGroup.visible = S.lines !== 'hide'; foundGroup.children.forEach(m => { m.visible = !!S.show[m.userData.tag]; }); }
-  handleMesh.visible = S.lines !== 'hide'; foldGlyphs.visible = S.lines !== 'hide';
+  handleMesh.visible = S.lines !== 'hide'; foldGlyphs.visible = S.lines !== 'hide'; applyRunsView();
   // with the surface showing, loose and averaged passes step back so you can read the shape; strict lines stay bright
   const surfUp = S.surf !== 'hide' && surfMesh;
   lineMeshes.forEach((m, t) => { m.visible = S.lines !== 'hide' && !!S.show[t];
@@ -1094,6 +1098,169 @@ const packDabs = () => dabs.map(d => [d.x, d.y, d.z, d.r, d.s].map(v => Math.rou
 function unpackStrokes(list){ return list.map(o => { if (o.c){ const sp = makeSpline(o.t, Float32Array.from(o.c, v => v / 1000), !!o.cl, 0, o.k ? Uint8Array.from(o.k) : null); if (o.e) sp.ends = o.e.slice(); if (o.f) sp.fold = o.f; return o.t === 2 ? makeStroke(1, sp.pts, sp.pts) : sp; }
   const raw = Float32Array.from(o.r, v => v / 1000); return makeStroke(o.t === 2 ? 1 : o.t, raw); }); }
 const unpackDabs = list => (list || []).map(([x, y, z, r, s]) => ({ x, y, z, r, s }));
+// ---------- runs from Party Lines: the lines you rode there, as paths with boards rolling along them while you sketch.
+// They sit in the park at your model size (what was a fingerboard is a real board here), can be gripped and moved
+// into place, and their rolling parts can become loose lines (the board's two wheel tracks: the ground it rode on).
+const RUN_COLORS = [0xff6b3d, 0x2fb3a5, 0xff5fa2, 0xf2c230, 0x4f8cff, 0x6fd16a, 0xa87bff, 0xe8463b];
+const runsGroup = new THREE.Group(); world.add(runsGroup);
+let runs = [], runsName = '', runsT0 = performance.now() / 1000, pendingSettle = false;
+const RUN_TRUCK = 0.0135, RUN_DECK = [0.096, 0.004, 0.028];       // Party Lines board, hand metres
+// a run from its saved form: times, park positions, board quaternions
+function runFromData(d){ const n = d.t.length; return { c: d.c, t: Float32Array.from(d.t), P: Float32Array.from(d.P), Q: Float32Array.from(d.Q), tricks: d.tricks || [], k: d.k, dur: d.t[n - 1] }; }
+const runData = r => ({ c: r.c, k: r.k, t: Array.from(r.t, x => Math.round(x * 1000) / 1000), P: Array.from(r.P, x => Math.round(x * 1000) / 1000), Q: Array.from(r.Q, x => Math.round(x * 1e4) / 1e4), tricks: r.tricks });
+const packRuns = () => runs.length ? { name: runsName, off: runsGroup.position.toArray(), runs: runs.map(runData) } : null;
+function unpackRuns(o){ runs = (o && o.runs || []).map(runFromData); runsName = o && o.name || ''; runsGroup.position.fromArray(o && o.off || [0, 0, 0]); buildRuns(); }
+// Party Lines lines → runs: room metres × model size, centred on your sketch (or the middle of the park), lowest
+// wheel on the sketch's ground
+function importRuns(o){
+  const k = Math.round(N()) || 10, all = [];
+  const raw = o.lines.map(L => { const q0 = new THREE.Quaternion().fromArray(L.q), p0 = new V3().fromArray(L.p), s = L.s, n = s.length / 8, t = [], P = [], Q = [], v = new V3(), q = new THREE.Quaternion();
+    for (let i = 0; i < n; i++){ t.push(s[8 * i]); v.set(s[8 * i + 1], s[8 * i + 2], s[8 * i + 3]).applyQuaternion(q0).add(p0).multiplyScalar(k); P.push(v.x, v.y, v.z); all.push(v.clone());
+      q.set(s[8 * i + 4], s[8 * i + 5], s[8 * i + 6], s[8 * i + 7]); q.premultiply(q0); Q.push(q.x, q.y, q.z, q.w); }
+    return { c: L.c, k, t, P, Q, tricks: L.tricks || [] }; });
+  const b = new THREE.Box3().setFromPoints(all), c = b.getCenter(new V3()), cb = contentBox();
+  const to = cb ? new V3((cb[0] + cb[3]) / 2, cb[1], (cb[2] + cb[5]) / 2) : new V3(0, 0, 0);
+  for (const r of raw) for (let i = 0; i < r.P.length; i += 3){ r.P[i] += to.x - c.x; r.P[i + 1] += to.y - b.min.y; r.P[i + 2] += to.z - c.z; }
+  runs = raw.map(runFromData); runsName = o.name || 'Party Lines'; runsGroup.position.set(0, 0, 0); S.runsShow = 1; S.runsRide = 1; buildRuns(); settleRuns(); pendingSettle = !surfMesh; scheduleSave(); menuDirty = true;
+  flash(runs.length + (runs.length === 1 ? ' run' : ' runs') + ' from ' + runsName + '. Grip a path to move them; Layers tab → Runs to turn them into lines.', 8);
+}
+function buildRuns(){
+  for (const o of [...runsGroup.children]){ runsGroup.remove(o); o.traverse(x => { if (x.geometry) x.geometry.dispose(); if (x.material) x.material.dispose(); }); }
+  runs.forEach(r => {
+    const col = RUN_COLORS[(r.c || 0) % RUN_COLORS.length], k = r.k || 10, n = r.t.length, g = new THREE.Group();
+    // the path as a thin tube (one-pixel lines vanish in a headset)
+    const pp = []; for (let i = 0; i < n; i += 2) pp.push(new V3(r.P[3 * i], r.P[3 * i + 1] + 0.004 * k, r.P[3 * i + 2]));
+    if (pp.length >= 2) g.add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pp), Math.min(1200, pp.length * 2), 0.0012 * k, 5, false), new THREE.MeshStandardMaterial({ color: col, roughness: 0.5, emissive: col, emissiveIntensity: 0.25 })));
+    // the board: deck, four wheels (origin where the wheels touch, deck along x)
+    const board = new THREE.Group(), mat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.5 }), wm = new THREE.MeshStandardMaterial({ color: 0xEEF0F3, roughness: 0.4 });
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(RUN_DECK[0] * k, RUN_DECK[1] * k, RUN_DECK[2] * k), mat); deck.position.y = 0.011 * k; board.add(deck);
+    for (const x of [-0.032, 0.032]) for (const z of [-RUN_TRUCK, RUN_TRUCK]){ const w = new THREE.Mesh(new THREE.CylinderGeometry(0.0035 * k, 0.0035 * k, 0.003 * k, 12), wm); w.rotation.x = Math.PI / 2; w.position.set(x * k, 0.0035 * k, z * k); board.add(w); }
+    g.add(board); g.userData = { r, board }; runsGroup.add(g);
+  });
+  applyRunsView();
+}
+function applyRunsView(){ runsGroup.visible = !!runs.length && !!S.runsShow && S.lines !== 'hide'; }
+const _rq = new THREE.Quaternion(), _rq2 = new THREE.Quaternion();
+function updateRuns(now){
+  if (!runsGroup.visible) return;
+  for (const g of runsGroup.children){ const { r, board } = g.userData; if (!r) continue; const n = r.t.length;
+    if (!S.runsRide){ board.visible = false; continue; } board.visible = true;
+    const T = (now - runsT0) % (r.dur + 0.8); if (T > r.dur){ board.visible = false; continue; }
+    let lo = 0, hi = n - 1; while (hi - lo > 1){ const m = (lo + hi) >> 1; if (r.t[m] <= T) lo = m; else hi = m; }
+    const u = r.t[hi] > r.t[lo] ? (T - r.t[lo]) / (r.t[hi] - r.t[lo]) : 0;
+    board.position.set(r.P[3 * lo] + (r.P[3 * hi] - r.P[3 * lo]) * u, r.P[3 * lo + 1] + (r.P[3 * hi + 1] - r.P[3 * lo + 1]) * u, r.P[3 * lo + 2] + (r.P[3 * hi + 2] - r.P[3 * lo + 2]) * u);
+    _rq.fromArray(r.Q, 4 * lo); _rq2.fromArray(r.Q, 4 * hi); board.quaternion.slerpQuaternions(_rq, _rq2, u); }
+}
+// the parts of each run where the board was rolling (not mid-flip), as its two wheel tracks: loose lines for the surface
+function runsToLines(){
+  if (!runs.length) return flash('No runs here. In Party Lines, press Bring to Pentimento.');
+  const off = runsGroup.position, out = [], v = new V3(), q = new THREE.Quaternion();
+  for (const r of runs){ const k = r.k || 10, n = r.t.length, step = 0.012 * k;
+    const flipping = t => r.tricks.some(x => t >= x.t - 0.06 && t <= x.t + x.d + 0.06);
+    for (const side of [-1, 1]){ let cur = [], last = null;
+      const flush = () => { if (cur.length >= 15) out.push(cur); cur = []; last = null; };
+      for (let i = 0; i < n; i++){
+        if (flipping(r.t[i])){ flush(); continue; }
+        q.fromArray(r.Q, 4 * i); v.set(0, 0, side * RUN_TRUCK * k).applyQuaternion(q).add(new V3(r.P[3 * i], r.P[3 * i + 1], r.P[3 * i + 2])).add(off);
+        if (last && last.distanceTo(v) > 0.6 * k / 10){ flush(); }          // a jump in the recording: start a new line
+        if (!last || last.distanceTo(v) >= step){ cur.push(v.x, v.y, v.z); last = v.clone(); }
+      }
+      flush(); } }
+  if (!out.length) return flash('Nothing rolling to turn into lines');
+  commit([...strokes, ...out.map(a => { const raw = Float32Array.from(a); return makeStroke(0, raw, smoothed(raw, Math.min(S.smooth, 2))); })]);
+  flash('Added ' + out.length + ' loose lines from the rolling parts of your runs (two wheel tracks each). Undo takes them back out.', 7);
+}
+function clearRuns(){ runs = []; buildRuns(); scheduleSave(); menuDirty = true; flash('Runs removed'); }
+// over the middle of the sketch, then lowered (or raised) so the wheels sit on the surface where it's under them
+function centreRuns(quiet){
+  const cb = contentBox(); if (!cb || !runs.length) return; const b = new THREE.Box3(); for (const r of runs) for (let i = 0; i < r.P.length; i += 3) b.expandByPoint(new V3(r.P[i], r.P[i + 1], r.P[i + 2]));
+  const c = b.getCenter(new V3()); runsGroup.position.set((cb[0] + cb[3]) / 2 - c.x, cb[1] - b.min.y, (cb[2] + cb[5]) / 2 - c.z);
+  const dy = settleRuns(); if (!quiet) flash(dy === null ? 'Runs placed over your sketch' : 'Runs placed on your surface'); scheduleSave(); }
+function settleRuns(){
+  if (!surfMesh) return null; world.updateMatrixWorld(true); const rc = new THREE.Raycaster(), gaps = [], o = runsGroup.position, down = new V3(0, -1, 0).transformDirection(world.matrixWorld);
+  for (const r of runs) for (let i = 0; i < r.P.length; i += 3 * 12){ const top = world.localToWorld(new V3(r.P[i] + o.x, 1e3, r.P[i + 2] + o.z));
+    rc.set(top, down); const hit = rc.intersectObject(surfMesh, false)[0]; if (!hit) continue; const y = world.worldToLocal(hit.point.clone()).y; gaps.push(y - (r.P[i + 1] + o.y)); }
+  if (gaps.length < 5) return null; gaps.sort((a, b) => a - b); const dy = gaps[Math.floor(gaps.length * 0.2)]; runsGroup.position.y += dy; return dy;   // the low fifth: most of the run on or just above the surface
+}
+// grip near a path to move all the runs
+function nearRun(p, r){ if (!runsGroup.visible) return false; const o = runsGroup.position; for (const R of runs) for (let i = 0; i < R.P.length; i += 9){ if ((R.P[i] + o.x - p.x) ** 2 + (R.P[i + 1] + o.y - p.y) ** 2 + (R.P[i + 2] + o.z - p.z) ** 2 < r * r) return true; } return false; }
+// ---------- Edit cage: a second editor for the finished SubD cage, like Gravity Sketch. Points of the cage show up;
+// drag one and the surface follows; drop it on another point and the two merge into one (a short edge or a sliver
+// face collapses away). The surface is then this edited cage until you rebuild from your lines.
+let cageEd = null, cageEditing = false, cageUndoS = [], cageRedoS = [], cageDirty = false, cageT = 0;
+const SV = () => window.PentimentoSolver, CEK = (a, b) => a < b ? a * 2097152 + b : b * 2097152 + a;
+const cageEdG = new THREE.Group(); cageEdG.visible = false; world.add(cageEdG);
+const MAXCP = 20000, cagePtMat = new THREE.MeshBasicMaterial({ color: 0xFFD23F, depthTest: false, transparent: true, opacity: 0.9 });
+const cagePts = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 8), cagePtMat, MAXCP); cagePts.renderOrder = 11; cagePts.frustumCulled = false; cagePts.count = 0; cageEdG.add(cagePts);
+const cageLineMat = new THREE.LineBasicMaterial({ color: 0xFFD23F, transparent: true, opacity: 0.55 }), cageCreaseMat = new THREE.LineBasicMaterial({ color: 0xFF3348 });
+let cageLines = null, cageCreases = null, cageHot = -1, cageSnap = -1;
+const snapRing = new THREE.Mesh(new THREE.TorusGeometry(1, 0.2, 8, 24), new THREE.MeshBasicMaterial({ color: 0x5FE0B8, depthTest: false, transparent: true })); snapRing.renderOrder = 13; snapRing.visible = false; cageEdG.add(snapRing);
+const cageSnapshot = () => ({ V: cageEd.V.slice(), F: cageEd.F.map(f => f.slice()), sharp: [...cageEd.sharp], levels: cageEd.levels });
+const cageRestore = o => { cageEd = { V: o.V.slice(), F: o.F.map(f => f.slice()), sharp: new Set(o.sharp), levels: o.levels || 2 }; };
+const packCage = () => cageEd ? { V: cageEd.V.map(x => Math.round(x * 1e4) / 1e4), F: cageEd.F, sharp: [...cageEd.sharp], levels: cageEd.levels } : null;
+function cageFromResult(r){ const c = r.cage, F = []; for (let f = 0, o = 0; f < c.C.length; f++){ F.push(Array.from(c.F.subarray(o, o + c.C[f]))); o += c.C[f]; }
+  const sharp = new Set(); for (let i = 0; i < c.sharp.length; i += 2) sharp.add(CEK(c.sharp[i], c.sharp[i + 1])); return { V: Array.from(c.V), F, sharp, levels: r.levels || 2 }; }
+function startCageEdit(){
+  if (!cageEd){ if (!lastResult || !lastResult.cage) return flash('Build a surface first'); if (building) return flash('Wait for the build to finish');
+    cageRestore(cageFromResult(lastResult)); cageUndoS = []; cageRedoS = []; }
+  cageEditing = true; cancelBuild(); showCage(); cageSurface(); scheduleSave(); menuDirty = true;
+  flash('Edit cage: drag a point, drop it on another to merge them. ' + (mainHand() === 'right' ? 'X / Y' : 'A / B') + ' undo / redo. Done editing to go back to your lines.', 8);
+}
+function stopCageEdit(){ cageEditing = false; cageHot = -1; snapRing.visible = false; showCage(); applySurfView(); menuDirty = true; flash('Your edited cage is the surface now. Build rebuilds it from your lines (the edits go).', 6); }
+// the edited cage, smoothed, as the surface (and the quad edges, creases and the export follow it)
+function cageSurface(){
+  if (!cageEd || !SV()) return; const A = SV(); cageDirty = false;
+  const base = { V: cageEd.V, F: cageEd.F, sharp: cageEd.sharp, corner: new Uint8Array(cageEd.V.length / 3), cageE: A.allEdges(cageEd.F) };
+  let sm = A.catmullClark(base, []); for (let i = 1; i < cageEd.levels; i++) sm = A.catmullClark(sm, []);
+  const C = []; cageEd.F.forEach(f => C.push(f.length));
+  const r = { surface: A.shade(sm), quadWire: A.edgeWire(sm, sm.cageE), fineWire: A.wire(sm), creases: A.creaseLines(sm), curves: lastResult ? lastResult.curves : [],
+    quads: { V: new Float32Array(cageEd.V), F: new Int32Array(cageEd.F.flat()), C: new Int32Array(C) }, nQuads: C.reduce((a, b) => a + b, 0), levels: cageEd.levels, edited: true,
+    cage: { V: new Float32Array(cageEd.V), F: new Int32Array(cageEd.F.flat()), C: new Int32Array(C), sharp: Int32Array.from([...cageEd.sharp].flatMap(k => [Math.floor(k / 2097152), k % 2097152])) } };
+  applyResult(r); stale = false;
+}
+function cagePtsUpdate(){ if (!cageEd) return; const V = cageEd.V, nv = V.length / 3, rr = 0.0035 * N(), M4 = new THREE.Matrix4();
+  cagePts.count = Math.min(nv, MAXCP); for (let i = 0; i < cagePts.count; i++){ const s = i === cageHot ? rr * 1.7 : rr; M4.makeScale(s, s, s).setPosition(V[3 * i], V[3 * i + 1], V[3 * i + 2]); cagePts.setMatrixAt(i, M4); }
+  cagePts.instanceMatrix.needsUpdate = true; }
+function showCage(){
+  cageEdG.visible = !!cageEd && cageEditing;
+  if (!cageEdG.visible) return;
+  cagePtsUpdate(); const V = cageEd.V;
+  const seg = [], cs = [], seen = new Set();
+  for (const f of cageEd.F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = CEK(a, b); if (seen.has(k)) continue; seen.add(k); (cageEd.sharp.has(k) ? cs : seg).push(V[3 * a], V[3 * a + 1], V[3 * a + 2], V[3 * b], V[3 * b + 1], V[3 * b + 2]); }
+  for (const [o, arr, mat] of [['l', seg, cageLineMat], ['c', cs, cageCreaseMat]]){ const old = o === 'l' ? cageLines : cageCreases; if (old){ cageEdG.remove(old); old.geometry.dispose(); }
+    const ls = new THREE.LineSegments(new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(arr, 3)), mat); cageEdG.add(ls); if (o === 'l') cageLines = ls; else cageCreases = ls; }
+}
+function cagePush(){ cageUndoS.push(cageSnapshot()); if (cageUndoS.length > 60) cageUndoS.shift(); cageRedoS = []; }
+function cageUndo(){ if (!cageUndoS.length) return flash('Nothing to undo in the cage'); cageRedoS.push(cageSnapshot()); cageRestore(cageUndoS.pop()); showCage(); cageSurface(); scheduleSave(); flash('Cage: undone'); }
+function cageRedo(){ if (!cageRedoS.length) return flash('Nothing to redo in the cage'); cageUndoS.push(cageSnapshot()); cageRestore(cageRedoS.pop()); showCage(); cageSurface(); scheduleSave(); flash('Cage: redone'); }
+function nearestCagePt(p, r, skip){ if (!cageEd) return -1; const V = cageEd.V; let best = -1, bd = r * r; for (let i = 0; i < V.length / 3; i++){ if (i === skip) continue; const d = (V[3 * i] - p.x) ** 2 + (V[3 * i + 1] - p.y) ** 2 + (V[3 * i + 2] - p.z) ** 2; if (d < bd){ bd = d; best = i; } } return best; }
+// merge point `from` into `to`: faces lose the repeated corner, faces left with under three corners go, the rest close up
+function cageWeld(from, to){
+  const F2 = [], seen = new Set();
+  for (const f of cageEd.F){ const g = []; for (const v0 of f){ const v = v0 === from ? to : v0; if (g[g.length - 1] !== v) g.push(v); } while (g.length > 1 && g[0] === g[g.length - 1]) g.pop();
+    if (g.length < 3 || new Set(g).size !== g.length) continue; const key = g.slice().sort((a, b) => a - b).join(','); if (seen.has(key)) continue; seen.add(key); F2.push(g); }
+  const sh = new Set(); for (const k of cageEd.sharp){ let a = Math.floor(k / 2097152), b = k % 2097152; if (a === from) a = to; if (b === from) b = to; if (a !== b) sh.add(CEK(a, b)); }
+  // drop points no face uses any more
+  const used = new Int32Array(cageEd.V.length / 3).fill(-1), V2 = []; F2.forEach(f => f.forEach(v => { if (used[v] < 0){ used[v] = V2.length / 3; V2.push(cageEd.V[3 * v], cageEd.V[3 * v + 1], cageEd.V[3 * v + 2]); } }));
+  const sh2 = new Set(); for (const k of sh){ const a = used[Math.floor(k / 2097152)], b = used[k % 2097152]; if (a >= 0 && b >= 0) sh2.add(CEK(a, b)); }
+  cageEd.V = V2; cageEd.F = F2.map(f => f.map(v => used[v])); cageEd.sharp = sh2;
+}
+// a drag: the point follows the hand (or the mouse); near another point it clicks onto it, and letting go merges them
+function screenCagePt(e){ if (!cageEd) return -1; let best = -1, bd = 14 * 14; const v = new V3(), V = cageEd.V;
+  for (let i = 0; i < V.length / 3; i++){ v.set(V[3 * i], V[3 * i + 1], V[3 * i + 2]); world.localToWorld(v).project(camera); if (v.z > 1) continue; const dx = (v.x + 1) / 2 * innerWidth - e.clientX, dy = (1 - v.y) / 2 * innerHeight - e.clientY, d = dx * dx + dy * dy; if (d < bd){ bd = d; best = i; } } return best; }
+function cageGrab(i, p){ cagePush(); cageHot = i; return { kind: 'cage', i, p0: p.clone(), q0: new V3(cageEd.V[3 * i], cageEd.V[3 * i + 1], cageEd.V[3 * i + 2]), snap: -1 }; }
+function cageDrag(d, p){
+  const np = d.q0.clone().add(p.clone().sub(d.p0)), t = nearestCagePt(np, 0.012 * N(), d.i);
+  if (t >= 0){ np.set(cageEd.V[3 * t], cageEd.V[3 * t + 1], cageEd.V[3 * t + 2]); snapRing.visible = true; snapRing.position.copy(np); snapRing.scale.setScalar(0.009 * N()); if (renderer.xr.isPresenting) snapRing.lookAt(renderer.xr.getCamera().getWorldPosition(new V3())); else snapRing.lookAt(camera.position); }
+  else snapRing.visible = false;
+  const hit = t >= 0 && t !== d.snap; d.snap = t;
+  cageEd.V[3 * d.i] = np.x; cageEd.V[3 * d.i + 1] = np.y; cageEd.V[3 * d.i + 2] = np.z; cageDirty = true; showCage(); return hit;
+}
+function cageDrop(d){
+  snapRing.visible = false; cageHot = -1;
+  if (d.snap >= 0){ cageWeld(d.i, d.snap); flash('Merged'); }
+  showCage(); cageSurface(); scheduleSave();
+}
 // ---------- hand the finished cage to Subdeck (the SubD sculpting app next door) for point-by-point clean-up:
 // drag points, drop one on another to merge them, crease edges, extrude, and skate it. Both apps live on the same
 // site, so the cage waits in this browser's storage and Subdeck picks it up when it opens.
@@ -1115,11 +1282,13 @@ function save(){
   saveT = -1;
   try {
     const yaw = new THREE.Euler().setFromQuaternion(world.quaternion, 'YXZ').y;
-    localStorage.setItem(KEY, JSON.stringify({ S, strokes: packStrokes(), dabs: packDabs(), view: { p: world.position.toArray(), yaw, s: world.scale.x } }));
+    localStorage.setItem(KEY, JSON.stringify({ S, strokes: packStrokes(), dabs: packDabs(), runs: packRuns(), cage: packCage(), view: { p: world.position.toArray(), yaw, s: world.scale.x } }));
   } catch (e) { flash('Sketch too big to keep in this browser. Download it from the Files tab.'); }
 }
 if (saved && saved.strokes) strokes = unpackStrokes(saved.strokes);
 if (saved && saved.dabs) dabs = unpackDabs(saved.dabs);
+if (saved && saved.runs) try { unpackRuns(saved.runs); } catch (e){}
+const savedCage = saved && saved.cage && saved.cage.V ? saved.cage : null;
 // ---------- your sketch library (Files tab): copies kept in this browser, plus files to download and open
 const LIB = 'pentimento-library', LIB_ROWS = 6, libKey = id => 'pentimento-sketch-' + id;
 const SKETCH_SET = ['quad', 'avg', 'fair', 'reach', 'group', 'subd', 'relax', 'target', 'hard', 'smooth'];   // the build settings travel with a sketch
@@ -1147,7 +1316,7 @@ function libSet(l){ libCache = l.slice().sort((a, b) => b.t - a.t); menuDirty = 
     libSet(await libDB.all());
   } catch (e){ libSet([]); flash('Saved sketches are not available in this browser (no database). Use Download file.', 6); }
 })();
-function sketchData(name){ const set = {}; SKETCH_SET.forEach(k => set[k] = S[k]); return { app: 'pentimento', v: VERSION, name, strokes: packStrokes(), dabs: packDabs(), set }; }
+function sketchData(name){ const set = {}; SKETCH_SET.forEach(k => set[k] = S[k]); return { app: 'pentimento', v: VERSION, name, strokes: packStrokes(), dabs: packDabs(), runs: packRuns(), cage: packCage(), set }; }
 // a small picture of the model from above and to one side, for the list
 function makeThumb(){
   const b = contentBox(); if (!b) return null;
@@ -1195,7 +1364,8 @@ function useSketch(o, name){
   curSk = null;
   let next; try { next = unpackStrokes(o.strokes); } catch (e){ return flash('Could not read that sketch'); }
   if (o.set) SKETCH_SET.forEach(k => { if (o.set[k] !== undefined) S[k] = o.set[k]; });
-  commit(next, unpackDabs(o.dabs)); rebuildHandles();
+  commit(next, unpackDabs(o.dabs)); rebuildHandles(); unpackRuns(o.runs || null);
+  cageEd = null; cageEditing = false; if (o.cage && o.cage.V){ cageRestore(o.cage); cageSurface(); }
   if (!renderer.xr.isPresenting) needsFit = true; else { const xc = renderer.xr.getCamera(), p = new V3(), q = new THREE.Quaternion(); xc.getWorldPosition(p); xc.getWorldQuaternion(q); fitView({ p, q }); }
   flash('Opened ' + (name || 'sketch') + '. Undo brings back what you had.');
 }
@@ -1319,7 +1489,7 @@ function backToGood(){
 }
 function clearAll(){
   if (clearArmed <= 0){ clearArmed = 3; flash('Press Clear all again to wipe every line'); return; }
-  clearArmed = 0; curSk = null; commit([], []); flash('Cleared. Undo brings it back.');
+  clearArmed = 0; curSk = null; cageEd = null; cageEditing = false; showCage(); commit([], []); flash('Cleared. Undo brings it back.');
 }
 function loadSample(){
   const seed = +new URLSearchParams(location.search).get('seed') || Math.floor(Math.random() * 1000);
@@ -1350,11 +1520,11 @@ function loadSample(){
   add({ id: 'room', x: MW - 44 - 250, y: 22, w: 250, h: 76, style: 'lock', label: () => S.bg === 'pass' && inAR() ? 'Room: on' : 'Room: off', on: () => S.bg === 'pass' && inAR(), act: toggleRoom });
   // always on top
   const goW = 300;
-  add({ id: 'build', x: P, y: 112, w: goW, h: 116, style: 'big', label: () => building ? 'BUILDING' : 'BUILD', sub: () => building ? Math.round(buildP * 100) + '%' + (pending ? ' · more queued' : '') : buildErr ? 'failed · press to retry' : S.surf === 'hide' ? 'surface is off' : stale ? 'lines changed' : hasSurface() ? 'up to date' : 'make the surface',
+  add({ id: 'build', x: P, y: 112, w: goW, h: 116, style: 'big', label: () => building ? 'BUILDING' : 'BUILD', sub: () => cageEd ? 'cage edited · rebuild?' : building ? Math.round(buildP * 100) + '%' + (pending ? ' · more queued' : '') : buildErr ? 'failed · press to retry' : S.surf === 'hide' ? 'surface is off' : stale ? 'lines changed' : hasSurface() ? 'up to date' : 'make the surface',
     act: () => { if (S.surf === 'hide') setSurfView(S.surfWas || 'shaded'); startBuild(); } });
   const xs = P + goW + G, wr = (MW - P - xs - 3 * G) / 4;
-  [{ id: 'undo', label: () => 'Undo', sub: () => mainHand() === 'right' ? 'X' : 'A', act: undo },
-   { id: 'redo', label: () => canGoBack() ? 'Last good' : 'Redo', sub: () => { const y = mainHand() === 'right' ? 'Y' : 'B'; return canGoBack() ? y + ' · go back' : y; }, style: 'lock', on: () => canGoBack(), act: () => canGoBack() ? backToGood() : redo() },
+  [{ id: 'undo', label: () => 'Undo', sub: () => mainHand() === 'right' ? 'X' : 'A', act: () => cageEditing ? cageUndo() : undo() },
+   { id: 'redo', label: () => canGoBack() ? 'Last good' : 'Redo', sub: () => { const y = mainHand() === 'right' ? 'Y' : 'B'; return canGoBack() ? y + ' · go back' : y; }, style: 'lock', on: () => canGoBack(), act: () => cageEditing ? cageRedo() : canGoBack() ? backToGood() : redo() },
    { id: 'lines', label: () => 'Lines', sub: () => S.lines === 'hide' ? 'hidden' : 'showing', on: () => S.lines !== 'hide', act: toggleLines },
    { id: 'surface', label: () => 'Surface', sub: () => S.surf === 'hide' ? 'off' : 'on', on: () => S.surf !== 'hide', act: toggleSurface }]
     .forEach((b, i) => add(Object.assign({ x: xs + i * (wr + G), y: 112, w: wr, h: 116 }, b)));
@@ -1422,6 +1592,12 @@ function loadSample(){
   text({ tab: 'layers', kind: 'note', x: P, y: 976, text: () => 'Locked or hidden lines can\'t be bent, marked or erased. Hidden lines still shape the surface.' });
   text({ tab: 'layers', kind: 'label', x: P, y: 1066, text: () => 'ALL LINES' });
   row('layers', 1088, 72, [['show', 'Show'], ['faint', 'Faint'], ['hide', 'Hide']].map(([v, n]) => ({ id: 'lines-' + v, label: () => n, on: () => S.lines === v, act: () => setLineView(v) })));
+  text({ tab: 'layers', kind: 'label', x: P, y: 1290, vis: () => runs.length > 0, text: () => 'RUNS FROM PARTY LINES · ' + runs.length + (runsName ? ' · ' + runsName : '') });
+  row('layers', 1312, 72, [{ id: 'runs-show', label: () => S.runsShow ? 'Showing' : 'Hidden', on: () => !!S.runsShow, act: () => { S.runsShow = S.runsShow ? 0 : 1; applyRunsView(); scheduleSave(); } },
+    { id: 'runs-ride', label: () => S.runsRide ? 'Boards ride' : 'Boards still', on: () => !!S.runsRide, act: () => { S.runsRide = S.runsRide ? 0 : 1; runsT0 = performance.now() / 1000; scheduleSave(); } },
+    { id: 'runs-lines', label: () => 'To lines', act: runsToLines },
+    { id: 'runs-centre', label: () => 'Re-place', act: centreRuns },
+    { id: 'runs-clear', label: () => 'Remove', style: 'danger', act: clearRuns }], { vis: () => runs.length > 0 });
   row('layers', 1176, 80, [{ id: 'strict', label: () => 'Make strict', sub: () => 'averaged creases → strict lines', act: makeStrict }]);
   // SURFACE: laid out like a quad remesher — how many quads, then how the surface is found, then the look
   const sy = i => 346 + i * 72;
@@ -1448,6 +1624,8 @@ function loadSample(){
     { id: 'edges-cycle', label: () => 'Edges: ' + EDGE_NAME[S.edges], on: () => S.edges !== 'off', act: () => setEdges(EDGES[(EDGES.indexOf(S.edges) + 1) % 3]) },
     { id: 'auto', style: 'lock', label: () => S.auto ? 'Auto build' : 'Manual', on: () => S.auto, act: () => { S.auto = !S.auto; scheduleSave(); flash(S.auto ? 'Surface rebuilds after each change' : 'Surface rebuilds only when you press Build'); if (S.auto && stale) scheduleBuild(); } }]);
 
+  row('surface', sy(12) + 188, 72, [{ id: 'cage-edit', style: 'lock', label: () => cageEditing ? 'Done editing' : cageEd ? 'Edit cage again' : 'Edit cage', on: () => cageEditing, act: () => cageEditing ? stopCageEdit() : startCageEdit() },
+    { id: 'cage-drop', style: 'danger', vis: () => !!cageEd, label: () => 'Drop cage edits', act: () => askUser('Drop your cage edits and rebuild from your lines?', [{ label: 'Drop them', act: () => { cageEd = null; cageEditing = false; showCage(); scheduleSave(); startBuild(); } }, { label: 'Keep them', act: () => {} }]) }]);
   // FILES: your saved sketches
   text({ tab: 'files', kind: 'label', x: P, y: 360, text: () => { const n = libList().length; return n ? 'SAVED SKETCHES · ' + n : 'SAVED SKETCHES'; } });
   for (let i = 0; i < LIB_ROWS; i++){
@@ -1493,7 +1671,8 @@ const TIP_PAGES = {
     'Show or hide each line type. Hidden lines still shape the surface.',
     'Lock a layer to keep it safe: locked lines can\'t be moved, erased, flattened or bent.',
     'Lock the layers you like before you erase or flatten near them.',
-    'Smooth paint (the Smooth tool on the surface) has its own row: hide it, or clear it to start again.']],
+    'Smooth paint (the Smooth tool on the surface) has its own row: hide it, or clear it to start again.',
+    'Runs from Party Lines (press Bring to Pentimento there) show here as paths with boards riding them. Grip a path to move them. To lines turns the rolling parts into loose lines: the board\'s two wheel tracks, flips left out.']],
   surface: ['WHAT THE SETTINGS DO', [
     'Start with Fit detail and Smoothness. The rest can stay as they are.',
     'Fit detail is the main knob. Smaller follows your lines more closely (tight bowls, small features) and builds slower. Larger is smoother and faster.',
@@ -1507,7 +1686,8 @@ const TIP_PAGES = {
     'Reach past lines: how far the surface carries on past your outermost lines.',
     'Join passes within: crease passes closer than this become one line.',
     'Subdivision: how smooth the shown surface is. Higher looks smoother and takes longer.',
-    'Quads: Even is the steady layout. Flowing (beta) follows directions more closely and can knot. Builder: Classic is the 2.6 builder, for comparing.']],
+    'Quads: Even is the steady layout. Flowing (beta) follows directions more closely and can knot. Builder: Classic is the 2.6 builder, for comparing.',
+    'Edit cage (bottom of this tab): the SubD cage as points. Trigger a point to drag it; drop it on another point and they merge. X / Y undo and redo in the cage. Done editing keeps the edits as your surface; Build asks before rebuilding from your lines.']],
   view: ['SEEING THE SURFACE', [
     'Low sun and Zebra show lumps clearly. Smooth stripes mean a smooth surface.',
     'Trust colours the surface: green where your lines sit on it, red where they are off it, blue-grey where it is a guess.',
@@ -1685,6 +1865,8 @@ function ontoSurface(p){
   return new V3(p.x - nx * k, p.y - ny * k, p.z - nz * k);
 }
 function toolMove(id, d, p){
+  if (d.kind === 'cage'){ d.snapHit = cageDrag(d, p); return 0; }
+  if (d.kind === 'runs'){ runsGroup.position.copy(d.o0).add(p.clone().sub(d.p0)); return 0; }
   const r = BRUSH[S.brush] * N();
   if (d.kind === 'draw'){
     p = ontoSurface(p) || p;
@@ -1704,6 +1886,8 @@ function toolMove(id, d, p){
   return amt;
 }
 function toolUp(id, d){
+  if (d.kind === 'cage'){ cageDrop(d); return; }
+  if (d.kind === 'runs'){ scheduleSave(); return; }
   if (d.kind === 'draw'){
     world.remove(d.mesh); d.mesh.geometry.dispose();
     if (d.raw.length >= 12){
@@ -1954,7 +2138,8 @@ function updateXRInput(dt){
     if (S.tool === 'flatten' && (mHit || h.grab)) showSense(null);
     // grip (middle finger) near a control point grabs it; near a strict line between points, adds one there
     const canPts = !mHit && !h.grab && !h.act && !myDial && S.ptsShow && S.lines !== 'hide';
-    const hh = canPts ? nearestHandle(p, 0.018 * N()) : null, hl = canPts && !hh ? nearSpline(p, 0.012 * N()) : null;
+    if (cageEditing && !h.act && !isOff(h)){ const i = nearestCagePt(p, 0.02 * N()); if (i !== cageHot){ cageHot = i; cagePtsUpdate(); if (i >= 0) pulse(h, 0.1, 6); } }
+    const hh = canPts && !cageEditing ? nearestHandle(p, 0.018 * N()) : null, hl = canPts && !hh && !cageEditing ? nearSpline(p, 0.012 * N()) : null;
     if (hh) hotH = hh; else if (hl) hi.push(hl.s);
     if ((hh || hl) && !h.wasNear){ pulse(h, 0.12, 8); } h.wasNear = !!(hh || hl);
     if (S.tool !== 'draw' && !mHit && !h.grab && !myDial && !isOff(h)){
@@ -1969,6 +2154,7 @@ function updateXRInput(dt){
     if (down(1) && !h.act && !myDial){
       if (hh){ h.act = ctrlStart(hh, p); h.ctrlGrip = true; pulse(h, 0.5, 20); }
       else if (hl){ h.act = insertGrab(hl, p); h.ctrlGrip = true; pulse(h, 0.6, 25); flash('Point added'); }
+      else if (nearRun(p, 0.02 * N())){ h.act = { kind: 'runs', p0: p.clone(), o0: runsGroup.position.clone() }; h.ctrlGrip = true; pulse(h, 0.5, 20); flash('Moving the runs'); }
       else { h.grab = true; grabReset(); pulse(h, 0.3, 15); }
     }
     if (up(1) && h.grab){ h.grab = false; grabReset(); }
@@ -1982,6 +2168,7 @@ function updateXRInput(dt){
     }
     else if (down(0) && !h.grab && !myDial){
       if (mHit && mHit.b){ pressMenu(mHit.b); pulse(h, 0.5, 20); }
+      else if (!mHit && !h.act && cageEditing){ const i = nearestCagePt(p, 0.02 * N()); if (i >= 0){ h.act = cageGrab(i, p); pulse(h, 0.4, 15); } }
       else if (!mHit && !h.act){ h.act = toolDown(h.i, p, null); pulse(h, 0.25, 10); }
     }
     if (h.act && pressed(held)){
@@ -1989,6 +2176,7 @@ function updateXRInput(dt){
       const amt = toolMove(h.i, h.act, p) || 0, k = h.act.kind;
       if (k === 'draw'){ if (h.act.n % 8 === 0) pulse(h, 0.04, 4); }
       else if (k === 'ctrl' && h.act.snapHit){ h.act.snapHit = false; pulse(h, 0.9, 35); }
+      else if (k === 'cage' && h.act.snapHit){ h.act.snapHit = false; pulse(h, 0.9, 35); }
       else if (k === 'ctrl'){ const step = 0.006 * N(); if (Math.abs(amt - (h.act.lastPull || 0)) > step){ pulse(h, 0.18, 8); h.act.lastPull = amt; } }
       // the buzz follows the erasing: stronger the more you rub out this frame, a hard knock per whole line
       else if (k === 'cut' && amt){ pulse(h, Math.min(1, 0.25 + amt * 0.04), 30); h.flash = 1; }
@@ -2004,15 +2192,15 @@ function updateXRInput(dt){
     if (h.act && up(held)){ toolUp(h.i, h.act); h.act = null; h.ctrlGrip = false; }
     // buttons
     const left = h.hand === 'left', off = isOff(h);
-    pointHint(h, h.ctrlGrip && h.act ? pw : null, left);
-    if (h.ctrlGrip && h.act){
+    pointHint(h, h.ctrlGrip && h.act && h.act.kind === 'ctrl' ? pw : null, left);
+    if (h.ctrlGrip && h.act && h.act.kind === 'ctrl'){
       // holding a point: A / X deletes it; B / Y goes smooth → sharp corner → break the line here, and at a joint
       // where two lines meet it fuses them into one
       if (down(4)){ ctrlDelete(h.act); h.act = null; h.ctrlGrip = false; pulse(h, 0.7, 30); }
       else if (down(5)){ if (ctrlSecond(h.act) === 'done'){ h.act = null; h.ctrlGrip = false; } pulse(h, 0.5, 20); }
     } else if (off){
-      if (down(4)){ undo(); pulse(h, 0.3, 15); }
-      if (down(5)){ if (canGoBack() && !redoS.length) backToGood(); else redo(); pulse(h, 0.3, 15); }
+      if (down(4)){ cageEditing ? cageUndo() : undo(); pulse(h, 0.3, 15); }
+      if (down(5)){ if (cageEditing) cageRedo(); else if (canGoBack() && !redoS.length) backToGood(); else redo(); pulse(h, 0.3, 15); }
     } else {
       // right hand: hold A for the tool dial, hold B for the panel dial; let go to pick
       if (!dial && down(4)) openDial(h, 'tool', pw, 4);
@@ -2065,6 +2253,8 @@ renderer.domElement.addEventListener('pointerdown', e => {
   if (e.button !== 0 || renderer.xr.isPresenting) return;
   const ray = mouseRay(e);
   renderer.domElement.setPointerCapture(e.pointerId);
+  if (cageEditing){ const i = screenCagePt(e); if (i >= 0){ const w = world.localToWorld(new V3(cageEd.V[3 * i], cageEd.V[3 * i + 1], cageEd.V[3 * i + 2]));
+    drawPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new V3()).negate(), w); mouseAct = cageGrab(i, toPark(w)); } return; }
   const hh = S.ptsShow && S.lines !== 'hide' ? screenHandle(e) : null;
   if (hh && e.altKey && !e.shiftKey){ const d = ctrlStart(hh, new V3(), false); if (ctrlSecond(d) === 'held') finishHeld(d); return; }
   if (hh && (e.shiftKey || e.altKey)){ beginEdit(); const tg = e.altKey ? pointToggle(hh.s, hh.k) : null, n = e.shiftKey ? delPoint(hh.s, hh.k) : tg.n;
@@ -2097,7 +2287,7 @@ renderer.domElement.addEventListener('pointermove', e => { lastPointer = { clien
     else if (!renderer.xr.isPresenting) setHighlight([]);
     return;
   }
-  if (mouseAct.kind === 'draw' || mouseAct.kind === 'bend' || mouseAct.kind === 'ctrl'){ const w = drawPlane && ray.intersectPlane(drawPlane, new V3()); if (w) toolMove('m', mouseAct, toPark(w)); }
+  if (mouseAct.kind === 'draw' || mouseAct.kind === 'bend' || mouseAct.kind === 'ctrl' || mouseAct.kind === 'cage'){ const w = drawPlane && ray.intersectPlane(drawPlane, new V3()); if (w) toolMove('m', mouseAct, toPark(w)); }
   else { const p = nearestLinePoint(ray); if (p){ mouseAct.dt = 1 / 30; toolMove('m', mouseAct, p); } }
 });
 const endMouse = () => { if (mouseAct){ toolUp('m', mouseAct); mouseAct = null; } };
@@ -2106,7 +2296,7 @@ addEventListener('keydown', e => {
   if (e.target.closest && e.target.closest('button,summary') && (e.key === ' ' || e.key === 'Enter')) return;
   const k = e.key.toLowerCase();
   if (e.key === ' '){ e.preventDefault(); startBuild(); }
-  else if ((e.ctrlKey || e.metaKey) && k === 'z'){ e.preventDefault(); e.shiftKey ? redo() : undo(); }
+  else if ((e.ctrlKey || e.metaKey) && k === 'z'){ e.preventDefault(); if (cageEditing) e.shiftKey ? cageRedo() : cageUndo(); else e.shiftKey ? redo() : undo(); }
   else if ((e.ctrlKey || e.metaKey) && k === 'y'){ e.preventDefault(); redo(); }
   else if (e.key >= '1' && e.key <= String(VT.length)) setTag(VT[+e.key - 1]);
   else if (k === 'd') setTool('draw'); else if (k === 'b') setTool('bend'); else if (k === 'm') setTool('mark'); else if (k === 'x') setTool('cut'); else if (k === 'e') setTool('erase');
@@ -2187,11 +2377,16 @@ setupButtons();
 window.pentimento = { ops: { delPoint: (...a) => delPoint(...a), cornerPoint: (...a) => cornerPoint(...a), addPoint: (...a) => addPoint(...a) }, load(list){ commit(list.map(o => makeStroke(o.tag, Float32Array.from(o.pts), Float32Array.from(o.pts)))); },
   drag(tool, path, brush){ S.tool = tool; if (brush !== undefined) S.brush = brush; const d = toolDown('t', new V3(...path[0])); for (const q of path){ d.dt = 1 / 72; toolMove('t', d, new V3(...q)); } toolUp('t', d); },
   showDial(kind, hover){ const f = camera.getWorldDirection(new V3()); dialMesh.position.copy(camera.position).addScaledVector(f, 0.42); dialMesh.quaternion.copy(camera.quaternion); dialMesh.visible = true; dial = { kind, h: null, items: dialItems(kind), hover }; drawDial(); },
-  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
+  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, cageUndo, get runs(){ return runs; }, get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid(); setTips(!!S.tips); applyLighting(); applyBackground();
+if (savedCage) try { cageRestore(savedCage); setTimeout(cageSurface, 0); } catch (e){}
+// runs handed over from Party Lines (its Bring to Pentimento button)
+try { const o = JSON.parse(localStorage.getItem('pentimento-import-runs') || 'null'); localStorage.removeItem('pentimento-import-runs'); if (o && Array.isArray(o.lines) && o.lines.length) importRuns(o); } catch (e){}
 if (strokes.length) scheduleBuild();
 let last = performance.now(), lastLines = 0;
 renderer.setAnimationLoop(now => {
+  updateRuns(now / 1000);
+  if (cageDirty && cageEd && now - cageT > 120){ cageT = now; cageSurface(); }
   if (foldGlyphs.children.length && foldGlyphs.userData.k !== N()){ foldGlyphs.userData.k = N(); sizeFoldGlyphs(); }
   const real = Math.min(1, (now - last) / 1000), dt = Math.min(0.05, real); last = now;   // timers use real time, motion uses capped time
   const xr = renderer.xr.isPresenting;

@@ -2143,7 +2143,7 @@ function solve(strokes, prm, progress = () => {}){
   };
 }
 
-const api = { solve, consensus, resample, catmullClark, sliceLoops };
+const api = { solve, consensus, resample, catmullClark, sliceLoops, shade, wire, edgeWire, allEdges, creaseLines, ek };
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 root.PentimentoSolver = api;
 // as a Web Worker: build in the background so the headset never stalls
