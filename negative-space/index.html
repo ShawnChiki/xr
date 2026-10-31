@@ -133,6 +133,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 // ================================================================ world field
 // One shared scalar field. White's rock is where d > 0.5, Black's rock is where d < 0.5.
@@ -291,8 +292,11 @@ renderer.xr.enabled = true;
 renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.1;
 renderer.xr.setFoveation?.(1);
 document.body.prepend(renderer.domElement);
+const ANISO = renderer.capabilities.getMaxAnisotropy();
 
 const scene = new THREE.Scene();
+// a soft studio reflection so the guns, gloves, gems and bombs read as metal and glass (the rock ignores it)
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
 scene.background = new THREE.Color(0x000000);  // set by applyBackdrop
 scene.fog = new THREE.FogExp2(0x040508, 0.022);
 const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.03, 220);
@@ -684,7 +688,16 @@ let AC = null, master, /* continuous voices below */ laserGain, oscA, oscB, lfo,
 function unlockAudio(){
   if (AC){ AC.resume(); return; }
   try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
-  master = AC.createGain(); master.gain.value = 0.55; master.connect(AC.destination);
+  master = AC.createGain(); master.gain.value = 0.55;
+  const comp = AC.createDynamicsCompressor();
+  comp.threshold.value = -18; comp.knee.value = 14; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.22;
+  const verb = AC.createConvolver(), wet = AC.createGain(); wet.gain.value = 0.2;
+  verb.buffer = (() => {                         // a generated room: two seconds of decaying stereo noise
+    const len = Math.floor(AC.sampleRate * 2.2), b = AC.createBuffer(2, len, AC.sampleRate);
+    for (let ch = 0; ch < 2; ch++){ const d = b.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3.2); }
+    return b;
+  })();
+  master.connect(comp); master.connect(verb).connect(wet).connect(comp); comp.connect(AC.destination);
   // the laser voice: two oscillators, a wobble, a filter. Each power reshapes it
   oscA = AC.createOscillator(); oscB = AC.createOscillator(); oscA.type = oscB.type = 'sawtooth';
   lfo = AC.createOscillator(); lfoGain = AC.createGain(); lfoGain.gain.value = 0; lfo.connect(lfoGain);
@@ -981,7 +994,7 @@ const POW_WORDS = {
 // the how-to panel
 const help = (() => {
   const c = document.createElement('canvas'); c.width = 1024; c.height = 900;
-  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = ANISO;
   const m = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2 * 900 / 1024), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, fog: false }));
   m.material.toneMapped = false; m.renderOrder = 101; m.visible = false; scene.add(m);
   return { m, c, tex };
@@ -1046,6 +1059,7 @@ function showHelp(on){
     help.m.position.copy(HEAD).addScaledVector(f, 1.3); help.m.position.y = HEAD.y - 0.1;
     help.m.lookAt(HEAD.x, help.m.position.y, HEAD.z);
   }
+  if (on && !help.m.visible) popIn(help.m);
   help.m.visible = on;
 }
 
@@ -1070,6 +1084,7 @@ const menu = (() => {
     o.material.toneMapped = false; o.add(glowSprite(TEX.white, 0.09, false)); o.userData.ph = i / 5 * Math.PI * 2; return o;
   });
   m.add(shade, gem, ...orbits);
+  tex.anisotropy = ANISO;
   return { W, H, PW, c, tex, m, gem, orbits, regions: [], hover: -1, t: 0 };
 })();
 const GROUP_COL = { Game: '#e0103a', Movement: '#4da3ff', Fun: '#f5c518' };
@@ -1204,12 +1219,23 @@ function menuFrame(dt){
 }
 
 let panelT = 0;
+// panels and orbs ease in with a little overshoot
+const pops = new Set();
+function popIn(o, from = 0.8){ o.userData.popT = 0; o.userData.popFrom = from; o.scale.setScalar(from); pops.add(o); }
+function updatePops(dt){
+  for (const o of pops){
+    const t = (o.userData.popT += dt) / 0.32, c = 1.7;
+    if (t >= 1){ o.scale.setScalar(1); pops.delete(o); continue; }
+    const e = 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);          // ease out back
+    o.scale.setScalar(o.userData.popFrom + (1 - o.userData.popFrom) * e);
+  }
+}
 function showPanel(title, lines, dark, secs = 0){
   drawPanel(title, lines, dark);
   const f = headForward(new V3()); f.y = 0; f.normalize();
   panel.m.position.copy(HEAD).addScaledVector(f, 1.5); panel.m.position.y = HEAD.y - 0.05;
   panel.m.lookAt(HEAD.x, panel.m.position.y, HEAD.z);
-  panel.m.visible = true; panelT = secs;
+  panel.m.visible = true; panelT = secs; popIn(panel.m);
 }
 
 // ================================================================ settings
@@ -1477,7 +1503,7 @@ function placeOrb(o){
     const v = sampleV(o.pos);
     if (air ? v < 0.2 : v > 0.8) break;
   }
-  o.g.position.copy(o.pos); o.g.visible = true; o.wait = 0;
+  o.g.position.copy(o.pos); o.g.visible = true; o.wait = 0; popIn(o.g, 0.01);
 }
 function blackFloor(x, z){
   for (let y = 0.3; y < HY; y += 0.25) if (sample(x, y, z) < 0.5) return y;
@@ -1607,11 +1633,15 @@ const GUN = {
 // a little stamped maker's plate on the side
 const plateTex = (() => {
   const c = document.createElement('canvas'); c.width = 256; c.height = 56; const x = c.getContext('2d');
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = ANISO;
+  const draw = () => {
   x.fillStyle = '#c9ccd2'; x.fillRect(0, 0, 256, 56); x.strokeStyle = '#3a3d44'; x.lineWidth = 4; x.strokeRect(3, 3, 250, 50);
   x.fillStyle = '#16181c'; x.font = '800 30px Unbounded, system-ui, sans-serif'; x.fillText('MELTER', 18, 39);
   x.font = '600 22px "Instrument Sans", system-ui, sans-serif'; x.fillText('04', 196, 38);
   x.fillStyle = '#e0103a'; x.beginPath(); x.arc(178, 28, 6, 0, 7); x.fill();
-  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  t.needsUpdate = true; };
+  draw(); document.fonts?.ready?.then(draw);
+  return t;
 })();
 const metalMat = new THREE.MeshStandardMaterial({ color: 0x4a4e57, roughness: 0.28, metalness: 0.85 });
 const darkMetal = new THREE.MeshStandardMaterial({ color: 0x24262c, roughness: 0.35, metalness: 0.7 });
@@ -2003,6 +2033,24 @@ function placeBeam(beam, from, to, on){
   beam.flash.position.copy(from); beam.flash.scale.setScalar((wide ? 0.13 : 0.08) * (0.7 + Math.random() * 0.6));
   beam.tip.position.copy(to); beam.tip.scale.setScalar((wide ? 0.75 : 0.36) * (0.85 + Math.random() * 0.3));
 }
+const heat = Array.from({ length: 24 }, () => {
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: TEX.hot, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+  sp.visible = false; scene.add(sp); return { sp, t: 0, s: 1 };
+});
+let heatNext = 0;
+function addHeat(p, n, size){
+  const h = heat[heatNext]; heatNext = (heatNext + 1) % heat.length;
+  h.sp.position.copy(p).addScaledVector(n, 0.04); h.t = 1.5; h.s = size; h.sp.visible = true;
+}
+function updateHeat(dt){
+  for (const h of heat){
+    if (h.t <= 0) continue;
+    h.t -= dt; const a = Math.max(0, h.t / 1.5);
+    h.sp.material.opacity = a * a; h.sp.material.color.setRGB(1, 0.45 + 0.4 * a, 0.25 + 0.5 * a * a);
+    h.sp.scale.setScalar(0.42 * h.s * (0.7 + 0.3 * a));
+    if (h.t <= 0) h.sp.visible = false;
+  }
+}
 function nearRuby(p){
   if (S.mode === 'play' && p.distanceTo(myRuby.position) < 3.6 && !S.threats.some(t => t.distanceTo(p) < 0.5) && S.threats.length < 60) S.threats.push(p.clone());
 }
@@ -2220,6 +2268,8 @@ function fire(o, d, from, beam, dt){
   hotStamp = false;
   sdf(hit.x, hit.y, hit.z, _n);
   if (Math.random() < 0.8) spawnSparks(hit, _n, powOn('wide') ? 3 : 2);
+  beam.heatT = (beam.heatT || 0) - dt;
+  if (beam.heatT <= 0){ beam.heatT = 0.07; addHeat(hit, _n, powOn('wide') ? 1.6 : 1); }
   nearRuby(hit);                                          // melting near your ruby wakes a Black defender
   return n > 0;
 }
@@ -2271,6 +2321,7 @@ function collide(){
 }
 function hopSound(){ tone(240, 0.1, 'triangle', 0.08, 360); noise(0.08, 0.06, 2000, 600); }
 function physics(dt, move, jump){
+  rig.position.y += player.lag || 0; player.lag = player.lag || 0;     // back to the true position before moving
   rig.updateMatrixWorld(); headWorld(HEAD);
   if (jump) player.buf = 0.18;                       // a press slightly before landing still counts
   const anchored = hands.filter(h => h.anchor);
@@ -2279,6 +2330,7 @@ function physics(dt, move, jump){
     player.vel.copy(player.climbV).multiplyScalar(1.2); player.vel.y = Math.max(player.vel.y, JUMPV() * 0.9);
     player.buf = 0; player.coyote = 0; hopSound();
   } else if (anchored.length){
+    player.lag = 0;
     _m.set(0, 0, 0);
     for (const h of anchored){ handPos(h, _hp); _m.add(_a.copy(h.anchor).sub(_hp)); }
     _m.multiplyScalar(1 / anchored.length);
@@ -2305,7 +2357,12 @@ function physics(dt, move, jump){
   }
   player.vel.y -= GRAVITY() * dt;
   rig.position.addScaledVector(player.vel, dt);
-  collide();
+  const push = collide();
+  // small upward pushes while walking (stepping onto a lump, the lip of a tunnel) are eased in over a few frames
+  // so your view glides up instead of jolting. The physics always works from your true position.
+  if (player.grounded && push.y > 0.03 && push.y < 0.4) player.lag = Math.min(0.3, player.lag + push.y);
+  player.lag *= Math.exp(-dt * 14); if (player.lag < 1e-4) player.lag = 0;
+  rig.position.y -= player.lag;
 }
 
 // ================================================================ Black's diggers
@@ -2353,9 +2410,19 @@ function updateBots(dt){
     for (const k in b.pw) b.pw[k] = Math.max(0, b.pw[k] - dt);
     if (b.mode === 'dig'){
       _d.copy(b.target).sub(b.pos); const L = _d.length(), sp = speed * (b.pw.fast > 0 ? 2 : 1);
-      if (L < 0.02) pickNext(b); else b.pos.addScaledVector(_d, Math.min(1, sp * dt / L));
+      if (L < 0.12) pickNext(b);
+      else {
+        // steer towards the next point rather than snapping to it, so tunnels curve like a worm's
+        if (!b.dir) b.dir = new V3(0, 1, 0);
+        _d.multiplyScalar(1 / L);
+        if (L < 0.3) b.dir.copy(_d); else b.dir.lerp(_d, Math.min(1, dt * 4)).normalize();
+        b.pos.addScaledVector(b.dir, Math.min(L, sp * dt));
+      }
       b.acc = (b.acc || 0) + dt;
-      if (b.acc >= 0.12){ stamp(b.pos.x, b.pos.y, b.pos.z, b.pw.wide > 0 ? 0.95 : 0.55, Math.min(1, 3.2 * b.acc), true, inBody); b.acc = 0; }
+      if (b.acc >= 0.12){
+        stamp(b.pos.x, b.pos.y, b.pos.z, b.pw.wide > 0 ? 0.95 : 0.55, 0.9, true, inBody); b.acc = 0;
+        if (b.pos.y > SURF + 0.3 && b.pos.distanceTo(HEAD) < 16 && Math.random() < 0.6) dustAt(b.pos);     // a tower tip pushing into your sky
+      }
       if (b.bombs > 0){ b.bombT -= dt; if (b.bombT <= 0){ b.bombT = 2.2; b.bombs--; blackBomb(b); } }
       // you melted the rock around them: in Black's world their tunnel filled in
       if (sampleV(b.pos) < 0.35){ b.bt += dt; if (b.bt > 0.4){ bury(b); } } else b.bt = 0;
@@ -2376,6 +2443,31 @@ function updateBots(dt){
       if (b.acc >= 0.12){ stamp(b.threat.x, b.threat.y, b.threat.z, 0.6, Math.min(1, 1.05 * b.acc), true, inBody); b.acc = 0; }
     }
   }
+}
+// dust: little grey specks shaken off where rock grows into your air
+const DN = 160, dPos = new Float32Array(DN * 3).fill(-999), dVel = new Float32Array(DN * 3), dLife = new Float32Array(DN);
+const dGeo = new THREE.BufferGeometry(); dGeo.setAttribute('position', new THREE.BufferAttribute(dPos, 3));
+const dust = new THREE.Points(dGeo, new THREE.PointsMaterial({ color: 0x9aa0a8, size: 0.035, transparent: true, opacity: 0.85, depthWrite: false }));
+dust.frustumCulled = false; scene.add(dust);
+let dNext = 0;
+function dustAt(p){
+  const r = 0.62;
+  for (let k = 0; k < 3; k++){
+    const i = dNext; dNext = (dNext + 1) % DN;
+    _a.randomDirection(); if (_a.y < 0) _a.y = -_a.y;
+    dPos[i * 3] = p.x + _a.x * r; dPos[i * 3 + 1] = p.y + _a.y * r; dPos[i * 3 + 2] = p.z + _a.z * r;
+    dVel[i * 3] = _a.x * 0.6; dVel[i * 3 + 1] = 0.4 + Math.random() * 0.6; dVel[i * 3 + 2] = _a.z * 0.6; dLife[i] = 0.9 + Math.random() * 0.6;
+  }
+}
+function updateDust(dt){
+  dust.material.color.setHex(rockMode() === 2 ? 0x2a2c31 : 0xb4b9c0);
+  for (let i = 0; i < DN; i++){
+    if (dLife[i] <= 0) continue;
+    dLife[i] -= dt; if (dLife[i] <= 0){ dPos[i * 3 + 1] = -999; continue; }
+    dVel[i * 3 + 1] -= 3 * dt;
+    dPos[i * 3] += dVel[i * 3] * dt; dPos[i * 3 + 1] += dVel[i * 3 + 1] * dt; dPos[i * 3 + 2] += dVel[i * 3 + 2] * dt;
+  }
+  dGeo.attributes.position.needsUpdate = true;
 }
 function bury(b){
   puff(b.pos);
@@ -2807,7 +2899,7 @@ renderer.setAnimationLoop(() => {
     if (panelT > 0){ panelT -= dt; if (panelT <= 0) panel.m.visible = false; }
   }
   updateRivals(now);
-  updateSparks(dt); updatePuffs(dt); updateShots(dt); updateWords(dt); updateShards(dt); updateRing(dt);
+  updateSparks(dt); updatePuffs(dt); updateShots(dt); updateWords(dt); updateShards(dt); updateRing(dt); updatePops(dt); updateHeat(dt); updateDust(dt);
   audioFrame(dt, active); clockFrame();
   flushDirty(inXR() ? 5 : 8);
   renderer.render(scene, camera);
