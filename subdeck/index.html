@@ -75,7 +75,7 @@
     <dl>
       <dt>Hands</dt><dd>They are your feet on the board. Turn the line between them to steer, raise them to crouch</dd>
       <dt>Trigger</dt><dd>Booster. It pushes toward whichever end of the board you look at, so look back to go fakie</dd>
-      <dt>Flick both hands up, or A</dt><dd>Ollie. In the air, roll your hands to flip the board</dd>
+      <dt>Ollie</dt><dd>Lower your back hand and the nose lifts. Snap it down fast: the tail smacks the ground and pops you up (harder snap, higher pop). Lift your front hand to level the board, or land steep and bail. Same with the front hand for a nollie. A also ollies. Hold the tail down to drag-brake. Roll your hands in the air to flip</dd>
       <dt>B</dt><dd>Back to the spawn</dd>
       <dt>X</dt><dd>Next spawn</dd>
       <dt>Y</dt><dd>Back to sculpting</dd>
@@ -380,7 +380,7 @@ function makeBoard(d = S.design || 0){
   g.userData.wheels = wheels; return g;
 }
 // x = front foot, y = up. Wheels touch at y = -0.06, which is the collision radius below the centre.
-const BOARD_R = 0.06, FEET_UP = 0.075;
+const BOARD_R = 0.06, FEET_UP = 0.075, TAIL = 0.2;      // TAIL: how far the board tips (radians) before the tail touches
 
 function makeSpawnMarker(){
   const g = new THREE.Group(), b = makeBoard(); const ghost = new THREE.MeshBasicMaterial({ color: 0xFF3D7F, transparent: true, opacity: 0.55 }); b.traverse(m => { if (m.material) m.material = ghost; }); g.add(b);
@@ -971,7 +971,7 @@ function dropMarks(dt){
   marks.instanceMatrix.needsUpdate = true;
 }
 
-const sk = { B: new V3(), V: new V3(), N: UP.clone(), F: new V3(1, 0, 0), Uair: UP.clone(), grounded: false, grind: null, bdir: 1, impact: 0, skid: 0, autoCool: 0, cool: 0, leave: 0, bail: 0, boost: 0, air: 0, sinceOllie: 9, events: [] };
+const sk = { B: new V3(), V: new V3(), N: UP.clone(), F: new V3(1, 0, 0), Uair: UP.clone(), grounded: false, grind: null, bdir: 1, impact: 0, skid: 0, autoCool: 0, pitch: 0, hsign: 1, tailDrag: false, cool: 0, leave: 0, bail: 0, boost: 0, air: 0, sinceOllie: 9, events: [] };
 let spawnIdx = 0;
 function spawnAt(i){
   const r = BOARD_R / S.scale;
@@ -1036,7 +1036,7 @@ function stepSkate(dt, inp){
       const v = hd.clone();
       if (inp.flat){ v.setY(0); if (v.lengthSq() < 1e-8 || n.y < -0.9) return null; v.normalize().applyQuaternion(new THREE.Quaternion().setFromUnitVectors(UP, n)); }
       v.addScaledVector(n, -v.dot(n)); if (v.lengthSq() < 1e-6) return null; v.normalize();
-      if (inp.flat && v.dot(sk.F) < 0) v.negate();                 // your feet line has no front, so keep the board's
+      if (inp.flat){ if (v.dot(sk.F) < 0){ v.negate(); sk.hsign = -1; } else sk.hsign = 1; }   // your feet line has no front, so keep the board's
       return v;
     };
     if (sk.grind){ const v = onto(inp.heading, railUp(sk.grind.T)); if (v) sk.F.copy(v); }
@@ -1046,10 +1046,23 @@ function stepSkate(dt, inp){
   // the booster pushes toward whichever end of the board you are looking at
   if (inp.look){ const d = sk.F.dot(inp.look); if (Math.abs(d) > 0.2) sk.bdir = Math.sign(d); }
   if (!sk.grounded && !sk.grind && inp.airQ){ sk.F.set(1, 0, 0).applyQuaternion(inp.airQ); sk.Uair.set(0, 1, 0).applyQuaternion(inp.airQ); }
-  if (inp.ollie && (sk.grounded || sk.grind) && sk.cool <= 0){
-    const n = sk.grind ? railUp(sk.grind.T) : sk.N, pop = S.pop / s;
-    sk.V.addScaledVector(n.y > 0.2 ? n.clone().lerp(UP, 0.35).normalize() : n, pop);
-    sk.Uair.copy(n); sk.grounded = false; sk.grind = null; sk.cool = 0.35; sk.leave = 0.12; sk.sinceOllie = 0; sk.events.push('ollie');
+  // The board tips with your feet line (inp.pitch, + = the board's front end up). On the ground it can only tip until
+  // the tail (or nose) hits the ground. Snap the tail down hard and the strike pops the board up: that's the ollie.
+  let pop = inp.ollie ? 1 : 0;
+  if (inp.pitch !== undefined){
+    const p = inp.pitch * sk.hsign, rate = (inp.pitchRate || 0) * sk.hsign;
+    if (sk.grounded){
+      sk.pitch = clamp(p, -TAIL, TAIL);
+      sk.tailDrag = Math.abs(p) >= TAIL * 0.97;
+      // tail (or nose) strike: the board reaches the ground fast enough to snap
+      if (Math.abs(p) >= TAIL * 0.85 && Math.sign(rate) === Math.sign(p) && Math.abs(rate) > 3 && sk.cool <= 0) pop = clamp(0.45 + (Math.abs(rate) - 3) / 6, 0.45, 1);
+    } else if (sk.grind){ sk.pitch = 0; sk.tailDrag = false; if (Math.abs(rate) > 3 && Math.abs(p) > TAIL * 0.6 && sk.cool <= 0) pop = 0.8; }
+    else sk.tailDrag = false;
+  }
+  if (pop && (sk.grounded || sk.grind) && sk.cool <= 0){
+    const n = sk.grind ? railUp(sk.grind.T) : sk.N, v = S.pop / s * pop;
+    sk.V.addScaledVector(n.y > 0.2 ? n.clone().lerp(UP, 0.35).normalize() : n, v);
+    sk.Uair.copy(n); sk.grounded = false; sk.grind = null; sk.cool = 0.35; sk.leave = 0.12; sk.sinceOllie = 0; sk.tailDrag = false; sk.events.push('ollie');
   }
   const steps = clamp(Math.ceil(sk.V.length() * dt / (r * 0.35)), 1, 14), h = dt / steps;
   for (let i = 0; i < steps && !sk.bail; i++) subStep(h, r, g, inp);
@@ -1070,6 +1083,7 @@ function subStep(h, r, g, inp){
     if (sm > 1e-12) side.multiplyScalar((sm - cut) / sm);
     const slip = (sm - cut) * s; sk.skid = slip;                                   // how fast you're sliding sideways (m/s)
     let dec = mu * load * h + 0.006 * al * al * s * h;                            // rolling friction and a little air
+    if (sk.tailDrag) dec += 0.35 * load * h;                                      // dragging the tail is a brake
     if (slip > 0.25){ const scrub = 0.5 * load * h * Math.min(1, slip / 2); dec += scrub; side.multiplyScalar(Math.max(0, 1 - scrub / Math.max(sm, 1e-9))); }   // sliding wheels scrub speed off
     al -= Math.sign(al) * Math.min(Math.abs(al), dec);
     sk.V.copy(n).multiplyScalar(vn).addScaledVector(sk.F, al).add(side);
@@ -1119,7 +1133,9 @@ function subStep(h, r, g, inp){
   if (contact){
     if (!sk.grounded){
       // landing: you need the board's wheels to face the ground, roughly
-      const up = sk.Uair; if (up.dot(contact) < -0.15 && sk.air > 0.25){ sk.bail = 0.7; sk.events.push('bail'); return; }
+      const up = sk.Uair, steep = Math.abs(sk.F.dot(contact)) > 0.8;
+      if ((up.dot(contact) < -0.15 || steep) && sk.air > 0.25){ sk.bail = 0.7; sk.events.push('bail'); return; }
+      sk.pitch = 0;
       sk.events.push('land'); sk.air = 0;
     }
     sk.grounded = true; sk.N.lerp(contact, 0.6).normalize();
@@ -1173,6 +1189,8 @@ function boardPose(dt = 0){
   const up = sk.grounded || sk.grind ? sk.N : sk.Uair;
   board.quaternion.setFromRotationMatrix(boardBasis(sk.F, up, _m4));
   board.position.copy(sk.B); board.scale.setScalar(1 / S.scale);
+  const pp = sk.grounded ? sk.pitch : 0, piv = new V3(pp >= 0 ? -0.27 : 0.27, -BOARD_R, 0);
+  boardModel.rotation.set(0, 0, pp); boardModel.position.copy(piv).sub(piv.clone().applyAxisAngle(new V3(0, 0, 1), pp));
   // the flame comes out of the end you're not looking at
   const f = sk.boost, b = sk.bdir; flame.visible = flameCore.visible = f > 0.02; flame.scale.set(0.5 + f, 0.6 + f * 1.1 + Math.random() * 0.25 * f, 0.5 + f); flameCore.scale.copy(flame.scale);
   flame.position.x = -0.55 * b; flameCore.position.x = -0.5 * b; flame.rotation.z = flameCore.rotation.z = b * Math.PI / 2;
@@ -1204,14 +1222,14 @@ function placeScaleRef(){
   scaleRef.position.set(-0.45 / S.scale, 0, Math.max(0.12, GROUND_SCULPT - 0.12));
 }
 let sculptWorld = null, skYaw = 0, paused = false;
-const hand = { mid: null, rel: null, relV: 0 };
+const hand = { mid: null, pitch0: null, prevPitch: null, pitchRate: 0 };
 function enterSkate(){
   if (mode === 'skate') return;
   collideDirty = true; collision(); buildGrindLines();
   sculptWorld = { p: world.position.clone(), q: world.quaternion.clone(), s: world.scale.x };
   mode = 'skate'; paused = false; spawnAt(spawnIdx);
   board.visible = true; for (const s of spawns) s.g.visible = false;
-  hand.mid = null; hand.rel = null; hand.relV = 0; endAllActions();
+  hand.mid = null; hand.pitch0 = null; hand.prevPitch = null; hand.pitchRate = 0; endAllActions();
   if (renderer.xr.isPresenting){ alignToHands(); menuShown = false; }
 
   else { deskSk.on = true; deskSk.cam = null; }
@@ -1225,7 +1243,7 @@ function alignToHands(){
   let hv = f ? f.front.clone().sub(f.back).setY(0) : null;
   if (!hv || hv.lengthSq() < 1e-6) hv = new V3(fw.z, 0, -fw.x);           // to your left
   hv.normalize(); if (hv.dot(fw) < -0.3) hv.negate();                      // point the spawn arrow the way you're facing, if your hands line up with it
-  skYaw = Math.atan2(hv.x, hv.z) - Math.atan2(d.x, d.z); hand.mid = null; wasAir = false; sk.bdir = 1;
+  skYaw = Math.atan2(hv.x, hv.z) - Math.atan2(d.x, d.z); hand.mid = null; hand.pitch0 = null; hand.prevPitch = null; hand.pitchRate = 0; wasAir = false; sk.bdir = 1; sk.hsign = 1; sk.pitch = 0;
 }
 function exitSkate(){
   if (mode !== 'skate') return;
@@ -1673,8 +1691,14 @@ function updateSkateXR(dt){
   const mid = fb.front.clone().add(fb.back).multiplyScalar(0.5);
   if (!hand.mid) hand.mid = mid.clone(); else hand.mid.lerp(mid, 1 - Math.exp(-dt * 30));
   // flick both hands up fast = ollie (like snapping your legs up)
-  const rel = mid.y - head.y; if (hand.rel !== null){ const v = (rel - hand.rel) / Math.max(dt, 1e-3); hand.relV = hand.relV * 0.5 + v * 0.5; } hand.rel = rel;
-  if (hand.relV > 1.3 && sk.cool <= 0 && (sk.grounded || sk.grind)){ ollie = true; hand.relV = 0; }
+  // how much your feet line tips (front hand up = +), measured from your own resting angle
+  const hv = fb.front.clone().sub(fb.back), raw = Math.atan2(hv.y, Math.hypot(hv.x, hv.z));
+  if (hand.pitch0 === null) hand.pitch0 = raw;
+  let pitch = raw - hand.pitch0;
+  if (sk.grounded && Math.abs(pitch) < 0.1) hand.pitch0 += (raw - hand.pitch0) * (1 - Math.exp(-dt / 2.5));
+  pitch = Math.abs(pitch) < 0.04 ? 0 : pitch - Math.sign(pitch) * 0.04;          // a little dead zone so wobbles don't tip the board
+  const pr = hand.prevPitch === null ? 0 : (pitch - hand.prevPitch) / Math.max(dt, 1e-3); hand.prevPitch = pitch;
+  hand.pitchRate = hand.pitchRate * 0.35 + pr * 0.65;
   // heading: the line from your back foot to your front foot, turned into park space
   _yawQ.setFromAxisAngle(UP, skYaw); const inv = _yawQ.clone().invert();
   const heading = fb.front.clone().sub(fb.back).applyQuaternion(inv).normalize();
@@ -1682,13 +1706,13 @@ function updateSkateXR(dt){
   const air = !sk.grounded && !sk.grind;
   let airQ = null;
   if (air){
-    if (!wasAir){ _hQ0.copy(handFrame(fb)); _bQ0.setFromRotationMatrix(boardBasis(sk.F, sk.Uair, _m4)); }
+    if (!wasAir){ _hQ0.copy(handFrame(fb)); _bQ0.setFromRotationMatrix(boardBasis(sk.F, sk.Uair, _m4)).multiply(new THREE.Quaternion().setFromAxisAngle(new V3(0, 0, 1), sk.pitch)); }
     const rel = handFrame(fb).multiply(_hQ0.clone().invert());               // hand turn since takeoff (real space)
     airQ = inv.clone().multiply(rel).multiply(_yawQ).multiply(_bQ0);         // the same turn in park space
   }
   wasAir = air;
   const look = renderer.xr.getCamera().getWorldDirection(new V3()).applyQuaternion(inv);
-  stepSkate(dt, { heading, boost, ollie, airQ, look, flat: true });
+  stepSkate(dt, { heading, boost, ollie, airQ, look, flat: true, pitch, pitchRate: hand.pitchRate });
   skateEvents(fb);
   if (sk.grind && Math.random() < 0.5){ pulse(fb.L, 0.12, 12); pulse(fb.R, 0.12, 12); }
   if (sk.grounded && sk.skid > 0.5 && Math.random() < 0.6){ const k = Math.min(0.7, sk.skid / 6); pulse(fb.L, k, 14); pulse(fb.R, k, 14); }
@@ -1781,7 +1805,7 @@ function audioUpdate(dt){
   to(AU.grind.g.gain, gr * (0.25 + 0.2 * Math.random()), 0.015); to(AU.grind.fl.frequency, 2900 + Math.random() * 1400, 0.02); to(AU.grind2.g.gain, gr * 0.3, 0.03);
   const bo = live ? sk.boost : 0;
   to(AU.boost.g.gain, bo * 0.16, 0.12); to(AU.boost.fl.frequency, 380 + bo * 260, 0.12); to(AU.boostHiss.g.gain, bo * 0.008, 0.12); to(AU.rumble.g.gain, bo * 0.07, 0.15); to(AU.rumble.o.frequency, 46 + bo * 8, 0.2);
-  const sl = live && sk.grounded ? Math.min(1, Math.max(0, sk.skid - 0.25) / 4) : 0;
+  const sl = live && sk.grounded ? Math.min(1, Math.max(0, sk.skid - 0.25) / 4 + (sk.tailDrag && sp > 0.4 ? 0.35 + sp / 25 : 0)) : 0;
   to(AU.skid.g.gain, sl * (0.35 + 0.15 * Math.random()), 0.02); to(AU.skid.fl.frequency, 800 + sl * 900 + Math.random() * 300, 0.02); to(AU.skidLo.g.gain, sl * 0.5, 0.03);
   const air = live && !sk.grounded && !sk.grind ? Math.min(1, sp / 12) : 0; to(AU.wind.g.gain, air * 0.3, 0.1); to(AU.wind.fl.frequency, 250 + sp * 60);
   // joints: the grid lines are expansion joints; both trucks clack over each one
