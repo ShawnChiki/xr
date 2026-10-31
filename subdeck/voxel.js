@@ -3,7 +3,7 @@
 // Each chunk is meshed with surface nets so it comes out smooth.
 
 export class VoxelField {
-  constructor(h = 0.02){
+  constructor(h = 0.04){
     this.h = h; this.C = 16; this.max = 4 * h;
     this.chunks = new Map();            // "cx,cy,cz" -> Float32Array(C³)
     this.dirty = new Set(); this.used = false;
@@ -142,7 +142,8 @@ export class VoxelField {
   decode(str){
     this.clear();
     if (!str || !str.startsWith('v2|')) return;        // older saves used a fixed box; those start fresh
-    const [, , body] = str.split('|'), C = this.C, h = this.h;
+    const [, hs, body] = str.split('|'), C = this.C;
+    this.h = +hs || this.h; this.max = 4 * this.h; const h = this.h;      // clay keeps the cell size it was made with
     for (const part of body.split(';')){
       const [key, b64] = part.split(':'), bin = atob(b64), d = new Float32Array(C * C * C).fill(this.max); let a = 0;
       for (let b = 0; b + 2 < bin.length; b += 3){ let q = bin.charCodeAt(b); if (q > 127) q -= 256; const run = bin.charCodeAt(b + 1) | (bin.charCodeAt(b + 2) << 8); d.fill(q / 31 * h, a, Math.min(d.length, a + run)); a += run; }

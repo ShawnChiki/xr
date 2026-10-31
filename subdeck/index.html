@@ -105,7 +105,7 @@ const KEY = 'subdeck-v1', SKEY = 'subdeck-settings-v1';
 const SLIDERS = [
   { k: 'gravity', label: 'Gravity', min: 1, max: 25, step: 0.1, def: 9.8, fmt: v => v.toFixed(1) + ' m/s²', tip: 'How hard you get pulled down. Earth is 9.8' },
   { k: 'friction', label: 'Friction', min: 0, max: 100, step: 1, def: 20, fmt: v => Math.round(v) + '', tip: 'How fast you slow down when you are not boosting' },
-  { k: 'booster', label: 'Booster', min: 0, max: 30, step: 0.5, def: 8, fmt: v => v.toFixed(1) + ' m/s²', tip: 'How hard the trigger pushes you' },
+  { k: 'booster', label: 'Booster', min: 0, max: 30, step: 0.5, def: 10, fmt: v => v.toFixed(1) + ' m/s²', tip: 'How hard the trigger pushes you' },
   { k: 'pop', label: 'Ollie pop', min: 0, max: 10, step: 0.1, def: 3.8, fmt: v => v.toFixed(1) + ' m/s', tip: 'How high an ollie throws you' },
   { k: 'grip', label: 'Grip', min: 0, max: 100, step: 1, def: 85, fmt: v => Math.round(v) + '', tip: 'How hard the wheels hold in turns. Turn harder than this and you skid. Low = drifty' },
   { k: 'top', label: 'Top speed', min: 2, max: 40, step: 0.5, def: 14, fmt: v => v.toFixed(1) + ' m/s', tip: 'The booster stops pushing past this speed' },
@@ -931,16 +931,25 @@ let coll = { bvh: null, geo: null };
 function collision(){
   if (!collideDirty && (coll.bvh || (!objs.length && !voxMeshes.size))) return coll;
   remeshVoxels(); collideDirty = false;
-  const pos = [], idx = []; let base = 0;
+  const pos = [], nor = [], idx = []; let base = 0;
   for (const o of objs) if (o.level !== S.level) buildObj(o);
   for (const m of [...objs.map(o => o.mesh), ...voxMeshes.values()]){
-    const g = m.geometry, P = g.attributes.position.array, I = g.index.array;
-    for (let i = 0; i < P.length; i++) pos.push(P[i]); for (let i = 0; i < I.length; i++) idx.push(I[i] + base); base += P.length / 3;
+    const g = m.geometry, P = g.attributes.position.array, I = g.index.array, Nn = g.attributes.normal ? g.attributes.normal.array : null;
+    for (let i = 0; i < P.length; i++){ pos.push(P[i]); nor.push(Nn ? Nn[i] : 0); } for (let i = 0; i < I.length; i++) idx.push(I[i] + base); base += P.length / 3;
   }
   collideDirty = false;
   if (!idx.length){ coll = { bvh: null, geo: null }; return coll; }
-  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); geo.setIndex(idx);
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3)); geo.setIndex(idx);
   coll = { geo, bvh: new MeshBVH(geo) }; return coll;
+}
+// the surface's smooth normal at a point on triangle fi (so the board glides over facets instead of bumping)
+const _bc = new V3(), _na = new V3(), _nb = new V3(), _nc = new V3();
+function smoothNormal(c, fi, pt, side){
+  const N = c.geo.attributes.normal; if (!N) return side.clone(); const P = c.geo.attributes.position, I = c.geo.index, ia = I.getX(3 * fi), ib = I.getX(3 * fi + 1), ic = I.getX(3 * fi + 2);
+  _a.fromBufferAttribute(P, ia); _b.fromBufferAttribute(P, ib); _c.fromBufferAttribute(P, ic); THREE.Triangle.getBarycoord(pt, _a, _b, _c, _bc);
+  const n = _na.fromBufferAttribute(N, ia).multiplyScalar(_bc.x).add(_nb.fromBufferAttribute(N, ib).multiplyScalar(_bc.y)).add(_nc.fromBufferAttribute(N, ic).multiplyScalar(_bc.z));
+  if (n.lengthSq() < 1e-10 || !isFinite(n.x)) return side.clone(); n.normalize(); if (n.dot(side) < 0) n.negate();
+  return n.dot(side) < 0.5 ? side.clone() : n.clone();        // near sharp edges trust the real direction
 }
 function faceNormal(c, fi){ const P = c.geo.attributes.position, I = c.geo.index; _a.fromBufferAttribute(P, I.getX(3 * fi)); _b.fromBufferAttribute(P, I.getX(3 * fi + 1)); _c.fromBufferAttribute(P, I.getX(3 * fi + 2)); return _tri.set(_a, _b, _c).getNormal(new V3()); }
 
@@ -973,21 +982,38 @@ function dropMarks(dt){
 
 const sk = { B: new V3(), V: new V3(), N: UP.clone(), F: new V3(1, 0, 0), Uair: UP.clone(), grounded: false, grind: null, bdir: 1, impact: 0, skid: 0, autoCool: 0, pitch: 0, hsign: 1, tailDrag: false, cool: 0, leave: 0, bail: 0, boost: 0, air: 0, sinceOllie: 9, events: [] };
 let spawnIdx = 0;
+// a spawn is buried if the spot just above it is inside clay
+const buried = s => { const q = s.p.clone().addScaledVector(s.n, 0.01), h = vox.h; return vox.get(Math.round(q.x / h), Math.round(q.y / h), Math.round(q.z / h)) < 0; };
 function spawnAt(i){
-  const r = BOARD_R / S.scale;
-  if (spawns.length){ spawnIdx = ((i % spawns.length) + spawns.length) % spawns.length; const s = spawns[spawnIdx];
-    sk.B.copy(s.p).addScaledVector(s.n, r * 1.02); sk.N.copy(s.n); sk.F.copy(tangentOf(s.d, s.n)); }
-  else { const top = highestPoint(); sk.B.copy(top).add(new V3(0, r * 1.02, 0)); sk.N.copy(UP); sk.F.set(1, 0, 0); }
+  const r = BOARD_R / S.scale; let s = null;
+  if (spawns.length){
+    // try each spawn in turn from this one; skip any that are buried in clay
+    for (let k = 0; k < spawns.length; k++){ const j = (((i + k) % spawns.length) + spawns.length) % spawns.length; if (!buried(spawns[j])){ spawnIdx = j; s = spawns[j]; break; } }
+  }
+  if (s){ sk.B.copy(s.p).addScaledVector(s.n, r * 1.02); sk.N.copy(s.n); sk.F.copy(tangentOf(s.d, s.n)); }
+  else {
+    // no usable spawn: drop onto the top surface above the first spawn (or the middle of everything)
+    const at = spawns.length ? spawns[0].p : null, top = highestPoint(at); sk.B.copy(top.p).addScaledVector(top.n, r * 1.02); sk.N.copy(top.n);
+    sk.F.copy(tangentOf(spawns.length ? spawns[0].d : new V3(1, 0, 0), top.n));
+    if (spawns.length && mode === 'skate') flash('All spawns are buried in clay, so you start on top');
+  }
+  sk.disp = null;
   sk.V.set(0, 0, 0); sk.skid = 0; sk.Uair.copy(sk.N); sk.grounded = true; sk.grind = null; sk.cool = 0.2; sk.leave = 0; sk.bail = 0; sk.air = 0;
   if (mode === 'skate' && renderer.xr.isPresenting) alignToHands();
 }
-function highestPoint(){ const c = collision(); if (!c.geo) return new V3(); c.geo.computeBoundingBox(); const b = c.geo.boundingBox, m = b.getCenter(new V3()); m.y = b.max.y + 0.05; const t = c.bvh.raycastFirst(new THREE.Ray(m, new V3(0, -1, 0)), THREE.DoubleSide); return t ? t.point.clone() : new V3(m.x, 0, m.z); }
+function highestPoint(at){
+  const c = collision(); if (!c.geo) return { p: at ? new V3(at.x, 0, at.z) : new V3(), n: UP.clone() };
+  c.geo.computeBoundingBox(); const b = c.geo.boundingBox, m = at ? at.clone() : b.getCenter(new V3()); m.y = b.max.y + 0.05;
+  const t = c.bvh.raycastFirst(new THREE.Ray(m, new V3(0, -1, 0)), THREE.DoubleSide);
+  if (!t) return { p: new V3(m.x, 0, m.z), n: UP.clone() }; const n = faceNormal(c, t.faceIndex); if (n.y < 0) n.negate(); return { p: t.point.clone(), n };
+}
 
 const _ray = new THREE.Ray(), _cl = {};
 function closest(p, maxD){
   const c = coll; let best = null;
-  if (c.bvh){ const t = c.bvh.closestPointToPoint(p, _cl, 0, maxD); if (t){ const n = p.clone().sub(t.point), d = t.distance; if (d < 1e-7) n.copy(faceNormal(c, t.faceIndex)).multiplyScalar(sk.N.dot(faceNormal(c, t.faceIndex)) < 0 ? -1 : 1); best = { point: t.point.clone(), n: n.normalize(), d }; } }
-  if (p.y < maxD && (!best || p.y < best.d)) best = { point: new V3(p.x, 0, p.z), n: UP.clone(), d: p.y };
+  if (c.bvh){ const t = c.bvh.closestPointToPoint(p, _cl, 0, maxD); if (t){ const n = p.clone().sub(t.point), d = t.distance; if (d < 1e-7) n.copy(faceNormal(c, t.faceIndex)).multiplyScalar(sk.N.dot(faceNormal(c, t.faceIndex)) < 0 ? -1 : 1); n.normalize();
+    best = { point: t.point.clone(), n, ns: smoothNormal(c, t.faceIndex, t.point, n), d }; } }
+  if (p.y < maxD && (!best || p.y < best.d)) best = { point: new V3(p.x, 0, p.z), n: UP.clone(), ns: UP.clone(), d: p.y };
   return best;
 }
 // everything you can grind: rails, plus ledges found on the shapes (sharp top edges, and the edges of raised flat surfaces)
@@ -1026,7 +1052,7 @@ function railUp(T){ const q = UP.clone().addScaledVector(T, -UP.dot(T)); if (q.l
 // inp: { heading: front-foot direction (park), boost: 0..1, ollie: bool, airQ: quaternion for the board in the air (or null) }
 function stepSkate(dt, inp){
   const s = S.scale, r = BOARD_R / s, g = S.gravity / s;
-  sk.cool -= dt; sk.leave -= dt; sk.sinceOllie += dt; sk.autoCool -= dt;
+  sk.cool -= dt; sk.leave -= dt; sk.sinceOllie += dt; sk.autoCool -= dt; sk.autoScan = (sk.autoScan || 0) - dt;
   if (sk.bail > 0){ sk.bail -= dt; if (sk.bail <= 0) spawnAt(spawnIdx); return; }
   sk.boost = inp.boost;
   // steering: on the ground the board lies on the surface, pointing where your feet point.
@@ -1069,7 +1095,7 @@ function stepSkate(dt, inp){
   if (!(isFinite(sk.B.x + sk.B.y + sk.B.z + sk.V.x + sk.V.y + sk.V.z + sk.F.x + sk.N.y + sk.Uair.y)) || sk.B.lengthSq() > 2500 || sk.B.y < -1) spawnAt(spawnIdx);
 }
 function subStep(h, r, g, inp){
-  const s = S.scale, mu = S.friction / 100 * 0.15, grip = S.grip / 100 * 2, top = S.top / s, acc = S.booster / s * inp.boost;
+  const s = S.scale, mu = S.friction / 100 * 0.15, grip = S.grip / 100 * 2.6, top = S.top / s, acc = S.booster / s * inp.boost;
   if (sk.grind){ sk.skid = 0; return grindStep(h, r, g, mu, top, acc, inp); }
   sk.V.y -= g * h;
   // booster toward the end you look at, until top speed
@@ -1111,7 +1137,7 @@ function subStep(h, r, g, inp){
       }
     }
     // auto grind: rolling along next to a ledge or rail that's lined up and within reach, pop up onto it
-    if (S.autoGrind && sk.grounded && sk.autoCool <= 0 && sk.V.length() * s > 1.2) autoPop(r, g);
+    if (S.autoGrind && sk.grounded && sk.autoCool <= 0 && sk.autoScan <= 0 && sk.V.length() * s > 1.2){ sk.autoScan = 0.08; autoPop(r, g); }
   }
   // contact with surfaces and the ground
   let contact = null;
@@ -1120,14 +1146,14 @@ function subStep(h, r, g, inp){
     if (c.d < r){
       sk.B.copy(c.point).addScaledVector(c.n, r); const vn = sk.V.dot(c.n);
       if (vn < 0){ if (!sk.grounded) sk.impact = Math.max(sk.impact, -vn * s); sk.V.addScaledVector(c.n, -vn); }
-      contact = c.n;
+      contact = c.ns;
     } else if (sk.grounded && sk.leave <= 0 && it === 0){
       // the surface curves away under you: stay on it while gravity can keep you there, otherwise take off
       // under an overhang you only stay on if you're fast enough for the curve to hold you (v² · curvature > gravity pulling you off)
       const away = (c.d - r) / h, hold = g * Math.max(0, c.n.y) * h + 0.35 / s;
       const vt2 = sk.V.lengthSq(), kap = Math.acos(clamp(sk.N.dot(c.n), -1, 1)) / Math.max(Math.sqrt(vt2) * h, 1e-9);
       const holds = c.n.y > -0.05 || vt2 * kap > g * -c.n.y;
-      if (away < hold && holds && sk.V.dot(c.n) < 0.6 / s){ sk.B.copy(c.point).addScaledVector(c.n, r); const vn = sk.V.dot(c.n); if (vn > 0) sk.V.addScaledVector(c.n, -vn); contact = c.n; }
+      if (away < hold && holds && sk.V.dot(c.n) < 0.6 / s){ sk.B.copy(c.point).addScaledVector(c.n, r); const vn = sk.V.dot(c.n); if (vn > 0) sk.V.addScaledVector(c.n, -vn); contact = c.ns; }
     }
   }
   if (contact){
@@ -1187,8 +1213,15 @@ function grindStep(h, r, g, mu, top, acc, inp){
 function boardPose(dt = 0){
   dropMarks(dt);
   const up = sk.grounded || sk.grind ? sk.N : sk.Uair;
-  board.quaternion.setFromRotationMatrix(boardBasis(sk.F, up, _m4));
-  board.position.copy(sk.B); board.scale.setScalar(1 / S.scale);
+  // ease the board's angle (fast) and soak up small bumps along the surface normal, so the ride and your view stay smooth
+  const qT = new THREE.Quaternion().setFromRotationMatrix(boardBasis(sk.F, up, _m4));
+  if (!sk.disp || dt <= 0){ board.quaternion.copy(qT); sk.disp = sk.B.clone(); }
+  else {
+    board.quaternion.slerp(qT, 1 - Math.exp(-dt * (sk.grounded ? 28 : 40)));
+    const n = sk.grounded ? sk.N : UP, off = sk.disp.clone().sub(sk.B).dot(n), lim = BOARD_R / S.scale;
+    sk.disp.copy(sk.B).addScaledVector(n, clamp(off, -lim, lim) * Math.exp(-dt * 16));
+  }
+  board.position.copy(sk.disp); board.scale.setScalar(1 / S.scale);
   const pp = sk.grounded ? sk.pitch : 0, piv = new V3(pp >= 0 ? -0.27 : 0.27, -BOARD_R, 0);
   boardModel.rotation.set(0, 0, pp); boardModel.position.copy(piv).sub(piv.clone().applyAxisAngle(new V3(0, 0, 1), pp));
   // the flame comes out of the end you're not looking at
@@ -1329,12 +1362,12 @@ function setTool(t){ S.tool = t; saveSettings(); menuDirty = true; }
 // a fresh scene that is one big block of clay, ready to carve scoops into
 function clayBlock(){
   restore('{}');
-  const W = 1.2, H = 0.3; vox.fillBox([-W, 0, -W], [W, H, W], 0.04); voxEncDirty = true;
+  const W = 2.5, H = 0.5; vox.fillBox([-W, 0, -W], [W, H, W], 0.08); voxEncDirty = true;
   addSpawn(new V3(-W + 0.12, H, 0), UP.clone(), new V3(1, 0, 0));
-  remeshVoxels(); commit(); setTool('carve'); if (S.brush < 0.06) setBrush(0.08); fitSoon();
+  remeshVoxels(); commit(); setTool('carve'); if (S.brush < 0.06) setBrush(0.08); fitSoon(true);
   flash('Clay block ready. Hold the trigger to carve scoops. Undo brings your old scene back', 4);
 }
-function setBrush(r){ S.brush = clamp(r, 0.008, 0.6); saveSettings(); menuDirty = true; flash('Brush ' + Math.round(S.brush * 200) + ' cm across'); }
+function setBrush(r){ S.brush = clamp(r, 0.015, 0.6); saveSettings(); menuDirty = true; flash('Brush ' + Math.round(S.brush * 200) + ' cm across'); }
 function setLevel(i){ S.level = clamp(i, 0, 3); saveSettings(); for (const o of objs) buildObj(o); collideDirty = true; menuDirty = true; flash(S.level ? 'Smooth ' + S.level : 'Cage only'); }
 function onScale(){ for (const s of spawns) placeSpawn(s); }
 
@@ -1745,7 +1778,7 @@ function skateEvents(fb){
 }
 function placeWorldUnderFeet(feet, dt){
   const s = S.scale; boardPose(dt);
-  const up = sk.grounded || sk.grind ? sk.N : sk.Uair, deck = sk.B.clone().addScaledVector(up, FEET_UP / s);
+  const up = sk.grounded || sk.grind ? sk.N : sk.Uair, deck = board.position.clone().addScaledVector(up, FEET_UP / s);
   world.scale.setScalar(s); world.quaternion.setFromAxisAngle(UP, skYaw);
   world.position.copy(feet).sub(deck.multiplyScalar(s).applyQuaternion(world.quaternion));
 }
@@ -1878,7 +1911,8 @@ async function start(kind){
   starting = false; if (!session){ setupButtons(); return; }
   isAR = sessMode === 'immersive-ar'; S.room = isAR; saveSettings(); audioInit();
   if (mode === 'skate') exitSkate();
-  renderer.xr.setReferenceSpaceType('local-floor'); await renderer.xr.setSession(session);
+  renderer.xr.setReferenceSpaceType('local-floor'); renderer.xr.setFoveation(0.6); await renderer.xr.setSession(session);
+  try { const rates = session.supportedFrameRates; if (rates && rates.length){ const best = Math.max(...[...rates].filter(r => r <= 90)); if (best) session.updateTargetFrameRate(best).catch(() => {}); } } catch (e) {}
   needsFit = true; menuShown = true; layoutKey = ''; applyBackground();
   const b = kind === 'immersive-ar' ? mrBtn : vrBtn; b.disabled = false; b.textContent = 'Exit';
   session.addEventListener('end', () => {
@@ -1896,11 +1930,12 @@ function fitXR(){
   const f = c.getWorldDirection(new V3()).setY(0); if (f.lengthSq() < 1e-6) f.set(0, 0, -1); f.normalize();
   const box = new THREE.Box3(); for (const o of objs){ o.mesh.geometry.computeBoundingBox(); box.union(o.mesh.geometry.boundingBox); } for (const m of voxMeshes.values()){ m.geometry.computeBoundingBox(); box.union(m.geometry.boundingBox); } for (const r of rails) for (const q of r.pts) box.expandByPoint(q);
   const ctr = box.isEmpty() ? new V3() : box.getCenter(new V3()), size = box.isEmpty() ? 0.6 : Math.max(box.max.x - box.min.x, box.max.z - box.min.z);
-  world.scale.setScalar(1); world.quaternion.setFromAxisAngle(UP, Math.atan2(-f.x, -f.z));
-  const at = p.clone().addScaledVector(f, 0.35 + size * 0.5); at.y = Math.max(0.55, p.y - 0.7);
-  world.position.copy(at).sub(new V3(ctr.x, 0, ctr.z).applyQuaternion(world.quaternion)); cageDirty = true; return true;
+  const sc = Math.min(1, FIT_MAX / Math.max(size, 0.01)); world.scale.setScalar(sc); world.quaternion.setFromAxisAngle(UP, Math.atan2(-f.x, -f.z));
+  const at = p.clone().addScaledVector(f, 0.35 + size * sc * 0.5); at.y = Math.max(0.55, p.y - 0.7);
+  world.position.copy(at).sub(new V3(ctr.x, 0, ctr.z).multiplyScalar(sc).applyQuaternion(world.quaternion)); cageDirty = true; return true;
 }
 let fitPending = false; function fitSoon(){ if (renderer.xr.isPresenting) needsFit = true; else fitPending = true; }
+const FIT_MAX = 1.5;      // big parks are shrunk to fit about this wide (metres) in front of you
 
 // ======================================================================
 // Loop
@@ -1912,7 +1947,10 @@ renderer.setAnimationLoop(now => {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   const xr = renderer.xr.isPresenting;
   if (needsFit && xr && fitXR()) needsFit = false;
-  if (fitPending && !xr){ fitPending = false; orbit.target.set(0, 0.06, 0); }
+  if (fitPending && !xr){ fitPending = false;
+    const box = new THREE.Box3(); for (const o of objs){ o.mesh.geometry.computeBoundingBox(); box.union(o.mesh.geometry.boundingBox); } for (const m of voxMeshes.values()){ m.geometry.computeBoundingBox(); box.union(m.geometry.boundingBox); }
+    const c = box.isEmpty() ? new V3(0, 0.06, 0) : box.getCenter(new V3()), sz = box.isEmpty() ? 1 : Math.max(0.6, box.getSize(new V3()).length());
+    orbit.target.copy(c); camera.position.copy(c).add(new V3(0.45, 0.4, 0.8).multiplyScalar(sz)); }
   try {
     if (xr){ if (mode === 'skate') updateSkateXR(dt); else updateSculptXR(dt); }
     else if (mode === 'skate') updateSkateDesk(dt);
