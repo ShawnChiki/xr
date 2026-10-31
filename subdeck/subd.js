@@ -124,18 +124,45 @@ export function extrudeEdge(cage, a, b){
   return [p2, q2];
 }
 
-// Pull a face out along with new side faces. Returns the indices of the moved (new) vertices.
-export function extrudeFace(cage, fi){
-  const f = cage.faces[fi], n = f.length, base = cage.verts.length, nu = f.map((v, i) => base + i);
-  for (const v of f) cage.verts.push(cage.verts[v].slice());
-  for (let i = 0; i < n; i++){ const j = (i + 1) % n; cage.faces.push([f[i], f[j], nu[j], nu[i]]); }
-  // edges of the face that were sharp stay sharp on the new top
-  for (let i = 0; i < n; i++){ const j = (i + 1) % n; if (cage.creases.has(ek(f[i], f[j]))) cage.creases.add(ek(nu[i], nu[j])); }
-  // a corner where both face edges were sharp keeps a sharp edge up the new side (a box stays a box)
-  for (let i = 0; i < n; i++){ const p = (i - 1 + n) % n, j = (i + 1) % n; if (cage.creases.has(ek(f[p], f[i])) && cage.creases.has(ek(f[i], f[j]))) cage.creases.add(ek(f[i], nu[i])); }
-  cage.faces[fi] = nu;
-  return nu;
+// Pull several faces out as one piece: shared edges stay inside, side walls go round the outline.
+// Returns a Map old vertex -> new vertex.
+export function extrudeFaces(cage, fis){
+  const set = new Set(fis), map = new Map(), cnt = new Map();
+  const nv = v => { if (!map.has(v)){ map.set(v, cage.verts.length); cage.verts.push(cage.verts[v].slice()); } return map.get(v); };
+  for (const fi of set){ const f = cage.faces[fi]; for (let i = 0; i < f.length; i++){ const k = ek(f[i], f[(i + 1) % f.length]); cnt.set(k, (cnt.get(k) || 0) + 1); } }
+  const sides = [];
+  for (const fi of set){ const f = cage.faces[fi]; for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; if (cnt.get(ek(a, b)) === 1) sides.push([a, b]); } }
+  const old = new Set(cage.creases);
+  for (const fi of set) cage.faces[fi] = cage.faces[fi].map(nv);
+  for (const [a, b] of sides){ cage.faces.push([a, b, map.get(b), map.get(a)]); if (old.has(ek(a, b))) cage.creases.add(ek(map.get(a), map.get(b))); }
+  // sharp edges inside the region move up to the new top
+  for (const k of old){ if (cnt.get(k) === 2){ const [a, b] = k.split('_').map(Number); cage.creases.delete(k); cage.creases.add(ek(map.get(a), map.get(b))); } }
+  // a corner where both outline edges were sharp keeps a sharp edge up the side (a box stays a box)
+  const sharpSides = new Map(); for (const [a, b] of sides) for (const v of [a, b]) sharpSides.set(v, (sharpSides.get(v) || []).concat(old.has(ek(a, b))));
+  for (const [v, l] of sharpSides) if (l.length >= 2 && l.every(Boolean)) cage.creases.add(ek(v, map.get(v)));
+  return map;
 }
+// one face; returns the new face's vertices
+export function extrudeFace(cage, fi){ extrudeFaces(cage, [fi]); return cage.faces[fi].slice(); }
+
+// Pull a run of open edges out together (neighbouring edges share their new points). Returns Map old -> new, or null.
+export function extrudeEdges(cage, edges){
+  const E = edgeMap(cage), map = new Map(); let n = 0;
+  const nv = v => { if (!map.has(v)){ map.set(v, cage.verts.length); cage.verts.push(cage.verts[v].slice()); } return map.get(v); };
+  for (const [a, b] of edges){
+    const e = E.get(ek(a, b)); if (!e || e.faces.length !== 1) continue;
+    const f = cage.faces[e.faces[0]], i = f.indexOf(a), fwd = f[(i + 1) % f.length] === b;
+    const [p, q] = fwd ? [a, b] : [b, a];
+    cage.faces.push([q, p, nv(p), nv(q)]); n++;
+  }
+  return n ? map : null;
+}
+
+// a mirror copy across the x = 0 plane (faces flipped so they still face out)
+export function mirrorCage(c){ return { verts: c.verts.map(v => [-v[0], v[1], v[2]]), faces: c.faces.map(f => f.slice().reverse()), creases: new Set(c.creases) }; }
+
+// a smooth ball: a cube cage with no sharp edges
+export function makeBlob(c, x, y, z){ const b = makeBlock(c, x, y, z); b.creases.clear(); return b; }
 
 // Cut a new edge loop across the ring of four-sided faces that this edge belongs to. Returns the new vertex indices.
 export function loopCut(cage, a, b, t = 0.5){
