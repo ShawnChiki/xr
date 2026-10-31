@@ -400,22 +400,19 @@ function placeSpawn(s){
 // ---------- voxel clay: Add, Carve and Smooth sculpt into a grid that covers the park ----------
 const vox = new VoxelField(), voxMeshes = new Map(); let voxEnc = null, voxEncDirty = true;
 const voxMat = gridMat(0xD9D4CA);
-function remeshVoxels(limit = 999){
-  let n = 0;
+function remeshVoxels(budgetMs = 1e9){
+  const t0 = performance.now();
   for (const id of vox.dirty){
-    if (n++ >= limit) break; vox.dirty.delete(id);
+    if (performance.now() - t0 > budgetMs) break; vox.dirty.delete(id);
     const m = vox.meshChunk(id), old = voxMeshes.get(id);
     if (!m){ if (old){ modelG.remove(old); old.geometry.dispose(); voxMeshes.delete(id); } continue; }
     const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(m.pos, 3)); g.setAttribute('normal', new THREE.BufferAttribute(m.nor, 3)); g.setIndex(m.idx);
     if (old){ old.geometry.dispose(); old.geometry = g; } else { const mesh = new THREE.Mesh(g, voxMat); modelG.add(mesh); voxMeshes.set(id, mesh); }
-    collideDirty = true;
+    collideDirty = true; cageDirty = true;
   }
 }
 function voxText(){ if (voxEncDirty){ voxEnc = vox.used || voxMeshes.size ? vox.encode() : null; voxEncDirty = false; } return voxEnc; }
-// the box you can sculpt clay inside, shown while a clay tool is picked
-const voxBox = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: 0x5FE0B8, transparent: true, opacity: 0.35 }));
-voxBox.scale.set(vox.h * (vox.n[0] - 1), vox.h * (vox.n[1] - 1), vox.h * (vox.n[2] - 1)); voxBox.position.set(vox.o[0] + voxBox.scale.x / 2, vox.o[1] + voxBox.scale.y / 2, vox.o[2] + voxBox.scale.z / 2);
-voxBox.visible = false; modelG.add(voxBox);
+
 
 // ---------- save, load, undo ----------
 const r5 = x => Math.round(x * 1e5) / 1e5, vj = v => [r5(v.x), r5(v.y), r5(v.z)];
@@ -482,7 +479,8 @@ cageDots.frustumCulled = railDots.frustumCulled = false;
 let dotScaleAt = 0;
 function rebuildCage(){
   cageDirty = false; selDirty = true; placeMirrorPlane();
-  { let r = 0.5; for (const o of objs) for (const v of o.cage.verts) r = Math.max(r, Math.hypot(v[0], v[2]) + 0.12); for (const q of rails) for (const v of q.pts) r = Math.max(r, Math.hypot(v.x, v.z) + 0.12); GROUND_SCULPT = r; } const show = mode === 'sculpt' && S.cage;
+  { let r = 0.5; for (const o of objs) for (const v of o.cage.verts) r = Math.max(r, Math.hypot(v[0], v[2]) + 0.12); for (const q of rails) for (const v of q.pts) r = Math.max(r, Math.hypot(v.x, v.z) + 0.12);
+    for (const m of voxMeshes.values()){ m.geometry.computeBoundingSphere(); const bs = m.geometry.boundingSphere; r = Math.max(r, Math.hypot(bs.center.x, bs.center.z) + bs.radius + 0.05); } GROUND_SCULPT = r; } const show = mode === 'sculpt' && S.cage;
   cageLines.visible = cageDots.visible = show; railDots.visible = mode === 'sculpt';
   const pos = [], col = [], cE = new THREE.Color(0x8FB3FF), cC = new THREE.Color(0xFF8A1F);
   let n = 0; const ws = world.scale.x, dr = 0.0045 / ws; dotScaleAt = ws;
@@ -859,7 +857,7 @@ function toolUp(a, quick){
   }
   if (a.kind === 'spawn'){ commit(); sfx('make'); flash('Spawn ' + spawns.length + ' placed'); return; }
   if (a.kind === 'erase'){ if (a.did){ clearSel(); commit(); } return; }
-  if (a.kind === 'clay'){ if (a.did){ remeshVoxels(); commit(); } return; }
+  if (a.kind === 'clay'){ if (a.did) commit(); return; }
   if (a.kind === 'move'){
     if (a.extrude && a.moved < 0.004 * k){ showSnaps(null); restore(committed); return; }
     const welds = weldSnaps(a); for (const o of objs) if (o.level !== S.level || welds) buildObj(o);
@@ -1187,6 +1185,24 @@ function boardPose(dt = 0){
   blob.visible = !!at; if (at){ const hgt = sk.B.distanceTo(at) * S.scale; blob.position.copy(at).addScaledVector(n, 0.0008); blob.quaternion.setFromUnitVectors(new V3(0, 0, 1), n); blob.scale.setScalar(0.32 / S.scale * (1 + hgt * 0.15)); blob.material.opacity = 0.42 / (1 + hgt * 0.6); }
 }
 
+// scale references while you sculpt: boards and a skater at your skating size, parked by the edge of the ground
+const scaleRef = new THREE.Group(); world.add(scaleRef);
+{
+  const b1 = makeBoard(), b2 = makeBoard(); b1.position.set(0, BOARD_R, 0); b2.position.set(0.95, BOARD_R, 0.1); b2.rotation.y = 0.5; scaleRef.add(b1, b2);
+  // a simple figure, 1.75 m tall at real size
+  const m = new THREE.MeshStandardMaterial({ color: 0x5CC8FF, roughness: 0.6 }), skin = new THREE.MeshStandardMaterial({ color: 0xE8C79A, roughness: 0.7 }), fig = new THREE.Group();
+  for (const z of [-0.1, 0.1]){ const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.065, 0.72, 4, 10), m); leg.position.set(0, 0.43, z); fig.add(leg); }
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.42, 4, 12), new THREE.MeshStandardMaterial({ color: 0xFF3D7F, roughness: 0.6 })); body.position.y = 1.15; fig.add(body);
+  for (const z of [-0.26, 0.26]){ const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.55, 4, 8), skin); arm.position.set(0, 1.17, z); arm.rotation.x = Math.sign(z) * 0.12; fig.add(arm); }
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.12, 16, 12), skin); head.position.y = 1.63; fig.add(head);
+  fig.position.set(0.45, 0, -0.2); scaleRef.add(fig);
+}
+function placeScaleRef(){
+  scaleRef.visible = mode === 'sculpt'; if (!scaleRef.visible) return;
+  // stand them just inside the front edge of the ground, at 1 : your size
+  scaleRef.scale.setScalar(1 / S.scale);
+  scaleRef.position.set(-0.45 / S.scale, 0, Math.max(0.12, GROUND_SCULPT - 0.12));
+}
 let sculptWorld = null, skYaw = 0, paused = false;
 const hand = { mid: null, rel: null, relV: 0 };
 function enterSkate(){
@@ -1291,7 +1307,7 @@ function layout(){
 let layoutKey = '';
 function relayout(){ const key = S.autoGrind + CLAY.has(S.tool) + mode + S.cage + S.room + clearArmed + spawns.length + renderer.xr.isPresenting + S.sound + S.design; if (key !== layoutKey){ layoutKey = key; layout(); menuDirty = true; } }
 function setTool(t){ S.tool = t; saveSettings(); menuDirty = true; }
-function setBrush(r){ S.brush = clamp(r, 0.008, 0.3); saveSettings(); menuDirty = true; flash('Brush ' + Math.round(S.brush * 200) + ' cm across'); }
+function setBrush(r){ S.brush = clamp(r, 0.008, 0.6); saveSettings(); menuDirty = true; flash('Brush ' + Math.round(S.brush * 200) + ' cm across'); }
 function setLevel(i){ S.level = clamp(i, 0, 3); saveSettings(); for (const o of objs) buildObj(o); collideDirty = true; menuDirty = true; flash(S.level ? 'Smooth ' + S.level : 'Cage only'); }
 function onScale(){ for (const s of spawns) placeSpawn(s); }
 
@@ -1676,7 +1692,7 @@ function updateSkateXR(dt){
   skateEvents(fb);
   if (sk.grind && Math.random() < 0.5){ pulse(fb.L, 0.12, 12); pulse(fb.R, 0.12, 12); }
   if (sk.grounded && sk.skid > 0.5 && Math.random() < 0.6){ const k = Math.min(0.7, sk.skid / 6); pulse(fb.L, k, 14); pulse(fb.R, k, 14); }
-  if (boost > 0.05 && Math.random() < 0.3){ pulse(fb.L, 0.08 * boost, 10); pulse(fb.R, 0.08 * boost, 10); }
+  if (boost > 0.05 && Math.random() < 0.15){ pulse(fb.L, 0.04 * boost, 8); pulse(fb.R, 0.04 * boost, 8); }
   // put the park where it has to be so the board is under your feet
   placeWorldUnderFeet(hand.mid, dt);
 }
@@ -1750,7 +1766,7 @@ function audioInit(){
   AU.grind = loop('bandpass', 3400, 11); AU.grind2 = loop('bandpass', 1500, 7);
   AU.boost = loop('lowpass', 700, 1); AU.boostHiss = loop('highpass', 4000, 0.6);
   AU.wind = loop('bandpass', 500, 0.7); AU.skid = loop('bandpass', 1100, 4); AU.skidLo = loop('lowpass', 380, 1);
-  const o = C.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 50; const of = C.createBiquadFilter(); of.type = 'lowpass'; of.frequency.value = 260; const og = C.createGain(); og.gain.value = 0;
+  const o = C.createOscillator(); o.type = 'sine'; o.frequency.value = 50; const of = C.createBiquadFilter(); of.type = 'lowpass'; of.frequency.value = 160; const og = C.createGain(); og.gain.value = 0;
   o.connect(of); of.connect(og); og.connect(AU.master); o.start(); AU.rumble = { o, g: og };
 }
 function setVolume(){ if (AU.master) AU.master.gain.setTargetAtTime(S.sound ? 0.9 : 0, AU.ctx.currentTime, 0.05); }
@@ -1764,7 +1780,7 @@ function audioUpdate(dt){
   const gr = live && sk.grind ? Math.min(1, 0.35 + Math.abs(sk.grind.sp) * S.scale / 7) : 0;
   to(AU.grind.g.gain, gr * (0.25 + 0.2 * Math.random()), 0.015); to(AU.grind.fl.frequency, 2900 + Math.random() * 1400, 0.02); to(AU.grind2.g.gain, gr * 0.3, 0.03);
   const bo = live ? sk.boost : 0;
-  to(AU.boost.g.gain, bo * 0.6); to(AU.boost.fl.frequency, 500 + bo * 700); to(AU.boostHiss.g.gain, bo * 0.07); to(AU.rumble.g.gain, bo * 0.28); to(AU.rumble.o.frequency, 42 + bo * 18 + Math.random() * 8, 0.02);
+  to(AU.boost.g.gain, bo * 0.16, 0.12); to(AU.boost.fl.frequency, 380 + bo * 260, 0.12); to(AU.boostHiss.g.gain, bo * 0.008, 0.12); to(AU.rumble.g.gain, bo * 0.07, 0.15); to(AU.rumble.o.frequency, 46 + bo * 8, 0.2);
   const sl = live && sk.grounded ? Math.min(1, Math.max(0, sk.skid - 0.25) / 4) : 0;
   to(AU.skid.g.gain, sl * (0.35 + 0.15 * Math.random()), 0.02); to(AU.skid.fl.frequency, 800 + sl * 900 + Math.random() * 300, 0.02); to(AU.skidLo.g.gain, sl * 0.5, 0.03);
   const air = live && !sk.grounded && !sk.grind ? Math.min(1, sp / 12) : 0; to(AU.wind.g.gain, air * 0.3, 0.1); to(AU.wind.fl.frequency, 250 + sp * 60);
@@ -1842,7 +1858,7 @@ navigator.xr?.addEventListener?.('devicechange', setupButtons); setupButtons();
 function fitXR(){
   const c = renderer.xr.getCamera(), p = c.getWorldPosition(new V3()); if (p.lengthSq() < 0.01) return false;
   const f = c.getWorldDirection(new V3()).setY(0); if (f.lengthSq() < 1e-6) f.set(0, 0, -1); f.normalize();
-  const box = new THREE.Box3(); for (const o of objs){ o.mesh.geometry.computeBoundingBox(); box.union(o.mesh.geometry.boundingBox); } for (const r of rails) for (const q of r.pts) box.expandByPoint(q);
+  const box = new THREE.Box3(); for (const o of objs){ o.mesh.geometry.computeBoundingBox(); box.union(o.mesh.geometry.boundingBox); } for (const m of voxMeshes.values()){ m.geometry.computeBoundingBox(); box.union(m.geometry.boundingBox); } for (const r of rails) for (const q of r.pts) box.expandByPoint(q);
   const ctr = box.isEmpty() ? new V3() : box.getCenter(new V3()), size = box.isEmpty() ? 0.6 : Math.max(box.max.x - box.min.x, box.max.z - box.min.z);
   world.scale.setScalar(1); world.quaternion.setFromAxisAngle(UP, Math.atan2(-f.x, -f.z));
   const at = p.clone().addScaledVector(f, 0.35 + size * 0.5); at.y = Math.max(0.55, p.y - 0.7);
@@ -1866,13 +1882,12 @@ renderer.setAnimationLoop(now => {
     else if (mode === 'skate') updateSkateDesk(dt);
     else orbit.update();
     if (mode === 'sculpt' && Math.abs(world.scale.x / (dotScaleAt || 1) - 1) > 0.15) cageDirty = true;
-    if (vox.dirty.size) remeshVoxels(24);
-    voxBox.visible = mode === 'sculpt' && CLAY.has(S.tool);
-    if (cageDirty) rebuildCage();
+    if (vox.dirty.size) remeshVoxels(renderer.xr.isPresenting ? 5 : 12);
+      if (cageDirty) rebuildCage();
     if (selDirty) rebuildSel();
     if (clearArmed > 0){ clearArmed -= dt; if (clearArmed <= 0){ clearArmed = 0; layoutKey = ''; } }
     if (flashT > 0){ flashT -= dt; if (flashT <= 0) menuDirty = true; }
-    placeMsg(dt); placeEnv(); audioUpdate(dt);
+    placeMsg(dt); placeEnv(); placeScaleRef(); audioUpdate(dt);
     if (menuDirty) drawMenu();
     menuWrap.hidden = xr;
   } catch (err){
