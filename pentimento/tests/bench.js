@@ -11,7 +11,7 @@ const args = process.argv.slice(2), SAVE = args.includes('--save'), only = args.
 
 const mk = seed => { let s0 = seed; const rnd = () => { s0 = (s0 * 16807) % 2147483647; return s0 / 2147483647; }; return { rnd, g: () => (rnd() + rnd() + rnd() + rnd() - 2) * 1.2 }; };
 const rms = a => a.length ? Math.sqrt(a.reduce((s, e) => s + e * e, 0) / a.length) : 0;
-const P = { detail: 0.3, avg: 0.48, lines: 4, fair: 0.3, reach: 0.4, group: 0.35, subd: 1, relax: 2 };
+const P = { detail: 0.3, avg: 0.48, lines: 4, fair: 0.3, reach: 0.4, group: 0.35, subd: 1, relax: 2, rows: 1 };   // rows: the app's default (one clean row along each crease)
 
 // ---------------- the cases. Each returns { st (strokes), prm, score(r) -> { name: value } } (lower is better unless noted)
 function spine(seed, A){
@@ -101,7 +101,7 @@ function ridge(seed){ // a sharp ridge with one strict crease along its top: how
   return { st, prm: P, score: r => { const V = r.surface.pos, a = [], fold = []; for (let i = 0; i < V.length; i += 3){ const x = V[i], y = V[i + 1], z = V[i + 2]; if (Math.abs(z) > 1.5 || Math.abs(x) > 0.5) continue; a.push(Math.abs(y - H(x, z))); } return { crest: rms(a) }; } };
 }
 function demo(seed){ const st = D.demoSketch(seed, 1), H = st.truth;
-  return { st: st.map(o => ({ tag: o.tag, pts: o.pts })), prm: { detail: 0.4, avg: 0.64, lines: 4, fair: 0.3, reach: 0.6, group: 0.35, subd: 1 }, score: r => { const V = r.quads.V, a = []; for (let i = 0; i < V.length; i += 3){ const x = V[i], y = V[i + 1], z = V[i + 2], e = 0.05, gr = Math.hypot((H(x + e, z) - H(x - e, z)) / (2 * e), (H(x, z + e) - H(x, z - e)) / (2 * e)); if (gr < 0.8) a.push(Math.abs(y - H(x, z)) / Math.hypot(1, gr)); } return { all: rms(a) }; } }; }
+  return { st: st.map(o => ({ tag: o.tag, pts: o.pts })), prm: { detail: 0.4, avg: 0.64, lines: 4, fair: 0.3, reach: 0.6, group: 0.35, subd: 1, rows: 1 }, score: r => { const V = r.quads.V, a = []; for (let i = 0; i < V.length; i += 3){ const x = V[i], y = V[i + 1], z = V[i + 2], e = 0.05, gr = Math.hypot((H(x + e, z) - H(x - e, z)) / (2 * e), (H(x, z + e) - H(x, z - e)) / (2 * e)); if (gr < 0.8) a.push(Math.abs(y - H(x, z)) / Math.hypot(1, gr)); } return { all: rms(a) }; } }; }
 function edgeLoop(seed){ const { rnd, g } = mk(seed), H = (x, z) => 0.3 * Math.sin(x * 0.5) * Math.cos(z * 0.4), st = [];
   for (let i = 0; i < 200; i++){ let x = -5 + rnd() * 10, z = -5 + rnd() * 10; const a = rnd() * 6.28, off = g() * 0.06, pts = []; for (let k = 0; k < 60; k++){ const xx = x + Math.cos(a) * k * 0.05, zz = z + Math.sin(a) * k * 0.05; pts.push(xx, H(xx, zz) + off, zz); } st.push({ tag: 0, pts }); }
   const loop = []; for (let a = 0; a <= Math.PI * 2 + 0.001; a += 0.02){ const r = 3 + 0.6 * Math.cos(2 * a), x = r * Math.cos(a), z = r * Math.sin(a) * 0.8; loop.push(x + g() * 0.03, H(x, z) + g() * 0.03, z); } st.push({ tag: 5, pts: loop });

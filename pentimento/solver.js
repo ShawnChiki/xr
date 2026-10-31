@@ -800,7 +800,7 @@ function embedCurve(M, C, id, L, cross){
   // a sharp crease reaches further for the sheet: where the surface rounded off below a thin top (a spine),
   // the crease still gets cut in and pulls the sheet up to it
   const RR = C.sharp && !cross ? L * 4 : L * 1.6;
-  const near = p => { let best = -1, bd = sq(RR); VG.each(p[0], p[1], p[2], RR, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } }); return best; };
+  const near = p => { let best = -1, bd = sq(RR); VG.each(p[0], p[1], p[2], RR, v => { if (C.row && M.fc[v] >= 0) return; const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } }); return best; };
   // runs of curve samples that lie over the mesh
   const runs = []; let cur = [];
   for (const p of S){ const v = near(p); if (v < 0){ if (cur.length) runs.push(cur); cur = []; continue; } if (cur[cur.length - 1] !== v) cur.push(v); }
@@ -850,6 +850,7 @@ function embedCurve(M, C, id, L, cross){
       const n = clean.length, denom = closed ? n : n - 1;
       for (let i = 0; i < n; i++){
         const v = clean[i], q = pointAt(C, a0 + (a1 - a0) * i / denom);
+        if (M.fc[v] >= 0 && M.fc[v] !== id && C.row) continue;   // a row never takes over a crease's vertex
         if (M.fc[v] >= 0 && M.fc[v] !== id){ if (cross) (M.cross || (M.cross = new Set())).add(v); else M.corner[v] = true; continue; }
         M.setP(v, q); M.fc[v] = id;
       }
@@ -942,6 +943,74 @@ function triArea(M){ let a = 0; for (let t = 0; t < M.tdead.length; t++) if (!M.
 function projector(Mfit, L){
   const VG = new Grid(L); for (let v = 0; v < Mfit.x.length; v++) if (Mfit.vt[v].length) VG.add(v, Mfit.x[v], Mfit.y[v], Mfit.z[v]);
   return p => { for (const r of [L * 1.5, L * 4, L * 12]){ const c = closestOnMesh(Mfit, VG, p, r); if (c) return c.p; } return p; };
+}
+// ---------------- clean rows of quads along each sharp crease: lines one (and two) quad widths out on each side,
+// cut into the mesh like the creases are, so the quads run parallel to the crease before the layout loosens up
+function creaseRows(M, curves, d, nRows, L){
+  const out = [], proj = projector(M, L), VG = new Grid(d);
+  for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
+  // what a row must keep clear of: other creases and edges, its own crease further along, and the border
+  const sharpS = []; curves.forEach((C, ci) => { if (C.sharp || C.edge) for (const p of resample(C.pts, d * 0.25, C.closed)) sharpS.push([ci, p]); });
+  const SG = new Grid(d); sharpS.forEach(([ci, p], i) => SG.add(i, p[0], p[1], p[2]));
+  const bord = []; { const E = M.edges(); for (let i = 0; i < E.length; i += 2) if (M.edgeTris(E[i], E[i + 1]).length === 1) bord.push(lerp3(M.P(E[i]), M.P(E[i + 1]), 0.5)); }
+  const BG = new Grid(d); bord.forEach((p, i) => BG.add(i, p[0], p[1], p[2]));
+  const clear = (p, ci, s0, C, r) => { let ok = true;
+    SG.each(p[0], p[1], p[2], r, i => { if (!ok) return; const [cj, q] = sharpS[i]; if (d2(p, q) >= r * r) return; if (cj !== ci){ ok = false; return; }
+      const sq2 = closestOnPoly(C, q).s, ds = C.closed ? Math.min(Math.abs(sq2 - s0), C.len - Math.abs(sq2 - s0)) : Math.abs(sq2 - s0); if (ds > r * 1.6) ok = false; });
+    if (ok) BG.each(p[0], p[1], p[2], r, i => { if (d2(p, bord[i]) < r * r) ok = false; }); return ok; };
+  const cand = [];
+  curves.forEach((C, ci) => {
+    if (!C.sharp || C.len < d * 3) return;
+    const step = Math.max(d * 0.4, L * 0.35), n = Math.max(3, Math.round(C.len / step)), sides = [[], []];
+    // a frame carried along the crease, so "side 0" means the same side all the way along
+    let e1 = null, prev = null;
+    for (let i = 0; i <= (C.closed ? n - 1 : n); i++){
+      const s0 = C.len * i / n, q = pointAt(C, s0), a = pointAt(C, s0 - step * 0.5), b = pointAt(C, s0 + step * 0.5), t = norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
+      if (!e1) e1 = Math.abs(t[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0]; { const k = dot(e1, t); e1 = norm([e1[0] - k * t[0], e1[1] - k * t[1], e1[2] - k * t[2]]); }
+      const e2 = [t[1] * e1[2] - t[2] * e1[1], t[2] * e1[0] - t[0] * e1[2], t[0] * e1[1] - t[1] * e1[0]];
+      // the surface on either side: directions (across the crease) to nearby vertices that aren't on a line
+      const dirs = []; VG.each(q[0], q[1], q[2], d * 1.6, v => { if (M.fc[v] >= 0) return; const w = [M.x[v] - q[0], M.y[v] - q[1], M.z[v] - q[2]], k = dot(w, t), pw = [w[0] - k * t[0], w[1] - k * t[1], w[2] - k * t[2]], l = Math.hypot(...pw);
+        if (l > d * 0.25 && Math.abs(k) < d * 0.8) dirs.push(Math.atan2(dot(pw, e2), dot(pw, e1))); });
+      let ang = [null, null];
+      if (dirs.length >= 2){
+        // the two sheets: the widest gap between directions splits them; each sheet's middle direction
+        dirs.sort((x, y) => x - y); let gi = 0, gw = -1; for (let k = 0; k < dirs.length; k++){ const g = (dirs[(k + 1) % dirs.length] - dirs[k] + (k + 1 === dirs.length ? 2 * Math.PI : 0)); if (g > gw){ gw = g; gi = k; } }
+        const ordered = []; for (let k = 1; k <= dirs.length; k++) ordered.push(dirs[(gi + k) % dirs.length]);
+        // unwrap, then find the second biggest gap inside: that's between the two sheets
+        for (let k = 1; k < ordered.length; k++) while (ordered[k] < ordered[k - 1]) ordered[k] += 2 * Math.PI;
+        let si = -1, sw = 0.5; for (let k = 0; k + 1 < ordered.length; k++){ const g = ordered[k + 1] - ordered[k]; if (g > sw){ sw = g; si = k; } }
+        const mid = arr => { let x = 0, y = 0; for (const a of arr){ x += Math.cos(a); y += Math.sin(a); } return Math.atan2(y, x); };
+        if (si < 0) ang = [mid(ordered), null];   // one sheet only (the crease runs along the border)
+        else ang = [mid(ordered.slice(0, si + 1)), mid(ordered.slice(si + 1))];
+        // keep each side matched to the side it was a step back
+        if (prev && ang[1] !== null){ const c = (x, y) => x === null || y === null ? 0 : Math.cos(x - y); if (c(ang[0], prev[1]) + c(ang[1], prev[0]) > c(ang[0], prev[0]) + c(ang[1], prev[1])) ang = [ang[1], ang[0]]; }
+        else if (prev && ang[1] === null){ const c = (x, y) => y === null ? -2 : Math.cos(x - y); if (c(ang[0], prev[1]) > c(ang[0], prev[0])) ang = [null, ang[0]]; }
+        prev = [ang[0] ?? (prev ? prev[0] : null), ang[1] ?? (prev ? prev[1] : null)];
+      }
+      for (let j = 0; j < 2; j++) sides[j].push(ang[j] === null ? null : { q, s0, a: ang[j], e1: e1.slice(), e2 });
+    }
+    // steady directions: each side's angle averaged with its neighbours along the crease
+    for (const sd of sides){ const sm = sd.map((x, i) => { if (!x) return null; let cx = 0, cy = 0; for (let k = -2; k <= 2; k++){ const y = sd[C.closed ? (i + k + sd.length) % sd.length : i + k]; if (y){ cx += Math.cos(y.a); cy += Math.sin(y.a); } } return Math.atan2(cy, cx); });
+      sd.forEach((x, i) => { if (x){ x.a = sm[i]; x.u = [0, 1, 2].map(c => Math.cos(x.a) * x.e1[c] + Math.sin(x.a) * x.e2[c]); } }); }
+    for (let j = 0; j < 2; j++) for (let r = 1; r <= nRows; r++){
+      const pts = sides[j].map(x => { if (!x) return null; const p = proj([x.q[0] + x.u[0] * d * r, x.q[1] + x.u[1] * d * r, x.q[2] + x.u[2] * d * r]);
+        if (d2(p, x.q) < sq(d * r * 0.6) || !clear(p, ci, x.s0, C, d * r * 0.75)) return null; return p; });
+      cand.push({ ci, r, closed: !!C.closed, tag: C.tag, pts });
+    }
+  });
+  // rows must not cross or crowd each other (two creases meeting at a corner, the inside of a tight bend)
+  { const G = new Grid(d); cand.forEach((c, a) => c.pts.forEach((p, k) => { if (p) G.add(a * 100000 + k, p[0], p[1], p[2]); }));
+    const drop = cand.map(c => c.pts.map(() => false));
+    cand.forEach((c, a) => c.pts.forEach((p, k) => { if (!p) return; G.each(p[0], p[1], p[2], d * 0.8, id => { const b = Math.floor(id / 100000), m = id % 100000; if (b === a){ const gap = c.closed ? Math.min(Math.abs(m - k), c.pts.length - Math.abs(m - k)) : Math.abs(m - k); if (gap > 4 && d2(p, c.pts[m]) < sq(d * 0.5)) drop[a][k] = true; return; }
+      const o = cand[b]; if (o.ci === c.ci && o.r !== c.r) return; if (d2(p, o.pts[m]) < sq(d * 0.8)) drop[a][k] = true; }); }));
+    cand.forEach((c, a) => { c.pts = c.pts.map((p, k) => drop[a][k] ? null : p); }); }
+  const proj2 = proj, relax = (pp, all) => { for (let it = 0; it < 4; it++){ const nx = pp.map((p, i) => { const a = pp[all ? (i - 1 + pp.length) % pp.length : i - 1], b = pp[all ? (i + 1) % pp.length : i + 1]; return a && b ? proj2(lerp3(p, lerp3(a, b, 0.5), 0.5)) : p; }); for (let i = 0; i < pp.length; i++) pp[i] = nx[i]; } return pp; };
+  for (const c of cand){
+    const all = c.closed && c.pts.every(Boolean);
+    let run = []; const flush = () => { if (run.length >= 4){ const R = makeCurve(relax(run, all), all, false, c.tag); if (R.len > d * 2.5){ R.row = true; R.level = c.r; out.push(R); } } run = []; };
+    for (const p of c.pts){ if (p) run.push(p); else flush(); } flush();
+  }
+  return out;
 }
 // faces of a cage that end up facing the wrong way (folded over): their corners are eased toward their neighbours and
 // put back on the surface, a few rounds, until nothing is folded (corners, crease points and the border stay put)
@@ -1485,7 +1554,7 @@ function instantQuads(M0, curves, guides, s, L, opt = {}){
 // crumpled little faces. Short edges are collapsed (onto the end that sits on a line, if one does), faces left with
 // repeated corners are cleaned up or dropped, and the vertices around anything still folded are relaxed
 function tidyCage(cage, info, s){
-  let { V, F, sharp, corner } = cage; const nv = V.length / 3, P = v => [V[3 * v], V[3 * v + 1], V[3 * v + 2]];
+  let { V, F, sharp, corner, feat } = cage; const nv = V.length / 3, P = v => [V[3 * v], V[3 * v + 1], V[3 * v + 2]];
   const locked = v => (info.fc && info.fc[v] >= 0) || (info.corner && info.corner[v]);
   const par = Int32Array.from({ length: nv }, (_, i) => i), fd = i => par[i] === i ? i : (par[i] = fd(par[i]));
   const edgeN = new Map(); F.forEach(f => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); edgeN.set(k, (edgeN.get(k) || 0) + 1); }));
@@ -1510,7 +1579,8 @@ function tidyCage(cage, info, s){
   const map = new Int32Array(nv).fill(-1), V2 = [], fc2 = [], co2 = [], cor2 = [];
   const F2 = NF.map(f => f.map(v => { if (map[v] < 0){ map[v] = V2.length / 3; V2.push(V[3 * v], V[3 * v + 1], V[3 * v + 2]); fc2.push(info.fc ? info.fc[v] : -1); co2.push(info.corner ? info.corner[v] : false); cor2.push(corner ? corner[v] : 0); } return map[v]; }));
   const S2 = new Set(); if (sharp) for (const k of sharp){ const a = map[fd(Math.floor(k / 2097152))], b = map[fd(k % 2097152)]; if (a >= 0 && b >= 0 && a !== b) S2.add(ek(a, b)); }
-  cage.V = V2; cage.F = F2; cage.sharp = S2; cage.corner = Uint8Array.from(cor2); info.fc = fc2; info.corner = co2;
+  let FT = null; if (feat){ FT = new Map(); for (const [k, id] of feat){ const a = map[fd(Math.floor(k / 2097152))], b = map[fd(k % 2097152)]; if (a >= 0 && b >= 0 && a !== b) FT.set(ek(a, b), id); } }
+  cage.V = V2; cage.F = F2; cage.sharp = S2; cage.corner = Uint8Array.from(cor2); if (feat) cage.feat = FT; info.fc = fc2; info.corner = co2;
   return merged;
 }
 // ---------------- trust: how well the finished surface agrees with your loose lines nearby, per drawn vertex.
@@ -1912,6 +1982,15 @@ function solve(strokes, prm, progress = () => {}){
       M.x = nx; M.y = ny; M.z = nz;
     }
   }
+  // clean rows of quads along the sharp creases
+  if ((prm.rows | 0) > 0 && !(prm.target < 0 && guides.length)){
+    const Lq = prm.target > 0 ? Math.max(L, 2 * Math.sqrt(triArea(M) / prm.target)) : L;
+    try { const rows = creaseRows(M, curves, Lq * 0.95, Math.min(2, prm.rows | 0), L);
+      if (rows.length){
+        // the first rows go in, the mesh settles around them, then the second rows (they sit about one edge apart)
+        const base0 = curves.length; curves.push(...rows);
+        for (const lv of [1, 2]){ rows.forEach((C, i) => { if (C.level === lv) embedCurve(M, C, base0 + i, L); }); if (lv === 1 && rows.some(C => C.level === 2)){ remesh(M, L, 0.8); unfold(M, 2); } } remesh(M, L, 0.8); unfold(M, 2); M.compact(); } } catch (e){}
+  }
   progress(0.88, 'Smoothing out folds');
   M.compact();
   // simpler topology: rebuild at the size that gives the quad count asked for, on the fitted surface
@@ -1971,7 +2050,12 @@ function solve(strokes, prm, progress = () => {}){
     squareQuads(cage, M, flow, prm.squareIters ?? 32, L, Mfit);
     if (prm.hard > 0) autoCreases(cage, prm.hard);
     progress(0.97, 'Hugging the surface');
-    hugCage(cage, M, Mfit, curves, L, 6);
+    // knots: edges far shorter than the rest and crumpled little faces are collapsed, then any fold is relaxed out
+    const info = { fc: Array.from({ length: cage.V.length / 3 }, (_, v) => M.fc[v]), corner: Array.from({ length: cage.V.length / 3 }, (_, v) => !!M.corner[v]) };
+    if (prm.tidy !== false){ const el = []; for (const f of cage.F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; el.push(Math.hypot(cage.V[3 * a] - cage.V[3 * b], cage.V[3 * a + 1] - cage.V[3 * b + 1], cage.V[3 * a + 2] - cage.V[3 * b + 2])); }
+      el.sort((x, y) => x - y); tidyCage(cage, info, el[el.length >> 1] || L); }
+    hugCage(cage, info, Mfit, curves, L, 6);
+    if (prm.tidy !== false) unfoldCage(cage, info, Mfit, curves, L, 12);
   }
   const lv = 1 + (prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
   const quads = catmullClark(cage, curves); quads.cageE = allEdges(quads.F);
@@ -1983,7 +2067,7 @@ function solve(strokes, prm, progress = () => {}){
   return {
     surface: sh, quadWire: smooth === quads ? wire(quads) : edgeWire(smooth, smooth.cageE), fineWire: smooth === quads ? null : wire(smooth), creases: creaseLines(smooth),
     quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()), C: new Int32Array(quads.F.map(f => f.length)) },
-    curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })),
+    curves: [...curves.filter(C => !C.row || prm.showRows).map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })),
       ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
     nQuads: quads.F.length, folds, cache, warm,
     note: prm.target < 0 ? (guides.length ? 'Couldn\'t lay quads along your guides here, so Auto was used. Make sure guides cross each other or reach the border.' : 'Draw guides on the surface to lay out the quads (Auto until then)') : ''

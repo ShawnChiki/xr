@@ -51,7 +51,7 @@
 </head>
 <body>
 <div class="slab card">
-  <h1>PENTI<span>MENTO</span><small id="ver">XR v2.12</small></h1>
+  <h1>PENTI<span>MENTO</span><small id="ver">XR v2.13</small></h1>
   <p>Sketch skate terrain with as many loose lines as you like. Mark the sharp edges and the lines that matter, and one smooth quad surface is found through all of them.</p>
   <div class="types"><span><i style="background:var(--loose)"></i>Loose</span><span><i style="background:var(--guide)"></i>Guide</span><span><i style="background:var(--crease)"></i>Crease</span><span><i style="background:var(--screase)"></i>Strict crease</span><span><i style="background:var(--edge)"></i>Edge</span><span><i style="background:var(--sedge)"></i>Strict edge</span></div>
   <div class="row">
@@ -84,7 +84,7 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=2.12"></script>
+<script src="demo.js?v=2.13"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -97,7 +97,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.12';
+const VERSION = '2.13';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'XR v' + VERSION;
 const V3 = THREE.Vector3;
@@ -173,7 +173,7 @@ const sun = new THREE.DirectionalLight(0xFFFFFF, 1.7); sun.position.set(2, 5, 3)
 renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02;
 // the room floor (VR only)
-const room = new THREE.GridHelper(20, 40, 0x2C3038, 0x23262C); scene.add(room);
+const room = new THREE.GridHelper(20, 40, 0x2C3038, 0x23262C); room.visible = false; scene.add(room);
 
 // the model: everything you draw lives in here, in real park metres
 const world = new THREE.Group(); scene.add(world);
@@ -229,7 +229,7 @@ const backdrop = new THREE.Mesh(new THREE.SphereGeometry(90, 24, 12), new THREE.
 backdrop.visible = false; backdrop.renderOrder = -11; scene.add(backdrop);
 function applyBackground(){
   const pass = S.bg === 'pass' && inAR(), b = S.bg === 'pass' ? (pass ? 'pass' : (S.bgVR || 'dark')) : S.bg;
-  sky.visible = b === 'sky'; room.visible = !pass;
+  sky.visible = b === 'sky'; room.visible = !pass && (S.grid | 0) >= 2; parkGrid.visible = (S.grid | 0) >= 1;
   backdrop.visible = inAR() && !pass && b !== 'sky'; if (backdrop.visible) backdrop.material.color.set(BG_COL[b]);
   if (pass){ scene.background = null; renderer.setClearColor(0x000000, 0); }
   else { scene.background = b === 'sky' ? null : BG.set(BG_COL[b]); renderer.setClearColor(b === 'sky' ? 0xD9DCE1 : BG_COL[b], 1); }
@@ -898,7 +898,7 @@ let buildErr = '', buildStart = 0, buildSnap = null, lastGood = null, fitCache =
 const hasSurface = () => !!surfMesh;
 const GUIDE_LAYOUT = { '-3': 'Guides ×1', '-2': 'Guides ×4', '-1': 'Guides ×16' };
 const targetVal = () => (S.target || 0) < 0 ? -1 - ((S.target || 0) + 3) : TARGETS[S.target || 0];   // -1: one face per patch, -2: 4, -3: 16
-function params(){ const q = QUAD[S.quad]; return { detail: q, avg: q * 1.6, lines: S.avg, fair: S.fair / 10, reach: REACH[S.reach], group: GROUP[S.group], subd: S.subd, relax: S.relax || 0, target: targetVal(), hard: HARD[S.hard || 0], tipFade: TIPS_FADE[S.tipSoft ?? 1] }; }
+function params(){ const q = QUAD[S.quad]; return { detail: q, avg: q * 1.6, lines: S.avg, fair: S.fair / 10, reach: REACH[S.reach], group: GROUP[S.group], subd: S.subd, relax: S.relax || 0, target: targetVal(), hard: HARD[S.hard || 0], tipFade: TIPS_FADE[S.tipSoft ?? 1], rows: S.rows ?? 1 }; }
 function scheduleBuild(){ stale = true; menuDirty = true; if (building) cancelBuild(); if (S.auto && S.surf !== 'hide') buildTimer = 0.6; }
 // stop a build that's out of date, so the next one can start straight away with the new lines
 function cancelBuild(){ if (!building) return; if (worker){ worker.terminate(); worker = null; } building = false; pending = false; buildId++; menuDirty = true; }
@@ -1107,9 +1107,45 @@ if (saved && saved.dabs) dabs = unpackDabs(saved.dabs);
 const LIB = 'pentimento-library', LIB_ROWS = 6, libKey = id => 'pentimento-sketch-' + id;
 const SKETCH_SET = ['quad', 'avg', 'fair', 'reach', 'group', 'subd', 'relax', 'target', 'hard', 'smooth'];   // the build settings travel with a sketch
 let libPage = 0, libDel = null, libDelT = 0, libCache = null;
-function libList(){ if (libCache) return libCache; try { libCache = JSON.parse(localStorage.getItem(LIB)) || []; } catch (e) { libCache = []; } return libCache; }
-function libWrite(l){ libCache = l; localStorage.setItem(LIB, JSON.stringify(l)); menuDirty = true; }
+// Saved sketches live in the browser's database (IndexedDB): far more room than the small quick-save store they used
+// to share with your settings. Each has a name, the time, a line count and a little picture.
+const libDB = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((res, rej) => { try { const r = indexedDB.open('pentimento', 1);
+    r.onupgradeneeded = () => { const d = r.result; if (!d.objectStoreNames.contains('index')) d.createObjectStore('index', { keyPath: 'id' }); if (!d.objectStoreNames.contains('data')) d.createObjectStore('data'); };
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); } catch (e){ rej(e); } }));
+  const run = (store, mode, fn) => open().then(d => new Promise((res, rej) => { const t = d.transaction(store, mode), q = fn(t.objectStore(store)); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error); }));
+  return { all: () => run('index', 'readonly', s => s.getAll()), get: id => run('data', 'readonly', s => s.get(id)),
+    put: (row, data) => (data === undefined ? Promise.resolve() : run('data', 'readwrite', s => s.put(data, row.id))).then(() => run('index', 'readwrite', s => s.put(row))),
+    del: id => run('index', 'readwrite', s => s.delete(id)).then(() => run('data', 'readwrite', s => s.delete(id))) };
+})();
+function libList(){ return libCache || []; }
+function libSet(l){ libCache = l.slice().sort((a, b) => b.t - a.t); menuDirty = true; }
+// on start: read the list, and move any sketches saved the old way into the database
+(async function initLibrary(){
+  try {
+    let old = []; try { old = JSON.parse(localStorage.getItem(LIB)) || []; } catch (_){}
+    for (const e of old){ let o = null; try { o = JSON.parse(localStorage.getItem(libKey(e.id))); } catch (_){} if (o) await libDB.put(e, o); try { localStorage.removeItem(libKey(e.id)); } catch (_){} }
+    if (old.length) try { localStorage.removeItem(LIB); } catch (_){}
+    libSet(await libDB.all());
+  } catch (e){ libSet([]); flash('Saved sketches are not available in this browser (no database). Use Download file.', 6); }
+})();
 function sketchData(name){ const set = {}; SKETCH_SET.forEach(k => set[k] = S[k]); return { app: 'pentimento', v: VERSION, name, strokes: packStrokes(), dabs: packDabs(), set }; }
+// a small picture of the model from above and to one side, for the list
+function makeThumb(){
+  const b = contentBox(); if (!b) return null;
+  const hide = [menuMesh, dialMesh, handleMesh, foldGlyphs, room, parkGrid, ...hints, ...hands.flatMap(h => [h.grip, h.ray, h.brush])].filter(o => o && o.visible);
+  hide.forEach(o => o.visible = false);
+  try {
+    const c = new V3((b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2), r = Math.hypot(b[3] - b[0], b[4] - b[1], b[5] - b[2]) / 2 || 1;
+    world.updateMatrixWorld(true); const cw = world.localToWorld(c.clone()), rw = r * world.scale.x;
+    const dirP = new V3(0.55, 0.75, 0.9).normalize(), eye = world.localToWorld(c.clone().addScaledVector(dirP, r * 1.75));
+    const cam = new THREE.PerspectiveCamera(40, 1.6, rw * 0.05, rw * 20); cam.position.copy(eye); cam.up.set(0, 1, 0); cam.lookAt(cw);
+    return snapshot(192, 120, cam, 0.72);
+  } finally { hide.forEach(o => o.visible = true); }
+}
+const thumbImgs = new Map();
+function thumbImage(e){ if (!e || !e.thumb) return null; let im = thumbImgs.get(e.id + e.t); if (!im){ im = new Image(); im.onload = () => { menuDirty = true; }; im.src = e.thumb; thumbImgs.set(e.id + e.t, im); } return im.complete && im.naturalWidth ? im : null; }
 let curSk = null;     // the library sketch you opened or last saved, so saving again can offer to overwrite it
 function saveSketch(){
   if (!strokes.length) return flash('Nothing to save yet');
@@ -1118,10 +1154,21 @@ function saveSketch(){
   saveSketchAs(null);
 }
 function saveSketchAs(over){
-  const l = libList().slice(), no = over ? over.no : l.reduce((m, e) => Math.max(m, e.no || 0), 0) + 1, name = over ? over.name : 'Sketch ' + no, id = over ? over.id : Date.now().toString(36);
-  try { localStorage.setItem(libKey(id), JSON.stringify(sketchData(name))); const row = { id, name, no, t: Date.now(), n: strokes.length };
-    libWrite([row, ...l.filter(x => x.id !== id)]); libPage = 0; curSk = { id, name }; flash((over ? 'Saved over ' : 'Saved as ') + name + ' (Files tab)'); }
-  catch (e){ if (!over) try { localStorage.removeItem(libKey(id)); } catch (_){} flash('This browser is out of room. Delete old sketches, or use Download file.'); }
+  const l = libList(), no = over ? over.no : l.reduce((m, e) => Math.max(m, e.no || 0), 0) + 1, name = over ? over.name : 'Sketch ' + no, id = over ? over.id : Date.now().toString(36);
+  let thumb = null; try { thumb = makeThumb(); } catch (_){}
+  const row = { id, name, no, t: Date.now(), n: strokes.length, thumb };
+  libSet([row, ...l.filter(x => x.id !== id)]); libPage = 0; curSk = { id, name };
+  libDB.put(row, sketchData(name)).then(() => flash((over ? 'Saved over ' : 'Saved as ') + name + ' (Files tab)'))
+    .catch(() => { if (!over) libSet(libList().filter(x => x.id !== id)); flash('This browser is out of room. Delete old sketches, or use Download file.', 6); });
+}
+// names: type one on a computer; in the headset, hold the trigger on Name and push the stick to a word
+const NAME_WORDS = ['Bowl', 'Spine', 'Ledge', 'Bank', 'Hip', 'Flow', 'Pool', 'Pyramid', 'Snake run', 'Mini ramp'];
+let nameTarget = null;
+function setSketchName(e, name){ name = String(name || '').trim().slice(0, 40); if (!name) return; const row = { ...e, name }; libSet([row, ...libList().filter(x => x.id !== e.id)]); if (curSk && curSk.id === e.id) curSk.name = name;
+  libDB.put(row).then(() => flash('Named ' + name)).catch(() => flash('Could not rename that one')); }
+function renameSketch(e){
+  if (!renderer.xr.isPresenting){ const v = prompt('Name this sketch', e.name); if (v) setSketchName(e, v); return; }
+  const h = hands.find(x => x.source && !isOff(x)); if (!h) return; nameTarget = e; openDial(h, 'name', penWorld(h), 0); flash('Keep holding the trigger, push the stick to a name, let go to pick', 5);
 }
 // a question on the menu with a few answers (the rest of the menu waits until you pick one)
 let ask = null;
@@ -1135,10 +1182,10 @@ function useSketch(o, name){
   if (!renderer.xr.isPresenting) needsFit = true; else { const xc = renderer.xr.getCamera(), p = new V3(), q = new THREE.Quaternion(); xc.getWorldPosition(p); xc.getWorldQuaternion(q); fitView({ p, q }); }
   flash('Opened ' + (name || 'sketch') + '. Undo brings back what you had.');
 }
-function loadSketch(e){ let o = null; try { o = JSON.parse(localStorage.getItem(libKey(e.id))); } catch (_){} if (!o) return flash('That sketch is missing'); useSketch(o, e.name); curSk = { id: e.id, name: e.name }; }
+function loadSketch(e){ libDB.get(e.id).then(o => { if (!o) return flash('That sketch is missing'); useSketch(o, e.name); curSk = { id: e.id, name: e.name }; }).catch(() => flash('Could not open that sketch')); }
 function deleteSketch(e){
   if (libDel !== e.id){ libDel = e.id; libDelT = 3; menuDirty = true; return flash('Press Sure? to delete ' + e.name + ' for good'); }
-  try { localStorage.removeItem(libKey(e.id)); } catch (_){} libWrite(libList().filter(x => x.id !== e.id)); libDel = null;
+  libDB.del(e.id).catch(() => {}); libSet(libList().filter(x => x.id !== e.id)); libDel = null; if (curSk && curSk.id === e.id) curSk = null;
   if (libPage * LIB_ROWS >= libList().length) libPage = Math.max(0, libPage - 1); flash(e.name + ' deleted');
 }
 const stampNow = () => { const d = new Date(), z = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`; };
@@ -1150,10 +1197,10 @@ function downloadSketch(){
 // ---------- problem report: one file with the sketch, every setting, recent messages and a picture of your view,
 // so whoever helps can open exactly what you had
 let pendingReport = null;
-function snapshot(w, h){
+function snapshot(w, h, camIn, quality){
   try {
-    const src = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera, cam = new THREE.PerspectiveCamera(renderer.xr.isPresenting ? 80 : camera.fov, w / h, 0.01, 300);
-    src.getWorldPosition(cam.position); src.getWorldQuaternion(cam.quaternion); cam.updateMatrixWorld();
+    const src = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera, cam = camIn || new THREE.PerspectiveCamera(renderer.xr.isPresenting ? 80 : camera.fov, w / h, 0.01, 300);
+    if (!camIn){ src.getWorldPosition(cam.position); src.getWorldQuaternion(cam.quaternion); } cam.updateMatrixWorld();
     const rt = new THREE.WebGLRenderTarget(w, h), was = renderer.xr.enabled, bg = scene.background, prev = renderer.getRenderTarget();
     if (!scene.background) scene.background = new THREE.Color(0x17191D);
     renderer.xr.enabled = false; renderer.setRenderTarget(rt); renderer.render(scene, cam); renderer.setRenderTarget(prev); renderer.xr.enabled = was; scene.background = bg;
@@ -1161,7 +1208,7 @@ function snapshot(w, h){
     const cv = document.createElement('canvas'); cv.width = w; cv.height = h; const g = cv.getContext('2d'), im = g.createImageData(w, h);
     const lut = new Uint8Array(256); for (let i = 0; i < 256; i++){ const x = i / 255; lut[i] = Math.round(255 * (x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055)); }
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++){ const a = 4 * ((h - 1 - y) * w + x), b = 4 * (y * w + x); im.data[b] = lut[px[a]]; im.data[b + 1] = lut[px[a + 1]]; im.data[b + 2] = lut[px[a + 2]]; im.data[b + 3] = 255; }
-    g.putImageData(im, 0, 0); return cv.toDataURL('image/jpeg', 0.85);
+    g.putImageData(im, 0, 0); return cv.toDataURL('image/jpeg', quality || 0.85);
   } catch (e){ return null; }
 }
 function makeReport(){
@@ -1230,7 +1277,7 @@ function fitView(head){
 // ======================================================================
 // Menu: a palette on your left controller (on a computer it sits at the right edge of the screen)
 // ======================================================================
-const MW = 1024, MH = 1560, menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH;
+const MW = 1024, MH = 1740, menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH;
 const mctx = menuCanvas.getContext('2d'), menuTex = new THREE.CanvasTexture(menuCanvas); menuTex.colorSpace = THREE.SRGBColorSpace; menuTex.anisotropy = 4;
 const MENU_W = 0.23, MENU_H = MENU_W * MH / MW;
 const menuMesh = new THREE.Mesh(new THREE.PlaneGeometry(MENU_W, MENU_H), new THREE.MeshBasicMaterial({ map: menuTex, transparent: true, side: THREE.DoubleSide }));
@@ -1336,6 +1383,8 @@ function loadSample(){
   row('view', 1084, 72, EDGES.map(v => ({ id: 'edges-' + v, label: () => EDGE_NAME[v], on: () => S.edges === v, act: () => setEdges(v) })));
   text({ tab: 'view', kind: 'label', x: P, y: 1180, text: () => 'MENU STYLE' });
   row('view', 1202, 72, MENU_STYLES.map(v => ({ id: 'menu-' + v, label: () => MENU_STYLE_NAME[v], on: () => S.menuStyle === v, act: () => { S.menuStyle = v; menuOpen = true; scheduleSave(); flash(MENU_STYLE_NOTE[v], 5); } })));
+  text({ tab: 'view', kind: 'label', x: P, y: 1416, text: () => 'FLOOR GRID' });
+  row('view', 1438, 72, [['0', 'Off'], ['1', 'Under the model'], ['2', 'Room too']].map(([v, n]) => ({ id: 'grid-' + v, label: () => n, on: () => String(S.grid | 0) === v, act: () => { S.grid = +v; applyBackground(); scheduleSave(); } })));
   text({ tab: 'view', kind: 'label', x: P, y: 1298, text: () => 'MAIN HAND · THE OTHER ONE HOLDS THE MENU' });
   row('view', 1320, 72, [['right', 'Right hand'], ['left', 'Left hand']].map(([v, n]) => ({ id: 'hand-' + v, label: () => n, on: () => mainHand() === v, act: () => { S.mainHand = v; placeMenuHand(); scheduleSave(); flash(n + ' draws. The menu is on your ' + (v === 'right' ? 'left' : 'right') + ' hand.'); } })));
   row('view', 956, 80, [{ id: 'pts-show', label: () => 'Show', on: () => !!S.ptsShow, act: () => { S.ptsShow = 1; rebuildHandles(); scheduleSave(); } },
@@ -1364,38 +1413,41 @@ function loadSample(){
   text({ tab: 'surface', kind: 'small', x: P + 22 + 210, y: sy(0) + 32, text: () => lastResult && lastResult.nQuads ? 'now ' + lastResult.nQuads.toLocaleString() + (stale || building ? '…' : '') : '' });
   stepper('surface', sy(0), 64, 'Target quads', () => (S.target || 0) < 0 ? GUIDE_LAYOUT[S.target] : TARGETS[S.target || 0] ? String(TARGETS[S.target]) : 'Auto', () => setTarget(Math.max(-3, (S.target || 0) - 1)), () => setTarget(Math.min(TARGETS.length - 1, (S.target || 0) + 1)));
   stepper('surface', sy(1), 64, 'Smart creases', () => HARD_NAME[S.hard || 0], () => setParam(() => S.hard = Math.max(0, (S.hard || 0) - 1)), () => setParam(() => S.hard = Math.min(HARD.length - 1, (S.hard || 0) + 1)));
+  stepper('surface', sy(3), 64, 'Crease rows', () => ['None', '1 row', '2 rows'][S.rows ?? 1], () => setParam(() => S.rows = Math.max(0, (S.rows ?? 1) - 1)), () => setParam(() => S.rows = Math.min(2, (S.rows ?? 1) + 1)));
   stepper('surface', sy(2), 64, 'Crease ends', () => TIPS_NAME[S.tipSoft ?? 1], () => setParam(() => S.tipSoft = Math.max(0, (S.tipSoft ?? 1) - 1)), () => setParam(() => S.tipSoft = Math.min(TIPS_FADE.length - 1, (S.tipSoft ?? 1) + 1)));
-  stepper('surface', sy(3), 64, 'Smoothness', () => String(S.fair), () => setParam(() => S.fair = Math.max(0, S.fair - 1)), () => setParam(() => S.fair = Math.min(10, S.fair + 1)));
-  stepper('surface', sy(4), 64, 'Relax', () => String(S.relax || 0), () => setParam(() => S.relax = Math.max(0, (S.relax || 0) - 1)), () => setParam(() => S.relax = Math.min(10, (S.relax || 0) + 1)));
-  stepper('surface', sy(5), 64, 'Fit detail', () => lenText(QUAD[S.quad]), () => setParam(() => S.quad = Math.max(0, S.quad - 1)), () => setParam(() => S.quad = Math.min(QUAD.length - 1, S.quad + 1)), MORE);
-  stepper('surface', sy(6), 64, 'Average across', () => S.avg + (S.avg === 1 ? ' line' : ' lines'), () => setParam(() => S.avg = Math.max(1, S.avg - 1)), () => setParam(() => S.avg = Math.min(12, S.avg + 1)), MORE);
-  stepper('surface', sy(7), 64, 'Reach past lines', () => lenText(REACH[S.reach]), () => setParam(() => S.reach = Math.max(0, S.reach - 1)), () => setParam(() => S.reach = Math.min(REACH.length - 1, S.reach + 1)), MORE);
-  stepper('surface', sy(8), 64, 'Join passes within', () => lenText(GROUP[S.group]), () => setParam(() => S.group = Math.max(0, S.group - 1)), () => setParam(() => S.group = Math.min(GROUP.length - 1, S.group + 1)), MORE);
-  stepper('surface', sy(9), 64, 'Subdivision', () => String(S.subd), () => setParam(() => S.subd = Math.max(0, S.subd - 1)), () => setParam(() => S.subd = Math.min(3, S.subd + 1)), MORE);
-  row('surface', sy(10), 64, [
+  stepper('surface', sy(4), 64, 'Smoothness', () => String(S.fair), () => setParam(() => S.fair = Math.max(0, S.fair - 1)), () => setParam(() => S.fair = Math.min(10, S.fair + 1)));
+  stepper('surface', sy(5), 64, 'Relax', () => String(S.relax || 0), () => setParam(() => S.relax = Math.max(0, (S.relax || 0) - 1)), () => setParam(() => S.relax = Math.min(10, (S.relax || 0) + 1)));
+  stepper('surface', sy(6), 64, 'Fit detail', () => lenText(QUAD[S.quad]), () => setParam(() => S.quad = Math.max(0, S.quad - 1)), () => setParam(() => S.quad = Math.min(QUAD.length - 1, S.quad + 1)), MORE);
+  stepper('surface', sy(7), 64, 'Average across', () => S.avg + (S.avg === 1 ? ' line' : ' lines'), () => setParam(() => S.avg = Math.max(1, S.avg - 1)), () => setParam(() => S.avg = Math.min(12, S.avg + 1)), MORE);
+  stepper('surface', sy(8), 64, 'Reach past lines', () => lenText(REACH[S.reach]), () => setParam(() => S.reach = Math.max(0, S.reach - 1)), () => setParam(() => S.reach = Math.min(REACH.length - 1, S.reach + 1)), MORE);
+  stepper('surface', sy(9), 64, 'Join passes within', () => lenText(GROUP[S.group]), () => setParam(() => S.group = Math.max(0, S.group - 1)), () => setParam(() => S.group = Math.min(GROUP.length - 1, S.group + 1)), MORE);
+  stepper('surface', sy(10), 64, 'Subdivision', () => String(S.subd), () => setParam(() => S.subd = Math.max(0, S.subd - 1)), () => setParam(() => S.subd = Math.min(3, S.subd + 1)), MORE);
+  row('surface', sy(11), 64, [
     { id: 'builder', label: () => (S.builder || 'new') === 'new' ? 'Builder: New' : 'Builder: Classic (2.6)', on: () => S.builder === 'classic', style: 'lock', act: () => setBuilder(S.builder === 'classic' ? 'new' : 'classic') },
     { id: 'layout', label: () => S.layout === 'field' ? 'Quads: Flowing (beta)' : 'Quads: Even', on: () => S.layout === 'field', style: 'lock', act: () => setParam(() => { S.layout = S.layout === 'field' ? 'pairs' : 'field'; flash(S.layout === 'field' ? 'Flowing quads (beta): the grid follows creases and guides, but can leave small glitches' : 'Even quads: the steady layout', 5); }) }], MORE);
-  moreBtn('surface', sy(11));
-  text({ tab: 'surface', kind: 'label', x: P, y: sy(11) + 84, text: () => 'SHOW' });
-  row('surface', sy(11) + 106, 64, [...[['shaded', 'On'], ['hide', 'Off']].map(([v, n]) => ({ id: 'surf-' + v, label: () => n, on: () => S.surf === v, act: () => setSurfView(v) })),
+  moreBtn('surface', sy(12));
+  text({ tab: 'surface', kind: 'label', x: P, y: sy(12) + 84, text: () => 'SHOW' });
+  row('surface', sy(12) + 106, 64, [...[['shaded', 'On'], ['hide', 'Off']].map(([v, n]) => ({ id: 'surf-' + v, label: () => n, on: () => S.surf === v, act: () => setSurfView(v) })),
     { id: 'edges-cycle', label: () => 'Edges: ' + EDGE_NAME[S.edges], on: () => S.edges !== 'off', act: () => setEdges(EDGES[(EDGES.indexOf(S.edges) + 1) % 3]) },
     { id: 'auto', style: 'lock', label: () => S.auto ? 'Auto build' : 'Manual', on: () => S.auto, act: () => { S.auto = !S.auto; scheduleSave(); flash(S.auto ? 'Surface rebuilds after each change' : 'Surface rebuilds only when you press Build'); if (S.auto && stale) scheduleBuild(); } }]);
 
   // FILES: your saved sketches
   text({ tab: 'files', kind: 'label', x: P, y: 360, text: () => { const n = libList().length; return n ? 'SAVED SKETCHES · ' + n : 'SAVED SKETCHES'; } });
   for (let i = 0; i < LIB_ROWS; i++){
-    const y = 382 + i * 84, h = 76, bw = 150, ent = () => libList()[libPage * LIB_ROWS + i];
+    const y = 382 + i * 104, h = 96, bw = 128, ent = () => libList()[libPage * LIB_ROWS + i];
     text({ tab: 'files', kind: 'panel', x: P, y, w: MW - 2 * P, h, vis: () => !!ent() });
-    text({ tab: 'files', kind: 'stepLabel', x: P + 22, y: y + h / 2 - 12, vis: () => !!ent(), text: () => ent().name });
-    text({ tab: 'files', kind: 'small', x: P + 22, y: y + h / 2 + 20, vis: () => !!ent(), text: () => { const e = ent(); return new Date(e.t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' · ' + e.n + ' lines'; } });
-    add({ tab: 'files', id: 'lib-load-' + i, x: MW - P - 2 * bw - G - 8, y: y + 8, w: bw, h: h - 16, vis: () => !!ent(), label: () => 'Load', act: () => loadSketch(ent()) });
-    add({ tab: 'files', id: 'lib-del-' + i, x: MW - P - bw - 8, y: y + 8, w: bw, h: h - 16, style: 'danger', vis: () => !!ent(), label: () => libDel === ent().id ? 'Sure?' : 'Delete', act: () => deleteSketch(ent()) });
+    text({ tab: 'files', kind: 'thumb', x: P + 8, y: y + 8, w: 128, h: 80, ent, vis: () => !!ent() });
+    text({ tab: 'files', kind: 'stepLabel', x: P + 152, y: y + h / 2 - 14, vis: () => !!ent(), text: () => { const n = ent().name; return n.length > 19 ? n.slice(0, 18) + '…' : n; } });
+    text({ tab: 'files', kind: 'small', x: P + 152, y: y + h / 2 + 20, vis: () => !!ent(), text: () => { const e = ent(); return new Date(e.t).toLocaleString(undefined, { month: 'short', day: 'numeric' }) + ' · ' + e.n + ' lines'; } });
+    add({ tab: 'files', id: 'lib-name-' + i, x: MW - P - 3 * bw - 2 * G - 8, y: y + 12, w: bw, h: h - 24, vis: () => !!ent(), label: () => 'Name', act: () => renameSketch(ent()) });
+    add({ tab: 'files', id: 'lib-load-' + i, x: MW - P - 2 * bw - G - 8, y: y + 12, w: bw, h: h - 24, vis: () => !!ent(), label: () => 'Load', act: () => loadSketch(ent()) });
+    add({ tab: 'files', id: 'lib-del-' + i, x: MW - P - bw - 8, y: y + 12, w: bw, h: h - 24, style: 'danger', vis: () => !!ent(), label: () => libDel === ent().id ? 'Sure?' : 'Delete', act: () => deleteSketch(ent()) });
   }
-  text({ tab: 'files', kind: 'note', x: P, y: 420, vis: () => !libList().length, text: () => 'Nothing saved yet. Save sketch keeps a copy here, in this browser. Keep sketching: your current lines are always kept too.' });
-  row('files', 382 + LIB_ROWS * 84, 64, [
+  text({ tab: 'files', kind: 'note', x: P, y: 420, vis: () => !libList().length, text: () => 'Nothing saved yet. Save sketch keeps a copy here, in this browser, with a little picture. Keep sketching: your current lines are always kept too.' });
+  row('files', 382 + LIB_ROWS * 104, 64, [
     { id: 'lib-prev', label: () => '◀ Newer', vis: () => libPage > 0, act: () => { libPage = Math.max(0, libPage - 1); } },
     { id: 'lib-next', label: () => 'Older ▶', vis: () => (libPage + 1) * LIB_ROWS < libList().length, act: () => { libPage++; } }]);
-  const fy = 382 + LIB_ROWS * 84 + 84;
+  const fy = 382 + LIB_ROWS * 104 + 84;
   row('files', fy, 80, [
     { id: 'lib-save', label: () => 'Save sketch', sub: () => 'a copy, kept here', act: saveSketch },
     { id: 'lib-new', label: () => clearArmed > 0 ? 'Press again' : 'New sketch', sub: () => 'clears the lines', style: 'danger', act: clearAll }]);
@@ -1546,6 +1598,7 @@ function drawMenu(){
     if (t.kind === 'label'){ g.textAlign = 'left'; g.font = '500 25px "IBM Plex Mono",monospace'; g.fillStyle = '#9AA2AD'; g.fillText(t.text(), t.x, t.y); }
     else if (t.kind === 'stepLabel'){ g.textAlign = 'left'; g.font = '600 30px "Archivo",sans-serif'; g.fillStyle = '#EEF0F3'; g.fillText(t.text(), t.x, t.y); }
     else if (t.kind === 'status'){ g.textAlign = 'left'; g.font = '600 30px "Archivo",sans-serif'; g.fillStyle = TAG_CSS[S.tag]; rr2(g, t.x, t.y - 7, 40, 14, 7); g.fill(); g.fillStyle = '#EEF0F3'; g.fillText(t.text(), t.x + 56, t.y); }
+    else if (t.kind === 'thumb'){ const im = thumbImage(t.ent()); g.save(); rr2(g, t.x, t.y, t.w, t.h, 12); g.clip(); if (im) g.drawImage(im, t.x, t.y, t.w, t.h); else { g.fillStyle = '#1F2227'; g.fillRect(t.x, t.y, t.w, t.h); } g.restore(); }
     else if (t.kind === 'small'){ g.textAlign = 'left'; g.font = '500 23px "IBM Plex Mono",monospace'; g.fillStyle = '#9AA2AD'; g.fillText(t.text(), t.x, t.y); }
     else if (t.kind === 'stepValue'){ g.textAlign = 'center'; g.font = '600 30px "IBM Plex Mono",monospace'; g.fillStyle = '#FF8A1F'; g.fillText(t.text(), t.x, t.y); }
     else if (t.kind === 'note'){ g.textAlign = 'left'; g.font = '500 27px "Archivo",sans-serif'; g.fillStyle = '#9AA2AD'; wrapText(g, t.text(), t.x, t.y, t.w || MW - 2 * t.x, 36); }
@@ -1752,6 +1805,7 @@ dialMesh.renderOrder = 50; dialMesh.visible = false; scene.add(dialMesh);
 const toolCol = t => t === 'draw' || t === 'mark' ? TAG_CSS[S.tag] : t === 'smooth' ? '#5FE0B8' : t === 'bend' || t === 'flatten' ? '#FFD23F' : '#F04348';
 function dialItems(kind){
   if (kind === 'tool') return TOOLS.map(t => ({ label: TOOL_NAME[t], icon: t, col: toolCol(t), on: S.tool === t, act: () => { setTool(t); flash(TOOL_NAME[t] + ': ' + TOOL_NOTE[t]); } }));
+  if (kind === 'name') return NAME_WORDS.map(w => ({ label: w, act: () => { if (nameTarget) setSketchName(nameTarget, w + ' ' + nameTarget.no); } }));
   if (kind === 'type') return VT.map(t => ({ label: TAG_NAME[t], icon: STRICT(t) ? 'strict' : 'line', col: TAG_CSS[t], tint: TAG_CSS[t], sub: STRICT(t) ? 'exact' : '', on: S.tag === t, act: () => { setTag(t); flash(TAG_NAME[t] + ': ' + TAG_SUB[t]); } }));
   const tab = (t, n) => ({ label: n, icon: t, on: menuShown && tabOpen(t), act: () => { menuTab = t; menuOpen = true; setMenuShown(true); flash(n + ' panel'); } });
   const room = () => S.bg === 'pass' && inAR();
@@ -1808,7 +1862,7 @@ function drawDial(){
   g.beginPath(); g.arc(c, c, r0 - 8, 0, Math.PI * 2); g.fillStyle = 'rgba(23,25,29,.96)'; g.fill();
   const h = dial.hover >= 0 ? it[dial.hover] : null;
   g.fillStyle = h ? '#FF8A1F' : '#9AA2AD'; g.font = '700 30px "Archivo",sans-serif';
-  g.fillText(h ? h.label : dial.kind === 'tool' ? 'TOOLS' : dial.kind === 'type' ? 'LINE TYPE' : 'PANELS', c, c - 12);
+  g.fillText(h ? h.label : dial.kind === 'tool' ? 'TOOLS' : dial.kind === 'type' ? 'LINE TYPE' : dial.kind === 'name' ? 'NAME' : 'PANELS', c, c - 12);
   g.fillStyle = '#6B7480'; g.font = '500 20px "IBM Plex Mono",monospace'; g.fillText(h ? 'let go to pick' : 'push the stick', c, c + 24);
   dialTex.needsUpdate = true;
 }
@@ -1866,7 +1920,7 @@ function updateXRInput(dt){
     let mHit = null;
     if (menuMesh.visible && menuOwner !== h && !h.act && !h.grab){ raycaster.ray.set(_o, _dir); const x = raycaster.intersectObject(menuMesh, false)[0]; if (x && x.uv) mHit = { b: menuButtonAt(x.uv, menuCropH), dist: x.distance }; }
     if (mHit){ hover = mHit.b || hover; h.beam.visible = true; h.beam.scale.z = mHit.dist; }
-    h.tip.visible = h.stem.visible = !mHit;
+    h.tip.visible = h.stem.visible = !mHit && !isOff(h);
     const pw = penWorld(h), p = toPark(pw);
     const myDial = dial && dial.h === h; if (myDial) updateDial(h, gp, pw);
     h.tip.material.color.setHex(S.tool === 'cut' || S.tool === 'erase' ? 0xF04348 : S.tool === 'smooth' ? 0x5FE0B8 : S.tool === 'bend' || S.tool === 'flatten' ? 0xFFD23F : TAG_COL[S.tag]);
@@ -1876,7 +1930,7 @@ function updateXRInput(dt){
     const hh = canPts ? nearestHandle(p, 0.018 * N()) : null, hl = canPts && !hh ? nearSpline(p, 0.012 * N()) : null;
     if (hh) hotH = hh; else if (hl) hi.push(hl.s);
     if ((hh || hl) && !h.wasNear){ pulse(h, 0.12, 8); } h.wasNear = !!(hh || hl);
-    if (S.tool !== 'draw' && !mHit && !h.grab && !myDial){
+    if (S.tool !== 'draw' && !mHit && !h.grab && !myDial && !isOff(h)){
       h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush] * (S.tool === 'flatten' || S.tool === 'smooth' || S.tool === 'bend' ? FLAT_K : 1));
       h.brush.material.color.setHex(S.tool === 'mark' ? TAG_COL[S.tag] : S.tool === 'smooth' ? 0x5FE0B8 : S.tool === 'bend' || S.tool === 'flatten' ? 0xFFD23F : 0xF04348);
       const r = BRUSH[S.brush] * N();
@@ -2106,7 +2160,7 @@ setupButtons();
 window.pentimento = { ops: { delPoint: (...a) => delPoint(...a), cornerPoint: (...a) => cornerPoint(...a), addPoint: (...a) => addPoint(...a) }, load(list){ commit(list.map(o => makeStroke(o.tag, Float32Array.from(o.pts), Float32Array.from(o.pts)))); },
   drag(tool, path, brush){ S.tool = tool; if (brush !== undefined) S.brush = brush; const d = toolDown('t', new V3(...path[0])); for (const q of path){ d.dt = 1 / 72; toolMove('t', d, new V3(...q)); } toolUp('t', d); },
   showDial(kind, hover){ const f = camera.getWorldDirection(new V3()); dialMesh.position.copy(camera.position).addScaledVector(f, 0.42); dialMesh.quaternion.copy(camera.quaternion); dialMesh.visible = true; dial = { kind, h: null, items: dialItems(kind), hover }; drawDial(); },
-  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
+  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid(); setTips(!!S.tips); applyLighting(); applyBackground();
 if (strokes.length) scheduleBuild();
 let last = performance.now(), lastLines = 0;
