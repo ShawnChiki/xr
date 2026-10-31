@@ -1993,7 +1993,7 @@ function solve(strokes, prm, progress = () => {}){
   const cs = prm.coarseScale ?? 1, aC = Math.max(aA, 0.6 * cs), hC = Math.max(h * 1.5, 0.9 * cs);
   for (let it = 0; it < (warm ? 0 : 6); it++){
     remesh(M, aC, 0.6);
-    fitStep(M, samples, curves, { ...base, quad: base.quad && !!prm.coarseQuad, L: aC, h: hC, hn: hC * 2.7, maxStep: aC * 1.5, parity: it & 1, reach2: Math.max(h * 4, hC * 2.7) });
+    fitStep(M, samples, curves, { ...base, quad: base.quad && prm.coarseQuad !== false, L: aC, h: hC, hn: hC * 2.7, maxStep: aC * 1.5, parity: it & 1, reach2: Math.max(h * 4, hC * 2.7) });
     if (prm.onStep) prm.onStep(M, "coarse", it); progress(0.1 + 0.25 * it / 6, 'Fitting the rough shape');
   }
   // fine fit, no curves yet
