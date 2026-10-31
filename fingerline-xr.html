@@ -479,7 +479,8 @@ function relink(){
     let prev = null;
     for (const sg of st.segs){ for (let s = (20 - acc % 20) % 20; s < sg.len; s += 20){ const b = { key: st.id + ':' + k++, p: sg.a.clone().addScaledVector(sg.t, s), t: sg.t, st, next: null }; if (prev) prev.next = b; prev = b; W3.beads.push(b); } acc += sg.len; }
   }
-  W3.floorY = W3.fixedFloor != null ? W3.fixedFloor : W3.minY - 60;
+  // the floor you can fall to: your real floor, unless the park reaches below it (then just under the park)
+  W3.floorY = W3.fixedFloor != null ? Math.min(W3.fixedFloor, W3.minY - 60) : W3.minY - 60;
 }
 function query3(min, max, cb){
   const stp = ++W3.stamp;
@@ -1211,7 +1212,8 @@ function guidedRail3(st){
 const $ = s => document.querySelector(s);
 const S = { width: 56, batch: 3, cap: 10, limit: 60, fric: 60, smoothLv: 1, speed: 1, trails: true, sound: true, tilt: 'hand', scale: 'skate', evo: 'learn', figure: 'hand', railKind: 'round', earth: true, crash: true, coinShare: true };   // ribbons follow how you hold the controller
 // park sizes: metres per park unit. A board is 40 units long.
-const SCALES = { finger: { name: 'Fingerboard', s: 0.0024, board: '10 cm' }, mini: { name: 'Mini', s: 0.0075, board: '30 cm' }, skate: { name: 'Skateboard', s: 0.02, board: '80 cm' } };
+const FINGER_S = 0.0025;   // a board 10 cm long: real fingerboard size, shown as 1:1
+const SCALES = { tiny: { name: 'Tiny', s: 0.001, board: '4 cm' }, finger: { name: 'Fingerboard', s: FINGER_S, board: '10 cm' }, mini: { name: 'Mini', s: 0.0075, board: '30 cm' }, skate: { name: 'Skateboard', s: 0.02, board: '80 cm' } };
 // rewards: tricks first by default
 Object.assign(RW, { coins: 3, tricks: 2.5, air: 1.5, grinds: 0.5, manuals: 0.5, distance: 0.25, variety: 1, bail: 150 });
 const TILTS = { auto: 'Bank: auto', hand: 'Bank: hand', flat: 'Bank: flat' };
@@ -1223,7 +1225,7 @@ const TYPE_NAME = { ground: 'Ground', rail: 'Rail', boost: 'Boost', scenery: 'Sc
 const RAIL_KINDS = { round: 'Round', square: 'Square', ledge: 'Ledge', coping: 'Coping' };
 const RAIL_HELP = { round: 'a ringing steel tube', square: 'flat-topped, slides fast', ledge: 'a waxed concrete block', coping: 'diamond ribs that chatter' };
 const TYPE_COL = { ground: 0x2a2d33, rail: 0x3F6FC2, boost: 0xE2474C, scenery: 0x2F9B5A, guide: 0x2EC4E8 };
-const TOOL_NAME = { pen: 'Freehand', curve: 'Curve points', poly: 'Sharp points', edit: 'Edit points', eraser: 'Eraser', flag: 'Start flag', coin: 'Coins' };
+const TOOL_NAME = { pen: 'Freehand', curve: 'Curve points', poly: 'Sharp points', edit: 'Edit points', eraser: 'Eraser', paths: 'Erase paths', flag: 'Start flag', coin: 'Coins' };
 const TOOL_HELP = {
   pen: 'Hold the trigger and draw. The ribbon lies the way you hold the controller.',
   curve: 'Click to place points; the road curves smoothly through them. Click the last point again or click the right stick to finish. B/Y takes back a point.',
@@ -1231,6 +1233,7 @@ const TOOL_HELP = {
   edit: 'Pull a dot to move it (twist to tilt). Grab the road between dots to add one. B/Y on a dot deletes it. Right stick click: smooth or sharp. Stick up/down near a ribbon: wider or narrower.',
   guideTip: 'Guide: a route riders must take, in the arrow direction. They take its branch at forks, hold its line, grind a rail it runs along, and jump where it leaves the road. They sparkle cyan while on it.',
   eraser: 'Touch a path with the tip to cut that piece away; sweep along it to erase more. Touching a coin removes it.',
+  paths: 'Shows the runs riders have learned. Touch one to forget it; riders stop repeating it. Undo brings it back.',
   coin: 'Click to place a coin where riders should go; on a road it floats just above it. Click a coin to remove it. Riders earn the most for grabbing coins. A coin few riders reach grows and is worth more, so one coin on each of three paths splits riders between them.',
   flag: 'Click where riders start, pointing the way they should head.' };
 let ltype = 'ground', tool = 'pen', paused = false, autoEvolve = true, following = false;
@@ -1300,7 +1303,8 @@ let dioYaw = 0;
 const sc = () => dio.scale.x;
 function setDio(pos, yaw, s){
   dioYaw = yaw; dio.position.copy(pos); dio.rotation.set(0, yaw, 0); dio.scale.setScalar(s); dio.updateMatrixWorld(true);
-  W3.fixedFloor = W3.floorY = -pos.y / s;            // your real floor, in park units
+  W3.fixedFloor = -pos.y / s;                         // your real floor, in park units
+  W3.floorY = W3.strokes.size ? Math.min(W3.fixedFloor, W3.minY - 60) : W3.fixedFloor;
   S.dio = { p: pos.toArray(), yaw, s };
 }
 if (S.dio && S.dio.s) setDio(new THREE.Vector3().fromArray(S.dio.p), S.dio.yaw, S.dio.s); else setDio(new THREE.Vector3(0, 0, 0), 0, S0);
@@ -2080,6 +2084,31 @@ function addGhost(r){
   line.frustumCulled = false; line.visible = S.trails; track.add(line); ghosts.push(line);
   if (ghosts.length > 16){ const g = ghosts.shift(); track.remove(g); g.geometry.dispose(); g.material.dispose(); }
 }
+// ---------- learned paths: every run the gene pool keeps, drawn as a tube (shown with the Erase paths tool) ----------
+const pathGroup = new THREE.Group(); track.add(pathGroup); let pathsDirty = true;
+function rebuildPaths(){
+  pathsDirty = false;
+  for (const c of [...pathGroup.children]){ pathGroup.remove(c); c.geometry.dispose(); c.material.dispose(); }
+  pathGroup.visible = tool === 'paths'; pathGroup.userData.n = Pool.list.length; if (!pathGroup.visible) return;
+  Pool.list.forEach((e, i) => {
+    if (!e.trail || e.trail.length < 6) return;
+    const pts = unflat(e.trail); if (pts.length < 2) return;
+    const m = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), Math.min(400, pts.length * 3), 1.8, 5, false),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL((i * 0.13) % 1, 0.75, i ? 0.62 : 0.55), transparent: true, opacity: 0.75, depthWrite: false }));
+    m.userData = { uid: e.uid, pts }; pathGroup.add(m);
+  });
+}
+function pathNear(p, R){
+  let best = null, bd = R;
+  for (const m of pathGroup.children) for (const q of m.userData.pts){ const d = q.distanceTo(p); if (d < bd){ bd = d; best = m; } }
+  return best;
+}
+function forgetPath(m, d){
+  const i = Pool.list.findIndex(e => e.uid === m.userData.uid); if (i < 0) return;
+  const [e] = Pool.list.splice(i, 1); d.list.push({ e, i }); Pool.leaders = Pool.leaders.filter(x => x.uid !== e.uid);
+  if (i === 0){ bestTrail = Pool.list[0] && Pool.list[0].trail || null; setBestLine(); }
+  rebuildPaths(); flash('Forgot that path. Riders won’t repeat it.'); save(); menuDirty = true;
+}
 function clearGhosts(){ for (const g of ghosts){ track.remove(g); g.geometry.dispose(); g.material.dispose(); } ghosts.length = 0; }
 
 // ---------- sound: placed in the room (HRTF), so you hear where riders are ----------
@@ -2249,6 +2278,8 @@ function checkRecords(){
 Sim.onEnd = r => {
   if (r.stopped) return;
   const res = judge(r); r.result = res;
+  // remember the line this run took, so it can be shown and erased later
+  { const uid = res.uid || r.rerunOf, e = uid && Pool.list.find(x => x.uid === uid); if (e && r.trail && r.trail.length > 1) e.trail = r.trail.filter((_, i) => i % 4 === 0).concat([r.trail[r.trail.length - 1]]).flatMap(p => [Math.round(p.x), Math.round(p.y), Math.round(p.z)]); pathsDirty = true; }
   bestDist = Math.max(bestDist, r.dist);
   callout(r, String(r.score), res.rerun ? 're-rated #' + res.rank : res.kept ? 'lives on #' + res.rank : 'out', res.kept ? '#2E9E62' : '#6B7480');
   if (res.kept && res.rank === 1 && r.trail && r.trail.length > 1){
@@ -2552,6 +2583,7 @@ const isPointsTool = () => tool === 'curve' || tool === 'poly';
 
 // p: park-local point; up: park-local "up" of the hand; fwd: park-local pointing direction; pu: park units per millimetre-ish
 function toolStart(id, p, up, fwd, pu){
+  if (tool === 'paths'){ const d = { kind: 'paths', list: [], R: Math.max(30 * pu, 14) }; const m = pathNear(p, d.R); if (m) forgetPath(m, d); return d; }
   if (tool === 'eraser'){ const d = { kind: 'erase', rec: [], added: new Set(), coins: [], pu }; eraseNear(p, pu, d); return d; }
   if (tool === 'coin'){
     const near = W3.coins.find(c => c.p.distanceTo(p) < Math.max(0.06 / sc(), 18));
@@ -2570,6 +2602,7 @@ function toolStart(id, p, up, fwd, pu){
 function toolMove(id, d, p, up, fwd){
   if (d.kind === 'pen'){ if (p.distanceTo(d.raw[d.raw.length - 1]) >= 3 * d.pu){ d.raw.push(p.clone()); d.ups.push(up.clone()); showPreview(id, d.raw); } }
   else if (d.kind === 'erase') eraseNear(p, d.pu, d);
+  else if (d.kind === 'paths'){ const m = pathNear(p, d.R); if (m) forgetPath(m, d); }
   else if (d.kind === 'flag'){ const h = new V3(fwd.x, 0, fwd.z); if (h.lengthSq() > 1e-4){ h.normalize(); flag3 = { x: p.x, y: p.y, z: p.z, dx: h.x, dz: h.z, placed: true, manual: true }; placeFlag(); } }
 }
 function toolEnd(id, d){
@@ -2587,7 +2620,8 @@ function toolEnd(id, d){
       undoStack.push({ add: [st.id] }); touchWorld();
       if (isRibbon(st.t) && !flag3.manual && [...W3.strokes.values()].filter(x => isRibbon(x.t)).length === 1) flagOnTop(st);
     }
-  } else if (d.kind === 'erase'){ if (d.rec.length || d.added.size || d.coins.length) undoStack.push({ remove: d.rec, add: [...d.added], coinBack: d.coins }); }
+  } else if (d.kind === 'paths'){ if (d.list.length) undoStack.push({ poolBack: d.list }); }
+  else if (d.kind === 'erase'){ if (d.rec.length || d.added.size || d.coins.length) undoStack.push({ remove: d.rec, add: [...d.added], coinBack: d.coins }); }
   else if (d.kind === 'flag'){ undoStack.push({ flag: d.from }); save(); }
   else if (d.kind === 'edit') editEnd(d);
   if (undoStack.length > 200) undoStack.shift();
@@ -2610,6 +2644,7 @@ function undo(){
   if (a.coinBack) for (const c of a.coinBack){ if (!W3.coins.includes(c)) W3.coins.push(c); } 
   if (a.coinMove) a.coinMove.c.p.copy(a.coinMove.from);
   if (a.coinAdd || a.coinBack || a.coinMove) syncCoins();
+  if (a.poolBack){ for (const { e } of a.poolBack) if (!Pool.list.includes(e)) Pool.list.push(e); Pool.list.sort((x, y) => y.score - x.score); bestTrail = Pool.list[0] && Pool.list[0].trail || bestTrail; setBestLine(); pathsDirty = true; save(); }
   touchWorld();
 }
 function clearRoom(){
@@ -2716,7 +2751,7 @@ function setScalePreset(key){
   S.scale = key; save(); if (!renderer.xr.isPresenting) needsFit = true;
   flash(SCALES[key].name + ' size: board ' + SCALES[key].board);
 }
-const boardText = () => { const m = 40 * sc(); return m >= 1 ? m.toFixed(1) + ' m' : Math.round(m * 100) + ' cm'; };
+const boardText = (s = sc()) => { const m = 40 * s; return m >= 1 ? m.toFixed(1) + ' m' : Math.round(m * 100) + ' cm'; };
 
 // ======================================================================
 // Menu: a palette on your left controller (on a computer it sits at the right edge of the screen)
@@ -2772,7 +2807,7 @@ const BTN = [], TXT = [];
   row('draw', 388, 90, TYPES.map(t => ({ id: 'type-' + t, label: () => TYPE_NAME[t], swatch: t, on: () => ltype === t, act: () => setType(t) })));
   text({ tab: 'draw', kind: 'label', x: P, y: 506, text: () => 'TOOL' });
   const tl = Object.keys(TOOL_NAME).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => tool === t, act: () => setTool(t) }));
-  row('draw', 526, 72, tl.slice(0, 3)); row('draw', 608, 72, tl.slice(3));
+  row('draw', 526, 72, tl.slice(0, 4)); row('draw', 608, 72, tl.slice(4));
   stepper('draw', P, 696, W, 76, 'Ribbon width', widthText, () => { S.width = clamp(S.width / 1.2, WMIN, WMAX); save(); }, () => { S.width = clamp(S.width * 1.2, WMIN, WMAX); save(); });
   only = () => ltype === 'rail';
   row('draw', 782, 76, Object.keys(RAIL_KINDS).map(k => ({ id: 'rk-' + k, label: () => RAIL_KINDS[k], on: () => S.railKind === k, act: () => { S.railKind = k; flash(RAIL_KINDS[k] + ': ' + RAIL_HELP[k]); save(); } })));
@@ -2813,7 +2848,7 @@ const BTN = [], TXT = [];
   // ROOM
   text({ tab: 'room', kind: 'label', x: P, y: 368, text: () => 'PARK SIZE · board ' + boardText() });
   row('room', 388, 116, Object.keys(SCALES).map(k => ({ id: 'scale-' + k, label: () => SCALES[k].name, sub: () => 'board ' + SCALES[k].board, on: () => Math.abs(sc() / SCALES[k].s - 1) < 0.03, act: () => setScalePreset(k) })));
-  text({ tab: 'room', kind: 'note', x: P, y: 548, text: () => 'Grip empty space to move the whole park. Grip with both hands to turn it and scale it. Riders keep riding.' });
+  text({ tab: 'room', kind: 'note', x: P, y: 548, text: () => 'Size now ' + ratioText(sc()) + ' (1:1 is real fingerboard size). ' + 'Grip empty space to move the whole park. Grip with both hands to turn it and scale it. Riders keep riding.' });
   row('room', 640, 80, [...toggles('room'), { id: 'earth', label: () => 'Floating earth', on: () => S.earth, act: () => { S.earth = !S.earth; trackDirty = true; save(); } }]);
   row('room', 734, 80, [{ id: 'hide', label: () => 'Hide this menu', act: () => setMenuShown(false) }]);
   text({ tab: 'room', kind: 'note', x: P, y: 852, text: () => 'Click the left stick to bring the menu back.' });
@@ -2885,7 +2920,7 @@ function nextStep(){
 function menuButtonAt(uv){ const x = uv.x * MW, y = (1 - uv.y) * MH; return BTN.find(b => visibleEl(b) && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) || null; }
 function pressMenu(b){ menuPressed = b; b.act(); menuDirty = true; setTimeout(() => { menuPressed = null; menuDirty = true; }, 140); }
 function setType(t){ ltype = t; if (!['pen', 'curve', 'poly'].includes(tool)) tool = 'pen'; menuDirty = true; }
-function setTool(t){ for (const id of [...pstate.keys()]) pointsFinish(id); tool = t; menuDirty = true; }
+function setTool(t){ for (const id of [...pstate.keys()]) pointsFinish(id); tool = t; menuDirty = true; pathsDirty = true; }
 function setPaused(v){ paused = v; menuDirty = true; }
 let followPoint = null, needsFit = true;
 if (document.fonts) document.fonts.ready.then(() => { menuDirty = true; });
@@ -2977,13 +3012,21 @@ function initParkGrab(){
     pg2 = { local: dio.worldToLocal(mid.clone()), dist: Math.max(0.02, d.length()), s: sc(), ang: Math.atan2(d.x, d.z), yaw: dioYaw };
   }
 }
+// size as a ratio to a real fingerboard (1:1)
+function ratioText(s){ const r = s / FINGER_S, f = x => x >= 9.95 ? String(Math.round(x)) : (Math.round(x * 10) / 10).toString(); return Math.abs(r - 1) < 1e-3 ? '1:1' : r > 1 ? f(r) + ':1' : '1:' + f(1 / r); }
 function updateParkGrab(){
+  if (!pg2) sizeLabel.visible = false;
   if (pg1){
     const gp = gripPos(pg1.st, new THREE.Vector3()), yaw = ctrlYaw(pg1.st) + pg1.yawOff, s = sc();
     setDio(gp.sub(pg1.local.clone().multiplyScalar(s).applyAxisAngle(_up, yaw)), yaw, s);
   } else if (pg2){
     const a = gripPos(parkGrabbers[0], new THREE.Vector3()), b = gripPos(parkGrabbers[1], new THREE.Vector3()), mid = a.clone().add(b).multiplyScalar(0.5), d = b.clone().sub(a);
-    const s = clamp(pg2.s * d.length() / pg2.dist, 0.0008, 0.06), yaw = pg2.yaw + (Math.atan2(d.x, d.z) - pg2.ang);
+    let s = clamp(pg2.s * d.length() / pg2.dist, 0.00025, 0.06); const yaw = pg2.yaw + (Math.atan2(d.x, d.z) - pg2.ang);
+    // locks at 1:1 (real fingerboard size) as you pass through it
+    const locked = Math.abs(s / FINGER_S - 1) < 0.07; if (locked) s = FINGER_S;
+    if (locked && !pg2.locked) for (const h of parkGrabbers) pulse(h, 0.6, 30); pg2.locked = locked;
+    sizeLabel.write(ratioText(s) + (locked ? '  fingerboard' : '  board ' + boardText(s)), locked ? '#FFC83D' : '#EEF0F3');
+    sizeLabel.position.copy(mid).add(new V3(0, 0.06, 0)); sizeLabel.visible = true;
     setDio(mid.sub(pg2.local.clone().multiplyScalar(s).applyAxisAngle(_up, yaw)), yaw, s); menuDirty = true;
   }
 }
@@ -3007,7 +3050,7 @@ function updateXRInput(dt){
     if (menuMesh.visible && menuOwner !== st && !st.draw && !st.held){ raycaster.ray.set(_o, _dir); const h = raycaster.intersectObject(menuMesh, false)[0]; if (h && h.uv) mHit = { b: menuButtonAt(h.uv), dist: h.distance }; }
     if (mHit){ hover = mHit.b || hover; st.beam.visible = true; st.beam.scale.z = mHit.dist; }
     st.tip.visible = st.stem.visible = !mHit;
-    st.tip.material.color.setHex(tool === 'eraser' ? 0xE5262C : tool === 'flag' || tool === 'edit' || tool === 'coin' ? 0xFFC83D : TYPE_COL[ltype]);
+    st.tip.material.color.setHex(tool === 'eraser' ? 0xE5262C : tool === 'paths' ? 0xB06CFF : tool === 'flag' || tool === 'edit' || tool === 'coin' ? 0xFFC83D : TYPE_COL[ltype]);
     st.tip.scale.setScalar(tool === 'eraser' ? 2.2 : 1);
     const p = penLocal(st), upL = toLocalDir(new V3(0, 1, 0).applyQuaternion(qW)), fwdL = toLocalDir(_dir);
     // what grip would pick up: a yellow glow around the tip (nothing nearby = grip moves the whole park)
@@ -3197,6 +3240,7 @@ function labelSprite(w, h){
 }
 const toastSp = labelSprite(1024, 120); scene.add(toastSp);
 const flagHint = labelSprite(1024, 120); flagObj.add(flagHint);
+const sizeLabel = labelSprite(1024, 120); sizeLabel.scale.set(0.34, 0.04, 1); scene.add(sizeLabel);
 
 // ======================================================================
 // Loop
@@ -3233,7 +3277,7 @@ renderer.setAnimationLoop(now => {
   } else acc = 0;
   checkRecords();
   for (const r of riders) updateRider3D(r);
-  spinCoins(dtReal); M.water.map.offset.x -= dtReal * 1.4; swayTrees(clock);
+  spinCoins(dtReal); if (pathsDirty || pathGroup.visible !== (tool === 'paths') || (tool === 'paths' && pathGroup.userData.n !== Pool.list.length)) rebuildPaths(); M.water.map.offset.x -= dtReal * 1.4; swayTrees(clock);
   if (!xr) desktopHandles();
   M.boost.emissiveIntensity = 0.35 + 0.25 * Math.sin(clock * 6);
   stepParticles(live ? dtReal : 0); stepCallouts(dtReal);
@@ -3261,7 +3305,7 @@ renderer.setAnimationLoop(now => {
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 // handy for poking at it from the browser console
-window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, addObject, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
+window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, addObject, pathGroup, ratioText, sc, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
 </script>
 </body>
 </html>
