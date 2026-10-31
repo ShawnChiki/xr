@@ -1927,6 +1927,8 @@ function wire({ V, F }){
   for (const f of F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = ek(a, b); if (seen.has(k)) continue; seen.add(k); seg.push(V[3 * a], V[3 * a + 1], V[3 * a + 2], V[3 * b], V[3 * b + 1], V[3 * b + 2]); }
   return new Float32Array(seg);
 }
+// the lightest cage that makes this surface (for editing it point by point elsewhere): points, faces, sharp edges
+const cageOut = c => ({ V: new Float32Array(c.V), F: new Int32Array(c.F.flat()), C: new Int32Array(c.F.map(f => f.length)), sharp: Int32Array.from([...(c.sharp || [])].flatMap(k => [Math.floor(k / 2097152), k % 2097152])) });
 // the quad layout drawn on the smooth surface itself: the finest edges that descend from the coarse quads' edges
 // (the coarse quads float off the surface, so drawn as they are the surface hides half of them)
 const allEdges = F => { const s = new Set(); for (const f of F) for (let i = 0; i < f.length; i++) s.add(ek(f[i], f[(i + 1) % f.length])); return s; };
@@ -2075,7 +2077,7 @@ function solve(strokes, prm, progress = () => {}){
     return { surface: shc, quadWire: smooth.cageE ? edgeWire(smooth, smooth.cageE) : wire(cage), fineWire: wire(smooth), creases: creaseLines(smooth),
       quads: { V: new Float32Array(cage.V), F: new Int32Array(cage.F.flat()), C: new Int32Array(cage.F.map(f => f.length)) },
       curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })), ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
-      nQuads: cage.F.length, cageMode: true, cache, warm, note: gc.lost ? 'A line no guide crosses was left out: draw a guide across it' : gc.bad ? gc.bad + ' patch' + (gc.bad > 1 ? 'es' : '') + ' left open: close them with more guides' : '' };
+      nQuads: cage.F.length, cageMode: true, cage: cageOut(cage), levels: lv, cache, warm, note: gc.lost ? 'A line no guide crosses was left out: draw a guide across it' : gc.bad ? gc.bad + ' patch' + (gc.bad > 1 ? 'es' : '') + ' left open: close them with more guides' : '' };
   }
   
   const simplify = () => { if (prm.target > 0){ const Lo = 2 * Math.sqrt(triArea(M) / prm.target);
@@ -2136,7 +2138,7 @@ function solve(strokes, prm, progress = () => {}){
     quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()), C: new Int32Array(quads.F.map(f => f.length)) },
     curves: [...curves.filter(C => !C.row || prm.showRows).map(C => ({ row: C.row ? C.level : 0, tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })),
       ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
-    nQuads: quads.F.length, folds, cache, warm,
+    nQuads: quads.F.length, cage: cageOut(cage), levels: 1 + (prm.subd | 0), folds, cache, warm,
     note: prm.target < 0 ? (guides.length ? 'Couldn\'t lay quads along your guides here, so Auto was used. Make sure guides cross each other or reach the border.' : 'Draw guides on the surface to lay out the quads (Auto until then)') : ''
   };
 }
