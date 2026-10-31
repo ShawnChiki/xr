@@ -1210,7 +1210,7 @@ function guidedRail3(st){
 // position, yaw, and a uniform scale in metres per park unit.
 // ======================================================================
 const $ = s => document.querySelector(s);
-const S = { width: 56, batch: 3, cap: 10, limit: 60, fric: 60, smoothLv: 1, speed: 1, trails: true, sound: true, tilt: 'hand', scale: 'skate', evo: 'learn', figure: 'hand', railKind: 'round', earth: true, crash: true, coinShare: true };   // ribbons follow how you hold the controller
+const S = { width: 56, batch: 3, cap: 10, limit: 60, fric: 60, smoothLv: 1, speed: 1, trails: true, sound: true, tilt: 'hand', scale: 'skate', evo: 'learn', figure: 'hand', flyStyle: 'hover', flyLife: true, flySpeed: 1, railKind: 'round', earth: true, crash: true, coinShare: true };   // ribbons follow how you hold the controller
 // park sizes: metres per park unit. A board is 40 units long.
 const FINGER_S = 0.0025;   // a board 10 cm long: real fingerboard size, shown as 1:1
 const SCALES = { tiny: { name: 'Tiny', s: 0.001, board: '4 cm' }, finger: { name: 'Fingerboard', s: FINGER_S, board: '10 cm' }, mini: { name: 'Mini', s: 0.0075, board: '30 cm' }, skate: { name: 'Skateboard', s: 0.02, board: '80 cm' } };
@@ -1297,7 +1297,8 @@ const room = new THREE.Group(); scene.add(room);
   floor.rotation.x = -Math.PI / 2; room.add(floor); }
 
 // ---------- the park ----------
-const dio = new THREE.Group(); scene.add(dio);
+const flyRig = new THREE.Group(); flyRig.matrixAutoUpdate = false; scene.add(flyRig);
+const dio = new THREE.Group(); flyRig.add(dio);
 const track = new THREE.Group(); dio.add(track);
 let dioYaw = 0;
 const sc = () => dio.scale.x;
@@ -1738,6 +1739,7 @@ function look3(g){
     deckCss: css(d1), deck2Css: css(d2), deck3Css: css(d3), pat: Math.floor(g.deckPat * 13) % 13,
     deck: d1, wheel, ply: hsl(g.plyHue, 0.7, 0.55), grip, truck,
     fl: 0.9 + 0.22 * g.finger, ring: g.ring > 0.78,
+    lefty: ((g.ring * 7.31 + g.nailHue * 3.17) % 1) < 0.4, backward: ((g.finger * 5.71 + g.wheelHue * 2.33) % 1) < 0.45,
     hat: Math.floor(g.ring * 3) % 3, hatCol: hsl(g.nailHue + 0.3, 0.68, 0.5), hair, pants, shoes,
   };
 }
@@ -1891,6 +1893,9 @@ function makeRider3D(r){
   const shadow = new THREE.Mesh(shadowGeo, new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, opacity: 0.3 }));
   shadow.renderOrder = 1;
   track.add(bRoot, hRoot, shadow);
+  // left hands are mirror images; some riders face the other way along the board (goofy, for little skaters)
+  if (fig === 'hand' && L.lefty) hOff.scale.z = -1;
+  if (L.backward) hOff.rotation.y = Math.PI;
   return { fig, L, ms, art, tex, bRoot, bInv, bYaw, bTilt, bPose, hRoot, hInv, hYaw, hOff, h, shadow };
 }
 function disposeRider3D(o){ track.remove(o.bRoot, o.hRoot, o.shadow); for (const m of Object.values(o.ms)) if (m) m.dispose(); for (const t of o.tex) t.dispose(); o.shadow.material.dispose(); }
@@ -2729,6 +2734,80 @@ function addShape(key){
   flash(sh.name + ' added. Grip it to move it');
 }
 
+// ---------- fly-through: the park glides smoothly around you, for filming ----------
+const FLY_STYLES = { hover: 'Hover', chase: 'Chase', heli: 'Helicopter', alien: 'Alien', rail: 'Rail cam', orbit: 'Orbit' };
+const FLY_KEYS = Object.keys(FLY_STYLES);
+const fly = { on: false, pos: new V3(), vel: new V3(), look: new V3(), lookVel: new V3(), yaw: 0, yawVel: 0, focus: null, t: 0, dist: 1, anchor: null, anchorYaw: 0, rail: null, ang: 0 };
+function setFly(on){
+  if (on === fly.on) return; fly.on = on;
+  if (on){
+    fly.focus = null; fly.rail = null; fly.t = 0; fly.anchor = null; fly.ang = Math.random() * 6;
+    const g = flyGoal(0); fly.pos.copy(g.pos); fly.look.copy(g.look); fly.vel.set(0, 0, 0); fly.lookVel.set(0, 0, 0); fly.yaw = yawOf(g.look.clone().sub(g.pos)); fly.yawVel = 0;
+    if (renderer.xr.isPresenting) setMenuShown(false);
+    flash('Flying: ' + FLY_STYLES[S.flyStyle] + (renderer.xr.isPresenting ? '. B/Y stops' : '. F stops'));
+  } else { flyRig.matrix.identity(); flyRig.matrixWorldNeedsUpdate = true; room.visible = true; orbit.enabled = true; needsFit = !renderer.xr.isPresenting; flash('Stopped flying'); }
+  menuDirty = true;
+}
+const yawOf = d => Math.atan2(d.x, d.z);
+function flyFocus(){
+  if (fly.focus && !fly.focus.done && fly.focus.mode !== 'bail') return fly.focus;
+  fly.focus = followTarget() || riders.find(r => !r.done) || null; return fly.focus;
+}
+// where the camera wants to be and what it looks at, in park units
+function flyGoal(dt){
+  const f = flyFocus(), up = new V3(0, 1, 0), t = fly.t, D = fly.dist, sp = S.flySpeed;
+  const fp = f ? f.pos.clone() : new V3(flag3.x, flag3.y, flag3.z);
+  let h = f ? velOf3(f).clone() : new V3(flag3.dx, 0, flag3.dz); h.y = 0; if (h.lengthSq() < 100) h = fly.lastH ? fly.lastH.clone() : new V3(1, 0, 0); h.normalize(); fly.lastH = h.clone();
+  const st = S.flyStyle;
+  if (st === 'chase') return { pos: fp.clone().addScaledVector(h, -135 * D).addScaledVector(up, 62 * D), look: fp.clone().addScaledVector(h, 70).addScaledVector(up, 18), w: 2.4 };
+  if (st === 'heli'){
+    const b = bounds(), c = new V3((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, (b.z0 + b.z1) / 2), R = (Math.max(b.x1 - b.x0, b.z1 - b.z0) * 0.55 + 200) * D;
+    fly.ang += dt * 0.11 * sp; return { pos: c.clone().add(new V3(Math.cos(fly.ang) * R, 260 * D + 25 * Math.sin(t * 0.3), Math.sin(fly.ang) * R)), look: c.clone().lerp(fp, 0.35), w: 0.9 };
+  }
+  if (st === 'alien'){ fly.ang += dt * 0.45 * sp; return { pos: fp.clone().add(new V3(Math.cos(fly.ang) * 150 * D, (55 + 45 * Math.sin(t * 0.8) + 25 * Math.sin(t * 2.1)) * D, Math.sin(fly.ang * 1.3) * 120 * D)), look: fp.clone().add(new V3(0, 10 * Math.sin(t * 1.7), 0)), w: 1.3 }; }
+  if (st === 'orbit'){ fly.ang += dt * 0.35 * sp; return { pos: fp.clone().add(new V3(Math.cos(fly.ang) * 120 * D, 50 * D, Math.sin(fly.ang) * 120 * D)), look: fp, w: 2 }; }
+  if (st === 'rail'){
+    // glide along a road's centre line, a little above it
+    if (!fly.rail || !W3.strokes.has(fly.rail.st.id)){
+      let best = null; for (const s2 of W3.strokes.values()) if (isRibbon(s2.t) && s2.k !== 'plank' && (!best || s2.pts.length > best.pts.length)) best = s2;
+      if (!best) return { pos: fp.clone().addScaledVector(h, -150).addScaledVector(up, 70), look: fp, w: 1.5 };
+      const S2 = [0]; for (let i = 1; i < best.pts.length; i++) S2.push(S2[i - 1] + best.pts[i].distanceTo(best.pts[i - 1]));
+      fly.rail = { st: best, S: S2, s: 0, dir: 1 };
+    }
+    const R2 = fly.rail, P = R2.st.pts, U = R2.st.ups, total = R2.S[R2.S.length - 1];
+    R2.s += R2.dir * dt * 110 * sp; if (R2.s > total){ R2.s = total; R2.dir = -1; } if (R2.s < 0){ R2.s = 0; R2.dir = 1; }
+    const at = s2 => { s2 = clamp(s2, 0, total); let i = 0; while (i < P.length - 2 && R2.S[i + 1] < s2) i++; const k = (s2 - R2.S[i]) / Math.max(1e-6, R2.S[i + 1] - R2.S[i]); return [P[i].clone().lerp(P[i + 1], k), U[i].clone().lerp(U[i + 1], k).normalize()]; };
+    const [c0, n0] = at(R2.s), [c1, n1] = at(R2.s + R2.dir * 160);
+    return { pos: c0.addScaledVector(n0, 48 * D), look: c1.addScaledVector(n1, 25), w: 2.4 };
+  }
+  // hover
+  return { pos: fp.clone().addScaledVector(h, -170 * D).addScaledVector(up, 85 * D), look: fp.clone().addScaledVector(h, 40), w: 1.5 };
+}
+// critically damped springs keep every move smooth, even when the target jumps
+function spring(x, v, goal, w, dt){ const a = goal.clone().sub(x).multiplyScalar(w * w).addScaledVector(v, -2 * w); v.addScaledVector(a, dt); x.addScaledVector(v, dt); }
+function flyFrame(dt, xr, xrCam){
+  if (!fly.on) return;
+  fly.t += dt; room.visible = false;
+  const g = flyGoal(dt), steps = Math.max(1, Math.ceil(dt / 0.01)), h = dt / steps;
+  for (let i = 0; i < steps; i++){ spring(fly.pos, fly.vel, g.pos, g.w, h); spring(fly.look, fly.lookVel, g.look, g.w * 1.2, h); }
+  const want = yawOf(fly.look.clone().sub(fly.pos)); let dy = want - fly.yaw; dy -= Math.round(dy / TAU) * TAU;
+  for (let i = 0; i < steps; i++){ fly.yawVel += (dy * 1.2 * 1.2 - 2 * 1.2 * fly.yawVel) * h; fly.yaw += fly.yawVel * h; dy -= fly.yawVel * h; }
+  const k = S.flyLife ? SCALES.skate.s / sc() : 1;
+  if (xr){
+    // the camera point lands at where your head was when you started, facing the way you were facing
+    if (!fly.anchor){ const p = new V3(), q = new THREE.Quaternion(); xrCam.getWorldPosition(p); xrCam.getWorldQuaternion(q); const f = new V3(0, 0, -1).applyQuaternion(q); fly.anchor = p; fly.anchorYaw = Math.atan2(-f.x, -f.z); }
+    dio.updateMatrix(); const cw = fly.pos.clone().applyMatrix4(dio.matrix), fw = new V3(Math.sin(fly.yaw), 0, Math.cos(fly.yaw)).transformDirection(dio.matrix);
+    const rot = fly.anchorYaw - Math.atan2(-fw.x, -fw.z);
+    flyRig.matrix.compose(new V3(), new THREE.Quaternion(), new V3(1, 1, 1));
+    const M = new THREE.Matrix4().makeTranslation(fly.anchor.x, fly.anchor.y, fly.anchor.z).multiply(new THREE.Matrix4().makeRotationY(rot)).multiply(new THREE.Matrix4().makeScale(k, k, k)).multiply(new THREE.Matrix4().makeTranslation(-cw.x, -cw.y, -cw.z));
+    flyRig.matrix.copy(M); flyRig.matrixWorldNeedsUpdate = true;
+  } else {
+    flyRig.matrix.identity(); flyRig.matrixWorldNeedsUpdate = true; orbit.enabled = false;
+    const cp = track.localToWorld(fly.pos.clone()), lp = track.localToWorld(fly.look.clone());
+    camera.position.copy(cp); camera.lookAt(lp);
+  }
+}
+
 // ---------- first look around: the start flag appears in front of you ----------
 function fitView(head){
   if (head){
@@ -2800,7 +2879,7 @@ const BTN = [], TXT = [];
    { id: 'undo', label: () => 'Undo', act: undo },
    { id: 'clear', label: () => 'Clear room', style: 'danger', act: clearRoom }].forEach((b, i) => add(Object.assign({ x: xs + i * (wr + G), y: 120, w: wr, h: 110 }, b)));
   // tabs
-  row(null, 254, 74, [['draw', 'Draw'], ['objects', 'Objects'], ['riders', 'Riders'], ['evolve', 'Evolve'], ['room', 'Room']].map(([t, n]) => ({ id: 'tab-' + t, style: 'tab', label: () => n, on: () => menuTab === t, act: () => { menuTab = t; } })));
+  row(null, 254, 74, [['draw', 'Draw'], ['objects', 'Objects'], ['riders', 'Riders'], ['evolve', 'Evolve'], ['fly', 'Fly'], ['room', 'Room']].map(([t, n]) => ({ id: 'tab-' + t, style: 'tab', label: () => n, on: () => menuTab === t, act: () => { menuTab = t; } })));
   const W = MW - 2 * P, half = (W - G) / 2;
   // DRAW
   text({ tab: 'draw', kind: 'label', x: P, y: 368, text: () => 'LINE TYPE' });
@@ -2845,6 +2924,15 @@ const BTN = [], TXT = [];
   const ok = Object.keys(OBJECTS), mkO = k => ({ id: 'obj-' + k, label: () => OBJECTS[k].name, sub: () => OBJECTS[k].sub, act: () => addObject(k) });
   for (let i = 0; i < 4; i++) row('objects', 388 + i * 104, 92, ok.slice(i * 3, i * 3 + 3).map(mkO));
   text({ tab: 'objects', kind: 'note', x: P, y: 832, text: () => 'Appears at your right hand, or sits on the road below it, lined up with the road. Grip to move it, Undo or the Eraser to remove it.' });
+  // FLY
+  add({ tab: 'fly', id: 'fly-go', x: P, y: 352, w: W, h: 96, style: 'big', label: () => fly.on ? 'STOP FLYING' : 'FLY THROUGH', sub: () => fly.on ? 'or press B / Y' : 'smooth, for filming', act: () => setFly(!fly.on) });
+  text({ tab: 'fly', kind: 'label', x: P, y: 482, text: () => 'STYLE' });
+  row('fly', 502, 80, FLY_KEYS.slice(0, 3).map(k => ({ id: 'fs-' + k, label: () => FLY_STYLES[k], on: () => S.flyStyle === k, act: () => { S.flyStyle = k; fly.rail = null; save(); } })));
+  row('fly', 592, 80, FLY_KEYS.slice(3).map(k => ({ id: 'fs-' + k, label: () => FLY_STYLES[k], on: () => S.flyStyle === k, act: () => { S.flyStyle = k; fly.rail = null; save(); } })));
+  text({ tab: 'fly', kind: 'label', x: P, y: 704, text: () => 'SIZE' });
+  row('fly', 724, 76, [{ id: 'fl-life', label: () => 'Life size', on: () => S.flyLife, act: () => { S.flyLife = true; save(); } }, { id: 'fl-park', label: () => 'Park as it is', on: () => !S.flyLife, act: () => { S.flyLife = false; save(); } }]);
+  stepper('fly', P, 812, W, 72, 'Speed', () => ({ 0.5: 'Slow', 1: 'Normal', 2: 'Fast' })[S.flySpeed], () => { S.flySpeed = S.flySpeed > 1 ? 1 : 0.5; save(); }, () => { S.flySpeed = S.flySpeed < 1 ? 1 : 2; save(); });
+  text({ tab: 'fly', kind: 'note', x: P, y: 916, text: () => 'Follows the best rider. In the headset: right stick ← → changes style, ↑ ↓ closer or farther, B/Y stops. Controllers and menu hide while you fly.' });
   // ROOM
   text({ tab: 'room', kind: 'label', x: P, y: 368, text: () => 'PARK SIZE · board ' + boardText() });
   row('room', 388, 116, Object.keys(SCALES).map(k => ({ id: 'scale-' + k, label: () => SCALES[k].name, sub: () => 'board ' + SCALES[k].board, on: () => Math.abs(sc() / SCALES[k].s - 1) < 0.03, act: () => setScalePreset(k) })));
@@ -3002,7 +3090,7 @@ const parkGrabbers = [];
 let pg1 = null, pg2 = null;
 const gripPos = (st, v) => st.grip.getWorldPosition(v);
 function ctrlYaw(st){ const r = new THREE.Vector3(1, 0, 0).applyQuaternion(st.grip.getWorldQuaternion(new THREE.Quaternion())); return Math.atan2(-r.z, r.x); }
-function grabPark(st){ if (!parkGrabbers.includes(st)) parkGrabbers.push(st); if (following) following = false; initParkGrab(); }
+function grabPark(st){ if (fly.on) return; if (!parkGrabbers.includes(st)) parkGrabbers.push(st); if (following) following = false; initParkGrab(); }
 function releasePark(st){ const i = parkGrabbers.indexOf(st); if (i < 0) return; parkGrabbers.splice(i, 1); initParkGrab(); save(); }
 function initParkGrab(){
   pg1 = pg2 = null;
@@ -3050,6 +3138,17 @@ function updateXRInput(dt){
     if (menuMesh.visible && menuOwner !== st && !st.draw && !st.held){ raycaster.ray.set(_o, _dir); const h = raycaster.intersectObject(menuMesh, false)[0]; if (h && h.uv) mHit = { b: menuButtonAt(h.uv), dist: h.distance }; }
     if (mHit){ hover = mHit.b || hover; st.beam.visible = true; st.beam.scale.z = mHit.dist; }
     st.tip.visible = st.stem.visible = !mHit;
+    if (fly.on){
+      st.tip.visible = st.stem.visible = false; if (st.grip.children[0]) st.grip.children[0].visible = menuShown;
+      if (down(0) && mHit && mHit.b) pressMenu(mHit.b);
+      if (down(3) && st.hand === 'left') setMenuShown(!menuShown);
+      if (down(5)) setFly(false);
+      const fx = gp.axes[2] || 0, fy = gp.axes[3] || 0;
+      if (st.flick === 0 && Math.abs(fx) > 0.7){ st.flick = Math.sign(fx); const i = FLY_KEYS.indexOf(S.flyStyle); S.flyStyle = FLY_KEYS[(i + st.flick + FLY_KEYS.length) % FLY_KEYS.length]; fly.rail = null; flash(FLY_STYLES[S.flyStyle]); save(); menuDirty = true; }
+      else if (Math.abs(fx) < 0.3) st.flick = 0;
+      if (Math.abs(fy) > 0.25) fly.dist = clamp(fly.dist * Math.exp(fy * dt * 0.9), 0.4, 3);
+      st.prev = gp.buttons.map(b => b.pressed); continue;
+    } else if (st.grip.children[0]) st.grip.children[0].visible = true;
     st.tip.material.color.setHex(tool === 'eraser' ? 0xE5262C : tool === 'paths' ? 0xB06CFF : tool === 'flag' || tool === 'edit' || tool === 'coin' ? 0xFFC83D : TYPE_COL[ltype]);
     st.tip.scale.setScalar(tool === 'eraser' ? 2.2 : 1);
     const p = penLocal(st), upL = toLocalDir(new V3(0, 1, 0).applyQuaternion(qW)), fwdL = toLocalDir(_dir);
@@ -3133,7 +3232,7 @@ function sheetFor(e){
 }
 const onSheet = e => { const w = mouseRay(e).intersectPlane(drawPlane, new V3()); return w ? track.worldToLocal(w) : null; };
 renderer.domElement.addEventListener('pointerdown', e => {
-  if (e.button !== 0 || renderer.xr.isPresenting) return;
+  if (e.button !== 0 || renderer.xr.isPresenting || fly.on) return;
   sndWake();
   if (tool === 'edit'){
     // grab a point dot, or the road itself to add one
@@ -3171,6 +3270,7 @@ addEventListener('keydown', e => {
   else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z'){ e.preventDefault(); undo(); }
   else if (e.key >= '1' && e.key <= '4') setType(TYPES[+e.key - 1]);
   else if (e.key.toLowerCase() === 'k') setPaused(!paused);
+  else if (e.key.toLowerCase() === 'f') setFly(!fly.on);
 });
 // on a computer: show every point dot while editing, and the points you're placing
 function desktopHandles(){
@@ -3289,7 +3389,8 @@ renderer.setAnimationLoop(now => {
       const k = Math.min(1, dtReal * 4); dio.position.addScaledVector(_rw.sub(followPoint), -k); dio.updateMatrixWorld();
     } else { const k = Math.min(1, dtReal * 4), delta = _rw.sub(orbit.target).multiplyScalar(k); orbit.target.add(delta); camera.position.add(delta); }
   }
-  if (!xr) orbit.update();
+  flyFrame(dtReal, xr, xrCam);
+  if (!xr && !fly.on) orbit.update();
   xrCam.getWorldPosition(listener); xrCam.getWorldQuaternion(listenerQ); sndFrame(live);
   if (flashT > 0){ flashT -= dtReal; if (flashT <= 0) menuDirty = true; }
   if (xr && flashT > 0){
@@ -3305,7 +3406,7 @@ renderer.setAnimationLoop(now => {
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 // handy for poking at it from the browser console
-window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, addObject, pathGroup, ratioText, sc, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
+window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, addObject, setFly, fly, pathGroup, ratioText, sc, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
 </script>
 </body>
 </html>
