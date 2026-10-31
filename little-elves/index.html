@@ -148,7 +148,18 @@ const planeGeo = new THREE.PlaneGeometry(1, 1);
 
 // ================= sound =================
 // Everything is synthesized. Each tribe has its own gibberish: different vowels, consonants, rhythm and buzz.
-const AU = { ctx: null, listener: null, noise: null, master: null };
+const AU = { ctx: null, listener: null, noise: null, master: null, ends: [] };
+// A budget for voices: far-away chatter is skipped (their mouths still move), and when lots of people are
+// talking at once, only the ones close to you get a voice.
+function voiceGate(e, dur) {
+  if (!e.voiceIn) return false;
+  const t = AU.ctx.currentTime, E = AU.ends;
+  for (let i = E.length - 1; i >= 0; i--) if (E[i] < t) E.splice(i, 1);
+  const d = e.root.parent === scene ? e.root.position.distanceTo(camHead) : 0;
+  if (d > 5.5 || E.length >= 16 || (E.length >= 9 && d > 1.2)) return false;
+  E.push(t + dur); return true;
+}
+const farFrom = (e, r) => e.root.parent === scene && e.root.position.distanceTo(camHead) > r;
 function initAudio() {
   if (AU.ctx) { AU.ctx.resume(); return; }
   AU.listener = new THREE.AudioListener(); camera.add(AU.listener);
@@ -230,6 +241,8 @@ function makeSyllables(L, n) {
 const makePhrase = L => makeSyllables(L, 3 + ((Math.random() * 3) | 0));
 function babble(e, n, question, delay = 0) {
   if (!e.voiceIn) return 0.6;
+  const est = n * 0.14 / (e.tempo || 1) + delay;
+  if (!voiceGate(e, est)) { e.talkT = Math.max(e.talkT, est); return est; }
   const L = LANGS[e.lang], t0 = now() + 0.02 + delay; let t = t0;
   const base = e.pitch * rand(0.9, 1.15);
   const sy = Math.random() < 0.3 ? e.phrase : makeSyllables(L, n);
@@ -244,6 +257,8 @@ function babble(e, n, question, delay = 0) {
 }
 function laugh(e, n, delay = 0) {
   if (!e.voiceIn) return 1.2;
+  const est = n * 0.15 + 0.4 + delay;
+  if (!voiceGate(e, est)) { e.talkT = Math.max(e.talkT, est); return est; }
   const t0 = now() + 0.02 + delay; let t = t0;
   const base = e.pitch * rand(1.15, 1.45), out = e.voiceIn, fs = e.fs, w = e.wave || 'sawtooth', pure = LANGS[e.lang].pure;
   const V = (tt, d, f0, f1, v, vol = 1, cons = null, vib = 0, wave = w) => pure ? tone(out, tt, d, f0, f1, 0.4 * vol, 'sine', vib) : syl(out, tt, d, f0, f1, v, fs, vol, cons, vib, wave);
@@ -273,6 +288,7 @@ function sing(e, freq, t, dur) {
 }
 function say(e, w, delay = 0) {
   if (!e.voiceIn) return 0.2;
+  if (!voiceGate(e, 0.5 + delay)) { e.talkT = Math.max(e.talkT, 0.4); return 0.4; }
   const t = now() + 0.01 + delay, b = e.pitch, fs = e.fs, out = e.voiceIn, raw = e.rawIn, wave = e.wave || 'sawtooth'; let d = 0.2;
   const pure = LANGS[e.lang].pure;
   const S = (tt, dd, f0, f1, v, c, vib) => pure ? tone(out, tt, dd, f0, f1, 0.45, 'sine', vib) : syl(out, tt, dd, f0, f1, v, fs, 0.9, c, vib, wave);
@@ -317,9 +333,9 @@ function say(e, w, delay = 0) {
   }
   e.talkT = Math.max(e.talkT, d); return d;
 }
-function step(e) { if (!e.rawIn) return; const t = now(); if (e.kind === 'bumble') tone(e.rawIn, t, 0.06, 140, 70, 0.25); else noiseBurst(e.rawIn, t, 0.018, e.kind === 'pixie' ? 6000 : 4200, 1.5, e.kind === 'pixie' ? 0.06 : 0.1); }
+function step(e) { if (!e.rawIn || farFrom(e, 2.5)) return; const t = now(); if (e.kind === 'bumble') tone(e.rawIn, t, 0.06, 140, 70, 0.25); else noiseBurst(e.rawIn, t, 0.018, e.kind === 'pixie' ? 6000 : 4200, 1.5, e.kind === 'pixie' ? 0.06 : 0.1); }
 function thud(e, big) {
-  if (!e.rawIn) return;
+  if (!e.rawIn || farFrom(e, 6)) return;
   const t = now() + 0.005;
   tone(e.rawIn, t, 0.3, e.kind === 'bumble' ? 100 : 130, 38, big ? 2.2 : 1.5);
   noiseBurst(e.rawIn, t, 0.12, 260, 0.7, big ? 1.3 : 0.9);
@@ -339,7 +355,7 @@ function whistle(e) {
   return t - now();
 }
 function sfx(e, type) {
-  if (!e || !e.rawIn) return;
+  if (!e || !e.rawIn || farFrom(e, 6)) return;
   const raw = e.rawIn, t = now();
   switch (type) {
     case 'splash': noiseBurst(raw, t, 0.45, 900, 0.5, 1.2, 'lowpass'); noiseBurst(raw, t + 0.02, 0.3, 3000, 0.6, 0.6); for (let i = 0; i < 4; i++) tone(raw, t + 0.15 + i * rand(0.05, 0.12), 0.06, rand(500, 800), rand(1200, 1800), 0.25); break;
@@ -977,7 +993,8 @@ class Elf {
     attachVoice(this);
   }
   get size() { return UNIT * this.s; }
-  update(dt, t) {
+  // vis=false: off-screen, so skip posing the body. cheap: far or off-screen, so skip the little extras.
+  update(dt, t, vis = true, cheap = false) {
     this.cool -= dt; if (this.pop < 1) this.pop = Math.min(1, this.pop + dt * 2.2);
     switch (this.state) {
       case 'air': this.updateAir(dt, t); break;
@@ -986,13 +1003,14 @@ class Elf {
       case 'script': if (this.script && this.script(dt, t)) this.script = null; break;
       default: this.updateGround(dt, t);
     }
-    this.animate(dt, t); this.place(dt, t);
+    if (vis) this.animate(dt, t); else this.talkT -= dt;
+    this.place(dt, t, cheap || !vis);
   }
   headPos(out) { return this.head.getWorldPosition(out); }
   centerPos(out) { return this.pelvis.getWorldPosition(out); }
   free() { return this.state === 'ground' && this.pop >= 1 && !this.chat && !this.chase && !this.activity && !this.giant && this.come < 0 && ['wander', 'dance', 'land', 'cheer', 'shake', 'run', 'idle', 'whistle'].includes(this.b); }
   available() { return this.state === 'ground' && this.pop >= 1 && !this.activity && !this.giant && !this.chase && this.come < 0 && !['prep', 'down', 'getup', 'gift', 'offer', 'swim', 'wallsplat', 'nap', 'balance', 'climb'].includes(this.b); }
-  grabbable() { return this.pop >= 1 && !this.giant && (this.state === 'ground' || this.state === 'air' || this.state === 'ride'); }
+  grabbable() { return this.pop >= 1 && this.state !== 'held'; }
   holdProp(m, flip = true) { m.position.set(0, -0.115 * this.armL, 0.03); m.rotation.set(flip ? Math.PI : 0, 0, 0); m.scale.setScalar(1 / this.size); this.elR.add(m); this.prop = m; }
   dropProp() { const m = this.prop; if (m && m.parent) m.parent.remove(m); this.prop = null; return m; }
   // ---------- on a surface ----------
@@ -1416,33 +1434,94 @@ class Elf {
     this.cool = 1.5; this.b = 'tickle'; this.timer = 1.4; this.chat = null; laugh(this, 7);
   }
   // ---------- picked up and thrown ----------
-  grab(key) {
+  // Anyone can be picked up: by the head (they dangle) or by the feet (upside down). They swing like a pendulum
+  // on your hand, their arms and legs flop toward gravity, and each one takes it differently.
+  grab(key, by = 'head') {
     if (this.state === 'ride' && this.ride) { HS[this.ride.hand].rider = null; this.ride = null; }
+    const wasBusy = !!this.activity || this.state === 'script';
+    if (this.giant && this.activity) {    // the climbers tumble off
+      const act = this.activity;
+      for (const c of act.cl || []) if (c.stage !== 'done' && c.e.activity === act && c.e.state === 'script') tumbleOff(c.e);
+      endAct(act, 'laugh');
+    }
+    leaveActivity(this);
+    if (this.state === 'script') { unclip(this); this.script = null; }
+    if (this.prop) { if (Gift.giver === this) dropFlower(this); else dropToFloor(this.dropProp()); }
+    if (this.prop2) { dropToFloor(this.prop2); this.prop2 = null; }
+    this.flipOverride = null; this.scriptLook = null; this.actLook = null; this.target = null; this.faceAt = null; this.sink = this.sinkT = 0; this.cb = 0;
     this.state = 'held'; this.holdKey = key; this.b = 'held'; this.chat = null; this.chase = null; this.come = -1; this.flight = null;
-    this.hang.copy(Y); this.holdMood = Math.random() < 0.65 ? 'love' : 'hate'; this.act = { talk: rand(0.8, 1.4) };
-    if (this.holdMood === 'love') laugh(this, 5); else say(this, 'nono');
+    const feet = by === 'feet', gp = Grab.pos[key] || this.root.position;
+    const up = _v1.set(0, 1, 0).applyQuaternion(this.root.quaternion);
+    const d = feet ? up.clone() : up.clone().negate();    // pivot (your hand) -> their middle
+    const v = tangent(d).multiplyScalar(feet ? 2.5 : 0.6);   // a nudge, so nobody balances upside down on your fist
+    const L = Math.max(0.03, (feet ? this.com : this.grabH - this.com) * this.size);
+    const mood = this.giant ? 'grumpy' : wasBusy ? 'kick' : pick(['giggle', 'giggle', 'kick', 'limp']);
+    this.sw = { feet, d, v, L, gp: gp.clone(), hv: new V3(), hvPrev: new V3(), acc: new V3(), off: new V3(), spin: 0, spinV: 0, mood, moodT: rand(3.5, 6), talk: rand(0.7, 1.2), wheeT: 0.6, flipped: false };
+    this.sw.off.copy(this.root.position).sub(this.heldRoot(gp, _v2));
+    this.act = {};
+    if (this.giant) say(this, 'grr');
+    else if (wasBusy) { say(this, Math.random() < 0.5 ? 'hey' : 'eee'); }
+    else if (mood === 'giggle') laugh(this, 5);
+    else if (mood === 'kick') say(this, 'nono');
+    else say(this, 'oof');
+    if (Math.random() < 0.5) this.othersLaugh(1.0);
   }
+  heldRoot(gp, out) { return out.copy(gp).addScaledVector(this.sw.d, this.sw.feet ? 0 : this.grabH * this.size); }
   updateHeld(dt, t) {
     const gp = Grab.pos[this.holdKey];
     if (!gp) { this.release(new V3()); return; }
-    const hv = velOf(this.holdKey);
-    _v1.copy(Y).addScaledVector(hv, -0.18).normalize();
-    this.hang.lerp(_v1, damp(5, dt)).normalize();
-    this.root.position.copy(gp).addScaledVector(this.hang, -this.grabH * this.size);
-    _v2.subVectors(camHead, this.root.position);
-    basisQuat(this.hang, _v2, _q1); this.root.quaternion.slerp(_q1, damp(10, dt));
+    const S = this.sw, idt = 1 / Math.max(dt, 1e-3);
+    // how your hand moves: velocity and (smoothed) acceleration
+    _v1.subVectors(gp, S.gp).multiplyScalar(idt).clampLength(0, 12); S.gp.copy(gp);
+    S.hvPrev.copy(S.hv); S.hv.lerp(_v1, damp(25, dt));
+    S.acc.subVectors(S.hv, S.hvPrev).multiplyScalar(idt).clampLength(0, 45);
+    // a pendulum hanging off your hand: gravity minus the hand's acceleration pulls the body around
+    const d = S.d, v = S.v, L = S.L;
+    _v3.set(0, -9.8, 0).sub(S.acc);
+    _v4.copy(_v3).addScaledVector(d, -_v3.dot(d)).multiplyScalar(1 / L);
+    v.addScaledVector(_v4, dt);
+    if (S.mood === 'kick') { const k = 5 * dt; v.x += Math.sin(t * 13 + this.seed) * k; v.z += Math.cos(t * 11 + this.seed) * k; }
+    const drag = S.mood === 'grumpy' ? 2.6 : S.mood === 'limp' ? 0.7 : S.mood === 'kick' ? 1.6 : 1.1;
+    v.multiplyScalar(Math.exp(-drag * dt));
+    d.addScaledVector(v, dt).normalize(); v.addScaledVector(d, -v.dot(d));
+    // spin a little around the hanging line when you swing sideways, then turn back to look at you
+    S.spinV += (-9 * S.spin - 2 * S.spinV + clamp(S.acc.dot(camRight), -20, 20) * 0.25) * dt; S.spin = clamp(S.spin + S.spinV * dt, -2.5, 2.5);
+    const up = _v1.copy(d); if (!S.feet) up.negate();
+    _v2.subVectors(camHead, gp); basisQuat(up, _v2, _q1);
+    _q2.setFromAxisAngle(up, S.spin); _q1.premultiply(_q2);
+    this.root.quaternion.slerp(_q1, damp(30, dt));
+    S.off.multiplyScalar(Math.exp(-12 * dt));
+    this.heldRoot(gp, this.root.position).add(S.off);
     this.p.copy(this.root.position);
-    this.act.talk -= dt;
-    if (this.act.talk <= 0) {
-      this.act.talk = rand(1.2, 2.4);
-      if (hv.length() > 1.2) say(this, 'whee');
-      else if (this.holdMood === 'love') { if (Math.random() < 0.6) laugh(this, 4); else babble(this, 3, true); }
-      else if (Math.random() < 0.5) say(this, 'nono'); else babble(this, 4);
+    // what they say about it
+    const fast = v.length() * L + S.hv.length();
+    S.wheeT -= dt; S.talk -= dt; S.moodT -= dt;
+    if (S.feet && !S.flipped && d.y < -0.75) { S.flipped = true; say(this, S.mood === 'giggle' ? 'woohoo' : 'waa'); S.talk = Math.max(S.talk, 0.9); }
+    if (fast > 1.7 && S.wheeT <= 0) { S.wheeT = 1.6; say(this, S.mood === 'grumpy' ? 'grr' : S.mood === 'kick' ? 'waa' : 'whee'); S.talk = Math.max(S.talk, 0.8); if (S.mood === 'limp') { S.mood = 'giggle'; laugh(this, 6, 0.5); } }
+    if (S.moodT <= 0) {
+      S.moodT = rand(4, 7);
+      if (S.mood === 'kick') { S.mood = 'limp'; say(this, 'aww'); }                       // tired of kicking: plays dead
+      else if (S.mood === 'limp') { S.mood = 'giggle'; say(this, 'boo'); laugh(this, 6, 0.4); S.talk = 1.6; }   // ...can't keep a straight face
+      else if (S.mood === 'giggle' && Math.random() < 0.3) { S.mood = 'kick'; say(this, 'hey'); }
+    }
+    if (S.talk <= 0) {
+      S.talk = rand(1.1, 2.3);
+      switch (S.mood) {
+        case 'giggle': if (Math.random() < 0.6) laugh(this, 4); else babble(this, 3, true); break;
+        case 'kick': { const r = Math.random(); if (r < 0.35) say(this, 'nono'); else if (r < 0.6) say(this, 'hey'); else babble(this, 4); break; }
+        case 'grumpy': if (Math.random() < 0.5) say(this, 'grr'); else babble(this, 3); S.talk += 1; break;
+        default: if (Math.random() < 0.25) say(this, 'hmm'); S.talk += 1;    // limp: very quiet
+      }
     }
   }
   release(vel) {
     if (this.state !== 'held') return;
+    const S = this.sw;
+    if (S) vel.addScaledVector(S.v, S.L * 0.8);    // the swing carries on
+    if (this.giant) vel.multiplyScalar(0.45);       // heavy!
     vel.clampLength(0, 8);
+    for (const k of ['shL', 'shR', 'hipL', 'hipR']) this.a[k] = wrapPi(this.a[k]);
+    if (this.av) for (const k of KEYS) this.av[k] = 0;
     const speed = vel.length();
     this.p.copy(this.root.position); this.holdKey = null;
     for (let i = 0; i < 2; i++) {
@@ -1557,11 +1636,31 @@ class Elf {
           A.hipL = 0.7 + Math.sin(t * 22) * 0.7; A.hipR = 0.7 + Math.cos(t * 20) * 0.7; A.knL = A.knR = 0.9; A.hp = -0.45;
       }
     } else if (this.state === 'held') {
-      const ph = t * 16;
-      A.hipL = 0.6 + Math.sin(ph) * 0.9; A.hipR = 0.6 - Math.sin(ph) * 0.9; A.knL = 1.0 + Math.cos(ph) * 0.6; A.knR = 1.0 - Math.cos(ph) * 0.6;
-      if (this.holdMood === 'love') { A.shLz = A.shRz = 2.5 + Math.sin(t * 7) * 0.3; A.elL = A.elR = 0.4; }
-      else { A.shL = 1.5 + Math.sin(t * 20) * 0.6; A.shR = 1.5 - Math.sin(t * 20) * 0.6; A.elL = A.elR = 0.6; }
-      look = camHead;
+      // ragdoll: arms (and legs, when held by the head) hang toward gravity plus the swing, in the body's own frame
+      const S = this.sw;
+      _v1.set(0, -9.8, 0).sub(S.acc).normalize(); _q1.copy(this.root.quaternion).invert(); _v1.applyQuaternion(_q1);
+      const flex = Math.atan2(_v1.z, -_v1.y), abd = Math.asin(clamp(_v1.x, -1, 1));
+      // joints have limits, so limbs never swing through the body: wrap into [lo, lo+2pi), then stop at the nearer limit
+      const lim = (x, lo, hi) => { x = lo + (((x - lo) % TAU) + TAU) % TAU; return x <= hi ? x : (x - hi < lo + TAU - x ? hi : lo); };
+      A.shL = A.shR = lim(flex, -1.3, 3.4); A.shLz = clamp(abd, -0.4, 1.6); A.shRz = clamp(-abd, -0.4, 1.6); A.elL = A.elR = 0.15;
+      if (S.feet) { A.hipL = A.hipR = 0; A.hipLz = A.hipRz = 0.06; A.knL = A.knR = 0.05; }
+      else { A.hipL = A.hipR = lim(flex, -0.7, 2.2); A.hipLz = clamp(abd, -0.25, 1.0) + 0.05; A.hipRz = clamp(-abd, -0.25, 1.0) + 0.05; A.knL = A.knR = 0.12; }
+      const ph = t * 15 + this.seed;
+      switch (S.mood) {
+        case 'giggle':    // happy little kicks and waving arms
+          A.shLz += 1.1 + Math.sin(t * 7) * 0.35; A.shRz += 1.1 + Math.cos(t * 7) * 0.35; A.elL = A.elR = 0.5;
+          if (!S.feet) { A.hipL += Math.sin(t * 6) * 0.45; A.hipR -= Math.sin(t * 6) * 0.45; A.knL = 0.5 + Math.max(0, Math.sin(t * 6)) * 0.6; A.knR = 0.5 + Math.max(0, -Math.sin(t * 6)) * 0.6; }
+          look = camHead; break;
+        case 'kick':      // wriggle and bicycle
+          A.shL += Math.sin(t * 19) * 0.9; A.shR -= Math.sin(t * 21) * 0.9; A.shLz += 0.5; A.shRz += 0.5; A.elL = A.elR = 0.7;
+          if (S.feet) { A.knL = 0.4 + Math.sin(ph) * 0.4; A.knR = 0.4 - Math.sin(ph) * 0.4; }
+          else { A.hipL += 0.5 + Math.sin(ph) * 0.9; A.hipR += 0.5 - Math.sin(ph) * 0.9; A.knL = 1.0 + Math.cos(ph) * 0.6; A.knR = 1.0 - Math.cos(ph) * 0.6; }
+          look = camHead; break;
+        case 'grumpy':    // arms folded, legs swinging
+          A.shL = A.shR = 1.35; A.shLz = A.shRz = -0.55; A.elL = A.elR = 1.9; A.hp = 0.25; look = camHead; break;
+        default:          // limp: playing dead, head flopped
+          A.hp = S.feet ? -0.3 : 0.55; A.hr = clamp(_v1.x * 0.9, -0.6, 0.6) + 0.15; mouth = 'o';
+      }
     } else if (this.state === 'ride') {
       const R = this.ride;
       if (R.phase === 'arm') climbPose(1);
@@ -1650,8 +1749,14 @@ class Elf {
       A.hy += clamp(Math.atan2(_v1.x, _v1.z), -1.2, 1.2);
       A.hp += clamp(-Math.atan2(_v1.y - 0.1, Math.hypot(_v1.x, _v1.z)), -0.7, 0.5);
     }
-    const k = damp(this.state === 'air' || this.state === 'held' ? 20 : 14, dt), a = this.a;
-    for (const key of KEYS) a[key] += (A[key] - a[key]) * k;
+    const a = this.a;
+    if (this.state === 'held') {    // springy and floppy while dangling
+      const av = this.av || (this.av = {}), limp = this.sw.mood === 'limp', kk = limp ? 70 : 110, cc = limp ? 4.5 : 8, h = Math.min(dt, 0.05);
+      for (const key of KEYS) { let v = av[key] || 0; v += (kk * (A[key] - a[key]) - cc * v) * h; a[key] += v * h; av[key] = v; }
+    } else {
+      const k = damp(this.state === 'air' ? 20 : 14, dt);
+      for (const key of KEYS) a[key] += (A[key] - a[key]) * k;
+    }
     this.hipL.rotation.set(-(a.hipL + a.lean), 0, a.hipLz);
     this.hipR.rotation.set(-(a.hipR + a.lean), 0, -a.hipRz);
     this.knL.rotation.x = a.knL; this.knR.rotation.x = a.knR;
@@ -1729,7 +1834,7 @@ class Elf {
     }
   }
   // ---------- place in the room ----------
-  place(dt, t) {
+  place(dt, t, cheap = false) {
     const r = this.root;
     if (this.state === 'ground') {
       const cbT = this.steepT > 0.12 && this.b !== 'down' && this.b !== 'getup' ? 1 : 0;
@@ -1754,18 +1859,21 @@ class Elf {
     _v1.copy(_v4).sub(this.prevPos).multiplyScalar(idt);
     _v2.copy(_v1).sub(this.prevVel).multiplyScalar(idt);
     this.prevPos.copy(_v4); this.prevVel.copy(_v1);
-    r.getWorldQuaternion(_q2); _v2.applyQuaternion(_q2.invert()).clampLength(0, 30);
-    const hs = this.hs;
-    hs.vx += (-70 * hs.x - 7 * hs.vx - _v2.z * 0.8) * dt; hs.x += hs.vx * dt;
-    hs.vz += (-70 * hs.z - 7 * hs.vz + _v2.x * 0.8) * dt; hs.z += hs.vz * dt;
-    this.tips.forEach((tp, i) => { const g = i ? 0.6 : 1; tp.rotation.x = tp.userData.rest + clamp(hs.x * g, -1, 1); tp.rotation.z = clamp(hs.z * g, -1, 1); });
+    if (!cheap) {
+      r.getWorldQuaternion(_q2); _v2.applyQuaternion(_q2.invert()).clampLength(0, 30);
+      const hs = this.hs, h = Math.min(dt, 0.05);
+      hs.vx += (-70 * hs.x - 7 * hs.vx - _v2.z * 0.8) * h; hs.x += hs.vx * h;
+      hs.vz += (-70 * hs.z - 7 * hs.vz + _v2.x * 0.8) * h; hs.z += hs.vz * h;
+      this.tips.forEach((tp, i) => { const g = i ? 0.6 : 1; tp.rotation.x = tp.userData.rest + clamp(hs.x * g, -1, 1); tp.rotation.z = clamp(hs.z * g, -1, 1); });
+    }
     // soft shadow
     const sh = this.shadow;
     if (this.hasShadow) {
       if (this.state === 'ground') {
         sh.visible = this.sink < 0.02; sh.position.copy(this.p).addScaledVector(this.n, 0.004);
         sh.quaternion.setFromUnitVectors(ZAX, this.n); sh.scale.setScalar((this.cb > 0.5 ? 0.6 : 1 + this.lie * 0.4) * sc * this.s);
-      } else if (this.state === 'air' || this.state === 'held') {
+      } else if (cheap && this.state === 'air') sh.visible = false;
+      else if (this.state === 'air' || this.state === 'held') {
         const h = cast(r.position, DOWN, 3);
         if (h) { sh.visible = true; sh.position.copy(h.p).addScaledVector(h.n, 0.004); sh.quaternion.setFromUnitVectors(ZAX, h.n); sh.scale.setScalar(this.s / (1 + h.d * 2.5)); }
         else sh.visible = false;
@@ -1957,8 +2065,49 @@ function endAct(act, b = 'cheer') {
   if (act.onEnd) act.onEnd();
   for (const g of act.props || []) fadeOut(g, act.keep || 8);
 }
+// Someone got picked up in the middle of a scene: the others gasp or laugh, and carry on if there are enough of them.
+const ACT_MIN = { math: 2, chess: 2, tea: 2, paint: 1, leap: 2, ring: 3, giant: 1 };
+function leaveActivity(e) {
+  const act = e.activity; if (!act) return;
+  e.activity = null; e.actLook = null; e.act = {};
+  const i = act.members.indexOf(e);
+  if (i >= 0) {
+    act.members = act.members.filter(x => x !== e);
+    if (act.seats && act.phase === 'gather') act.seats = act.seats.filter((_, k) => k !== i);
+  }
+  if (!acts.includes(act)) return;
+  const left = act.members.filter(o => o.activity === act);
+  left.forEach((o, k) => { if (Math.random() < 0.5) say(o, 'gasp', 0.1 + k * 0.08); else laugh(o, 5, 0.2 + k * 0.1); });
+  LOG.push('left ' + act.type + ' ' + left.length);
+  if (left.length < (ACT_MIN[act.type] || 1)) endAct(act, 'laugh');
+}
+// Riding the giant when the giant gets picked up: everybody falls off.
+function tumbleOff(e) {
+  e.dropProp(); e.activity = null; e.actLook = null; e.scriptLook = null; e.flipOverride = null; e.script = null; e.act = {};
+  e.p.copy(e.root.position); e.vel.set(rand(-0.7, 0.7), rand(0.6, 1.3), rand(-0.7, 0.7));
+  e.toAir({ T: 0.8, style: 'flail', splat: true }); say(e, 'waa', rand(0, 0.3));
+}
+// A held cup, crayon or brush falls to the floor, bounces and fades.
+const falling = [];
+function dropToFloor(m) {
+  if (!m) return;
+  scene.attach(m); m.getWorldPosition(_v1);
+  const h = cast(_v2.copy(_v1).addScaledVector(Y, 0.02), DOWN, 3);
+  falling.push({ o: m, v: new V3(rand(-0.3, 0.3), rand(0.4, 0.8), rand(-0.3, 0.3)), w: new V3(rand(-14, 14), rand(-14, 14), rand(-14, 14)), floor: h ? h.p.y : Room.floorY });
+  fadeOut(m, 5);
+}
 function fadeOut(obj, delay) { fading.push({ obj, t: delay, s0: obj.scale.x }); }
 function updateFading(dt) {
+  for (let i = falling.length - 1; i >= 0; i--) {
+    const b = falling[i], o = b.o;
+    if (!o.parent) { falling.splice(i, 1); continue; }
+    b.v.y -= 9.8 * dt; o.position.addScaledVector(b.v, dt);
+    o.rotation.x += b.w.x * dt; o.rotation.y += b.w.y * dt; o.rotation.z += b.w.z * dt;
+    if (o.position.y < b.floor + 0.004 && b.v.y < 0) {
+      o.position.y = b.floor + 0.004; b.v.y *= -0.35; b.v.x *= 0.6; b.v.z *= 0.6; b.w.multiplyScalar(0.5);
+      if (Math.abs(b.v.y) < 0.12) { o.rotation.x = Math.PI / 2; o.rotation.z = 0; falling.splice(i, 1); }
+    }
+  }
   for (let i = fading.length - 1; i >= 0; i--) {
     const f = fading[i]; f.t -= dt;
     if (f.t < 0.5) f.obj.scale.setScalar(Math.max(0.001, f.s0 * f.t / 0.5));
@@ -2023,7 +2172,7 @@ function startMath() {
   const spot = findSpot(0.35); if (!spot) return false;
   const m = recruit(2, spot); if (m.length < 2) return false;
   const toU = _v1.subVectors(camera.position, spot).setY(0).normalize().clone(), side = new V3().crossVectors(Y, toU).normalize();
-  const grp = new THREE.Group(); grp.position.copy(spot).addScaledVector(Y, 0.003); basisQuat(Y, toU, grp.quaternion); scene.add(grp);
+  const grp = new THREE.Group(); grp.position.copy(spot).addScaledVector(Y, 0.015); basisQuat(Y, toU, grp.quaternion); scene.add(grp);
   const P = canvasPlane(0.3, 0.2, 512, 340); P.mesh.rotation.x = -Math.PI / 2; grp.add(P.mesh);
   const lines = [];
   const draw = () => {
@@ -2091,20 +2240,21 @@ function startTea() {
     type: 'tea', members: m, spot, r: 0.4, props: [grp], keep: 8, seats, cups: false,
     next: m.map(() => rand(0.5, 2)), pours: [2.5, 17], toast: 11, said: {},
     update(dt) {
-      if (!this.cups) { this.cups = true; m.forEach(e => e.holdProp(makeCup(pick(['#ffffff', '#ffd1e3', '#d6f5ff'])), false)); }
+      const live = m.filter(e => e.activity === this), n = live.length;
+      if (!this.cups) { this.cups = true; live.forEach(e => e.holdProp(makeCup(pick(['#ffffff', '#ffd1e3', '#d6f5ff'])), false)); }
       const T = this.T;
       for (const pt of this.pours) if (T > pt && T < pt + 2.2) {
-        const host = m[0]; host.b = 'pour'; pot.rotation.z = Math.min(0.9, (T - pt) * 1.5);
+        const host = live[0]; host.b = 'pour'; pot.rotation.z = Math.min(0.9, (T - pt) * 1.5);
         if (!this.said['p' + pt]) { this.said['p' + pt] = 1; sfx(host, 'pour'); babble(host, 3); }
         if (Math.random() < dt * 20) burst(spout.getWorldPosition(_v1), ['#8a4b2a', '#a0602a'], 1, 0.05, 3);
         return false;
       } else pot.rotation.z *= 0.9;
       if (T > this.toast && T < this.toast + 2.2) {
-        for (const e of m) e.b = 'toast';
-        if (!this.said.t) { this.said.t = 1; sfx(m[0], 'clink'); sfx(m[1], 'clink'); m.forEach((e, i) => say(e, 'yay', 0.3 + i * 0.1)); burst(_v1.copy(spot).addScaledVector(Y, 0.12), BRIGHT, 16, 0.5); }
+        for (const e of live) e.b = 'toast';
+        if (!this.said.t) { this.said.t = 1; sfx(live[0], 'clink'); sfx(live[1], 'clink'); live.forEach((e, i) => say(e, 'yay', 0.3 + i * 0.1)); burst(_v1.copy(spot).addScaledVector(Y, 0.12), BRIGHT, 16, 0.5); }
         return false;
       }
-      m.forEach((e, i) => {
+      live.forEach((e, i) => {
         this.next[i] -= dt;
         if (this.next[i] <= 0) {
           const r = Math.random(); this.next[i] = rand(1.4, 3);
@@ -2112,7 +2262,7 @@ function startTea() {
           else if (r < 0.7) { e.b = 'sitTalk'; babble(e, 3 + ((Math.random() * 3) | 0), Math.random() < 0.4); }
           else { e.b = 'laughSit'; laugh(e, 5); }
         }
-        const o = m[(i + 1) % n]; e.actLook = e.actLookV || (e.actLookV = new V3()); e.actLookV.copy(o.headPos(_v1));
+        const o = live[(i + 1) % n]; e.actLook = e.actLookV || (e.actLookV = new V3()); e.actLookV.copy(o.headPos(_v1));
       });
       return T > 26;
     },
@@ -2353,7 +2503,8 @@ function tryGiantClimb(g) {
       const front = g.p.clone().addScaledVector(gf, 0.3);
       let busy = false;
       this.cl.forEach((c, i) => {
-        const e = c.e; if (c.stage === 'done') return; busy = true; c.t += dt;
+        const e = c.e; if (c.stage !== 'done' && e.activity !== this) c.stage = 'done';
+        if (c.stage === 'done') return; busy = true; c.t += dt;
         const side = c.seat === 'shR' ? -1 : c.seat === 'shL' ? 1 : 0;
         const right = _v3.crossVectors(Y, gf).normalize();
         if (c.stage === 'walk') {
@@ -2422,8 +2573,9 @@ function startRing() {
       else if (T < 18) { const k = Math.sin((T - 14) / 4 * TAU * 2); Rt = R0 * (1 - 0.3 * Math.max(0, k)); up = Math.max(0, k); if (k > 0.95 && !this.said['in' + Math.floor(T)]) { this.said['in' + Math.floor(T)] = 1; m.forEach((e, i) => say(e, 'woohoo', i * 0.05)); } }
       else if (T < 21.5) om = 1.4 * Math.min(1, (T - 18));
       this.rot += om * dt; this.R += (Rt - this.R) * damp(4, dt);
-      const pts = line.geometry.attributes.position;
+      const pts = line.geometry.attributes.position, inRing = e => e.activity === this, live = m.filter(inRing);
       m.forEach((e, i) => {
+        if (!inRing(e)) return;
         const a = ang[i] + this.rot; e.root.position.set(C.x + Math.cos(a) * this.R, C.y, C.z + Math.sin(a) * this.R);
         basisQuat(Y, _v1.subVectors(C, e.root.position), e.root.quaternion); e.p.copy(e.root.position);
         e.b = 'ring'; e.act.ringK = Math.min(1, Math.abs(om) / 0.5 + (up > 0 ? 0.6 : 0)); e.act.ringUp = up; e.act.ringPh = i * Math.PI;
@@ -2431,6 +2583,7 @@ function startRing() {
       // colorful hand-holding links between neighbors
       m.forEach((e, i) => {
         const o = m[(i + 1) % m.length];
+        if (!inRing(e) || !inRing(o)) { pts.setXYZ(i * 2, 0, -50, 0); pts.setXYZ(i * 2 + 1, 0, -50, 0); return; }   // a gap where someone was taken
         const a1 = e.elL.localToWorld(_v1.set(0, -0.115 * e.armL, 0)), a2 = e.elR.localToWorld(_v2.set(0, -0.115 * e.armL, 0));
         const b1 = o.elL.localToWorld(_v3.set(0, -0.115 * o.armL, 0)), b2 = o.elR.localToWorld(_v4.set(0, -0.115 * o.armL, 0));
         const ea = a1.distanceTo(o.root.position) < a2.distanceTo(o.root.position) ? a1 : a2, ob = b1.distanceTo(e.root.position) < b2.distanceTo(e.root.position) ? b1 : b2;
@@ -2442,11 +2595,12 @@ function startRing() {
       if (this.noteT <= 0 && T < 21.5) {
         this.noteT = Math.abs(om) > 1 ? 0.2 : 0.32;
         const semi = RING_TUNE[this.note++ % RING_TUNE.length];
-        if (AU.ctx) { const t0 = now(); m.forEach(e => { if (e.voiceIn) sing(e, (e.pitch > 260 ? 523 : 262) * Math.pow(2, semi / 12), t0, this.noteT * 0.9); }); }
+        // a handful of singers is enough to sound like everyone (and much lighter than a dozen voices)
+        if (AU.ctx) { const t0 = now(), every = Math.max(1, Math.ceil(live.length / 6)); live.forEach((e, i) => { if (e.voiceIn && i % every === 0) sing(e, (e.pitch > 260 ? 523 : 262) * Math.pow(2, semi / 12), t0, this.noteT * 0.9); }); }
       }
       if (T > 21.5 && !this.said.fall) {
         this.said.fall = 1;
-        m.forEach((e, i) => { say(e, 'whee', i * 0.04); laugh(e, 8, 0.5 + Math.random() * 0.3); });
+        live.forEach((e, i) => { say(e, 'whee', i * 0.04); laugh(e, 8, 0.5 + Math.random() * 0.3); });
         burst(_v1.copy(C).addScaledVector(Y, 0.2), BRIGHT, 40, 1.2);
       }
       return T > 22;
@@ -2865,13 +3019,17 @@ function updateGrabs(grabbers) {
   for (const g of grabbers) {
     Grab.pos[g.key] = g.p;
     if (g.rise && !Mark.active && !Menu.visible && !nearMushroom(g.p) && Mush.key !== g.key && !Grab.held[g.key]) {
-      let best = null, bd = 0.11;
+      // nearest person within reach (bigger people are easier to catch); near the feet means upside down
+      let best = null, bd = 1, by = 'head';
       for (const e of elves) {
         if (!e.grabbable() || Grab.isHeld(e)) continue;
-        const d = Math.min(e.headPos(_v1).distanceTo(g.p), e.centerPos(_v2).distanceTo(g.p));
-        if (d < bd) { bd = d; best = e; }
+        if (e === Gift.giver && e.prop && e.prop.getWorldPosition(_v3).distanceTo(g.p) < 0.12) continue;   // they're reaching for the flower
+        const r = 0.06 + 0.05 * Math.min(e.s, 3);
+        const dh = Math.min(e.headPos(_v1).distanceTo(g.p), e.centerPos(_v2).distanceTo(g.p)) / r;
+        const df = e.root.position.distanceTo(g.p) / r, d = Math.min(dh, df);
+        if (d < bd) { bd = d; best = e; by = df < dh * 0.7 ? 'feet' : 'head'; }
       }
-      if (best) { Grab.held[g.key] = best; best.grab(g.key); }
+      if (best) { Grab.held[g.key] = best; best.grab(g.key, by); }
     }
     if (!g.grip && Grab.held[g.key]) { const e = Grab.held[g.key]; delete Grab.held[g.key]; e.release(g.key === 'm' && Mouse.throwV ? Mouse.throwV.clone().multiplyScalar(1.4) : velOf(g.key).multiplyScalar(1.1)); }
   }
@@ -3185,7 +3343,13 @@ const pointer = new THREE.Vector2(), mray = new THREE.Raycaster();
 function setRay(ev) { pointer.set(ev.clientX / innerWidth * 2 - 1, -(ev.clientY / innerHeight) * 2 + 1); mray.setFromCamera(pointer, camera); }
 function elfUnder() {
   let best = null, bestD = 0.12;
-  for (const e of elves) { if (!e.grabbable()) continue; const c = e.centerPos(new V3()); const d = mray.ray.distanceToPoint(c) / Math.max(1, c.distanceTo(camera.position) / 3); if (d < bestD) { bestD = d; best = e; } }
+  for (const e of elves) {
+    if (!e.grabbable()) continue;
+    for (const c of [e.headPos(new V3()), e.centerPos(new V3()), e.root.position.clone()]) {
+      const d = mray.ray.distanceToPoint(c) / Math.max(1, c.distanceTo(camera.position) / 3) / Math.sqrt(Math.min(e.s, 3));
+      if (d < bestD) { bestD = d; best = e; Mouse.depth = c.distanceTo(camera.position); }
+    }
+  }
   return best;
 }
 renderer.domElement.addEventListener('pointerdown', ev => {
@@ -3195,7 +3359,7 @@ renderer.domElement.addEventListener('pointerdown', ev => {
   if (Mush.state === 'float' && mray.intersectObject(Mush.group, true).length) { startEating(); Mouse.down = null; return; }
   if (Gift.giver && Gift.giver.prop && Gift.giver.b === 'offer' && mray.intersectObject(Gift.giver.prop, true).length) { takeFlower(Gift.giver, 'cam'); Mouse.down = null; return; }
   const e = elfUnder();
-  if (e) { Mouse.target = e; Mouse.depth = e.centerPos(new V3()).distanceTo(camera.position); controls.enabled = false; }
+  if (e) { Mouse.target = e; controls.enabled = false; }
 });
 renderer.domElement.addEventListener('pointermove', ev => {
   if (!Mouse.down || !Mouse.target) return;
@@ -3266,6 +3430,35 @@ function xrStep(frame) {
     showCard(['No room scan found', 'The little people will stay on the floor.', 'To fix it: Quest Settings > Physical space', '> Space setup. Then come back!'], 9);
   }
 }
+// As the crowd grows, people you can't see, or who are far away, are updated every few frames (with the time
+// saved up), and skip the small extras. Anyone near you, in your hand, or dancing around you always runs every frame.
+const LOD = { f: 0, frus: new THREE.Frustum(), m: new THREE.Matrix4(), sph: new THREE.Sphere(), last: { full: 0, part: 0, skip: 0 } };
+function updateElves(dt, t, xr) {
+  LOD.f++;
+  const n = elves.length, busy = n > 8 && !LOD.off, st = LOD.last; st.full = st.part = st.skip = 0;
+  if (busy) {
+    if (!xr) camera.updateMatrixWorld();
+    LOD.m.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); LOD.frus.setFromProjectionMatrix(LOD.m);
+  }
+  for (const e of elves) {
+    e.acc = (e.acc || 0) + dt;
+    if (e.slot === undefined) e.slot = (Math.random() * 12) | 0;
+    let every = 1, vis = true;
+    if (busy && !e.giant && e.state !== 'held' && e.state !== 'ride' && Gift.giver !== e && !(e.activity && e.activity.type === 'ring')) {
+      const d = e.root.position.distanceTo(camHead);
+      LOD.sph.center.copy(e.root.position).addScaledVector(Y, 0.12 * e.s); LOD.sph.radius = 0.25 * e.s + 0.1;
+      vis = d < 0.9 || LOD.frus.intersectsSphere(LOD.sph);
+      if (!vis) every = n > 16 ? 6 : 4;
+      else if (d > 4) every = n > 16 ? 3 : 2;
+      else if (d > 2.5 && n > 16) every = 2;
+      if (e.state === 'air') every = Math.min(every, 2);
+    }
+    if (every > 1 && (LOD.f + e.slot) % every) { st.skip++; continue; }
+    const step = Math.min(e.acc, 0.1); e.acc = 0;
+    e.update(step, t, vis, every > 1);
+    if (every > 1) st.part++; else st.full++;
+  }
+}
 function simulate(dt, t, xr) {
   updateCamVectors();
   userPos.copy(camera.position); camHead.copy(camera.position);
@@ -3280,7 +3473,7 @@ function simulate(dt, t, xr) {
   updateMushroom(dt, t, grabbers);
   updateSpawner(dt);
   director(dt);
-  for (const e of elves) e.update(dt, t);
+  updateElves(dt, t, xr);
   for (const v of [...visitors]) v.update(dt, t);
   updateFlyer(dt, t);
   updateSparks(dt); updateDecals(dt); updateScan(dt, t); updateCard(dt);
@@ -3295,7 +3488,7 @@ renderer.setAnimationLoop((time, frame) => {
 });
 
 enterWorld('preview');
-window.littleElves = { renderer, readRoom, ff: (secs) => { for (let i = 0; i < secs * 60; i++) { simT += 1 / 60; simulate(1 / 60, simT, false); } }, elves, visitors, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls, tryPeek, tryChase, startFlyer, start: { ...STARTERS, ring: startRing, giant: spawnGiant, gift: () => { const e = elves.find(x => x.free()); return e && e.startGift(); } }, acts, Gift, LOG, Flyer, Dir, Grab, Mouse, HS };
+window.littleElves = { renderer, readRoom, ff: (secs) => { for (let i = 0; i < secs * 60; i++) { simT += 1 / 60; simulate(1 / 60, simT, false); } }, elves, visitors, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls, tryPeek, tryChase, startFlyer, start: { ...STARTERS, ring: startRing, giant: spawnGiant, gift: () => { const e = elves.find(x => x.free()); return e && e.startGift(); } }, acts, Gift, LOG, Flyer, Dir, Grab, Mouse, HS, LOD, AU };
 </script>
 <script src="../updated.js"></script>
 </body>
