@@ -1250,7 +1250,69 @@ const r1 = v => Math.round(v * 10) / 10, r3 = v => Math.round(v * 1000) / 1000;
 const ser = () => [...W3.strokes.values()].map(st => ({ id: st.id, t: st.t, w: st.W, m: st.mode || 'free', ...(st.k ? { k: st.k } : {}), ...(st.ctrl ? { c: st.ctrl.flatMap(p => [r1(p.x), r1(p.y), r1(p.z)]), cu: st.cups.flatMap(u => [r3(u.x), r3(u.y), r3(u.z)]) } : {}), p: st.pts.flatMap(p => [r1(p.x), r1(p.y), r1(p.z)]), u: st.ups.flatMap(u => [r3(u.x), r3(u.y), r3(u.z)]) }));
 const unflat = a => { const o = []; for (let i = 0; i < a.length; i += 3) o.push(new V3(a[i], a[i + 1], a[i + 2])); return o; };
 let saveT = 0;
-function save(){ clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(KEY, JSON.stringify({ strokes: ser(), coins: W3.coins.map(c => [r1(c.p.x), r1(c.p.y), r1(c.p.z), r3(c.rate ?? 0.5)]), flag: flag3, pool: Pool.list, born: Pool.born, name: mapName, best: bestTrail, auto: autoEvolve, bestDist, seen: [...seenTricks], S: { ...S, w: { ...RW } } })); } catch (e) {} }, 400); }
+function save(now){ clearTimeout(saveT); const go = () => { try { localStorage.setItem(KEY, JSON.stringify({ strokes: ser(), coins: W3.coins.map(c => [r1(c.p.x), r1(c.p.y), r1(c.p.z), r3(c.rate ?? 0.5)]), flag: flag3, pool: Pool.list, born: Pool.born, name: mapName, cur: currentMapId, best: bestTrail, auto: autoEvolve, bestDist, seen: [...seenTricks], S: { ...S, w: { ...RW } } })); } catch (e) {} }; if (now) go(); else saveT = setTimeout(go, 400); }
+// ---------- saved maps: a park plus everything its riders have learned ----------
+const MAPS_KEY = 'fingerline-xr.maps', mapKey = id => 'fingerline-xr.map.' + id;
+let mapsIdx = (() => { try { return JSON.parse(localStorage.getItem(MAPS_KEY) || '[]'); } catch (e) { return []; } })();
+let currentMapId = null, pendingDel = null;
+function snapshot(){
+  return { v: 1, name: mapName, strokes: ser(), coins: W3.coins.map(c => [r1(c.p.x), r1(c.p.y), r1(c.p.z), r3(c.rate ?? 0.5)]), flag: { ...flag3 },
+    pool: Pool.list, born: Pool.born, best: bestTrail, bestDist, seen: [...seenTricks], w: { ...RW }, dio: S.dio, evo: S.evo, coinShare: S.coinShare };
+}
+function applySnapshot(d){
+  clearRiders(); clearGhosts(); clearWorld3(); pstate.clear(); undoStack.length = 0;
+  for (const s of d.strokes || []){ const st = addStroke(s.t, unflat(s.p), unflat(s.u), s.id, s.w, s.k); if (st){ st.mode = s.m || 'free'; if (s.c){ st.ctrl = unflat(s.c); st.cups = unflat(s.cu); } } }
+  W3.coins = (d.coins || []).map((a, i) => ({ id: i + 1, p: new V3(a[0], a[1], a[2]), rate: a[3] ?? 0.5 })); W3.coinId = W3.coins.length + 1;
+  if (d.flag) flag3 = { ...d.flag };
+  Pool.list = d.pool || []; Pool.born = d.born || 0; Pool.leaders.length = 0; bestTrail = d.best || null; bestDist = d.bestDist || 0; seenTricks = new Set(d.seen || []);
+  mapName = d.name || 'Untitled park';
+  if (d.w) Object.assign(RW, d.w);
+  if (d.evo){ S.evo = d.evo; Sim.learn = S.evo !== 'free'; }
+  if (d.coinShare != null) S.coinShare = W3.coinShare = d.coinShare;
+  if (d.dio && d.dio.s) setDio(new V3().fromArray(d.dio.p), d.dio.yaw, d.dio.s);
+  relink(); rescorePool(); placeFlag(); syncCoins(); setBestLine(); pathsDirty = true; touchWorld(); menuDirty = true;
+}
+function writeMaps(){ try { localStorage.setItem(MAPS_KEY, JSON.stringify(mapsIdx)); } catch (e) {} }
+// save the park to a slot: over the current one, or as a new map
+function saveMap(asNew){
+  if (!W3.strokes.size){ flash('Nothing to save yet. Draw a ramp first'); return null; }
+  let entry = !asNew && currentMapId && mapsIdx.find(m => m.id === currentMapId);
+  if (!entry){ let n = mapsIdx.length + 1; while (mapsIdx.some(m => m.name === 'Map ' + n)) n++; entry = { id: Date.now().toString(36), name: 'Map ' + n }; mapsIdx.unshift(entry); }
+  mapName = entry.name; currentMapId = entry.id;
+  Object.assign(entry, { t: Date.now(), riders: Pool.list.length, pieces: W3.strokes.size });
+  try { localStorage.setItem(mapKey(entry.id), JSON.stringify(snapshot())); writeMaps(); flash('Saved ' + entry.name + ' with ' + Pool.list.length + ' learned runs'); }
+  catch (e){ flash('Out of space. Delete an old map, then try again'); }
+  save(true); menuDirty = true; return entry;
+}
+function loadMap(id){
+  const entry = mapsIdx.find(m => m.id === id); if (!entry) return;
+  let d = null; try { d = JSON.parse(localStorage.getItem(mapKey(id)) || 'null'); } catch (e) {}
+  if (!d){ flash('That map could not be read'); return; }
+  // never lose the park you're leaving: keep it in its own slot first
+  let kept = '';
+  if (W3.strokes.size && currentMapId !== id){ const e2 = saveMap(false); if (e2) kept = 'Kept your park as ' + e2.name + '. '; }
+  applySnapshot(d); currentMapId = id; mapName = entry.name; save(true);
+  flash(kept + 'Loaded ' + entry.name);
+}
+function deleteMap(id){
+  if (pendingDel && pendingDel.id === id && clock - pendingDel.t < 3){
+    try { localStorage.removeItem(mapKey(id)); } catch (e) {}
+    const e = mapsIdx.find(m => m.id === id); mapsIdx = mapsIdx.filter(m => m.id !== id); writeMaps(); if (currentMapId === id) currentMapId = null;
+    pendingDel = null; flash('Deleted ' + (e ? e.name : 'map'));
+  } else { pendingDel = { id, t: clock }; flash('Press Delete again to remove it'); }
+  menuDirty = true;
+}
+function downloadMap(){
+  const blob = new Blob([JSON.stringify(snapshot())], { type: 'application/json' }), a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = (mapName || 'fingerline-park').replace(/[^\w\- ]+/g, '').trim().replace(/ +/g, '-') + '.fingerline.json'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000); flash('Downloaded ' + mapName);
+}
+function openMapFile(){
+  const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json,application/json';
+  inp.onchange = () => { const f = inp.files && inp.files[0]; if (!f) return; f.text().then(txt => { try { const d = JSON.parse(txt); if (!d.strokes) throw 0; if (W3.strokes.size) saveMap(false); applySnapshot(d); currentMapId = null; saveMap(true); } catch (e){ flash('That file is not a Fingerline park'); } }); };
+  inp.click();
+}
+const ago = t => { const m = (Date.now() - t) / 60000; return m < 1 ? 'just now' : m < 60 ? Math.round(m) + ' min ago' : m < 1440 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' days ago'; };
 let bootExtra = null;
 function boot(){
   let d = null, old = false;
@@ -1260,6 +1322,7 @@ function boot(){
     for (const s of d.strokes || []){ const st = addStroke(s.t, unflat(s.p), unflat(s.u), s.id, s.w, s.k); if (st){ st.mode = s.m || 'free'; if (s.k) st.k = s.k; if (s.c){ st.ctrl = unflat(s.c); st.cups = unflat(s.cu); } } }
     bootExtra = { bestDist: d.bestDist || 0, seen: d.seen || [] };
     W3.coins = (d.coins || []).map((a, i) => ({ id: i + 1, p: new V3(a[0], a[1], a[2]), rate: a[3] ?? 0.5 })); W3.coinId = W3.coins.length + 1;
+    if (d.name) mapName = d.name; currentMapId = d.cur || null;
     flag3 = d.flag || flag3; Pool.list = d.pool || []; Pool.born = d.born || 0; bestTrail = d.best || null;
     if (d.S){ const { w, ...rest } = d.S; Object.assign(S, rest); if (w) Object.assign(RW, w); }
     W3.coinShare = S.coinShare !== false;
@@ -2879,7 +2942,7 @@ const BTN = [], TXT = [];
    { id: 'undo', label: () => 'Undo', act: undo },
    { id: 'clear', label: () => 'Clear room', style: 'danger', act: clearRoom }].forEach((b, i) => add(Object.assign({ x: xs + i * (wr + G), y: 120, w: wr, h: 110 }, b)));
   // tabs
-  row(null, 254, 74, [['draw', 'Draw'], ['objects', 'Objects'], ['riders', 'Riders'], ['evolve', 'Evolve'], ['fly', 'Fly'], ['room', 'Room']].map(([t, n]) => ({ id: 'tab-' + t, style: 'tab', label: () => n, on: () => menuTab === t, act: () => { menuTab = t; } })));
+  row(null, 254, 74, [['draw', 'Draw'], ['objects', 'Objects'], ['riders', 'Riders'], ['evolve', 'Evolve'], ['fly', 'Fly'], ['maps', 'Maps'], ['room', 'Room']].map(([t, n]) => ({ id: 'tab-' + t, style: 'tab', label: () => n, on: () => menuTab === t, act: () => { menuTab = t; } })));
   const W = MW - 2 * P, half = (W - G) / 2;
   // DRAW
   text({ tab: 'draw', kind: 'label', x: P, y: 368, text: () => 'LINE TYPE' });
@@ -2924,6 +2987,21 @@ const BTN = [], TXT = [];
   const ok = Object.keys(OBJECTS), mkO = k => ({ id: 'obj-' + k, label: () => OBJECTS[k].name, sub: () => OBJECTS[k].sub, act: () => addObject(k) });
   for (let i = 0; i < 4; i++) row('objects', 388 + i * 104, 92, ok.slice(i * 3, i * 3 + 3).map(mkO));
   text({ tab: 'objects', kind: 'note', x: P, y: 832, text: () => 'Appears at your right hand, or sits on the road below it, lined up with the road. Grip to move it, Undo or the Eraser to remove it.' });
+  // MAPS
+  row('maps', 352, 96, [
+    { id: 'map-save', label: () => 'Save', sub: () => currentMapId && mapsIdx.some(m => m.id === currentMapId) ? 'over ' + mapName : 'as a new map', act: () => saveMap(false) },
+    { id: 'map-new', label: () => 'Save as new', sub: () => 'keeps the old one', act: () => saveMap(true) }]);
+  text({ tab: 'maps', kind: 'label', x: P, y: 478, text: () => 'SAVED MAPS · each keeps what its riders learned' });
+  for (let i = 0; i < 6; i++){
+    const y = 496 + i * 72, mp = () => mapsIdx[i];
+    only = () => !!mp();
+    text({ tab: 'maps', kind: 'panel', x: P, y, w: W, h: 64 });
+    text({ tab: 'maps', kind: 'stepLabel', x: P + 22, y: y + 32, text: () => { const m = mp(); return m ? (m.id === currentMapId ? '● ' : '') + m.name + '   ' + (m.riders || 0) + ' runs · ' + ago(m.t) : ''; } });
+    add({ tab: 'maps', id: 'map-load-' + i, style: 'step', x: P + W - 300, y: y + 7, w: 150, h: 50, label: () => 'Load', act: () => mp() && loadMap(mp().id) });
+    add({ tab: 'maps', id: 'map-del-' + i, style: 'step', x: P + W - 140, y: y + 7, w: 132, h: 50, label: () => pendingDel && mp() && pendingDel.id === mp().id && clock - pendingDel.t < 3 ? 'Sure?' : 'Delete', act: () => mp() && deleteMap(mp().id) });
+    only = null;
+  }
+  row('maps', 936, 62, [{ id: 'map-dl', label: () => 'Download file', act: downloadMap }, { id: 'map-open', label: () => 'Open file', act: openMapFile }]);
   // FLY
   add({ tab: 'fly', id: 'fly-go', x: P, y: 352, w: W, h: 96, style: 'big', label: () => fly.on ? 'STOP FLYING' : 'FLY THROUGH', sub: () => fly.on ? 'or press B / Y' : 'smooth, for filming', act: () => setFly(!fly.on) });
   text({ tab: 'fly', kind: 'label', x: P, y: 482, text: () => 'STYLE' });
@@ -2977,7 +3055,7 @@ function drawMenu(){
     } else if (b.sub){
       g.font = '700 32px "Archivo",sans-serif'; g.fillText(b.label(), cx, cy - 16);
       g.font = '500 24px "IBM Plex Mono",monospace'; g.fillStyle = on ? '#4A4F59' : '#9AA2AD'; g.fillText(b.sub(), cx, cy + 22);
-    } else if (b.style === 'step'){ g.font = '700 46px "Archivo",sans-serif'; g.fillText(b.label(), cx, cy + 2); }
+    } else if (b.style === 'step'){ g.font = b.label().length > 2 ? '700 28px "Archivo",sans-serif' : '700 46px "Archivo",sans-serif'; g.fillText(b.label(), cx, cy + 2); }
     else {
       let fs = b.style === 'tab' ? 32 : b.w < 200 ? 26 : 30; g.font = `700 ${fs}px "Archivo",sans-serif`;
       while (g.measureText(b.label()).width > b.w - 16 && fs > 18){ fs--; g.font = `700 ${fs}px "Archivo",sans-serif`; }
@@ -3406,7 +3484,7 @@ renderer.setAnimationLoop(now => {
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 // handy for poking at it from the browser console
-window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, addObject, setFly, fly, pathGroup, ratioText, sc, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
+window.__fl = { W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, addShape, addObject, saveMap, loadMap, mapsIdx: () => mapsIdx, setFly, fly, pathGroup, ratioText, sc, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
 </script>
 </body>
 </html>
