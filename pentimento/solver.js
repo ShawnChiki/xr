@@ -444,7 +444,7 @@ function patchLabels(M, curves, samples, L){
   const isC = new Uint8Array(nv); for (let v = 0; v < nv; v++) if (vp[v] === -2) isC[v] = 1;
   const CG = new Grid(L); for (let v = 0; v < nv; v++) if (isC[v]) CG.add(v, M.x[v], M.y[v], M.z[v]);
   const votes = new Map();
-  samples.forEach((sm, k) => { if (sm.curve || sm.guide) return; const p = sm.p; let bv = -1, bd = sq(L * 3); G.each(p[0], p[1], p[2], L * 3, v => { const d = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (d < bd){ bd = d; bv = v; } });
+  samples.forEach((sm, k) => { if (sm.curve || sm.guide) return; const p = sm.p; let bv = -1, bd = sq(L * 3); { const look = v => { const d = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (d < bd){ bd = d; bv = v; } }; G.each(p[0], p[1], p[2], L * 1.2, look); if (bv < 0 || bd > sq(L * 1.2)){ bv = -1; bd = sq(L * 3); G.each(p[0], p[1], p[2], L * 3, look); } }
     if (bv < 0) return; sp[k] = vp[bv];
     let cd = sq(L * 2); CG.each(p[0], p[1], p[2], L * 2, v => { cd = Math.min(cd, sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2])); }); dCrease[k] = Math.sqrt(cd);
     if (dCrease[k] > L * 1.2){ const key = sm.sid, m = votes.get(key) || new Map(); m.set(sp[k], (m.get(sp[k]) || 0) + 1); votes.set(key, m); } });
@@ -608,8 +608,11 @@ function fitStep(M, samples, curves, o){
   // hand each sample to its nearest vertex
   const VG = new Grid(o.L); for (let v = 0; v < nv; v++) VG.add(v, M.x[v], M.y[v], M.z[v]);
   const own = Array.from({ length: nv }, () => []);
+  // (nearest vertex: look close first; only a sample with nothing close needs the wide search)
+  const r1 = Math.min(o.reach2, o.L * 1.2);
   for (let k = 0; k < samples.length; k++){ const p = samples[k].p; let best = -1, bd = sq(o.reach2);
-    VG.each(p[0], p[1], p[2], o.reach2, v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } });
+    const look = v => { const dd = sq(M.x[v] - p[0]) + sq(M.y[v] - p[1]) + sq(M.z[v] - p[2]); if (dd < bd){ bd = dd; best = v; } };
+    VG.each(p[0], p[1], p[2], r1, look); if (best < 0 || bd > r1 * r1){ best = -1; bd = sq(o.reach2); VG.each(p[0], p[1], p[2], o.reach2, look); }
     if (best >= 0){ if (sharpV(best) && !samples[k].curve){ let b2 = -1, bd2 = Infinity; for (const w of nb[best]) if (!sharpV(w)){ const dd = sq(M.x[w] - p[0]) + sq(M.y[w] - p[1]) + sq(M.z[w] - p[2]); if (dd < bd2){ bd2 = dd; b2 = w; } } if (b2 >= 0) best = b2; } own[best].push(k); } }
   const stamp = new Int32Array(nv).fill(-1), R = o.h * o.grow, R2 = R * R, ihn2 = 1 / (o.hn * o.hn), h2 = o.h * o.h;
   // which side of a sharp crease each vertex is on (vertices right on a crease listen to both)
@@ -992,18 +995,28 @@ function creaseRows(M, curves, d, nRows, L){
     // steady directions: each side's angle averaged with its neighbours along the crease
     for (const sd of sides){ const sm = sd.map((x, i) => { if (!x) return null; let cx = 0, cy = 0; for (let k = -2; k <= 2; k++){ const y = sd[C.closed ? (i + k + sd.length) % sd.length : i + k]; if (y){ cx += Math.cos(y.a); cy += Math.sin(y.a); } } return Math.atan2(cy, cx); });
       sd.forEach((x, i) => { if (x){ x.a = sm[i]; x.u = [0, 1, 2].map(c => Math.cos(x.a) * x.e1[c] + Math.sin(x.a) * x.e2[c]); } }); }
-    for (let j = 0; j < 2; j++) for (let r = 1; r <= nRows; r++){
-      const pts = sides[j].map(x => { if (!x) return null; const p = proj([x.q[0] + x.u[0] * d * r, x.q[1] + x.u[1] * d * r, x.q[2] + x.u[2] * d * r]);
-        if (d2(p, x.q) < sq(d * r * 0.6) || !clear(p, ci, x.s0, C, d * (r + 0.6), d * 1.1)) return null; return p; });   // other creases stay (r + 0.6) rows away, so two creases' rows never meet
-      cand.push({ ci, r, closed: !!C.closed, tag: C.tag, pts });
-    }
+    // each row only where the row inside it is (rows nest: as many as there's room for, more along open stretches,
+    // fewer where creases crowd or the crease bends tightly toward this side)
+    for (let j = 0; j < 2; j++){ let prev = null;
+      for (let r = 1; r <= nRows; r++){
+        const pts = sides[j].map((x, i) => { if (!x || (prev && !prev[i])) return null; const p = proj([x.q[0] + x.u[0] * d * r, x.q[1] + x.u[1] * d * r, x.q[2] + x.u[2] * d * r]);
+          if (d2(p, x.q) < sq(d * r * 0.6) || !clear(p, ci, x.s0, C, d * (r + 0.6), d * 1.1)) return null;   // other creases stay (r + 0.6) rows away, so two creases' rows never meet
+          if (prev){ const g = d2(p, prev[i]); if (g < sq(d * 0.6) || g > sq(d * 1.6)) return null; }
+          return p; });
+        // a tight bend toward this side squeezes the row: drop it where it's squeezed to under half the crease's spacing
+        for (let i = 0; i + 1 < pts.length; i++){ const a = pts[i], b = pts[i + 1], qa = sides[j][i], qb = sides[j][i + 1]; if (!a || !b || !qa || !qb) continue;
+          if (d2(a, b) < sq(0.5) * d2(qa.q, qb.q)){ pts[i] = null; pts[i + 1] = null; } }
+        cand.push({ ci, j, r, closed: !!C.closed, tag: C.tag, pts }); prev = pts;
+      } }
   });
   // rows must not cross or crowd each other (two creases meeting at a corner, the inside of a tight bend)
   { const G = new Grid(d); cand.forEach((c, a) => c.pts.forEach((p, k) => { if (p) G.add(a * 100000 + k, p[0], p[1], p[2]); }));
     const drop = cand.map(c => c.pts.map(() => false));
     cand.forEach((c, a) => c.pts.forEach((p, k) => { if (!p) return; G.each(p[0], p[1], p[2], d * 1.1, id => { const b = Math.floor(id / 100000), m = id % 100000; if (b === a){ const gap = c.closed ? Math.min(Math.abs(m - k), c.pts.length - Math.abs(m - k)) : Math.abs(m - k); if (gap > 4 && d2(p, c.pts[m]) < sq(d * 0.5)) drop[a][k] = true; return; }
       const o = cand[b]; if (o.ci === c.ci && o.r !== c.r) return; if (d2(p, o.pts[m]) < sq(d * 1.05)) drop[a][k] = true; }); }));
-    cand.forEach((c, a) => { c.pts = c.pts.map((p, k) => drop[a][k] ? null : p); }); }
+    cand.forEach((c, a) => { c.pts = c.pts.map((p, k) => drop[a][k] ? null : p); });
+    // and keep them nested after that
+    for (const c of cand){ if (c.r < 2) continue; const inner = cand.find(o => o.ci === c.ci && o.j === c.j && o.r === c.r - 1); if (inner) c.pts = c.pts.map((p, k) => inner.pts[k] ? p : null); } }
   // shrink-free smoothing (in, then back out), so rows round a corner without closing up on each other
   const proj2 = proj, relax = (pp, all) => { for (let it = 0; it < 4; it++){ const k = it & 1 ? -0.34 : 0.32; const nx = pp.map((p, i) => { const a = pp[all ? (i - 1 + pp.length) % pp.length : i - 1], b = pp[all ? (i + 1) % pp.length : i + 1]; return a && b ? proj2(lerp3(p, lerp3(a, b, 0.5), k)) : p; }); for (let i = 0; i < pp.length; i++) pp[i] = nx[i]; } return pp; };
   for (const c of cand){
@@ -1018,7 +1031,7 @@ function creaseRows(M, curves, d, nRows, L){
 function untangleCage(cage, info, Mfit, curves, L, rounds, spread = 0){
   const { V, F } = cage, nv = V.length / 3, proj = projector(Mfit, L), N = vertexNormals(Mfit), VG = new Grid(L * 2);
   for (let v = 0; v < Mfit.x.length; v++) if (Mfit.vt[v].length) VG.add(v, Mfit.x[v], Mfit.y[v], Mfit.z[v]);
-  const nrmAt = p => { let bv = -1, bd = Infinity; VG.each(p[0], p[1], p[2], L * 4, v => { const d = d2(Mfit.P(v), p); if (d < bd){ bd = d; bv = v; } }); return bv >= 0 ? N[bv] : null; };
+  const nrmAt = p => { let bv = -1, bd = Infinity; const look = v => { const d = sq(Mfit.x[v] - p[0]) + sq(Mfit.y[v] - p[1]) + sq(Mfit.z[v] - p[2]); if (d < bd){ bd = d; bv = v; } }; VG.each(p[0], p[1], p[2], L * 2, look); if (bv < 0 || bd > sq(L * 2)){ bv = -1; bd = Infinity; VG.each(p[0], p[1], p[2], L * 4, look); } return bv >= 0 ? N[bv] : null; };
   const nb = Array.from({ length: nv }, () => new Set()), edgeN = new Map();
   F.forEach(f => f.forEach((a, i) => { const b = f[(i + 1) % f.length]; nb[a].add(b); nb[b].add(a); const k = ek(a, b); edgeN.set(k, (edgeN.get(k) || 0) + 1); }));
   const border = new Uint8Array(nv); for (const [k, c] of edgeN) if (c === 1){ border[Math.floor(k / 2097152)] = 1; border[k % 2097152] = 1; }
@@ -1043,7 +1056,7 @@ function untangleCage(cage, info, Mfit, curves, L, rounds, spread = 0){
 function unfoldCage(cage, info, Mfit, curves, L, rounds){
   const proj = projector(Mfit, L), N = vertexNormals(Mfit), VG = new Grid(L * 2);
   for (let v = 0; v < Mfit.x.length; v++) if (Mfit.vt[v].length) VG.add(v, Mfit.x[v], Mfit.y[v], Mfit.z[v]);
-  const nrmAt = p => { let bv = -1, bd = Infinity; VG.each(p[0], p[1], p[2], L * 4, v => { const d = d2(Mfit.P(v), p); if (d < bd){ bd = d; bv = v; } }); return bv >= 0 ? N[bv] : null; };
+  const nrmAt = p => { let bv = -1, bd = Infinity; const look = v => { const d = sq(Mfit.x[v] - p[0]) + sq(Mfit.y[v] - p[1]) + sq(Mfit.z[v] - p[2]); if (d < bd){ bd = d; bv = v; } }; VG.each(p[0], p[1], p[2], L * 2, look); if (bv < 0 || bd > sq(L * 2)){ bv = -1; bd = Infinity; VG.each(p[0], p[1], p[2], L * 4, look); } return bv >= 0 ? N[bv] : null; };
   const fnorm = (V, f) => { const nn = [0, 0, 0], c = [0, 0, 0]; for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; nn[0] += (V[3 * a + 1] - V[3 * b + 1]) * (V[3 * a + 2] + V[3 * b + 2]); nn[1] += (V[3 * a + 2] - V[3 * b + 2]) * (V[3 * a] + V[3 * b]); nn[2] += (V[3 * a] - V[3 * b]) * (V[3 * a + 1] + V[3 * b + 1]); for (let k = 0; k < 3; k++) c[k] += V[3 * a + k] / f.length; } return [norm(nn), c]; };
   let total = 0;
   for (let r = 0; r < rounds; r++){
@@ -1980,7 +1993,7 @@ function solve(strokes, prm, progress = () => {}){
   const cs = prm.coarseScale ?? 1, aC = Math.max(aA, 0.6 * cs), hC = Math.max(h * 1.5, 0.9 * cs);
   for (let it = 0; it < (warm ? 0 : 6); it++){
     remesh(M, aC, 0.6);
-    fitStep(M, samples, curves, { ...base, L: aC, h: hC, hn: hC * 2.7, maxStep: aC * 1.5, parity: it & 1, reach2: Math.max(h * 4, hC * 2.7) });
+    fitStep(M, samples, curves, { ...base, quad: base.quad && !!prm.coarseQuad, L: aC, h: hC, hn: hC * 2.7, maxStep: aC * 1.5, parity: it & 1, reach2: Math.max(h * 4, hC * 2.7) });
     if (prm.onStep) prm.onStep(M, "coarse", it); progress(0.1 + 0.25 * it / 6, 'Fitting the rough shape');
   }
   // fine fit, no curves yet
