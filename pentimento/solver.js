@@ -1824,7 +1824,7 @@ function solve(strokes, prm, progress = () => {}){
   const toPts = s => { const a = []; for (let i = 0; i + 2 < s.pts.length; i += 3) a.push([s.pts[i], s.pts[i + 1], s.pts[i + 2]]); return a; };
   const byTag = [[], [], [], [], [], [], []], looseSig = [];
   for (const s of strokes){ const p = toPts(s), t = Math.min(6, s.tag || 0); if (p.length < 2) continue;
-    if (t === 0){ byTag[0].push(p); looseSig.push((s.id ?? '') + ':' + p.length + ':' + Math.round(p[0][0] * 1000) + ',' + Math.round(p[0][2] * 1000) + ':' + Math.round(p[p.length - 1][1] * 1000)); } else for (const q of sliceLoops(p, g * 0.6, Math.max(g * 5, L * 4))){ q.corners = s.corners; byTag[t].push(q); } }
+    if (t === 0){ p.w = s.w; byTag[0].push(p); looseSig.push((s.id ?? '') + ':' + p.length + ':' + Math.round(p[0][0] * 1000) + ',' + Math.round(p[0][2] * 1000) + ':' + Math.round(p[p.length - 1][1] * 1000)); } else for (const q of sliceLoops(p, g * 0.6, Math.max(g * 5, L * 4))){ q.corners = s.corners; byTag[t].push(q); } }
   progress(0.02, 'Finding the guide and crease lines');
   // Creases shape the surface (strict ones first, so they get cut in first and the averaged ones fit around them).
   // Guides don't compete with the loose lines: they're laid onto the surface afterwards and steer the quads.
@@ -1838,7 +1838,7 @@ function solve(strokes, prm, progress = () => {}){
   const guides0 = [...strictCurves(byTag[2], L, false, 2), ...consensus(byTag[1], g, L * 0.5, false, 1)];
   const samples = [];
   const ds = Math.min(L, h) / 3;
-  byTag[0].forEach((s, i) => { for (const p of resample(s, ds, false)) samples.push({ p, w: 1, sid: i }); });
+  byTag[0].forEach((s, i) => { for (const p of resample(s, ds, false)) samples.push({ p, w: s.w || 1, sid: i }); });   // w: helper lines the app adds to hold a crease's fold
   // guides only fill in where there are no loose lines at all (a whisper of weight, and they don't count as strokes)
   guides0.forEach(G => { for (const p of resample(G.pts, ds, G.closed)) samples.push({ p, w: 0.04, guide: true }); });
   curves.forEach((C, i) => { for (const p of resample(C.pts, ds, C.closed)) samples.push({ p, w: C.strict ? 6 : 3, curve: true, sid: -1 - i }); });
