@@ -221,7 +221,7 @@ export function compact(cage){
   const used = new Set(); for (const f of cage.faces) for (const v of f) used.add(v);
   const map = new Map(), verts = [];
   cage.verts.forEach((v, i) => { if (used.has(i)){ map.set(i, verts.length); verts.push(v); } });
-  cage.faces = cage.faces.map(f => f.map(v => map.get(v)));
+  cage.verts = verts; cage.faces = cage.faces.map(f => f.map(v => map.get(v)));
   const cr = new Set(); for (const k of cage.creases){ const [a, b] = k.split('_').map(Number); if (map.has(a) && map.has(b)) cr.add(ek(map.get(a), map.get(b))); }
   cage.creases = cr; return map;
 }

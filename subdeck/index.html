@@ -93,6 +93,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 import { MeshBVH } from 'three-mesh-bvh';
 import * as SD from './subd.js';
+import { VoxelField } from './voxel.js';
 
 const $ = s => document.querySelector(s);
 const V3 = THREE.Vector3, clamp = (x, a, b) => Math.max(a, Math.min(b, x)), UP = new V3(0, 1, 0);
@@ -110,15 +111,19 @@ const SLIDERS = [
   { k: 'top', label: 'Top speed', min: 2, max: 40, step: 0.5, def: 14, fmt: v => v.toFixed(1) + ' m/s', tip: 'The booster stops pushing past this speed' },
   { k: 'scale', label: 'Your size', min: 2, max: 40, step: 1, def: 10, fmt: v => '1:' + Math.round(v), tip: '1:10 is fingerboard size. Bigger number = smaller you' },
 ];
-const DEF = { tool: 'edit', level: 2, cage: true, room: true, mirror: false, sound: true, design: 0 };
+const DEF = { tool: 'edit', level: 2, cage: true, room: true, mirror: false, sound: true, design: 0, brush: 0.04, autoGrind: true };
 for (const s of SLIDERS) DEF[s.k] = s.def;
 const S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem(SKEY) || '{}')); } catch (e) {}
 const saveSettings = () => { try { localStorage.setItem(SKEY, JSON.stringify(S)); } catch (e) {} };
 
-const TOOLS = ['edit', 'surface', 'block', 'blob', 'tube', 'bowl', 'rail', 'spawn', 'extrude', 'loop', 'crease', 'erase'];
-const TOOL_NAME = { edit: 'Edit', blob: 'Blob', surface: 'Surface', block: 'Block', tube: 'Tube', bowl: 'Bowl', rail: 'Rail', spawn: 'Spawn', extrude: 'Extrude', loop: 'Loop cut', crease: 'Crease', erase: 'Erase' };
+const TOOLS = ['edit', 'surface', 'block', 'blob', 'tube', 'bowl', 'rail', 'spawn', 'extrude', 'loop', 'crease', 'erase', 'add', 'carve', 'smooth'];
+const CLAY = new Set(['add', 'carve', 'smooth']);
+const TOOL_NAME = { add: 'Add clay', carve: 'Carve', smooth: 'Smooth', edit: 'Edit', blob: 'Blob', surface: 'Surface', block: 'Block', tube: 'Tube', bowl: 'Bowl', rail: 'Rail', spawn: 'Spawn', extrude: 'Extrude', loop: 'Loop cut', crease: 'Crease', erase: 'Erase' };
 const TOOL_TIP = {
+  add: 'Hold the trigger to build up clay. Right stick up and down sizes the brush',
+  carve: 'Hold the trigger to dig into clay. Right stick up and down sizes the brush',
+  smooth: 'Rub over clay to soften it. Right stick up and down sizes the brush',
   edit: 'Trigger a point, edge or face to drag it. Tap to select more. A or X while dragging extrudes',
   blob: 'Drag from corner to corner. A smooth ball to pull into shapes',
   surface: 'Drag from one corner to the other. Flat, tilted or upright',
@@ -132,7 +137,7 @@ const TOOL_TIP = {
   crease: 'Touch an edge to make it sharp, touch again to smooth it',
   erase: 'Rub over faces, rails or spawns to remove them',
 };
-const TOOL_COL = { edit: 0xFFD23F, blob: 0xD9D4CA, surface: 0xD9D4CA, block: 0xD9D4CA, tube: 0xD9D4CA, bowl: 0xD9D4CA, rail: 0xC9CED6, spawn: 0xFF3D7F, extrude: 0x5FE0B8, loop: 0x5CC8FF, crease: 0xFF8A1F, erase: 0xF04348 };
+const TOOL_COL = { add: 0x5FE0B8, carve: 0xF0436E, smooth: 0x5CC8FF, edit: 0xFFD23F, blob: 0xD9D4CA, surface: 0xD9D4CA, block: 0xD9D4CA, tube: 0xD9D4CA, bowl: 0xD9D4CA, rail: 0xC9CED6, spawn: 0xFF3D7F, extrude: 0x5FE0B8, loop: 0x5CC8FF, crease: 0xFF8A1F, erase: 0xF04348 };
 
 // ======================================================================
 // Scene
@@ -143,7 +148,7 @@ renderer.xr.enabled = true; renderer.xr.setReferenceSpaceType('local-floor');
 document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 const BG = new THREE.Color(0x1B1E24);
-const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.003, 1200);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 1200);
 camera.position.set(0.9, 0.75, 1.25);
 scene.add(camera);
 const orbit = new OrbitControls(camera, renderer.domElement); orbit.target.set(0, 0.06, 0); orbit.enableDamping = true;
@@ -166,6 +171,7 @@ function gridMat(hex, opts = {}){
       { vec3 q = vGP / 0.05; vec3 w = abs(normalize(vGN) + 1e-5); w /= (w.x + w.y + w.z);
         vec3 fw = max(fwidth(q), vec3(1e-4)); vec3 g = abs(fract(q - 0.5) - 0.5) / fw;
         float l = (1.0 - min(min(g.y, g.z), 1.0)) * w.x + (1.0 - min(min(g.x, g.z), 1.0)) * w.y + (1.0 - min(min(g.x, g.y), 1.0)) * w.z;
+        l *= 1.0 - smoothstep(0.12, 0.45, max(max(fw.x, fw.y), fw.z));
         diffuseColor.rgb *= 1.0 - 0.2 * l; }`);
   };
   return m;
@@ -179,7 +185,7 @@ ground.position.y = -0.0006; world.add(ground);
 // ---------- a whole world around you: sky, sun, far hills, far ground, a plinth under the model ----------
 const SUN_DIR = new V3(0.45, 0.32, -0.83).normalize();
 const sky = new THREE.Mesh(new THREE.SphereGeometry(450, 40, 20), new THREE.ShaderMaterial({
-  side: THREE.BackSide, depthWrite: false, fog: false, uniforms: { sunDir: { value: SUN_DIR } },
+  side: THREE.BackSide, depthWrite: false, depthTest: false, fog: false, uniforms: { sunDir: { value: SUN_DIR } },
   vertexShader: 'varying vec3 vP; void main(){ vP = position; vec4 q = projectionMatrix * modelViewMatrix * vec4(position, 1.0); gl_Position = q.xyww; gl_Position.z *= 0.99999; }',
   fragmentShader: `uniform vec3 sunDir; varying vec3 vP;
     vec3 lin(vec3 c){ return pow(c, vec3(2.2)); }
@@ -197,7 +203,7 @@ scene.fog = new THREE.Fog(0xF3B9A4, 70, 420);
 const env = new THREE.Group(); scene.add(env);
 {
   const farGround = new THREE.Mesh(new THREE.CircleGeometry(440, 64).rotateX(-Math.PI / 2), new THREE.MeshLambertMaterial({ color: 0x6E6A78 }));
-  farGround.position.y = -0.02; env.add(farGround);
+  farGround.position.y = -0.02; env.add(farGround); env.userData.far = farGround;
   // low hills in a ring, a few colours, flat shaded
   seedHills: { let sd = 5; const rr = () => (sd = (sd * 16807) % 2147483647) / 2147483647;
     const cols = [0x8C7FB0, 0x9C86B8, 0xB592B8, 0x7D7AA8, 0xC59BB2];
@@ -222,6 +228,7 @@ function placeEnv(){
   // far away things sit on the real floor while you sculpt, and on the park's ground while you skate
   if (mode === 'skate'){ env.position.copy(world.position); env.position.y -= 0.25; } else env.position.set(world.position.x, 0, world.position.z);
   ground.scale.setScalar(mode === 'skate' ? GROUND_SKATE / 3 : GROUND_SCULPT / 3);
+  env.userData.far.visible = mode !== 'skate';
   const tableUp = mode === 'sculpt' && world.position.y > 0.05;
   plinth.visible = tableUp && !pass;
   if (tableUp){ const r = GROUND_SCULPT * world.scale.x; plinth.scale.set(r, world.position.y - 0.004, r); plinth.position.set(world.position.x, (world.position.y - 0.004) / 2, world.position.z); }
@@ -230,7 +237,7 @@ function applyBackground(){
   const live = renderer.xr.isPresenting, pass = live && isAR && S.room && mode === 'sculpt';
   // three.js clears to see-through in MR, so the sky is what makes it full VR
   sky.visible = env.visible = !pass; scene.fog = pass ? null : scene.fog || new THREE.Fog(0xF3B9A4, 70, 420);
-  scene.background = pass ? null : BG; ground.material.opacity = pass ? 0.5 : 0.95;
+  scene.background = pass ? null : BG; ground.material.transparent = pass; ground.material.opacity = pass ? 0.5 : 1; ground.material.needsUpdate = true;
 }
 
 // ======================================================================
@@ -390,10 +397,30 @@ function placeSpawn(s){
   s.g.scale.setScalar(1 / S.scale);
 }
 
+// ---------- voxel clay: Add, Carve and Smooth sculpt into a grid that covers the park ----------
+const vox = new VoxelField(), voxMeshes = new Map(); let voxEnc = null, voxEncDirty = true;
+const voxMat = gridMat(0xD9D4CA);
+function remeshVoxels(limit = 999){
+  let n = 0;
+  for (const id of vox.dirty){
+    if (n++ >= limit) break; vox.dirty.delete(id);
+    const m = vox.meshChunk(id), old = voxMeshes.get(id);
+    if (!m){ if (old){ modelG.remove(old); old.geometry.dispose(); voxMeshes.delete(id); } continue; }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(m.pos, 3)); g.setAttribute('normal', new THREE.BufferAttribute(m.nor, 3)); g.setIndex(m.idx);
+    if (old){ old.geometry.dispose(); old.geometry = g; } else { const mesh = new THREE.Mesh(g, voxMat); modelG.add(mesh); voxMeshes.set(id, mesh); }
+    collideDirty = true;
+  }
+}
+function voxText(){ if (voxEncDirty){ voxEnc = vox.used || voxMeshes.size ? vox.encode() : null; voxEncDirty = false; } return voxEnc; }
+// the box you can sculpt clay inside, shown while a clay tool is picked
+const voxBox = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), new THREE.LineBasicMaterial({ color: 0x5FE0B8, transparent: true, opacity: 0.35 }));
+voxBox.scale.set(vox.h * (vox.n[0] - 1), vox.h * (vox.n[1] - 1), vox.h * (vox.n[2] - 1)); voxBox.position.set(vox.o[0] + voxBox.scale.x / 2, vox.o[1] + voxBox.scale.y / 2, vox.o[2] + voxBox.scale.z / 2);
+voxBox.visible = false; modelG.add(voxBox);
+
 // ---------- save, load, undo ----------
 const r5 = x => Math.round(x * 1e5) / 1e5, vj = v => [r5(v.x), r5(v.y), r5(v.z)];
 function serialize(){
-  return JSON.stringify({ v: 1, objs: objs.map(o => ({ kind: o.kind, cage: SD.cageToJSON(o.cage) })), rails: rails.map(r => r.pts.map(vj)), spawns: spawns.map(s => ({ p: vj(s.p), n: vj(s.n), d: vj(s.d) })) });
+  return JSON.stringify({ v: 1, objs: objs.map(o => ({ kind: o.kind, cage: SD.cageToJSON(o.cage) })), rails: rails.map(r => r.pts.map(vj)), spawns: spawns.map(s => ({ p: vj(s.p), n: vj(s.n), d: vj(s.d) })), vox: voxText() });
 }
 function restore(str){
   for (const o of [...objs]) removeObj(o); for (const r of [...rails]) removeRail(r); for (const s of [...spawns]) removeSpawn(s);
@@ -403,6 +430,7 @@ function restore(str){
     for (const r of d.rails || []) addRail(r.map(p => new V3(...p)));
     for (const s of d.spawns || []) addSpawn(new V3(...s.p), new V3(...s.n), new V3(...s.d));
   }
+  vox.decode(d && d.vox || null); voxEnc = d && d.vox || null; voxEncDirty = false; remeshVoxels();
   sel = []; selDirty = true; collideDirty = true; cageDirty = true; menuDirty = true;
 }
 let committed = '', undoS = [], redoS = [];
@@ -632,7 +660,7 @@ function moveAct(list, rigid){
     if (p.plane){ it.mode = 'plane'; continue; }
     const kk = key(p.o, p.i); if (seen.has(kk)) continue; seen.add(kk); items.push({ o: p.o, i: p.i, p0: vv(p.o.cage.verts[p.i]), mode: 'mirror' });
   }
-  return { kind: 'move', items, rigid, moved: 0 };
+  return { kind: 'move', items, rigid, moved: 0, snap: true };
 }
 function applyMove(a, T, dp){
   const touched = new Set();
@@ -642,8 +670,55 @@ function applyMove(a, T, dp){
     else { if (a.rigid) q.applyMatrix4(T); else q.add(dp); if (it.mode === 'plane') q.x = 0; }
     it.o.cage.verts[it.i] = [q.x, q.y, q.z]; touched.add(it.o);
   }
+  if (a.snap) snapItems(a);
   for (const o of touched) buildObj(o, Math.min(S.level, 2));
   a.moved = Math.max(a.moved, dp.length()); cageDirty = true; selDirty = true;
+}
+// ---------- snapping and welding: drop a point onto another point (any object) and they join ----------
+const SNAP_R = 0.02;
+const snapG = new THREE.Group(); modelG.add(snapG);
+const snapMat = new THREE.MeshBasicMaterial({ color: 0x4FD67A, depthTest: false, transparent: true, opacity: 0.9 }), snapGeo = new THREE.TorusGeometry(1, 0.18, 8, 24);
+function snapItems(a){
+  const lim = SNAP_R * k_(), moved = new Set(a.items.map(it => it.o.id + ':' + it.i)); let n = 0;
+  for (const it of a.items){
+    const q = it.o.cage.verts[it.i]; let best = null, bd = lim;
+    for (const o of objs){ const V = o.cage.verts;
+      for (let j = 0; j < V.length; j++){
+        if (moved.has(o.id + ':' + j)) continue; const w = V[j], d = Math.hypot(w[0] - q[0], w[1] - q[1], w[2] - q[2]); if (d >= bd) continue;
+        if (o === it.o && o.cage.faces.some(f => f.includes(j) && f.includes(it.i))) continue;
+        bd = d; best = { o, ref: w };
+      }
+    }
+    it.snap = best; if (best){ it.o.cage.verts[it.i] = best.ref.slice(); n++; }
+  }
+  a.snapN = n; showSnaps(a);
+}
+function showSnaps(a){
+  const want = a ? a.items.filter(it => it.snap) : [], k = 1 / world.scale.x;
+  while (snapG.children.length < want.length){ const m = new THREE.Mesh(snapGeo, snapMat); m.renderOrder = 35; snapG.add(m); }
+  snapG.children.forEach((m, i) => { m.visible = i < want.length; if (!m.visible) return; m.position.fromArray(want[i].snap.ref); m.scale.setScalar(0.012 * k); if (renderer.xr.isPresenting) m.lookAt(world.worldToLocal(renderer.xr.getCamera().getWorldPosition(new V3()))); else m.lookAt(world.worldToLocal(camera.position.clone())); });
+}
+function combineInto(a, b){
+  const off = a.cage.verts.length; for (const v of b.cage.verts) a.cage.verts.push(v);
+  for (const f of b.cage.faces) a.cage.faces.push(f.map(v => v + off));
+  for (const kk of b.cage.creases){ const [x, y] = kk.split('_').map(Number); a.cage.creases.add(SD.ek(x + off, y + off)); }
+  removeObj(b);
+}
+function weldSnaps(a){
+  showSnaps(null);
+  const pairs = a.items.filter(it => it.snap).map(it => ({ m: it.o.cage.verts[it.i], t: it.snap.ref })); let n = 0, joined = 0;
+  const owner = ref => objs.find(o => o.cage.verts.includes(ref));
+  for (const pr of pairs){
+    const om = owner(pr.m), ot = owner(pr.t); if (!om || !ot) continue;
+    if (om !== ot){ combineInto(om, ot); joined++; }
+    const mi = om.cage.verts.indexOf(pr.m), ti = om.cage.verts.indexOf(pr.t);
+    if (mi < 0 || ti < 0 || mi === ti || om.cage.faces.some(f => f.includes(mi) && f.includes(ti))) continue;
+    SD.weld(om.cage, mi, ti); n++;
+  }
+  // two faces that now sit on the same points become one
+  for (const o of objs){ const seen = new Set(); o.cage.faces = o.cage.faces.filter(f => { const kk = f.slice().sort((x, y) => x - y).join(','); if (seen.has(kk)) return false; seen.add(kk); return true; }); }
+  if (n) flash((n === 1 ? 'Joined' : 'Joined ' + n + ' points') + (joined ? ', and the shapes became one' : ''));
+  return n;
 }
 // Extrude faces (together, as one piece per object) or open edges. Returns { items, els } for a move, or null.
 function extrudeEls(els){
@@ -693,6 +768,7 @@ function toolDown(tool, p, info){
   if (tool === 'spawn'){ const s = surfaceNear(p, 0.05 * k); const at = s ? s.point : p.clone(), n = s ? s.n : UP.clone();
     const sp = addSpawn(at, n, tangentOf(info.handFwd, n)); return { kind: 'spawn', s: sp, start: p.clone(), fwd: info.handFwd.clone() }; }
   if (tool === 'erase'){ const a = { kind: 'erase', did: false }; eraseAt(a, p); return a; }
+  if (CLAY.has(tool)){ const a = { kind: 'clay', tool, last: p.clone(), k: 1, did: false }; clayAt(a, p); return a; }
   if (tool === 'edit'){
     const hit = pick(p, EDIT_KINDS, k);
     if (!hit) return { kind: 'tap', empty: true, moved: 0 };
@@ -701,7 +777,7 @@ function toolDown(tool, p, info){
     if (hit.type === 'rail') return objAct({ type: 'rail', r: hit.r });
     const inSel = sel.some(e => elKey(e) === elKey(hit)), els = inSel ? sel.slice() : [hit], list = [];
     for (const e of els) for (const v of elVerts(e)) list.push({ o: e.o, i: v });
-    return Object.assign(moveAct(list, hit.type !== 'vert' || els.length > 1), { els, hit, tap: true });
+    return Object.assign(moveAct(list, hit.type !== 'vert' || els.length > 1), { els, hit, tap: true, snap: !els.some(e => e.type === 'face') });
   }
   const hit = pick(p, TOOL_KINDS[tool], k);
   if (tool === 'loop'){
@@ -723,7 +799,7 @@ function toolDown(tool, p, info){
     const inSel = sel.some(e => elKey(e) === elKey(hit)), res = extrudeEls(inSel ? sel.slice() : [hit]);
     if (!res) return null;
     if (inSel) sel = res.els; selDirty = true;
-    return Object.assign({ kind: 'move', items: res.items, rigid: true, moved: 0 }, { els: res.els, extrude: true });
+    return Object.assign({ kind: 'move', items: res.items, rigid: true, moved: 0 }, { els: res.els, extrude: true, snap: !res.els.some(e => e.type === 'face') });
   }
   return null;
 }
@@ -740,6 +816,13 @@ function toolMove(a, p, T, dp){
   if (a.kind === 'rail'){ const k = k_(); if (p.distanceTo(a.pts[a.pts.length - 1]) > 0.008 * k){ a.pts.push(p.clone()); updateRailPreview(a.line, a.pts); } return; }
   if (a.kind === 'spawn'){ const k = k_(), d = p.clone().sub(a.start); if (d.length() > 0.02 * k){ a.s.d.copy(tangentOf(d, a.s.n)); placeSpawn(a.s); } return; }
   if (a.kind === 'erase'){ eraseAt(a, p); return; }
+  if (a.kind === 'clay'){
+    // dab the brush along the stroke so fast moves still leave a solid line; Smooth keeps working while you hold still
+    const R = S.brush * k_(), step = R * 0.3, d = p.distanceTo(a.last);
+    if (d >= step){ const n = Math.ceil(d / step); for (let i = 1; i <= n; i++) clayAt(a, a.last.clone().lerp(p, i / n)); a.last.copy(p); }
+    else if (a.tool === 'smooth') clayAt(a, p);
+    return;
+  }
   if (a.kind === 'tap'){ a.moved = Math.max(a.moved, dp.length()); return; }
   if (a.kind === 'move'){ applyMove(a, T, dp); return; }
   if (a.kind === 'obj'){ applyObj(a, T); a.moved = Math.max(a.moved, dp.length()); return; }
@@ -755,7 +838,7 @@ function toolUp(a, quick){
   const k = k_();
   if (a.kind === 'tap'){ if (quick || a.moved < 0.006 * k){ if (sel.length){ clearSel(); flash('Selection cleared'); } } return; }
   if (a.kind === 'move' && a.tap && quick && a.moved < 0.006 * k && isCageEl(a.hit)){
-    for (const it of a.items) it.o.cage.verts[it.i] = [it.p0.x, it.p0.y, it.p0.z];
+    showSnaps(null); for (const it of a.items) it.o.cage.verts[it.i] = [it.p0.x, it.p0.y, it.p0.z];
     for (const o of new Set(a.items.map(it => it.o))) buildObj(o);
     toggleSel(a.hit); sfx('click'); return;
   }
@@ -776,38 +859,21 @@ function toolUp(a, quick){
   }
   if (a.kind === 'spawn'){ commit(); sfx('make'); flash('Spawn ' + spawns.length + ' placed'); return; }
   if (a.kind === 'erase'){ if (a.did){ clearSel(); commit(); } return; }
+  if (a.kind === 'clay'){ if (a.did){ remeshVoxels(); commit(); } return; }
   if (a.kind === 'move'){
-    if (a.extrude && a.moved < 0.004 * k){ restore(committed); return; }
-    const welds = weldMoved(a); for (const o of new Set(a.items.map(it => it.o))) if (objs.includes(o)) buildObj(o);
+    if (a.extrude && a.moved < 0.004 * k){ showSnaps(null); restore(committed); return; }
+    const welds = weldSnaps(a); for (const o of objs) if (o.level !== S.level || welds) buildObj(o);
     if (welds || a.extrude || a.extruded) clearSel();
     commit(); return;
   }
   if (a.kind === 'obj'){ for (const g of [a.t, a.tw]) if (g && g.type === 'obj' && objs.includes(g.o)) buildObj(g.o); commit(); return; }
   if (a.moved > 0) commit();
 }
-// a moved border point that lands on another border point of the same object joins it
-function weldMoved(a){
-  const lim = 0.012 * k_(); let welds = 0;
-  for (const o of new Set(a.items.map(it => it.o))){
-    // vertex arrays keep their identity through a weld, so follow the moved points by reference
-    let moved = a.items.filter(it => it.o === o).map(it => o.cage.verts[it.i]).filter(Boolean);
-    for (let guard = 0; guard < 32; guard++){
-      const V = o.cage.verts, border = SD.borderVerts(o.cage); let done = false;
-      for (const mp of moved){
-        const mi = V.indexOf(mp); if (mi < 0 || !border.has(mi)) continue;
-        let best = -1, bd = lim;
-        for (const oi of border){
-          if (oi === mi || moved.includes(V[oi])) continue;
-          const d = Math.hypot(V[oi][0] - mp[0], V[oi][1] - mp[1], V[oi][2] - mp[2]);
-          if (d < bd && !o.cage.faces.some(f => f.includes(mi) && f.includes(oi))){ bd = d; best = oi; }
-        }
-        if (best >= 0){ SD.weld(o.cage, mi, best); moved = moved.filter(x => x !== mp); welds++; done = true; break; }
-      }
-      if (!done) break;
-    }
-  }
-  if (welds) flash(welds === 1 ? 'Joined' : 'Joined ' + welds + ' points');
-  return welds;
+function clayAt(a, p){
+  const R = S.brush * k_(), k = a.tool === 'smooth' ? clamp(a.k, 0.2, 1) : 1;
+  if (vox.brush(a.tool, [p.x, p.y, p.z], R, k)) a.did = true;
+  if (S.mirror && Math.abs(p.x) > R * 0.5) vox.brush(a.tool, [-p.x, p.y, p.z], R, k);
+  voxEncDirty = true;
 }
 function eraseAt(a, p){
   const hit = pick(p, TOOL_KINDS.erase, k_()); if (!hit) return;
@@ -865,12 +931,12 @@ function deleteHeld(a){
 // ======================================================================
 let coll = { bvh: null, geo: null };
 function collision(){
-  if (!collideDirty && (coll.bvh || !objs.length)) return coll;
-  collideDirty = false;
+  if (!collideDirty && (coll.bvh || (!objs.length && !voxMeshes.size))) return coll;
+  remeshVoxels(); collideDirty = false;
   const pos = [], idx = []; let base = 0;
-  for (const o of objs){
-    if (o.level !== S.level) buildObj(o);
-    const g = o.mesh.geometry, P = g.attributes.position.array, I = g.index.array;
+  for (const o of objs) if (o.level !== S.level) buildObj(o);
+  for (const m of [...objs.map(o => o.mesh), ...voxMeshes.values()]){
+    const g = m.geometry, P = g.attributes.position.array, I = g.index.array;
     for (let i = 0; i < P.length; i++) pos.push(P[i]); for (let i = 0; i < I.length; i++) idx.push(I[i] + base); base += P.length / 3;
   }
   collideDirty = false;
@@ -907,7 +973,7 @@ function dropMarks(dt){
   marks.instanceMatrix.needsUpdate = true;
 }
 
-const sk = { B: new V3(), V: new V3(), N: UP.clone(), F: new V3(1, 0, 0), Uair: UP.clone(), grounded: false, grind: null, bdir: 1, impact: 0, skid: 0, cool: 0, leave: 0, bail: 0, boost: 0, air: 0, sinceOllie: 9, events: [] };
+const sk = { B: new V3(), V: new V3(), N: UP.clone(), F: new V3(1, 0, 0), Uair: UP.clone(), grounded: false, grind: null, bdir: 1, impact: 0, skid: 0, autoCool: 0, cool: 0, leave: 0, bail: 0, boost: 0, air: 0, sinceOllie: 9, events: [] };
 let spawnIdx = 0;
 function spawnAt(i){
   const r = BOARD_R / S.scale;
@@ -926,9 +992,35 @@ function closest(p, maxD){
   if (p.y < maxD && (!best || p.y < best.d)) best = { point: new V3(p.x, 0, p.z), n: UP.clone(), d: p.y };
   return best;
 }
+// everything you can grind: rails, plus ledges found on the shapes (sharp top edges, and the edges of raised flat surfaces)
+let grindLines = [];
+function buildGrindLines(){
+  grindLines = rails.map(r => ({ poly: r.poly, rad: RAIL_R, kind: 'rail' }));
+  const nrm = (V, f) => { const n = [0, 0, 0]; for (let i = 0; i < f.length; i++){ const a = V[f[i]], b = V[f[(i + 1) % f.length]]; n[0] += (a[1] - b[1]) * (a[2] + b[2]); n[1] += (a[2] - b[2]) * (a[0] + b[0]); n[2] += (a[0] - b[0]) * (a[1] + b[1]); } const l = Math.hypot(...n) || 1; return n.map(x => x / l); };
+  const ctr = (V, f) => f.reduce((c, i) => c.map((x, j) => x + V[i][j] / f.length), [0, 0, 0]);
+  for (const o of objs){
+    const sm = SD.subdivideN(o.cage, S.level), V = sm.verts, fN = sm.faces.map(f => nrm(V, f)), fC = sm.faces.map(f => ctr(V, f)), pairs = [];
+    for (const [key, e] of SD.edgeMap(sm)){
+      const A = V[e.a], B = V[e.b], my = (A[1] + B[1]) / 2; let ok = false;
+      if (e.faces.length === 2 && sm.creases.has(key)){
+        const [f1, f2] = e.faces, top = Math.abs(fN[f1][1]) > 0.75 ? f1 : Math.abs(fN[f2][1]) > 0.75 ? f2 : -1, side = top === f1 ? f2 : f1;
+        ok = top >= 0 && Math.abs(fN[side][1]) < 0.6 && fC[side][1] < my - 1e-4 && Math.abs(fC[top][1] - my) < 0.006;
+      } else if (e.faces.length === 1) ok = Math.abs(fN[e.faces[0]][1]) > 0.8 && my > 0.012;
+      if (ok) pairs.push([e.a, e.b]);
+    }
+    // chain the edges into lines, breaking at sharp corners
+    const adj = new Map(), used = new Set(), key = (a, b) => a < b ? a + '_' + b : b + '_' + a;
+    for (const [a, b] of pairs){ (adj.get(a) || adj.set(a, []).get(a)).push(b); (adj.get(b) || adj.set(b, []).get(b)).push(a); }
+    const dir = (a, b) => { const d = [V[b][0] - V[a][0], V[b][1] - V[a][1], V[b][2] - V[a][2]], l = Math.hypot(...d) || 1; return d.map(x => x / l); };
+    const grow = L => { for (;;){ const cur = L[L.length - 1], prev = L[L.length - 2], all = adj.get(cur) || [], nb = all.filter(n => !used.has(key(cur, n)));
+      if (nb.length !== 1 || all.length > 2) return; const d1 = dir(prev, cur), d2 = dir(cur, nb[0]); if (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2] < 0.82) return; used.add(key(cur, nb[0])); L.push(nb[0]); } };
+    for (const [a, b] of pairs){ if (used.has(key(a, b))) continue; used.add(key(a, b)); const L = [a, b]; grow(L); L.reverse(); grow(L);
+      const poly = L.map(i => vv(V[i])), len = poly.reduce((t, q, i) => i ? t + q.distanceTo(poly[i - 1]) : 0, 0); if (len > 0.03) grindLines.push({ poly, rad: 0.0008, kind: 'ledge' }); }
+  }
+}
 function railClosest(p, maxD){
   let best = null;
-  for (const r of rails){ const P = r.poly; for (let i = 1; i < P.length; i++){ const d = segDist(p, P[i - 1], P[i], _cp); if (d < maxD && (!best || d < best.d)) best = { r, i, d, point: _cp.clone(), t: _ln.closestPointToPointParameter(p, true) }; } }
+  for (const r of grindLines){ const P = r.poly; for (let i = 1; i < P.length; i++){ const d = segDist(p, P[i - 1], P[i], _cp) - r.rad; if (d < maxD && (!best || d < best.d)) best = { r, i, d, point: _cp.clone(), t: _ln.closestPointToPointParameter(p, true) }; } }
   return best;
 }
 function railUp(T){ const q = UP.clone().addScaledVector(T, -UP.dot(T)); if (q.lengthSq() < 1e-4) q.set(1, 0, 0).addScaledVector(T, -T.x); return q.normalize(); }
@@ -936,7 +1028,7 @@ function railUp(T){ const q = UP.clone().addScaledVector(T, -UP.dot(T)); if (q.l
 // inp: { heading: front-foot direction (park), boost: 0..1, ollie: bool, airQ: quaternion for the board in the air (or null) }
 function stepSkate(dt, inp){
   const s = S.scale, r = BOARD_R / s, g = S.gravity / s;
-  sk.cool -= dt; sk.leave -= dt; sk.sinceOllie += dt;
+  sk.cool -= dt; sk.leave -= dt; sk.sinceOllie += dt; sk.autoCool -= dt;
   if (sk.bail > 0){ sk.bail -= dt; if (sk.bail <= 0) spawnAt(spawnIdx); return; }
   sk.boost = inp.boost;
   // steering: on the ground the board lies on the surface, pointing where your feet point.
@@ -963,7 +1055,7 @@ function stepSkate(dt, inp){
   }
   const steps = clamp(Math.ceil(sk.V.length() * dt / (r * 0.35)), 1, 14), h = dt / steps;
   for (let i = 0; i < steps && !sk.bail; i++) subStep(h, r, g, inp);
-  if (sk.B.lengthSq() > 2500 || sk.B.y < -1) spawnAt(spawnIdx);
+  if (!(isFinite(sk.B.x + sk.B.y + sk.B.z + sk.V.x + sk.V.y + sk.V.z + sk.F.x + sk.N.y + sk.Uair.y)) || sk.B.lengthSq() > 2500 || sk.B.y < -1) spawnAt(spawnIdx);
 }
 function subStep(h, r, g, inp){
   const s = S.scale, mu = S.friction / 100 * 0.15, grip = S.grip / 100 * 2, top = S.top / s, acc = S.booster / s * inp.boost;
@@ -992,20 +1084,22 @@ function subStep(h, r, g, inp){
     if (hit && hit.distance < len + r * 0.5){ sk.B.addScaledVector(_ray.direction, Math.max(0, hit.distance - r * 0.6)); }
     else sk.B.add(move);
   } else sk.B.add(move);
-  // rails: drop onto one from above to grind. Rails never block you, so coping can't snag your wheels.
-  if (rails.length && sk.leave <= 0){
-    const rc = railClosest(sk.B, RAIL_R + r * 1.25);
+  // rails and ledges: drop onto one from above to grind. They never block you, so coping can't snag your wheels.
+  if (grindLines.length && sk.leave <= 0){
+    const air = !sk.grounded, rc = railClosest(sk.B, r * (air ? 2.4 : 1.3));
     if (rc){
       const away = sk.B.clone().sub(rc.point), d = away.length(); away.divideScalar(d || 1);
       const T = rc.r.poly[rc.i].clone().sub(rc.r.poly[rc.i - 1]).normalize(), up = railUp(T), vl = sk.V.length(), along = Math.abs(sk.V.dot(T)), lineUp = Math.abs(sk.F.dot(T));
       // on from the air (an ollie or a proper air) moving along it, or by rolling onto it lined up with it
-      const fromAir = !sk.grounded && (sk.sinceOllie < 1.5 || sk.air > 0.3) && (along > 0.35 * vl || lineUp > 0.7);
+      const fromAir = air && (sk.sinceOllie < 2 || sk.air > 0.2) && (along > 0.3 * vl || lineUp > 0.65);
       const rolling = sk.grounded && lineUp > 0.9 && along > 0.5 * vl;
-      if (away.dot(up) > 0.45 && sk.V.dot(away) < 0.4 / s && (fromAir || rolling)){
+      if (away.dot(up) > 0.35 && sk.V.dot(away) < 0.4 / s && (fromAir || rolling)){
         sk.grind = { r: rc.r, i: rc.i, t: rc.t, T, sp: sk.V.dot(T), slow: 0 }; sk.grounded = false; sk.events.push('grind');
         return;
       }
     }
+    // auto grind: rolling along next to a ledge or rail that's lined up and within reach, pop up onto it
+    if (S.autoGrind && sk.grounded && sk.autoCool <= 0 && sk.V.length() * s > 1.2) autoPop(r, g);
   }
   // contact with surfaces and the ground
   let contact = null;
@@ -1035,6 +1129,21 @@ function subStep(h, r, g, inp){
   } else if (sk.grounded){ sk.grounded = false; sk.Uair.copy(sk.N); sk.events.push('air'); }
   if (!sk.grounded){ sk.air += h; sk.skid = 0; }
 }
+function autoPop(r, g){
+  const s = S.scale, reach = 1.1 / s, foot = sk.B.clone().addScaledVector(sk.N, -r); let best = null;
+  for (const L of grindLines){ const P = L.poly; for (let i = 1; i < P.length; i++){
+    const d = segDist(foot, P[i - 1], P[i], _cp); if (d > reach) continue;
+    const T = P[i].clone().sub(P[i - 1]).normalize(), dh = _cp.y + L.rad - foot.y; if (dh < 0.015 / s || dh > 1.0 / s) continue;
+    if (Math.abs(sk.F.dot(T)) < 0.8 || Math.abs(sk.V.dot(T)) < 0.65 * sk.V.length()) continue;
+    const off = _cp.clone().sub(foot); off.addScaledVector(T, -off.dot(T)); off.y = 0; if (off.length() > 0.9 / s) continue;
+    // only what's ahead of you, or right beside you
+    if (best && d >= best.d) continue; best = { d, dh, off: off.clone(), T };
+  } }
+  if (!best) return;
+  const up = Math.sqrt(2 * g * (best.dh + 0.12 / s)), tUp = up / g;
+  sk.V.addScaledVector(UP, up - Math.max(0, sk.V.y)).addScaledVector(best.off, 1 / Math.max(tUp, 0.15));
+  sk.grounded = false; sk.Uair.copy(sk.N); sk.cool = 0.3; sk.leave = 0.14; sk.sinceOllie = 0; sk.autoCool = 1.2; sk.events.push('ollie');
+}
 function grindStep(h, r, g, mu, top, acc, inp){
   const G = sk.grind, P = G.r.poly;
   // gravity and the booster along the rail (toward where you look), a little friction
@@ -1052,10 +1161,10 @@ function grindStep(h, r, g, mu, top, acc, inp){
   }
   G.i = i; G.t = t; G.T = P[i].clone().sub(P[i - 1]).normalize();
   const on = P[i - 1].clone().lerp(P[i], t), up = railUp(G.T);
-  sk.B.copy(on).addScaledVector(up, RAIL_R + r * 0.9);
+  sk.B.copy(on).addScaledVector(up, G.r.rad + r * 0.9);
   sk.V.copy(G.T).multiplyScalar(sp); sk.N.copy(up); sk.Uair.copy(up);
   // off the end of the rail
-  if ((t >= 1 && i === P.length - 1 && sp > 0) || (t <= 0 && i === 1 && sp < 0)){ sk.grind = null; sk.leave = 0.15; sk.events.push('off-rail'); return; }
+  if ((t >= 1 && i === P.length - 1 && sp > 0) || (t <= 0 && i === 1 && sp < 0)){ sk.grind = null; sk.leave = 0.15; sk.autoCool = 0.8; sk.events.push('off-rail'); return; }
   // stalled on it for a moment: slip off the side the board leans to
   G.slow = Math.abs(sp) * S.scale < 0.25 ? G.slow + h : 0;
   if (G.slow > 0.45){ const side = sk.F.clone().multiplyScalar(sk.bdir).addScaledVector(up, -sk.F.dot(up) * sk.bdir); sk.grind = null; sk.leave = 0.3; sk.V.copy(side.normalize()).multiplyScalar(0.6 / S.scale); sk.events.push('off-rail'); }
@@ -1082,7 +1191,7 @@ let sculptWorld = null, skYaw = 0, paused = false;
 const hand = { mid: null, rel: null, relV: 0 };
 function enterSkate(){
   if (mode === 'skate') return;
-  collideDirty = true; collision();
+  collideDirty = true; collision(); buildGrindLines();
   sculptWorld = { p: world.position.clone(), q: world.quaternion.clone(), s: world.scale.x };
   mode = 'skate'; paused = false; spawnAt(spawnIdx);
   board.visible = true; for (const s of spawns) s.g.visible = false;
@@ -1114,7 +1223,7 @@ function exitSkate(){
 // ======================================================================
 // Hand panel (a canvas on your left hand; also shown top-right on a computer)
 // ======================================================================
-const MW = 1024, MH = 1240;
+const MW = 1024, MH = 1360;
 const menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH;
 const mctx = menuCanvas.getContext('2d'), menuTex = new THREE.CanvasTexture(menuCanvas); menuTex.colorSpace = THREE.SRGBColorSpace; menuTex.anisotropy = 4;
 const MENU_W = 0.24, MENU_H = MENU_W * MH / MW;
@@ -1134,13 +1243,20 @@ function layout(){
   let y = 140;
   if (mode === 'sculpt'){
     const cw = (W - 3 * 14) / 4;
-    TOOLS.forEach((t, i) => B('t-' + t, P + (i % 4) * (cw + 14), y + Math.floor(i / 4) * 140, cw, 128, TOOL_NAME[t], () => setTool(t), { icon: t, on: () => S.tool === t }));
-    y += 3 * 140 + 4;
+    TOOLS.forEach((t, i) => B('t-' + t, P + (i % 4) * (cw + 14), y + Math.floor(i / 4) * 130, cw, 118, TOOL_NAME[t], () => setTool(t), { icon: t, on: () => S.tool === t }));
+    y += 4 * 130 + 4;
     EL.push({ kind: 'tip', x: P, y: y + 22, text: () => TOOL_TIP[S.tool], wrap: true });
     y += 88;
-    EL.push({ kind: 'label', x: P, y: y + 42, text: () => 'Smooth' });
     const sw = (W - 200 - 3 * 10) / 4;
-    ['Cage', '1', '2', '3'].forEach((l, i) => B('lv' + i, P + 200 + i * (sw + 10), y, sw, 84, l, () => setLevel(i), { on: () => S.level === i }));
+    if (CLAY.has(S.tool)){
+      EL.push({ kind: 'label', x: P, y: y + 42, text: () => 'Brush' });
+      B('br-', P + 200, y, sw, 84, '−', () => setBrush(S.brush * 0.8));
+      EL.push({ kind: 'label', x: P + 200 + sw + 10 + 20, y: y + 42, text: () => Math.round(S.brush * 200) + ' cm' });
+      B('br+', P + 200 + 3 * (sw + 10), y, sw, 84, '+', () => setBrush(S.brush * 1.25));
+    } else {
+      EL.push({ kind: 'label', x: P, y: y + 42, text: () => 'Smooth' });
+      ['Cage', '1', '2', '3'].forEach((l, i) => B('lv' + i, P + 200 + i * (sw + 10), y, sw, 84, l, () => setLevel(i), { on: () => S.level === i }));
+    }
     y += 104;
     const tw = (W - 2 * 14) / 3, hw = (W - 14) / 2;
     B('cage', P, y, tw, 84, S.cage ? 'Hide cage' : 'Show cage', () => { S.cage = !S.cage; saveSettings(); cageDirty = true; layoutKey = ''; });
@@ -1161,8 +1277,10 @@ function layout(){
     for (const sl of SLIDERS){ EL.push({ id: 's-' + sl.k, kind: 'slider', sl, x: P, y, w: W, h: 92 }); y += 98; }
     y += 6;
     const hw = (W - 14) / 2;
-    B('sound', P, y, hw, 84, 'Sound', () => { S.sound = !S.sound; saveSettings(); audioInit(); setVolume(); }, { on: () => S.sound, sub: S.sound ? 'on' : 'off' });
-    B('design', P + hw + 14, y, hw, 84, 'Board graphic', () => setDesign((S.design || 0) + 1), { sub: DESIGNS[S.design || 0].name });
+    const tw = (W - 2 * 14) / 3;
+    B('sound', P, y, tw, 84, 'Sound', () => { S.sound = !S.sound; saveSettings(); audioInit(); setVolume(); }, { on: () => S.sound, sub: S.sound ? 'on' : 'off' });
+    B('auto', P + tw + 14, y, tw, 84, 'Auto grind', () => { S.autoGrind = !S.autoGrind; saveSettings(); flash(S.autoGrind ? 'Ride along a ledge or rail lined up and you pop onto it' : 'Auto grind off: ollie onto ledges and rails'); }, { on: () => S.autoGrind, sub: S.autoGrind ? 'on' : 'off' });
+    B('design', P + 2 * (tw + 14), y, tw, 84, 'Board', () => setDesign((S.design || 0) + 1), { sub: DESIGNS[S.design || 0].name });
     y += 102;
     B('spawn', P, y, hw, 84, spawns.length > 1 ? 'Next spawn' : 'Respawn', () => { spawnAt(spawnIdx + 1); flash(spawns.length ? 'Spawn ' + (spawnIdx + 1) + ' of ' + spawns.length : 'Back on top'); });
     B('defaults', P + hw + 14, y, hw, 84, 'Defaults', () => { for (const sl of SLIDERS) S[sl.k] = sl.def; saveSettings(); onScale(); flash('Back to the default feel'); });
@@ -1171,15 +1289,19 @@ function layout(){
   }
 }
 let layoutKey = '';
-function relayout(){ const key = mode + S.cage + S.room + clearArmed + spawns.length + renderer.xr.isPresenting + S.sound + S.design; if (key !== layoutKey){ layoutKey = key; layout(); menuDirty = true; } }
+function relayout(){ const key = S.autoGrind + CLAY.has(S.tool) + mode + S.cage + S.room + clearArmed + spawns.length + renderer.xr.isPresenting + S.sound + S.design; if (key !== layoutKey){ layoutKey = key; layout(); menuDirty = true; } }
 function setTool(t){ S.tool = t; saveSettings(); menuDirty = true; }
+function setBrush(r){ S.brush = clamp(r, 0.008, 0.3); saveSettings(); menuDirty = true; flash('Brush ' + Math.round(S.brush * 200) + ' cm across'); }
 function setLevel(i){ S.level = clamp(i, 0, 3); saveSettings(); for (const o of objs) buildObj(o); collideDirty = true; menuDirty = true; flash(S.level ? 'Smooth ' + S.level : 'Cage only'); }
 function onScale(){ for (const s of spawns) placeSpawn(s); }
 
 function drawIcon(g, name, x, y, size, col){
   g.save(); g.translate(x, y); g.scale(size / 48, size / 48); g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 4; g.lineCap = g.lineJoin = 'round';
   const L = (...p) => { g.beginPath(); g.moveTo(p[0], p[1]); for (let i = 2; i < p.length; i += 2) g.lineTo(p[i], p[i + 1]); g.stroke(); };
-  if (name === 'edit'){ g.beginPath(); g.moveTo(-14, -20); g.lineTo(14, 4); g.lineTo(2, 6); g.lineTo(10, 20); g.lineTo(4, 23); g.lineTo(-4, 9); g.lineTo(-14, 16); g.closePath(); g.stroke(); }
+  if (name === 'add'){ g.beginPath(); g.ellipse(0, 6, 20, 13, 0, 0, 7); g.stroke(); L(0, -22, 0, -6); L(-8, -14, 8, -14); }
+  else if (name === 'carve'){ g.beginPath(); g.moveTo(-22, -6); g.lineTo(-10, -6); g.arc(0, -6, 10, Math.PI, 0, true); g.lineTo(22, -6); g.lineTo(22, 16); g.lineTo(-22, 16); g.closePath(); g.stroke(); }
+  else if (name === 'smooth'){ L(-22, 6, -14, -6, -8, 8, -2, -4, 2, 2); g.beginPath(); g.moveTo(2, 2); g.quadraticCurveTo(12, -6, 22, 2); g.stroke(); }
+  else if (name === 'edit'){ g.beginPath(); g.moveTo(-14, -20); g.lineTo(14, 4); g.lineTo(2, 6); g.lineTo(10, 20); g.lineTo(4, 23); g.lineTo(-4, 9); g.lineTo(-14, 16); g.closePath(); g.stroke(); }
   else if (name === 'blob'){ g.globalAlpha = 0.5; L(-18, -18, 18, -18, 18, 18, -18, 18, -18, -18); g.globalAlpha = 1; g.beginPath(); g.arc(0, 0, 15, 0, 7); g.stroke(); }
   else if (name === 'surface'){ L(-22, 10, -6, -12, 22, -12, 6, 10, -22, 10); g.globalAlpha = 0.35; g.beginPath(); g.moveTo(-22, 10); g.lineTo(-6, -12); g.lineTo(22, -12); g.lineTo(6, 10); g.fill(); }
   else if (name === 'block'){ L(-16, -6, 0, -14, 16, -6, 16, 12, 0, 20, -16, 12, -16, -6); L(-16, -6, 0, 2, 16, -6); L(0, 2, 0, 20); }
@@ -1326,7 +1448,8 @@ const hands = [0, 1].map(i => {
   beam.visible = false; ray.add(beam);
   const tip = new THREE.Mesh(new THREE.SphereGeometry(0.006, 16, 12), new THREE.MeshBasicMaterial({ color: 0xFFFFFF })); tip.position.z = -PEN; ray.add(tip);
   const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.0012, 0.0012, PEN, 6), new THREE.MeshBasicMaterial({ color: 0x9AA2AD })); stem.rotation.x = Math.PI / 2; stem.position.z = -PEN / 2; ray.add(stem);
-  const h = { i, ray, grip, model, beam, tip, stem, source: null, hand: '', prev: [], act: null, grab: false, gM0: new THREE.Matrix4(), p0: new V3(), flick: 0 };
+  const bsph = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16), new THREE.MeshBasicMaterial({ color: 0x5FE0B8, wireframe: true, transparent: true, opacity: 0.35, depthTest: false })); bsph.renderOrder = 40; bsph.visible = false; scene.add(bsph);
+  const h = { i, ray, grip, model, beam, tip, stem, bsph, source: null, hand: '', prev: [], act: null, grab: false, gM0: new THREE.Matrix4(), p0: new V3(), flick: 0 };
   ray.addEventListener('connected', e => { h.source = e.data; h.hand = e.data.handedness; if (h.hand === 'left'){ grip.add(menuMesh); } });
   ray.addEventListener('disconnected', () => { if (h.act){ toolUp(h.act); h.act = null; } if (h.grab){ h.grab = false; grabReset(); } if (menuMesh.parent === grip) grip.remove(menuMesh); h.source = null; });
   return h;
@@ -1400,6 +1523,9 @@ function updateSculptXR(dt){
     h.tip.material.color.setHex(TOOL_COL[S.tool]);
     const pw = penWorld(h), p = toPark(pw), k = k_();
     const myDial = dial && dial.h === h; if (myDial) updateDial(h, gp, pw);
+    h.bsph.visible = CLAY.has(S.tool) && !mHit && !h.grab && !myDial && (!h.act || h.act.kind === 'clay');
+    if (h.bsph.visible){ h.bsph.position.copy(pw); h.bsph.scale.setScalar(S.brush); h.bsph.material.color.setHex(TOOL_COL[S.tool]); h.bsph.material.opacity = h.act ? 0.6 : 0.3; }
+    if (h.act && h.act.kind === 'clay') h.act.k = gp.buttons[0] ? gp.buttons[0].value : 1;
     // highlight what the trigger would touch (yellow), or the whole thing the grip would take (soft white)
     if (!h.act && !h.grab && !mHit && !myDial){
       const kinds = S.tool === 'edit' ? EDIT_KINDS : TOOL_KINDS[S.tool];
@@ -1431,7 +1557,8 @@ function updateSculptXR(dt){
       if (a.kind === 'obj2'){ /* the other hand drives it */ }
       else if (a.kind === 'obj' && a.two) applyObj(a, twoHandT(a));
       else {
-        const T = handDelta(h), dp = p.clone().sub(h.p0); toolMove(a, p, T, dp);
+        const sn0 = a.snapN || 0, T = handDelta(h), dp = p.clone().sub(h.p0); toolMove(a, p, T, dp);
+        if ((a.snapN || 0) > sn0){ pulse(h, 0.6, 25); sfx('click'); }
         if (a.buzz){ pulse(h, 0.7, 30); a.buzz = 0; }
         if (a.kind === 'rail' && a.pts.length % 6 === 0) pulse(h, 0.05, 4);
       }
@@ -1439,7 +1566,7 @@ function updateSculptXR(dt){
       if (down(4)){
         if (a.kind === 'move' && a.els){
           const res = extrudeEls(a.els);
-          if (res){ a.items = res.items; a.els = res.els; a.rigid = true; a.moved = 0; a.extruded = true; a.tap = false; h.gM0.copy(h.grip.matrixWorld); h.p0.copy(p); pulse(h, 0.7, 30); sfx('click'); flash('Extruded. Keep pulling'); }
+          if (res){ a.items = res.items; a.els = res.els; a.rigid = true; a.moved = 0; a.extruded = true; a.tap = false; a.snap = !res.els.some(e => e.type === 'face'); h.gM0.copy(h.grip.matrixWorld); h.p0.copy(p); pulse(h, 0.7, 30); sfx('click'); flash('Extruded. Keep pulling'); }
           else flash(a.els.some(e => e.type === 'edge') ? 'Only open edges pull out' : 'Extrude works on edges and faces');
         } else if (a.kind === 'obj'){ duplicateHeld(a); pulse(h, 0.6, 25); }
       }
@@ -1467,7 +1594,7 @@ function updateSculptXR(dt){
         if (!dial && down(4)) openDial(h, pw);
         if (down(5)){ S.cage = !S.cage; saveSettings(); cageDirty = true; layoutKey = ''; flash(S.cage ? 'Cage shown' : 'Cage hidden'); }
         const ay = gp.axes[3] || 0;
-        if (!dial){ if (h.flick === 0 && Math.abs(ay) > 0.7){ h.flick = 1; setLevel(S.level - Math.sign(ay)); pulse(h, 0.15, 8); } else if (Math.abs(ay) < 0.3) h.flick = 0; }
+        if (!dial){ if (h.flick === 0 && Math.abs(ay) > 0.7){ h.flick = 1; if (CLAY.has(S.tool)) setBrush(S.brush * (ay < 0 ? 1.25 : 0.8)); else setLevel(S.level - Math.sign(ay)); pulse(h, 0.15, 8); } else if (Math.abs(ay) < 0.3) h.flick = 0; }
       }
     }
     if (dial && dial.h === h && !pressed(4)) closeDial(true);
@@ -1674,7 +1801,7 @@ function exportOBJ(){
   const add = (geo, name) => { L.push('g ' + name); const P = geo.attributes.position, I = geo.index;
     for (let i = 0; i < P.count; i++) L.push('v ' + P.getX(i).toFixed(5) + ' ' + P.getY(i).toFixed(5) + ' ' + P.getZ(i).toFixed(5));
     for (let i = 0; i < I.count; i += 3) L.push('f ' + (I.getX(i) + base) + ' ' + (I.getX(i + 1) + base) + ' ' + (I.getX(i + 2) + base)); base += P.count; };
-  objs.forEach((o, i) => add(o.mesh.geometry, o.kind + '_' + (i + 1))); rails.forEach((r, i) => add(r.mesh.geometry, 'rail_' + (i + 1)));
+  objs.forEach((o, i) => add(o.mesh.geometry, o.kind + '_' + (i + 1))); rails.forEach((r, i) => add(r.mesh.geometry, 'rail_' + (i + 1))); [...voxMeshes.values()].forEach((m, i) => add(m.geometry, 'clay_' + (i + 1)));
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([L.join('\n')], { type: 'text/plain' })); a.download = 'subdeck.obj'; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000); flash('Saved subdeck.obj to your downloads');
 }
@@ -1728,28 +1855,37 @@ let fitPending = false; function fitSoon(){ if (renderer.xr.isPresenting) needsF
 // ======================================================================
 committed = (() => { try { return localStorage.getItem(KEY); } catch (e) { return null; } })() || exampleJSON();
 restore(committed);
-let last = performance.now();
+let last = performance.now(), errCount = 0;
 renderer.setAnimationLoop(now => {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   const xr = renderer.xr.isPresenting;
   if (needsFit && xr && fitXR()) needsFit = false;
   if (fitPending && !xr){ fitPending = false; orbit.target.set(0, 0.06, 0); }
-  if (xr){ if (mode === 'skate') updateSkateXR(dt); else updateSculptXR(dt); }
-  else if (mode === 'skate') updateSkateDesk(dt);
-  else orbit.update();
-  if (mode === 'sculpt' && Math.abs(world.scale.x / (dotScaleAt || 1) - 1) > 0.15) cageDirty = true;
-  if (cageDirty) rebuildCage();
-  if (selDirty) rebuildSel();
-  if (clearArmed > 0){ clearArmed -= dt; if (clearArmed <= 0){ clearArmed = 0; layoutKey = ''; } }
-  if (flashT > 0){ flashT -= dt; if (flashT <= 0) menuDirty = true; }
-  placeMsg(dt); placeEnv(); audioUpdate(dt);
-  if (menuDirty) drawMenu();
-  menuWrap.hidden = xr;
+  try {
+    if (xr){ if (mode === 'skate') updateSkateXR(dt); else updateSculptXR(dt); }
+    else if (mode === 'skate') updateSkateDesk(dt);
+    else orbit.update();
+    if (mode === 'sculpt' && Math.abs(world.scale.x / (dotScaleAt || 1) - 1) > 0.15) cageDirty = true;
+    if (vox.dirty.size) remeshVoxels(24);
+    voxBox.visible = mode === 'sculpt' && CLAY.has(S.tool);
+    if (cageDirty) rebuildCage();
+    if (selDirty) rebuildSel();
+    if (clearArmed > 0){ clearArmed -= dt; if (clearArmed <= 0){ clearArmed = 0; layoutKey = ''; } }
+    if (flashT > 0){ flashT -= dt; if (flashT <= 0) menuDirty = true; }
+    placeMsg(dt); placeEnv(); audioUpdate(dt);
+    if (menuDirty) drawMenu();
+    menuWrap.hidden = xr;
+  } catch (err){
+    // never let one bad frame stop the app: show what went wrong instead
+    console.error(err); errCount++;
+    if (errCount < 4 || errCount % 120 === 0) flash('Glitch: ' + String(err && err.message || err).slice(0, 90), 6);
+    if (mode === 'skate' && !isFinite(world.position.x + world.position.y + world.position.z)) spawnAt(spawnIdx);
+  }
   renderer.render(scene, camera);
 });
 
 // a small handle for automated testing
-window.subdeck = { S, SD, get objs(){ return objs; }, get rails(){ return rails; }, get spawns(){ return spawns; }, sk, stepSkate, spawnAt, enterSkate, exitSkate, collision, toolDown, toolMove, toolUp, pick, restore, serialize, exampleJSON, commit, undo, redo, setLevel, get mode(){ return mode; }, world, camera, deskSk,
+window.subdeck = { S, SD, vox, get grindLines(){ return grindLines; }, buildGrindLines, remeshVoxels, get objs(){ return objs; }, get rails(){ return rails; }, get spawns(){ return spawns; }, sk, stepSkate, spawnAt, enterSkate, exitSkate, collision, toolDown, toolMove, toolUp, pick, restore, serialize, exampleJSON, commit, undo, redo, setLevel, get mode(){ return mode; }, world, camera, deskSk,
   _t: { alignToHands, updateSkateXR, updateSculptXR, hands, frontBack, handFrame, get EL(){ return EL; }, menuAtPx, get paused(){ return paused; }, get skYaw(){ return skYaw; } } };
 </script>
 <script src="../updated.js"></script>
