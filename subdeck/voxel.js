@@ -62,6 +62,22 @@ export class VoxelField {
     this.markRange(i0, j0, k0, i1, j1, k1);
     return true;
   }
+  // fill a box with clay (rounded edges), merged with whatever is there. lo / hi = corners in park metres.
+  fillBox(lo, hi, round = 0.03){
+    const { h, max, C } = this, pad = 3, c = [0, 1, 2].map(a => (lo[a] + hi[a]) / 2), hw = [0, 1, 2].map(a => (hi[a] - lo[a]) / 2 - round);
+    const i0 = Math.floor(lo[0] / h) - pad, i1 = Math.ceil(hi[0] / h) + pad, j0 = Math.floor(lo[1] / h) - pad, j1 = Math.ceil(hi[1] / h) + pad, k0 = Math.floor(lo[2] / h) - pad, k1 = Math.ceil(hi[2] / h) + pad;
+    const f = v => Math.floor(v / C);
+    for (let cz = f(k0); cz <= f(k1); cz++) for (let cy = f(j0); cy <= f(j1); cy++) for (let cx = f(i0); cx <= f(i1); cx++){
+      const key = this.key(cx, cy, cz); let d = this.chunks.get(key);
+      if (!d){ d = new Float32Array(C * C * C).fill(max); this.chunks.set(key, d); }
+      for (let kk = cz * C; kk < cz * C + C; kk++) for (let j = cy * C; j < cy * C + C; j++) for (let i = cx * C; i < cx * C + C; i++){
+        const qx = Math.abs(i * h - c[0]) - hw[0], qy = Math.abs(j * h - c[1]) - hw[1], qz = Math.abs(kk * h - c[2]) - hw[2];
+        const s = Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qy, qz), 0) - round, t = (i - cx * C) + C * ((j - cy * C) + C * (kk - cz * C));
+        const v = Math.min(d[t], s); d[t] = v < -max ? -max : v > max ? max : v;
+      }
+    }
+    this.used = true; this.markRange(i0, j0, k0, i1, j1, k1);
+  }
   // surface nets for one chunk -> { pos, nor, idx } in park metres (null if empty)
   meshChunk(key){
     const [cx, cy, cz] = key.split(',').map(Number), C = this.C, h = this.h, P = C + 3;
