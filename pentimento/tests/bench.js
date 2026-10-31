@@ -104,6 +104,18 @@ function guideLayout(seed){ const st = D.demoSketch(7, 1), H = st.truth, s2 = st
   for (const z of [-3.2, -1, 1, 3.2]) s2.push(line(u => [-7.6 + 15 * u, H(-7.6 + 15 * u, z) + 0.02, z])); for (const x of [-6.6, -0.3, 1.4, 5.3]) s2.push(line(u => [x, H(x, -4.3 + 9.2 * u) + 0.02, -4.3 + 9.2 * u]));
   return { st: s2, prm: { detail: 0.4, avg: 0.64, lines: 4, fair: 0.3, reach: 0.6, group: 0.35, subd: 2, relax: 2, target: -2 }, score: r => { const C = r.quads.C ? Array.from(r.quads.C) : []; return { notQuads: C.length ? C.filter(c => c !== 4).length / C.length * 100 : 100 }; } }; }
 
+// guides drawn by hand (wobbly, stopping short of the border, some drawn twice) on the sample sketch, laid out as ×4 / ×16
+function handGuides(seed, target){
+  const { rnd, g } = mk(seed * 7 + 3), base = D.demoSketch(7, 1), H = base.truth, st = base.map(o => ({ tag: o.tag, pts: o.pts }));
+  const line = (a, b, wob) => { const p = [], ph = rnd() * 6; for (let i = 0; i <= 80; i++){ const u = i / 80, x = a[0] + (b[0] - a[0]) * u + Math.sin(u * 5 + ph) * wob + g() * 0.02, z = a[1] + (b[1] - a[1]) * u + Math.cos(u * 4 + ph) * wob + g() * 0.02; p.push(x, H(x, z) + 0.03 + g() * 0.04, z); } return p; };
+  for (const z of [-3, -1.2, 0.8, 2.9]){ const x0 = -7 + rnd() * 1.2, x1 = 6.5 - rnd() * 1.5; st.push({ tag: 1, pts: line([x0, z], [x1, z + g() * 0.3], 0.12) }); if (rnd() < 0.4) st.push({ tag: 1, pts: line([x0 + 1, z + 0.1], [x1 - 2, z + 0.15], 0.1) }); }
+  for (const x of [-6, -2.5, 0.5, 3.5, 5.8]){ const z0 = -4 + rnd() * 0.8, z1 = 4.2 - rnd() * 1.2; st.push({ tag: 1, pts: line([x, z0], [x + g() * 0.3, z1], 0.1) }); }
+  return { st, prm: { detail: 0.4, avg: 0.64, lines: 4, fair: 0.3, reach: 0.6, group: 0.35, subd: 1, relax: 2, target }, score: r => {
+    const F = r.quads.F, C = r.quads.C, cnt = new Map(); let o = 0; for (let f = 0; f < C.length; f++){ const n = C[f]; for (let i = 0; i < n; i++){ const a = F[o + i], b = F[o + (i + 1) % n], k = a < b ? a * 1e7 + b : b * 1e7 + a; cnt.set(k, (cnt.get(k) || 0) + 1); } o += n; }
+    const adj = new Map(); for (const [k, c] of cnt) if (c === 1){ const a = Math.floor(k / 1e7), b = k % 1e7; (adj.get(a) || adj.set(a, []).get(a)).push(b); (adj.get(b) || adj.set(b, []).get(b)).push(a); }
+    const seen = new Set(); let loops = 0; for (const v of adj.keys()){ if (seen.has(v)) continue; loops++; const q = [v]; seen.add(v); while (q.length){ const x = q.pop(); for (const w of adj.get(x)) if (!seen.has(w)){ seen.add(w); q.push(w); } } }
+    return { holes: Math.max(0, loops - 1) }; } };
+}
 const CASES = [];
 for (const sd of [1, 2]){
   CASES.push(['spine 78° #' + sd, () => spine(sd, 78 * Math.PI / 180)], ['spine 88° #' + sd, () => spine(sd, 88 * Math.PI / 180)]);
@@ -111,6 +123,7 @@ for (const sd of [1, 2]){
 }
 for (const m of ['loose', 'avg']) CASES.push(['deck corner, ' + m + ' joins', () => corner(1, m)], ['L-ledge, ' + m + ' joins', () => ledge(1, m)]);
 CASES.push(['deck corner, line turns', () => corner(2, 'turn')]);
+for (const sd of [1, 3, 4]) CASES.push(['hand guides ×4 #' + sd, () => handGuides(sd, -2)], ['hand guides ×16 #' + sd, () => handGuides(sd, -1)]);
 CASES.push(['half pipe', () => halfpipe(3)], ['ridge', () => ridge(5)], ['sample sketch #7', () => demo(7)], ['sample sketch #3', () => demo(3)], ['edge loop', () => edgeLoop(4)], ['guide layout', () => guideLayout(7)]);
 const repDir = path.join(__dirname, 'reports');
 if (fs.existsSync(repDir)) for (const f of fs.readdirSync(repDir).filter(f => f.endsWith('.json'))){
@@ -128,7 +141,7 @@ function reportPrm(s){ const QUAD = [0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.8, 1
 // ---------------- run
 const basePath = path.join(__dirname, 'baseline.json'), base = fs.existsSync(basePath) ? JSON.parse(fs.readFileSync(basePath, 'utf8')) : {};
 const out = {}; let worse = 0, broke = 0, t0 = Date.now();
-const fmt = (k, v) => k === 'glitch' ? String(v) : k === 'notQuads' || k === 'odd' ? v.toFixed(1) + '%' : k === 'outside' ? (v * 100).toFixed(0) : (v * 100).toFixed(1) + 'cm';
+const fmt = (k, v) => k === 'glitch' || k === 'holes' ? String(v) : k === 'notQuads' || k === 'odd' ? v.toFixed(1) + '%' : k === 'outside' ? (v * 100).toFixed(0) : (v * 100).toFixed(1) + 'cm';
 for (const [name, make] of CASES){
   if (only.length && !only.some(w => name.toLowerCase().includes(w.toLowerCase()))) continue;
   const c = make(), t = Date.now(); let r, sc;
@@ -150,7 +163,7 @@ for (const [name, make] of CASES){
     for (const a of fa) if (a < med * 0.08) g++;
     sc.glitch = g; }
   out[name] = sc; const b = base[name], notes = [];
-  for (const [k, v] of Object.entries(sc)){ let s = k + ' ' + fmt(k, v); if (b && b[k] !== undefined){ const d = v - b[k], lim = Math.max(b[k] * 0.25, k === 'glitch' ? 2 : k === 'notQuads' || k === 'odd' ? 2 : k === 'outside' ? 0.02 : 0.004); if (d > lim){ s += ' ▲ worse (was ' + fmt(k, b[k]) + ')'; worse++; } else if (-d > lim) s += ' ▼ better (was ' + fmt(k, b[k]) + ')'; } notes.push(s); }
+  for (const [k, v] of Object.entries(sc)){ let s = k + ' ' + fmt(k, v); if (b && b[k] !== undefined){ const d = v - b[k], lim = Math.max(b[k] * 0.25, k === 'glitch' ? 2 : k === 'holes' ? 0.5 : k === 'notQuads' || k === 'odd' ? 2 : k === 'outside' ? 0.02 : 0.004); if (d > lim){ s += ' ▲ worse (was ' + fmt(k, b[k]) + ')'; worse++; } else if (-d > lim) s += ' ▼ better (was ' + fmt(k, b[k]) + ')'; } notes.push(s); }
   console.log(name.padEnd(26), notes.join('   '), ' ' + (ms / 1000).toFixed(1) + 's');
 }
 console.log(`\n${Object.keys(out).length} cases in ${((Date.now() - t0) / 1000).toFixed(0)}s · ${broke} failed · ${worse} scores worse than the baseline`);
