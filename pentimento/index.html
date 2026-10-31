@@ -51,7 +51,7 @@
 </head>
 <body>
 <div class="slab card">
-  <h1>PENTI<span>MENTO</span><small id="ver">XR v2.10</small></h1>
+  <h1>PENTI<span>MENTO</span><small id="ver">XR v2.11</small></h1>
   <p>Sketch skate terrain with as many loose lines as you like. Mark the sharp edges and the lines that matter, and one smooth quad surface is found through all of them.</p>
   <div class="types"><span><i style="background:var(--loose)"></i>Loose</span><span><i style="background:var(--guide)"></i>Guide</span><span><i style="background:var(--crease)"></i>Crease</span><span><i style="background:var(--screase)"></i>Strict crease</span><span><i style="background:var(--edge)"></i>Edge</span><span><i style="background:var(--sedge)"></i>Strict edge</span></div>
   <div class="row">
@@ -62,7 +62,7 @@
   <button id="updateBtn" class="big" hidden>Update</button>
   <button id="reportBtn" class="big" hidden>Download the problem report</button>
   <div id="status">Checking for a headset…</div>
-  <div class="keys">On this screen: drag points to move them · shift-click deletes a point · alt-click makes it a sharp corner · ctrl-click a strict line adds a point · drag to draw · right-drag to orbit · wheel to zoom · 1–6 line type · D draw · B bend · F flatten · P smooth · M mark · X erase bits · E erase lines · L lines on/off · S surface on/off · Q mesh edges · Space builds</div>
+  <div class="keys">On this screen: drag points to move them · shift-click deletes a point · alt-click: sharp corner, again breaks the line, on a joint fuses two lines · ctrl-click a strict line adds a point · drag to draw · right-drag to orbit · wheel to zoom · 1–6 line type · D draw · B bend · F flatten · P smooth · M mark · X erase bits · E erase lines · L lines on/off · S surface on/off · Q mesh edges · Space builds</div>
   <details>
     <summary>Headset controls</summary>
     <dl>
@@ -84,7 +84,7 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=2.10"></script>
+<script src="demo.js?v=2.11"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -97,7 +97,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.10';
+const VERSION = '2.11';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'XR v' + VERSION;
 const V3 = THREE.Vector3;
@@ -258,7 +258,9 @@ function smoothed(raw, lv){
 function makeStroke(tag, raw, pts){ pts = pts || smoothed(raw, S.smooth); return { id: nextId++, tag, raw, pts, box: boxOf(pts) }; }
 function nearBox(s, p, r){ const b = s.box; return p.x > b[0] - r && p.x < b[3] + r && p.y > b[1] - r && p.y < b[4] + r && p.z > b[2] - r && p.z < b[5] + r; }
 function touches(s, p, r){ if (!nearBox(s, p, r)) return false; const a = s.pts, r2 = r * r; for (let i = 0; i < a.length; i += 3) if ((a[i] - p.x) ** 2 + (a[i + 1] - p.y) ** 2 + (a[i + 2] - p.z) ** 2 < r2) return true; return false; }
-function changed(){ linesDirty = true; menuDirty = true; scheduleBuild(); scheduleSave(); placeGrid(); }
+function changed(){ linesDirty = true; menuDirty = true; scheduleBuild(); scheduleSave(); placeGrid();
+  // a blank sketch has no surface: clear the old build straight away
+  if (!strokes.length) try { cancelBuild(); clearSurface(); buildTimer = -1; stale = false; buildErr = ''; lastGood = null; } catch (e){} }
 // the park grid sits just under the lowest line so it never cuts through the terrain
 function placeGrid(){ const b = contentBox(); parkGrid.position.y = b ? b[1] - 0.15 : 0; }
 function commit(next, nextDabs){ undoS.push(snap()); if (undoS.length > 100) undoS.shift(); redoS = []; strokes = next; if (nextDabs) dabs = nextDabs; changed(); }
@@ -688,6 +690,41 @@ function ctrlCorner(d){
   d.base = n; d.cur = n; if (d.lastP) d.p0 = d.lastP.clone(); d.q0 = ctrlAt(n, d.k); liveTube(d.mesh, n); rebuildHandles(); d.did = true;
   flash(msg, 4);
 }
+// the second button while holding a point: at a joint of two lines, fuse them; on an end, its softness;
+// in the middle, smooth → sharp corner → break the line here
+function jointAt(cur, k){
+  if (!isEnd(cur, k)) return null; const q = ctrlAt(cur, k), eps = 0.0005 * N(), near = c => (c[0] - q[0]) ** 2 + (c[1] - q[1]) ** 2 + (c[2] - q[2]) ** 2 < eps * eps, last = cur.ctrl.length / 3 - 1;
+  if (cur.ctrl.length / 3 > 2 && near(ctrlAt(cur, k === 0 ? last : 0))) return { s: cur, k: k === 0 ? last : 0, self: true };
+  for (const s of strokes){ if (!s.ctrl || s.id === cur.id || s.closed || s.tag !== cur.tag || !editable(s)) continue; const n = s.ctrl.length / 3 - 1; if (near(ctrlAt(s, 0))) return { s, k: 0 }; if (near(ctrlAt(s, n))) return { s, k: n }; }
+  return null;
+}
+function secondLabel(d){ const cur = d.cur || d.base; if (!cur.ctrl) return 'sharp corner'; if (jointAt(cur, d.k)) return 'fuse into one line'; if (isEnd(cur, d.k)) return 'end: sharp / soft'; return cur.kinks && cur.kinks[d.k] ? 'break the line here' : 'sharp corner'; }
+const ctrlOf = (s, rev) => { const n = s.ctrl.length / 3, c = [], k = []; for (let i = 0; i < n; i++){ const j = rev ? n - 1 - i : i; c.push(s.ctrl[3 * j], s.ctrl[3 * j + 1], s.ctrl[3 * j + 2]); k.push(s.kinks ? s.kinks[j] : 0); } return { c, k }; };
+function finishHeld(d){ world.remove(d.mesh); d.mesh.geometry.dispose(); for (const o of d.partners || []){ world.remove(o.mesh); o.mesh.geometry.dispose(); } d.partners = []; d.did = true; linesDirty = true; rebuildHandles(); endEdit(true); }
+function ctrlSecond(d){
+  const cur = d.cur || d.base, k = d.k, j = cur.ctrl ? jointAt(cur, k) : null;
+  if (j && j.self){   // the two ends of one line meet: it becomes a closed loop
+    const { c, k: kk } = ctrlOf(cur, false); c.splice(c.length - 3, 3); kk.pop(); kk[0] = 0;
+    const n = makeSpline(cur.tag, Float32Array.from(c), true, cur.id, Uint8Array.from(kk)); replaceStroke(n); finishHeld(d); flash('Fused into one closed loop'); return 'done';
+  }
+  if (j){             // two lines end to end: one line, smooth through the joint
+    const A = ctrlOf(cur, k === 0), B = ctrlOf(j.s, j.k !== 0);   // A ends at the joint, B starts there
+    const c = [...A.c, ...B.c.slice(3)], kk = [...A.k.slice(0, -1), 0, ...B.k.slice(1)];
+    const n = makeSpline(cur.tag, Float32Array.from(c), false, cur.id, Uint8Array.from(kk));
+    const ea = cur.ends ? cur.ends[k === 0 ? 1 : 0] : null, eb = j.s.ends ? j.s.ends[j.k === 0 ? 1 : 0] : null; if (ea != null || eb != null) n.ends = [ea ?? null, eb ?? null];
+    strokes = strokes.filter(s => s.id !== j.s.id).map(s => s.id === n.id ? n : s); finishHeld(d); flash('Fused into one line, smooth through the joint. Holding it, the second button twice breaks it again.', 5); return 'done';
+  }
+  if (cur.ctrl && !isEnd(cur, k) && cur.kinks && cur.kinks[k]){   // a sharp corner: break the line here
+    const n0 = cur.ctrl.length / 3; let a, b;
+    if (cur.closed){ const c = [], kk = []; for (let i = 0; i <= n0; i++){ const q = (k + i) % n0; c.push(cur.ctrl[3 * q], cur.ctrl[3 * q + 1], cur.ctrl[3 * q + 2]); kk.push(i === 0 || i === n0 ? 0 : cur.kinks[q]); }
+      a = makeSpline(cur.tag, Float32Array.from(c), false, cur.id, Uint8Array.from(kk)); }
+    else { const { c, k: kk } = ctrlOf(cur, false); const ka = kk.slice(0, k + 1), kb = kk.slice(k); ka[k] = 0; kb[0] = 0;
+      a = makeSpline(cur.tag, Float32Array.from(c.slice(0, 3 * (k + 1))), false, cur.id, Uint8Array.from(ka)); b = makeSpline(cur.tag, Float32Array.from(c.slice(3 * k)), false, undefined, Uint8Array.from(kb));
+      if (cur.ends){ a.ends = [cur.ends[0], null]; b.ends = [null, cur.ends[1]]; } }
+    strokes = strokes.flatMap(s => s.id === cur.id ? (b ? [a, b] : [a]) : [s]); finishHeld(d); flash(b ? 'Broken into two lines. Hold the joint and press the second button to fuse them again.' : 'Loop opened here', 5); return 'done';
+  }
+  ctrlCorner(d); return 'held';
+}
 // grab a strict line between its points: a new point is added there
 function insertGrab(line, p){
   beginEdit(); const [n, k] = addPoint(line.s, line.i); replaceStroke(n); rebuildHandles();
@@ -991,21 +1028,32 @@ let libPage = 0, libDel = null, libDelT = 0, libCache = null;
 function libList(){ if (libCache) return libCache; try { libCache = JSON.parse(localStorage.getItem(LIB)) || []; } catch (e) { libCache = []; } return libCache; }
 function libWrite(l){ libCache = l; localStorage.setItem(LIB, JSON.stringify(l)); menuDirty = true; }
 function sketchData(name){ const set = {}; SKETCH_SET.forEach(k => set[k] = S[k]); return { app: 'pentimento', v: VERSION, name, strokes: packStrokes(), dabs: packDabs(), set }; }
+let curSk = null;     // the library sketch you opened or last saved, so saving again can offer to overwrite it
 function saveSketch(){
   if (!strokes.length) return flash('Nothing to save yet');
-  const l = libList().slice(), no = l.reduce((m, e) => Math.max(m, e.no || 0), 0) + 1, name = 'Sketch ' + no, id = Date.now().toString(36);
-  try { localStorage.setItem(libKey(id), JSON.stringify(sketchData(name))); l.unshift({ id, name, no, t: Date.now(), n: strokes.length }); libWrite(l); libPage = 0; flash('Saved as ' + name + ' (Files tab)'); }
-  catch (e){ try { localStorage.removeItem(libKey(id)); } catch (_){} flash('This browser is out of room. Delete old sketches, or use Download file.'); }
+  const e = curSk && libList().find(x => x.id === curSk.id);
+  if (e) return askUser('Save over ' + e.name + '?', [{ label: 'Overwrite', act: () => saveSketchAs(e) }, { label: 'Save new', act: () => saveSketchAs(null) }, { label: 'Cancel', act: () => {} }]);
+  saveSketchAs(null);
 }
+function saveSketchAs(over){
+  const l = libList().slice(), no = over ? over.no : l.reduce((m, e) => Math.max(m, e.no || 0), 0) + 1, name = over ? over.name : 'Sketch ' + no, id = over ? over.id : Date.now().toString(36);
+  try { localStorage.setItem(libKey(id), JSON.stringify(sketchData(name))); const row = { id, name, no, t: Date.now(), n: strokes.length };
+    libWrite([row, ...l.filter(x => x.id !== id)]); libPage = 0; curSk = { id, name }; flash((over ? 'Saved over ' : 'Saved as ') + name + ' (Files tab)'); }
+  catch (e){ if (!over) try { localStorage.removeItem(libKey(id)); } catch (_){} flash('This browser is out of room. Delete old sketches, or use Download file.'); }
+}
+// a question on the menu with a few answers (the rest of the menu waits until you pick one)
+let ask = null;
+function askUser(text, items){ ask = { text, items }; setMenuShown(true); menuDirty = true; }
 function useSketch(o, name){
   if (!o || !Array.isArray(o.strokes)) return flash('That isn\'t a Pentimento sketch');
+  curSk = null;
   let next; try { next = unpackStrokes(o.strokes); } catch (e){ return flash('Could not read that sketch'); }
   if (o.set) SKETCH_SET.forEach(k => { if (o.set[k] !== undefined) S[k] = o.set[k]; });
   commit(next, unpackDabs(o.dabs)); rebuildHandles();
   if (!renderer.xr.isPresenting) needsFit = true; else { const xc = renderer.xr.getCamera(), p = new V3(), q = new THREE.Quaternion(); xc.getWorldPosition(p); xc.getWorldQuaternion(q); fitView({ p, q }); }
   flash('Opened ' + (name || 'sketch') + '. Undo brings back what you had.');
 }
-function loadSketch(e){ let o = null; try { o = JSON.parse(localStorage.getItem(libKey(e.id))); } catch (_){} if (!o) return flash('That sketch is missing'); useSketch(o, e.name); }
+function loadSketch(e){ let o = null; try { o = JSON.parse(localStorage.getItem(libKey(e.id))); } catch (_){} if (!o) return flash('That sketch is missing'); useSketch(o, e.name); curSk = { id: e.id, name: e.name }; }
 function deleteSketch(e){
   if (libDel !== e.id){ libDel = e.id; libDelT = 3; menuDirty = true; return flash('Press Sure? to delete ' + e.name + ' for good'); }
   try { localStorage.removeItem(libKey(e.id)); } catch (_){} libWrite(libList().filter(x => x.id !== e.id)); libDel = null;
@@ -1100,11 +1148,14 @@ function fitView(head){
 // ======================================================================
 // Menu: a palette on your left controller (on a computer it sits at the right edge of the screen)
 // ======================================================================
-const MW = 1024, MH = 1460, menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH;
+const MW = 1024, MH = 1560, menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH;
 const mctx = menuCanvas.getContext('2d'), menuTex = new THREE.CanvasTexture(menuCanvas); menuTex.colorSpace = THREE.SRGBColorSpace; menuTex.anisotropy = 4;
 const MENU_W = 0.23, MENU_H = MENU_W * MH / MW;
 const menuMesh = new THREE.Mesh(new THREE.PlaneGeometry(MENU_W, MENU_H), new THREE.MeshBasicMaterial({ map: menuTex, transparent: true, side: THREE.DoubleSide }));
 menuMesh.position.set(0, 0.07 + MENU_H / 2 * Math.cos(0.55), -0.02 - MENU_H / 2 * Math.sin(0.55)); menuMesh.rotation.x = -0.55; menuMesh.visible = false;
+// the control points draw through the surface so you can always grab them; a second copy of the menu drawn after
+// them (depth-tested) covers the ones behind the menu, while anything in front of it (your hand) still shows
+{ const occ = new THREE.Mesh(menuMesh.geometry, menuMesh.material); occ.renderOrder = 14; menuMesh.add(occ); }
 let menuOpen = true, layoutKey = '', menuCropH = MH;
 let menuDirty = true, menuHover = null, menuPressed = null, flashText = '', flashT = 0, menuTab = 'sketch', menuShown = true, clearArmed = 0;
 const flashLog = [], errLog = [];
@@ -1122,7 +1173,7 @@ function backToGood(){
 }
 function clearAll(){
   if (clearArmed <= 0){ clearArmed = 3; flash('Press Clear all again to wipe every line'); return; }
-  clearArmed = 0; commit([], []); flash('Cleared. Undo brings it back.');
+  clearArmed = 0; curSk = null; commit([], []); flash('Cleared. Undo brings it back.');
 }
 function loadSample(){
   const seed = +new URLSearchParams(location.search).get('seed') || Math.floor(Math.random() * 1000);
@@ -1145,6 +1196,8 @@ function loadSample(){
     add({ tab, style: 'step', x: px, y: y + 8, w: bs, h: bs, label: () => '+', act: () => { inc(); menuDirty = true; }, ...f });
   };
   const moreBtn = (tab, y) => add({ tab, id: 'more-' + tab, x: P, y, w: MW - 2 * P, h: 60, styleOnly: true, label: () => S.more ? 'Fewer settings ▴' : 'More settings ▾', act: () => { S.more = S.more ? 0 : 1; scheduleSave(); } });
+  // the question box (askUser): three answers
+  for (let i = 0; i < 3; i++){ const w = (MW - 2 * P - 2 * G) / 3; add({ id: 'ask-' + i, modal: true, x: P + i * (w + G), y: 420, w, h: 100, style: i === 0 ? 'lock' : undefined, on: () => i === 0, vis: () => !!(ask && ask.items[i]), label: () => ask && ask.items[i] ? ask.items[i].label : '', act: () => { const it = ask.items[i]; ask = null; it.act(); } }); }
   // in the title bar: a newer version is out
   add({ id: 'update', x: MW - 44 - 250 - 14 - 210, y: 22, w: 210, h: 76, style: 'lock', on: () => true, vis: () => !!updateTo, label: () => 'Get v' + updateTo, act: doUpdate });
   // in the title bar: see your room or go full VR, without leaving the headset
@@ -1154,8 +1207,8 @@ function loadSample(){
   add({ id: 'build', x: P, y: 112, w: goW, h: 116, style: 'big', label: () => building ? 'BUILDING' : 'BUILD', sub: () => building ? Math.round(buildP * 100) + '%' + (pending ? ' · more queued' : '') : buildErr ? 'failed · press to retry' : S.surf === 'hide' ? 'surface is off' : stale ? 'lines changed' : hasSurface() ? 'up to date' : 'make the surface',
     act: () => { if (S.surf === 'hide') setSurfView(S.surfWas || 'shaded'); startBuild(); } });
   const xs = P + goW + G, wr = (MW - P - xs - 3 * G) / 4;
-  [{ id: 'undo', label: () => 'Undo', sub: () => 'X', act: undo },
-   { id: 'redo', label: () => canGoBack() ? 'Last good' : 'Redo', sub: () => canGoBack() ? 'Y · go back' : 'Y', style: 'lock', on: () => canGoBack(), act: () => canGoBack() ? backToGood() : redo() },
+  [{ id: 'undo', label: () => 'Undo', sub: () => mainHand() === 'right' ? 'X' : 'A', act: undo },
+   { id: 'redo', label: () => canGoBack() ? 'Last good' : 'Redo', sub: () => { const y = mainHand() === 'right' ? 'Y' : 'B'; return canGoBack() ? y + ' · go back' : y; }, style: 'lock', on: () => canGoBack(), act: () => canGoBack() ? backToGood() : redo() },
    { id: 'lines', label: () => 'Lines', sub: () => S.lines === 'hide' ? 'hidden' : 'showing', on: () => S.lines !== 'hide', act: toggleLines },
    { id: 'surface', label: () => 'Surface', sub: () => S.surf === 'hide' ? 'off' : 'on', on: () => S.surf !== 'hide', act: toggleSurface }]
     .forEach((b, i) => add(Object.assign({ x: xs + i * (wr + G), y: 112, w: wr, h: 116 }, b)));
@@ -1201,6 +1254,8 @@ function loadSample(){
   row('view', 1084, 72, EDGES.map(v => ({ id: 'edges-' + v, label: () => EDGE_NAME[v], on: () => S.edges === v, act: () => setEdges(v) })));
   text({ tab: 'view', kind: 'label', x: P, y: 1180, text: () => 'MENU STYLE' });
   row('view', 1202, 72, MENU_STYLES.map(v => ({ id: 'menu-' + v, label: () => MENU_STYLE_NAME[v], on: () => S.menuStyle === v, act: () => { S.menuStyle = v; menuOpen = true; scheduleSave(); flash(MENU_STYLE_NOTE[v], 5); } })));
+  text({ tab: 'view', kind: 'label', x: P, y: 1298, text: () => 'MAIN HAND · THE OTHER ONE HOLDS THE MENU' });
+  row('view', 1320, 72, [['right', 'Right hand'], ['left', 'Left hand']].map(([v, n]) => ({ id: 'hand-' + v, label: () => n, on: () => mainHand() === v, act: () => { S.mainHand = v; placeMenuHand(); scheduleSave(); flash(n + ' draws. The menu is on your ' + (v === 'right' ? 'left' : 'right') + ' hand.'); } })));
   row('view', 956, 80, [{ id: 'pts-show', label: () => 'Show', on: () => !!S.ptsShow, act: () => { S.ptsShow = 1; rebuildHandles(); scheduleSave(); } },
     { id: 'pts-hide', label: () => 'Hide', on: () => !S.ptsShow, act: () => { S.ptsShow = 0; rebuildHandles(); scheduleSave(); } }]);
   // LAYERS: one row per line type, with show and lock
@@ -1314,6 +1369,7 @@ const tipsCanvas = document.createElement('canvas'); tipsCanvas.width = MW; tips
 const tipsTex = new THREE.CanvasTexture(tipsCanvas); tipsTex.colorSpace = THREE.SRGBColorSpace; tipsTex.anisotropy = 4;
 const tipsMesh = new THREE.Mesh(new THREE.PlaneGeometry(MENU_W, MENU_H), new THREE.MeshBasicMaterial({ map: tipsTex, transparent: true, side: THREE.DoubleSide }));
 tipsMesh.position.set(-MENU_W - 0.012, 0, 0); tipsMesh.visible = false; menuMesh.add(tipsMesh);
+{ const occ = new THREE.Mesh(tipsMesh.geometry, tipsMesh.material); occ.renderOrder = 14; tipsMesh.add(occ); }
 function drawTips(){
   const g = tipsCanvas.getContext('2d'); g.clearRect(0, 0, MW, MH);
   rr2(g, 0, 0, MW, MH, 48); g.fillStyle = '#1F2227'; g.fill();
@@ -1350,7 +1406,7 @@ function relayout(){
 }
 // how tall the menu needs to be right now: the header, the open tab's content, and the message line
 const FOOT = () => (S.menuStyle || 'full') === 'full' ? 184 : 118;
-function contentBottom(){ let b = 324; for (const e of [...BTN, ...TXT]){ if (!visibleEl(e) || !e.tab) continue; b = Math.max(b, extent(e)[1]); } if (S.menuStyle === 'compact' && !menuOpen) b = 384; return b; }
+function contentBottom(){ let b = ask ? 560 : 324; for (const e of [...BTN, ...TXT]){ if (!visibleEl(e) || !e.tab) continue; b = Math.max(b, extent(e)[1]); } if (S.menuStyle === 'compact' && !menuOpen) b = 384; return b; }
 function setMenuCrop(h){
   if (h === menuCropH) return; menuCropH = h; const f = h / MH, H = MENU_H * f;
   menuMesh.scale.y = f; menuMesh.position.set(0, 0.07 + H / 2 * Math.cos(0.55), -0.02 - H / 2 * Math.sin(0.55));
@@ -1374,8 +1430,7 @@ function drawMenu(){
   const w1 = g.measureText('PENTI').width, w2 = g.measureText('MENTO').width; g.fillStyle = '#FF8A1F'; g.fillText('MENTO', 44 + w1, 62);
   g.font = '500 26px "IBM Plex Mono",monospace'; g.fillStyle = '#6B7480'; g.fillText('v' + VERSION, 44 + w1 + w2 + 18, 66);
   for (const t of TXT) if (visibleEl(t) && t.kind === 'panel'){ rr2(g, t.x, t.y, t.w, t.h, 20); g.fillStyle = '#272A30'; g.fill(); }
-  for (const b of BTN){
-    if (!visibleEl(b)) continue;
+  const drawBtn = b => {
     const on = b.on && b.on(), hot = menuHover === b, pr = menuPressed === b;
     rr2(g, b.x, b.y, b.w, b.h, b.style === 'step' ? 14 : 22);
     g.fillStyle = b.style === 'big' ? '#FF8A1F' : b.style === 'danger' ? (hot ? '#F04348' : '#B3262B') : on && b.style === 'lock' ? '#FFD23F' : on ? '#EEF0F3' : b.style === 'step' ? (hot ? '#4A4F59' : '#383D46') : hot ? '#383D46' : '#2A2E35';
@@ -1401,7 +1456,8 @@ function drawMenu(){
       while (g.measureText(b.label()).width > b.w - 18 && fs > 18){ fs--; g.font = `700 ${fs}px "Archivo",sans-serif`; }
       g.fillText(b.label(), cx, cy + 2);
     }
-  }
+  };
+  for (const b of BTN) if (!b.modal && visibleEl(b)) drawBtn(b);
   for (const t of TXT){
     if (!visibleEl(t) || t.kind === 'panel') continue;
     if (t.kind === 'label'){ g.textAlign = 'left'; g.font = '500 25px "IBM Plex Mono",monospace'; g.fillStyle = '#9AA2AD'; g.fillText(t.text(), t.x, t.y); }
@@ -1413,14 +1469,20 @@ function drawMenu(){
     else if (t.kind === 'layer'){ const pt = t.tag === 'paint'; g.textAlign = 'left'; g.fillStyle = pt ? '#5FE0B8' : TAG_CSS[t.tag]; rr2(g, t.x, t.y - 7, 54, 14, 7); g.fill();
       g.font = '600 31px "Archivo",sans-serif'; g.fillStyle = (pt ? S.paintShow : S.show[t.tag]) ? '#EEF0F3' : '#6B7480'; g.fillText(t.text(), t.x + 72, t.y); }
   }
+  if (ask){
+    g.fillStyle = 'rgba(23,25,29,.88)'; g.fillRect(0, 104, MW, CH - 104 - FOOT() + 10);
+    rr2(g, 24, 250, MW - 48, 300, 32); g.fillStyle = '#2A2E35'; g.fill(); g.lineWidth = 4; g.strokeStyle = '#FF8A1F'; g.stroke();
+    g.textAlign = 'center'; g.fillStyle = '#EEF0F3'; g.font = '700 40px "Archivo",sans-serif'; g.fillText(ask.text, MW / 2, 340);
+    for (const b of BTN) if (b.modal && visibleEl(b)) drawBtn(b);
+  }
   g.textAlign = 'left'; g.font = '500 28px "IBM Plex Mono",monospace';
   const fy = CH - FOOT() + 40, ft = flashT > 0 ? flashText : nextStep();
   g.fillStyle = flashT > 0 ? '#FF8A1F' : '#EEF0F3'; g.font = '500 27px "IBM Plex Mono",monospace';
   { const words = ft.split(' '), ls = []; let l = ''; for (const w of words){ const t = l ? l + ' ' + w : w; if (g.measureText(t).width > MW - 88 && l){ ls.push(l); l = w; } else l = t; } if (l) ls.push(l);
     if (ls.length > 2){ ls.length = 2; ls[1] = ls[1].replace(/\s*\S*$/, '…'); } ls.forEach((t, i) => g.fillText(t, 44, fy + i * 34)); }
   if ((S.menuStyle || 'full') === 'full'){ g.fillStyle = '#6B7480'; g.font = '500 23px "IBM Plex Mono",monospace';
-    g.fillText('tap A: draw · hold A: tool dial · hold B: panel dial · X/Y: undo/redo', 44, fy + 78);
-    g.fillText('grip: move points or the model · stick ← →: line type · ↑ ↓: brush', 44, fy + 112); }
+    { const R = mainHand() === 'right', a = R ? 'A' : 'X', b = R ? 'B' : 'Y', u = R ? 'X/Y' : 'A/B'; g.fillText(`tap ${a}: draw · hold ${a}: tools · hold ${b}: panels · ${u}: undo/redo`, 44, fy + 78); }
+    g.fillText('other trigger: tap menu · hold panels · grip: points or model', 44, fy + 112); }
   menuTex.needsUpdate = true;
 }
 function nextStep(){
@@ -1430,7 +1492,7 @@ function nextStep(){
   if (stale && !S.auto) return 'Press Build to update the surface';
   return 'Keep sketching. Overlap as much as you like.';
 }
-function menuButtonAt(uv, H){ relayout(); const x = uv.x * MW, y = (1 - uv.y) * (H || MH); return BTN.find(b => visibleEl(b) && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) || null; }
+function menuButtonAt(uv, H){ relayout(); const x = uv.x * MW, y = (1 - uv.y) * (H || MH); return BTN.find(b => visibleEl(b) && (!ask || b.modal) && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) || null; }
 function pressMenu(b){ menuPressed = b; b.act(); menuDirty = true; setTimeout(() => { menuPressed = null; menuDirty = true; }, 140); }
 if (document.fonts) document.fonts.ready.then(() => { menuDirty = true; if (S.tips) drawTips(); });
 
@@ -1506,17 +1568,41 @@ const PEN = 0.045;
 const _o = new V3(), _dir = new V3(), _q = new THREE.Quaternion(), _tw = new V3();
 const hands = [0, 1].map(i => {
   const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
-  grip.add(modelFactory.createControllerModel(grip)); scene.add(ray, grip);
+  const model = modelFactory.createControllerModel(grip); grip.add(model); scene.add(ray, grip);
   const beam = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xFF8A1F, transparent: true, opacity: 0.85 }));
   beam.visible = false; ray.add(beam);
   const tip = new THREE.Mesh(new THREE.SphereGeometry(0.005, 16, 12), new THREE.MeshBasicMaterial({ color: TAG_COL[0] })); tip.position.z = -PEN; ray.add(tip);
   const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.001, 0.001, PEN, 6), new THREE.MeshBasicMaterial({ color: 0x9AA2AD })); stem.rotation.x = Math.PI / 2; stem.position.z = -PEN / 2; ray.add(stem);
   const brush = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.MeshBasicMaterial({ color: 0xFFFFFF, wireframe: true, transparent: true, opacity: 0.35 })); brush.visible = false; scene.add(brush);
-  const h = { i, ray, grip, beam, tip, stem, brush, source: null, hand: '', prev: [], flick: 0, act: null, grab: false, sizeT: 0 };
-  ray.addEventListener('connected', e => { h.source = e.data; h.hand = e.data.handedness; if (h.hand === 'left'){ grip.add(menuMesh); menuMesh.visible = menuShown; } });
+  const h = { i, ray, grip, model, beam, tip, stem, brush, source: null, hand: '', prev: [], flick: 0, act: null, grab: false, sizeT: 0 };
+  ray.addEventListener('connected', e => { h.source = e.data; h.hand = e.data.handedness; h.decor = false; placeMenuHand(); });
   ray.addEventListener('disconnected', () => { if (dial && dial.h === h) closeDial(false); h.ctrlGrip = false; if (h.act){ toolUp(h.i, h.act); h.act = null; } if (h.grab){ h.grab = false; grabReset(); } if (menuMesh.parent === grip){ grip.remove(menuMesh); menuMesh.visible = false; } h.source = null; });
   return h;
 });
+const mainHand = () => S.mainHand === 'left' ? 'left' : 'right';
+const isOff = h => !!h.hand && h.hand !== mainHand();
+// the menu rides on the hand that doesn't draw
+function placeMenuHand(){ const h = hands.find(isOff); if (h){ if (menuMesh.parent !== h.grip) h.grip.add(menuMesh); } else if (menuMesh.parent) menuMesh.parent.remove(menuMesh); menuDirty = true; }
+// the undo button on the controller: red, with a back arrow (redo gets a small forward arrow)
+function arrowSprite(back, red){
+  const c = document.createElement('canvas'); c.width = c.height = 128; const g = c.getContext('2d');
+  g.beginPath(); g.arc(64, 64, 60, 0, 7); g.fillStyle = red ? '#F04348' : '#383D46'; g.fill();
+  g.strokeStyle = '#ffffff'; g.lineWidth = 13; g.lineCap = g.lineJoin = 'round'; g.save(); if (!back){ g.translate(128, 0); g.scale(-1, 1); }
+  g.beginPath(); g.arc(68, 70, 26, Math.PI * 1.05, Math.PI * 0.45, true); g.stroke(); g.beginPath(); g.moveTo(30, 40); g.lineTo(40, 66); g.lineTo(62, 52); g.stroke(); g.restore();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true })); sp.scale.set(0.011, 0.011, 1); sp.renderOrder = 15; return sp;
+}
+function decorateButtons(h){
+  if (h.decor || !h.model || !h.hand) return; const mc = h.model.motionController; if (!mc || !h.model.children.length) return;
+  for (const o of h.decorObjs || []) o.parent && o.parent.remove(o); h.decorObjs = []; h.decor = true;
+  if (!isOff(h)) return;
+  const ids = h.hand === 'left' ? ['x-button', 'y-button'] : ['a-button', 'b-button'];
+  ids.forEach((id, i) => { const comp = mc.components && mc.components[id], root = comp && comp.rootNodeName ? h.model.getObjectByName(comp.rootNodeName) : null; if (!root) return;
+    if (i === 0) root.traverse(o => { if (o.isMesh && o.material){ o.material = o.material.clone(); if (o.material.color) o.material.color.set(0xF04348); if (o.material.emissive) o.material.emissive.set(0x3A0A0B); } });
+    h.grip.updateMatrixWorld(true); const b = new THREE.Box3().setFromObject(root); if (b.isEmpty()) return;
+    const cw = b.getCenter(new V3()); cw.y = b.max.y; const local = h.grip.worldToLocal(cw.clone());
+    const sp = arrowSprite(i === 0, i === 0); sp.position.copy(local).add(new V3(0, 0.006, 0)); if (i) sp.scale.multiplyScalar(0.75); h.grip.add(sp); h.decorObjs.push(sp); });
+}
 function pulse(h, k = 0.4, ms = 18){ try { h.source?.gamepad?.hapticActuators?.[0]?.pulse(k, ms); } catch (e) {} }
 function penWorld(h){ h.ray.getWorldPosition(_o); h.ray.getWorldQuaternion(_q); _dir.set(0, 0, -1).applyQuaternion(_q); return _tw.copy(_o).addScaledVector(_dir, PEN).clone(); }
 const toPark = w => world.worldToLocal(w.clone());
@@ -1643,12 +1729,12 @@ function drawDial(){
   g.fillStyle = '#6B7480'; g.font = '500 20px "IBM Plex Mono",monospace'; g.fillText(h ? 'let go to pick' : 'push the stick', c, c + 24);
   dialTex.needsUpdate = true;
 }
-function openDial(h, kind, pw){
+function openDial(h, kind, pw, btn = 5){
   const head = renderer.xr.getCamera().getWorldPosition(new V3()), up = new V3(0, 1, 0);
   const toHead = head.clone().sub(pw); toHead.y = 0; if (toHead.lengthSq() < 1e-6) toHead.set(0, 0, 1); toHead.normalize();
   dialMesh.position.copy(pw).addScaledVector(toHead, 0.03).addScaledVector(up, 0.09);
   dialMesh.lookAt(head); dialMesh.visible = true;
-  dial = { kind, h, t0: performance.now(), items: dialItems(kind), hover: -1, p0: pw.clone(), right: new V3(1, 0, 0).applyQuaternion(dialMesh.quaternion), up: new V3(0, 1, 0).applyQuaternion(dialMesh.quaternion) };
+  dial = { kind, h, btn, t0: performance.now(), items: dialItems(kind), hover: -1, p0: pw.clone(), right: new V3(1, 0, 0).applyQuaternion(dialMesh.quaternion), up: new V3(0, 1, 0).applyQuaternion(dialMesh.quaternion) };
   if (h && h.act){ toolUp(h.i, h.act); h.act = null; }
   drawDial(); pulse(h, 0.3, 15);
 }
@@ -1675,9 +1761,9 @@ function hintSprite(){ const c = document.createElement('canvas'); c.width = 512
 const hints = [hintSprite(), hintSprite()];
 function pointHint(h, pw, left){
   const sp = hints[h.i]; if (!pw){ sp.visible = false; return; }
-  const txt = left ? 'X delete point · Y sharp corner' : 'A delete point · B sharp corner';
+  const [a, b] = left ? ['X', 'Y'] : ['A', 'B'], txt = a + ' delete point · ' + b + ' ' + (h.act ? secondLabel(h.act) : 'sharp corner');
   if (sp.userData.txt !== txt){ const g = sp.userData.c.getContext('2d'); g.clearRect(0, 0, 512, 96); g.fillStyle = 'rgba(23,25,29,.9)'; g.beginPath(); g.roundRect(4, 8, 504, 80, 40); g.fill();
-    g.fillStyle = '#EEF0F3'; g.font = '600 32px "Archivo",sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(txt, 256, 50); sp.userData.t.needsUpdate = true; sp.userData.txt = txt; }
+    g.fillStyle = '#EEF0F3'; let fs = 32; g.font = `600 ${fs}px "Archivo",sans-serif`; while (g.measureText(txt).width > 480 && fs > 20){ fs--; g.font = `600 ${fs}px "Archivo",sans-serif`; } g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(txt, 256, 50); sp.userData.t.needsUpdate = true; sp.userData.txt = txt; }
   sp.visible = true; sp.position.copy(pw).add(new V3(0, 0.035, 0));
 }
 function updateXRInput(dt){
@@ -1690,6 +1776,7 @@ function updateXRInput(dt){
     const gp = h.source && h.source.gamepad;
     h.tip.visible = h.stem.visible = !!gp; h.beam.visible = false; h.brush.visible = false;
     if (!gp) continue;
+    if (!h.decor) decorateButtons(h);
     const pressed = i => !!(gp.buttons[i] && gp.buttons[i].pressed), down = i => pressed(i) && !h.prev[i], up = i => !pressed(i) && h.prev[i];
     h.ray.getWorldPosition(_o); _dir.set(0, 0, -1).applyQuaternion(h.ray.getWorldQuaternion(_q)).normalize();
     // pointing at the menu?
@@ -1723,7 +1810,13 @@ function updateXRInput(dt){
     if (up(1) && h.grab){ h.grab = false; grabReset(); }
     const held = h.ctrlGrip ? 1 : 0;      // which button keeps the current action going
     // trigger: menu button, or the tool
-    if (down(0) && !h.grab && !myDial){
+    if (isOff(h)){
+      // off hand: tap the trigger to show or hide the menu, hold it for the panel dial (let go on a panel to open it)
+      if (down(0) && !dial){ h.trigT = performance.now(); h.trigDial = false; }
+      if (h.trigT && pressed(0) && !h.trigDial && !dial && performance.now() - h.trigT > 280){ openDial(h, 'panel', pw, 0); h.trigDial = true; }
+      if (up(0) && h.trigT){ if (!h.trigDial){ setMenuShown(!menuShown); pulse(h, 0.2, 10); } h.trigT = 0; }
+    }
+    else if (down(0) && !h.grab && !myDial){
       if (mHit && mHit.b){ pressMenu(mHit.b); pulse(h, 0.5, 20); }
       else if (!mHit && !h.act){ h.act = toolDown(h.i, p, null); pulse(h, 0.25, 10); }
     }
@@ -1746,22 +1839,23 @@ function updateXRInput(dt){
     h.brush.material.opacity = 0.35 + 0.6 * h.flash;
     if (h.act && up(held)){ toolUp(h.i, h.act); h.act = null; h.ctrlGrip = false; }
     // buttons
-    const left = h.hand === 'left';
+    const left = h.hand === 'left', off = isOff(h);
     pointHint(h, h.ctrlGrip && h.act ? pw : null, left);
     if (h.ctrlGrip && h.act){
-      // holding a point: A / X deletes it, B / Y makes it a sharp corner (or smooth again)
+      // holding a point: A / X deletes it; B / Y goes smooth → sharp corner → break the line here, and at a joint
+      // where two lines meet it fuses them into one
       if (down(4)){ ctrlDelete(h.act); h.act = null; h.ctrlGrip = false; pulse(h, 0.7, 30); }
-      else if (down(5)){ ctrlCorner(h.act); pulse(h, 0.5, 20); }
-    } else if (left){
+      else if (down(5)){ if (ctrlSecond(h.act) === 'done'){ h.act = null; h.ctrlGrip = false; } pulse(h, 0.5, 20); }
+    } else if (off){
       if (down(4)){ undo(); pulse(h, 0.3, 15); }
       if (down(5)){ if (canGoBack() && !redoS.length) backToGood(); else redo(); pulse(h, 0.3, 15); }
     } else {
       // right hand: hold A for the tool dial, hold B for the panel dial; let go to pick
-      if (!dial && down(4)) openDial(h, 'tool', pw);
-      else if (!dial && down(5)) openDial(h, S.menuStyle === 'compact' ? 'type' : 'panel', pw);
-      if (dial && dial.h === h && ((dial.kind === 'tool' && !pressed(4)) || (dial.kind !== 'tool' && !pressed(5)))) closeDial(true);
+      if (!dial && down(4)) openDial(h, 'tool', pw, 4);
+      else if (!dial && down(5)) openDial(h, S.menuStyle === 'compact' ? 'type' : 'panel', pw, 5);
     }
-    if (down(3)){ if (left) setMenuShown(!menuShown); else { setTool(S.tool === 'draw' ? 'cut' : 'draw'); flash(TOOL_NAME[S.tool]); } pulse(h, 0.2, 10); }
+    if (dial && dial.h === h && !pressed(dial.btn)) closeDial(true);
+    if (down(3)){ if (off) setMenuShown(!menuShown); else { setTool(S.tool === 'draw' ? 'cut' : 'draw'); flash(TOOL_NAME[S.tool]); } pulse(h, 0.2, 10); }
     // stick: ← → line type, ↑ ↓ brush size
     const ax = gp.axes[2] || 0, ay = gp.axes[3] || 0;
     if (dial && dial.h === h){ /* the stick is steering the dial */ }
@@ -1807,6 +1901,7 @@ renderer.domElement.addEventListener('pointerdown', e => {
   const ray = mouseRay(e);
   renderer.domElement.setPointerCapture(e.pointerId);
   const hh = S.ptsShow && S.lines !== 'hide' ? screenHandle(e) : null;
+  if (hh && e.altKey && !e.shiftKey){ const d = ctrlStart(hh, new V3(), false); if (ctrlSecond(d) === 'held') finishHeld(d); return; }
   if (hh && (e.shiftKey || e.altKey)){ beginEdit(); const tg = e.altKey ? pointToggle(hh.s, hh.k) : null, n = e.shiftKey ? delPoint(hh.s, hh.k) : tg.n;
     if (n) replaceStroke(n); else strokes = strokes.filter(s => s.id !== hh.s.id); linesDirty = true; endEdit(true);
     flash(e.shiftKey ? 'Point deleted' : tg.msg); return; }
@@ -1925,7 +2020,7 @@ setupButtons();
 window.pentimento = { ops: { delPoint: (...a) => delPoint(...a), cornerPoint: (...a) => cornerPoint(...a), addPoint: (...a) => addPoint(...a) }, load(list){ commit(list.map(o => makeStroke(o.tag, Float32Array.from(o.pts), Float32Array.from(o.pts)))); },
   drag(tool, path, brush){ S.tool = tool; if (brush !== undefined) S.brush = brush; const d = toolDown('t', new V3(...path[0])); for (const q of path){ d.dt = 1 / 72; toolMove('t', d, new V3(...q)); } toolUp('t', d); },
   showDial(kind, hover){ const f = camera.getWorldDirection(new V3()); dialMesh.position.copy(camera.position).addScaledVector(f, 0.42); dialMesh.quaternion.copy(camera.quaternion); dialMesh.visible = true; dial = { kind, h: null, items: dialItems(kind), hover }; drawDial(); },
-  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
+  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid(); setTips(!!S.tips); applyLighting(); applyBackground();
 if (strokes.length) scheduleBuild();
 let last = performance.now(), lastLines = 0;
