@@ -128,7 +128,7 @@ function reportPrm(s){ const QUAD = [0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.8, 1
 // ---------------- run
 const basePath = path.join(__dirname, 'baseline.json'), base = fs.existsSync(basePath) ? JSON.parse(fs.readFileSync(basePath, 'utf8')) : {};
 const out = {}; let worse = 0, broke = 0, t0 = Date.now();
-const fmt = (k, v) => k === 'notQuads' || k === 'odd' ? v.toFixed(1) + '%' : k === 'outside' ? (v * 100).toFixed(0) : (v * 100).toFixed(1) + 'cm';
+const fmt = (k, v) => k === 'glitch' ? String(v) : k === 'notQuads' || k === 'odd' ? v.toFixed(1) + '%' : k === 'outside' ? (v * 100).toFixed(0) : (v * 100).toFixed(1) + 'cm';
 for (const [name, make] of CASES){
   if (only.length && !only.some(w => name.toLowerCase().includes(w.toLowerCase()))) continue;
   const c = make(), t = Date.now(); let r, sc;
@@ -139,8 +139,18 @@ for (const [name, make] of CASES){
   { const F = r.quads.F, C = r.quads.C, val = new Map(), cnt = new Map(); let o = 0; for (let f = 0; f < C.length; f++){ const n = C[f]; for (let i = 0; i < n; i++){ const a = F[o + i], b = F[o + (i + 1) % n], k = a < b ? a * 1e7 + b : b * 1e7 + a; cnt.set(k, (cnt.get(k) || 0) + 1); } o += n; }
     const bv = new Set(); for (const [k, c] of cnt){ const a = Math.floor(k / 1e7), b = k % 1e7; val.set(a, (val.get(a) || 0) + 1); val.set(b, (val.get(b) || 0) + 1); if (c === 1){ bv.add(a); bv.add(b); } }
     let inner = 0, odd = 0; for (const [v, d] of val){ if (bv.has(v)) continue; inner++; if (d !== 4) odd++; } sc.odd = inner ? odd / inner * 100 : 0; }
+  // glitches: faces folded back against a neighbour, slivers far smaller than their neighbours, edges shared by 3+ faces
+  { const F = r.quads.F, C = r.quads.C, V = r.quads.V, fn = [], fa = [], ef = new Map(); let o = 0;
+    for (let f = 0; f < C.length; f++){ const n = C[f], ids = []; for (let i = 0; i < n; i++) ids.push(F[o + i]); o += n; const P = i => [V[3 * ids[i]], V[3 * ids[i] + 1], V[3 * ids[i] + 2]], nn = [0, 0, 0];
+      for (let i = 0; i < n; i++){ const p = P(i), q = P((i + 1) % n); nn[0] += (p[1] - q[1]) * (p[2] + q[2]); nn[1] += (p[2] - q[2]) * (p[0] + q[0]); nn[2] += (p[0] - q[0]) * (p[1] + q[1]); }
+      const l = Math.hypot(...nn); fa.push(l / 2); fn.push(nn.map(x => x / (l || 1)));
+      for (let i = 0; i < n; i++){ const a = ids[i], b = ids[(i + 1) % n], k = a < b ? a * 1e7 + b : b * 1e7 + a; (ef.get(k) || ef.set(k, []).get(k)).push(f); } }
+    const med = fa.slice().sort((a, b) => a - b)[fa.length >> 1] || 1; let g = 0;
+    for (const fs of ef.values()){ if (fs.length > 2) g++; else if (fs.length === 2 && fn[fs[0]][0] * fn[fs[1]][0] + fn[fs[0]][1] * fn[fs[1]][1] + fn[fs[0]][2] * fn[fs[1]][2] < -0.2) g++; }
+    for (const a of fa) if (a < med * 0.08) g++;
+    sc.glitch = g; }
   out[name] = sc; const b = base[name], notes = [];
-  for (const [k, v] of Object.entries(sc)){ let s = k + ' ' + fmt(k, v); if (b && b[k] !== undefined){ const d = v - b[k], lim = Math.max(b[k] * 0.25, k === 'notQuads' || k === 'odd' ? 2 : k === 'outside' ? 0.02 : 0.004); if (d > lim){ s += ' ▲ worse (was ' + fmt(k, b[k]) + ')'; worse++; } else if (-d > lim) s += ' ▼ better (was ' + fmt(k, b[k]) + ')'; } notes.push(s); }
+  for (const [k, v] of Object.entries(sc)){ let s = k + ' ' + fmt(k, v); if (b && b[k] !== undefined){ const d = v - b[k], lim = Math.max(b[k] * 0.25, k === 'glitch' ? 2 : k === 'notQuads' || k === 'odd' ? 2 : k === 'outside' ? 0.02 : 0.004); if (d > lim){ s += ' ▲ worse (was ' + fmt(k, b[k]) + ')'; worse++; } else if (-d > lim) s += ' ▼ better (was ' + fmt(k, b[k]) + ')'; } notes.push(s); }
   console.log(name.padEnd(26), notes.join('   '), ' ' + (ms / 1000).toFixed(1) + 's');
 }
 console.log(`\n${Object.keys(out).length} cases in ${((Date.now() - t0) / 1000).toFixed(0)}s · ${broke} failed · ${worse} scores worse than the baseline`);

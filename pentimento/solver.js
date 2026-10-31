@@ -1741,7 +1741,7 @@ function solve(strokes, prm, progress = () => {}){
   
   const simplify = () => { if (prm.target > 0){ const Lo = 2 * Math.sqrt(triArea(M) / prm.target);
     if (Lo > L * 1.2){ progress(0.89, 'Simplifying to about ' + prm.target + ' quads'); Mfit = M.clone(); coarsen(M, Mfit, curves, Lo, L, 14); M.compact(); } } };
-  const fieldQuads = prm.layout !== 'pairs';
+  const fieldQuads = prm.layout === 'field';                 // flowing quads are opt-in (beta)
   if (!fieldQuads) simplify();
   if (guides.length){
     flow = flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h);
