@@ -60,6 +60,13 @@ function corner(seed, mode = 'exact'){ const H = (x, z) => 1.5 - 0.6 * Math.max(
   if (mode === 'turn'){ const p = [...seg(H, [0, -2.2], [0, 0]), ...seg(H, [0, 0], [-2.2, 0]).slice(3)]; st.push({ tag: 4, pts: p }, { tag: 4, pts: seg(H, [0, 0], [2, 2]) }); }
   else st.push(...joins(seed, [[[0, 0, 0], [0, 0, -2.2]], [[0, 0, 0], [-2.2, 0, 0]], [[0, 0, 0], [2, 0, 2]]], mode, on));
   return { st, prm: P, score: hfScore(H, (x, z) => Math.hypot(x, z) < 0.6, 2) }; }
+// a tight round bowl sunk in a deck (lowest curve radius about 0.5 m), at the app's default 40 cm detail
+function bowl(seed, R = 1.4, D = 1.0){ const H = (x, z) => { const r = Math.hypot(x, z); return r < R ? -D * (1 - (r / R) ** 2) ** 2 : 0; }, st = planes(seed, H, 230, 2.4);
+  return { st, prm: { ...P, detail: 0.4, avg: 0.64 }, score: hfScore(H, (x, z) => Math.hypot(x, z) < R * 0.8, 2.4) }; }
+// one crease drawn as two strokes that overlap where they meet, a few cm apart (a fin used to grow between them)
+function overlap(seed, gap = 0.05){ const H = (x, z) => 1.2 - 0.7 * Math.max(0, x), st = planes(seed, H, 170, 2);
+  st.push({ tag: 4, pts: seg(H, [0, -2.2], [0, 0.35]) }, { tag: 4, pts: seg((x, z) => H(x, z), [gap, -0.3], [gap * 0.6, 2.2]) });
+  return { st, prm: P, score: hfScore(H, (x, z) => Math.abs(x) < 0.6 && Math.abs(z) < 0.8, 2) }; }
 function apex(seed, nf){ const U = []; for (let i = 0; i < nf; i++){ const a = i * 2 * Math.PI / nf; U.push([Math.cos(a), Math.sin(a)]); }
   const H = (x, z) => Math.max(0.2, 1.6 - 0.8 * Math.max(...U.map(u => u[0] * x + u[1] * z))), st = planes(seed, H, 170, 2);
   for (let i = 0; i < nf; i++){ const a = (i + 0.5) * 2 * Math.PI / nf, L = 1.6 / Math.cos(Math.PI / nf) * 0.95; st.push({ tag: 4, pts: seg(H, [0, 0], [Math.cos(a) * L, Math.sin(a) * L]) }); }
@@ -122,6 +129,8 @@ for (const sd of [1, 2]){
   CASES.push(['deck corner #' + sd, () => corner(sd)], ['3-way apex #' + sd, () => apex(sd, 3)], ['4-way apex #' + sd, () => apex(sd, 4)], ['L-ledge inside corner #' + sd, () => ledge(sd)]);
 }
 for (const m of ['loose', 'avg']) CASES.push(['deck corner, ' + m + ' joins', () => corner(1, m)], ['L-ledge, ' + m + ' joins', () => ledge(1, m)]);
+CASES.push(['sample sketch #3, 20 cm', () => { const c = demo(3); c.prm = { ...c.prm, detail: 0.2, avg: 0.32 }; return c; }], ['sample sketch #7, 25 cm', () => { const c = demo(7); c.prm = { ...c.prm, detail: 0.25, avg: 0.4 }; return c; }]);
+CASES.push(['tight bowl #1', () => bowl(1)], ['tight bowl #2', () => bowl(2, 1.1, 0.8)], ['crease overlap 5cm', () => overlap(1, 0.05)], ['crease overlap 12cm', () => overlap(2, 0.12)]);
 CASES.push(['deck corner, line turns', () => corner(2, 'turn')]);
 for (const sd of [1, 3, 4]) CASES.push(['hand guides ×4 #' + sd, () => handGuides(sd, -2)], ['hand guides ×16 #' + sd, () => handGuides(sd, -1)]);
 CASES.push(['half pipe', () => halfpipe(3)], ['ridge', () => ridge(5)], ['sample sketch #7', () => demo(7)], ['sample sketch #3', () => demo(3)], ['edge loop', () => edgeLoop(4)], ['guide layout', () => guideLayout(7)]);

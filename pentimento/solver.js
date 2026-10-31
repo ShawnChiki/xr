@@ -453,8 +453,36 @@ function patchLabels(M, curves, samples, L){
   return { vp, sp };
 }
 // ---------------- the crease network
+// A line drawn over the end of another (a second stroke that overlaps where the two meet, a few cm off) would
+// close a paper-thin sliver between two sharp lines, and the surface grows a fin there. The bit of a line that
+// runs alongside another is dropped, so the two meet end to end; a line that runs alongside along its whole
+// length is a second pass over the same crease and is dropped.
+function trimOverlaps(curves, L, tol){
+  const t = Math.min(tol, Math.max(0.12, L * 0.55)), t2 = t * t, out = curves.slice(), step = Math.max(0.02, t * 0.25);
+  const copy = (C, pts) => { const N = makeCurve(pts, false, C.sharp, C.tag); for (const k in C) if (!(k in N)) N[k] = C[k]; return N; };
+  for (let pass = 0; pass < 2; pass++) for (let bi = 0; bi < out.length; bi++){
+    let B = out[bi]; if (!B || B.closed || B.len < step * 2) continue;
+    for (const atEnd of [0, 1]){
+      B = out[bi]; if (!B) break;
+      // how far from this end the line stays beside some other line
+      let best = 0;
+      for (let ai = 0; ai < out.length; ai++){ const A = out[ai]; if (ai === bi || !A) continue;
+        let s = 0; while (s <= B.len){ const q = pointAt(B, atEnd ? B.len - s : s); if (closestOnPoly(A, q).d2 > t2) break; s += step; }
+        // the strict line keeps its shape when an averaged one overlaps it, so trim the averaged one
+        if (s > best && !(B.strict && !A.strict && s < B.len)) best = s; }
+      if (best < t * 1.5) continue;
+      if (best >= B.len - step){ out[bi] = null; break; }
+      const keep = [], cut = atEnd ? B.len - best : best;
+      if (atEnd){ for (let i = 0; i < B.pts.length && B.cum[i] < cut; i++) keep.push(B.pts[i]); keep.push(pointAt(B, cut)); }
+      else { keep.push(pointAt(B, cut)); for (let i = 0; i < B.pts.length; i++) if (B.cum[i] > cut) keep.push(B.pts[i]); }
+      if (keep.length >= 2) out[bi] = copy(B, keep);
+    }
+  }
+  return out.filter(Boolean);
+}
 function creaseNetwork(curves, L, g){
   const tol = Math.max(L * 0.8, Math.min(g, 0.3));
+  curves = trimOverlaps(curves, L, tol);
   const ends = []; curves.forEach((C, ci) => { if (!C.closed && C.pts.length >= 2) ends.push({ ci, at: 0, p: C.pts[0] }, { ci, at: 1, p: C.pts[C.pts.length - 1] }); });
   // ends that nearly meet
   const par = ends.map((_, i) => i), fd = i => par[i] === i ? i : (par[i] = fd(par[i]));
@@ -559,6 +587,19 @@ function creaseSides(curves, samples, h, L){
   return { near, sideOf, rho };
 }
 const C_closed = C => !!(C && C.closed);
+const FA6 = new Float64Array(36), FY6 = new Float64Array(6), FC6 = new Float64Array(6), PH6 = new Float64Array(6), X6 = new Float64Array(6), SA6 = new Float64Array(36);
+// solve the n×n system A x = y (n ≤ 6) by elimination with pivoting; false when it's singular
+function solve6(A, y, n, x){
+  const M = SA6; for (let i = 0; i < 36; i++) M[i] = A[i]; for (let i = 0; i < n; i++) x[i] = y[i];
+  for (let c = 0; c < n; c++){
+    let p = c, bv = Math.abs(M[c * 6 + c]); for (let r = c + 1; r < n; r++){ const v = Math.abs(M[r * 6 + c]); if (v > bv){ bv = v; p = r; } }
+    if (bv < 1e-14) return false;
+    if (p !== c){ for (let k = 0; k < n; k++){ const t = M[c * 6 + k]; M[c * 6 + k] = M[p * 6 + k]; M[p * 6 + k] = t; } const t = x[c]; x[c] = x[p]; x[p] = t; }
+    for (let r = c + 1; r < n; r++){ const f = M[r * 6 + c] / M[c * 6 + c]; if (!f) continue; for (let k = c; k < n; k++) M[r * 6 + k] -= f * M[c * 6 + k]; x[r] -= f * x[c]; }
+  }
+  for (let c = n - 1; c >= 0; c--){ let s = x[c]; for (let k = c + 1; k < n; k++) s -= M[c * 6 + k] * x[k]; x[c] = s / M[c * 6 + c]; }
+  return true;
+}
 function fitStep(M, samples, curves, o){
   const nv = M.x.length, N = vertexNormals(M), nb = [], bnd = new Uint8Array(nv);
   for (let v = 0; v < nv; v++) nb.push(M.nbrs(v));
@@ -623,25 +664,27 @@ function fitStep(M, samples, curves, o){
       WB[i] = samples[gk[i]].w * Math.exp(-gt[i] * ir2 - gn[i] * gn[i] * ihn2); GU[i] = dx * t1[0] + dy * t1[1] + dz * t1[2]; GW[i] = dx * t2[0] + dy * t2[1] + dz * t2[2]; RW[i] = 1; }
     // plane fit: offset a0 plus slopes; then refit twice, trusting less the samples far off the plane
     // (a line that floated up, an overshoot into the air), so the bulk of your lines decides
-    let W = 0, dataN = 0, a0 = 0, b1 = 0, b2 = 0;
+    // with o.quad the fit is a small bowl (plane plus curvature) instead of a flat plane: a plane laid across a
+    // tight bowl or a round spine sits above the bottom (below the top), so the surface came out ironed flat
+    let W = 0, dataN = 0;
+    let edgeV = bnd[v]; if (!edgeV) for (const w of nb[v]) if (bnd[w]){ edgeV = 1; break; }   // at the border the lines are all on one side: curvature from them would overshoot
+    const nb6 = o.quad && !edgeV ? 6 : 3, A6 = FA6, y6 = FY6, cf = FC6; cf.fill(0);
+    const basis = (u, ww, out) => { out[0] = 1; out[1] = u; out[2] = ww; out[3] = u * u; out[4] = u * ww; out[5] = ww * ww; };
     for (let pass = 0; pass < (o.robust ? 3 : 1); pass++){
-      W = 0; let Su = 0, Sw = 0, Suu = 0, Suw = 0, Sww = 0, Sn = 0, Sun = 0, Swn = 0;
-      for (let i = 0; i < m; i++){ const w = WB[i] * RW[i], u = GU[i], ww = GW[i], dn = gn[i];
-        W += w; Su += w * u; Sw += w * ww; Suu += w * u * u; Suw += w * u * ww; Sww += w * ww * ww; Sn += w * dn; Sun += w * u * dn; Swn += w * ww * dn; }
+      W = 0; A6.fill(0); y6.fill(0); let Sn = 0;
+      for (let i = 0; i < m; i++){ const w = WB[i] * RW[i]; if (w <= 0) continue; basis(GU[i], GW[i], PH6); W += w; Sn += w * gn[i];
+        for (let a = 0; a < nb6; a++){ const wa = w * PH6[a]; y6[a] += wa * gn[i]; for (let b = a; b < nb6; b++) A6[a * 6 + b] += wa * PH6[b]; } }
       if (W <= 1e-9) break;
-      dataN = Sn / W; a0 = dataN; b1 = b2 = 0;
-      const lam = 0.03 * W * r2, a11 = Suu + lam, a22 = Sww + lam;
-      const det = W * (a11 * a22 - Suw * Suw) - Su * (Su * a22 - Suw * Sw) + Sw * (Su * Suw - a11 * Sw);
-      if (Math.abs(det) > 1e-12){
-        const A0 = (Sn * (a11 * a22 - Suw * Suw) - Su * (Sun * a22 - Suw * Swn) + Sw * (Sun * Suw - a11 * Swn)) / det;
-        const B1 = (W * (Sun * a22 - Suw * Swn) - Sn * (Su * a22 - Suw * Sw) + Sw * (Su * Swn - Sun * Sw)) / det;
-        const B2 = (W * (a11 * Swn - Sun * Suw) - Su * (Su * Swn - Sun * Sw) + Sn * (Su * Suw - a11 * Sw)) / det;
-        if (isFinite(A0) && Math.abs(A0) < Math.sqrt(r2) * 2){ a0 = A0; b1 = B1; b2 = B2; dataN = A0; }
-      }
+      dataN = Sn / W; cf.fill(0); cf[0] = dataN;
+      for (let a = 0; a < nb6; a++) for (let b = 0; b < a; b++) A6[a * 6 + b] = A6[b * 6 + a];
+      // keep the slopes and (more so) the curvature small where the lines can't pin them down
+      const lam = 0.03 * W * r2; A6[7] += lam; A6[14] += lam; if (nb6 === 6){ const lq = (o.lq ?? 0.02) * W * r2 * r2; A6[21] += lq; A6[28] += lq * 0.5; A6[35] += lq; }
+      if (solve6(A6, y6, nb6, X6) && isFinite(X6[0]) && Math.abs(X6[0]) < Math.sqrt(r2) * 2){ for (let a = 0; a < nb6; a++) cf[a] = X6[a]; dataN = cf[0]; }
       if (!o.robust) break;
-      let rr = 0; for (let i = 0; i < m; i++){ const res = gn[i] - (a0 + b1 * GU[i] + b2 * GW[i]); rr += WB[i] * RW[i] * res * res; }
+      let rr = 0; const res = i => { basis(GU[i], GW[i], PH6); let f = 0; for (let a = 0; a < nb6; a++) f += cf[a] * PH6[a]; return gn[i] - f; };
+      for (let i = 0; i < m; i++){ const e = res(i); rr += WB[i] * RW[i] * e * e; }
       const sig = Math.max(Math.sqrt(rr / W), o.L * 0.15), c2 = 1 / (sig * sig * 1.5);
-      for (let i = 0; i < m; i++){ const res = gn[i] - (a0 + b1 * GU[i] + b2 * GW[i]); RW[i] = 1 / (1 + res * res * c2); }
+      for (let i = 0; i < m; i++){ const e = res(i); RW[i] = 1 / (1 + e * e * c2); }
     }
     const c = W / (W + 0.4);
     const ring = nb[v];
@@ -651,7 +694,7 @@ function fitStep(M, samples, curves, o){
     // (next to the border the one-sided umbrella is lopsided, so there it falls back to plain smoothing)
     let bx = -lx, by = -ly, bz = -lz, nearB = bnd[v]; for (const w of ring){ if (bnd[w] || sharpV(w)) nearB = 1; bx += U[3 * w] / ring.length; by += U[3 * w + 1] / ring.length; bz += U[3 * w + 2] / ring.length; }
     const bilN = nearB ? lapN : -(bx * n[0] + by * n[1] + bz * n[2]) * 0.35;
-    const fairN = c * lapN + (1 - c) * bilN;
+    const fairN = o.bil ? bilN : c * lapN + (1 - c) * bilN;
     const fv = Math.min(0.75, o.fair + (1 - o.fair) * 0.9 * pm), k = 1 - c * (1 - fv);
     let offN = (1 - k) * dataN + k * fairN; offN = Math.max(-o.maxStep, Math.min(o.maxStep, offN));
     let tx = lx - lapN * n[0], ty = ly - lapN * n[1], tz = lz - lapN * n[2];
@@ -783,11 +826,27 @@ function embedCurve(M, C, id, L, cross){
         if (seen.has(v)){ const j = seen.get(v); for (const u of clean.splice(j + 1)) seen.delete(u); continue; }
         seen.set(v, clean.length); clean.push(v); }
       if (clean.length < 2) continue;
+      // a line whose ends nearly meet (a bowl's coping drawn as one stroke): a chain running past the place where it
+      // starts and ends belongs to two far-apart stretches of the line, so it's cut there; laid out as one, it was
+      // spread around the whole line and pulled the inside of the bowl up into a lid
+      const chains = [clean];
+      if (!C.closed && !closed){ const sv = clean.map(v => closestOnPoly(C, M.P(v)).s); chains.length = 0; let a = 0;
+        for (let i = 1; i < clean.length; i++) if (Math.abs(sv[i] - sv[i - 1]) > Math.max(C.len * 0.3, L * 6)){ chains.push(clean.slice(a, i)); a = i; }
+        chains.push(clean.slice(a)); }
+      for (const clean of chains){
+      if (clean.length < 2) continue;
       // spread the chain evenly along the stretch of curve it covers
       const s0 = closestOnPoly(C, M.P(clean[0])).s, s1 = closestOnPoly(C, M.P(clean[clean.length - 1])).s;
       let a0 = s0, a1 = s1;
-      if (closed){ a1 = a0 + C.len * (clean.length) / clean.length; }
-      else { if (a0 < L) a0 = 0; if (C.len - a1 < L) a1 = C.len; if (a1 < a0 && !C.closed){ const t = a0; a0 = a1; a1 = t; clean.reverse(); } }
+      if (closed){
+        // which way round the loop the chain runs (laid out the wrong way, every vertex lands across the loop and
+        // the inside of a bowl's coping flattens into a lid)
+        const sm = closestOnPoly(C, M.P(clean[Math.floor(clean.length / 3)])).s, dm = ((sm - s0) % C.len + C.len) % C.len;
+        a1 = dm <= C.len / 2 ? a0 + C.len : a0 - C.len; }
+      else if (C.closed){
+        // part of a loop: go the short way from one end to the other (it may run across where the loop starts)
+        const fwd = ((s1 - s0) % C.len + C.len) % C.len; a1 = fwd <= C.len - fwd ? a0 + fwd : a0 - (C.len - fwd); }
+      else { if (a0 < L) a0 = 0; if (C.len - a1 < L) a1 = C.len; if (a1 < a0){ const t = a0; a0 = a1; a1 = t; clean.reverse(); } }
       const n = clean.length, denom = closed ? n : n - 1;
       for (let i = 0; i < n; i++){
         const v = clean[i], q = pointAt(C, a0 + (a1 - a0) * i / denom);
@@ -799,6 +858,7 @@ function embedCurve(M, C, id, L, cross){
       // the line's own sharp corners pin the nearest chain vertex, exactly on the corner
       for (const cp of (C.corners || [])){ let bv = -1, bd = sq(L * 1.2); for (const v of clean){ const dd = d2(M.P(v), cp); if (dd < bd){ bd = dd; bv = v; } } if (bv >= 0){ M.setP(bv, cp); M.corner[bv] = true; } }
       added += n;
+      }
     }
   }
   return added;
@@ -1735,11 +1795,14 @@ function solve(strokes, prm, progress = () => {}){
   if (!M){ M = startSheet(samples, aA, prm.reach, h); if (!M.tdead.length) return { empty: true, curves: [] }; }
   const paint = makePaint(prm.dabs);
   const sides = prm.sides === false ? null : creaseSides(curves, samples, h, L);
-  const base = { sides, paint, fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4, robust: prm.robust !== false };
+  const base = { sides, paint, fair: prm.fair, reach2: Math.max(h * 2, L * 3), step: 0.8, relax: 0.6, lines: Math.max(1, prm.lines | 0 || 4), grow: 2.4, robust: prm.robust !== false, quad: prm.quad !== false, bil: !!prm.bil, lq: prm.lq };
   // coarse fit
+  // the rough shape is found at a fixed coarse scale whatever the detail asked for, so a fine setting can't leave
+  // the sheet stuck as a lid over a deep bowl (at fine scale the bowl's lines are out of reach of the sheet)
+  const cs = prm.coarseScale ?? 1, aC = Math.max(aA, 0.6 * cs), hC = Math.max(h * 1.5, 0.9 * cs);
   for (let it = 0; it < (warm ? 0 : 6); it++){
-    remesh(M, aA, 0.6);
-    fitStep(M, samples, curves, { ...base, L: aA, h: h * 1.5, hn: h * 4, maxStep: aA * 1.5, parity: it & 1, reach2: h * 4 });
+    remesh(M, aC, 0.6);
+    fitStep(M, samples, curves, { ...base, L: aC, h: hC, hn: hC * 2.7, maxStep: aC * 1.5, parity: it & 1, reach2: Math.max(h * 4, hC * 2.7) });
     if (prm.onStep) prm.onStep(M, "coarse", it); progress(0.1 + 0.25 * it / 6, 'Fitting the rough shape');
   }
   // fine fit, no curves yet
