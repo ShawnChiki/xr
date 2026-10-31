@@ -855,7 +855,7 @@ function embedCurve(M, C, id, L, cross){
         M.setP(v, q); M.fc[v] = id;
       }
       for (let i = 0; i < (closed ? n : n - 1); i++){ const a = clean[i], b = clean[(i + 1) % n]; if (!M.fe.has(M.ek(a, b))) M.fe.set(M.ek(a, b), id); }
-      if (!closed){ M.corner[clean[0]] = true; M.corner[clean[n - 1]] = true; }
+      if (!closed && !C.row){ M.corner[clean[0]] = true; M.corner[clean[n - 1]] = true; }
       // the line's own sharp corners pin the nearest chain vertex, exactly on the corner
       for (const cp of (C.corners || [])){ let bv = -1, bd = sq(L * 1.2); for (const v of clean){ const dd = d2(M.P(v), cp); if (dd < bd){ bd = dd; bv = v; } } if (bv >= 0){ M.setP(bv, cp); M.corner[bv] = true; } }
       added += n;
@@ -954,10 +954,10 @@ function creaseRows(M, curves, d, nRows, L){
   const SG = new Grid(d); sharpS.forEach(([ci, p], i) => SG.add(i, p[0], p[1], p[2]));
   const bord = []; { const E = M.edges(); for (let i = 0; i < E.length; i += 2) if (M.edgeTris(E[i], E[i + 1]).length === 1) bord.push(lerp3(M.P(E[i]), M.P(E[i + 1]), 0.5)); }
   const BG = new Grid(d); bord.forEach((p, i) => BG.add(i, p[0], p[1], p[2]));
-  const clear = (p, ci, s0, C, r) => { let ok = true;
+  const clear = (p, ci, s0, C, r, rb) => { let ok = true;
     SG.each(p[0], p[1], p[2], r, i => { if (!ok) return; const [cj, q] = sharpS[i]; if (d2(p, q) >= r * r) return; if (cj !== ci){ ok = false; return; }
       const sq2 = closestOnPoly(C, q).s, ds = C.closed ? Math.min(Math.abs(sq2 - s0), C.len - Math.abs(sq2 - s0)) : Math.abs(sq2 - s0); if (ds > r * 1.6) ok = false; });
-    if (ok) BG.each(p[0], p[1], p[2], r, i => { if (d2(p, bord[i]) < r * r) ok = false; }); return ok; };
+    if (ok) BG.each(p[0], p[1], p[2], rb, i => { if (d2(p, bord[i]) < rb * rb) ok = false; }); return ok; };
   const cand = [];
   curves.forEach((C, ci) => {
     if (!C.sharp || C.len < d * 3) return;
@@ -994,20 +994,21 @@ function creaseRows(M, curves, d, nRows, L){
       sd.forEach((x, i) => { if (x){ x.a = sm[i]; x.u = [0, 1, 2].map(c => Math.cos(x.a) * x.e1[c] + Math.sin(x.a) * x.e2[c]); } }); }
     for (let j = 0; j < 2; j++) for (let r = 1; r <= nRows; r++){
       const pts = sides[j].map(x => { if (!x) return null; const p = proj([x.q[0] + x.u[0] * d * r, x.q[1] + x.u[1] * d * r, x.q[2] + x.u[2] * d * r]);
-        if (d2(p, x.q) < sq(d * r * 0.6) || !clear(p, ci, x.s0, C, d * r * 0.75)) return null; return p; });
+        if (d2(p, x.q) < sq(d * r * 0.6) || !clear(p, ci, x.s0, C, d * (r + 0.6), d * 1.1)) return null; return p; });   // other creases stay (r + 0.6) rows away, so two creases' rows never meet
       cand.push({ ci, r, closed: !!C.closed, tag: C.tag, pts });
     }
   });
   // rows must not cross or crowd each other (two creases meeting at a corner, the inside of a tight bend)
   { const G = new Grid(d); cand.forEach((c, a) => c.pts.forEach((p, k) => { if (p) G.add(a * 100000 + k, p[0], p[1], p[2]); }));
     const drop = cand.map(c => c.pts.map(() => false));
-    cand.forEach((c, a) => c.pts.forEach((p, k) => { if (!p) return; G.each(p[0], p[1], p[2], d * 0.8, id => { const b = Math.floor(id / 100000), m = id % 100000; if (b === a){ const gap = c.closed ? Math.min(Math.abs(m - k), c.pts.length - Math.abs(m - k)) : Math.abs(m - k); if (gap > 4 && d2(p, c.pts[m]) < sq(d * 0.5)) drop[a][k] = true; return; }
-      const o = cand[b]; if (o.ci === c.ci && o.r !== c.r) return; if (d2(p, o.pts[m]) < sq(d * 0.8)) drop[a][k] = true; }); }));
+    cand.forEach((c, a) => c.pts.forEach((p, k) => { if (!p) return; G.each(p[0], p[1], p[2], d * 1.1, id => { const b = Math.floor(id / 100000), m = id % 100000; if (b === a){ const gap = c.closed ? Math.min(Math.abs(m - k), c.pts.length - Math.abs(m - k)) : Math.abs(m - k); if (gap > 4 && d2(p, c.pts[m]) < sq(d * 0.5)) drop[a][k] = true; return; }
+      const o = cand[b]; if (o.ci === c.ci && o.r !== c.r) return; if (d2(p, o.pts[m]) < sq(d * 1.05)) drop[a][k] = true; }); }));
     cand.forEach((c, a) => { c.pts = c.pts.map((p, k) => drop[a][k] ? null : p); }); }
-  const proj2 = proj, relax = (pp, all) => { for (let it = 0; it < 4; it++){ const nx = pp.map((p, i) => { const a = pp[all ? (i - 1 + pp.length) % pp.length : i - 1], b = pp[all ? (i + 1) % pp.length : i + 1]; return a && b ? proj2(lerp3(p, lerp3(a, b, 0.5), 0.5)) : p; }); for (let i = 0; i < pp.length; i++) pp[i] = nx[i]; } return pp; };
+  // shrink-free smoothing (in, then back out), so rows round a corner without closing up on each other
+  const proj2 = proj, relax = (pp, all) => { for (let it = 0; it < 4; it++){ const k = it & 1 ? -0.34 : 0.32; const nx = pp.map((p, i) => { const a = pp[all ? (i - 1 + pp.length) % pp.length : i - 1], b = pp[all ? (i + 1) % pp.length : i + 1]; return a && b ? proj2(lerp3(p, lerp3(a, b, 0.5), k)) : p; }); for (let i = 0; i < pp.length; i++) pp[i] = nx[i]; } return pp; };
   for (const c of cand){
     const all = c.closed && c.pts.every(Boolean);
-    let run = []; const flush = () => { if (run.length >= 4){ const R = makeCurve(relax(run, all), all, false, c.tag); if (R.len > d * 2.5){ R.row = true; R.level = c.r; out.push(R); } } run = []; };
+    let run = []; const flush = () => { if (run.length >= 4){ const R = makeCurve(relax(run, all), all, false, c.tag); if (R.len > d * (2.5 + c.r)){ R.row = true; R.level = c.r; out.push(R); } } run = []; };
     for (const p of c.pts){ if (p) run.push(p); else flush(); } flush();
   }
   return out;
@@ -1565,23 +1566,43 @@ function tidyCage(cage, info, s){
   for (const f of F){ let ar = 0; const p0 = P(f[0]); for (let i = 1; i + 1 < f.length; i++) ar += Math.hypot(...cross3(p0, P(f[i]), P(f[i + 1]))) / 2;
     if (ar > s * s * 0.15) continue; let bk = -1, bd = Infinity; for (let i = 0; i < f.length; i++){ const d = d2(P(f[i]), P(f[(i + 1) % f.length])); if (d < bd){ bd = d; bk = ek(f[i], f[(i + 1) % f.length]); } } if (bk >= 0) cand.add(bk); }
   const order = [...cand].map(k => [k, d2(P(Math.floor(k / 2097152)), P(k % 2097152))]).sort((a, b) => a[1] - b[1]);
-  for (const [k] of order){ let a = fd(Math.floor(k / 2097152)), b = fd(k % 2097152); if (a === b) continue;
+  const touched = new Uint8Array(nv);   // one merge per vertex per round: chains of merges made stars
+  for (const [k] of order){ const a0 = Math.floor(k / 2097152), b0 = k % 2097152; if (touched[a0] || touched[b0]) continue; let a = fd(a0), b = fd(b0); if (a === b) continue;
     const la = locked(a) || border[a], lb = locked(b) || border[b];
     if (la && lb) continue;                       // both pinned (to a line, a corner or the border): leave it
     if (lb){ const t = a; a = b; b = t; }          // keep the pinned one where it is
     if (!locked(a) && !border[a]){ const pa = P(a), pb = P(b); for (let c = 0; c < 3; c++) V[3 * a + c] = (pa[c] + pb[c]) / 2; }
-    par[b] = a; merged++; }
-  if (!merged) return 0;
+    par[b] = a; touched[a0] = touched[b0] = 1; merged++; }
   const seen = new Set(), NF = [];
   for (const f of F){ const g = []; for (const v of f){ const r = fd(v); if (g[g.length - 1] !== r) g.push(r); } while (g.length > 1 && g[0] === g[g.length - 1]) g.pop();
     if (g.length < 3 || new Set(g).size !== g.length) continue; const key = g.slice().sort((x, y) => x - y).join(','); if (seen.has(key)) continue; seen.add(key); NF.push(g); }
+  // doublets: an inside vertex where only two faces meet (they share both its edges). Smoothed, it shows as a
+  // little lens-shaped loop; the two faces become one and the vertex goes
+  let dissolved = 0;
+  for (let round = 0; round < 10; round++){
+    const vf = new Map(), ec = new Map(), usedF = new Set(); NF.forEach((f, i) => { if (!f) return; f.forEach((v, j) => { (vf.get(v) || vf.set(v, []).get(v)).push(i); const k = ek(v, f[(j + 1) % f.length]); ec.set(k, (ec.get(k) || 0) + 1); }); });
+    let any = false;
+    for (const [v, fs] of vf){
+      if (fs.length !== 2 || usedF.has(fs[0]) || usedF.has(fs[1]) || !NF[fs[0]] || !NF[fs[1]] || (info.corner && info.corner[fd(v)])) continue;
+      const f1 = NF[fs[0]], f2 = NF[fs[1]], i1 = f1.indexOf(v), i2 = f2.indexOf(v); if (i1 < 0 || i2 < 0) continue;
+      const a = f1[(i1 - 1 + f1.length) % f1.length], b = f1[(i1 + 1) % f1.length];
+      if (ec.get(ek(a, v)) !== 2 || ec.get(ek(v, b)) !== 2 || f2[(i2 + 1) % f2.length] !== a || f2[(i2 - 1 + f2.length) % f2.length] !== b) continue;
+      // f1 runs a → v → b; f2 runs b → v → a. Merged: f1 from b round to a, then f2 from a round to b
+      const m = []; for (let k = 1; k < f1.length; k++) m.push(f1[(i1 + k) % f1.length]); for (let k = 2; k < f2.length - 1; k++) m.push(f2[(i2 + k) % f2.length]);
+      if (m.length < 3 || new Set(m).size !== m.length) continue;
+      NF[fs[0]] = m; NF[fs[1]] = null; usedF.add(fs[0]); usedF.add(fs[1]); dissolved++; any = true;
+    }
+    if (!any) break;
+  }
+  for (let i = NF.length - 1; i >= 0; i--) if (!NF[i]) NF.splice(i, 1);
+  if (!merged && !dissolved) return 0;
   // compact
   const map = new Int32Array(nv).fill(-1), V2 = [], fc2 = [], co2 = [], cor2 = [];
   const F2 = NF.map(f => f.map(v => { if (map[v] < 0){ map[v] = V2.length / 3; V2.push(V[3 * v], V[3 * v + 1], V[3 * v + 2]); fc2.push(info.fc ? info.fc[v] : -1); co2.push(info.corner ? info.corner[v] : false); cor2.push(corner ? corner[v] : 0); } return map[v]; }));
   const S2 = new Set(); if (sharp) for (const k of sharp){ const a = map[fd(Math.floor(k / 2097152))], b = map[fd(k % 2097152)]; if (a >= 0 && b >= 0 && a !== b) S2.add(ek(a, b)); }
   let FT = null; if (feat){ FT = new Map(); for (const [k, id] of feat){ const a = map[fd(Math.floor(k / 2097152))], b = map[fd(k % 2097152)]; if (a >= 0 && b >= 0 && a !== b) FT.set(ek(a, b), id); } }
   cage.V = V2; cage.F = F2; cage.sharp = S2; cage.corner = Uint8Array.from(cor2); if (feat) cage.feat = FT; info.fc = fc2; info.corner = co2;
-  return merged;
+  return merged + dissolved;
 }
 // ---------------- trust: how well the finished surface agrees with your loose lines nearby, per drawn vertex.
 // 1 = lines sit right on it, 0 = lines are well off it, -1 = no lines nearby (the surface is a guess there)
@@ -1705,12 +1726,12 @@ function alignTarget(M, F, v, n){
 }
 
 // ---------------- quads and subdivision
-function quadify(M, curves, FL){
+function quadify(M, curves, FL, opts){
   M.compact();
   const T = M.T, nt = M.tdead.length, used = new Uint8Array(nt), cand = [];
   const E = M.edges();
   for (let i = 0; i < E.length; i += 2){
-    const a = E[i], b = E[i + 1]; if (M.fe.has(M.ek(a, b))) continue;
+    const a = E[i], b = E[i + 1], fid = M.fe.get(M.ek(a, b)), soft = fid !== undefined && curves[fid] && curves[fid].row; if (fid !== undefined && !soft) continue;
     const ts = M.edgeTris(a, b); if (ts.length !== 2) continue;
     let [t1, t2] = ts; const opp = (t, p, q) => { const o = 3 * t; for (let k = 0; k < 3; k++) if (T[o + k] === p && T[o + (k + 1) % 3] === q) return T[o + (k + 2) % 3]; return -1; };
     let c = opp(t1, a, b); if (c < 0){ [t1, t2] = [t2, t1]; c = opp(t1, a, b); } const d = opp(t2, b, a); if (c < 0 || d < 0) continue;
@@ -1721,12 +1742,32 @@ function quadify(M, curves, FL){
     if (FL && FL.conf[a] > 0.05){ const nn = norm([n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]]); let m = 0;
       for (let k = 0; k < 4; k++){ const u = q[k], w = q[(k + 1) % 4]; m += misalign(FL, a, norm([M.x[w] - M.x[u], M.y[w] - M.y[u], M.z[w] - M.z[u]]), nn); }
       cost += 4 * FL.conf[a] * m / 4; }
-    cand.push([cost, t1, t2, q, worst]);
+    cand.push([cost, t1, t2, q, worst, soft]);
   }
   cand.sort((p, q) => p[0] - q[0]);
-  const F = [];
-  for (const [, t1, t2, q, w] of cand){ if (w > 0.75 || used[t1] || used[t2]) continue; used[t1] = used[t2] = 1; F.push(q); }
-  for (let t = 0; t < nt; t++) if (!used[t]) F.push([T[3 * t], T[3 * t + 1], T[3 * t + 2]]);
+  // greedy first (best-shaped pairs), then pair up the leftovers: from a lone triangle, walk an alternating chain
+  // (re-pairing triangles along the way) until it reaches another lone one. Every lone triangle becomes a point
+  // where three quads meet once the cage is smoothed, so the fewer the cleaner
+  const mate = new Int32Array(nt).fill(-1), qOf = new Map(), pk = (x, y) => x < y ? x * 4194304 + y : y * 4194304 + x;
+  const adjOf = withSoft => { const adj = new Map(); for (const [, t1, t2, q, w, sf] of cand){ if (w > (opts && opts.augLimit || (withSoft ? 1.25 : 0.9)) || (sf && !withSoft)) continue; (adj.get(t1) || adj.set(t1, []).get(t1)).push(t2); (adj.get(t2) || adj.set(t2, []).get(t2)).push(t1); qOf.set(pk(t1, t2), { q, w }); } return adj; };
+  for (const [, t1, t2, q, w, sf] of cand) if (!sf && w <= 0.75 && mate[t1] < 0 && mate[t2] < 0){ mate[t1] = t2; mate[t2] = t1; }
+  // last of all, a lone triangle in a row strip may pair across the row line (one quad straddles it)
+  if (!(opts && opts.augment === false)) for (const withSoft of [false, true]){ const adj = adjOf(withSoft);
+    for (let pass = 0; pass < 2; pass++) for (let t0 = 0; t0 < nt; t0++){
+      if (mate[t0] >= 0 || M.tdead[t0] || !adj.has(t0)) continue;
+      // breadth-first over alternating chains: a free step to a neighbour, then the forced step to its mate
+      const from = new Map([[t0, -1]]), q = [t0]; let end = -1;
+      for (let qi = 0; qi < q.length && qi < 400 && end < 0; qi++){ const t = q[qi];
+        for (const u of adj.get(t) || []){ if (from.has(u) || u === mate[t]) continue; from.set(u, t);
+          if (mate[u] < 0){ end = u; break; }
+          const m = mate[u]; if (from.has(m)) continue; from.set(m, u); q.push(m); } }
+      if (end < 0) continue;
+      let u = end; for (let g = 0; g < 1000; g++){ const t = from.get(u), prev = mate[t]; mate[t] = u; mate[u] = t; if (t === t0 || prev < 0) break; u = prev; }
+    } }
+  const F = [], done = new Uint8Array(nt);
+  for (let t = 0; t < nt; t++){ if (M.tdead[t] || done[t]) continue; const m = mate[t];
+    if (m >= 0 && !done[m]){ const e = qOf.get(pk(t, m)); if (e){ done[t] = done[m] = 1; F.push(e.q); continue; } }
+    done[t] = 1; F.push([T[3 * t], T[3 * t + 1], T[3 * t + 2]]); }
   const V = []; for (let v = 0; v < M.x.length; v++) V.push(M.x[v], M.y[v], M.z[v]);
   const sharp = new Set(); for (const [k, id] of M.fe) if (curves[id] && curves[id].sharp) sharp.add(k);
   return { V, F, sharp, feat: new Map(M.fe), corner: Uint8Array.from(M.corner, c => c ? 1 : 0) };
@@ -1984,12 +2025,22 @@ function solve(strokes, prm, progress = () => {}){
   }
   // clean rows of quads along the sharp creases
   if ((prm.rows | 0) > 0 && !(prm.target < 0 && guides.length)){
-    const Lq = prm.target > 0 ? Math.max(L, 2 * Math.sqrt(triArea(M) / prm.target)) : L;
-    try { const rows = creaseRows(M, curves, Lq * 0.95, Math.min(2, prm.rows | 0), L);
-      if (rows.length){
-        // the first rows go in, the mesh settles around them, then the second rows (they sit about one edge apart)
-        const base0 = curves.length; curves.push(...rows);
-        for (const lv of [1, 2]){ rows.forEach((C, i) => { if (C.level === lv) embedCurve(M, C, base0 + i, L); }); if (lv === 1 && rows.some(C => C.level === 2)){ remesh(M, L, 0.8); unfold(M, 2); } } remesh(M, L, 0.8); unfold(M, 2); M.compact(); } } catch (e){}
+    const Lq = prm.target > 0 ? Math.max(L, 2 * Math.sqrt(triArea(M) / prm.target)) : L, M0 = M.clone(), a0 = triArea(M), base0 = curves.length;
+    // all the rows asked for; if cutting them in went wrong (a sanity check: rows only re-cut the mesh, so its area
+    // barely changes), one row fewer, and so on
+    for (let nR = Math.min(4, prm.rows | 0); nR >= 1; nR--){
+      let ok = false;
+      try { const rows = creaseRows(M, curves, Lq * 0.95, nR, L);
+        if (!rows.length) break;
+        curves.push(...rows);
+        // the first rows go in, the mesh settles around them, then the next rows out (they sit about one edge apart)
+        for (let lv = 1; lv <= nR; lv++){ rows.forEach((C, i) => { if (C.level === lv) embedCurve(M, C, base0 + i, L); }); if (lv < nR && rows.some(C => C.level === lv + 1)){ remesh(M, L, 0.8); unfold(M, 2); } }
+        remesh(M, L, 0.8); unfold(M, 2); M.compact();
+        const ar = triArea(M) / a0; ok = ar > 0.95 && ar < 1.05;
+      } catch (e){ ok = false; }
+      if (ok) break;
+      M = M0.clone(); curves.length = base0;
+    }
   }
   progress(0.88, 'Smoothing out folds');
   M.compact();
@@ -2051,11 +2102,14 @@ function solve(strokes, prm, progress = () => {}){
     if (prm.hard > 0) autoCreases(cage, prm.hard);
     progress(0.97, 'Hugging the surface');
     // knots: edges far shorter than the rest and crumpled little faces are collapsed, then any fold is relaxed out
-    const info = { fc: Array.from({ length: cage.V.length / 3 }, (_, v) => M.fc[v]), corner: Array.from({ length: cage.V.length / 3 }, (_, v) => !!M.corner[v]) };
+    // row lines shape the layout only: for hugging the surface their vertices are ordinary (a row drawn on the
+    // faceted fitting mesh sits a hair under the smooth surface, and holding the cage to it dented the surface)
+    const info = { fc: Array.from({ length: cage.V.length / 3 }, (_, v) => M.fc[v] >= 0 && curves[M.fc[v]] && curves[M.fc[v]].row ? -1 : M.fc[v]), corner: Array.from({ length: cage.V.length / 3 }, (_, v) => !!M.corner[v]) };
     if (prm.tidy !== false){ const el = []; for (const f of cage.F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; el.push(Math.hypot(cage.V[3 * a] - cage.V[3 * b], cage.V[3 * a + 1] - cage.V[3 * b + 1], cage.V[3 * a + 2] - cage.V[3 * b + 2])); }
-      el.sort((x, y) => x - y); tidyCage(cage, info, el[el.length >> 1] || L); }
+      el.sort((x, y) => x - y); for (let r = 0; r < 4; r++) if (!tidyCage(cage, info, el[el.length >> 1] || L)) break; }
     hugCage(cage, info, Mfit, curves, L, 6);
     if (prm.tidy !== false) unfoldCage(cage, info, Mfit, curves, L, 12);
+    if (prm.onCage) prm.onCage(cage, info);
   }
   const lv = 1 + (prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
   const quads = catmullClark(cage, curves); quads.cageE = allEdges(quads.F);
@@ -2067,7 +2121,7 @@ function solve(strokes, prm, progress = () => {}){
   return {
     surface: sh, quadWire: smooth === quads ? wire(quads) : edgeWire(smooth, smooth.cageE), fineWire: smooth === quads ? null : wire(smooth), creases: creaseLines(smooth),
     quads: { V: new Float32Array(quads.V), F: new Int32Array(quads.F.flat()), C: new Int32Array(quads.F.map(f => f.length)) },
-    curves: [...curves.filter(C => !C.row || prm.showRows).map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })),
+    curves: [...curves.filter(C => !C.row || prm.showRows).map(C => ({ row: C.row ? C.level : 0, tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })),
       ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
     nQuads: quads.F.length, folds, cache, warm,
     note: prm.target < 0 ? (guides.length ? 'Couldn\'t lay quads along your guides here, so Auto was used. Make sure guides cross each other or reach the border.' : 'Draw guides on the surface to lay out the quads (Auto until then)') : ''
