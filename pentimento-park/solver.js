@@ -358,7 +358,7 @@ function dropSmallParts(M, minTris){
 // ---------------------------------------------------------------- remeshing
 // how long an edge along a strict line may be: as long as anywhere else where the line runs straight, shorter only
 // where it bends (so the edges still follow it to within a small fraction of the quad size)
-function strictLenFn(curves){
+function strictLenFn(curves, minF = 0.45){
   const K = new Map();
   curves.forEach((C, id) => { if (!C.strict) return; const P = C.pts, n = P.length; if (n < 3) return; const k = new Float64Array(n);
     for (let i = 0; i < n; i++){ const a = P[(i - 1 + n) % n], b = P[i], c = P[(i + 1) % n]; if (!C.closed && (i === 0 || i === n - 1)) continue;
@@ -368,7 +368,7 @@ function strictLenFn(curves){
   return (id, mx, my, mz, L) => { const o = K.get(id); if (!o) return L * 0.7; const P = o.C.pts, k = o.k, R2 = sq(L * 0.6); let kmax = 0, bj = 0, bd = Infinity;
     for (let i = 0; i < P.length; i++){ const d = (P[i][0] - mx) ** 2 + (P[i][1] - my) ** 2 + (P[i][2] - mz) ** 2; if (d < bd){ bd = d; bj = i; } if (d < R2 && k[i] > kmax) kmax = k[i]; }
     if (!kmax) kmax = k[bj];
-    const tol = 0.035 * L; return Math.max(0.45 * L, Math.min(L * 4 / 3, Math.sqrt(8 * tol / Math.max(1e-9, kmax)))); };
+    const tol = 0.035 * L; return Math.max(Math.min(1, minF) * L, Math.min(L * 4 / 3, Math.sqrt(8 * tol / Math.max(1e-9, kmax)))); };
 }
 function remesh(M, L, flipDot){
   const hi2 = sq(L * 4 / 3), lo2 = sq(L * 0.8);
@@ -1584,6 +1584,51 @@ function instantQuads(M0, curves, guides, s, L, opt = {}){
 // ---------------- tidy the flowing layout: where the grid knotted, it leaves edges far shorter than the rest and
 // crumpled little faces. Short edges are collapsed (onto the end that sits on a line, if one does), faces left with
 // repeated corners are cleaned up or dropped, and the vertices around anything still folded are relaxed
+// ---------------------------------------------------------------- triangle healing
+// Two triangles joined by a straight strip of quads (each quad entered on one side and left on the opposite one) become
+// all quads: the strip's rungs shift over by one, so 2 triangles + n quads turn into n + 1 quads. Strips never cross a
+// sharp edge or a curve, and a shift that would fold a face is skipped. Shortest strips first.
+function healTris(cage, maxLen = 8){
+  const V = cage.V, P = v => [V[3 * v], V[3 * v + 1], V[3 * v + 2]];
+  const blocked = (a, b) => { const k = ek(a, b); return (cage.sharp && cage.sharp.has(k)) || (cage.feat && cage.feat.has && cage.feat.has(k)); };
+  const nrm = f => { const c = [0, 0, 0]; for (let i = 0; i < f.length; i++){ const a = P(f[i]), b = P(f[(i + 1) % f.length]); c[0] += (a[1] - b[1]) * (a[2] + b[2]); c[1] += (a[2] - b[2]) * (a[0] + b[0]); c[2] += (a[0] - b[0]) * (a[1] + b[1]); } return c; };
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2], len = a => Math.hypot(a[0], a[1], a[2]) || 1e-12;
+  let healed = 0;
+  for (let round = 0; round < 6; round++){
+    const F = cage.F, ef = new Map(); F.forEach((f, fi) => { if (!f) return; f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); (ef.get(k) || ef.set(k, []).get(k)).push(fi); }); });
+    const across = (fi, a, b) => { const l = ef.get(ek(a, b)); return l && l.length === 2 ? (l[0] === fi ? l[1] : l[0]) : -1; };
+    const cands = [];
+    F.forEach((t, ti) => { if (!t || t.length !== 3) return;
+      for (let i = 0; i < 3; i++){ const a1 = t[i], u0 = t[(i + 1) % 3], w0 = t[(i + 2) % 3]; if (blocked(u0, w0)) continue;
+        const U = [u0], W = [w0], Q = []; let cur = ti, u = u0, w = w0, ok = false, t2 = -1;
+        for (let n = 0; n <= maxLen; n++){ const nx = across(cur, u, w); if (nx < 0) break; const g = F[nx]; if (!g) break;
+          if (g.length === 3){ if (nx !== ti){ t2 = nx; ok = true; } break; }
+          if (g.length !== 4) break; const iu = g.indexOf(u), iw = g.indexOf(w);
+          // leave the quad on the side opposite the one we came in by
+          const un = g[(iu + (g[(iu + 1) % 4] === w ? 3 : 1)) % 4], wn = g[(iw + (g[(iw + 1) % 4] === u ? 3 : 1)) % 4];
+          if (un === w || wn === u || blocked(un, wn) || U.includes(un) || W.includes(wn)) break;
+          Q.push(nx); U.push(un); W.push(wn); u = un; w = wn; cur = nx; }
+        if (ok) cands.push({ ti, t2, a1, U, W, Q }); } });
+    cands.sort((x, y) => x.Q.length - y.Q.length);
+    const used = new Set(); let did = 0;
+    for (const c of cands){ const faces = [c.ti, c.t2, ...c.Q]; if (faces.some(f => used.has(f))) continue;
+      const T2 = F[c.t2], n = c.U.length - 1, un = c.U[n], wn = c.W[n], a2 = T2.find(v => v !== un && v !== wn);
+      if (a2 === c.a1 || c.U.includes(a2) || c.W.includes(a2)) continue;
+      // the rungs can shift either way round; take the first that makes no folded or bent-in face
+      const t = F[c.ti], fwd = t[(t.indexOf(c.a1) + 1) % 3] === c.U[0], seq = [t, ...c.Q.map(f => F[f]), T2].map(nrm);
+      const tryShift = (A, B) => { const out = []; for (let k = 0; k <= n; k++) out.push([A[k], A[k + 1], B[k + 1], B[k]]); if (!fwd) out.forEach(q => q.reverse());
+        for (let k = 0; k < out.length; k++){ const q = out[k]; if (new Set(q).size !== 4) return null; const nq = nrm(q), r = [0, 1, 2].map(j => seq[k][j] / len(seq[k]) + seq[k + 1][j] / len(seq[k + 1]));
+          if (Math.abs(dot(nq, r)) / (len(nq) * len(r)) < 0.5) return null;
+          const h1 = nrm([q[0], q[1], q[2]]), h2 = nrm([q[0], q[2], q[3]]), h3 = nrm([q[1], q[2], q[3]]), h4 = nrm([q[1], q[3], q[0]]);
+          if (dot(h1, h2) <= 0 || dot(h3, h4) <= 0) return null; }
+        return out; };
+      const out = tryShift([c.a1, ...c.U], [...c.W, a2]) || tryShift([...c.U, a2], [c.a1, ...c.W]), bad = !out;
+      if (bad) continue;
+      faces.forEach(f => used.add(f)); faces.slice(0, out.length).forEach((f, j) => { F[f] = out[j]; }); faces.slice(out.length).forEach(f => { F[f] = null; }); did++; }
+    if (!did) break; cage.F = F.filter(Boolean); healed += did;
+  }
+  return healed;
+}
 function tidyCage(cage, info, s){
   let { V, F, sharp, corner, feat } = cage; const nv = V.length / 3, P = v => [V[3 * v], V[3 * v + 1], V[3 * v + 2]];
   const locked = v => (info.fc && info.fc[v] >= 0) || (info.corner && info.corner[v]);
@@ -2026,7 +2071,7 @@ function solve(strokes, prm, progress = () => {}){
   const cache = { key: fitKey, sig: looseSig, x: Float64Array.from(M.x), y: Float64Array.from(M.y), z: Float64Array.from(M.z), T: Int32Array.from(M.T) };
   const guides = layGuides(M, guides0, L, h);
   let flow = guides.length ? flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h) : null;
-  M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0)); M.strictLen = strictLenFn(curves);
+  M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0)); M.strictLen = strictLenFn(curves, prm.creaseMin ?? 0.45);
   curves.forEach((C, i) => embedCurve(M, C, i, L));
   if (cutAtEdges(M, curves, samples, h)) progress(0.56, 'Trimming at the edges');
   untangle(M, 4);
@@ -2073,6 +2118,15 @@ function solve(strokes, prm, progress = () => {}){
       if (ok) break;
       M = M0.clone(); curves.length = base0;
     }
+  }
+  // guides become edges: each one is cut into the mesh like a crease row (not sharp), so the quads line up along it.
+  // If cutting them in goes wrong (the area check, as for rows), the build carries on without them as edges.
+  if (guides.length && prm.guideEdges !== false && !(prm.target < 0)){
+    const M0 = M.clone(), a0 = triArea(M), base1 = curves.length;
+    try {
+      guides.forEach((G, i) => { const C = Object.assign(G, { row: true, level: 1, guideEdge: true }); curves.push(C); embedCurve(M, C, base1 + i, L); });
+      remesh(M, L, 0.8); unfold(M, 2); M.compact(); const ar = triArea(M) / a0; if (!(ar > 0.95 && ar < 1.05)) throw new Error('area');
+    } catch (e){ M = M0.clone(); curves.length = base1; guides.forEach(G => { delete G.row; delete G.level; delete G.guideEdge; }); }
   }
   progress(0.88, 'Smoothing out folds');
   M.compact();
@@ -2125,7 +2179,7 @@ function solve(strokes, prm, progress = () => {}){
   // field-aligned quads first; the older pairing of triangles if that can't cover the surface cleanly
   let cage = null, iq = null;
   if (fieldQuads){ progress(0.93, 'Laying out the quads'); try { iq = instantQuads(M, curves, guides, prm.target > 0 ? Math.max(L * 0.95, Math.sqrt(triArea(M) / (prm.target / 4))) : L * 0.95, L, { oIters: prm.oIters, pIters: prm.pIters }); } catch (e){ iq = null; } }
-  if (iq){ cage = iq.cage; if (prm.iqTidy !== false) tidyCage(cage, iq.info, iq.s); if (prm.iqSquare ?? 16) squareQuads(cage, M, null, prm.iqSquare ?? 16, L, Mfit, v => iq.info.fc[v] >= 0 || !!iq.info.corner[v]); if (prm.hard > 0) autoCreases(cage, prm.hard); progress(0.97, 'Hugging the surface'); hugCage(cage, iq.info, Mfit, curves, L, 8); untangleCage(cage, iq.info, Mfit, curves, L, prm.iqUntangle ?? 30, prm.iqSpread ?? 1); unfoldCage(cage, iq.info, Mfit, curves, L, prm.iqUnfold ?? 20); if (prm.onCage) prm.onCage(cage, iq.info); }
+  if (iq){ cage = iq.cage; if (prm.iqTidy !== false) tidyCage(cage, iq.info, iq.s); if (prm.heal !== false) healTris(cage, prm.healLen ?? 8); if (prm.iqSquare ?? 16) squareQuads(cage, M, null, prm.iqSquare ?? 16, L, Mfit, v => iq.info.fc[v] >= 0 || !!iq.info.corner[v]); if (prm.hard > 0) autoCreases(cage, prm.hard); progress(0.97, 'Hugging the surface'); hugCage(cage, iq.info, Mfit, curves, L, 8); untangleCage(cage, iq.info, Mfit, curves, L, prm.iqUntangle ?? 30, prm.iqSpread ?? 1); unfoldCage(cage, iq.info, Mfit, curves, L, prm.iqUnfold ?? 20); if (prm.onCage) prm.onCage(cage, iq.info); }
   else {
     if (fieldQuads) simplify();
     cage = quadify(M, curves, flow);
@@ -2139,6 +2193,7 @@ function solve(strokes, prm, progress = () => {}){
     const info = { fc: Array.from({ length: cage.V.length / 3 }, (_, v) => M.fc[v] >= 0 && curves[M.fc[v]] && curves[M.fc[v]].row ? -1 : M.fc[v]), corner: Array.from({ length: cage.V.length / 3 }, (_, v) => !!M.corner[v]) };
     if (prm.tidy !== false){ const el = []; for (const f of cage.F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; el.push(Math.hypot(cage.V[3 * a] - cage.V[3 * b], cage.V[3 * a + 1] - cage.V[3 * b + 1], cage.V[3 * a + 2] - cage.V[3 * b + 2])); }
       el.sort((x, y) => x - y); for (let r = 0; r < 4; r++) if (!tidyCage(cage, info, el[el.length >> 1] || L)) break; }
+    if (prm.heal !== false) healTris(cage, prm.healLen ?? 8);
     hugCage(cage, info, Mfit, curves, L, 6);
     if (prm.tidy !== false) unfoldCage(cage, info, Mfit, curves, L, 12);
     if (prm.onCage) prm.onCage(cage, info);
@@ -2160,7 +2215,7 @@ function solve(strokes, prm, progress = () => {}){
   };
 }
 
-const api = { solve, consensus, resample, catmullClark, sliceLoops, shade, wire, edgeWire, allEdges, creaseLines, ek };
+const api = { healTris, solve, consensus, resample, catmullClark, sliceLoops, shade, wire, edgeWire, allEdges, creaseLines, ek };
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 root.PentimentoSolver = api;
 // as a Web Worker: build in the background so the headset never stalls

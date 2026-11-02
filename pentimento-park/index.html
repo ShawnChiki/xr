@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p2.0"></script>
-<script src="solver.js?v=p2.0"></script>
+<script src="demo.js?v=p2.4"></script>
+<script src="solver.js?v=p2.4"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -106,7 +106,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.3';
+const VERSION = '2.4';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -117,9 +117,9 @@ const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 // ======================================================================
 // line types. Averaged ones are found from many loose passes; strict ones are used exactly as drawn.
 const TAG_NAME = ['Loose', 'Guide', 'Guide', 'Crease', 'Strict crease', 'Edge', 'Strict edge'];
-const TAG_SUB = ['shapes the surface', 'lays out the quads', 'lays out the quads', 'averaged · sharp', 'exact · sharp', 'surface ends here', 'ends exactly here'];
-const TAG_COL = [0xD5DAE1, 0x5CC8FF, 0x4A5BFF, 0xFF9A2E, 0xFF3348, 0x4FD67A, 0x0FA84A];
-const TAG_CSS = ['#D5DAE1', '#5CC8FF', '#4A5BFF', '#FF9A2E', '#FF3348', '#4FD67A', '#0FA84A'];
+const TAG_SUB = ['shapes the surface', 'quad edges follow it', 'quad edges follow it', 'averaged · sharp', 'exact · sharp', 'surface ends here', 'ends exactly here'];
+const TAG_COL = [0xD5DAE1, 0x5CC8FF, 0x5CC8FF, 0xFF9A2E, 0xFF3348, 0x4FD67A, 0x0FA84A];
+const TAG_CSS = ['#D5DAE1', '#5CC8FF', '#5CC8FF', '#FF9A2E', '#FF3348', '#4FD67A', '#0FA84A'];
 const STRICT = t => t === 2 || t === 4 || t === 6;
 const NT = 7;
 const VT = [0, 1, 3, 4, 5, 6];                                    // the line types you can pick (one kind of guide)
@@ -325,7 +325,7 @@ function eraseAt(p, r){
 function markAt(p, r){
   let hit = false;
   strokes = strokes.map(s => { if (s.tag === S.tag || !editable(s) || !touches(s, p, r)) return s; hit = true;
-    if (STRICT(S.tag)) return s.ctrl ? { ...s, tag: S.tag } : asSpline(s, S.tag);         // becoming strict: gets control points
+    if (STRICT(S.tag) || S.tag === 1){ const tg = S.tag === 1 ? 2 : S.tag; return s.ctrl ? { ...s, tag: tg } : asSpline(s, tg); }         // becoming strict (or a guide): gets control points
     const n = { ...s, tag: S.tag }; delete n.ctrl; delete n.closed; const t = tubeCache.get(s); if (t && !STRICT(s.tag)) tubeCache.set(n, t); return n; });
   if (hit) linesDirty = true; return hit;
 }
@@ -671,6 +671,21 @@ function ctrlMove(d, p){
   const m = Math.hypot(p.x - d.p0.x, p.y - d.p0.y, p.z - d.p0.z); if (m > 1e-6) d.did = true; d.lastP = p.clone(); return m;
 }
 // a new strict line's ends click onto points already there
+// an averaged crease (or edge) drawn so it ends near a strict line sticks to it: its end lands on that line's nearest
+// point (a control point if one is close), and the last stretch bends over smoothly to meet it
+function stickEnds(n){
+  if (n.ctrl || (n.tag !== 3 && n.tag !== 5)) return n; const P = Float32Array.from(n.pts), m = P.length / 3; if (m < 4) return n;
+  const r = 0.035 * N(), rc = 0.02 * N(); let hit = 0;
+  const strictLines = strokes.filter(s => s.ctrl && STRICT(s.tag) && s.tag !== 2 && S.show[s.tag]);
+  for (const end of [0, m - 1]){ const q = [P[3 * end], P[3 * end + 1], P[3 * end + 2]], d2q = t => (t[0] - q[0]) ** 2 + (t[1] - q[1]) ** 2 + (t[2] - q[2]) ** 2; let best = null, bd = rc * rc;
+    for (const s of strictLines) for (let j = 0; j < s.ctrl.length / 3; j++){ const t = ctrlAt(s, j), d = d2q(t); if (d < bd){ bd = d; best = t; } }   // a control point first
+    if (!best){ bd = r * r; for (const s of strictLines){ const a = s.pts; for (let i = 0; i < a.length; i += 3){ const t = [a[i], a[i + 1], a[i + 2]], d = d2q(t); if (d < bd){ bd = d; best = t; } } } }
+    if (!best) continue; hit++;
+    // ease the move in over the last fifth of the line
+    const dx = best[0] - q[0], dy = best[1] - q[1], dz = best[2] - q[2], span = Math.max(2, Math.floor(m / 5));
+    for (let k = 0; k <= span; k++){ const i = end === 0 ? k : m - 1 - k, w = (1 - k / span) ** 2 * (3 - 2 * (1 - k / span)) ; P[3 * i] += dx * w; P[3 * i + 1] += dy * w; P[3 * i + 2] += dz * w; } }
+  if (!hit) return n; return { ...n, pts: P, box: boxOf(P) };
+}
 function snapEnds(n){
   if (!n.ctrl || n.closed) return n; const r = 0.025 * N(), r2 = 0.07 * N(), c = n.ctrl.slice(), last = c.length / 3 - 1; let hit = 0; const misses = [];
   const lineish = s => s.id !== n.id && S.show[s.tag] && s.tag >= 3;
@@ -912,7 +927,7 @@ let lastBuildSecs = 0, buildT0 = 0, buildErr = '', buildStart = 0, buildSnap = n
 const hasSurface = () => !!surfMesh;
 const GUIDE_LAYOUT = { '-3': 'Guides ×1', '-2': 'Guides ×4', '-1': 'Guides ×16' };
 const targetVal = () => (S.target || 0) < 0 ? -1 - ((S.target || 0) + 3) : TARGETS[S.target || 0];   // -1: one face per patch, -2: 4, -3: 16
-function params(){ const q = QUAD[S.quad]; return { detail: q, avg: q * 1.6, lines: S.avg, fair: S.fair / 10, reach: REACH[S.reach], group: GROUP[S.group], subd: S.subd, relax: S.relax || 0, target: targetVal(), hard: HARD[S.hard || 0], tipFade: TIPS_FADE[S.tipSoft ?? 1], rows: S.rows ?? 1 }; }
+function params(){ const q = QUAD[S.quad]; return { detail: q, avg: q * 1.6, lines: S.avg, fair: S.fair / 10, reach: REACH[S.reach], group: GROUP[S.group], subd: S.subd, relax: S.relax || 0, target: targetVal(), hard: HARD[S.hard || 0], tipFade: TIPS_FADE[S.tipSoft ?? 1], rows: S.rows ?? 1, creaseMin: CREASE_MIN[S.creaseMin ?? 2] }; }
 function scheduleBuild(){ stale = true; menuDirty = true; if (building) cancelBuild(); if (cageEd) return; if (S.auto && S.surf !== 'hide') buildTimer = 0.6; }
 // stop a build that's out of date, so the next one can start straight away with the new lines
 function cancelBuild(){ if (!building) return; if (worker){ worker.terminate(); worker = null; } building = false; pending = false; buildId++; menuDirty = true; }
@@ -1198,12 +1213,13 @@ function scheduleSave(){ saveT = 1.2; }
 const packStrokes = () => strokes.map(s => s.ctrl ? { t: s.tag, c: Array.from(s.ctrl, v => Math.round(v * 1000)), cl: s.closed ? 1 : 0, ...(s.kinks ? { k: Array.from(s.kinks) } : {}), ...(s.ends ? { e: s.ends } : {}), ...(s.fold ? { f: s.fold } : {}) } : { t: s.tag, r: Array.from(s.raw, v => Math.round(v * 1000)), ...(s.tieOf ? { u: s.tieOf } : {}) });
 const packDabs = () => dabs.map(d => [d.x, d.y, d.z, d.r, d.s].map(v => Math.round(v * 1000) / 1000));
 // strict guides from before 2.3 become plain guides (there is one kind of guide now)
-function unpackStrokes(list){ return list.map(o => { if (o.c){ const sp = makeSpline(o.t, Float32Array.from(o.c, v => v / 1000), !!o.cl, 0, o.k ? Uint8Array.from(o.k) : null); if (o.e) sp.ends = o.e.slice(); if (o.f) sp.fold = o.f; return o.t === 2 ? makeStroke(1, sp.pts, sp.pts) : sp; }
-  const raw = Float32Array.from(o.r, v => v / 1000), st = makeStroke(o.t === 2 ? 1 : o.t, raw, o.u ? raw : null); if (o.u) st.tieOf = o.u; return st; }); }
+function unpackStrokes(list){ return list.map(o => { if (o.c){ const sp = makeSpline(o.t, Float32Array.from(o.c, v => v / 1000), !!o.cl, 0, o.k ? Uint8Array.from(o.k) : null); if (o.e) sp.ends = o.e.slice(); if (o.f) sp.fold = o.f; return sp; }
+  const raw = Float32Array.from(o.r, v => v / 1000), st = makeStroke(o.t, raw, o.u ? raw : null); if (o.u) st.tieOf = o.u; return st; }); }
 const unpackDabs = list => (list || []).map(([x, y, z, r, s]) => ({ x, y, z, r, s }));
 // ---------- runs from Party Lines: the lines you rode there, as paths with boards rolling along them while you sketch.
 // They sit in the park at your model size (what was a fingerboard is a real board here), can be gripped and moved
 // into place, and their rolling parts can become loose lines (the board's two wheel tracks: the ground it rode on).
+const hexCss = c => '#' + c.toString(16).padStart(6, '0');
 const RUN_COLORS = [0xff6b3d, 0x2fb3a5, 0xff5fa2, 0xf2c230, 0x4f8cff, 0x6fd16a, 0xa87bff, 0xe8463b];
 const runsGroup = new THREE.Group(); world.add(runsGroup);
 let runs = [], runsName = '', runsT0 = performance.now() / 1000, pendingSettle = false;
@@ -2024,7 +2040,8 @@ if (saved && saved.runs) try { unpackRuns(saved.runs); } catch (e){}
 const savedCage = saved && saved.cage && saved.cage.V ? saved.cage : null;
 // ---------- your sketch library (Files tab): copies kept in this browser, plus files to download and open
 const LIB = 'pentimento-library', LIB_ROWS = 6, libKey = id => 'pentimento-sketch-' + id;
-const SKETCH_SET = ['quad', 'avg', 'fair', 'reach', 'group', 'subd', 'relax', 'target', 'hard', 'smooth'];   // the build settings travel with a sketch
+const CREASE_MIN = [1, 0.8, 0.6, 0.45, 0.3];   // shortest edge along a bending strict crease, as a share of the quad size
+const SKETCH_SET = ['creaseMin', 'quad', 'avg', 'fair', 'reach', 'group', 'subd', 'relax', 'target', 'hard', 'smooth'];   // the build settings travel with a sketch
 let libPage = 0, libDel = null, libDelT = 0, libCache = null;
 // Saved sketches live in the browser's database (IndexedDB): far more room than the small quick-save store they used
 // to share with your settings. Each has a name, the time, a line count and a little picture.
@@ -2319,6 +2336,10 @@ function setStep(st, quiet){
     { id: 'runs-ride', label: () => S.runsRide ? 'Boards ride' : 'Boards still', on: () => !!S.runsRide, act: () => { S.runsRide = S.runsRide ? 0 : 1; runsT0 = performance.now() / 1000; scheduleSave(); } },
     { id: 'runs-lock', label: () => S.runsLock ? 'Runs locked' : 'Lock runs', style: 'lock', on: () => !!S.runsLock, act: () => { S.runsLock = S.runsLock ? 0 : 1; scheduleSave(); flash(S.runsLock ? 'Runs locked: gripping near them moves the model' : 'Runs unlocked: grip a path to move it'); } },
     { id: 'runs-clear', label: () => 'Remove all', style: 'danger', act: clearRuns }], { vis: hasRuns });
+  // one row per run: its colour, how long it is, and a Delete
+  for (let i = 0; i < 8; i++){ const h = 64, bw = 150, r = () => runs[i];
+    blk('ride', h, [text({ kind: 'panel', x: P, y: 0, w: W, h }), text({ kind: 'runRow', x: P + 22, y: h / 2, i, text: () => 'Run ' + (i + 1) + ' · ' + r().dur.toFixed(1) + ' s' + (r().tricks.length ? ' · ' + r().tricks.length + (r().tricks.length === 1 ? ' flip' : ' flips') : '') }),
+      add({ id: 'run-del-' + i, x: MW - P - bw - 8, y: 8, w: bw, h: h - 16, style: 'danger', label: () => 'Delete', act: () => deleteRun(runs[i]) })], { vis: () => !!r(), gap: 8 }); }
   note('ride', 'Grip a path to move that run (swing your hand to turn it). Holding it: A lays ties under it, B removes them, stick press deletes the run.', { vis: hasRuns });
   section('ride', 'TIES · SHORT LINES UNDER A RUN, SO THE SURFACE FOLLOWS IT', { vis: hasRuns });
   stepper('ride', 64, 'Tie spacing', () => 'every ' + lenText(TIE_GAP[S.tieGap ?? 2]), () => { S.tieGap = Math.max(0, (S.tieGap ?? 2) - 1); scheduleSave(); }, () => { S.tieGap = Math.min(TIE_GAP.length - 1, (S.tieGap ?? 2) + 1); scheduleSave(); }, { vis: hasRuns });
@@ -2375,6 +2396,7 @@ function setStep(st, quiet){
     { extra: h => [text({ kind: 'small', x: P + 232, y: h / 2 + 2, text: () => lastResult && lastResult.nQuads ? 'now ' + lastResult.nQuads.toLocaleString() + (stale || building ? '…' : '') : '' })] });
   stepper('surface', 64, 'Fit detail', () => lenText(QUAD[S.quad]), () => setParam(() => S.quad = Math.max(0, S.quad - 1)), () => setParam(() => S.quad = Math.min(QUAD.length - 1, S.quad + 1)));
   stepper('surface', 64, 'Smoothness', () => String(S.fair), () => setParam(() => S.fair = Math.max(0, S.fair - 1)), () => setParam(() => S.fair = Math.min(10, S.fair + 1)));
+  stepper('surface', 64, 'Shortest crease edge', () => (CREASE_MIN[S.creaseMin ?? 2] >= 1 ? 'Even' : lenText(QUAD[S.quad] * CREASE_MIN[S.creaseMin ?? 2])), () => setParam(() => S.creaseMin = Math.max(0, (S.creaseMin ?? 2) - 1)), () => setParam(() => S.creaseMin = Math.min(CREASE_MIN.length - 1, (S.creaseMin ?? 2) + 1)));
   stepper('surface', 64, 'Crease rows', () => (S.rows ?? 1) ? (S.rows ?? 1) + ((S.rows ?? 1) === 1 ? ' row' : ' rows') : 'None', () => setParam(() => S.rows = Math.max(0, (S.rows ?? 1) - 1)), () => setParam(() => S.rows = Math.min(4, (S.rows ?? 1) + 1)));
   section('surface', 'FINE TUNING', MORE);
   stepper('surface', 64, 'Smart creases', () => HARD_NAME[S.hard || 0], () => setParam(() => S.hard = Math.max(0, (S.hard || 0) - 1)), () => setParam(() => S.hard = Math.min(HARD.length - 1, (S.hard || 0) + 1)), MORE);
@@ -2505,6 +2527,7 @@ const TIP_PAGES = {
     'Fit detail is the main knob: smaller follows your lines more closely and builds slower; larger is smoother and faster.',
     'Smoothness: higher irons out wobbly lines; lower keeps more of exactly what you drew.',
     'Target quads: Auto sizes quads from Fit detail. A number gives a lighter mesh, easier to shape in step 4. Guides ×4 / ×16 builds the mesh from your blue guides.',
+    'Shortest crease edge: along a strict crease the edges are as long as anywhere else where it runs straight, and only get shorter where it bends, but never shorter than this. Even keeps one size everywhere (the crease is followed a little more loosely in tight bends).',
     'Crease rows: clean rows of quads along each sharp crease, up to 4.',
     'Look: Zebra shows lumps (smooth stripes, smooth surface); Trust shows where your lines sit on it. More settings has the rest.']],
   shape: ['4 · SHAPE: CLEAN UP THE SUBD', [
@@ -2691,6 +2714,7 @@ function drawMenu(){
       g.textAlign = 'left'; g.font = '46px "Archivo Black","Arial Black",sans-serif'; g.fillStyle = '#EEF0F3'; g.fillText(STEP_NAME[st], t.x + 88, t.y + 26);
       g.font = '500 26px "Archivo",sans-serif'; g.fillStyle = '#9AA2AD'; g.fillText(STEP_SUB[st], t.x + 88, t.y + 64); }
     else if (t.kind === 'note'){ g.textAlign = 'left'; g.font = '500 27px "Archivo",sans-serif'; g.fillStyle = '#9AA2AD'; wrapText(g, t.text(), t.x, t.y, t.w || MW - 2 * t.x, 36); }
+    else if (t.kind === 'runRow'){ const r = runs[t.i]; g.textAlign = 'left'; g.fillStyle = hexCss(RUN_COLORS[((r && r.c) || 0) % RUN_COLORS.length]); rr2(g, t.x, t.y - 7, 40, 14, 7); g.fill(); g.font = '600 30px "Archivo",sans-serif'; g.fillStyle = '#EEF0F3'; g.fillText(t.text(), t.x + 58, t.y); }
     else if (t.kind === 'layer'){ const pt = t.tag === 'paint'; g.textAlign = 'left'; g.fillStyle = pt ? '#5FE0B8' : TAG_CSS[t.tag]; rr2(g, t.x, t.y - 7, 54, 14, 7); g.fill();
       g.font = '600 31px "Archivo",sans-serif'; g.fillStyle = (pt ? S.paintShow : S.show[t.tag]) ? '#EEF0F3' : '#6B7480'; g.fillText(t.text(), t.x + 72, t.y); }
   }
@@ -2789,10 +2813,13 @@ function toolUp(id, d){
     world.remove(d.mesh); d.mesh.geometry.dispose();
     if (d.raw.length >= 12){
       const raw = Float32Array.from(d.raw), pts = smoothed(raw, S.smooth), laps = sliceLoops(pts, 0.025 * N(), 0.12 * N());
-      const made = laps.map(([a, b]) => { const st = makeStroke(S.tag, raw.slice(3 * a, 3 * b), pts.slice(3 * a, 3 * b)); return STRICT(S.tag) ? snapEnds(asSpline(st, S.tag)) : st; });
+      // guides are drawn as editable lines with points, like the strict ones: the quads' edges follow them exactly
+      const tg = S.tag === 1 ? 2 : S.tag;
+      const made = laps.map(([a, b]) => { const st = makeStroke(tg, raw.slice(3 * a, 3 * b), pts.slice(3 * a, 3 * b)); return STRICT(tg) ? snapEnds(asSpline(st, tg)) : stickEnds(st); });
       commit([...strokes, ...made]);
       if (laps.length > 1) flash('Cut that line into ' + laps.length + ' laps');
-      else if (STRICT(S.tag) && gapT <= 0) flash('Drag its points to shape it');
+      else if (tg === 2 && gapT <= 0) flash('Guide: the quads\' edges will run along it. Drag its points to shape it.', 4);
+      else if (STRICT(tg) && gapT <= 0) flash('Drag its points to shape it');
     }
     return;
   }
@@ -2819,14 +2846,18 @@ const hands = [0, 1].map(i => {
   const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.001, 0.001, PEN, 6), new THREE.MeshBasicMaterial({ color: 0x9AA2AD })); stem.rotation.x = Math.PI / 2; stem.position.z = -PEN / 2; ray.add(stem);
   const brush = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.MeshBasicMaterial({ color: 0xFFFFFF, wireframe: true, transparent: true, opacity: 0.35 })); brush.visible = false; scene.add(brush);
   const h = { i, ray, grip, model, beam, tip, stem, brush, source: null, hand: '', prev: [], flick: 0, act: null, grab: false, sizeT: 0 };
-  ray.addEventListener('connected', e => { h.source = e.data; h.hand = e.data.handedness; h.decor = false; placeMenuHand(); });
-  ray.addEventListener('disconnected', () => { if (dial && dial.h === h) closeDial(false); h.ctrlGrip = false; if (h.act){ toolUp(h.i, h.act); h.act = null; } if (h.grab){ h.grab = false; grabReset(); } if (menuMesh.parent === grip){ grip.remove(menuMesh); menuMesh.visible = false; } h.source = null; });
+  // the Quest swaps to hand tracking when the controllers sit still: hands are ignored here (nothing moves or
+  // switches), and the menu waits where it was until a controller comes back
+  const isHandSrc = src => !src.gamepad || !!src.hand || (src.profiles || []).some(p => /hand/.test(p));
+  ray.addEventListener('connected', e => { if (isHandSrc(e.data)){ h.source = null; return; } h.source = e.data; h.hand = e.data.handedness; h.decor = false; if (menuParked && !S.menuPinned){ menuParked = false; placeMenuHand(); } else placeMenuHand(); });
+  ray.addEventListener('disconnected', () => { if (dial && dial.h === h) closeDial(false); h.ctrlGrip = false; if (h.act){ toolUp(h.i, h.act); h.act = null; } if (h.grab){ h.grab = false; grabReset(); } if (menuMesh.parent === grip){ scene.attach(menuMesh); menuParked = true; } h.source = null; });
   return h;
 });
 const mainHand = () => S.mainHand === 'left' ? 'left' : 'right';
 const isOff = h => !!h.hand && h.hand !== mainHand();
 // the menu rides on the hand that doesn't draw
-function placeMenuHand(){ if (S.menuPinned || hands.some(h => h.menuGrab)) return; const h = hands.find(isOff); if (h){ if (menuMesh.parent !== h.grip) h.grip.add(menuMesh); } else if (menuMesh.parent) menuMesh.parent.remove(menuMesh); menuDirty = true; }
+let menuParked = false;
+function placeMenuHand(){ if (S.menuPinned || hands.some(h => h.menuGrab)) return; if (menuParked && !hands.some(h => isOff(h) && h.source)) return; menuParked = false; const h = hands.find(isOff); if (h){ if (menuMesh.parent !== h.grip){ h.grip.add(menuMesh); menuMesh.rotation.set(MENU_TILT, 0, 0); menuMesh.scale.x = 1; placeMenuMesh(MENU_H * menuCropH / MH); } } else if (menuMesh.parent) menuMesh.parent.remove(menuMesh); menuDirty = true; }
 // grip the menu with your main hand to leave it floating in the room; bring it back to the other hand (or Settings →
 // Menu back to hand) to put it back
 function dockMenu(){ S.menuPinned = 0; hands.forEach(h => h.menuGrab = false); const off = hands.find(isOff); if (!off) return; off.grip.add(menuMesh);
@@ -3043,7 +3074,7 @@ function updateXRInput(dt){
   hotH = hands.some(h => h.act && h.act.kind === 'ctrl') ? hotHandle : null;
   const menuOwner = hands.find(h => menuMesh.parent === h.grip);
   if (menuOwner) menuOwner.grip.updateMatrixWorld(true);
-  menuMesh.visible = (!!menuOwner || (!!S.menuPinned && menuMesh.parent === scene)) && menuShown;
+  menuMesh.visible = (!!menuOwner || ((!!S.menuPinned || menuParked) && menuMesh.parent === scene)) && menuShown;
   let hover = null, hi = [];
   for (const h of hands){
     const gp = h.source && h.source.gamepad;
