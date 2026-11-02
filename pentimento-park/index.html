@@ -106,7 +106,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.2';
+const VERSION = '2.3';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -945,7 +945,7 @@ function clearSurface(){
   surfMesh = wireLines = fineLines = creaseLines = foundGroup = null; lastResult = null;
 }
 function applyResult(r){
-  clearSurface();
+  clearSurface(); if (panels) clearPanels();
   if (r.empty){ flash('Draw a few more lines first'); return; }
   if (r.note) flash(r.note, r.culprits && r.culprits.length ? 10 : 6);
   lastResult = r;
@@ -1040,6 +1040,8 @@ function hasSurfaceNear(c, R){ if (!surfGrid) buildSurfGrid(); let any = false; 
 function clearPaint(){ if (!dabs.length) return flash('No smooth paint to clear'); commit(strokes, []); paintTint(); flash('Smooth paint cleared. Undo brings it back.'); }
 function applySurfView(){
   surf.visible = S.surf !== 'hide';
+  // the Fab step shows the panels in place of the plain surface
+  const pv = !!panels && menuTab === 'fab' && S.surf !== 'hide'; try { panelGroup.visible = pv; } catch (e){} if (surfMesh) surfMesh.visible = !pv;
   if (wireLines) wireLines.visible = S.edges === 'quads';
   if (fineLines) fineLines.visible = S.edges === 'fine';
   // edges show up on stripes or a light surface in blue, otherwise in dark grey
@@ -1053,7 +1055,7 @@ function applySurfView(){
     m.material.depthWrite = m.material.opacity > 0.9; });
   menuDirty = true;
 }
-function setSurfView(v){ S.surf = v; applySurfView(); scheduleSave(); resumeBuild(); }
+function setSurfView(v){  S.surf = v; applySurfView(); scheduleSave(); resumeBuild(); }
 function toggleLines(){ if (S.lines === 'hide') S.lines = S.linesWas || 'show'; else { S.linesWas = S.lines; S.lines = 'hide'; } applySurfView(); scheduleSave(); flash(S.lines === 'hide' ? 'All lines hidden' : 'Lines showing'); }
 // A on the right controller: surface and lines → surface only → lines only → both again
 function cycleView(){
@@ -1083,6 +1085,94 @@ function makeStrict(){
   const tags = new Set(found.map(c => c.tag));
   commit([...strokes.filter(s => !(tags.has(s.tag) && !S.lock[s.tag])), ...add]);
   flash(add.length + (add.length === 1 ? ' line is' : ' lines are') + ' strict now. Drag the points to edit.');
+}
+// ---------- Fab · hex panels: the surface covered in near-hexagonal panels of one size, however fine its mesh is.
+// Seeds are spread over the surface and relaxed (each panel's centre moves to the middle of the area nearest it,
+// measured along the surface) until the panels settle into hexagons. Creases are seams: a panel never crosses one.
+const PANEL_SIZE = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3];     // across a panel, park metres
+let panels = null;                                            // { label (per welded vertex), map (soup → welded), n, flat, size }
+const panelGroup = new THREE.Group(); world.add(panelGroup);
+function clearPanels(){ for (const o of [...panelGroup.children]){ panelGroup.remove(o); o.geometry.dispose(); } panels = null; if (surfMesh) applySurfView(); menuDirty = true; }
+function makePanels(){
+  if (!surfMesh) return flash('Build a surface first (step 3)');
+  const P = surfMesh.geometry.attributes.position.array, NN = surfMesh.geometry.attributes.normal.array, ns = P.length / 3;
+  // weld the triangle soup into points and their neighbours
+  const key = new Map(), map = new Int32Array(ns), X = []; for (let i = 0; i < ns; i++){ const k = Math.round(P[3 * i] * 1e4) + ',' + Math.round(P[3 * i + 1] * 1e4) + ',' + Math.round(P[3 * i + 2] * 1e4); let v = key.get(k); if (v === undefined){ v = X.length / 3; key.set(k, v); X.push(P[3 * i], P[3 * i + 1], P[3 * i + 2]); } map[i] = v; }
+  const nv = X.length / 3, crease = new Uint8Array(nv), area = new Float64Array(nv), adj = Array.from({ length: nv }, () => new Map());
+  if (S.panelSeams !== 0 && creaseV) for (let i = 0; i < ns; i++) if (creaseV[i]) crease[map[i]] = 1;
+  const D = (a, b) => Math.hypot(X[3 * a] - X[3 * b], X[3 * a + 1] - X[3 * b + 1], X[3 * a + 2] - X[3 * b + 2]);
+  for (let t = 0; t < ns; t += 3){ const a = map[t], b = map[t + 1], c = map[t + 2]; if (a === b || b === c || a === c) continue;
+    for (const [u, w] of [[a, b], [b, c], [c, a]]){ const d = D(u, w); adj[u].set(w, d); adj[w].set(u, d); }
+    const ux = X[3 * b] - X[3 * a], uy = X[3 * b + 1] - X[3 * a + 1], uz = X[3 * b + 2] - X[3 * a + 2], wx = X[3 * c] - X[3 * a], wy = X[3 * c + 1] - X[3 * a + 1], wz = X[3 * c + 2] - X[3 * a + 2];
+    const A = Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx) / 6; area[a] += A; area[b] += A; area[c] += A; }
+  const size = PANEL_SIZE[S.panelSize ?? 3], sp = size * 0.95;
+  // seeds: spread out, at least a panel apart (points on seams can't be centres)
+  const order = Array.from({ length: nv }, (_, i) => i); let rs = 12345; const rnd = () => (rs = (rs * 16807) % 2147483647) / 2147483647; for (let i = nv - 1; i > 0; i--){ const j = Math.floor(rnd() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+  const cell = sp, grid = new Map(), gk = (x, y, z) => Math.floor(x / cell) + ',' + Math.floor(y / cell) + ',' + Math.floor(z / cell); let seeds = [];
+  for (const v of order){ if (crease[v] || !adj[v].size) continue; const x = X[3 * v], y = X[3 * v + 1], z = X[3 * v + 2]; let ok = true;
+    for (let i = -1; i <= 1 && ok; i++) for (let j = -1; j <= 1 && ok; j++) for (let k = -1; k <= 1 && ok; k++){ const l = grid.get(gk(x + i * cell, y + j * cell, z + k * cell)); if (l) for (const q of l) if (D(q, v) < sp){ ok = false; break; } }
+    if (ok){ seeds.push(v); const g = gk(x, y, z); (grid.get(g) || grid.set(g, []).get(g)).push(v); } }
+  if (seeds.length > 4000) return flash('That would be over 4000 panels: pick a bigger panel size');
+  // nearest seed along the surface (a little heap), seams stop the spread
+  const label = new Int32Array(nv), dist = new Float64Array(nv);
+  const grow = () => { label.fill(-1); dist.fill(Infinity); const h = []; const push = (d, v) => { h.push([d, v]); let i = h.length - 1; while (i){ const p = (i - 1) >> 1; if (h[p][0] <= h[i][0]) break; [h[p], h[i]] = [h[i], h[p]]; i = p; } };
+    const pop = () => { const top = h[0], last = h.pop(); if (h.length){ h[0] = last; let i = 0; for (;;){ const l = 2 * i + 1, r = l + 1; let m = i; if (l < h.length && h[l][0] < h[m][0]) m = l; if (r < h.length && h[r][0] < h[m][0]) m = r; if (m === i) break; [h[m], h[i]] = [h[i], h[m]]; i = m; } } return top; };
+    seeds.forEach((v, i) => { dist[v] = 0; label[v] = i; push(0, v); });
+    while (h.length){ const [d, v] = pop(); if (d > dist[v]) continue; if (crease[v] && dist[v] > 0) continue;
+      for (const [w, l] of adj[v]){ const nd = d + l; if (nd < dist[w]){ dist[w] = nd; label[w] = label[v]; push(nd, w); } } } };
+  for (let it = 0; it < 12; it++){ grow();
+    const cx = new Float64Array(seeds.length), cy = new Float64Array(seeds.length), cz = new Float64Array(seeds.length), ca = new Float64Array(seeds.length);
+    for (let v = 0; v < nv; v++){ const L = label[v]; if (L < 0) continue; const a = area[v]; cx[L] += X[3 * v] * a; cy[L] += X[3 * v + 1] * a; cz[L] += X[3 * v + 2] * a; ca[L] += a; }
+    const best = new Int32Array(seeds.length).fill(-1), bd = new Float64Array(seeds.length).fill(Infinity);
+    for (let v = 0; v < nv; v++){ const L = label[v]; if (L < 0 || crease[v] || !ca[L]) continue; const d = (X[3 * v] - cx[L] / ca[L]) ** 2 + (X[3 * v + 1] - cy[L] / ca[L]) ** 2 + (X[3 * v + 2] - cz[L] / ca[L]) ** 2; if (d < bd[L]){ bd[L] = d; best[L] = v; } }
+    // tiny slivers (squeezed against a seam or the edge) are dropped
+    seeds = seeds.map((v, i) => best[i] >= 0 && ca[i] > 0.12 * size * size ? best[i] : -1).filter(v => v >= 0); }
+  grow();
+  // how flat each panel is: farthest point from its average plane
+  const n = seeds.length, nx = new Float64Array(n), ny = new Float64Array(n), nz = new Float64Array(n), mx = new Float64Array(n), my = new Float64Array(n), mz = new Float64Array(n), cnt = new Float64Array(n), flat = new Float64Array(n);
+  for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0) continue; nx[L] += NN[3 * i]; ny[L] += NN[3 * i + 1]; nz[L] += NN[3 * i + 2]; mx[L] += P[3 * i]; my[L] += P[3 * i + 1]; mz[L] += P[3 * i + 2]; cnt[L]++; }
+  for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0) continue; const l = Math.hypot(nx[L], ny[L], nz[L]) || 1; flat[L] = Math.max(flat[L], Math.abs(((P[3 * i] - mx[L] / cnt[L]) * nx[L] + (P[3 * i + 1] - my[L] / cnt[L]) * ny[L] + (P[3 * i + 2] - mz[L] / cnt[L]) * nz[L]) / l)); }
+  panels = { label, map, n, flat, size, X, dist: Float64Array.from(dist) }; showPanels();
+  const fl = Array.from(flat).sort((a, b) => a - b), med = fl[Math.floor(fl.length / 2)] || 0;
+  flash(n + ' panels about ' + lenText(size) + ' across. Half are within ' + lenText(med) + ' of flat.', 7);
+}
+const PANEL_COLS = [0xFF6B3D, 0x2FB3A5, 0xFF5FA2, 0xF2C230, 0x4F8CFF, 0x6FD16A, 0xA87BFF, 0xE8463B, 0x5FE0B8].map(c => new THREE.Color(c));
+function showPanels(){
+  for (const o of [...panelGroup.children]){ panelGroup.remove(o); o.geometry.dispose(); }
+  if (!panels || !surfMesh) return; const { label, map, flat, size } = panels, src = surfMesh.geometry, P = src.attributes.position.array, NN = src.attributes.normal.array, ns = P.length / 3;
+  // colour: each panel its own colour (neighbours differ), or how flat it is
+  const pc = new Int32Array(panels.n).fill(-1), nbs = Array.from({ length: panels.n }, () => new Set());
+  for (let t = 0; t < ns; t += 3){ const a = label[map[t]], b = label[map[t + 1]], c = label[map[t + 2]]; for (const [x, y] of [[a, b], [b, c], [c, a]]) if (x >= 0 && y >= 0 && x !== y){ nbs[x].add(y); nbs[y].add(x); } }
+  for (let i = 0; i < panels.n; i++){ const used = new Set([...nbs[i]].map(j => pc[j])); let c = 0; while (used.has(c)) c++; pc[i] = c % PANEL_COLS.length; }
+  const col = new Float32Array(ns * 3), tmp = new THREE.Color();
+  for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0){ col.set([0.6, 0.6, 0.6], 3 * i); continue; }
+    if (S.panelColor === 1){ const u = Math.min(1, flat[L] / (0.06 * size)); tmp.setRGB(0.3 + 0.7 * u, 0.85 - 0.6 * u, 0.4 - 0.2 * u); } else tmp.copy(PANEL_COLS[pc[L]]);
+    col[3 * i] = tmp.r; col[3 * i + 1] = tmp.g; col[3 * i + 2] = tmp.b; }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', src.attributes.position.clone()); g.setAttribute('normal', src.attributes.normal.clone()); g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 })); panelGroup.add(m);
+  // the seams between panels: through the middle of each triangle edge whose ends are in different panels
+  // where along the edge the two panels are equally far (from each end's distance to its own centre), so the seams
+  // run smooth instead of zig-zagging along the mesh
+  const dist = panels.dist, X = panels.X, seg = [], off = 0.006 * N(), q = (i, j) => { const a = map[i], b = map[j], l = Math.hypot(X[3 * a] - X[3 * b], X[3 * a + 1] - X[3 * b + 1], X[3 * a + 2] - X[3 * b + 2]) || 1e-9;
+    const t = Math.max(0.05, Math.min(0.95, (dist[b] + l - dist[a]) / (2 * l))); return [0, 1, 2].map(k => P[3 * i + k] + (P[3 * j + k] - P[3 * i + k]) * t + (NN[3 * i + k] + NN[3 * j + k]) / 2 * off); };
+  for (let t = 0; t < ns; t += 3){ const ids = [t, t + 1, t + 2], L = ids.map(i => label[map[i]]), cut = [];
+    for (let k = 0; k < 3; k++){ const i = ids[k], j = ids[(k + 1) % 3]; if (L[k] !== L[(k + 1) % 3]) cut.push(q(i, j)); }
+    if (cut.length === 2) seg.push(...cut[0], ...cut[1]);
+    else if (cut.length === 3){ const c = [0, 1, 2].map(k => (cut[0][k] + cut[1][k] + cut[2][k]) / 3); for (const p of cut) seg.push(...p, ...c); } }
+  const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(seg, 3)); panelGroup.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x17191D })));
+  applySurfView();
+}
+// each panel as its own named mesh, for Rhino (Smash or UnrollSrf to flatten it) or Blender
+function exportPanels(){
+  if (!panels || !surfMesh) return flash('Make the panels first');
+  const P = surfMesh.geometry.attributes.position.array, ns = P.length / 3, { label, map, n } = panels, by = Array.from({ length: n }, () => []);
+  for (let t = 0; t < ns; t += 3){ const L = [t, t + 1, t + 2].map(i => label[map[i]]), m = L[0] === L[1] || L[0] === L[2] ? L[0] : L[1]; if (m >= 0) by[m].push(t); }
+  const out = ['# Pentimento Park — hex panels, park metres, Y up, one object per panel'];
+  let base = 1; by.forEach((ts, k) => { if (!ts.length) return; out.push('o panel_' + String(k + 1).padStart(3, '0'));
+    for (const t of ts) for (let j = 0; j < 3; j++){ const i = t + j; out.push(`v ${P[3 * i].toFixed(4)} ${P[3 * i + 1].toFixed(4)} ${P[3 * i + 2].toFixed(4)}`); }
+    for (let j = 0; j < ts.length; j++) out.push(`f ${base + 3 * j} ${base + 3 * j + 1} ${base + 3 * j + 2}`); base += ts.length * 3; });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'text/plain' })); a.download = 'pentimento-park-panels.obj'; a.click();
+  flash('Saved ' + n + ' panels as separate objects (OBJ)');
 }
 function exportOBJ(){
   if (!lastResult || !lastResult.quads) return flash('Build a surface first');
@@ -2168,6 +2258,7 @@ function setStep(st, quiet){
   else if (st !== 'settings' && S.tool === 'ride') S.tool = SKETCH_TOOLS.includes(S.sketchTool) ? S.sketchTool : 'draw';
   if (st === 'shape' && !cageEditing && (cageEd || hasSurface())) startCageEdit(true);
   if (st !== 'settings') S.more = 0;
+  try { applySurfView(); } catch (e){}
   menuDirty = true; scheduleSave(); if (S.tips) drawTips();
   if (!quiet && st !== 'settings') flash((STEPS.indexOf(st) + 1) + ' · ' + STEP_NAME[st] + ': ' + STEP_SUB[st] + (st === 'ride' && !S.rideAnyScale ? ' · park at 1:10' : ''));
 }
@@ -2320,8 +2411,18 @@ function setStep(st, quiet){
 
   // ===== 5 FAB
   head('fab');
+  section('fab', 'HEX PANELS');
+  note('fab', 'Cover the surface in panels of one size, however fine its mesh is. They settle into hexagons, and creases act as seams: no panel crosses one.');
+  stepper('fab', 64, 'Panel size', () => lenText(PANEL_SIZE[S.panelSize ?? 3]) + ' across', () => { S.panelSize = Math.max(0, (S.panelSize ?? 3) - 1); scheduleSave(); }, () => { S.panelSize = Math.min(PANEL_SIZE.length - 1, (S.panelSize ?? 3) + 1); scheduleSave(); });
+  row('fab', 72, [{ id: 'seams-on', label: () => 'Creases are seams', on: () => S.panelSeams !== 0, act: () => { S.panelSeams = 1; scheduleSave(); } }, { id: 'seams-off', label: () => 'Panels cross creases', on: () => S.panelSeams === 0, act: () => { S.panelSeams = 0; scheduleSave(); } }]);
+  { const goW = 620; blk('fab', 96, [
+    add({ id: 'panels-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => panels ? 'REMAKE' : 'MAKE PANELS', sub: () => panels ? panels.n + ' panels · ' + lenText(panels.size) : hasSurface() ? 'from the surface' : 'build a surface first', act: () => { flash('Making panels…'); setTimeout(makePanels, 30); } }),
+    add({ id: 'panels-clear', x: P + goW + G, y: 0, w: W - goW - G, h: 96, style: 'danger', label: () => 'Clear', vis: () => !!panels, act: clearPanels })]); }
+  row('fab', 72, [{ id: 'pc-panel', label: () => 'Colour: by panel', on: () => S.panelColor !== 1, act: () => { S.panelColor = 0; showPanels(); scheduleSave(); } },
+    { id: 'pc-flat', label: () => 'Colour: how flat', on: () => S.panelColor === 1, act: () => { S.panelColor = 1; showPanels(); scheduleSave(); flash('Green: nearly flat (cut from a flat sheet). Red: curved (needs bending or forming).', 6); } }], { vis: () => !!panels });
+  row('fab', 80, [{ id: 'panels-obj', label: () => 'Save panels OBJ', sub: () => 'one object per panel, for Rhino or Blender', act: exportPanels }], { vis: () => !!panels });
   section('fab', 'COMING NEXT');
-  note('fab', 'Panels for building your park come next: wood (CNC ribs under bendable sheets) and concrete (pour zones and formwork). They will live in this step.');
+  note('fab', 'Wood: CNC ribs under bendable sheets. Concrete: pour zones and formwork lines.');
   endSection('fab');
 
   // ===== 6 FILES
@@ -2416,8 +2517,12 @@ const TIP_PAGES = {
     'Move: grab a point and drag it; drop it on another and they merge. Soft: a sphere of points comes along with falloff. Smooth: sweep over bumps to relax them.',
     'Crease: touch edges to make them sharp (start on a crease to soften instead). Draw face: tap 3 or 4 corners for a new face. Fill hole: touch a hole\'s edge. Delete: sweep over faces.',
     'Stick up / down sizes the sphere for Soft and Smooth. X / Y undo and redo your shaping.']],
-  fab: ['5 · FAB', [
-    'Panels for building your park come next: wood (CNC ribs under bendable sheets) and concrete (pour zones and formwork).']],
+  fab: ['5 · FAB: PANELS TO BUILD IT', [
+    'Hex panels cover the built surface in panels of one size, whatever its quad count. Pick a size and press Make panels.',
+    'Creases are seams: a panel stops at a crease. Turn that off and panels run across them.',
+    'Colour: how flat shows green for panels you could cut from flat sheet, red for ones that need bending or forming.',
+    'Save panels OBJ gives each panel as its own object: in Rhino, Smash or UnrollSrf flattens them for cutting.',
+    'Next here: CNC ribs for wood, pour zones for concrete.']],
   files: ['6 · FILES: SAVE AND EXPORT', [
     'Save (top of the menu) keeps your sketch here in this browser with a picture; your current work is always kept too. Name a sketch from its row.',
     'Save OBJ: the quad surface and its crease lines, for Rhino (ToSubD, then ToNURBS) or Blender.',
