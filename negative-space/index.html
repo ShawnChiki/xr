@@ -60,6 +60,9 @@
   .step button{background:transparent;border:0;color:var(--chalk);padding:4px 11px;font-size:16px;line-height:1}
   .step output{min-width:96px;text-align:center;font-size:13px;font-weight:600}
   p.fine{font-size:12px;margin-top:6px}
+  #mpCode{width:78px;font:600 16px var(--body);letter-spacing:.2em;text-align:center;padding:9px 8px;border-radius:999px;border:1.5px solid rgba(230,233,236,.35);background:transparent;color:var(--chalk)}
+  #mpCode:focus-visible{outline:2px solid var(--ruby);outline-offset:2px}
+  #mpStatus{color:var(--chalk);min-height:1em}
   #banner span{display:block;margin-top:8px;font-size:15px}
   @media (prefers-reduced-motion:reduce){ *{transition:none!important} }
 </style>
@@ -81,6 +84,17 @@
       <button id="again" class="ghost" hidden>New game</button>
     </div>
     <p id="status">Checking for a headset…</p>
+    <details id="mp">
+      <summary>Play a friend</summary>
+      <p class="fine">One of you hosts and reads out a 4-digit code, the other joins with it. Same WiFi or anywhere in the world.</p>
+      <div class="row" style="margin-top:10px;align-items:center">
+        <button id="mpHost">Host a game</button>
+        <input id="mpCode" inputmode="numeric" maxlength="4" placeholder="Code" aria-label="Friend's code">
+        <button id="mpJoin" class="ghost">Join</button>
+      </div>
+      <p id="mpStatus" class="fine" aria-live="polite"></p>
+      <button id="mpLeave" class="ghost" hidden>Leave match</button>
+    </details>
     <details id="settings">
       <summary>Custom game</summary>
       <div id="setRows"></div>
@@ -98,7 +112,9 @@
         <dt>Left trigger</dt><dd>Throws a bomb when you hold one. With a trap, hold to aim and let go to set it</dd>
         <dt>Right stick up/down</dt><dd>Push the ruby or a trap further out, or pull it in</dd>
         <dt>Grip ruby</dt><dd>Drag the floating ruby somewhere safer. It moves slowly, and slips if you pull too far.</dd>
-        <dt>B or click left stick</dt><dd>Pause, with the menu. Custom game holds every setting. The Quest menu button pauses too</dd>
+        <dt>B</dt><dd>Pause, with the menu. Custom game holds every setting</dd>
+        <dt>Quest menu button</dt><dd>Pause, and press again to resume</dd>
+        <dt>Shake a gun</dt><dd>Reload your laser faster</dd>
         <dt>Click right stick</dt><dd>Change the backdrop</dd>
         <dt>Hiding</dt><dd>Point the ruby where you want it, push it out with the right stick, pull a trigger to place it</dd>
       </dl>
@@ -135,6 +151,10 @@ import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
+// multiplayer state (the code is near the end, under "play a friend")
+const NET = { on: false, host: false, guest: false, conn: null, peer: null, ui: 'idle', code: '', status: '', entry: '',
+  start: null, cfg: null, out: [], applying: false, lastIn: 0, touched: new Map(), rx: {} };
+
 // ================================================================ world field
 // One shared scalar field. White's rock is where d > 0.5, Black's rock is where d < 0.5.
 // White melting lowers d, Black digging raises d, so every Black tunnel appears here as rock.
@@ -144,7 +164,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 const CELL = 0.25, SLOPE = 1.0, CH = 16;
 let NW, NY, N, SIZE, HY, SURF, CW, CY, NCH, F;
 function setDims(nw, ny){
-  NW = N = nw; NY = ny; SIZE = (NW - 1) * CELL; HY = (NY - 1) * CELL; SURF = (Math.floor(NY / 2) + 0.2) * CELL;
+  NW = N = nw; NY = ny; SIZE = (NW - 1) * CELL; HY = (NY - 1) * CELL; SURF = HY / 2;
   CW = NW / CH; CY = NY / CH; NCH = CW * CY * CW; F = new Float32Array(NW * NY * NW);
 }
 setDims(96, 64);
@@ -202,12 +222,13 @@ function stamp(cx, cy, cz, r, k, raise, guard){
   const j0 = Math.max(0, Math.floor((cy - R) / CELL)), j1 = Math.min(NY - 1, Math.ceil((cy + R) / CELL));
   const k0 = Math.max(0, Math.floor((cz - R) / CELL)), k1 = Math.min(NW - 1, Math.ceil((cz + R) / CELL));
   let changed = 0;
+  if (NET.on && !NET.applying) netRecord(cx, cy, cz, r, k, raise);
   for (let kk = k0; kk <= k1; kk++) for (let jj = j0; jj <= j1; jj++) for (let ii = i0; ii <= i1; ii++){
     const px = ii * CELL, py = jj * CELL, pz = kk * CELL;
     const dist = Math.hypot(px - cx, py - cy, pz - cz); if (dist > R) continue;
     const ds = clamp(0.5 + (dist - r) * SLOPE, 0, 1), id = ii + NW * (jj + NY * kk), d = F[id];
     if (raise){
-      const t = 1 - ds; if (t <= d + 1e-4) continue;
+      const t = 1 - ds; if (jj > NY - 3 || t <= d + 1e-4) continue;
       if (guard && guard(px, py, pz)) continue;
       F[id] = d + (t - d) * k;
     } else {
@@ -362,6 +383,11 @@ rockMat.onBeforeCompile = sh => {
       float flatness = smoothstep(0.6, 0.92, abs(Nn.y));
       float edgeMask = mix(1.0, nearF, flatness);           // floors seen edge-on far away do not count as edges
       float th = 0.3 * flatness;                            // and flat ground has to be almost edge-on to count at all
+      // speckle: blotches and grit cut from 3D noise, like terrazzo; strongest underground and close to you
+      float blot = smoothstep(0.6, 0.64, vn(vWP * 2.6 + vec3(3.1, 0.0, 7.7)));
+      float grit = smoothstep(0.8, 0.83, vn(vWP * 8.5 + vec3(11.0, 5.0, 2.0)));
+      float speck = max(blot * 0.75, grit) * (0.45 + 0.55 * (1.0 - smoothstep(uSurf - 0.2, uSurf + 0.4, vWP.y)))
+                  * (1.0 - smoothstep(3.0, 14.0, length(cameraPosition - vWP)));
       if (uStyle > 2.5){
         // Hologram: dark glassy faces, a coloured fresnel glow and scanlines
         float rim = pow(1.0 - ndv, 1.8) * edgeMask;
@@ -397,6 +423,9 @@ rockMat.onBeforeCompile = sh => {
         c *= 1.0 - 0.62 * fres;
         outgoingLight = c;
       }
+      // speckles go dark on pale rock and light on dark rock, in every view style
+      float lum = dot(outgoingLight, vec3(0.333));
+      outgoingLight = mix(outgoingLight, lum > 0.35 ? outgoingLight * 0.32 : outgoingLight + vec3(0.2, 0.21, 0.23), speck * 0.8);
     }
     #include <opaque_fragment>`);
 };
@@ -1083,7 +1112,7 @@ function drawHelp(){
   x.fillStyle = P.botSub; x.font = body;
   x.fillText('A jumps, or hops you off a wall. Grip rock to climb.', 56, 762);
   x.fillText('Left trigger throws bombs and aims traps. Right stick: reach.', 56, 806);
-  x.fillStyle = P.botInk; x.fillText('B or a left stick click pauses. A trigger closes this.', 56, 856);
+  x.fillStyle = P.botInk; x.fillText('B pauses. Shake a gun to reload faster. A trigger closes this.', 56, 856);
   help.tex.needsUpdate = true;
 }
 function showHelp(on){
@@ -1123,13 +1152,13 @@ const menu = (() => {
 })();
 const GROUP_COL = { Game: '#e0103a', 'Power-ups': '#8cff3a', Movement: '#4da3ff', Fun: '#f5c518' };
 const ORB_CSS = k => k === 'compass' ? '#f2f4f7' : '#' + POW[k].color.toString(16).padStart(6, '0');
-const ICON = { team: '◐', width: '↔', height: '↕', hide: '◆', diggers: '✱', speed: '»', depth: '↧', charge: '+', beam: '⌀', orbs: '●',
+const ICON = { team: '◐', width: '↔', height: '↕', hide: '◆', diggers: '✱', speed: '»', depth: '↧', charge: '+', beam: '⌀', walk: '»', orbs: '●',
   grav: '↓', jump: '↑', fling: '↗', turn: '↻', view: '◑', bg: '▦', rock: '■', bounce: '∩', blast: '✸', look: '◉', music: '♪' };
 // The menu has two pages. Main: play, custom game, how to play. Custom game: every setting, in four tabs,
 // and a button that starts a game with them. The main page only uses the top of the canvas.
-const MAIN_H = 450, MENU_TABS = ['Game', 'Power-ups', 'Movement', 'Fun'];
+const MAIN_H = 720, NET_H = 880, MENU_TABS = ['Game', 'Power-ups', 'Movement', 'Fun'];
 menu.page = 'main'; menu.tab = 'Game';
-const menuPageH = () => menu.page === 'main' ? MAIN_H : menu.H;
+const menuPageH = () => menu.page === 'main' ? MAIN_H : menu.page === 'net' ? NET_H : menu.H;
 function menuGo(page){ menu.page = page; menu.hover = -1; layoutMenu(); menuDraw(); }
 // keep the visible part of the panel centred where it opened, and the dressing around it
 function layoutMenu(){
@@ -1159,27 +1188,92 @@ function menuDraw(){
   x.strokeStyle = '#8e939b'; x.lineWidth = 2; x.beginPath(); x.arc(bx + 38, by + 35, 20, 0, 7); x.stroke();
   x.fillStyle = P.botInk; x.font = '600 32px "Instrument Sans", system-ui, sans-serif'; x.fillText('You are ' + YOU(), bx + 72, by + 46);
   // a pill button; returns nothing, adds a hit region
-  const btn = (label, glyph, X, Y, w, h, act, primary, on) => {
+  const btn = (label, glyph, X, Y, w, h, act, primary, on, fs = 38) => {
     const i = R.length; R.push({ x: X, y: Y, w, h, act });
     const hov = menu.hover === i;
     x.fillStyle = primary ? (hov ? '#ff2a50' : '#e0103a') : on ? P.mid : (hov ? P.hov : P.bot);
     x.strokeStyle = primary ? '#e0103a' : on ? P.botInk : P.dim; x.lineWidth = 3;
     x.beginPath(); x.roundRect(X, Y, w, h, h / 2); x.fill(); x.stroke();
     if (hov && !primary){ x.fillStyle = P.hov; x.beginPath(); x.roundRect(X, Y, w, h, h / 2); x.fill(); x.stroke(); }
-    x.fillStyle = primary ? '#ffffff' : P.botInk; x.font = '600 38px "Instrument Sans", system-ui, sans-serif'; x.textAlign = 'center';
-    x.fillText((glyph ? glyph + '  ' : '') + label, X + w / 2, Y + h / 2 + 13); x.textAlign = 'left';
+    x.fillStyle = primary ? '#ffffff' : P.botInk; x.font = '600 ' + fs + 'px "Instrument Sans", "Noto Sans Symbols 2", system-ui, sans-serif'; x.textAlign = 'center';
+    x.fillText((glyph ? glyph + '  ' : '') + label, X + w / 2, Y + h / 2 + fs / 3); x.textAlign = 'left';
   };
   if (menu.page === 'main'){
     const ended = S.mode === 'won' || S.mode === 'lost';
     const inGame = (S.mode === 'play' && (S.t > 0 || S.cd < 3.6)) || (S.mode === 'hide' && S.hideT < 45);
-    const list = inGame
-      ? [['Resume', '▶', () => closeMenu(), true], ['Restart', '↻', () => { newGame(); closeMenu(); }], ['Custom game', '⚙', () => menuGo('custom')], ['How to play', '?', () => { closeMenu(); showHelp(true); }]]
-      : [[ended ? 'Play again' : 'Play', '▶', ended ? () => { newGame(); closeMenu(); } : () => closeMenu(), true], ['Custom game', '⚙', () => menuGo('custom')], ['How to play', '?', () => { closeMenu(); showHelp(true); }]];
-    const gap = 24, w = (W - 112 - gap * (list.length - 1)) / list.length;
-    list.forEach(([l, g, a, pr], i) => btn(l, g, 56 + i * (w + gap), 236, w, 96, a, pr));
+    const help = ['How to play', '?', () => { closeMenu(); showHelp(true); }], friend = ['Play a friend', '⇄', () => menuGo('net')];
+    const again = () => { newGame(); closeMenu(); };
+    const list = NET.on
+      ? [[ended ? 'Play again' : 'Resume', '▶', ended ? again : () => closeMenu(), true], ...(ended ? [] : [['Restart', '↻', again]]),
+         ...(NET.host ? [['Custom game', '⚙', () => menuGo('custom')]] : []), ['Leave match', '✕', () => { netLeave(); menuDraw(); }], help]
+      : inGame
+      ? [['Resume', '▶', () => closeMenu(), true], ['Restart', '↻', again], ['Custom game', '⚙', () => menuGo('custom')], friend, help]
+      : [[ended ? 'Play again' : 'Play', '▶', ended ? again : () => closeMenu(), true], ['Custom game', '⚙', () => menuGo('custom')], friend, help];
+    const gap = 20, w = (W - 112 - gap * (list.length - 1)) / list.length;
+    list.forEach(([l, g, a, pr], i) => btn(l, g, 56 + i * (w + gap), 236, w, 96, a, pr, false, list.length > 4 ? 32 : 38));
     x.font = '400 30px "Instrument Sans", system-ui, sans-serif'; x.fillStyle = P.botSub;
-    if (inGame){ x.fillStyle = GROUP_COL.Game; x.font = '700 32px "Instrument Sans", system-ui, sans-serif'; }
-    x.fillText(inGame ? 'Ⅱ  Paused.  B closes this menu' : 'Point and pull the trigger', 56, 396);
+    if (inGame || NET.on){ x.fillStyle = GROUP_COL.Game; x.font = '700 32px "Instrument Sans", system-ui, sans-serif'; }
+    x.fillText(NET.on ? '⇄  Playing your friend.  The match keeps going while this menu is open'
+      : inGame ? 'Ⅱ  Paused.  B closes this menu' : 'Point and pull the trigger', 56, 396);
+    // settings that change right away, in two rows of three
+    const quick = ['view', 'bg', 'rock', 'walk', 'turn', 'music'];
+    quick.forEach((key, n) => {
+      const d = DEF[key], X = 56 + (n % 3) * 504, Y = 460 + Math.floor(n / 3) * 128, sw = 472, col = n < 3 ? GROUP_COL.Fun : GROUP_COL.Movement;
+      x.fillStyle = col; x.font = '600 28px "Instrument Sans", "Noto Sans Symbols 2", system-ui, sans-serif'; x.fillText(ICON[key] || '•', X + 4, Y);
+      x.fillStyle = P.botSub; x.font = '400 28px "Instrument Sans", system-ui, sans-serif'; x.fillText(d.label, X + 38, Y);
+      const sy = Y + 16, i0 = R.length;
+      R.push({ x: X, y: sy, w: 80, h: 56, act: () => setCfg(key, CFG[key] - 1) });
+      R.push({ x: X + 80, y: sy, w: sw - 160, h: 56, act: () => setCfg(key, CFG[key] + 1) });
+      R.push({ x: X + sw - 80, y: sy, w: 80, h: 56, act: () => setCfg(key, CFG[key] + 1) });
+      x.fillStyle = P.mid; x.beginPath(); x.roundRect(X, sy, sw, 56, 28); x.fill();
+      for (let k = 0; k < 3; k++) if (menu.hover === i0 + k){ const r = R[i0 + k]; x.fillStyle = k === 1 ? P.hov : col; x.beginPath(); x.roundRect(r.x, r.y, r.w, r.h, 28); x.fill(); }
+      x.fillStyle = P.botInk; x.font = '600 30px "Instrument Sans", system-ui, sans-serif'; x.textAlign = 'center';
+      x.fillText('‹', X + 40, sy + 38); x.fillText('›', X + sw - 40, sy + 38); x.fillText(d.opts[CFG[key]], X + sw / 2, sy + 38); x.textAlign = 'left';
+    });
+    menu.tex.needsUpdate = true; return;
+  }
+  if (menu.page === 'net'){
+    // ---- play a friend: host shows a code, join types it on a keypad
+    x.fillStyle = P.topSub; x.font = '700 40px "Instrument Sans", system-ui, sans-serif'; x.fillText('Play a friend', 600, 110);
+    const msg = (t, y, col) => { x.fillStyle = col || P.botSub; x.font = '400 32px "Instrument Sans", system-ui, sans-serif'; wrap(x, t, 56, y, 700, 42); };
+    if (NET.on){
+      x.fillStyle = P.botInk; x.font = '800 64px Unbounded, system-ui, sans-serif'; x.fillText('Connected', 56, 340);
+      msg('Playing your friend with code ' + NET.code + '. You are ' + YOU() + ', they are ' + ENEMY() + '.', 410);
+      btn('Back', '‹', 56, NET_H - 140, 250, 92, () => menuGo('main'));
+    } else if (NET.ui === 'hosting'){
+      x.fillStyle = P.botSub; x.font = '400 34px "Instrument Sans", system-ui, sans-serif'; x.fillText('Your code', 56, 290);
+      x.fillStyle = P.botInk; x.font = '800 220px Unbounded, system-ui, sans-serif';
+      x.fillText(NET.code ? NET.code.split('').join(' ') : '· · · ·', 56, 530);
+      msg(NET.status || '', 610, GROUP_COL.Game);
+      msg('Read this to your friend. They pick Play a friend, then Join, and type it in.', 680);
+      btn('Cancel', '‹', 56, NET_H - 140, 260, 92, () => { netLeave(); menuDraw(); });
+    } else if (NET.ui === 'joining' || NET.ui === 'connecting'){
+      x.fillStyle = P.botSub; x.font = '400 34px "Instrument Sans", system-ui, sans-serif'; x.fillText("Your friend's code", 56, 290);
+      for (let i = 0; i < 4; i++){
+        const X = 56 + i * 150; x.fillStyle = P.mid; x.beginPath(); x.roundRect(X, 320, 130, 160, 24); x.fill();
+        x.fillStyle = P.botInk; x.font = '800 100px Unbounded, system-ui, sans-serif'; x.textAlign = 'center';
+        x.fillText(NET.entry[i] || '', X + 65, 440); x.textAlign = 'left';
+      }
+      msg(NET.status || 'Type the 4 numbers on your friend\'s screen.', 550, NET.status ? GROUP_COL.Game : null);
+      const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '⌫', '0', 'Join'], kw = 180, kh = 110, kx = W - 56 - (kw * 3 + 36);
+      keys.forEach((k, i) => {
+        const X = kx + (i % 3) * (kw + 18), Y = 200 + Math.floor(i / 3) * (kh + 18), ready = NET.entry.length === 4;
+        btn(k, '', X, Y, kw, kh, () => {
+          if (NET.ui === 'connecting') return;
+          if (k === '⌫') NET.entry = NET.entry.slice(0, -1);
+          else if (k === 'Join'){ if (ready) netJoin(NET.entry); }
+          else if (NET.entry.length < 4){ NET.entry += k; NET.status = ''; if (NET.entry.length === 4) netJoin(NET.entry); }
+        }, k === 'Join' && ready, false, 52);
+      });
+      btn('Back', '‹', 56, NET_H - 140, 250, 92, () => { netLeave(); NET.entry = ''; menuGo('net'); });
+    } else {
+      msg('One of you hosts and reads out a 4-digit code. The other joins with it. It works on the same WiFi or with a friend anywhere in the world.', 290);
+      btn('Host a game', '+', 56, 450, 600, 130, () => netHost(), true);
+      btn('Join a game', '⌨', 690, 450, 600, 130, () => { NET.ui = 'joining'; NET.entry = ''; NET.status = ''; });
+      msg('You play White or Black and your friend gets the other side. Their tunnels rise in your sky, and yours in theirs.', 650);
+      if (NET.status) msg(NET.status, 760, GROUP_COL.Game);
+      btn('Back', '‹', 56, NET_H - 140, 250, 92, () => menuGo('main'));
+    }
     menu.tex.needsUpdate = true; return;
   }
   // ---- custom game: tabs, the rows of the open tab, then back / defaults / start
@@ -1243,6 +1337,7 @@ const ptrDot = new THREE.Group();
 }
 ptrDot.visible = false; scene.add(ptrDot);
 function openMenu(){
+  S.sysPause = false;
   S.menu = true; panel.m.visible = false; help.m.visible = false; skyLabel.sp.visible = false; laserSound(false, false);
   for (const h of hands){ placeBeam(h.beam, _o, _o, false); }
   const f = headForward(new V3()); f.y = 0; if (f.lengthSq() < 1e-4) f.set(0, 0, -1); f.normalize();
@@ -1285,12 +1380,12 @@ function menuFrame(dt){
     const px = best.uv.x * menu.W, py = (1 - best.uv.y) * menu.H;
     hov = menu.regions.findIndex(r => px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h);
   } else ptrDot.visible = false;
-  if (hov !== menu.hover){ menu.hover = hov; menuDraw(); if (hov >= 0 && bh) buzz(bh, 0.15, 12); }
+  if (hov !== menu.hover){ menu.hover = hov; menuDraw(); if (hov >= 0 && bh){ buzz(bh, 0.15, 12); tone(1400, 0.025, 'sine', 0.025); } }
   for (const h of hands){
     const v = h.src?.gamepad?.buttons?.[0]?.value > 0.5, was = !!h.prev.mt; h.prev.mt = v;
     if (v && !was && h === bh && hov >= 0){
       menu.regions[hov].act(); tone(660, 0.05, 'triangle', 0.08); buzz(h, 0.4, 25);
-      if (S.menu) menuDraw();
+      if (S.menu){ layoutMenu(); menuDraw(); }
       return;
     }
   }
@@ -1339,6 +1434,7 @@ const SETTINGS = [
   { key: 'nSight',    label: 'Eye',           orb: 'sight',    opts: ['None', '1', '2', '3'], vals: [0, 1, 2, 3], def: 1 },
   { key: 'nCompass',  label: 'Compass',       orb: 'compass',  opts: ['None', '1', '2', '3'], vals: [0, 1, 2, 3], def: 1 },
   { group: 'Movement' },
+  { key: 'walk',    label: 'Walk speed',      opts: ['Slow', 'Normal', 'Fast', 'Zoomy'], vals: [0.7, 1, 1.35, 1.8], def: 1 },
   { key: 'grav',    label: 'Gravity',         opts: ['Moon', 'Low', 'Earth', 'Heavy'], vals: [0.3, 0.6, 1, 1.6], def: 2 },
   { key: 'jump',    label: 'Jump',            opts: ['Hop', 'Normal', 'High', 'Super'], vals: [0.7, 1, 1.4, 2], def: 1 },
   { key: 'fling',   label: 'Fling',           opts: ['Soft', 'Normal', 'Strong', 'Wild'], vals: [0.9, 1.4, 2.1, 3.2], def: 1 },
@@ -1360,7 +1456,7 @@ try {
   const b = localStorage.getItem('ns-bg'); if (b && !localStorage.getItem('ns-cfg')) CFG.bg = Math.max(0, BD_KEYS.indexOf(b));
 } catch (e) {}
 for (const k in DEF) CFG[k] = clamp(CFG[k] | 0, 0, DEF[k].opts.length - 1);
-const val = k => DEF[k].vals ? DEF[k].vals[CFG[k]] : CFG[k];
+const val = k => NET.cfg && k in NET.cfg ? NET.cfg[k] : DEF[k].vals ? DEF[k].vals[CFG[k]] : CFG[k];
 const SET = { get hide(){ return CFG.hide === 0; } };
 function saveCfg(){ try { localStorage.setItem('ns-cfg', JSON.stringify(CFG)); } catch (e) {} }
 function setCfg(k, i){
@@ -1380,8 +1476,9 @@ function rockMode(){
   return t === 'W' ? 0 : 2;
 }
 // pick a team for this game and dress everything in its colours
-function pickTeam(){
-  TEAM = CFG.team === 0 ? (Math.random() < 0.5 ? 'W' : 'B') : CFG.team === 1 ? 'W' : 'B';
+function pickTeam(ns){
+  TEAM = ns ? (ns.team === 'W' ? 'B' : 'W') : CFG.team === 0 ? (Math.random() < 0.5 ? 'W' : 'B') : CFG.team === 1 ? 'W' : 'B';
+  if (NET.ready) remoteTeam();
   rockU.value = rockMode(); applyBackdrop(backdrop);
   const light = TEAM === 'B';
   for (const h of hands) gloveTeam(h.glove);
@@ -1626,10 +1723,17 @@ function depthIn(p){
   for (const d of CL_DIRS) for (let r = 0.3; r < best; r += 0.3){ _cl.copy(p).addScaledVector(d, r); if (sampleV(_cl) < 0.6){ best = r; break; } }
   return best;
 }
-function placeOrb(o){
+function placeOrb(o){ placeOrbHere(o); netOrb(o); orbAppeared(o); }
+// a new orb out in the open nearby gets a soft two-note chime, louder the closer it is
+function orbAppeared(o){
+  if (S.mode !== 'play') return;
+  if (o.layer === 'high'){ [1568, 2093, 2637].forEach((f, i) => tone(f, 0.5, 'sine', 0.04, 0, i * 0.11)); return; }   // a faint chime, somewhere above
+  const d = o.pos.distanceTo(HEAD); if (d > 14 || sampleV(o.pos) > 0.5) return;
+  const v = 1 - d / 14; tone(1760, 0.3, 'sine', 0.035 * v); tone(2349, 0.4, 'sine', 0.03 * v, 0, 0.09);
+}
+function placeOrbHere(o){
   if (o.layer === 'high'){
     placeHigh(o); o.g.position.copy(o.pos); o.g.visible = true; o.wait = 0; popIn(o.g, 0.01);
-    if (S.mode === 'play') [1568, 2093, 2637].forEach((f, i) => tone(f, 0.5, 'sine', 0.04, 0, i * 0.11));   // a faint chime, somewhere above
     return;
   }
   // Try a few dozen spots and keep the best: far from anywhere you have been, and well clear of the edges
@@ -1664,9 +1768,14 @@ function spawnBot(b){
 }
 
 function newGame(mode){
+  if (NET.on && NET.guest && !NET.start){ netSend({ t: 'again' }); return; }   // in a match the host starts every game
   if (!mode) mode = SET.hide ? 'hide' : 'play';
-  if (val('width') !== NW || val('height') !== NY) resizeWorld(val('width'), val('height'));
-  pickTeam();
+  if (NET.on) mode = 'play';
+  const ns = NET.on && NET.guest ? NET.start : null; NET.start = null;
+  if (!NET.on) NET.cfg = null;
+  const nw = ns ? ns.w : val('width'), ny = ns ? ns.h : val('height');
+  if (nw !== NW || ny !== NY) resizeWorld(nw, ny);
+  pickTeam(ns);
   initField();
   for (let ci = 0; ci < chunkMeshes.length; ci++) rebuildChunk(ci);
   dirty.clear();
@@ -1681,6 +1790,18 @@ function newGame(mode){
     skyRuby.position.set(rand(3, SIZE - 3), SURF + rand(2.6, 4.8), rand(3, SIZE - 3));
     if (Math.hypot(skyRuby.position.x - sx, skyRuby.position.z - sz) > 6) break;
   }
+  let guestSpawn = null;
+  if (ns){
+    myRuby.position.set(ns.sky[0], mir(ns.sky[1]), ns.sky[2]); skyRuby.position.set(ns.my[0], mir(ns.my[1]), ns.my[2]);
+    sx = ns.spawn[0]; sz = ns.spawn[1];
+  } else if (NET.on){
+    // a fair match: both rubies the same depth, and your friend starts well away from the ruby they dig for
+    skyRuby.position.y = Math.min(HY - 0.8, SURF + (SURF - myRuby.position.y));
+    for (let tries = 0; tries < 50; tries++){
+      guestSpawn = [r3(rand(2.5, SIZE - 2.5)), r3(rand(2.5, SIZE - 2.5))];
+      if (Math.hypot(guestSpawn[0] - skyRuby.position.x, guestSpawn[1] - skyRuby.position.z) > 7) break;
+    }
+  }
   skyFree.copy(skyRuby.position);
   myRuby.visible = true; myRuby.userData.gem.material.emissive.setHex(0x60001a);
   player.vel.set(0, 0, 0); player.climbV.set(0, 0, 0); player.grounded = false;
@@ -1692,15 +1813,24 @@ function newGame(mode){
   else { rig.rotation.set(0, 0, 0); desk.yaw = yaw; desk.pitch = 0.12; }
   rig.updateMatrixWorld(); headWorld(HEAD);
   for (const b of bots) spawnBot(b);                 // the ones beyond the digger count sit idle
-  rebuildOrbs(); trail.length = 0; trailT = 0;
-  const order = orbs.filter(o => o.layer !== 'high').sort(() => Math.random() - 0.5);
-  orbs.forEach(o => startOrb(o, order.indexOf(o), order.length));
+  trail.length = 0; trailT = 0;
+  if (ns){                                           // the host's power-ups; the host says when each one appears
+    for (const o of orbs) scene.remove(o.g);
+    orbs.length = 0;
+    for (const [kind, layer] of ns.orbs){ const o = makeOrb(kind, layer); o.g.visible = false; o.wait = 1e9; orbs.push(o); }
+  } else {
+    rebuildOrbs();
+    const order = orbs.filter(o => o.layer !== 'high').sort(() => Math.random() - 0.5);
+    orbs.forEach(o => startOrb(o, order.indexOf(o), order.length));
+  }
   banner.hidden = true; panel.m.visible = false;
   if (S.mode === 'hide') S.hideT = 45;
   skyGem(true); skyLabel.sp.visible = false;
   skyRuby.visible = true; myRuby.scale.setScalar(1); thrown.forEach(t => { t.live = false; t.g.visible = false; });
   traps.forEach(t => { t.live = false; t.g.visible = false; }); trapAim.on = false; trapPreview.visible = false; aimLine.visible = false;
   for (const sh of shards) sh.life = 0;
+  if (NET.ready) remote.pose = null;
+  if (NET.on && NET.host) netSendStart(guestSpawn);
 }
 const hideLo = () => SURF + 1.2, hideHi = () => HY - 1.2;
 function hideSpotOK(p){ return p.y >= hideLo() && p.y <= hideHi() && p.x > 1.5 && p.x < SIZE - 1.5 && p.z > 1.5 && p.z < SIZE - 1.5 && sampleV(p) < 0.25; }
@@ -2042,6 +2172,10 @@ deskBtn.onclick = () => {
   if (S.mode === 'ready') return startDesktop();
   card.hidden = true; renderer.domElement.requestPointerLock?.();
 };
+$('mpHost').onclick = () => { unlockAudio(); netHost(); };
+$('mpJoin').onclick = () => { unlockAudio(); const c = $('mpCode').value.replace(/\D/g, ''); if (c.length === 4) netJoin(c); else netStatus('Type the 4 numbers from your friend.'); };
+$('mpCode').onkeydown = e => { if (e.key === 'Enter') $('mpJoin').click(); };
+$('mpLeave').onclick = () => netLeave();
 $('custom').onclick = () => { if (S.mode === 'ready') return startDesktop(); newGame(); card.hidden = true; renderer.domElement.requestPointerLock?.(); };
 $('defaults').onclick = () => { for (const k in DEF) if (CFG[k] !== DEF[k].def) setCfg(k, DEF[k].def); };
 againBtn.onclick = () => { newGame(); card.hidden = true; renderer.domElement.requestPointerLock?.(); };
@@ -2077,7 +2211,10 @@ vrBtn.onclick = async () => {
   newGame(); deskGun.visible = false;
   introPending = 3;
   session.addEventListener('visibilitychange', () => {
-    if (session.visibilityState !== 'visible' && !S.menu && !(S.intro > 0) && S.mode !== 'ready') openMenu();
+    // The Quest menu button belongs to the headset, so the game only sees the headset's own menu opening and closing:
+    // opening it pauses, closing it resumes. A pause you started with B stays put.
+    if (session.visibilityState !== 'visible'){ if (!S.menu && !(S.intro > 0) && S.mode !== 'ready'){ openMenu(); S.sysPause = true; } }
+    else if (S.sysPause){ S.sysPause = false; if (S.menu) closeMenu(); }
   });
   session.addEventListener('end', () => {
     vrBtn.textContent = 'Enter VR'; setupButtons(); laserSound(false, false);
@@ -2238,7 +2375,7 @@ function shoot(from, d){
   tone(170, 0.2, 'sine', 0.35, 50); noise(0.12, 0.25, 2500, 400); tone(1400, 0.05, 'triangle', 0.04, 0, 0.09);   // thoomp, then the click
 }
 function explode(p){
-  const r = (powOn('wide') ? 2.0 : 1.4) * val('blast');
+  const r = (powOn('wide') ? 2.0 : 1.4) * val('blast'); netFx(p, r, false);
   hotStamp = true; stamp(p.x, p.y, p.z, r, 1, false); hotStamp = false;
   const f = flashes.find(q => q.t <= 0) || flashes[0]; f.t = 0.4; f.r = r; f.f.position.copy(p); f.f.visible = true;
   for (let i = 0; i < 6; i++) spawnSparks(p, _n.randomDirection(), 5);
@@ -2317,7 +2454,7 @@ function updateTraps(dt, now){
   }
 }
 function springMine(t){
-  t.live = false; t.g.visible = false; const p = t.g.position.clone();
+  t.live = false; t.g.visible = false; const p = t.g.position.clone(); netFx(p, 2.4, true);
   hotStamp = true; stamp(p.x, p.y, p.z, 2.4 * val('blast'), 1, false); hotStamp = false;
   let n = 0; for (const b of liveBots()) if (b.pos.distanceTo(p) < 3.4){ bury(b); n++; }
   ringBurst(p, POW.trap.color, 6); burstShards(p, 30, [POW.trap.color, 0x1b1530, 0xe6e9ec], 5, 1.5);
@@ -2387,7 +2524,7 @@ function updateThrown(dt){
 }
 // your bomb: a huge sphere of rock vanishes, debris flies, and the blast shoves you if you are close
 function bigExplode(p){
-  const r = 3.0 * val('blast');
+  const r = 3.0 * val('blast'); netFx(p, r, true);
   hotStamp = true; stamp(p.x, p.y, p.z, r, 1, false); hotStamp = false;
   const f = flashes.find(q => q.t <= 0) || flashes[0]; f.t = 0.4; f.r = r * 1.6; f.f.position.copy(p); f.f.visible = true;
   burstShards(p, 45, rockMode() === 2 ? [0x2a2c30, 0x3a3d44] : [0xe6e9ec, 0xcfd3d8], 7, 2, 1.6);
@@ -2487,6 +2624,42 @@ function collide(){
   rig.updateMatrixWorld(); headWorld(HEAD);
   return total;
 }
+// a soft crunch every stride, and a thud with a ring of dust when you land from a height
+function footfalls(dt, fallV, wasG){
+  if (player.grounded && !wasG && fallV < -3.2){
+    const v = clamp((-fallV - 3) / 7, 0.15, 1);
+    noise(0.22, 0.22 * v, 700, 70); tone(80, 0.18, 'sine', 0.22 * v, 45);
+    const f = _a.set(HEAD.x, rig.position.y + 0.05, HEAD.z);
+    for (let i = 0; i < 2 + Math.round(v * 4); i++) dustAt(f);
+    for (const h of hands) buzz(h, 0.5 * v, 60);
+    player.stepD = 0; return;
+  }
+  if (!player.grounded) return;
+  const sp = Math.hypot(player.vel.x, player.vel.z);
+  player.stepD = (player.stepD || 0) + sp * dt;
+  if (player.stepD > 0.72 && sp > 0.4){
+    player.stepD = 0; const v = clamp(sp / MOVE, 0.3, 1);
+    noise(0.06, 0.05 * v, 900 + Math.random() * 500, 250); tone(110 + Math.random() * 30, 0.05, 'sine', 0.035 * v);
+  }
+}
+function shakeReload(dt){
+  if (!inXR() || S.mode !== 'play' || val('charge') === 0) return;
+  for (const h of hands){
+    if (!h.src) continue;
+    handPos(h, _hp);
+    if (!h.shP){ h.shP = _hp.clone(); h.shDir = new V3(); continue; }
+    const v = _a.copy(_hp).sub(h.shP).multiplyScalar(1 / Math.max(dt, 1e-3)); h.shP.copy(_hp);
+    const sp = v.length(); if (sp < 0.9) continue;
+    v.multiplyScalar(1 / sp);
+    if (h.shDir.lengthSq() > 0 && v.dot(h.shDir) < -0.35 && S.charge < 1){
+      S.charge = Math.min(1, S.charge + 0.05); S.chargeWait = 0;
+      noise(0.05, 0.07, 3200, 1400, 'bandpass'); tone(700 + S.charge * 700, 0.04, 'triangle', 0.04);
+      buzz(h, 0.35, 25);
+      if (S.charge >= 1){ tone(1320, 0.12, 'triangle', 0.08); tone(1760, 0.18, 'triangle', 0.07, 0, 0.08); }
+    }
+    h.shDir.copy(v);
+  }
+}
 function hopSound(){ tone(240, 0.1, 'triangle', 0.08, 360); noise(0.08, 0.06, 2000, 600); }
 function physics(dt, move, jump){
   rig.position.y += player.lag || 0; player.lag = player.lag || 0;     // back to the true position before moving
@@ -2525,7 +2698,9 @@ function physics(dt, move, jump){
   }
   player.vel.y -= GRAVITY() * dt;
   rig.position.addScaledVector(player.vel, dt);
+  const fallV = player.vel.y, wasG = player.grounded;
   const push = collide();
+  footfalls(dt, fallV, wasG);
   // small upward pushes while walking (stepping onto a lump, the lip of a tunnel) are eased in over a few frames
   // so your view glides up instead of jolting. The physics always works from your true position.
   if (player.grounded && push.y > 0.03 && push.y < 0.4) player.lag = Math.min(0.3, player.lag + push.y);
@@ -2561,7 +2736,7 @@ function nextThreat(){
   S.threats.sort((a, b) => a.distanceTo(myRuby.position) - b.distanceTo(myRuby.position));
   return S.threats[0];
 }
-const liveBots = () => bots.slice(0, val('diggers'));
+const liveBots = () => NET.on ? [] : bots.slice(0, val('diggers'));       // a match against a friend has no diggers
 function updateBots(dt){
   const bots = liveBots();
   const speed = (0.55 + Math.min(0.45, S.t / 420)) * val('speed');
@@ -2637,6 +2812,26 @@ function updateDust(dt){
   }
   dGeo.attributes.position.needsUpdate = true;
 }
+// motes: a few hundred specks drifting in the air around you, which make the space feel deep
+const MN = 260, mPos = new Float32Array(MN * 3);
+for (let i = 0; i < MN * 3; i++) mPos[i] = (Math.random() - 0.5) * 12;
+const mGeo = new THREE.BufferGeometry(); mGeo.setAttribute('position', new THREE.BufferAttribute(mPos, 3));
+const motes = new THREE.Points(mGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.018, transparent: true, opacity: 0.5, depthWrite: false }));
+motes.frustumCulled = false; scene.add(motes);
+let moteT = 0;
+function updateMotes(dt){
+  moteT += dt;
+  motes.material.color.setHex(bdLight() ? 0x3a3d44 : 0xcfd3d8);
+  const c = [HEAD.x, HEAD.y, HEAD.z];
+  for (let i = 0; i < MN; i++){
+    mPos[i * 3] += Math.sin(moteT * 0.3 + i) * 0.04 * dt;
+    mPos[i * 3 + 1] += 0.03 * dt * (0.5 + (i % 5) * 0.2);
+    mPos[i * 3 + 2] += Math.cos(moteT * 0.27 + i * 1.7) * 0.04 * dt;
+    // the cloud stays centred on you: a speck more than 6 m away wraps round to the other side
+    for (let a = 0; a < 3; a++){ const r = mPos[i * 3 + a] - c[a]; if (r > 6 || r < -6) mPos[i * 3 + a] = c[a] + ((r + 6) % 12 + 12) % 12 - 6; }
+  }
+  mGeo.attributes.position.needsUpdate = true;
+}
 function bury(b){
   puff(b.pos);
   const d = b.pos.distanceTo(HEAD);
@@ -2651,6 +2846,7 @@ const endFrom = new V3();
 // you win: your ruby bursts out of the rock, flies up to you spinning, confetti in both team colours
 function win(){
   if (S.mode !== 'play') return;
+  netSend({ t: 'end' });
   S.mode = 'won'; S.endT = 0; laserSound(false, false); endFrom.copy(myRuby.position);
   [523, 659, 784, 1046, 1318].forEach((f, i) => tone(f, 0.45, 'triangle', 0.16, 0, i * 0.09));
   noise(1.2, 0.18, 6000, 2000, 'highpass', 0.3);
@@ -2741,6 +2937,7 @@ function updateRubies(dt, now){
   if (S.mode === 'play') dragSky(dt); else if (S.held) dropSky();
   skyRuby.userData.gem.rotation.y += dt * 0.8;
   let near = 1e9; for (const b of liveBots()) if (b.mode === 'dig') near = Math.min(near, b.pos.distanceTo(skyRuby.position));
+  if (NET.on && remote.g.visible) near = Math.min(near, remote.headW.distanceTo(skyRuby.position));
   S.warn = near < 2.3 ? 1 - near / 2.3 : 0;
   S.tension = S.mode === 'play' && S.cd <= 0 ? clamp(1 - (near - 0.6) / 6, 0, 1) : 0;     // the music listens to this
   const pulse = 1 + S.warn * 0.35 * Math.max(0, Math.sin(now * 0.012));
@@ -2751,7 +2948,7 @@ function updateRubies(dt, now){
     const d = HEAD.distanceTo(skyRuby.position);
     tone(980, 0.06, 'square', 0.05 * clamp(1 - d / 18, 0.2, 1));
   }
-  if (S.mode === 'play' && sampleV(skyRuby.position) > 0.5) lose();
+  if (S.mode === 'play' && !NET.on && sampleV(skyRuby.position) > 0.5) lose();
 
   // your buried ruby
   const exposed = myExposed();
@@ -2816,7 +3013,9 @@ function updateOrbs(dt, now){
   }
 }
 function takeOrb(o, b){
+  if (NET.guest && !o.granted){ o.g.visible = false; o.wait = 1e9; netSend({ t: 'grab', i: orbs.indexOf(o) }); return; }   // the host decides
   o.g.visible = false; o.wait = o.layer === 'high' ? HIGH_WAIT : rand(25, 45);
+  netOrb(o);
   if (b){ blackPower(b, o.kind, o.pos); return; }
   if (o.kind === 'recharge'){
     S.charge = 1; S.chargeWait = 0; wordBurst(...POW_WORDS.recharge, POW.recharge.color, o.pos);
@@ -2905,7 +3104,7 @@ function xrFrame(dt){
   _r.crossVectors(_f, _up);
   const ax = L ? L.src.gamepad.axes[2] || 0 : 0, ay = L ? L.src.gamepad.axes[3] || 0 : 0;
   _m.set(0, 0, 0);
-  if (Math.hypot(ax, ay) > 0.15) _m.addScaledVector(_r, ax * MOVE).addScaledVector(_f, -ay * MOVE);
+  if (Math.hypot(ax, ay) > 0.15) _m.addScaledVector(_r, ax * MOVE * val('walk')).addScaledVector(_f, -ay * MOVE * val('walk'));
   // snap turn
   const rx = R ? R.src.gamepad.axes[2] || 0 : 0;
   const ry = R ? R.src.gamepad.axes[3] || 0 : 0;
@@ -2915,7 +3114,7 @@ function xrFrame(dt){
   else if (Math.abs(rx) < 0.3) snapReady = true;
   const aBtn = edge(R, 4), xBtn = edge(L, 4), jump = aBtn || xBtn;
   if (edge(R, 3)) nextBackdrop();
-  if (edge(R, 5) || edge(L, 3)){ showHelp(false); openMenu(); return; }      // B or a left stick click pauses
+  if (edge(R, 5)){ showHelp(false); openMenu(); return; }                  // B pauses
   const ended = S.mode === 'won' || S.mode === 'lost';
   if (ended && xBtn){ setHide(!SET.hide); drawEnd(); }
   if (ended && aBtn){ newGame(); return; }
@@ -3006,7 +3205,7 @@ function deskFrame(dt){
   if (k.has('KeyS') || k.has('ArrowDown')) _m.sub(_f);
   if (k.has('KeyD') || k.has('ArrowRight')) _m.add(_r);
   if (k.has('KeyA') || k.has('ArrowLeft')) _m.sub(_r);
-  if (_m.lengthSq()) _m.normalize().multiplyScalar(MOVE);
+  if (_m.lengthSq()) _m.normalize().multiplyScalar(MOVE * val('walk'));
   physics(dt, _m, k.has('Space') && (S.mode === 'play' || S.mode === 'hide'));
   if (S.mode === 'hide' && desk.mouse){ desk.mouse = false; placeHidden(false); }
   camera.updateMatrixWorld();
@@ -3066,7 +3265,7 @@ function frame(){
     S.chargeWait = Math.max(0, (S.chargeWait || 0) - dt);
     if (val('charge') === 0 || S.mode !== 'play') S.charge = 1;
     else if (!firing && S.chargeWait <= 0) S.charge = Math.min(1, S.charge + dt / (val('charge') * 1.5));
-    if (inXR()) xrFrame(dt); else deskFrame(dt);
+    if (inXR()){ xrFrame(dt); shakeReload(dt); } else deskFrame(dt);
     if (running()) updateBots(dt);
     updateThrown(dt); updateTraps(dt, now);
     endFrame(dt);
@@ -3081,13 +3280,314 @@ function frame(){
     if (panelT > 0){ panelT -= dt; if (panelT <= 0) panel.m.visible = false; }
   }
   updateRivals(now);
+  netFrame(dt); updateRemote(dt); updateMotes(dt);
   updateSparks(dt); updatePuffs(dt); updateShots(dt); updateWords(dt); updateShards(dt); updateRing(dt); updatePops(dt); updateHeat(dt); updateDust(dt);
   audioFrame(dt, active); clockFrame();
   flushDirty(inXR() ? 5 : 8);
 }
 
+
+// ================================================================ play a friend (1v1 over the internet)
+// PeerJS's free matchmaker introduces the two players by a 4-digit code; after that the headsets talk directly.
+// The host is the referee: it runs the power-ups and owns the true copy of the world. Each side sends its own
+// melts as tiny events, which the other applies upside down (your melt is a tower in their sky). Every 3 seconds
+// the host fingerprints every chunk of the world; the guest compares and asks for any chunk that drifted.
+// The guest lives in the host's world turned upside down: height y on one side is HY - y on the other.
+const mir = y => HY - y;
+const r3 = v => Math.round(v * 1000) / 1000;
+const NET_PREFIX = 'negative-space-xr-';
+// a stand-in for PeerJS over a BroadcastChannel, so two tabs on one computer can test with ?nettest
+class BCConn {
+  constructor(p, id){ this.p = p; this.peer = id; this.h = {}; this.open = false; }
+  on(e, f){ (this.h[e] = this.h[e] || []).push(f); } emit(e, ...a){ (this.h[e] || []).forEach(f => f(...a)); }
+  ready(){ if (this.open) return; this.open = true; setTimeout(() => this.emit('open'), 0); }
+  send(d){ this.p.bc.postMessage({ to: this.peer, from: this.p.id, k: 'data', d }); }
+  close(){ this.p.bc.postMessage({ to: this.peer, from: this.p.id, k: 'close' }); this.emit('close'); }
+}
+class BCPeer {
+  constructor(id){
+    this.id = id || 'g' + Math.random().toString(36).slice(2, 8); this.h = {}; this.conns = {};
+    this.bc = new BroadcastChannel('ns-net');
+    this.bc.onmessage = e => {
+      const m = e.data; if (m.to !== this.id) return;
+      if (m.k === 'conn'){ const c = new BCConn(this, m.from); this.conns[m.from] = c; this.emit('connection', c); c.ready(); this.bc.postMessage({ to: m.from, from: this.id, k: 'ok' }); }
+      else if (m.k === 'ok') this.conns[m.from]?.ready();
+      else if (m.k === 'data') this.conns[m.from]?.emit('data', m.d);
+      else if (m.k === 'close') this.conns[m.from]?.emit('close');
+    };
+    setTimeout(() => this.emit('open', this.id), 10);
+  }
+  on(e, f){ (this.h[e] = this.h[e] || []).push(f); } emit(e, ...a){ (this.h[e] || []).forEach(f => f(...a)); }
+  connect(id){
+    const c = new BCConn(this, id); this.conns[id] = c; this.bc.postMessage({ to: id, from: this.id, k: 'conn' });
+    setTimeout(() => { if (!c.open) this.emit('error', { type: 'peer-unavailable' }); }, 1500);
+    return c;
+  }
+  destroy(){ try { this.bc.close(); } catch (e) {} }
+}
+const NET_TEST = /[?&]nettest/.test(location.search);
+function loadPeer(){
+  if (NET_TEST || window.Peer) return Promise.resolve();
+  return new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';
+    s.onload = res; s.onerror = () => rej(new Error('load')); document.head.append(s);
+  });
+}
+const makePeer = id => NET_TEST ? new BCPeer(id) : (id ? new window.Peer(id, { debug: 1 }) : new window.Peer({ debug: 1 }));
+
+function netStatus(s){ NET.status = s; const el = $('mpStatus'); if (el) el.textContent = s; if (S.menu && menu.page === 'net') menuDraw(); }
+function netReset(){
+  try { NET.conn?.close(); } catch (e) {} try { NET.peer?.destroy(); } catch (e) {}
+  Object.assign(NET, { on: false, host: false, guest: false, conn: null, peer: null, ui: 'idle', start: null, cfg: null, out: [], lastIn: 0 });
+  remote.g.visible = false; syncDeskNet();
+}
+async function netHost(){
+  netReset(); NET.ui = 'hosting'; netStatus('Starting…');
+  try { await loadPeer(); } catch (e){ NET.ui = 'idle'; return netStatus("Couldn't load the multiplayer library. Check the internet and try again."); }
+  const tryCode = (left) => {
+    const code = String(1000 + Math.floor(Math.random() * 9000)), peer = makePeer(NET_PREFIX + code);
+    NET.peer = peer;
+    peer.on('open', () => { NET.code = code; netStatus('Waiting for your friend…'); syncDeskNet(); });
+    peer.on('connection', c => { if (NET.conn){ c.close?.(); return; } netAttach(c, true); });
+    peer.on('error', e => {
+      if (e.type === 'unavailable-id' && left > 0){ peer.destroy(); tryCode(left - 1); return; }
+      if (!NET.on) netStatus(e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error'
+        ? "Can't reach the matchmaker. Check the internet and try again." : 'Something went wrong (' + e.type + '). Try again.');
+    });
+  };
+  tryCode(3);
+}
+async function netJoin(code){
+  netReset(); NET.ui = 'connecting'; NET.code = code; netStatus('Connecting to ' + code + '…');
+  try { await loadPeer(); } catch (e){ NET.ui = 'joining'; return netStatus("Couldn't load the multiplayer library. Check the internet and try again."); }
+  const peer = makePeer(); NET.peer = peer;
+  peer.on('open', () => netAttach(peer.connect(NET_PREFIX + code, { reliable: true, serialization: 'json' }), false));
+  peer.on('error', e => {
+    if (NET.on) return;
+    NET.ui = 'joining';
+    netStatus(e.type === 'peer-unavailable' ? 'No game with code ' + code + '. Check the number with your friend.'
+      : e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' ? "Can't reach the matchmaker. Check the internet and try again."
+      : 'Something went wrong (' + e.type + '). Try again.');
+  });
+  setTimeout(() => { if (!NET.on && NET.ui === 'connecting'){ NET.ui = 'joining'; netStatus("Couldn't connect. Try again, or both use home WiFi."); } }, 15000);
+}
+function netAttach(c, host){
+  NET.conn = c;
+  c.on('open', () => {
+    Object.assign(NET, { on: true, host, guest: !host, ui: 'live', lastIn: performance.now(), out: [], touched: new Map() });
+    netStatus('Connected'); syncDeskNet();
+    tone(523, 0.15, 'triangle', 0.12); tone(784, 0.25, 'triangle', 0.12, 0, 0.12);
+    if (host) netBegin();
+  });
+  c.on('data', netData);
+  c.on('close', () => netLost('Your friend left the match'));
+  c.on('error', () => netLost('The connection dropped'));
+}
+function netSend(m){ if (NET.on && NET.conn) try { NET.conn.send(m); } catch (e) {} }
+function netLeave(){ if (NET.on) netSend({ t: 'bye' }); netReset(); netStatus(''); }
+// the friend is gone: carry on against the diggers
+function netLost(why){
+  if (!NET.on) return;
+  netReset(); netStatus(why);
+  if (S.mode === 'play'){ for (const b of liveBots()) spawnBot(b); for (const o of orbs) if (!o.g.visible) o.wait = rand(5, 20); }
+  wordBurst(why, 'playing the diggers now', 0xe0103a, null);
+  tone(392, 0.2, 'triangle', 0.1); tone(262, 0.35, 'triangle', 0.1, 0, 0.15);
+}
+// the host starts a game (also on Restart, Play again and a custom game) and tells the guest how it is set up
+function netBegin(){
+  if (S.mode === 'ready' && !inXR()) startDesktop(); else { newGame(); if (S.menu) closeMenu(); }
+}
+function netSendStart(guestSpawn){
+  netSend({ t: 'start', w: NW, h: NY, team: TEAM, my: [myRuby.position.x, myRuby.position.y, myRuby.position.z].map(r3),
+    sky: [skyRuby.position.x, skyRuby.position.y, skyRuby.position.z].map(r3), spawn: guestSpawn,
+    orbs: orbs.map(o => [o.kind, o.layer]), cfg: { charge: val('charge'), beam: val('beam'), blast: val('blast') } });
+  for (const o of orbs) if (o.g.visible) netOrb(o);
+}
+function netOrb(o){ if (NET.on && NET.host) netSend({ t: 'orb', i: orbs.indexOf(o), v: o.g.visible ? 1 : 0, p: [o.pos.x, o.pos.y, o.pos.z].map(r3) }); }
+// melts and fills made here, sent once a frame in this side's coordinates
+function netRecord(cx, cy, cz, r, k, raise){
+  NET.out.push([r3(cx), r3(cy), r3(cz), r3(r), r3(k), raise ? 1 : 0]);
+  if (NET.guest){                                   // remember which chunks we just changed, so a check doesn't undo them
+    const R = r + 0.5 / SLOPE, t = performance.now();
+    for (let cz2 = Math.max(0, Math.floor((cz - R) / CELL / CH)); cz2 <= Math.min(CW - 1, Math.floor((cz + R) / CELL / CH)); cz2++)
+      for (let cy2 = Math.max(0, Math.floor((mir(cy) - R) / CELL / CH)); cy2 <= Math.min(CY - 1, Math.floor((mir(cy) + R) / CELL / CH)); cy2++)
+        for (let cx2 = Math.max(0, Math.floor((cx - R) / CELL / CH)); cx2 <= Math.min(CW - 1, Math.floor((cx + R) / CELL / CH)); cx2++)
+          NET.touched.set(cx2 + CW * (cy2 + CY * cz2), t);
+  }
+}
+let netDustT = 0;
+function netData(m){
+  NET.lastIn = performance.now(); NET.rx[m.t] = (NET.rx[m.t] || 0) + 1;
+  switch (m.t){
+    case 'p': remotePose(m); break;
+    case 's':
+      NET.applying = true;
+      for (const [x, y, z, r, k, raise] of m.a){
+        const my = mir(y);
+        stamp(x, my, z, r, k, !raise, raise ? null : inBody);
+        if (!raise && my > SURF + 0.3 && performance.now() > netDustT && Math.hypot(x - HEAD.x, my - HEAD.y, z - HEAD.z) < 16){ netDustT = performance.now() + 120; dustAt(_a.set(x, my, z)); }
+      }
+      NET.applying = false; break;
+    case 'start': NET.start = m; NET.cfg = m.cfg; netBegin(); break;
+    case 'again': if (NET.host) netBegin(); break;
+    case 'orb': {
+      const o = orbs[m.i]; if (!o) break;
+      if (m.v){ o.pos.set(m.p[0], mir(m.p[1]), m.p[2]); o.g.position.copy(o.pos); o.g.visible = true; o.wait = 0; popIn(o.g, 0.01); orbAppeared(o); }
+      else { o.g.visible = false; o.wait = 1e9; }
+      break;
+    }
+    case 'grab': {                                    // the guest touched an orb: first come, first served
+      const o = orbs[m.i];
+      if (o && o.g.visible){ o.g.visible = false; o.wait = o.layer === 'high' ? HIGH_WAIT : rand(25, 45); netSend({ t: 'gave', i: m.i }); puff(o.pos); }
+      break;
+    }
+    case 'gave': { const o = orbs[m.i]; if (o){ o.granted = true; takeOrb(o, null); o.granted = false; o.wait = 1e9; } break; }
+    case 'end': if (S.mode === 'play'){ lose(); S.endMsg = [ENEMY() + ' wins', 'Your friend dug through to their ruby after ' + fmt(S.t) + '.', true]; } break;
+    case 'fx': remoteFx(m); break;
+    case 'sig': netCheck(m.a); break;
+    case 'need': if (NET.host) for (const ci of m.a) netSend({ t: 'ck', ci, d: chunkBytes(ci) }); break;
+    case 'ck': applyChunk(m.ci, m.d); break;
+    case 'bye': netLost('Your friend left the match'); break;
+  }
+}
+// ---- keeping the two worlds the same
+function chunkSig(ci){
+  const [cx, cy, cz] = chunkOf(ci), g = NET.guest; let h = 0;
+  for (let k = cz * CH; k < cz * CH + CH; k++) for (let j = cy * CH; j < cy * CH + CH; j++){
+    const row = NW * ((g ? NY - 1 - j : j) + NY * k);
+    for (let i = cx * CH; i < cx * CH + CH; i++){ const v = g ? 1 - F[i + row] : F[i + row]; h = (Math.imul(h, 31) + Math.round(Math.round(v * 255) / 17)) | 0; }
+  }
+  return h;
+}
+function chunkBytes(ci){
+  const [cx, cy, cz] = chunkOf(ci), b = new Uint8Array(CH * CH * CH); let n = 0;
+  for (let k = cz * CH; k < cz * CH + CH; k++) for (let j = cy * CH; j < cy * CH + CH; j++) for (let i = cx * CH; i < cx * CH + CH; i++)
+    b[n++] = Math.round(clamp(F[i + NW * (j + NY * k)], 0, 1) * 255);
+  let s = ''; for (let i = 0; i < b.length; i += 2048) s += String.fromCharCode.apply(null, b.subarray(i, i + 2048));
+  return btoa(s);
+}
+function netCheck(sigs){
+  if (!NET.guest || sigs.length !== NCH) return;
+  const now = performance.now(), need = [];
+  for (let ci = 0; ci < NCH && need.length < 20; ci++){
+    if (now - (NET.touched.get(ci) || -1e9) < 2500) continue;
+    if (chunkSig(ci) !== sigs[ci]) need.push(ci);
+  }
+  if (need.length) netSend({ t: 'need', a: need });
+}
+function applyChunk(ci, d){
+  if (!NET.guest || now0() - (NET.touched.get(ci) || -1e9) < 2500) return;
+  const s = atob(d), [cx, cy, cz] = chunkOf(ci); let n = 0;
+  for (let k = cz * CH; k < cz * CH + CH; k++) for (let j = cy * CH; j < cy * CH + CH; j++){
+    const jj = NY - 1 - j;
+    for (let i = cx * CH; i < cx * CH + CH; i++, n++){
+      if (inBody(i * CELL, jj * CELL, k * CELL)) continue;
+      F[i + NW * (jj + NY * k)] = 1 - s.charCodeAt(n) / 255;
+    }
+  }
+  markDirty(cx * CH, cx * CH + CH - 1, NY - (cy + 1) * CH, NY - 1 - cy * CH, cz * CH, cz * CH + CH - 1);
+}
+const now0 = () => performance.now();
+// ---- your friend, upside down in your rock: a helmet, a body and two gloves in their team colours
+const remote = (() => {
+  const g = new THREE.Group(); g.scale.y = -1; g.visible = false; scene.add(g);
+  const shell = new THREE.MeshStandardMaterial({ color: 0x16181c, roughness: 0.35, metalness: 0.2 });
+  const visor = new THREE.MeshStandardMaterial({ color: 0xe0103a, emissive: 0x600010, roughness: 0.15, metalness: 0.4 });
+  const head = new THREE.Group();
+  head.add(new THREE.Mesh(new THREE.SphereGeometry(0.13, 24, 16).scale(1, 1.08, 1.05), shell));
+  const v = new THREE.Mesh(new RoundedBoxGeometry(0.2, 0.07, 0.08, 3, 0.03), visor); v.position.set(0, 0.01, -0.1); head.add(v);
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.42, 6, 16), shell);
+  const gl = [makeGlove(-1), makeGlove(1)].map(m => { const h = new THREE.Group(); h.add(m); g.add(h); return h; });
+  const halo = glowSprite(TEX.mint, 0.9, true); halo.material.opacity = 0; head.add(halo);
+  g.add(head, body);
+  const mats = []; g.traverse(o => { if (o.material) mats.push(o.material); });
+  return { g, head, body, gl, shell, halo, mats, seen: null, pose: null, headW: new V3(), grind: 0 };
+})();
+NET.ready = true;
+function remoteTeam(){
+  if (!NET.ready) return;
+  const light = TEAM === 'W';                          // your friend is the other team
+  remote.shell.color.setHex(light ? 0xe6e9ec : 0x16181c);
+  for (const h of remote.gl) h.children[0].userData.skin.color.setHex(light ? 0xe6e9ec : 0x16181c);
+}
+function remotePose(m){
+  remote.pose = m;
+  if (S.mode === 'play' && m.sr) myRuby.position.set(m.sr[0], mir(m.sr[1]), m.sr[2]);   // their floating ruby is your buried one
+}
+const _rq = new THREE.Quaternion(), _rp = new V3();
+function updateRemote(dt){
+  const P = remote.pose;
+  remote.g.visible = NET.on && !!P && S.mode !== 'ready';
+  if (!remote.g.visible) return;
+  remote.g.position.y = HY;                            // their world, flipped onto yours: height y there is HY - y here
+  const k = 1 - Math.exp(-dt * 14);
+  remote.head.position.lerp(_rp.set(P.h[0], P.h[1], P.h[2]), k); remote.head.quaternion.slerp(_rq.set(P.h[3], P.h[4], P.h[5], P.h[6]), k);
+  remote.body.position.copy(remote.head.position); remote.body.position.y -= 0.5;
+  const e = new THREE.Euler().setFromQuaternion(remote.head.quaternion, 'YXZ'); remote.body.rotation.set(0, e.y, 0);
+  remote.gl.forEach((h, i) => {
+    const q = P.g && P.g[i];
+    h.visible = !!q;
+    if (!q) return;
+    h.position.lerp(_rp.set(q[0], q[1], q[2]), k); h.quaternion.slerp(_rq.set(q[3], q[4], q[5], q[6]), k);
+    const G = h.children[0].userData, trig = q[7] || 0, sq = q[8] || 0;
+    G.fingers.forEach((f, j) => { const c = j === 0 ? trig : Math.max(0.25, sq); f.p1.rotation.x = -(0.25 + c * 1.15); f.p2.rotation.x = -(0.15 + c * 1.25); });
+  });
+  remote.headW.set(remote.head.position.x, mir(remote.head.position.y), remote.head.position.z);
+  // with Sight you see them through the rock
+  const seen = sightOn();
+  if (seen !== remote.seen){ remote.seen = seen; remote.shell.emissive.setHex(seen ? 0x1d7a62 : 0x000000); for (const m of remote.mats){ m.depthTest = !seen; m.transparent = seen; m.opacity = seen ? 0.85 : 1; m.needsUpdate = true; } remote.g.renderOrder = seen ? 50 : 0; }
+  remote.halo.material.opacity = seen ? 0.7 : 0;
+  // you hear them grinding through the rock when they are close
+  const d = remote.headW.distanceTo(HEAD);
+  if (P.f && d < 9 && (remote.grind -= dt) <= 0){ remote.grind = 0.14; const v = 1 - d / 9; noise(0.13, 0.07 * v, 420, 160); }
+}
+function remoteFx(m){
+  const p = _a.set(m.p[0], mir(m.p[1]), m.p[2]), d = p.distanceTo(HEAD), v = clamp(1 - d / 26, 0, 1);
+  for (let i = 0; i < (m.big ? 6 : 3); i++) dustAt(_p.copy(p).add(_d.randomDirection().multiplyScalar(m.r * 0.6)));
+  if (v > 0){ noise(m.big ? 1.6 : 0.9, (m.big ? 0.55 : 0.35) * v, 380, 50); tone(m.big ? 40 : 60, 0.8, 'sine', 0.35 * v, 22); for (const h of hands) buzz(h, 0.6 * v, 100); }
+}
+function netFx(p, r, big){ if (NET.on && !NET.applying) netSend({ t: 'fx', p: [p.x, p.y, p.z].map(r3), r, big: big ? 1 : 0 }); }
+// once a frame: send melts, twenty times a second send where you are, every 3 s (host) send the fingerprints
+let netPoseT = 0, netSigT = 0;
+function netFrame(dt){
+  if (!NET.on) return;
+  if (NET.out.length){ netSend({ t: 's', a: NET.out }); NET.out = []; }
+  if ((netPoseT -= dt) <= 0){
+    netPoseT = 0.05;
+    _q.copy(rig.quaternion).multiply(camera.quaternion);
+    const m = { t: 'p', h: [HEAD.x, HEAD.y, HEAD.z, _q.x, _q.y, _q.z, _q.w].map(r3), g: null,
+      f: (inXR() ? hands.some(h => h.src?.gamepad?.buttons?.[0]?.value > 0.5) : desk.mouse) && S.charge > 0.01 ? 1 : 0 };
+    if (S.mode === 'play') m.sr = [skyRuby.position.x, skyRuby.position.y, skyRuby.position.z].map(r3);
+    if (inXR()){
+      m.g = ['left', 'right'].map(side => {
+        const h = hands.find(q => q.side === side && q.src); if (!h) return null;
+        handPos(h, _hp); _rq.copy(rig.quaternion).multiply(h.grip.quaternion);
+        const gp = h.src.gamepad;
+        return [_hp.x, _hp.y, _hp.z, _rq.x, _rq.y, _rq.z, _rq.w].map(r3).concat([r3(gp?.buttons[0]?.value || 0), r3(gp?.buttons[1]?.value || 0)]);
+      });
+    }
+    netSend(m);
+  }
+  if (NET.host && (netSigT -= dt) <= 0){ netSigT = 3; const a = new Array(NCH); for (let ci = 0; ci < NCH; ci++) a[ci] = chunkSig(ci); netSend({ t: 'sig', a }); }
+}
+// a heartbeat that keeps going while a headset is paused (taking it off, the Quest menu); only a long silence ends the match
+setInterval(() => {
+  if (!NET.on) return;
+  netSend({ t: 'k' });
+  if (performance.now() - NET.lastIn > 20000) netLost('The connection dropped');
+}, 1000);
+// the page's own multiplayer controls
+function syncDeskNet(){
+  const host = $('mpHost'); if (!host) return;
+  $('mpLeave').hidden = !NET.on && NET.ui === 'idle';
+  host.disabled = NET.on;
+  $('mpJoin').disabled = NET.on;
+  if (NET.ui === 'hosting' && NET.code && !NET.on) $('mpStatus').textContent = 'Your code is ' + NET.code + '. Waiting for your friend…';
+  else if (NET.on) $('mpStatus').textContent = 'Playing your friend (code ' + NET.code + ').';
+}
+
 // for quick testing from the console
-window.NS = { menuGo, menuDraw, layoutMenu, floor, trail, applyBackdropK: k => applyBackdrop(k), beamR, updateOrbs, clearance: p => clearance(p), styleU, rebuildOrbs, makeGun, makeGlove, updateGlove, deskGun, resizeWorld, dims: () => ({ NW, NY, SIZE, HY, SURF }), MUS, mStep, musicTick, skyVel, traps, setTrap, springMine, aimTrap, releaseTrap, trapAim, updateRivals, buildRival, introFrame, endFrame, updateShards, pickTeam, TEAMS: () => TEAM, throwBomb, thrown, bigExplode, burstShards, startIntro, countFrame, running, CFG, setCfg, openMenu, closeMenu, menuFrame, menu, takeOrb, blackPower, bodyNear, wordBurst, applyBackdrop, nextBackdrop, orbs, showHelp, explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
+window.NS = { netFrame, updateRemote, NET, netHost, netJoin, netLeave, remote, chunkSig, menuGo, menuDraw, layoutMenu, floor, trail, applyBackdropK: k => applyBackdrop(k), beamR, updateOrbs, clearance: p => clearance(p), styleU, rebuildOrbs, makeGun, makeGlove, updateGlove, deskGun, resizeWorld, dims: () => ({ NW, NY, SIZE, HY, SURF }), MUS, mStep, musicTick, skyVel, traps, setTrap, springMine, aimTrap, releaseTrap, trapAim, updateRivals, buildRival, introFrame, endFrame, updateShards, pickTeam, TEAMS: () => TEAM, throwBomb, thrown, bigExplode, burstShards, startIntro, countFrame, running, CFG, setCfg, openMenu, closeMenu, menuFrame, menu, takeOrb, blackPower, bodyNear, wordBurst, applyBackdrop, nextBackdrop, orbs, showHelp, explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
 </script>
 <script src="../updated.js"></script>
 </body>
