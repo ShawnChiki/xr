@@ -8,6 +8,7 @@ panelization for fabrication (concrete and wood approaches) → export to Rhino 
 
 ## Changelog
 
+- **v1.8** — Step 4 is now called SubD. New SubD tools: Loop cut (tap an edge: a new edge loop runs across the whole row of quads beside it) and Straighten (tap the edge where a row starts and the edge where it ends: every edge between them is lined up and evenly spaced, staying on the surface). The Edit in Subdeck link is gone.
 - **v1.7** — Shape gets Cut: tap an edge for a new point on it, tap points or edges one after another to cut new edges across the faces (optionally as creases, for sharp seams); tap the last point again to stop. Triangles show pink and 5+ sided faces purple, with a count in the menu, so they're easy to find and fix.
 - **v1.6** — Shape is much lighter: while you drag, smooth or soft-move, the surface previews one level coarser from a cached shading plan (about 10× faster), then refines when you let go; the net's lines move in place instead of being rebuilt. Smoothing has a strength setting, and it leaves smooth paint, so rebuilding from your lines keeps those spots smooth. Plain words: the cage is now the control points / control net. Patch is now Draw face: tap existing points or empty spots on the surface (new points) to redraw polygons. Surface → Look has Shaded / Zebra / Trust buttons (stripes show with Zebra) and the edge views. Floor grid is gone.
 - **v1.5** — Sketch has Build and Auto build at the top again. In Sketch, hold B for the line type dial; the other hand's trigger (held) is the step dial.
