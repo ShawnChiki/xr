@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p2.6"></script>
-<script src="solver.js?v=p2.6"></script>
+<script src="demo.js?v=p2.8"></script>
+<script src="solver.js?v=p2.8"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -106,7 +106,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.6';
+const VERSION = '2.8';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -1101,14 +1101,20 @@ function makeStrict(){
   commit([...strokes.filter(s => !(tags.has(s.tag) && !S.lock[s.tag])), ...add]);
   flash(add.length + (add.length === 1 ? ' line is' : ' lines are') + ' strict now. Drag the points to edit.');
 }
-// ---------- Fab · hex panels: the surface covered in near-hexagonal panels of one size, however fine its mesh is.
-// Seeds are spread over the surface and relaxed (each panel's centre moves to the middle of the area nearest it,
-// measured along the surface) until the panels settle into hexagons. Creases are seams: a panel never crosses one.
-const PANEL_SIZE = [0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3];     // across a panel, park metres
-let panels = null;                                            // { label (per welded vertex), map (soup → welded), n, flat, size }
+// ---------- Fab · quad panels, as flat as you ask. The surface's own quad layout (the SubD cage) is the starting
+// grid: each cage quad is one panel if it's flat enough, otherwise it's split in four, and again, until every piece is
+// within the flatness you set (or as small as the surface's detail goes). Where whole quads are flat, neighbours
+// join into bigger panels. Panel edges run along the surface's quad lines, so they're clean curves, never jagged,
+// and creases are always panel edges.
+const PANEL_TOL = [0.003, 0.006, 0.01, 0.02, 0.04, 0.08];     // how far a panel may bow off flat, park metres
+let panels = null;                                            // { list: [{ pts (grid points), outline, corners, dev }], G (grids) }
 const panelGroup = new THREE.Group(); world.add(panelGroup);
 function clearPanels(){ for (const o of [...panelGroup.children]){ panelGroup.remove(o); o.geometry.dispose(); } panels = null; if (surfMesh) applySurfView(); menuDirty = true; }
-function makePanels(){
+// the cage as the builder made it (or as you shaped it)
+function panelCage(){ if (cageEd) return { V: cageEd.V.slice(), F: cageEd.F.map(f => f.slice()), sharp: new Set(cageEd.sharp) };
+  const c = lastResult && lastResult.cage; if (!c) return null; const F = []; for (let f = 0, o = 0; f < c.C.length; f++){ F.push(Array.from(c.F.subarray(o, o + c.C[f]))); o += c.C[f]; }
+  const sharp = new Set(); for (let i = 0; i < c.sharp.length; i += 2) sharp.add(CEK(c.sharp[i], c.sharp[i + 1])); return { V: Array.from(c.V), F, sharp }; }
+function hexCells(size){
   if (!surfMesh) return flash('Build a surface first (step 3)');
   const P = surfMesh.geometry.attributes.position.array, NN = surfMesh.geometry.attributes.normal.array, ns = P.length / 3;
   // weld the triangle soup into points and their neighbours
@@ -1120,14 +1126,14 @@ function makePanels(){
     for (const [u, w] of [[a, b], [b, c], [c, a]]){ const d = D(u, w); adj[u].set(w, d); adj[w].set(u, d); }
     const ux = X[3 * b] - X[3 * a], uy = X[3 * b + 1] - X[3 * a + 1], uz = X[3 * b + 2] - X[3 * a + 2], wx = X[3 * c] - X[3 * a], wy = X[3 * c + 1] - X[3 * a + 1], wz = X[3 * c + 2] - X[3 * a + 2];
     const A = Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx) / 6; area[a] += A; area[b] += A; area[c] += A; }
-  const size = PANEL_SIZE[S.panelSize ?? 3], sp = size * 0.95;
+  const sp = size * 0.95;
   // seeds: spread out, at least a panel apart (points on seams can't be centres)
   const order = Array.from({ length: nv }, (_, i) => i); let rs = 12345; const rnd = () => (rs = (rs * 16807) % 2147483647) / 2147483647; for (let i = nv - 1; i > 0; i--){ const j = Math.floor(rnd() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
   const cell = sp, grid = new Map(), gk = (x, y, z) => Math.floor(x / cell) + ',' + Math.floor(y / cell) + ',' + Math.floor(z / cell); let seeds = [];
   for (const v of order){ if (crease[v] || !adj[v].size) continue; const x = X[3 * v], y = X[3 * v + 1], z = X[3 * v + 2]; let ok = true;
     for (let i = -1; i <= 1 && ok; i++) for (let j = -1; j <= 1 && ok; j++) for (let k = -1; k <= 1 && ok; k++){ const l = grid.get(gk(x + i * cell, y + j * cell, z + k * cell)); if (l) for (const q of l) if (D(q, v) < sp){ ok = false; break; } }
     if (ok){ seeds.push(v); const g = gk(x, y, z); (grid.get(g) || grid.set(g, []).get(g)).push(v); } }
-  if (seeds.length > 4000) return flash('That would be over 4000 panels: pick a bigger panel size');
+  if (seeds.length > 20000) return null;
   // nearest seed along the surface (a little heap), seams stop the spread
   const label = new Int32Array(nv), dist = new Float64Array(nv);
   const grow = () => { label.fill(-1); dist.fill(Infinity); const h = []; const push = (d, v) => { h.push([d, v]); let i = h.length - 1; while (i){ const p = (i - 1) >> 1; if (h[p][0] <= h[i][0]) break; [h[p], h[i]] = [h[i], h[p]]; i = p; } };
@@ -1147,47 +1153,140 @@ function makePanels(){
   const n = seeds.length, nx = new Float64Array(n), ny = new Float64Array(n), nz = new Float64Array(n), mx = new Float64Array(n), my = new Float64Array(n), mz = new Float64Array(n), cnt = new Float64Array(n), flat = new Float64Array(n);
   for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0) continue; nx[L] += NN[3 * i]; ny[L] += NN[3 * i + 1]; nz[L] += NN[3 * i + 2]; mx[L] += P[3 * i]; my[L] += P[3 * i + 1]; mz[L] += P[3 * i + 2]; cnt[L]++; }
   for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0) continue; const l = Math.hypot(nx[L], ny[L], nz[L]) || 1; flat[L] = Math.max(flat[L], Math.abs(((P[3 * i] - mx[L] / cnt[L]) * nx[L] + (P[3 * i + 1] - my[L] / cnt[L]) * ny[L] + (P[3 * i + 2] - mz[L] / cnt[L]) * nz[L]) / l)); }
-  panels = { label, map, n, flat, size, X, dist: Float64Array.from(dist) }; showPanels();
-  const fl = Array.from(flat).sort((a, b) => a - b), med = fl[Math.floor(fl.length / 2)] || 0;
-  flash(n + ' panels about ' + lenText(size) + ' across. Half are within ' + lenText(med) + ' of flat.', 7);
+  return { label, map, n, flat, size, X, dist: Float64Array.from(dist), crease, adj };
+}
+const HEX_SIZE = [0.15, 0.25, 0.4, 0.6, 0.8, 1, 1.25, 1.5, 2, 3];
+// hex panels with straight edges: each panel's corners are where three panels meet (and where it meets a seam or
+// the edge), joined by straight lines and laid flat on the panel's own plane
+function makeHexPanels(){
+  if (!surfMesh) return flash('Build a surface first (step 3)');
+  const size = HEX_SIZE[S.hexSize ?? 3], cells = hexCells(size); if (!cells) return flash('That many panels would be too slow: pick a bigger size');
+  const { label, map, n, X, dist, crease, adj } = cells, src = surfMesh.geometry, P = src.attributes.position.array, NN = src.attributes.normal.array, ns = P.length / 3;
+  const XV = v => new V3(X[3 * v], X[3 * v + 1], X[3 * v + 2]);
+  const bis = (a, b) => { const l = XV(a).distanceTo(XV(b)) || 1e-9, t = Math.max(0.05, Math.min(0.95, (dist[b] + l - dist[a]) / (2 * l))); return XV(a).lerp(XV(b), t); };
+  const pts = Array.from({ length: n }, () => []), nrm = Array.from({ length: n }, () => new V3());
+  for (let t = 0; t < ns; t += 3){ const v = [map[t], map[t + 1], map[t + 2]], L = v.map(x => label[x]);
+    for (let k = 0; k < 3; k++) if (L[k] >= 0) nrm[L[k]].add(new V3(NN[3 * (t + k)], NN[3 * (t + k) + 1], NN[3 * (t + k) + 2]));
+    if (L[0] >= 0 && L[1] >= 0 && L[2] >= 0 && L[0] !== L[1] && L[1] !== L[2] && L[0] !== L[2]){ const j = bis(v[0], v[1]).add(bis(v[1], v[2])).add(bis(v[2], v[0])).multiplyScalar(1 / 3); for (const c of L) pts[c].push(j); } }
+  // the surface's edge and the seams: their points belong to the panels along them
+  const ecount = new Map(); for (let t = 0; t < ns; t += 3) for (let k = 0; k < 3; k++){ const a = map[t + k], b = map[t + (k + 1) % 3], key = a < b ? a + ',' + b : b + ',' + a; ecount.set(key, (ecount.get(key) || 0) + 1); }
+  for (const [key, c] of ecount){ if (c !== 1) continue; const [a, b] = key.split(',').map(Number); if (label[a] < 0 || label[b] < 0) continue;
+    pts[label[a]].push(XV(a)); if (label[a] !== label[b]){ const q = bis(a, b); pts[label[a]].push(q); pts[label[b]].push(q.clone()); } }
+  for (let v = 0; v < X.length / 3; v++){ if (!crease[v] || label[v] < 0) continue; const own = new Set([label[v]]); for (const w of adj[v].keys()) if (label[w] >= 0) own.add(label[w]); for (const c of own) pts[c].push(XV(v)); }
+  // order each panel's corners round its middle, on its own plane
+  const list = [];
+  for (let c = 0; c < n; c++){ const q = pts[c]; if (q.length < 3) continue; const ctr = new V3(); q.forEach(p => ctr.add(p)); ctr.multiplyScalar(1 / q.length);
+    const nz = nrm[c].lengthSq() ? nrm[c].clone().normalize() : new V3(0, 1, 0), ax = Math.abs(nz.y) < 0.9 ? new V3(0, 1, 0) : new V3(1, 0, 0), e1 = ax.clone().sub(nz.clone().multiplyScalar(ax.dot(nz))).normalize(), e2 = nz.clone().cross(e1);
+    const ord = q.map(p => { const d = p.clone().sub(ctr); return [Math.atan2(d.dot(e2), d.dot(e1)), p]; }).sort((a, b) => a[0] - b[0]).map(x => x[1]);
+    const ring = []; for (const p of ord) if (!ring.length || ring[ring.length - 1].distanceToSquared(p) > (size * 0.04) ** 2) ring.push(p); if (ring.length > 2 && ring[0].distanceToSquared(ring[ring.length - 1]) < (size * 0.04) ** 2) ring.pop();
+    if (ring.length < 3) continue;
+    // how far the surface under it is from its plane
+    list.push({ ring, c: ctr, nrm: nz, dev: cells.flat[c] }); }
+  panels = { hex: true, list, merged: [], size, tol: Math.max(0.01, ...list.map(p => p.dev)) }; showPanels();
+  const fl = list.map(p => p.dev).sort((a, b) => a - b), med = fl[fl.length >> 1] || 0;
+  flash(list.length + ' hex panels about ' + lenText(size) + ' across, straight edged. Half are within ' + lenText(med) + ' of flat.', 7);
+}
+function makePanels(){
+  const A = SV(), cage = panelCage(); if (!A || !cage) return flash('Build a surface first (step 3)');
+  const tol = PANEL_TOL[S.panelTol ?? 2], nf = cage.F.length;
+  // subdivide: deep enough for small panels, light enough to stay quick (about 100k little quads in all)
+  const D = Math.max(2, Math.min(5, Math.floor(Math.log(120000 / Math.max(1, nf)) / Math.log(4))));
+  const lv = [{ V: cage.V, F: cage.F, sharp: cage.sharp, corner: new Uint8Array(cage.V.length / 3) }];
+  for (let i = 0; i < D; i++) lv.push(A.catmullClark(lv[i], []));
+  const off = lv.map(L => { const o = new Int32Array(L.F.length + 1); L.F.forEach((f, i) => { o[i + 1] = o[i] + f.length; }); return o; });
+  // the grid of points over one face: (2^d + 1)² point numbers at level lvl + d, u along its first edge, v along its last
+  function grid(lvl, fi, d){
+    const f = lv[lvl].F[fi]; if (!d) return [[f[0], f[3]], [f[1], f[2]]];
+    const n = 1 << d, h = n >> 1, G = Array.from({ length: n + 1 }, () => new Int32Array(n + 1));
+    const frame = [[0, 0, 1, 0, 0, 1], [n, 0, 0, 1, -1, 0], [n, n, -1, 0, 0, -1], [0, n, 0, -1, 1, 0]];   // child at each corner: base, its u, its v
+    for (let i = 0; i < 4; i++){ const g = grid(lvl + 1, off[lvl][fi] + i, d - 1), [bx, by, ux, uy, vx, vy] = frame[i];
+      for (let a = 0; a <= h; a++) for (let b = 0; b <= h; b++) G[bx + ux * a + vx * b][by + uy * a + vy * b] = g[a][b]; }
+    return G; }
+  const VD = lv[D].V, P = v => new V3(VD[3 * v], VD[3 * v + 1], VD[3 * v + 2]);
+  // roots: each cage quad; anything else is split once into quads first
+  const roots = []; cage.F.forEach((f, fi) => { if (f.length === 4) roots.push({ G: grid(0, fi, D), n: 1 << D, cage: fi, corners: f.slice() }); else for (let i = 0; i < f.length; i++) roots.push({ G: grid(1, off[0][fi] + i, D - 1), n: 1 << (D - 1), cage: fi, corners: null }); });
+  // how far points stray from the plane through a panel's corners (best fit through them)
+  const devOf = pts => { const c = new V3(); pts.forEach(p => c.add(p)); c.multiplyScalar(1 / pts.length); const q = pts, nrm = new V3();
+    for (let i = 0; i < q.length; i++){ const a = q[i].clone().sub(c), b = q[(i + 1) % q.length].clone().sub(c); nrm.add(a.cross(b)); } nrm.normalize(); return { c, nrm }; };
+  const panelOf = (root, i0, j0, s) => { const G = root.G, pts = [];
+    for (let i = i0; i <= i0 + s; i++) for (let j = j0; j <= j0 + s; j++) pts.push(P(G[i][j]));
+    const ring = [P(G[i0][j0]), P(G[i0 + s][j0]), P(G[i0 + s][j0 + s]), P(G[i0][j0 + s])], pl = devOf(pts.length > 4 ? gridRing(G, i0, j0, s).map(P) : ring);
+    let dev = 0; for (const p of pts) dev = Math.max(dev, Math.abs(p.clone().sub(pl.c).dot(pl.nrm))); return { root, i0, j0, s, dev, pl }; };
+  function gridRing(G, i0, j0, s){ const r = []; for (let i = i0; i < i0 + s; i++) r.push(G[i][j0]); for (let j = j0; j < j0 + s; j++) r.push(G[i0 + s][j]); for (let i = i0 + s; i > i0; i--) r.push(G[i][j0 + s]); for (let j = j0 + s; j > j0; j--) r.push(G[i0][j]); return r; }
+  // split until flat (or as small as it goes)
+  const list = [];
+  for (const root of roots){ const st = [[0, 0, root.n]]; while (st.length){ const [i0, j0, s] = st.pop(); const pn = panelOf(root, i0, j0, s);
+    if (pn.dev <= tol || s === 1) list.push(pn); else { const h = s >> 1; st.push([i0, j0, h], [i0 + h, j0, h], [i0, j0 + h, h], [i0 + h, j0 + h, h]); } } }
+  // join whole cage quads that are flat into bigger panels: 2×2 blocks round a plain four-way point, then pairs
+  const whole = new Map(); list.forEach((pn, k) => { if (pn.s === pn.root.n && pn.root.corners) whole.set(pn.root.cage, k); });
+  const merged = [], gone = new Set(), nbF = new Map(); cage.F.forEach((f, fi) => f.forEach(v => (nbF.get(v) || nbF.set(v, []).get(v)).push(fi)));
+  const ptsOfCage = fi => { const k = whole.get(fi), r = list[k].root, out = []; for (let i = 0; i <= r.n; i++) for (let j = 0; j <= r.n; j++) out.push(P(r.G[i][j])); return out; };
+  const tryJoin = (faces, ring) => { const pts = faces.flatMap(ptsOfCage), pl = devOf(ring.map(v => P(v))); let dev = 0; for (const p of pts) dev = Math.max(dev, Math.abs(p.clone().sub(pl.c).dot(pl.nrm))); return dev <= tol ? { faces, ring, dev, pl } : null; };
+  if (S.panelJoin !== 0){
+    for (const [v, fs] of nbF){ if (fs.length !== 4 || fs.some(fi => !whole.has(fi) || gone.has(fi))) continue;
+      const inner = fs.flatMap(fi => { const f = cage.F[fi], i = f.indexOf(v); return [CEK(v, f[(i + 1) % 4])]; }); if (inner.some(k => cage.sharp.has(k))) continue;
+      // the outer ring: the far corner of each quad and the points between
+      const ring = []; let fi = fs[0]; const seen = new Set();
+      for (let g = 0; g < 4; g++){ const f = cage.F[fi], i = f.indexOf(v); ring.push(f[(i + 1) % 4], f[(i + 2) % 4]); seen.add(fi); const nxt = fs.find(x => !seen.has(x) && cage.F[x].includes(f[(i + 3) % 4])); if (nxt === undefined) break; fi = nxt; }
+      if (ring.length !== 8) continue; const j = tryJoin(fs, [ring[1], ring[3], ring[5], ring[7]]); if (j){ j.outline = ring; merged.push(j); fs.forEach(x => gone.add(x)); } }
+  }
+  const finalList = list.filter(pn => !(pn.root.corners && pn.s === pn.root.n && gone.has(pn.root.cage)));
+  const rootAll = new Map(); roots.forEach(r => { if (r.corners) rootAll.set(r.cage, r); });
+  panels = { list: finalList, merged, P, tol, D, rootAll }; showPanels();
+  const n = finalList.length + merged.length, worst = Math.max(0, ...finalList.map(p => p.dev), ...merged.map(m => m.dev));
+  const over = finalList.filter(p => p.dev > tol).length;
+  flash(n + ' quad panels, each within ' + lenText(tol) + ' of flat' + (over ? ' (' + over + ' small ones in tight spots are over: the surface is too curved there for its detail)' : '') + '.', 8);
 }
 const PANEL_COLS = [0xFF6B3D, 0x2FB3A5, 0xFF5FA2, 0xF2C230, 0x4F8CFF, 0x6FD16A, 0xA87BFF, 0xE8463B, 0x5FE0B8].map(c => new THREE.Color(c));
 function showPanels(){
   for (const o of [...panelGroup.children]){ panelGroup.remove(o); o.geometry.dispose(); }
-  if (!panels || !surfMesh) return; const { label, map, flat, size } = panels, src = surfMesh.geometry, P = src.attributes.position.array, NN = src.attributes.normal.array, ns = P.length / 3;
-  // colour: each panel its own colour (neighbours differ), or how flat it is
-  const pc = new Int32Array(panels.n).fill(-1), nbs = Array.from({ length: panels.n }, () => new Set());
-  for (let t = 0; t < ns; t += 3){ const a = label[map[t]], b = label[map[t + 1]], c = label[map[t + 2]]; for (const [x, y] of [[a, b], [b, c], [c, a]]) if (x >= 0 && y >= 0 && x !== y){ nbs[x].add(y); nbs[y].add(x); } }
-  for (let i = 0; i < panels.n; i++){ const used = new Set([...nbs[i]].map(j => pc[j])); let c = 0; while (used.has(c)) c++; pc[i] = c % PANEL_COLS.length; }
-  const col = new Float32Array(ns * 3), tmp = new THREE.Color();
-  for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0){ col.set([0.6, 0.6, 0.6], 3 * i); continue; }
-    if (S.panelColor === 1){ const u = Math.min(1, flat[L] / (0.06 * size)); tmp.setRGB(0.3 + 0.7 * u, 0.85 - 0.6 * u, 0.4 - 0.2 * u); } else tmp.copy(PANEL_COLS[pc[L]]);
-    col[3 * i] = tmp.r; col[3 * i + 1] = tmp.g; col[3 * i + 2] = tmp.b; }
-  const g = new THREE.BufferGeometry(); g.setAttribute('position', src.attributes.position.clone()); g.setAttribute('normal', src.attributes.normal.clone()); g.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  const m = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 })); panelGroup.add(m);
-  // the seams between panels: through the middle of each triangle edge whose ends are in different panels
-  // where along the edge the two panels are equally far (from each end's distance to its own centre), so the seams
-  // run smooth instead of zig-zagging along the mesh
-  const dist = panels.dist, X = panels.X, seg = [], off = 0.006 * N(), q = (i, j) => { const a = map[i], b = map[j], l = Math.hypot(X[3 * a] - X[3 * b], X[3 * a + 1] - X[3 * b + 1], X[3 * a + 2] - X[3 * b + 2]) || 1e-9;
-    const t = Math.max(0.05, Math.min(0.95, (dist[b] + l - dist[a]) / (2 * l))); return [0, 1, 2].map(k => P[3 * i + k] + (P[3 * j + k] - P[3 * i + k]) * t + (NN[3 * i + k] + NN[3 * j + k]) / 2 * off); };
-  for (let t = 0; t < ns; t += 3){ const ids = [t, t + 1, t + 2], L = ids.map(i => label[map[i]]), cut = [];
-    for (let k = 0; k < 3; k++){ const i = ids[k], j = ids[(k + 1) % 3]; if (L[k] !== L[(k + 1) % 3]) cut.push(q(i, j)); }
-    if (cut.length === 2) seg.push(...cut[0], ...cut[1]);
-    else if (cut.length === 3){ const c = [0, 1, 2].map(k => (cut[0][k] + cut[1][k] + cut[2][k]) / 3); for (const p of cut) seg.push(...p, ...c); } }
+  if (!panels) return; if (panels.hex) return showHexPanels(); const { list, merged, P, tol } = panels, pos = [], col = [], seg = [], tmp = new THREE.Color();
+  const colFor = (k, dev) => S.panelColor === 1 ? tmp.setRGB(0.3 + 0.7 * Math.min(1, dev / tol), 0.85 - 0.6 * Math.min(1, dev / tol), 0.4 - 0.2 * Math.min(1, dev / tol)) : tmp.copy(PANEL_COLS[k % PANEL_COLS.length]);
+  const quad = (a, b, c, d, cl) => { for (const p of [a, b, c, a, c, d]){ pos.push(p.x, p.y, p.z); col.push(cl.r, cl.g, cl.b); } };
+  const off = 0.004 * N();
+  const lift = (p, nrm) => p.clone().addScaledVector(nrm, off);
+  // each small panel: its little grid of surface quads, and its outline along the grid lines
+  list.forEach((pn, k) => { const G = pn.root.G, cl = colFor(k * 7 + pn.i0 + pn.j0, pn.dev).clone();
+    for (let i = pn.i0; i < pn.i0 + pn.s; i++) for (let j = pn.j0; j < pn.j0 + pn.s; j++) quad(P(G[i][j]), P(G[i + 1][j]), P(G[i + 1][j + 1]), P(G[i][j + 1]), cl);
+    const r = []; for (let i = pn.i0; i < pn.i0 + pn.s; i++) r.push(G[i][pn.j0]); for (let j = pn.j0; j < pn.j0 + pn.s; j++) r.push(G[pn.i0 + pn.s][j]); for (let i = pn.i0 + pn.s; i > pn.i0; i--) r.push(G[i][pn.j0 + pn.s]); for (let j = pn.j0 + pn.s; j > pn.j0; j--) r.push(G[pn.i0][j]);
+    for (let q = 0; q < r.length; q++){ const a = lift(P(r[q]), pn.pl.nrm), b = lift(P(r[(q + 1) % r.length]), pn.pl.nrm); seg.push(a.x, a.y, a.z, b.x, b.y, b.z); } });
+  // joined panels: their four quads' grids, one colour, and the outline round all four
+  merged.forEach((m, k) => { const cl = colFor(k * 3 + 1, m.dev).clone();
+    m.faces.forEach(fi => { const root = panelsRoots(fi); if (!root) return; const G = root.G; for (let i = 0; i < root.n; i++) for (let j = 0; j < root.n; j++) quad(P(G[i][j]), P(G[i + 1][j]), P(G[i + 1][j + 1]), P(G[i][j + 1]), cl); });
+    m.faces.forEach(fi => { const root = panelsRoots(fi); if (!root) return; const G = root.G, n = root.n, f = root.corners;
+      // only the edges on the outside of the joined panel
+      const sides = [[f[0], f[1], i => G[i][0]], [f[1], f[2], j => G[n][j]], [f[2], f[3], i => G[n - i][n]], [f[3], f[0], j => G[0][n - j]]];
+      for (const [a, b, at] of sides){ const inner = m.faces.some(o => o !== fi && panelsRoots(o) && panelsRoots(o).corners.includes(a) && panelsRoots(o).corners.includes(b)); if (inner) continue;
+        for (let t = 0; t < n; t++){ const p = lift(P(at(t)), m.pl.nrm), q = lift(P(at(t + 1)), m.pl.nrm); seg.push(p.x, p.y, p.z, q.x, q.y, q.z); } } }); });
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3)); g.computeVertexNormals();
+  panelGroup.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, side: THREE.DoubleSide, flatShading: false, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 })));
   const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(seg, 3)); panelGroup.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x17191D })));
   applySurfView();
 }
-// each panel as its own named mesh, for Rhino (Smash or UnrollSrf to flatten it) or Blender
+function showHexPanels(){
+  const pos = [], col = [], seg = [], tmp = new THREE.Color(), off = 0.004 * N(), tol = PANEL_TOL[S.panelTol ?? 2];
+  panels.list.forEach((pn, k) => { const u = Math.min(1, pn.dev / tol), cl = S.panelColor === 1 ? tmp.setRGB(0.3 + 0.7 * u, 0.85 - 0.6 * u, 0.4 - 0.2 * u).clone() : PANEL_COLS[k % PANEL_COLS.length];
+    const R = pn.ring.map(p => p.clone().addScaledVector(pn.nrm, off)), c = pn.c.clone().addScaledVector(pn.nrm, off);
+    for (let i = 0; i < R.length; i++){ const a = R[i], b = R[(i + 1) % R.length]; for (const p of [c, a, b]){ pos.push(p.x, p.y, p.z); col.push(cl.r, cl.g, cl.b); } seg.push(a.x, a.y, a.z, b.x, b.y, b.z); } });
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3)); g.computeVertexNormals();
+  panelGroup.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 })));
+  const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(seg, 3)); panelGroup.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0x17191D })));
+  applySurfView();
+}
+function panelsRoots(fi){ return panels && panels.rootAll.get(fi) || null; }
+// flat panels to cut: each one's four corners laid onto its own best plane, one object per panel
 function exportPanels(){
-  if (!panels || !surfMesh) return flash('Make the panels first');
-  const P = surfMesh.geometry.attributes.position.array, ns = P.length / 3, { label, map, n } = panels, by = Array.from({ length: n }, () => []);
-  for (let t = 0; t < ns; t += 3){ const L = [t, t + 1, t + 2].map(i => label[map[i]]), m = L[0] === L[1] || L[0] === L[2] ? L[0] : L[1]; if (m >= 0) by[m].push(t); }
-  const out = ['# Pentimento Park — hex panels, park metres, Y up, one object per panel'];
-  let base = 1; by.forEach((ts, k) => { if (!ts.length) return; out.push('o panel_' + String(k + 1).padStart(3, '0'));
-    for (const t of ts) for (let j = 0; j < 3; j++){ const i = t + j; out.push(`v ${P[3 * i].toFixed(4)} ${P[3 * i + 1].toFixed(4)} ${P[3 * i + 2].toFixed(4)}`); }
-    for (let j = 0; j < ts.length; j++) out.push(`f ${base + 3 * j} ${base + 3 * j + 1} ${base + 3 * j + 2}`); base += ts.length * 3; });
+  if (!panels) return flash('Make the panels first');
+  if (panels.hex){ const out = ['# Pentimento Park — flat hex panels (straight edges, each on its own best plane), park metres, Y up']; let base = 1;
+    panels.list.forEach((pn, k) => { out.push('o panel_' + String(k + 1).padStart(4, '0') + '  # bows ' + (pn.dev * 1000).toFixed(0) + ' mm off flat'); for (const p of pn.ring){ const q = p.clone().addScaledVector(pn.nrm, -p.clone().sub(pn.c).dot(pn.nrm)); out.push(`v ${q.x.toFixed(4)} ${q.y.toFixed(4)} ${q.z.toFixed(4)}`); } out.push('f ' + pn.ring.map((_, i) => base + i).join(' ')); base += pn.ring.length; });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'text/plain' })); a.download = 'pentimento-park-hex-panels.obj'; a.click(); return flash('Saved ' + panels.list.length + ' flat hex panels (OBJ)'); }
+  const { list, merged, P } = panels, out = ['# Pentimento Park — flat quad panels (corners on each panel\'s best plane), park metres, Y up'];
+  let base = 1, k = 0; const put = (pts, pl, dev) => { out.push('o panel_' + String(++k).padStart(4, '0') + '  # bows ' + (dev * 1000).toFixed(0) + ' mm off flat');
+    for (const p of pts){ const q = p.clone().addScaledVector(pl.nrm, -p.clone().sub(pl.c).dot(pl.nrm)); out.push(`v ${q.x.toFixed(4)} ${q.y.toFixed(4)} ${q.z.toFixed(4)}`); } out.push('f ' + pts.map((_, i) => base + i).join(' ')); base += pts.length; };
+  for (const pn of list){ const G = pn.root.G; put([P(G[pn.i0][pn.j0]), P(G[pn.i0 + pn.s][pn.j0]), P(G[pn.i0 + pn.s][pn.j0 + pn.s]), P(G[pn.i0][pn.j0 + pn.s])], pn.pl, pn.dev); }
+  for (const m of merged) put(m.ring.map(v => P(v)), m.pl, m.dev);
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'text/plain' })); a.download = 'pentimento-park-panels.obj'; a.click();
-  flash('Saved ' + n + ' panels as separate objects (OBJ)');
+  flash('Saved ' + k + ' flat panels (OBJ, one object each)');
 }
 function exportOBJ(){
   if (!lastResult || !lastResult.quads) return flash('Build a surface first');
@@ -2491,16 +2590,20 @@ function setStep(st, quiet){
 
   // ===== 5 FAB
   head('fab');
-  section('fab', 'HEX PANELS');
-  note('fab', 'Cover the surface in panels of one size, however fine its mesh is. They settle into hexagons, and creases act as seams: no panel crosses one.');
-  stepper('fab', 64, 'Panel size', () => lenText(PANEL_SIZE[S.panelSize ?? 3]) + ' across', () => { S.panelSize = Math.max(0, (S.panelSize ?? 3) - 1); scheduleSave(); }, () => { S.panelSize = Math.min(PANEL_SIZE.length - 1, (S.panelSize ?? 3) + 1); scheduleSave(); });
-  row('fab', 72, [{ id: 'seams-on', label: () => 'Creases are seams', on: () => S.panelSeams !== 0, act: () => { S.panelSeams = 1; scheduleSave(); } }, { id: 'seams-off', label: () => 'Panels cross creases', on: () => S.panelSeams === 0, act: () => { S.panelSeams = 0; scheduleSave(); } }]);
+  section('fab', 'PANELS');
+  row('fab', 72, [{ id: 'ps-quad', label: () => 'Quads', sub: () => 'as flat as you set', on: () => S.panelShape !== 'hex', act: () => { S.panelShape = 'quad'; scheduleSave(); } }, { id: 'ps-hex', label: () => 'Hexes', sub: () => 'one size, straight edges', on: () => S.panelShape === 'hex', act: () => { S.panelShape = 'hex'; scheduleSave(); } }]);
+  stepper('fab', 64, 'Hex size', () => lenText(HEX_SIZE[S.hexSize ?? 3]) + ' across', () => { S.hexSize = Math.max(0, (S.hexSize ?? 3) - 1); scheduleSave(); }, () => { S.hexSize = Math.min(HEX_SIZE.length - 1, (S.hexSize ?? 3) + 1); scheduleSave(); }, { vis: () => S.panelShape === 'hex' });
+  row('fab', 72, [{ id: 'seams-on', label: () => 'Creases are seams', on: () => S.panelSeams !== 0, act: () => { S.panelSeams = 1; scheduleSave(); } }, { id: 'seams-off', label: () => 'Hexes cross creases', on: () => S.panelSeams === 0, act: () => { S.panelSeams = 0; scheduleSave(); } }], { vis: () => S.panelShape === 'hex' });
+  note('fab', () => S.panelShape === 'hex' ? 'Hexagons of one size, relaxed over the surface. Each one\'s corners are where three panels meet, joined by straight edges and laid on its own plane.' : 'Flat panels along the surface\'s own quad lines: each quad is one panel if it\'s flat enough, otherwise it splits until every piece is. Flat areas get big panels (neighbouring flat quads join up), curved areas small ones. Creases are always panel edges.');
+  stepper('fab', 64, () => S.panelShape === 'hex' ? 'Colour scale: flat to' : 'Flat to within', () => lenText(PANEL_TOL[S.panelTol ?? 2]), () => { S.panelTol = Math.max(0, (S.panelTol ?? 2) - 1); scheduleSave(); }, () => { S.panelTol = Math.min(PANEL_TOL.length - 1, (S.panelTol ?? 2) + 1); scheduleSave(); });
+  row('fab', 72, [{ id: 'join-on', label: () => 'Join flat quads', on: () => S.panelJoin !== 0, act: () => { S.panelJoin = 1; scheduleSave(); } }, { id: 'join-off', label: () => 'Keep one per quad', on: () => S.panelJoin === 0, act: () => { S.panelJoin = 0; scheduleSave(); } }], { vis: () => S.panelShape !== 'hex' });
   { const goW = 620; blk('fab', 96, [
-    add({ id: 'panels-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => panels ? 'REMAKE' : 'MAKE PANELS', sub: () => panels ? panels.n + ' panels · ' + lenText(panels.size) : hasSurface() ? 'from the surface' : 'build a surface first', act: () => { flash('Making panels…'); setTimeout(makePanels, 30); } }),
+    add({ id: 'panels-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => panels ? 'REMAKE' : 'MAKE PANELS', sub: () => panels ? (panels.list.length + panels.merged.length) + (panels.hex ? ' hexes · ' + lenText(panels.size) : ' panels · within ' + lenText(panels.tol)) : hasSurface() ? 'from the surface' : 'build a surface first', act: () => { flash('Making panels…'); setTimeout(S.panelShape === 'hex' ? makeHexPanels : makePanels, 30); } }),
     add({ id: 'panels-clear', x: P + goW + G, y: 0, w: W - goW - G, h: 96, style: 'danger', label: () => 'Clear', vis: () => !!panels, act: clearPanels })]); }
   row('fab', 72, [{ id: 'pc-panel', label: () => 'Colour: by panel', on: () => S.panelColor !== 1, act: () => { S.panelColor = 0; showPanels(); scheduleSave(); } },
-    { id: 'pc-flat', label: () => 'Colour: how flat', on: () => S.panelColor === 1, act: () => { S.panelColor = 1; showPanels(); scheduleSave(); flash('Green: nearly flat (cut from a flat sheet). Red: curved (needs bending or forming).', 6); } }], { vis: () => !!panels });
-  row('fab', 80, [{ id: 'panels-obj', label: () => 'Save panels OBJ', sub: () => 'one object per panel, for Rhino or Blender', act: exportPanels }], { vis: () => !!panels });
+    { id: 'pc-flat', label: () => 'Colour: how flat', on: () => S.panelColor === 1, act: () => { S.panelColor = 1; showPanels(); scheduleSave(); flash('Green: flat. Red: at the limit you set.', 5); } }], { vis: () => !!panels });
+  row('fab', 80, [{ id: 'panels-obj', label: () => 'Save flat panels OBJ', sub: () => 'one flat quad per panel, to cut', act: exportPanels }], { vis: () => !!panels });
+  note('fab', 'Want bigger quad panels overall? Fewer quads in step 3 (Target quads) gives a coarser layout to start from.', { vis: () => S.panelShape !== 'hex' });
   section('fab', 'COMING NEXT');
   note('fab', 'Wood: CNC ribs under bendable sheets. Concrete: pour zones and formwork lines.');
   endSection('fab');
@@ -2600,11 +2703,12 @@ const TIP_PAGES = {
     'Crease: touch edges to make them sharp (start on a crease to soften instead). Draw face: tap 3 or 4 corners for a new face. Fill hole: touch a hole\'s edge. Delete: sweep over faces.',
     'Stick up / down sizes the sphere for Soft and Smooth. X / Y undo and redo your shaping.']],
   fab: ['5 · FAB: PANELS TO BUILD IT', [
-    'Hex panels cover the built surface in panels of one size, whatever its quad count. Pick a size and press Make panels.',
-    'Creases are seams: a panel stops at a crease. Turn that off and panels run across them.',
-    'Colour: how flat shows green for panels you could cut from flat sheet, red for ones that need bending or forming.',
-    'Save panels OBJ gives each panel as its own object: in Rhino, Smash or UnrollSrf flattens them for cutting.',
-    'Next here: CNC ribs for wood, pour zones for concrete.']],
+    'Quad panels follow the surface\'s own quad lines. Each quad stays one panel if it bows off flat by less than Flat to within; otherwise it splits in four until every piece does.',
+    'Join flat quads lets four flat quads round a point become one big panel.',
+    'Colour: how flat shows each panel against your limit: green is flat, red right at the limit.',
+    'Save flat panels OBJ gives each panel as one flat quad (its corners laid on its own best plane), ready to cut; the name of each says how much it bows.',
+    'For bigger panels everywhere, build with fewer Target quads (step 3).',
+    'Hexes: one size all over, straight edges between the points where three panels meet, each laid on its own plane. Creases are seams unless you let them cross.']],
   files: ['6 · FILES: SAVE AND EXPORT', [
     'Save (top of the menu) keeps your sketch here in this browser with a picture; your current work is always kept too. Name a sketch from its row.',
     'Save OBJ: the quad surface and its crease lines, for Rhino (ToSubD, then ToNURBS) or Blender.',
@@ -2801,7 +2905,7 @@ function nextStep(){
   if (building) return buildMsg + '…';
   if (menuTab === 'ride') return runs.length ? runs.length + (runs.length === 1 ? ' run' : ' runs') + ' recorded. Next: step 2, sketch the terrain around them.' : 'Hold ' + (mainHand() === 'right' ? 'A' : 'X') + ' and ride the board to record your first run';
   if (menuTab === 'shape') return cageEditing ? CAGE_NAME[cageTool()] + ': ' + CAGE_NOTE[cageTool()] : 'Build a surface in step 3, then shape its control points here';
-  if (menuTab === 'fab') return 'Coming next: panels for wood and concrete';
+  if (menuTab === 'fab') return panels ? 'Save the panels as an OBJ to cut them' : 'Pick Quads or Hexes and press Make panels';
   if (menuTab === 'files') return 'Save keeps your work here; Save OBJ takes the surface to Rhino or Blender';
   if (menuTab === 'settings') return 'Settings stay the same on every step';
   if (menuTab === 'surface' && !hasSurface() && strokes.length) return 'Press Build to make the surface';
