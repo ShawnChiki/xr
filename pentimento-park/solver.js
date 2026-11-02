@@ -964,13 +964,32 @@ function projector(Mfit, L){
   const VG = new Grid(L); for (let v = 0; v < Mfit.x.length; v++) if (Mfit.vt[v].length) VG.add(v, Mfit.x[v], Mfit.y[v], Mfit.z[v]);
   return p => { for (const r of [L * 1.5, L * 4, L * 12]){ const c = closestOnMesh(Mfit, VG, p, r); if (c) return c.p; } return p; };
 }
+// ---------------- between two creases that run side by side a few quads apart: evenly spaced lines in the gap, so
+// the quads between them come out in tidy, even rows (instead of two sets of crease rows bumping into each other)
+function bridgeLines(M, curves, Lq, L){
+  const proj = projector(M, L), out = [], sharp = curves.filter(C => C.sharp && !C.row && C.len > Lq * 2);
+  const tan = (C, s, h) => { const a = pointAt(C, s - h), b = pointAt(C, s + h); return norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]); };
+  for (let ia = 0; ia < sharp.length; ia++) for (let ib = ia + 1; ib < sharp.length; ib++){
+    const A = sharp[ia], B = sharp[ib], step = Lq * 0.5, n = Math.max(2, Math.round(A.len / step)); let run = [];
+    const flush = () => {
+      if (run.length >= 6){ const ds = run.map(o => o.d).sort((x, y) => x - y), dm = ds[ds.length >> 1], k = Math.round(dm / Lq) - 1;
+        for (let j = 1; j <= k; j++){ const P = run.map(o => proj(lerp3(o.p, o.q, j / (k + 1)))); if (P.length >= 3){ const C = makeCurve(P, false, false, 1); C.row = true; C.level = 1; C.bridge = true; out.push(C); } } }
+      run = []; };
+    for (let i = 0; i <= n; i++){ const sA = A.len * i / n, p = pointAt(A, sA), c = closestOnPoly(B, p), d = Math.sqrt(c.d2);
+      const endB = !B.closed && (c.s < Lq * 0.3 || c.s > B.len - Lq * 0.3), endA = !A.closed && (sA < Lq * 0.3 || sA > A.len - Lq * 0.3);
+      const ok = !endA && !endB && d > Lq * 1.4 && d < Lq * 5 && Math.abs(dot(tan(A, sA, step * 0.5), tan(B, c.s, step * 0.5))) > 0.94;
+      if (ok) run.push({ p, q: c.p, d }); else flush(); }
+    flush();
+  }
+  return out;
+}
 // ---------------- clean rows of quads along each sharp crease: lines one (and two) quad widths out on each side,
 // cut into the mesh like the creases are, so the quads run parallel to the crease before the layout loosens up
 function creaseRows(M, curves, d, nRows, L){
   const out = [], proj = projector(M, L), VG = new Grid(d);
   for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
   // what a row must keep clear of: other creases and edges, its own crease further along, and the border
-  const sharpS = []; curves.forEach((C, ci) => { if (C.sharp || C.edge) for (const p of resample(C.pts, d * 0.25, C.closed)) sharpS.push([ci, p]); });
+  const sharpS = []; curves.forEach((C, ci) => { if (C.sharp || C.edge || C.bridge) for (const p of resample(C.pts, d * 0.25, C.closed)) sharpS.push([ci, p]); });
   const SG = new Grid(d); sharpS.forEach(([ci, p], i) => SG.add(i, p[0], p[1], p[2]));
   const bord = []; { const E = M.edges(); for (let i = 0; i < E.length; i += 2) if (M.edgeTris(E[i], E[i + 1]).length === 1) bord.push(lerp3(M.P(E[i]), M.P(E[i + 1]), 0.5)); }
   const BG = new Grid(d); bord.forEach((p, i) => BG.add(i, p[0], p[1], p[2]));
@@ -2099,6 +2118,14 @@ function solve(strokes, prm, progress = () => {}){
       }
       M.x = nx; M.y = ny; M.z = nz;
     }
+  }
+  // even lines between creases that run side by side
+  if (prm.bridges === true && !(prm.target < 0 && guides.length)){
+    const Lq = prm.target > 0 ? Math.max(L, 2 * Math.sqrt(triArea(M) / prm.target)) : L, M0 = M.clone(), a0 = triArea(M), base1 = curves.length;
+    try { const br = bridgeLines(M, curves, Lq, L);
+      if (br.length){ br.forEach((C, i) => { curves.push(C); embedCurve(M, C, base1 + i, L); }); remesh(M, L, 0.8); unfold(M, 2); M.compact();
+        const ar = triArea(M) / a0; if (!(ar > 0.95 && ar < 1.05)) throw new Error('area'); }
+    } catch (e){ M = M0.clone(); curves.length = base1; }
   }
   // clean rows of quads along the sharp creases
   if ((prm.rows | 0) > 0 && !(prm.target < 0 && guides.length)){
