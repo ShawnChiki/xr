@@ -86,7 +86,7 @@
     <p id="status">Checking for a headset…</p>
     <details id="mp">
       <summary>Play a friend</summary>
-      <p class="fine">One of you hosts and reads out a 4-digit code, the other joins with it. Same WiFi or anywhere in the world.</p>
+      <p class="fine">One of you hosts and reads out a 4-digit code, the other joins with it. Same WiFi or anywhere in the world. You can talk: allow the microphone when asked.</p>
       <div class="row" style="margin-top:10px;align-items:center">
         <button id="mpHost">Host a game</button>
         <input id="mpCode" inputmode="numeric" maxlength="4" placeholder="Code" aria-label="Friend's code">
@@ -98,7 +98,7 @@
         <p class="fine" id="mpWho"></p>
         <div class="row" style="margin-top:8px"><button id="mpReady">I'm ready</button></div>
       </div>
-      <button id="mpLeave" class="ghost" hidden>Leave match</button>
+      <div class="row"><button id="mpMic" class="ghost" hidden>Mic is on</button><button id="mpLeave" class="ghost" hidden>Leave match</button></div>
     </details>
     <details id="settings">
       <summary>Custom game</summary>
@@ -1217,7 +1217,7 @@ function menuDraw(){
     const again = () => { newGame(); closeMenu(); };
     const list = NET.on
       ? [...(ended ? [] : [['Resume', '▶', () => closeMenu(), true]]), [ended ? 'Play again' : 'Match lobby', '↻', () => netToLobby(true), ended],
-         ['Leave match', '✕', () => { netLeave(); menuDraw(); }], help]
+         [voice.muted ? 'Mic off' : 'Mic on', voice.muted ? '○' : '◉', () => voiceMute(!voice.muted)], ['Leave match', '✕', () => { netLeave(); menuDraw(); }], help]
       : inGame
       ? [['Resume', '▶', () => closeMenu(), true], ['Restart', '↻', again], ['Custom game', '⚙', () => menuGo('custom')], friend, help]
       : [[ended ? 'Play again' : 'Play', '▶', ended ? again : () => closeMenu(), true], ['Custom game', '⚙', () => menuGo('custom')], friend, help];
@@ -1283,7 +1283,8 @@ function menuDraw(){
       });
       btn(NET.ready.me ? 'Not ready' : "I'm ready", NET.ready.me ? '' : '✓', RX, 440, RW, 140, () => netSetReady(!NET.ready.me), !NET.ready.me, false, 46);
       x.fillStyle = P.botSub; x.font = '400 30px "Instrument Sans", system-ui, sans-serif';
-      wrap(x, NET.ready.me && NET.ready.them ? 'Starting…' : NET.host ? 'Changing the match asks you both to ready up again.' : 'If your friend changes the match, you both ready up again.', RX, 640, RW, 40);
+      wrap(x, NET.ready.me && NET.ready.them ? 'Starting…' : NET.host ? 'Changing the match asks you both to ready up again.' : 'If your friend changes the match, you both ready up again.', RX, 616, RW, 38);
+      btn(!voice.ok ? 'No microphone' : voice.muted ? 'Mic is off' : 'Mic is on', voice.muted || !voice.ok ? '○' : '◉', RX, 700, RW, 72, () => { if (voice.ok) voiceMute(!voice.muted); }, false, false, 30);
       x.font = '400 30px "Instrument Sans", system-ui, sans-serif';
       btn('Leave match', '✕', RX, 790, RW, 76, () => { netLeave(); menuGo('net'); }, false, false, 30);
     } else if (NET.ui === 'hosting'){
@@ -2283,6 +2284,7 @@ $('mpJoin').onclick = () => { unlockAudio(); const c = $('mpCode').value.replace
 $('mpCode').onkeydown = e => { if (e.key === 'Enter') $('mpJoin').click(); };
 $('mpLeave').onclick = () => netLeave();
 $('mpReady').onclick = () => netSetReady(!NET.ready.me);
+$('mpMic').onclick = () => voiceMute(!voice.muted);
 $('custom').onclick = () => { if (S.mode === 'ready') return startDesktop(); newGame(); card.hidden = true; renderer.domElement.requestPointerLock?.(); };
 $('defaults').onclick = () => { for (const k in DEF) if (CFG[k] !== DEF[k].def) setCfg(k, DEF[k].def); };
 againBtn.onclick = () => { newGame(); card.hidden = true; renderer.domElement.requestPointerLock?.(); };
@@ -3365,7 +3367,7 @@ renderer.setAnimationLoop(() => {
   try { frame(); }
   catch (e){ if (frameErrs++ < 20) console.error('frame error', e); }
   // these run on their own, so a fault anywhere in the game step can't freeze the match or the rock
-  try { netFrame(netDt); updateRemote(netDt); } catch (e){ if (frameErrs++ < 20) console.error('net error', e); }
+  try { netFrame(netDt); updateRemote(netDt); voiceFrame(); } catch (e){ if (frameErrs++ < 20) console.error('net error', e); }
   try { flushDirty(inXR() ? 5 : 8); } catch (e){ if (frameErrs++ < 20) console.error('mesh error', e); }
   try { renderer.render(scene, camera); } catch (e){ if (frameErrs++ < 20) console.error('render error', e); }
 });
@@ -3459,6 +3461,7 @@ const makePeer = id => NET_TEST ? new BCPeer(id) : (id ? new window.Peer(id, { d
 
 function netStatus(s){ NET.status = s; const el = $('mpStatus'); if (el) el.textContent = s; if (S.menu && menu.page === 'net') menuDraw(); }
 function netReset(){
+  voiceStop();
   try { NET.conn?.close(); } catch (e) {} try { NET.peer?.destroy(); } catch (e) {}
   Object.assign(NET, { on: false, host: false, guest: false, conn: null, peer: null, ui: 'idle', start: null, cfg: null, out: [], lastIn: 0 });
   remote.g.visible = false; syncDeskNet();
@@ -3471,6 +3474,7 @@ async function netHost(){
     NET.peer = peer;
     peer.on('open', () => { NET.code = code; netStatus('Waiting for your friend…'); syncDeskNet(); });
     peer.on('connection', c => { if (NET.conn){ c.close?.(); return; } netAttach(c, true); });
+    peer.on('call', c => { if (!NET.on && !NET.conn){ c.close?.(); return; } (voice.ready || Promise.resolve()).then(() => { c.answer(voice.local || silentStream()); voiceAttach(c); }); });
     peer.on('error', e => {
       if (e.type === 'unavailable-id' && left > 0){ peer.destroy(); tryCode(left - 1); return; }
       if (!NET.on) netStatus(e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error'
@@ -3500,6 +3504,7 @@ function netAttach(c, host){
     netStatus('Connected'); syncDeskNet();
     tone(523, 0.15, 'triangle', 0.12); tone(784, 0.25, 'triangle', 0.12, 0, 0.12);
     netToLobby(false);
+    voice.ready = voiceStart();
   });
   c.on('data', netData);
   c.on('close', () => netLost('Your friend left the match'));
@@ -3520,6 +3525,70 @@ function netBegin(){
   NET.go = true;
   if (S.mode === 'ready' && !inXR()) startDesktop();
   else { newGame(); if (S.menu) closeMenu(); if (!inXR()){ card.hidden = true; renderer.domElement.requestPointerLock?.(); } }
+}
+// ---- voice chat. Your friend's voice comes from where they are, muffled by however much rock is between you.
+const voice = { local: null, call: null, el: null, nodes: null, muted: false, ready: null, ok: false };
+function silentStream(){ unlockAudio(); return AC ? AC.createMediaStreamDestination().stream : new MediaStream(); }
+async function voiceStart(){
+  if (NET_TEST || !navigator.mediaDevices?.getUserMedia) return;
+  try {
+    voice.local = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    voice.ok = true; voiceMute(voice.muted);
+  } catch (e){
+    voice.local = null; voice.ok = false;
+    wordBurst('No microphone', 'you can still hear your friend', bdLight() ? 0x16181c : 0xe6e9ec, null);
+  }
+  if (NET.guest && NET.peer && NET.on) voiceAttach(NET.peer.call(NET_PREFIX + NET.code, voice.local || silentStream()));
+  lobbyRedraw();
+}
+function voiceAttach(c){
+  if (!c) return;
+  voice.call = c;
+  c.on('stream', st => voicePlay(st));
+  c.on('close', () => voiceUnplug());
+  c.on('error', () => voiceUnplug());
+}
+function voicePlay(st){
+  unlockAudio(); if (!AC) return;
+  voiceUnplug();
+  // Chrome only lets a remote stream into Web Audio while it's also attached to a (silent) audio element
+  if (!voice.el){ voice.el = new Audio(); voice.el.muted = true; voice.el.autoplay = true; }
+  voice.el.srcObject = st; voice.el.play?.().catch(() => {});
+  const src = AC.createMediaStreamSource(st), filt = AC.createBiquadFilter(), gain = AC.createGain();
+  const pan = new PannerNode(AC, { panningModel: 'HRTF', distanceModel: 'inverse', refDistance: 2.5, maxDistance: 80, rolloffFactor: 0.45 });
+  filt.type = 'lowpass'; filt.frequency.value = 12000; gain.gain.value = 1.5;
+  src.connect(filt).connect(pan).connect(gain).connect(AC.destination);
+  voice.nodes = { src, filt, pan, gain };
+}
+function voiceUnplug(){ if (voice.nodes){ try { voice.nodes.src.disconnect(); voice.nodes.gain.disconnect(); } catch (e) {} voice.nodes = null; } }
+function voiceStop(){
+  voiceUnplug();
+  try { voice.call?.close(); } catch (e) {}
+  voice.local?.getTracks().forEach(t => t.stop());
+  Object.assign(voice, { local: null, call: null, ready: null, ok: false });
+  if (voice.el) voice.el.srcObject = null;
+}
+function voiceMute(m){ voice.muted = m; voice.local?.getAudioTracks().forEach(t => { t.enabled = !m; }); lobbyRedraw(); if (S.menu) menuDraw(); }
+const _vl = new V3(), _vf = new V3(), _vu = new V3();
+function voiceFrame(){
+  const N = voice.nodes; if (!N || !AC) return;
+  const t = AC.currentTime, L = AC.listener;
+  _q.copy(rig.quaternion).multiply(camera.quaternion); _vf.set(0, 0, -1).applyQuaternion(_q); _vu.set(0, 1, 0).applyQuaternion(_q);
+  if (L.positionX){
+    L.positionX.setTargetAtTime(HEAD.x, t, 0.02); L.positionY.setTargetAtTime(HEAD.y, t, 0.02); L.positionZ.setTargetAtTime(HEAD.z, t, 0.02);
+    L.forwardX.setTargetAtTime(_vf.x, t, 0.02); L.forwardY.setTargetAtTime(_vf.y, t, 0.02); L.forwardZ.setTargetAtTime(_vf.z, t, 0.02);
+    L.upX.setTargetAtTime(_vu.x, t, 0.02); L.upY.setTargetAtTime(_vu.y, t, 0.02); L.upZ.setTargetAtTime(_vu.z, t, 0.02);
+  } else { L.setPosition(HEAD.x, HEAD.y, HEAD.z); L.setOrientation(_vf.x, _vf.y, _vf.z, _vu.x, _vu.y, _vu.z); }
+  let cut = 12000;
+  if (remote.live && S.mode !== 'ready' && NET.phase === 'game'){
+    _vl.copy(remote.headW);
+    // how much of the straight line between you is rock (yours or theirs: anything not open to both of you)
+    let rock = 0; const n = 14;
+    for (let i = 1; i < n; i++){ _a.lerpVectors(HEAD, remote.headW, i / n); const v = sampleV(_a); if (v > 0.5) rock++; }
+    cut = 9000 * Math.pow(1 - 0.8 * rock / (n - 1), 2) + 500;
+  } else _vl.copy(HEAD).addScaledVector(_vf, 1.2);        // in the lobby and menus they're simply in front of you
+  N.pan.positionX.setTargetAtTime(_vl.x, t, 0.05); N.pan.positionY.setTargetAtTime(_vl.y, t, 0.05); N.pan.positionZ.setTargetAtTime(_vl.z, t, 0.05);
+  N.filt.frequency.setTargetAtTime(cut, t, 0.15);
 }
 // ---- the lobby: the host sets the match, both press Ready, and any change to the match means both confirm again
 const LOBBY_KEYS = ['team', 'width', 'height', 'hide', 'charge', 'regen', 'beam', 'blast'];
@@ -3747,6 +3816,7 @@ setInterval(() => {
 function syncDeskNet(){
   const host = $('mpHost'); if (!host) return;
   $('mpLeave').hidden = !NET.on && NET.ui === 'idle';
+  $('mpMic').hidden = !NET.on; $('mpMic').textContent = !voice.ok ? 'No microphone' : voice.muted ? 'Mic is off' : 'Mic is on';
   host.disabled = NET.on;
   $('mpJoin').disabled = NET.on;
   if (NET.ui === 'hosting' && NET.code && !NET.on) $('mpStatus').textContent = 'Your code is ' + NET.code + '. Waiting for your friend…';
@@ -3761,7 +3831,7 @@ function syncDeskNet(){
 }
 
 // for quick testing from the console
-window.NS = { friendBot, errs: () => frameErrs, nearFriend: (x, y, z) => nearFriend(x, y, z), netSetReady, poseGlove, netFrame, updateRemote, NET, netHost, netJoin, netLeave, remote, chunkSig, menuGo, menuDraw, layoutMenu, floor, trail, applyBackdropK: k => applyBackdrop(k), beamR, updateOrbs, clearance: p => clearance(p), styleU, rebuildOrbs, makeGun, makeGlove, updateGlove, deskGun, resizeWorld, dims: () => ({ NW, NY, SIZE, HY, SURF }), MUS, mStep, musicTick, skyVel, traps, setTrap, springMine, aimTrap, releaseTrap, trapAim, updateRivals, buildRival, introFrame, endFrame, updateShards, pickTeam, TEAMS: () => TEAM, throwBomb, thrown, bigExplode, burstShards, startIntro, countFrame, running, CFG, setCfg, openMenu, closeMenu, menuFrame, menu, takeOrb, blackPower, bodyNear, wordBurst, applyBackdrop, nextBackdrop, orbs, showHelp, explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
+window.NS = { voice, voicePlay, voiceFrame, voiceMute, friendBot, errs: () => frameErrs, nearFriend: (x, y, z) => nearFriend(x, y, z), netSetReady, poseGlove, netFrame, updateRemote, NET, netHost, netJoin, netLeave, remote, chunkSig, menuGo, menuDraw, layoutMenu, floor, trail, applyBackdropK: k => applyBackdrop(k), beamR, updateOrbs, clearance: p => clearance(p), styleU, rebuildOrbs, makeGun, makeGlove, updateGlove, deskGun, resizeWorld, dims: () => ({ NW, NY, SIZE, HY, SURF }), MUS, mStep, musicTick, skyVel, traps, setTrap, springMine, aimTrap, releaseTrap, trapAim, updateRivals, buildRival, introFrame, endFrame, updateShards, pickTeam, TEAMS: () => TEAM, throwBomb, thrown, bigExplode, burstShards, startIntro, countFrame, running, CFG, setCfg, openMenu, closeMenu, menuFrame, menu, takeOrb, blackPower, bodyNear, wordBurst, applyBackdrop, nextBackdrop, orbs, showHelp, explode, dragSky, updateBots, updateRubies, xrFrame, hands, fire, rayHit, physics, S, F, sample, newGame, startDesktop, bots, rig, player, stamp, meshChunk, skyRuby, myRuby, desk, HEAD, win, lose, N, CELL, SIZE, SURF };
 </script>
 <script src="../updated.js"></script>
 </body>
