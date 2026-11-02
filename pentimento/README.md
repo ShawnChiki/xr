@@ -6,6 +6,7 @@ Open in the Quest browser: https://shawnchiki.github.io/xr/pentimento/
 
 ## Versions
 
+- **v2.21** — Strict creases no longer crowd the quads: along a straightish strict line the edges are as long as anywhere else, and they only get shorter where it bends (so the density is even, crease or no crease).
 - **v2.20** — Run moves undo: Undo (X, or the menu) puts a moved run back, in step with your line edits. A run only starts moving once your hand has clearly carried it (about 3 cm), so a grip meant for the model doesn't nudge it. Layers → Runs → Lock stops gripping them altogether; grip near a path then moves the model.
 - **v2.19** — Ties under runs: grip a path and press A to lay short loose lines across it, under the wheels, every so far along where the board was rolling (flips skipped), so the surface follows your ride. B takes them away. Tie spacing and width are in Layers → Runs, with Lay ties under all; laying them again replaces that run's ties.
 - **v2.18** — Runs move one at a time: grip a path and only that run comes with your hand; swing your hand round while holding to turn it (a little give, so moving doesn't turn it by accident). Each run keeps its own place in saves, and To lines uses where each one now sits.

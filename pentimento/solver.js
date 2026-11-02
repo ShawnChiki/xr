@@ -277,7 +277,7 @@ class Mesh {
     return true;
   }
   clone(){ const M = new Mesh(); M.x = this.x.slice(); M.y = this.y.slice(); M.z = this.z.slice(); M.vt = this.vt.map(a => a.slice()); M.dead = this.dead.slice();
-    M.fc = this.fc.slice(); M.corner = this.corner.slice(); M.T = this.T.slice(); M.tdead = this.tdead.slice(); M.fe = new Map(this.fe); M.strictIds = this.strictIds; return M; }
+    M.fc = this.fc.slice(); M.corner = this.corner.slice(); M.T = this.T.slice(); M.tdead = this.tdead.slice(); M.fe = new Map(this.fe); M.strictIds = this.strictIds; M.strictLen = this.strictLen; return M; }
   compact(){
     const map = new Int32Array(this.x.length).fill(-1), M = new Mesh();
     for (let t = 0; t < this.tdead.length; t++){ if (this.tdead[t]) continue;
@@ -356,22 +356,39 @@ function dropSmallParts(M, minTris){
 }
 
 // ---------------------------------------------------------------- remeshing
+// how long an edge along a strict line may be: as long as anywhere else where the line runs straight, shorter only
+// where it bends (so the edges still follow it to within a small fraction of the quad size)
+function strictLenFn(curves){
+  const K = new Map();
+  curves.forEach((C, id) => { if (!C.strict) return; const P = C.pts, n = P.length; if (n < 3) return; const k = new Float64Array(n);
+    for (let i = 0; i < n; i++){ const a = P[(i - 1 + n) % n], b = P[i], c = P[(i + 1) % n]; if (!C.closed && (i === 0 || i === n - 1)) continue;
+      const u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], w = [c[0] - b[0], c[1] - b[1], c[2] - b[2]], lu = Math.hypot(...u) || 1e-9, lw = Math.hypot(...w) || 1e-9;
+      const cs = Math.max(-1, Math.min(1, (u[0] * w[0] + u[1] * w[1] + u[2] * w[2]) / (lu * lw))); k[i] = Math.acos(cs) / Math.max(1e-6, (lu + lw) / 2); }
+    K.set(id, { C, k }); });
+  return (id, mx, my, mz, L) => { const o = K.get(id); if (!o) return L * 0.7; const P = o.C.pts, k = o.k, R2 = sq(L * 0.6); let kmax = 0, bj = 0, bd = Infinity;
+    for (let i = 0; i < P.length; i++){ const d = (P[i][0] - mx) ** 2 + (P[i][1] - my) ** 2 + (P[i][2] - mz) ** 2; if (d < bd){ bd = d; bj = i; } if (d < R2 && k[i] > kmax) kmax = k[i]; }
+    if (!kmax) kmax = k[bj];
+    const tol = 0.035 * L; return Math.max(0.45 * L, Math.min(L * 4 / 3, Math.sqrt(8 * tol / Math.max(1e-9, kmax)))); };
+}
 function remesh(M, L, flipDot){
   const hi2 = sq(L * 4 / 3), lo2 = sq(L * 0.8);
   // split long edges, longest first
   let E = M.edges(), list = [];
-  const strictE = (a, b) => { const id = M.fe.get(M.ek(a, b)); return id !== undefined && M.strictIds && M.strictIds.has(id); };
-  const hiS = sq(L * 0.7), loS = sq(L * 0.3);
-  for (let i = 0; i < E.length; i += 2){ const l = M.len2(E[i], E[i + 1]); if (l > (strictE(E[i], E[i + 1]) ? hiS : hi2)) list.push([l, E[i], E[i + 1]]); }
+  const sid = (a, b) => { const id = M.fe.get(M.ek(a, b)); return id !== undefined && M.strictIds && M.strictIds.has(id) ? id : -1; };
+  const strictE = (a, b) => sid(a, b) >= 0;
+  // strict lines: edges as long as anywhere else where the line is straightish, shorter where it bends
+  const sMax = (a, b) => { const id = sid(a, b); if (id < 0) return 0; if (!M.strictLen) return L * 0.7; return M.strictLen(id, (M.x[a] + M.x[b]) / 2, (M.y[a] + M.y[b]) / 2, (M.z[a] + M.z[b]) / 2, L); };
+  const hiOf = (a, b) => { const m = sMax(a, b); return m ? sq(m) : hi2; };
+  for (let i = 0; i < E.length; i += 2){ const l = M.len2(E[i], E[i + 1]); if (l > hiOf(E[i], E[i + 1])) list.push([l, E[i], E[i + 1]]); }
   list.sort((p, q) => q[0] - p[0]);
-  for (const [, a, b] of list) if (M.len2(a, b) > (strictE(a, b) ? hiS : hi2)) M.split(a, b);
+  for (const [, a, b] of list) if (M.len2(a, b) > hiOf(a, b)) M.split(a, b);
   // collapse short edges
   E = M.edges(); list = [];
   for (let i = 0; i < E.length; i += 2){ const l = M.len2(E[i], E[i + 1]); if (l < lo2) list.push([l, E[i], E[i + 1]]); }
   list.sort((p, q) => p[0] - q[0]);
   for (const [, a0, b0] of list){
     if (M.dead[a0] || M.dead[b0] || !M.edgeTris(a0, b0).length || M.len2(a0, b0) >= lo2) continue;
-    if (strictE(a0, b0) && M.len2(a0, b0) >= loS) continue;
+    if (strictE(a0, b0)){ const m = sMax(a0, b0); if (M.len2(a0, b0) >= sq(Math.min(L * 0.8, m * 0.55))) continue; }
     let a = a0, b = b0, np;
     const fa = M.fc[a] >= 0, fb = M.fc[b] >= 0;
     if (M.corner[a] && M.corner[b]) continue;
@@ -2009,7 +2026,7 @@ function solve(strokes, prm, progress = () => {}){
   const cache = { key: fitKey, sig: looseSig, x: Float64Array.from(M.x), y: Float64Array.from(M.y), z: Float64Array.from(M.z), T: Int32Array.from(M.T) };
   const guides = layGuides(M, guides0, L, h);
   let flow = guides.length ? flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h) : null;
-  M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0));
+  M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0)); M.strictLen = strictLenFn(curves);
   curves.forEach((C, i) => embedCurve(M, C, i, L));
   if (cutAtEdges(M, curves, samples, h)) progress(0.56, 'Trimming at the edges');
   untangle(M, 4);
