@@ -1953,6 +1953,12 @@ function catmullClark({ V, F, sharp, feat, corner, soft, chain, tips, fade, tipF
 }
 // ---------------- soft crease ends: a sharp crease that stops in the open (not on another crease or the border)
 // fades out over its last stretch instead of ending in a hard notch
+// averaged creases can be softer than fully sharp: their edges stay sharp for only so many subdivision steps
+function softenCreases(cage, info, curves, sc){
+  if (!(sc > 0) || sc >= 99 || !info || !info.fc) return; cage.soft = new Map(cage.soft || []);
+  for (const k of cage.sharp){ const a = Math.floor(k / 2097152), b = k % 2097152, ia = info.fc[a], ib = info.fc[b], C = ia >= 0 ? curves[ia] : null;
+    if (C && ia === ib && !C.strict && C.tag === 3) cage.soft.set(k, Math.min(cage.soft.has(k) ? cage.soft.get(k) : Infinity, sc)); }
+}
 function prepTips(cage, fade, ends, L){
   if (!(fade > 0) && !(ends && ends.some(e => e.f > 0))) return;
   const { V, F, sharp } = cage, nv = V.length / 3, cnt = new Map();
@@ -2167,7 +2173,7 @@ function solve(strokes, prm, progress = () => {}){
     progress(0.95, 'Hugging the surface');
     hugCage(cage, info, M, curves, L, 8, 0.3);
     untangleCage(cage, info, M, curves, L, 40);
-    const lv = Math.max(1, prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
+    softenCreases(cage, info, curves, prm.softCrease); const lv = Math.max(1, prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
     cage.cageE = allEdges(cage.F); let smooth = catmullClark(cage, curves); for (let i = 1; i < lv; i++){ applyTips(smooth, lv - i); smooth = catmullClark(smooth, curves); }
     smooth = hardView(smooth);
     progress(1, 'Done');
@@ -2206,7 +2212,7 @@ function solve(strokes, prm, progress = () => {}){
   // field-aligned quads first; the older pairing of triangles if that can't cover the surface cleanly
   let cage = null, iq = null;
   if (fieldQuads){ progress(0.93, 'Laying out the quads'); try { iq = instantQuads(M, curves, guides, prm.target > 0 ? Math.max(L * 0.95, Math.sqrt(triArea(M) / (prm.target / 4))) : L * 0.95, L, { oIters: prm.oIters, pIters: prm.pIters }); } catch (e){ iq = null; } }
-  if (iq){ cage = iq.cage; if (prm.iqTidy !== false) tidyCage(cage, iq.info, iq.s); if (prm.heal !== false) healTris(cage, prm.healLen ?? 8); if (prm.iqSquare ?? 16) squareQuads(cage, M, null, prm.iqSquare ?? 16, L, Mfit, v => iq.info.fc[v] >= 0 || !!iq.info.corner[v]); if (prm.hard > 0) autoCreases(cage, prm.hard); progress(0.97, 'Hugging the surface'); hugCage(cage, iq.info, Mfit, curves, L, 8); untangleCage(cage, iq.info, Mfit, curves, L, prm.iqUntangle ?? 30, prm.iqSpread ?? 1); unfoldCage(cage, iq.info, Mfit, curves, L, prm.iqUnfold ?? 20); if (prm.onCage) prm.onCage(cage, iq.info); }
+  if (iq){ cage = iq.cage; if (prm.iqTidy !== false) tidyCage(cage, iq.info, iq.s); if (prm.heal !== false) healTris(cage, prm.healLen ?? 8); if (prm.iqSquare ?? 16) squareQuads(cage, M, null, prm.iqSquare ?? 16, L, Mfit, v => iq.info.fc[v] >= 0 || !!iq.info.corner[v]); if (prm.hard > 0) autoCreases(cage, prm.hard); progress(0.97, 'Hugging the surface'); hugCage(cage, iq.info, Mfit, curves, L, 8); untangleCage(cage, iq.info, Mfit, curves, L, prm.iqUntangle ?? 30, prm.iqSpread ?? 1); unfoldCage(cage, iq.info, Mfit, curves, L, prm.iqUnfold ?? 20); softenCreases(cage, iq.info, curves, prm.softCrease); if (prm.onCage) prm.onCage(cage, iq.info); }
   else {
     if (fieldQuads) simplify();
     cage = quadify(M, curves, flow);
@@ -2223,6 +2229,7 @@ function solve(strokes, prm, progress = () => {}){
     if (prm.heal !== false) healTris(cage, prm.healLen ?? 8);
     hugCage(cage, info, Mfit, curves, L, 6);
     if (prm.tidy !== false) unfoldCage(cage, info, Mfit, curves, L, 12);
+    softenCreases(cage, info, curves, prm.softCrease);
     if (prm.onCage) prm.onCage(cage, info);
   }
   const lv = 1 + (prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
