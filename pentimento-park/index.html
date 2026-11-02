@@ -106,7 +106,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.1';
+const VERSION = '2.2';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -1535,7 +1535,7 @@ function cageWeld(from, to){
 function cageCompact(F2, sh){
   const used = new Int32Array(cageEd.V.length / 3).fill(-1), V2 = []; F2.forEach(f => f.forEach(v => { if (used[v] < 0){ used[v] = V2.length / 3; V2.push(cageEd.V[3 * v], cageEd.V[3 * v + 1], cageEd.V[3 * v + 2]); } }));
   const sh2 = new Set(); for (const k of sh){ const a = used[Math.floor(k / 2097152)], b = used[k % 2097152]; if (a >= 0 && b >= 0) sh2.add(CEK(a, b)); }
-  cageEd.V = V2; cageEd.F = F2.map(f => f.map(v => used[v])); cageEd.sharp = sh2; cagePicks = []; cageHov = null;
+  cageEd.V = V2; cageEd.F = F2.map(f => f.map(v => used[v])); cageEd.sharp = sh2; cagePicks = []; cageHov = null; try { clearRedrawSel(true); } catch (e){}
 }
 // ---------- cage tools (while editing the cage): Move points (drop on another to merge), Soft move (a sphere of points
 // with falloff), Smooth (sweep to relax bumps; creases and borders slide along themselves), Crease (touch edges to make
@@ -1551,14 +1551,14 @@ const CAGE_NOTE = {
   cpatch: 'Redraw polygons: tap four corners in order (existing points, or anywhere on the surface for a new point). Tap the first again after three for a triangle. Delete faces first to redraw an area.',
   cfill: 'Touch an edge of a hole to close it with a face.',
   cdel: 'Touch faces to take them out (sweep to take several).',
-  credraw: 'Draw a curve along a row of edges, or where you want the row to run: the row from your curve\'s start to its end is refit to follow it, smoothed and on the surface. Draw it closed to refit a loop.',
+  credraw: 'Two steps. First sweep along the edges you want to move: they turn blue (sweep again to add more; tap B to start over). Then draw where they should go: they are refit to your curve, smoothed and on the surface.',
   cloop: 'Tap an edge: a new edge loop runs all the way across the quads beside it, through the spot you tapped. Stops at triangles, 5+ sided faces and borders.',
   cstraight: 'Tap the edge where a row starts, then the edge where it ends: every edge between them gets straightened and evenly spaced, staying on the surface. Tap the first edge again to pick a new start.',
   ccut: 'Add points and seams: tap an edge to put a new point on it, tap points or edges one after another to cut a new edge across each face between them. Tap the last one again to stop.' };
 let cagePicks = [], cageTopoF = null, cageTopoE = null;
 const SMOOTH_K = [0.35, 0.6, 1, 1.7, 2.8], SMOOTH_NAME = ['Gentle', 'Light', 'Medium', 'Strong', 'Very strong'];
 const cageTool = () => CAGE_TOOLS.includes(S.cageTool) && S.cageTool !== 'cmove' ? S.cageTool : 'cgrab';
-function setCageTool(t){ S.cageTool = t; cagePicks = []; cutPrev = -1; straightFrom = null; cagePickUpdate(); menuDirty = true; scheduleSave(); flash(CAGE_NAME[t] + ': ' + CAGE_NOTE[t], 5); }
+function setCageTool(t){ if (t !== 'credraw') try { clearRedrawSel(true); } catch (e){} S.cageTool = t; cagePicks = []; cutPrev = -1; straightFrom = null; cagePickUpdate(); menuDirty = true; scheduleSave(); flash(CAGE_NAME[t] + ': ' + CAGE_NOTE[t], 5); }
 // edges with how many faces use them (one: a border or a hole's edge), and each point's neighbours
 function cageTopo(){
   if (cageTopoF === cageEd.F && cageTopoE) return cageTopoE;
@@ -1752,47 +1752,54 @@ function straightenChain(chain){
 // ---------- Redraw edges: draw a curve; the row of edges from its start to its end (the cheapest path that keeps
 // close to it) is refit to follow it: smoothed, laid on the surface, the row's points spread evenly along it, and
 // the points beside the row pulled along a little so it blends in
+let redrawSel = new Set();          // the edges picked to be redrawn
+const redrawSelLine = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x4FC3FF, depthTest: false, transparent: true })); redrawSelLine.renderOrder = 13; redrawSelLine.frustumCulled = false; cageEdG.add(redrawSelLine);
+function showRedrawSel(){ const a = []; if (cageEd) for (const k of redrawSel){ const [u, v] = edgeEnds(k); if (3 * Math.max(u, v) + 2 >= cageEd.V.length) continue; a.push(...cv(u).toArray(), ...cv(v).toArray()); }
+  redrawSelLine.geometry.dispose(); redrawSelLine.geometry = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(a, 3)); menuDirty = true; }
+function clearRedrawSel(quiet){ if (!redrawSel.size) return; redrawSel = new Set(); showRedrawSel(); if (!quiet) flash('Picked edges cleared: sweep along the edges you want to move'); }
+// the picked edges in order along their row (or round their loop); null if they branch or break apart
+function orderSel(){
+  const nb = new Map(); for (const k of redrawSel){ const [u, v] = edgeEnds(k); (nb.get(u) || nb.set(u, []).get(u)).push(v); (nb.get(v) || nb.set(v, []).get(v)).push(u); }
+  if ([...nb.values()].some(l => l.length > 2)) return null;
+  const ends = [...nb.keys()].filter(v => nb.get(v).length === 1), closed = !ends.length, s0 = closed ? nb.keys().next().value : ends[0];
+  const chain = [s0], seen = new Set([s0]); let cur = s0;
+  for (let g = 0; g < 5000; g++){ const nx = nb.get(cur).find(w => !seen.has(w)); if (nx === undefined) break; chain.push(nx); seen.add(nx); cur = nx; }
+  if (seen.size !== nb.size) return null; if (closed) chain.push(s0); return { chain, closed };
+}
 function redrawEdges(raw){
-  if (raw.length < 3 * 6) return flash('Draw a longer curve along the edges');
-  const sm0 = cageSmoothed(), proj = surfProjector(sm0), nv = cageEd.V.length / 3, L = i => new V3(sm0.V[3 * i], sm0.V[3 * i + 1], sm0.V[3 * i + 2]);
-  // the curve: smoothed, evenly spaced, on the surface
-  let pts = smoothed(Float32Array.from(raw), Math.max(3, S.smooth + 2)); const C0 = []; for (let i = 0; i < pts.length; i += 3) C0.push(new V3(pts[i], pts[i + 1], pts[i + 2]));
-  const { E, nb } = cageTopo(); let h = 0, ne = 0; for (const e of E.values()){ h += L(e.a).distanceTo(L(e.b)); if (++ne > 400) break; } h /= Math.max(1, ne);
-  const closed = C0.length > 8 && C0[0].distanceTo(C0[C0.length - 1]) < 1.2 * h && lenOf(C0).pop() > 4 * h;
+  if (raw.length < 3 * 6) return;
+  // step 1: nothing picked yet, so this sweep picks the edges it ran along
+  if (!redrawSel.size){
+    const pts = []; for (let i = 0; i < raw.length; i += 3) pts.push(new V3(raw[i], raw[i + 1], raw[i + 2]));
+    const r = 0.018 * N(); for (const p of pts){ const k = nearestCageEdge(p, r); if (k !== null) redrawSel.add(k); }
+    showRedrawSel();
+    if (!redrawSel.size) return flash('Sweep along the edges of the net you want to move');
+    const o = orderSel(); return flash(o ? (redrawSel.size + ' edges picked. Now draw where they should go. (B starts the pick over.)') : 'Those edges branch or have gaps: sweep along one row (B starts over)', 6);
+  }
+  const o = orderSel(); if (!o) return flash('The picked edges branch or have gaps: tap B and pick one row');
+  const sm0 = cageSmoothed(), proj = surfProjector(sm0), L = i => new V3(sm0.V[3 * i], sm0.V[3 * i + 1], sm0.V[3 * i + 2]);
+  // the curve: smoothed, evenly spaced, laid on the surface
+  const pts = smoothed(Float32Array.from(raw), Math.max(3, S.smooth + 2)); let C = []; for (let i = 0; i < pts.length; i += 3) C.push(new V3(pts[i], pts[i + 1], pts[i + 2]));
   const lenOf = c => { const a = [0]; for (let i = 1; i < c.length; i++) a.push(a[i - 1] + c[i].distanceTo(c[i - 1])); return a; };
   const at = (c, a, s) => { let j = 1; while (j < c.length - 1 && a[j] < s) j++; const t = (s - a[j - 1]) / Math.max(1e-9, a[j] - a[j - 1]); return c[j - 1].clone().lerp(c[j], Math.max(0, Math.min(1, t))); };
-  let C = C0, A = lenOf(C); { const m = Math.max(16, Math.ceil(A[A.length - 1] / (h / 4))), out = []; for (let i = 0; i <= m; i++) out.push(proj(at(C, A, A[A.length - 1] * i / m))); C = out; A = lenOf(C); }
-  if (closed){ C[C.length - 1] = C[0].clone(); A = lenOf(C); }
-  const segD2 = p => { let b = Infinity; for (let i = 1; i < C.length; i++) b = Math.min(b, segDist2(p, C[i - 1], C[i])); return b; };
-  const nearestV = (p, skip) => { let bi = -1, bd = (2.5 * h) ** 2; for (let i = 0; i < nv; i++){ if (skip && skip.has(i)) continue; const d = L(i).distanceToSquared(p); if (d < bd){ bd = d; bi = i; } } return bi; };
-  // cheapest path through the net between two points, where edges far from the curve cost a lot
-  const path = (s0, t0, avoid) => {
-    const dist = new Float64Array(nv).fill(Infinity), from = new Int32Array(nv).fill(-1), done = new Uint8Array(nv); dist[s0] = 0; const q = [s0];
-    while (q.length){ let bi = 0; for (let i = 1; i < q.length; i++) if (dist[q[i]] < dist[q[bi]]) bi = i; const v = q[bi]; q[bi] = q[q.length - 1]; q.pop();
-      if (done[v]) continue; done[v] = 1; if (v === t0) break;
-      for (const w of nb[v]){ if (avoid && avoid.has(w) && w !== t0) continue; const a = L(v), b = L(w), l = a.distanceTo(b) || 1e-9, m = a.clone().add(b).multiplyScalar(0.5), dd = Math.max(segD2(m), segD2(b)) / (h * h);
-        const c = l * (1 + 12 * dd); if (dist[v] + c < dist[w]){ dist[w] = dist[v] + c; from[w] = v; q.push(w); } } }
-    if (from[t0] < 0 && t0 !== s0) return null; const p = [t0]; while (p[p.length - 1] !== s0) p.push(from[p[p.length - 1]]); return p.reverse(); };
-  let chain;
-  const s0 = nearestV(C[0]); if (s0 < 0) return flash('Start your curve on a row of edges (near a point of the net)');
-  if (closed){ const mid = nearestV(C[Math.floor(C.length / 2)], new Set([s0])); if (mid < 0) return flash('Couldn\'t find a loop of edges along that curve');
-    const p1 = path(s0, mid); if (!p1) return flash('Couldn\'t find a loop of edges along that curve'); const p2 = path(mid, s0, new Set(p1.slice(1, -1))); if (!p2) return flash('Couldn\'t find a loop of edges along that curve');
-    chain = [...p1, ...p2.slice(1)]; }
-  else { const t0 = nearestV(C[C.length - 1], new Set([s0])); if (t0 < 0) return flash('End your curve on a row of edges (near a point of the net)'); chain = path(s0, t0); if (!chain) return flash('Couldn\'t find a row of edges along that curve'); }
-  if (chain.length < 3) return flash('Draw along at least two edges');
+  let A = lenOf(C); { const m = 64, out = []; for (let i = 0; i <= m; i++) out.push(proj(at(C, A, A[A.length - 1] * i / m))); C = out; A = lenOf(C); }
+  let chain = o.chain;
+  if (o.closed){ // start the loop at the point nearest where you started drawing, and go round the same way you drew
+    C.push(C[0].clone()); A = lenOf(C); const ring = chain.slice(0, -1); let bi = 0, bd = Infinity; ring.forEach((v, i) => { const d = L(v).distanceToSquared(C[0]); if (d < bd){ bd = d; bi = i; } });
+    let r2 = [...ring.slice(bi), ...ring.slice(0, bi)]; if (L(r2[1]).distanceTo(C[8]) > L(r2[r2.length - 1]).distanceTo(C[8])) r2 = [r2[0], ...r2.slice(1).reverse()]; chain = [...r2, r2[0]]; }
+  else if (L(chain[0]).distanceTo(C[0]) + L(chain[chain.length - 1]).distanceTo(C[C.length - 1]) > L(chain[0]).distanceTo(C[C.length - 1]) + L(chain[chain.length - 1]).distanceTo(C[0])) chain = chain.slice().reverse();
   cagePush();
-  // where each of the row's points should land: spread along the curve by the row's own spacing
-  const ln = lenOf(chain.map(L)), tot = ln[ln.length - 1] || 1, Ltot = A[A.length - 1], T = chain.map((v, i) => at(C, A, Ltot * ln[i] / tot));
-  const inChain = new Set(chain), loopEnd = closed ? chain.length - 1 : chain.length;
-  // the points beside the row come along partway, so the faces either side stretch instead of folding
-  const ring1 = new Map(); chain.slice(0, loopEnd).forEach((v, i) => { const dv = T[i].clone().sub(L(v)); for (const w of nb[v]){ if (inChain.has(w)) continue; const o = ring1.get(w) || { d: new V3(), n: 0 }; o.d.add(dv); o.n++; ring1.set(w, o); } });
-  for (const [w, o] of ring1){ const k = 0.45 / o.n; cageEd.V[3 * w] += o.d.x * k; cageEd.V[3 * w + 1] += o.d.y * k; cageEd.V[3 * w + 2] += o.d.z * k; }
-  // move the row's control points until their spots on the surface land on the curve
-  for (let r = 0; r < 8; r++){ const Lv = r ? cageSmoothed().V : sm0.V;
-    for (let i = 0; i < loopEnd; i++){ const v = chain[i]; cageEd.V[3 * v] += T[i].x - Lv[3 * v]; cageEd.V[3 * v + 1] += T[i].y - Lv[3 * v + 1]; cageEd.V[3 * v + 2] += T[i].z - Lv[3 * v + 2]; } }
-  if (S.cutCrease) for (let i = 1; i < chain.length; i++) cageEd.sharp.add(CEK(chain[i - 1], chain[i]));
-  showCage(); cageSurface(); scheduleSave();
-  flash('Refit a ' + (closed ? 'loop' : 'row') + ' of ' + (chain.length - 1) + ' edges to your curve' + (S.cutCrease ? ', as a crease' : '') + '. ' + (mainHand() === 'right' ? 'X' : 'A') + ' undoes it.', 5);
+  try {
+    const ln = lenOf(chain.map(L)), tot = ln[ln.length - 1] || 1, Ltot = A[A.length - 1], T = chain.map((v, i) => at(C, A, Ltot * ln[i] / tot)), n = o.closed ? chain.length - 1 : chain.length;
+    const inChain = new Set(chain), { nb } = cageTopo(), ring1 = new Map();
+    for (let i = 0; i < n; i++){ const v = chain[i], dv = T[i].clone().sub(L(v)); for (const w of nb[v]){ if (inChain.has(w)) continue; const q = ring1.get(w) || { d: new V3(), n: 0 }; q.d.add(dv); q.n++; ring1.set(w, q); } }
+    for (const [w, q] of ring1){ const k = 0.45 / q.n; cageEd.V[3 * w] += q.d.x * k; cageEd.V[3 * w + 1] += q.d.y * k; cageEd.V[3 * w + 2] += q.d.z * k; }
+    for (let r = 0; r < 6; r++){ const Lv = r ? cageSmoothed().V : sm0.V;
+      for (let i = 0; i < n; i++){ const v = chain[i]; cageEd.V[3 * v] += T[i].x - Lv[3 * v]; cageEd.V[3 * v + 1] += T[i].y - Lv[3 * v + 1]; cageEd.V[3 * v + 2] += T[i].z - Lv[3 * v + 2]; } }
+    if (S.cutCrease) for (let i = 1; i < chain.length; i++) cageEd.sharp.add(CEK(chain[i - 1], chain[i]));
+  } catch (e){ cageUndo(); return flash('Couldn\'t refit those edges (' + e.message + ')'); }
+  clearRedrawSel(true); showCage(); cageSurface(); scheduleSave();
+  flash('Refit ' + (chain.length - 1) + ' edges to your curve' + (S.cutCrease ? ', as a crease' : '') + '. ' + (mainHand() === 'right' ? 'X' : 'A') + ' undoes it.', 5);
 }
 // mouse picking of edges, on screen
 function deskHover(e){ const i = screenCagePt(e); if (i >= 0) return { t: 'v', id: i }; const k = screenCageEdge(e); if (k !== null) return { t: 'e', id: k };
@@ -2403,7 +2410,7 @@ const TIP_PAGES = {
     'Your surface is shaped by a loose net of control points around it (Rhino and Blender call it the SubD cage). This step shows those points. Leaving the step keeps your shaping; building again in step 3 asks first.',
     'Cut adds points and seams: tap an edge for a new point on it; tap points or edges one after another to cut new edges across the faces (set New edges are creases for sharp seams).',
     'Grab works like Gravity Sketch: point at a point, edge or face (it lights up blue). Trigger drags it, A deletes it (an edge between two faces joins them into one), B creases it, a stick press loop-cuts through an edge. Hold A for the other tools; tap A in another tool to come back to Grab.',
-    'Redraw edges: draw a curve along a row of edges (or where you want one). The row from its start to its end is refit to follow it, smoothed and on the surface; draw it closed for a loop. Set New edges are creases to make it a sharp seam too.',
+    'Redraw edges, in two steps: sweep along the edges you want to move (they turn blue; B starts over), then draw where they should go. They are refit to your curve, smoothed and on the surface.',
     'Draw face redraws polygons: delete faces in an area, then tap four corners for each new face: existing points or spots on the surface.',
     'Smoothing here also leaves smooth paint, so if you rebuild from your lines later, those spots come out smooth too.',
     'Move: grab a point and drag it; drop it on another and they merge. Soft: a sphere of points comes along with falloff. Smooth: sweep over bumps to relax them.',
@@ -2647,7 +2654,7 @@ function ontoSurface(p){
 }
 function toolMove(id, d, p){
   if (d.kind === 'cage'){ d.snapHit = cageDrag(d, p); return 0; }
-  if ((d.kind[0] === 'c' && CAGE_TOOLS.includes(d.kind)) || d.kind === 'cgroup') return cageToolMove(d, p, d.dt);
+  if ((d.kind[0] === 'c' && CAGE_TOOLS.includes(d.kind)) || d.kind === 'cgroup'){ try { return cageToolMove(d, p, d.dt); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'cage tool' }); return 0; } }
   if (d.kind === 'runs'){ runDrag(d, p, d.h ? handYaw(d.h) : undefined); return 0; }
   if (d.kind === 'ride'){ rideSample(d); return 0; }
   const r = BRUSH[S.brush] * N();
@@ -2670,7 +2677,7 @@ function toolMove(id, d, p){
 }
 function toolUp(id, d){
   if (d.kind === 'cage'){ cageDrop(d); return; }
-  if (CAGE_TOOLS.includes(d.kind) || d.kind === 'cgroup'){ cageToolUp(d); return; }
+  if (CAGE_TOOLS.includes(d.kind) || d.kind === 'cgroup'){ try { cageToolUp(d); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'cage tool' }); flash('That tool hit a problem (' + e.message + '). Undo if anything looks off.'); } return; }
   if (d.kind === 'ride'){ rideEnd(d); return; }
   if (d.kind === 'runs'){ if (d.live){ undoS.push(d.before); if (undoS.length > 100) undoS.shift(); redoS = []; menuDirty = true; scheduleSave(); } return; }
   if (d.kind === 'draw'){
@@ -2905,6 +2912,7 @@ function closeDial(pick){
   if (pick && d.hover >= 0){ d.items[d.hover].act(); if (d.h) pulse(d.h, 0.6, 30); }
   // a quick tap of A (no pick): in Grab it deletes what you're pointing at; otherwise back to Grab / Draw
   else if (pick && d.kind === 'tool' && performance.now() - d.t0 < 350){ if (cageEditing && cageTool() === 'cgrab' && d.hov){ cageHov = d.hov; deleteHover(); } else if (cageEditing) setCageTool('cgrab'); else { setTool('draw'); flash('Draw'); } if (d.h) pulse(d.h, 0.4, 20); }
+  else if (pick && d.kind === 'panel' && performance.now() - d.t0 < 350 && cageEditing && cageTool() === 'credraw'){ clearRedrawSel(); if (d.h) pulse(d.h, 0.4, 20); }
   // a quick tap of B in Grab creases what you're pointing at
   else if (pick && d.kind === 'panel' && performance.now() - d.t0 < 350 && cageEditing && cageTool() === 'cgrab' && d.hov){ cageHov = d.hov; creaseHover(); if (d.h) pulse(d.h, 0.4, 20); }
 }
@@ -2991,7 +2999,7 @@ function updateXRInput(dt){
     }
     else if (down(0) && !h.grab && !myDial){
       if (mHit && mHit.b){ pressMenu(mHit.b); pulse(h, 0.5, 20); }
-      else if (!mHit && !h.act && cageEditing){ h.act = cageToolDown(p); pulse(h, h.act ? 0.4 : 0.25, 15); }
+      else if (!mHit && !h.act && cageEditing){ try { h.act = cageToolDown(p); } catch (e){ h.act = null; errLog.push({ t: Date.now(), msg: String(e.message), at: "cage tool" }); flash("That tool hit a problem (" + e.message + ")"); } pulse(h, h.act ? 0.4 : 0.25, 15); }
       else if (!mHit && S.tool === 'ride' && !cageEditing){ if (h.fitting) endRefit(h); else boardTrick(h); pulse(h, 0.9, 45); }
       else if (!mHit && !h.act){ h.act = toolDown(h.i, p, null); pulse(h, 0.25, 10); }
     }
