@@ -1927,6 +1927,7 @@ async function takeOut(h,v,opt={}){
   ui();
   const rel=vGi===h.gi?'same':(vGi^1)===h.gi?'flip':'side';        // victim upright, upside down, or at 90° to the hunter
   const f=figs[v.id], hf=figs[h.id], gag=state.opts.funny?(opt.nab?filmOn('nab'):opt.fell?pickOn(TAKEOUTS()):opt.walled?(state.opts.wall==='box'?pickBox(h,v):filmOn('walled')):pickOn(TAKEOUTS())):null, film=gag&&!FAST();
+  netEcho('film',gag,h.id,v.id,vGi===h.gi?'same':(vGi^1)===h.gi?'flip':'side',{nab:!!opt.nab,walled:!!opt.walled,fell:!!opt.fell});      // friends online play the same scene
   CINE=1; cam.hold=true; camTween(vCell0,3,500);
   if(film){                         // a beat of reaction in the world, then cut to the little film
     if(!opt.fell){ setMood(f,'shock'); setMood(hf,'evil'); worldEmote(v,'!'); sfx.gasp(); await wait(850); }
@@ -4645,7 +4646,7 @@ addEventListener('keydown',ev=>{
 /* ---------- XR: play in the Quest browser with your hands (MR passthrough, or a VR room) ---------- */
 /* The headset browser slows or pauses page timers while you're in XR, and the bots run on timers.
    So each timeout is also kept in a list that the XR frame loop checks every frame; whichever fires first runs it, once. */
-const XR_VERSION='2.2';
+const XR_VERSION='2.3';
 /* ---------- online: play with friends on other devices (like Negative Space) ----------
    PeerJS's free matchmaker introduces devices by a 4-digit code; after that they talk directly.
    The host is the referee: it runs the real game, including the bots. A friend's device shows the host's game and
@@ -4672,7 +4673,7 @@ function loadPeer(){ if(NET_TEST||window.Peer) return Promise.resolve(); return 
 const makePeer=id=>NET_TEST?new BCPeer(id):(id?new window.Peer(id,{debug:1}):new window.Peer({debug:1}));
 function isLocal(p){ if(!NET.on||NET.applying||!NET.owner||!p) return !NET.guest||NET.applying; return NET.owner[p.id]===NET.me; }
 function netStatus(s){ NET.status=s; netPageSync(); }
-function netReset(){ try{ NET.conns.forEach(c=>c.close&&c.close()); }catch(e){} try{ NET.conn&&NET.conn.close(); }catch(e){} try{ NET.peer&&NET.peer.destroy(); }catch(e){}
+function netReset(){ try{ for(const id of Object.keys(NET.calls||{})) dropCall(id); if(NET.mic){ NET.mic.getTracks().forEach(t=>t.stop()); NET.mic=null; } NET.voice=false; NET.roster=[]; }catch(e){} try{ NET.conns.forEach(c=>c.close&&c.close()); }catch(e){} try{ NET.conn&&NET.conn.close(); }catch(e){} try{ NET.peer&&NET.peer.destroy(); }catch(e){}
   Object.assign(NET,{on:false,host:false,guest:false,peer:null,conns:[],conn:null,ui:'idle',code:'',owner:null,me:'H',lastSig:'',snapQ:null,joined:false}); netPageSync(); }
 async function netHost(){
   netReset(); NET.ui='hosting'; netStatus('Starting…');
@@ -4680,8 +4681,9 @@ async function netHost(){
   const tryCode=left=>{ const code=String(1000+Math.floor(Math.random()*9000)), peer=makePeer(NET_PREFIX+code); NET.peer=peer;
     peer.on('open',()=>{ Object.assign(NET,{code,on:true,host:true,me:'H'}); netStatus('Waiting for friends to join…'); });
     peer.on('connection',c=>{ if(NET.conns.length>=5||state&&state.started&&!state.attract&&!state.over&&NET.owner){ try{ c.close(); }catch(e){} return; }
-      c.on('open',()=>{ NET.conns.push(c); c.key='G'+c.peer; netStatus(NET.conns.length+' friend'+(NET.conns.length>1?'s':'')+' joined'); try{ sfx.snap&&sfx.snap(); }catch(e){} c.send({t:'hello',you:c.key}); });
+      c.on('open',()=>{ NET.conns.push(c); c.key='G'+c.peer; netStatus(NET.conns.length+' friend'+(NET.conns.length>1?'s':'')+' joined'); try{ sfx.snap&&sfx.snap(); }catch(e){} c.send({t:'hello',you:c.key}); rosterSend(); });
       c.on('data',m=>netHostData(c,m)); c.on('close',()=>netGuestGone(c)); c.on('error',()=>netGuestGone(c)); });
+    peer.on('call',voiceAnswer);
     peer.on('error',e=>{ if(e.type==='unavailable-id'&&left>0){ peer.destroy(); tryCode(left-1); return; }
       netStatus(e.type==='network'||e.type==='server-error'||e.type==='socket-error'?"Can't reach the matchmaker. Check the internet and try again.":'Something went wrong ('+e.type+'). Try again.'); }); };
   tryCode(3);
@@ -4690,6 +4692,7 @@ async function netJoin(code){
   netReset(); NET.ui='connecting'; NET.code=code; netStatus('Connecting to '+code+'…');
   try{ await loadPeer(); }catch(e){ NET.ui='joining'; return netStatus("Couldn't load the online library. Check the internet and try again."); }
   const peer=makePeer(); NET.peer=peer;
+  peer.on('call',voiceAnswer);
   peer.on('open',()=>{ const c=peer.connect(NET_PREFIX+code,{reliable:true,serialization:'json'}); NET.conn=c;
     c.on('open',()=>{ Object.assign(NET,{on:true,guest:true,ui:'waiting'}); netStatus('Joined. Waiting for the host to start.'); hideTitle(); gen++; });
     c.on('data',netGuestData); c.on('close',()=>netLost('The host left the game')); c.on('error',()=>netLost('The connection dropped')); });
@@ -4700,7 +4703,7 @@ async function netJoin(code){
 function netSendAll(m){ for(const c of NET.conns) try{ c.send(m); }catch(e){} }
 function netLeave(){ if(NET.guest) try{ NET.conn.send({t:'bye'}); }catch(e){} if(NET.host) netSendAll({t:'bye'}); netReset(); netStatus(''); }
 function netLost(why){ if(!NET.guest) return; netReset(); netStatus(why); toast(why); showTitle(); }
-function netGuestGone(c){ const i=NET.conns.indexOf(c); if(i<0) return; NET.conns.splice(i,1);
+function netGuestGone(c){ const i=NET.conns.indexOf(c); if(i<0) return; NET.conns.splice(i,1); dropCall(c.peer); rosterSend();
   if(state&&NET.owner) state.players.forEach(q=>{ if(NET.owner[q.id]===c.key){ NET.owner[q.id]='H'; q.bot=true; } });       // their seats are played by bots from here
   toast('A friend left. A bot takes over their seat.'); netStatus(NET.conns.length+' friend'+(NET.conns.length===1?'':'s')+' connected');
   if(state&&state.started&&!state.over&&cur().bot&&!busy) runPhase(); NET.lastSig=''; }
@@ -4731,6 +4734,7 @@ function netIntent(kind,...a){
 }
 function netHostData(c,m){
   if(m.t==='bye'){ netGuestGone(c); return; }
+  if(m.t==='voice'){ c.voice=!!m.on; rosterSend(); return; }
   if(m.t!=='act'||!state||!state.started||state.over||busy) return;
   const p=cur(); if(!NET.owner||NET.owner[p.id]!==c.key) return;              // only the seat whose turn it is
   NET.applying=true;
@@ -4750,12 +4754,14 @@ function netHostData(c,m){
   finally{ NET.applying=false; NET.lastSig=''; }
 }
 function netGuestData(m){
-  if(m.t==='hello'){ NET.me=m.you; return; }
+  if(m.t==='hello'){ NET.me=m.you; if(NET.voice) try{ NET.conn.send({t:'voice',on:true}); }catch(e){} return; }
+  if(m.t==='roster'){ NET.roster=m.peers||[]; meshSync(); return; }
   if(m.t==='bye'){ netLost('The host left the game'); return; }
   if(m.t==='snap'){ NET.snapQ=m; return; }
   if(m.t==='ev'){
     if(m.kind==='walk'){ const [id,path]=m.a; guestWalk(id,path); }
-    else if(m.kind==='out'){ const [h,v]=m.a, H=state&&state.players[h], V=state&&state.players[v]; if(H&&V){ toast(NAMES[H.ci]+' took out '+NAMES[V.ci]); try{ sfx.gasp&&sfx.gasp(); }catch(e){} } }
+    else if(m.kind==='out'){ NET.outQ={a:m.a,t:performance.now()}; }                       // a scene usually follows; if not, a short message
+    else if(m.kind==='film'){ NET.outQ=null; guestFilm(...m.a); }
   }
 }
 function guestWalk(id,path){                       // play the host's walk here; the next snapshot lands after it
@@ -4763,6 +4769,15 @@ function guestWalk(id,path){                       // play the host's walk here;
   NET.animUntil=performance.now()+per*(path.length-1)+150; clearMarks();
   animate(per*(path.length-1),u=>{ const t=u*(path.length-1), j=Math.min(path.length-2,Math.floor(t)), w=t-j, a=path[j], b=path[j+1];
     f.position.copy(v3(add(add(a,mul(sub(b,a),w)),mul(up,.08*Math.sin(Math.PI*w))))); });
+}
+async function guestFilm(gag,h,v,rel,opt){         // the same take-out scene the host is playing
+  const H=state&&state.players[h], V=state&&state.players[v]; if(!H||!V||NET.film) return;
+  NET.film=true;
+  try{ setMood(figs[v.id],'shock'); setMood(figs[h.id],'evil'); worldEmote(V,'!'); sfx.gasp&&sfx.gasp(); }catch(e){}
+  try{ await wait(850); cineOpen(false); setCine('',[],''); await stagePlay(gag,H,V,rel);
+    setCine(opt&&opt.nab?'Nabbed!':opt&&opt.walled?'Boxed in':'Taken out',[nameSpan(H),' '+(GAGS[gag]||'got')+' ',nameSpan(V)],'','slam'); await wait(2600); }
+  catch(e){ console.warn('film',e); }
+  finally{ try{ stageStop(); cineClose(); }catch(e){} NET.film=false; }
 }
 function netApplySnap(m){
   NET.snapQ=null; const first=!NET.joined; NET.joined=true; NET.ui='live';
@@ -4773,21 +4788,51 @@ function netApplySnap(m){
 }
 function netTick(){
   if(NET.host) netSnap(false);
-  if(NET.guest&&NET.snapQ&&performance.now()>NET.animUntil&&!anims.length) netApplySnap(NET.snapQ);
+  if(NET.guest&&NET.outQ&&performance.now()-NET.outQ.t>400){ const [h,v]=NET.outQ.a, H=state&&state.players[h], V=state&&state.players[v]; NET.outQ=null; if(H&&V){ toast(NAMES[H.ci]+' took out '+NAMES[V.ci]); try{ sfx.gasp&&sfx.gasp(); }catch(e){} } }
+  if(NET.guest&&NET.snapQ&&!NET.film&&performance.now()>NET.animUntil&&!anims.length) netApplySnap(NET.snapQ);
 }
-window.__net={NET,netHost,netJoin,netStart,netLeave};
+window.__net={NET,netHost,netJoin,netStart,netLeave,setVoice,meshSync};
+/* voice chat: PeerJS media calls between everyone who has it on (a small mesh; the lower id calls the higher) */
+Object.assign(NET,{voice:false,mic:null,calls:{},audios:{},roster:[],voiceMsg:''});
+const myId=()=>NET.peer&&NET.peer.id;
+function rosterSend(){ if(!NET.host) return; const me={id:myId(),voice:NET.voice}; NET.roster=[me,...NET.conns.map(c=>({id:c.peer,voice:!!c.voice}))]; netSendAll({t:'roster',peers:NET.roster}); meshSync(); }
+function hearStream(id,stream){ let a=NET.audios[id]; if(!a){ a=new Audio(); a.autoplay=true; NET.audios[id]=a; } a.srcObject=stream; a.play&&a.play().catch(()=>{}); }
+function dropCall(id){ const c=NET.calls[id]; if(c) try{ c.close(); }catch(e){} delete NET.calls[id]; const a=NET.audios[id]; if(a){ try{ a.pause(); a.srcObject=null; }catch(e){} delete NET.audios[id]; } }
+function wireCall(call){ NET.calls[call.peer]=call; call.on('stream',s=>hearStream(call.peer,s)); call.on('close',()=>dropCall(call.peer)); call.on('error',()=>dropCall(call.peer)); }
+function meshSync(){
+  if(!NET.peer||!NET.peer.call) return;
+  const me=myId(), want=new Set(NET.voice?NET.roster.filter(p=>p.voice&&p.id!==me).map(p=>p.id):[]);
+  for(const id of Object.keys(NET.calls)) if(!want.has(id)) dropCall(id);
+  if(!NET.voice||!NET.mic) return;
+  for(const id of want) if(!NET.calls[id]&&me<id){ try{ wireCall(NET.peer.call(id,NET.mic)); }catch(e){ console.warn('call',e); } }
+}
+function voiceAnswer(call){ if(NET.voice&&NET.mic){ call.answer(NET.mic); wireCall(call); } else try{ call.close(); }catch(e){} }
+async function setVoice(on){
+  if(on===NET.voice) return;
+  if(on){
+    if(!NET.peer||!NET.peer.call){ NET.voiceMsg='Voice chat needs a real online game.'; netPageSync(); return; }
+    try{ NET.mic=NET.mic||await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
+    catch(e){ NET.voiceMsg="Couldn't use the microphone. Allow it for this page, then try again."; netPageSync(); return; }
+    NET.voice=true; NET.voiceMsg='';
+  } else { NET.voice=false; for(const id of Object.keys(NET.calls)) dropCall(id); if(NET.mic){ NET.mic.getTracks().forEach(t=>t.stop()); NET.mic=null; } }
+  if(NET.host) rosterSend(); else if(NET.guest){ try{ NET.conn.send({t:'voice',on:NET.voice}); }catch(e){} meshSync(); }
+  netPageSync();
+}
+const voiceCount=()=>Object.keys(NET.calls).length;
 /* the flat page: a small overlay to host or join */
 function netPageSync(){
   const ov=document.getElementById('netOv'); if(!ov) return; const st=document.getElementById('netSt'); if(st) st.textContent=NET.status||'';
   const code=document.getElementById('netCode'); if(code) code.textContent=NET.host&&NET.code?NET.code.split('').join(' '):'';
   const go=document.getElementById('netGo'); if(go) go.hidden=!(NET.host&&NET.conns.length);
+  const vb=document.getElementById('netV'); if(vb){ vb.hidden=!NET.on; vb.textContent='Voice chat: '+(NET.voice?'on'+(voiceCount()?' · hearing '+voiceCount():''):'off'); vb.setAttribute('aria-pressed',String(NET.voice)); }
+  if(st&&NET.voiceMsg) st.textContent=NET.voiceMsg;
 }
 function netPageUI(){
   if(document.getElementById('netOv')) return;
   const ov=document.createElement('div'); ov.id='netOv'; ov.className='howto'; ov.hidden=true; ov.innerHTML='<div class="h-card"><h2>Play online</h2><p class="h-foot">One of you hosts and reads out the 4-digit code. Friends join with it, on a headset, phone or computer. Same WiFi or anywhere.</p>'+
     '<div class="t-row"><button class="qp small" id="netH">Host a game</button></div><div class="netcode" id="netCode"></div>'+
     '<div class="t-row"><input id="netIn" inputmode="numeric" maxlength="4" placeholder="Code" style="flex:1;min-height:46px;border-radius:14px;border:1.5px solid var(--line);padding:0 14px;font:600 18px var(--body)"><button class="btn primary" id="netJ">Join</button></div>'+
-    '<p class="h-foot" id="netSt"></p><div class="t-row"><button class="btn primary" id="netGo" hidden>Start game</button><button class="btn" id="netX">Close</button></div></div>';
+    '<p class="h-foot" id="netSt"></p><div class="t-row"><button class="btn" id="netV" hidden>Voice chat: off</button><button class="btn primary" id="netGo" hidden>Start game</button><button class="btn" id="netX">Close</button></div></div>';
   document.body.appendChild(ov);
   const tb=document.createElement('button'); tb.className='tbtn'; tb.id='tOnline'; tb.textContent='Play online'; const row=document.querySelector('.t-row'); if(row) row.appendChild(tb);
   tb.addEventListener('click',()=>{ ov.hidden=false; netPageSync(); });
@@ -4795,6 +4840,7 @@ function netPageUI(){
   document.getElementById('netJ').onclick=()=>{ const c=document.getElementById('netIn').value.replace(/\D/g,''); if(c.length===4) netJoin(c); else netStatus('Type the 4 numbers from your friend.'); };
   document.getElementById('netGo').onclick=()=>{ ov.hidden=true; netStart(); };
   document.getElementById('netX').onclick=()=>{ ov.hidden=true; };
+  document.getElementById('netV').onclick=()=>setVoice(!NET.voice);
 }
 
 const TIMERS=(()=>{
@@ -4907,6 +4953,7 @@ const XR=(()=>{
       {k:'fast',label:'Bot turns',icon:'fast',opts:[['n','Normal'],['f','Fast']],v:PREF.fast?'f':'n',set:v=>setFast(v==='f')},
       {k:'skip',label:'Cut scenes',icon:'film',opts:[['play','Play'],['skip','Skip']],v:PREF.skip?'skip':'play',set:v=>{ PREF.skip=v==='skip'; savePref(); }},
       {k:'gfx',label:'Graphics',icon:'cube',opts:[['low','Low'],['med','Medium'],['high','High']],v:PREF.gfx,set:v=>{ PREF.gfx=v; savePref(); applyGfx(); }},
+      ...(NET.on?[{k:'voice',label:'Voice chat'+(NET.voice&&voiceCount()?' · hearing '+voiceCount():''),icon:'sound',opts:[['on','On'],['off','Off']],v:NET.voice?'on':'off',set:v=>setVoice(v==='on')}]:[]),
       {k:'hints',label:'Controller button labels',icon:'tip',opts:[['on','On'],['off','Off']],v:PREF.hints?'on':'off',set:v=>{ PREF.hints=v==='on'; savePref(); }},
       {k:'tips',label:'Tips',icon:'tip',opts:[['on','On'],['off','Off']],v:tipState.off?'off':'on',set:v=>{ if(v==='off'){ tipState.off=1; tipNow=null; $('hint').hidden=true; } else { for(const k in tipState) delete tipState[k]; } saveTips(); }},
       {k:'turn',label:'Turn to my down each turn',icon:'down',opts:[['on','On'],['off','Off']],v:PREF.autoTurn?'on':'off',set:v=>{ PREF.autoTurn=v==='on'; savePref(); }}];
@@ -4979,12 +5026,14 @@ const XR=(()=>{
     const say=(t,y,sz)=>{ c.font='500 '+(sz||32)+'px '+F; c.fillStyle='#4A5068'; const L=wrap(t,CW-2*pad,3); L.forEach((l,i)=>c.fillText(l,pad,y+i*(sz?sz+10:42))); return y+L.length*(sz?sz+10:42); };
     let y=pad+76;
     if(NET.guest){ y=say(NET.joined?'Connected.':'Joined game '+NET.code.split('').join(' ')+'. Waiting for the host to start.',y); if(NET.status&&!NET.joined) say(NET.status,y+10,28);
+      row([{id:'n-voice',label:'Voice chat: '+(NET.voice?'on':'off'),icon:'sound',primary:NET.voice,go:()=>setVoice(!NET.voice)}],70,'600 30px '+F,y+70); if(NET.voiceMsg) say(NET.voiceMsg,y+150,24);
       row([{id:'n-leave',label:'Leave',go:()=>{ netLeave(); X.netPage=false; showTitle(); }}],84,'700 36px '+F,CH-pad-84); return; }
     if(NET.host){
       c.font='700 150px '+F; c.fillStyle='#3A3FC9'; c.fillText(NET.code?NET.code.split('').join(' '):'· · · ·',pad,y-8); y+=172;
       y=say(NET.conns.length?(NET.conns.length+' friend'+(NET.conns.length>1?'s':'')+' joined. Start when everyone is in.'):'Read this code to your friends. They pick Play online, then Join, and type it in.',y,30);
       const fillRow=[{id:'n-fill1',label:'Bots fill empty seats',primary:NET.fill,go:()=>{ NET.fill=true; }},{id:'n-fill0',label:'Only people',primary:!NET.fill,go:()=>{ NET.fill=false; }}];
       row(fillRow,70,'600 30px '+F,y+14);
+      row([{id:'n-voice',label:'Voice chat: '+(NET.voice?'on':'off'),icon:'sound',primary:NET.voice,go:()=>setVoice(!NET.voice)}],70,'600 30px '+F,y+100); if(NET.voiceMsg) say(NET.voiceMsg,y+184,24);
       const B=[{id:'n-cancel',label:'Cancel',go:()=>{ netLeave(); X.netPage=false; }}]; if(NET.conns.length) B.push({id:'n-start',label:'Start game',primary:true,go:()=>{ X.netPage=false; netStart(); }});
       row(B,84,'700 36px '+F,CH-pad-84); return; }
     if(NET.ui==='joining'||NET.ui==='connecting'){
@@ -5009,7 +5058,7 @@ const XR=(()=>{
   }
   function drawSettings(c,F,pad){
     c.font='700 50px '+F; c.fillStyle='#1B1E2E'; c.textBaseline='top'; c.fillText('Settings',pad,pad);
-    let y=pad+80; const nRows=settingRows().length, rh=nRows>7?68:76, segH=nRows>7?54:60;
+    let y=pad+80; const nRows=settingRows().length, rh=nRows>8?62:nRows>7?68:76, segH=nRows>8?50:nRows>7?54:60;
     for(const r of settingRows()){
       icon(c,r.icon,pad,y+rh/2-17,34,'#4A5068');
       c.font='600 32px '+F; c.fillStyle='#1B1E2E'; c.textBaseline='middle';
@@ -5044,7 +5093,7 @@ const XR=(()=>{
     if(out.length<maxL&&line) out.push(line); else if(line&&out.length>=maxL) out[maxL-1]=out[maxL-1].replace(/\s*\S*$/,'…'); return out; }
   function drawPanel(){
     const S=status(), gb=gameButtons(), xb=xrButtons();
-    const ho=handoff(), su=inSetup(), sig=JSON.stringify([netShown()&&[NET.ui,NET.entry,NET.status,NET.code,NET.conns.length,NET.fill,NET.host,NET.joined],X.teamPick,su&&X.setPage,su&&setupRows().map(r=>[r.label,r.val,r.opts.map(o=>o.on)]),ho,X.picker,X.settings,X.settings&&settingRows().map(r=>r.v),S,gb.map(b=>[b.id,b.label,b.primary]),xb.map(b=>[b.id,b.label]),hoverId,shown($('quitBtn'))]);
+    const ho=handoff(), su=inSetup(), sig=JSON.stringify([netShown()&&[NET.ui,NET.entry,NET.status,NET.code,NET.conns.length,NET.fill,NET.host,NET.joined,NET.voice,NET.voiceMsg],X.teamPick,su&&X.setPage,su&&setupRows().map(r=>[r.label,r.val,r.opts.map(o=>o.on)]),ho,X.picker,X.settings,X.settings&&settingRows().map(r=>r.v+r.label),S,gb.map(b=>[b.id,b.label,b.primary]),xb.map(b=>[b.id,b.label]),hoverId,shown($('quitBtn'))]);
     if(sig===panelSig) return; panelSig=sig;
     const c=pctx, F='Figtree,"Segoe UI",system-ui,sans-serif', pad=40; hits=[];
     c.clearRect(0,0,CW,CH); rr(0,0,CW,CH,44); c.fillStyle='rgba(243,244,248,.97)'; c.fill(); c.lineWidth=4; c.strokeStyle='#C6CAD8'; c.stroke();
