@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p3.0"></script>
-<script src="solver.js?v=p3.0"></script>
+<script src="demo.js?v=p3.1"></script>
+<script src="solver.js?v=p3.1"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -106,7 +106,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '3.0';
+const VERSION = '3.1';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -961,7 +961,7 @@ function clearSurface(){
   surfMesh = wireLines = fineLines = creaseLines = foundGroup = null; lastResult = null;
 }
 function applyResult(r){
-  clearSurface(); if (panels) clearPanels();
+  clearSurface(); if (panels) clearPanels(); if (waffle) clearWaffle();
   if (r.empty){ flash('Draw a few more lines first'); return; }
   if (r.note) flash(r.note, r.culprits && r.culprits.length ? 10 : 6);
   lastResult = r;
@@ -1110,83 +1110,225 @@ function makeStrict(){
 const PANEL_TOL = [0.003, 0.006, 0.01, 0.02, 0.04, 0.08];     // how far a panel may bow off flat, park metres
 let panels = null;                                            // { list: [{ pts (grid points), outline, corners, dev }], G (grids) }
 const panelGroup = new THREE.Group(); world.add(panelGroup);
-function clearPanels(){ for (const o of [...panelGroup.children]){ panelGroup.remove(o); o.geometry.dispose(); } panels = null; if (surfMesh) applySurfView(); menuDirty = true; }
+function clearPanels(){ for (const o of [...panelGroup.children]){ panelGroup.remove(o); o.geometry.dispose(); } panels = null; try { showPanelLabels(); } catch (e){} if (surfMesh) applySurfView(); menuDirty = true; }
 // the cage as the builder made it (or as you shaped it)
 function panelCage(){ if (cageEd) return { V: cageEd.V.slice(), F: cageEd.F.map(f => f.slice()), sharp: new Set(cageEd.sharp) };
   const c = lastResult && lastResult.cage; if (!c) return null; const F = []; for (let f = 0, o = 0; f < c.C.length; f++){ F.push(Array.from(c.F.subarray(o, o + c.C[f]))); o += c.C[f]; }
   const sharp = new Set(); for (let i = 0; i < c.sharp.length; i += 2) sharp.add(CEK(c.sharp[i], c.sharp[i + 1])); return { V: Array.from(c.V), F, sharp }; }
-function hexCells(size){
-  if (!surfMesh) return flash('Build a surface first (step 3)');
-  const P = surfMesh.geometry.attributes.position.array, NN = surfMesh.geometry.attributes.normal.array, ns = P.length / 3;
-  // weld the triangle soup into points and their neighbours
-  const key = new Map(), map = new Int32Array(ns), X = []; for (let i = 0; i < ns; i++){ const k = Math.round(P[3 * i] * 1e4) + ',' + Math.round(P[3 * i + 1] * 1e4) + ',' + Math.round(P[3 * i + 2] * 1e4); let v = key.get(k); if (v === undefined){ v = X.length / 3; key.set(k, v); X.push(P[3 * i], P[3 * i + 1], P[3 * i + 2]); } map[i] = v; }
-  const nv = X.length / 3, crease = new Uint8Array(nv), area = new Float64Array(nv), adj = Array.from({ length: nv }, () => new Map());
-  if (S.panelSeams !== 0 && creaseV) for (let i = 0; i < ns; i++) if (creaseV[i]) crease[map[i]] = 1;
+// ---------- Voronoi panels: cells relaxed over the surface, each sized to how curved the surface is under it (a
+// cell bows by about curvature × size² / 8, so where it's flat a cell can be big and where it bends it has to be
+// small), between the smallest and largest you set. Creases split the surface into separate sheets first, so a seam
+// is one clean shared edge.
+function voronoiCells(minS, maxS, tol){
+  if (!surfMesh) return null;
+  const P = surfMesh.geometry.attributes.position.array, NN = surfMesh.geometry.attributes.normal.array, ns = P.length / 3, seams = S.panelSeams !== 0;
+  // weld the triangle soup; with seams on, points on a crease stay apart on each side (their normals differ there)
+  const key = new Map(), map = new Int32Array(ns), X = [], NV = [];
+  for (let i = 0; i < ns; i++){ let k = Math.round(P[3 * i] * 1e4) + ',' + Math.round(P[3 * i + 1] * 1e4) + ',' + Math.round(P[3 * i + 2] * 1e4); if (seams) k += '|' + Math.round(NN[3 * i] * 20) + ',' + Math.round(NN[3 * i + 1] * 20) + ',' + Math.round(NN[3 * i + 2] * 20);
+    let v = key.get(k); if (v === undefined){ v = X.length / 3; key.set(k, v); X.push(P[3 * i], P[3 * i + 1], P[3 * i + 2]); NV.push(NN[3 * i], NN[3 * i + 1], NN[3 * i + 2]); } map[i] = v; }
+  const nv = X.length / 3, area = new Float64Array(nv), adj = Array.from({ length: nv }, () => new Map()), ecount = new Map(), border = new Uint8Array(nv);
   const D = (a, b) => Math.hypot(X[3 * a] - X[3 * b], X[3 * a + 1] - X[3 * b + 1], X[3 * a + 2] - X[3 * b + 2]);
   for (let t = 0; t < ns; t += 3){ const a = map[t], b = map[t + 1], c = map[t + 2]; if (a === b || b === c || a === c) continue;
-    for (const [u, w] of [[a, b], [b, c], [c, a]]){ const d = D(u, w); adj[u].set(w, d); adj[w].set(u, d); }
+    for (const [u, w] of [[a, b], [b, c], [c, a]]){ const d = D(u, w); adj[u].set(w, d); adj[w].set(u, d); const k = u < w ? u * nv + w : w * nv + u; ecount.set(k, (ecount.get(k) || 0) + 1); }
     const ux = X[3 * b] - X[3 * a], uy = X[3 * b + 1] - X[3 * a + 1], uz = X[3 * b + 2] - X[3 * a + 2], wx = X[3 * c] - X[3 * a], wy = X[3 * c + 1] - X[3 * a + 1], wz = X[3 * c + 2] - X[3 * a + 2];
     const A = Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx) / 6; area[a] += A; area[b] += A; area[c] += A; }
-  const sp = size * 0.95;
-  // seeds: spread out, at least a panel apart (points on seams can't be centres)
+  for (const [k, c] of ecount) if (c === 1){ border[Math.floor(k / nv)] = 1; border[k % nv] = 1; }
+  // how curved it is at each point (the turn of the normal per metre), smoothed a little; then the cell size there
+  let kap = new Float64Array(nv);
+  for (let v = 0; v < nv; v++){ let m = 0; for (const [w, l] of adj[v]){ const c = NV[3 * v] * NV[3 * w] + NV[3 * v + 1] * NV[3 * w + 1] + NV[3 * v + 2] * NV[3 * w + 2]; m = Math.max(m, Math.acos(Math.max(-1, Math.min(1, c))) / Math.max(1e-6, l)); } kap[v] = m; }
+  for (let it = 0; it < 3; it++){ const k2 = new Float64Array(nv); for (let v = 0; v < nv; v++){ let sum = kap[v], c = 1; for (const w of adj[v].keys()){ sum += kap[w]; c++; } k2[v] = sum / c; } kap = k2; }
+  const sz = new Float64Array(nv); for (let v = 0; v < nv; v++) sz[v] = Math.max(minS, Math.min(maxS, Math.sqrt(8 * tol / Math.max(1e-6, kap[v]))));
+  // seeds: spread out, about a cell apart (by the size wanted there), never on a seam or the edge
   const order = Array.from({ length: nv }, (_, i) => i); let rs = 12345; const rnd = () => (rs = (rs * 16807) % 2147483647) / 2147483647; for (let i = nv - 1; i > 0; i--){ const j = Math.floor(rnd() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
-  const cell = sp, grid = new Map(), gk = (x, y, z) => Math.floor(x / cell) + ',' + Math.floor(y / cell) + ',' + Math.floor(z / cell); let seeds = [];
-  for (const v of order){ if (crease[v] || !adj[v].size) continue; const x = X[3 * v], y = X[3 * v + 1], z = X[3 * v + 2]; let ok = true;
-    for (let i = -1; i <= 1 && ok; i++) for (let j = -1; j <= 1 && ok; j++) for (let k = -1; k <= 1 && ok; k++){ const l = grid.get(gk(x + i * cell, y + j * cell, z + k * cell)); if (l) for (const q of l) if (D(q, v) < sp){ ok = false; break; } }
-    if (ok){ seeds.push(v); const g = gk(x, y, z); (grid.get(g) || grid.set(g, []).get(g)).push(v); } }
-  if (seeds.length > 20000) return null;
-  // nearest seed along the surface (a little heap), seams stop the spread
+  const cell = maxS, grid = new Map(), gk = (x, y, z) => Math.floor(x / cell) + ',' + Math.floor(y / cell) + ',' + Math.floor(z / cell); let seeds = [];
+  for (const v of order){ if (border[v] || !adj[v].size) continue; const x = X[3 * v], y = X[3 * v + 1], z = X[3 * v + 2], r = sz[v] * 0.9; let ok = true;
+    for (let i = -1; i <= 1 && ok; i++) for (let j = -1; j <= 1 && ok; j++) for (let k = -1; k <= 1 && ok; k++){ const l = grid.get(gk(x + i * cell, y + j * cell, z + k * cell)); if (l) for (const q of l) if (D(q, v) < Math.min(r, sz[q] * 0.9)){ ok = false; break; } }
+    if (ok){ seeds.push(v); const g = gk(x, y, z); (grid.get(g) || grid.set(g, []).get(g)).push(v); } if (seeds.length > 20000) return null; }
+  // nearest seed along the surface, measured in cells (so a small-cell area counts as farther)
   const label = new Int32Array(nv), dist = new Float64Array(nv);
   const grow = () => { label.fill(-1); dist.fill(Infinity); const h = []; const push = (d, v) => { h.push([d, v]); let i = h.length - 1; while (i){ const p = (i - 1) >> 1; if (h[p][0] <= h[i][0]) break; [h[p], h[i]] = [h[i], h[p]]; i = p; } };
     const pop = () => { const top = h[0], last = h.pop(); if (h.length){ h[0] = last; let i = 0; for (;;){ const l = 2 * i + 1, r = l + 1; let m = i; if (l < h.length && h[l][0] < h[m][0]) m = l; if (r < h.length && h[r][0] < h[m][0]) m = r; if (m === i) break; [h[m], h[i]] = [h[i], h[m]]; i = m; } } return top; };
     seeds.forEach((v, i) => { dist[v] = 0; label[v] = i; push(0, v); });
-    while (h.length){ const [d, v] = pop(); if (d > dist[v]) continue; if (crease[v] && dist[v] > 0) continue;
-      for (const [w, l] of adj[v]){ const nd = d + l; if (nd < dist[w]){ dist[w] = nd; label[w] = label[v]; push(nd, w); } } } };
+    while (h.length){ const [d, v] = pop(); if (d > dist[v]) continue; for (const [w, l] of adj[v]){ const nd = d + 2 * l / (sz[v] + sz[w]); if (nd < dist[w]){ dist[w] = nd; label[w] = label[v]; push(nd, w); } } } };
   for (let it = 0; it < 12; it++){ grow();
-    const cx = new Float64Array(seeds.length), cy = new Float64Array(seeds.length), cz = new Float64Array(seeds.length), ca = new Float64Array(seeds.length);
-    for (let v = 0; v < nv; v++){ const L = label[v]; if (L < 0) continue; const a = area[v]; cx[L] += X[3 * v] * a; cy[L] += X[3 * v + 1] * a; cz[L] += X[3 * v + 2] * a; ca[L] += a; }
+    const cx = new Float64Array(seeds.length), cy = new Float64Array(seeds.length), cz = new Float64Array(seeds.length), ca = new Float64Array(seeds.length), ar = new Float64Array(seeds.length);
+    for (let v = 0; v < nv; v++){ const L = label[v]; if (L < 0) continue; const a = area[v] / (sz[v] * sz[v]); cx[L] += X[3 * v] * a; cy[L] += X[3 * v + 1] * a; cz[L] += X[3 * v + 2] * a; ca[L] += a; ar[L] += area[v] / (sz[v] * sz[v]); }
     const best = new Int32Array(seeds.length).fill(-1), bd = new Float64Array(seeds.length).fill(Infinity);
-    for (let v = 0; v < nv; v++){ const L = label[v]; if (L < 0 || crease[v] || !ca[L]) continue; const d = (X[3 * v] - cx[L] / ca[L]) ** 2 + (X[3 * v + 1] - cy[L] / ca[L]) ** 2 + (X[3 * v + 2] - cz[L] / ca[L]) ** 2; if (d < bd[L]){ bd[L] = d; best[L] = v; } }
-    // tiny slivers (squeezed against a seam or the edge) are dropped
-    seeds = seeds.map((v, i) => best[i] >= 0 && ca[i] > 0.12 * size * size ? best[i] : -1).filter(v => v >= 0); }
+    for (let v = 0; v < nv; v++){ const L = label[v]; if (L < 0 || border[v] || !ca[L]) continue; const d = (X[3 * v] - cx[L] / ca[L]) ** 2 + (X[3 * v + 1] - cy[L] / ca[L]) ** 2 + (X[3 * v + 2] - cz[L] / ca[L]) ** 2; if (d < bd[L]){ bd[L] = d; best[L] = v; } }
+    // slivers squeezed against a seam or the edge go (their neighbours fill in)
+    seeds = seeds.map((v, i) => best[i] >= 0 && ar[i] > 0.15 ? best[i] : -1).filter(v => v >= 0); }
   grow();
-  // how flat each panel is: farthest point from its average plane
   const n = seeds.length, nx = new Float64Array(n), ny = new Float64Array(n), nz = new Float64Array(n), mx = new Float64Array(n), my = new Float64Array(n), mz = new Float64Array(n), cnt = new Float64Array(n), flat = new Float64Array(n);
   for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0) continue; nx[L] += NN[3 * i]; ny[L] += NN[3 * i + 1]; nz[L] += NN[3 * i + 2]; mx[L] += P[3 * i]; my[L] += P[3 * i + 1]; mz[L] += P[3 * i + 2]; cnt[L]++; }
   for (let i = 0; i < ns; i++){ const L = label[map[i]]; if (L < 0) continue; const l = Math.hypot(nx[L], ny[L], nz[L]) || 1; flat[L] = Math.max(flat[L], Math.abs(((P[3 * i] - mx[L] / cnt[L]) * nx[L] + (P[3 * i + 1] - my[L] / cnt[L]) * ny[L] + (P[3 * i + 2] - mz[L] / cnt[L]) * nz[L]) / l)); }
-  return { label, map, n, flat, size, X, dist: Float64Array.from(dist), crease, adj };
+  return { label, map, n, flat, X, dist: Float64Array.from(dist), sz, ecount, border, seeds };
 }
-const HEX_SIZE = [0.15, 0.25, 0.4, 0.6, 0.8, 1, 1.25, 1.5, 2, 3];
-// hex panels with straight edges: each panel's corners are where three panels meet (and where it meets a seam or
-// the edge), joined by straight lines and laid flat on the panel's own plane
-function makeHexPanels(){
+const VOR_MIN = [0.08, 0.12, 0.2, 0.3, 0.4, 0.6], VOR_MAX = [0.4, 0.6, 0.8, 1.2, 1.6, 2.4, 3.2];   // park metres
+// Voronoi panels with straight edges: each one's corners are where three cells meet, or where a cell edge meets a
+// seam or the outside, joined by straight lines; along a seam or the outside it follows that line
+function makeVoronoiPanels(){
   if (!surfMesh) return flash('Build a surface first (step 3)');
-  const size = HEX_SIZE[S.hexSize ?? 3], cells = hexCells(size); if (!cells) return flash('That many panels would be too slow: pick a bigger size');
-  const { label, map, n, X, dist, crease, adj } = cells, src = surfMesh.geometry, P = src.attributes.position.array, NN = src.attributes.normal.array, ns = P.length / 3;
+  const minS = VOR_MIN[S.vorMin ?? 2], maxS = Math.max(minS * 1.2, VOR_MAX[S.vorMax ?? 3]), tol = PANEL_TOL[S.panelTol ?? 2];
+  const cells = voronoiCells(minS, maxS, tol); if (!cells) return flash('That many cells would be too slow: raise the smallest cell size');
+  const { label, map, n, X, dist, sz, ecount, border } = cells, nv = X.length / 3, src = surfMesh.geometry, NN = src.attributes.normal.array, ns = src.attributes.position.count;
   const XV = v => new V3(X[3 * v], X[3 * v + 1], X[3 * v + 2]);
-  const bis = (a, b) => { const l = XV(a).distanceTo(XV(b)) || 1e-9, t = Math.max(0.05, Math.min(0.95, (dist[b] + l - dist[a]) / (2 * l))); return XV(a).lerp(XV(b), t); };
+  const bis = (a, b) => { const l = 2 * XV(a).distanceTo(XV(b)) / (sz[a] + sz[b]) || 1e-9, t = Math.max(0.05, Math.min(0.95, (dist[b] + l - dist[a]) / (2 * l))); return XV(a).lerp(XV(b), t); };
   const pts = Array.from({ length: n }, () => []), nrm = Array.from({ length: n }, () => new V3());
   for (let t = 0; t < ns; t += 3){ const v = [map[t], map[t + 1], map[t + 2]], L = v.map(x => label[x]);
     for (let k = 0; k < 3; k++) if (L[k] >= 0) nrm[L[k]].add(new V3(NN[3 * (t + k)], NN[3 * (t + k) + 1], NN[3 * (t + k) + 2]));
     if (L[0] >= 0 && L[1] >= 0 && L[2] >= 0 && L[0] !== L[1] && L[1] !== L[2] && L[0] !== L[2]){ const j = bis(v[0], v[1]).add(bis(v[1], v[2])).add(bis(v[2], v[0])).multiplyScalar(1 / 3); for (const c of L) pts[c].push(j); } }
-  // the surface's edge and the seams: their points belong to the panels along them
-  const ecount = new Map(); for (let t = 0; t < ns; t += 3) for (let k = 0; k < 3; k++){ const a = map[t + k], b = map[t + (k + 1) % 3], key = a < b ? a + ',' + b : b + ',' + a; ecount.set(key, (ecount.get(key) || 0) + 1); }
-  for (const [key, c] of ecount){ if (c !== 1) continue; const [a, b] = key.split(',').map(Number); if (label[a] < 0 || label[b] < 0) continue;
-    pts[label[a]].push(XV(a)); if (label[a] !== label[b]){ const q = bis(a, b); pts[label[a]].push(q); pts[label[b]].push(q.clone()); } }
-  for (let v = 0; v < X.length / 3; v++){ if (!crease[v] || label[v] < 0) continue; const own = new Set([label[v]]); for (const w of adj[v].keys()) if (label[w] >= 0) own.add(label[w]); for (const c of own) pts[c].push(XV(v)); }
-  // order each panel's corners round its middle, on its own plane
+  // the outside and the seams (both are edges with one face here): their points go to the cell they belong to, and
+  // where two cells meet along one, the split point goes to both
+  for (const [k, c] of ecount){ if (c !== 1) continue; const a = Math.floor(k / nv), b = k % nv; if (label[a] < 0 || label[b] < 0) continue;
+    pts[label[a]].push(XV(a)); pts[label[b]].push(XV(b)); if (label[a] !== label[b]){ const q = bis(a, b); pts[label[a]].push(q); pts[label[b]].push(q.clone()); } }
   const list = [];
   for (let c = 0; c < n; c++){ const q = pts[c]; if (q.length < 3) continue; const ctr = new V3(); q.forEach(p => ctr.add(p)); ctr.multiplyScalar(1 / q.length);
-    const nz = nrm[c].lengthSq() ? nrm[c].clone().normalize() : new V3(0, 1, 0), ax = Math.abs(nz.y) < 0.9 ? new V3(0, 1, 0) : new V3(1, 0, 0), e1 = ax.clone().sub(nz.clone().multiplyScalar(ax.dot(nz))).normalize(), e2 = nz.clone().cross(e1);
+    const size = sz[cells.seeds[c]] || minS, nz = nrm[c].lengthSq() ? nrm[c].clone().normalize() : new V3(0, 1, 0), ax = Math.abs(nz.y) < 0.9 ? new V3(0, 1, 0) : new V3(1, 0, 0), e1 = ax.clone().sub(nz.clone().multiplyScalar(ax.dot(nz))).normalize(), e2 = nz.clone().cross(e1);
     const ord = q.map(p => { const d = p.clone().sub(ctr); return [Math.atan2(d.dot(e2), d.dot(e1)), p]; }).sort((a, b) => a[0] - b[0]).map(x => x[1]);
-    const ring = []; for (const p of ord) if (!ring.length || ring[ring.length - 1].distanceToSquared(p) > (size * 0.04) ** 2) ring.push(p); if (ring.length > 2 && ring[0].distanceToSquared(ring[ring.length - 1]) < (size * 0.04) ** 2) ring.pop();
-    if (ring.length < 3) continue;
-    // how far the surface under it is from its plane
-    list.push({ ring, c: ctr, nrm: nz, dev: cells.flat[c] }); }
-  panels = { hex: true, list, merged: [], size, tol: Math.max(0.01, ...list.map(p => p.dev)) }; showPanels();
-  const fl = list.map(p => p.dev).sort((a, b) => a - b), med = fl[fl.length >> 1] || 0;
-  flash(list.length + ' hex panels about ' + lenText(size) + ' across, straight edged. Half are within ' + lenText(med) + ' of flat.', 7);
+    const ring = []; for (const p of ord) if (!ring.length || ring[ring.length - 1].distanceToSquared(p) > (size * 0.03) ** 2) ring.push(p); if (ring.length > 2 && ring[0].distanceToSquared(ring[ring.length - 1]) < (size * 0.03) ** 2) ring.pop();
+    if (ring.length < 3) continue; list.push({ ring, c: ctr, nrm: nz, dev: cells.flat[c], size }); }
+  panels = { hex: true, list, merged: [], minS, maxS, tol }; labelPanels(); showPanels();
+  const over = list.filter(p => p.dev > tol).length;
+  flash(list.length + ' Voronoi panels, ' + lenText(minS) + ' to ' + lenText(maxS) + ' across' + (over ? ' (' + over + ' are curvier than ' + lenText(tol) + ': they hit the smallest size)' : ', each within ' + lenText(tol) + ' of flat') + '.', 8);
 }
+// ---------- fabrication size: the model is built at a scale (1:10 makes a fingerboard park out of the park you
+// drew), from sheets of a thickness. Park metres → millimetres of the real piece.
+const FAB_SCALE = [1, 2, 5, 10, 20, 50], SHEET_T = [3.2, 4.8, 6.4, 9.5, 12.7, 19], SHEET_T_NAME = ['1/8"', '3/16"', '1/4"', '3/8"', '1/2"', '3/4"'];
+const SHEETS = [[300, 200], [457, 305], [610, 457], [762, 508], [1220, 610], [2440, 1220]];
+const fabK = () => 1000 / FAB_SCALE[S.fabScale ?? 3];                 // mm of the real piece per park metre
+const mmText = mm => mm >= 1000 ? (Math.round(mm / 10) / 100) + ' m' : Math.round(mm) + ' mm';
+function surfBox(){ if (!surfMesh) return null; surfMesh.geometry.computeBoundingBox(); return surfMesh.geometry.boundingBox.clone(); }
+// ---------- labels and unrolled chains: neighbouring flat panels stay joined along shared edges (scored, to fold
+// there when you fit them), unrolled flat into strips that fit the sheet; each panel is named by its strip and place
+function labelPanels(){
+  if (!panels || !panels.hex) return; const L = panels.list, key = p => Math.round(p.x * 2e4) + ',' + Math.round(p.y * 2e4) + ',' + Math.round(p.z * 2e4);
+  // each panel flat on its own plane (2D, in the real piece's millimetres)
+  const K = fabK();
+  L.forEach(pn => { const nz = pn.nrm, ax = Math.abs(nz.y) < 0.9 ? new V3(0, 1, 0) : new V3(1, 0, 0), e1 = ax.clone().sub(nz.clone().multiplyScalar(ax.dot(nz))).normalize(), e2 = nz.clone().cross(e1);
+    pn.flat2 = pn.ring.map(p => { const d = p.clone().sub(pn.c); return [d.dot(e1) * K, d.dot(e2) * K]; }); pn.keys = pn.ring.map(key); });
+  // shared edges
+  const edgeMap = new Map(); L.forEach((pn, i) => pn.keys.forEach((a, k) => { const b = pn.keys[(k + 1) % pn.keys.length], e = a < b ? a + '|' + b : b + '|' + a; (edgeMap.get(e) || edgeMap.set(e, []).get(e)).push([i, k]); }));
+  // neighbours: every edge two panels share; they hinge on the longest one, and the rest of that shared boundary
+  // folds with it
+  const len2 = (pn, k) => pn.ring[k].distanceTo(pn.ring[(k + 1) % pn.ring.length]), share = L.map(() => new Map());
+  for (const l of edgeMap.values()) if (l.length === 2){ const [[i, ki], [j, kj]] = l; (share[i].get(j) || share[i].set(j, []).get(j)).push([ki, kj]); (share[j].get(i) || share[j].set(i, []).get(i)).push([kj, ki]); }
+  const nbrs = L.map((pn, i) => [...share[i]].map(([j, l]) => { const [ki, kj] = l.reduce((b, e) => len2(pn, e[0]) > len2(pn, b[0]) ? e : b); return { j, ki, kj, w: l.reduce((s3, e) => s3 + len2(pn, e[0]), 0) }; }).sort((a, b) => b.w - a.w));
+  panels.share = share;
+  const [SW, SH] = SHEETS[S.sheet ?? 2], maxLen = S.chainLen ?? 6, chainOf = new Int32Array(L.length).fill(-1), chains = [];
+  const xf = (pts, a0, b0, a1, b1) => { // rigid move taking segment a0→b0 onto a1→b1
+    const t0 = Math.atan2(b0[1] - a0[1], b0[0] - a0[0]), t1 = Math.atan2(b1[1] - a1[1], b1[0] - a1[0]), r = t1 - t0, c = Math.cos(r), s2 = Math.sin(r);
+    return pts.map(([x, y]) => { const dx = x - a0[0], dy = y - a0[1]; return [a1[0] + dx * c - dy * s2, a1[1] + dx * s2 + dy * c]; }); };
+  const segX = (p, q, r, t) => { const d = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]); const d1 = d(p, q, r), d2 = d(p, q, t), d3 = d(r, t, p), d4 = d(r, t, q); return d1 * d2 < -1e-6 && d3 * d4 < -1e-6; };
+  const inside = (pt, poly) => { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) if ((poly[i][1] > pt[1]) !== (poly[j][1] > pt[1]) && pt[0] < (poly[j][0] - poly[i][0]) * (pt[1] - poly[i][1]) / (poly[j][1] - poly[i][1]) + poly[i][0]) c = !c; return c; };
+  const overlaps = (A, B) => { for (let i = 0; i < A.length; i++) for (let j = 0; j < B.length; j++) if (segX(A[i], A[(i + 1) % A.length], B[j], B[(j + 1) % B.length])) return true;
+    const ca = A.reduce((s3, p) => [s3[0] + p[0] / A.length, s3[1] + p[1] / A.length], [0, 0]), cb = B.reduce((s3, p) => [s3[0] + p[0] / B.length, s3[1] + p[1] / B.length], [0, 0]); return inside(ca, B) || inside(cb, A); };
+  const bbox = polys => { let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity; for (const p of polys) for (const [x, y] of p){ x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); } return [x0, y0, x1, y1]; };
+  // start strips from one end of the park and grow each from its newest panel, so they come out as chains
+  const order = L.map((pn, i) => i).sort((a, b) => (L[a].c.x + L[a].c.z) - (L[b].c.x + L[b].c.z));
+  for (const s0 of order){ if (chainOf[s0] >= 0) continue; const ch = { id: chains.length, items: [{ i: s0, poly: L[s0].flat2 }], folds: [] }; chainOf[s0] = ch.id; chains.push(ch);
+    let tip = ch.items[0];
+    while (ch.items.length < maxLen){ let added = null;
+      for (const nb of nbrs[tip.i]){ if (chainOf[nb.j] >= 0) continue; const P2 = L[nb.j].flat2, a0 = P2[(nb.kj + 1) % P2.length], b0 = P2[nb.kj], a1 = tip.poly[nb.ki], b1 = tip.poly[(nb.ki + 1) % tip.poly.length];
+        const poly = xf(P2, a0, b0, a1, b1); poly[(nb.kj + 1) % P2.length] = a1.slice(); poly[nb.kj] = b1.slice();   // the shared edge lands exactly on its neighbour's
+        if (ch.items.some(it => it !== tip && overlaps(poly, it.poly))) continue;
+        const bb = bbox([...ch.items.map(it => it.poly), poly]); if (bb[2] - bb[0] > SW - 10 || bb[3] - bb[1] > SH - 10){ const bb2 = [bb[1], bb[0], bb[3], bb[2]]; if (bb2[2] - bb2[0] > SW - 10 || bb2[3] - bb2[1] > SH - 10) continue; }
+        added = { i: nb.j, poly, parent: tip, pe: nb.ki, oe: nb.kj }; break; }
+      if (!added) break; chainOf[added.i] = ch.id; ch.items.push(added); tip = added; } }
+  // names: strip letter(s), then place along it
+  const nm = i => { let s3 = ''; i++; while (i > 0){ const m = (i - 1) % 26; s3 = String.fromCharCode(65 + m) + s3; i = Math.floor((i - 1) / 26); } return s3; };
+  chains.forEach(ch => { ch.name = nm(ch.id); ch.items.forEach((it, k) => { L[it.i].label = ch.name + (k + 1); }); });
+  panels.chains = chains;
+}
+// one SVG for the laser: red cut lines round each strip, blue score lines where it folds, names on every panel; strips
+// laid out on sheets of the size you set
+function exportPanelSVG(){
+  if (!panels || !panels.hex || !panels.chains) return flash('Make Voronoi panels first');
+  const [SW, SH] = SHEETS[S.sheet ?? 2], L = panels.list, gap = 6, out = [];
+  const shapes = panels.chains.map(ch => { let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity; for (const it of ch.items) for (const [x, y] of it.poly){ x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    let w = x1 - x0, h = y1 - y0, rot = false; if (w > SW - 2 * gap || (h > w && h <= SW - 2 * gap && w <= SH - 2 * gap)){ rot = true; [w, h] = [h, w]; } return { ch, x0, y0, w, h, rot }; }).sort((a, b) => b.h - a.h);
+  // shelves
+  let sheet = 0, x = gap, y = gap, rowH = 0; for (const sh of shapes){ if (x + sh.w > SW - gap){ x = gap; y += rowH + gap; rowH = 0; } if (y + sh.h > SH - gap){ sheet++; x = gap; y = gap; rowH = 0; } sh.sheet = sheet; sh.x = x; sh.y = y; x += sh.w + gap; rowH = Math.max(rowH, sh.h); }
+  const nSheets = sheet + 1, place = (sh, [px, py]) => { let qx = px - sh.x0, qy = py - sh.y0; if (sh.rot) [qx, qy] = [qy, sh.w - qx + 0 * qy]; return [(sh.x + qx).toFixed(2), (sh.sheet * (SH + 20) + sh.y + qy).toFixed(2)]; };
+  out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${SW}mm" height="${nSheets * (SH + 20)}mm" viewBox="0 0 ${SW} ${nSheets * (SH + 20)}">`);
+  for (let k = 0; k < nSheets; k++) out.push(`<rect x="0" y="${k * (SH + 20)}" width="${SW}" height="${SH}" fill="none" stroke="#999" stroke-width="0.2"/><text x="2" y="${k * (SH + 20) + SH + 8}" font-size="5" fill="#999">sheet ${k + 1} of ${nSheets} · ${SW} × ${SH} mm · ${SHEET_T_NAME[S.sheetT ?? 0]} · 1:${FAB_SCALE[S.fabScale ?? 3]}</text>`);
+  for (const sh of shapes){ const ch = sh.ch;
+    const SH2 = panels.share;
+    for (const it of ch.items){ const p = it.poly, mineToParent = it.parent ? new Set((SH2[it.i].get(it.parent.i) || []).map(e => e[0])) : new Set(), kids = ch.items.filter(o => o.parent === it), foldE = new Set();
+      for (const o of kids) for (const e of SH2[it.i].get(o.i) || []) foldE.add(e[0]);
+      for (let i = 0; i < p.length; i++){ if (mineToParent.has(i)) continue;   // drawn by the panel it folds from
+      const fold = foldE.has(i), A = place(sh, p[i]), B = place(sh, p[(i + 1) % p.length]);
+      out.push(`<line x1="${A[0]}" y1="${A[1]}" x2="${B[0]}" y2="${B[1]}" stroke="${fold ? '#0060ff' : '#ff0000'}" stroke-width="0.1"${fold ? ' stroke-dasharray="2 1"' : ''}/>`); } }
+    for (const it of ch.items){ const c = it.poly.reduce((s3, p) => [s3[0] + p[0] / it.poly.length, s3[1] + p[1] / it.poly.length], [0, 0]), C = place(sh, c), r = Math.sqrt(Math.abs(polyArea(it.poly)));
+      out.push(`<text x="${C[0]}" y="${C[1]}" font-size="${Math.max(1.5, Math.min(8, r * 0.22)).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" fill="#000">${L[it.i].label}</text>`); } }
+  out.push('</svg>');
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'image/svg+xml' })); a.download = 'pentimento-park-panels.svg'; a.click();
+  flash('Saved ' + L.length + ' panels in ' + panels.chains.length + ' strips on ' + nSheets + (nSheets === 1 ? ' sheet' : ' sheets') + ' (SVG: red cut, blue dashed score)', 7);
+}
+const polyArea = p => { let a = 0; for (let i = 0; i < p.length; i++){ const q = p[(i + 1) % p.length]; a += p[i][0] * q[1] - q[0] * p[i][1]; } return a / 2; };
+// ---------- the waffle underneath: ribs both ways at a spacing, from the base up to just under the panels, with
+// half-depth slots where they cross (one set slotted from the top, the other from the bottom)
+let waffle = null; const waffleGroup = new THREE.Group(); world.add(waffleGroup);
+function clearWaffle(){ for (const o of [...waffleGroup.children]){ waffleGroup.remove(o); o.geometry.dispose(); } waffle = null; menuDirty = true; }
+function heightGrid(cell){
+  const P = surfMesh.geometry.attributes.position.array, bb = surfBox(), nx = Math.ceil((bb.max.x - bb.min.x) / cell) + 1, nz = Math.ceil((bb.max.z - bb.min.z) / cell) + 1, H = new Float32Array(nx * nz).fill(-Infinity);
+  for (let t = 0; t < P.length; t += 9){ const ax = P[t], ay = P[t + 1], az = P[t + 2], bx = P[t + 3], by = P[t + 4], bz = P[t + 5], cx = P[t + 6], cy = P[t + 7], cz = P[t + 8];
+    const i0 = Math.max(0, Math.floor((Math.min(ax, bx, cx) - bb.min.x) / cell)), i1 = Math.min(nx - 1, Math.ceil((Math.max(ax, bx, cx) - bb.min.x) / cell)), j0 = Math.max(0, Math.floor((Math.min(az, bz, cz) - bb.min.z) / cell)), j1 = Math.min(nz - 1, Math.ceil((Math.max(az, bz, cz) - bb.min.z) / cell));
+    const d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz); if (Math.abs(d) < 1e-12) continue;
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++){ const x = bb.min.x + i * cell, z = bb.min.z + j * cell, l1 = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / d, l2 = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / d, l3 = 1 - l1 - l2;
+      if (l1 < -1e-6 || l2 < -1e-6 || l3 < -1e-6) continue; const y = l1 * ay + l2 * by + l3 * cy; if (y > H[i * nz + j]) H[i * nz + j] = y; } }
+  return { H, nx, nz, cell, bb, at: (x, z) => { const i = Math.round((x - bb.min.x) / cell), j = Math.round((z - bb.min.z) / cell); return i < 0 || j < 0 || i >= nx || j >= nz ? -Infinity : H[i * nz + j]; } };
+}
+function makeWaffle(){
+  if (!surfMesh) return flash('Build a surface first (step 3)'); clearWaffle();
+  const K = fabK(), t = SHEET_T[S.sheetT ?? 0] / K, gapP = (S.ribGap ?? 60) / K, bb = surfBox(), base = bb.min.y - (S.baseExtra ?? 0) / K, G = heightGrid(Math.max(0.002 / (1 / K), gapP / 12, (bb.max.x - bb.min.x) / 600));
+  const ribs = [], step = G.cell;
+  // ribs across x (constant x) and across z (constant z)
+  for (const dir of ['x', 'z']){ const lo = dir === 'x' ? bb.min.x : bb.min.z, hi = dir === 'x' ? bb.max.x : bb.max.z, lo2 = dir === 'x' ? bb.min.z : bb.min.x, hi2 = dir === 'x' ? bb.max.z : bb.max.x;
+    // a rib longer than the sheet is cut into pieces, each cut halfway between two crossing ribs (so every piece
+    // is still held by its slots)
+    const maxL = (SHEETS[S.sheet ?? 2][0] - 24) / K;
+    let k = 0; for (let c = lo + gapP / 2; c < hi; c += gapP){ k++; let run = []; const mine = [];
+      const keep = pr => { if (pr.length > 3 && Math.max(...pr.map(r => r[1])) - base > 8 / K) mine.push(pr); };
+      const flush = () => { let pr = run; run = [];
+        while (pr.length > 3 && pr[pr.length - 1][0] - pr[0][0] > maxL){ const st = pr[0][0]; let cut = lo2 + Math.floor((st + maxL - lo2) / gapP) * gapP; if (cut <= st + gapP * 0.5) cut = st + maxL;
+          const i = pr.findIndex(q => q[0] >= cut); keep(pr.slice(0, i + 1)); pr = pr.slice(i); }
+        keep(pr); };
+      for (let u = lo2; u <= hi2 + 1e-9; u += step){ const y = dir === 'x' ? G.at(c, u) : G.at(u, c); if (y > -Infinity) run.push([u, y - t]); else flush(); } flush();
+      mine.forEach((pr, m) => ribs.push({ dir, c, prof: pr, name: (dir === 'x' ? 'X' : 'Z') + k + (mine.length > 1 ? String.fromCharCode(97 + m) : '') })); } }
+  // where ribs cross: slot both, half the height each (x ribs from the top, z ribs from the bottom)
+  for (const r of ribs){ r.slots = []; for (const o of ribs){ if (o.dir === r.dir) continue; const u = o.c; if (u < r.prof[0][0] || u > r.prof[r.prof.length - 1][0]) continue; if (r.c < o.prof[0][0] || r.c > o.prof[o.prof.length - 1][0]) continue;
+    let top = -Infinity; for (const [uu, y] of r.prof) if (Math.abs(uu - u) <= step) top = Math.max(top, y); if (top <= base) continue; r.slots.push({ u, mid: base + (top - base) / 2, top, other: o.name }); } }
+  waffle = { ribs, base, t, K }; showWaffle();
+  flash(ribs.length + ' ribs (' + ribs.filter(r => r.dir === 'x').length + ' one way, ' + ribs.filter(r => r.dir === 'z').length + ' the other), every ' + mmText(S.ribGap ?? 60) + ', ' + SHEET_T_NAME[S.sheetT ?? 0] + ' thick', 7);
+}
+function showWaffle(){ for (const o of [...waffleGroup.children]){ waffleGroup.remove(o); o.geometry.dispose(); } if (!waffle) return; const seg = [];
+  for (const r of waffle.ribs){ const P3 = (u, y) => r.dir === 'x' ? [r.c, y, u] : [u, y, r.c], pr = r.prof, a = pr[0][0], b = pr[pr.length - 1][0];
+    const loop = [P3(a, waffle.base), ...pr.map(([u, y]) => P3(u, y)), P3(b, waffle.base)]; for (let i = 0; i < loop.length; i++){ const p = loop[i], q = loop[(i + 1) % loop.length]; seg.push(...p, ...q); } }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(seg, 3)); waffleGroup.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xF2C230 }))); waffleGroup.visible = menuTab === 'fab'; }
+function exportWaffleSVG(){
+  if (!waffle) return flash('Make the waffle first'); const K = waffle.K, tmm = SHEET_T[S.sheetT ?? 0], [SW, SH] = SHEETS[S.sheet ?? 2], gap = 6, out = [];
+  const shapes = waffle.ribs.map(r => { const u0 = r.prof[0][0], pts = [[0, 0], ...r.prof.map(([u, y]) => [(u - u0) * K, (y - waffle.base) * K]), [(r.prof[r.prof.length - 1][0] - u0) * K, 0]];
+    const w = Math.max(...pts.map(p => p[0])), h = Math.max(...pts.map(p => p[1])); return { r, pts, w, h, u0 }; }).sort((a, b) => b.h - a.h);
+  let sheet = 0, x = gap, y = gap, rowH = 0; for (const sh of shapes){ if (x + sh.w > SW - gap){ x = gap; y += rowH + gap; rowH = 0; } if (y + sh.h > SH - gap){ sheet++; x = gap; y = gap; rowH = 0; } sh.sheet = sheet; sh.x = x; sh.y = y; x += sh.w + gap; rowH = Math.max(rowH, sh.h); }
+  const nS = sheet + 1; out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${SW}mm" height="${nS * (SH + 20)}mm" viewBox="0 0 ${SW} ${nS * (SH + 20)}">`);
+  for (let k = 0; k < nS; k++) out.push(`<rect x="0" y="${k * (SH + 20)}" width="${SW}" height="${SH}" fill="none" stroke="#999" stroke-width="0.2"/><text x="2" y="${k * (SH + 20) + SH + 8}" font-size="5" fill="#999">ribs · sheet ${k + 1} of ${nS} · ${tmm} mm (${SHEET_T_NAME[S.sheetT ?? 0]}) · 1:${FAB_SCALE[S.fabScale ?? 3]}</text>`);
+  for (const sh of shapes){ const oy = sh.sheet * (SH + 20) + sh.y, X = px => (sh.x + px).toFixed(2), Y = py => (oy + sh.h - py).toFixed(2);
+    // outline with the slots cut in
+    let d = ''; const pts = sh.pts; d += `M${X(pts[0][0])} ${Y(pts[0][1])}`; for (const p of pts.slice(1)) d += ` L${X(p[0])} ${Y(p[1])}`; d += ' Z';
+    out.push(`<path d="${d}" fill="none" stroke="#ff0000" stroke-width="0.1"/>`);
+    for (const sl of sh.r.slots){ const cx = (sl.u - sh.u0) * K, hw = tmm / 2, yA = sh.r.dir === 'x' ? (sl.mid - waffle.base) * K : -1, yB = sh.r.dir === 'x' ? (sl.top - waffle.base) * K + 1 : (sl.mid - waffle.base) * K;
+      out.push(`<rect x="${X(cx - hw)}" y="${Y(yB)}" width="${tmm.toFixed(2)}" height="${(yB - yA).toFixed(2)}" fill="none" stroke="#ff0000" stroke-width="0.1"/>`); }
+    out.push(`<text x="${X(sh.w / 2)}" y="${Y(Math.min(8, sh.h / 3))}" font-size="${Math.max(2, Math.min(6, sh.h / 4)).toFixed(1)}" text-anchor="middle" fill="#0060ff">${sh.r.name}</text>`); }
+  out.push('</svg>'); const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'image/svg+xml' })); a.download = 'pentimento-park-waffle.svg'; a.click();
+  flash('Saved ' + waffle.ribs.length + ' ribs on ' + nS + (nS === 1 ? ' sheet' : ' sheets') + ' (SVG). The slots are cut where the ribs cross; the names are etched.', 7);
+}
+// panel names in the headset: small tags on each panel
+const labelGroup = new THREE.Group(); world.add(labelGroup);
+function showPanelLabels(){ for (const o of [...labelGroup.children]){ labelGroup.remove(o); o.material.map.dispose(); o.material.dispose(); }
+  if (!panels || !panels.hex || !S.panelLabels || menuTab !== 'fab') return;
+  for (const pn of panels.list.slice(0, 1500)){ if (!pn.label) continue; const c = document.createElement('canvas'); c.width = 96; c.height = 48; const g = c.getContext('2d'); g.fillStyle = 'rgba(23,25,29,.85)'; g.beginPath(); g.roundRect(2, 2, 92, 44, 14); g.fill(); g.fillStyle = '#fff'; g.font = '700 28px Archivo, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(pn.label, 48, 26);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthTest: true, transparent: true })); const sc = Math.max(0.05, pn.size * 0.35);
+    sp.scale.set(sc, sc / 2, 1); sp.position.copy(pn.c).addScaledVector(pn.nrm, 0.01 * N()); labelGroup.add(sp); } }
 function makePanels(){
   const A = SV(), cage = panelCage(); if (!A || !cage) return flash('Build a surface first (step 3)');
   const tol = PANEL_TOL[S.panelTol ?? 2], nf = cage.F.length;
@@ -1241,7 +1383,7 @@ function makePanels(){
 const PANEL_COLS = [0xFF6B3D, 0x2FB3A5, 0xFF5FA2, 0xF2C230, 0x4F8CFF, 0x6FD16A, 0xA87BFF, 0xE8463B, 0x5FE0B8].map(c => new THREE.Color(c));
 function showPanels(){
   for (const o of [...panelGroup.children]){ panelGroup.remove(o); o.geometry.dispose(); }
-  if (!panels) return; if (panels.hex) return showHexPanels(); const { list, merged, P, tol } = panels, pos = [], col = [], seg = [], tmp = new THREE.Color();
+  if (!panels) return; if (panels.hex){ showHexPanels(); showPanelLabels(); return; } const { list, merged, P, tol } = panels, pos = [], col = [], seg = [], tmp = new THREE.Color();
   const colFor = (k, dev) => S.panelColor === 1 ? tmp.setRGB(0.3 + 0.7 * Math.min(1, dev / tol), 0.85 - 0.6 * Math.min(1, dev / tol), 0.4 - 0.2 * Math.min(1, dev / tol)) : tmp.copy(PANEL_COLS[k % PANEL_COLS.length]);
   const quad = (a, b, c, d, cl) => { for (const p of [a, b, c, a, c, d]){ pos.push(p.x, p.y, p.z); col.push(cl.r, cl.g, cl.b); } };
   const off = 0.004 * N();
@@ -2450,7 +2592,7 @@ function setStep(st, quiet){
   else if (st !== 'settings' && S.tool === 'ride') S.tool = SKETCH_TOOLS.includes(S.sketchTool) ? S.sketchTool : 'draw';
   if (st === 'shape' && !cageEditing && (cageEd || hasSurface())) startCageEdit(true);
   if (st !== 'settings') S.more = 0;
-  try { applySurfView(); showRunHandles(); } catch (e){}
+  try { applySurfView(); showRunHandles(); waffleGroup.visible = st === 'fab'; showPanelLabels(); } catch (e){}
   menuDirty = true; scheduleSave(); if (S.tips) drawTips();
   if (!quiet && st !== 'settings') flash((STEPS.indexOf(st) + 1) + ' · ' + STEP_NAME[st] + ': ' + STEP_SUB[st] + (st === 'ride' && !S.rideAnyScale ? ' · park at 1:10' : ''));
 }
@@ -2616,22 +2758,34 @@ function setStep(st, quiet){
 
   // ===== 5 FAB
   head('fab');
+  section('fab', () => { const bb = surfBox(), K = fabK(); return bb ? 'THE PIECE · ' + mmText((bb.max.x - bb.min.x) * K) + ' × ' + mmText((bb.max.z - bb.min.z) * K) + ' × ' + mmText((bb.max.y - bb.min.y + (S.baseExtra ?? 0) / K) * K) + ' TALL' : 'THE PIECE'; });
+  stepper('fab', 64, 'Build it at', () => FAB_SCALE[S.fabScale ?? 3] === 1 ? 'full size' : '1:' + FAB_SCALE[S.fabScale ?? 3], () => { S.fabScale = Math.max(0, (S.fabScale ?? 3) - 1); scheduleSave(); }, () => { S.fabScale = Math.min(FAB_SCALE.length - 1, (S.fabScale ?? 3) + 1); scheduleSave(); });
+  stepper('fab', 64, () => 'Sheet thickness · ' + SHEET_T[S.sheetT ?? 0] + ' mm', () => SHEET_T_NAME[S.sheetT ?? 0], () => { S.sheetT = Math.max(0, (S.sheetT ?? 0) - 1); scheduleSave(); }, () => { S.sheetT = Math.min(SHEET_T.length - 1, (S.sheetT ?? 0) + 1); scheduleSave(); });
+  stepper('fab', 64, 'Sheet size (mm)', () => SHEETS[S.sheet ?? 2].join(' × '), () => { S.sheet = Math.max(0, (S.sheet ?? 2) - 1); scheduleSave(); }, () => { S.sheet = Math.min(SHEETS.length - 1, (S.sheet ?? 2) + 1); scheduleSave(); });
+  stepper('fab', 64, 'Base below lowest point', () => mmText(S.baseExtra ?? 0), () => { S.baseExtra = Math.max(0, (S.baseExtra ?? 0) - 5); scheduleSave(); }, () => { S.baseExtra = Math.min(200, (S.baseExtra ?? 0) + 5); scheduleSave(); });
   section('fab', 'PANELS');
-  row('fab', 72, [{ id: 'ps-quad', label: () => 'Quads', sub: () => 'as flat as you set', on: () => S.panelShape !== 'hex', act: () => { S.panelShape = 'quad'; scheduleSave(); } }, { id: 'ps-hex', label: () => 'Hexes', sub: () => 'one size, straight edges', on: () => S.panelShape === 'hex', act: () => { S.panelShape = 'hex'; scheduleSave(); } }]);
-  stepper('fab', 64, 'Hex size', () => lenText(HEX_SIZE[S.hexSize ?? 3]) + ' across', () => { S.hexSize = Math.max(0, (S.hexSize ?? 3) - 1); scheduleSave(); }, () => { S.hexSize = Math.min(HEX_SIZE.length - 1, (S.hexSize ?? 3) + 1); scheduleSave(); }, { vis: () => S.panelShape === 'hex' });
-  row('fab', 72, [{ id: 'seams-on', label: () => 'Creases are seams', on: () => S.panelSeams !== 0, act: () => { S.panelSeams = 1; scheduleSave(); } }, { id: 'seams-off', label: () => 'Hexes cross creases', on: () => S.panelSeams === 0, act: () => { S.panelSeams = 0; scheduleSave(); } }], { vis: () => S.panelShape === 'hex' });
-  note('fab', () => S.panelShape === 'hex' ? 'Hexagons of one size, relaxed over the surface. Each one\'s corners are where three panels meet, joined by straight edges and laid on its own plane.' : 'Flat panels along the surface\'s own quad lines: each quad is one panel if it\'s flat enough, otherwise it splits until every piece is. Flat areas get big panels (neighbouring flat quads join up), curved areas small ones. Creases are always panel edges.');
-  stepper('fab', 64, () => S.panelShape === 'hex' ? 'Colour scale: flat to' : 'Flat to within', () => lenText(PANEL_TOL[S.panelTol ?? 2]), () => { S.panelTol = Math.max(0, (S.panelTol ?? 2) - 1); scheduleSave(); }, () => { S.panelTol = Math.min(PANEL_TOL.length - 1, (S.panelTol ?? 2) + 1); scheduleSave(); });
+  row('fab', 72, [{ id: 'ps-quad', label: () => 'Quads', sub: () => 'along the quad lines', on: () => S.panelShape !== 'hex', act: () => { S.panelShape = 'quad'; scheduleSave(); } }, { id: 'ps-hex', label: () => 'Voronoi', sub: () => 'sized by the curve', on: () => S.panelShape === 'hex', act: () => { S.panelShape = 'hex'; scheduleSave(); } }]);
+  note('fab', () => S.panelShape === 'hex' ? 'Cells relaxed over the surface, small where it curves tightly and big where it\'s flat (between the sizes below), each with straight edges and laid on its own plane. Creases split the surface first, so a seam is one clean edge.' : 'Flat panels along the surface\'s own quad lines: each quad is one panel if it\'s flat enough, otherwise it splits until every piece is. Neighbouring flat quads join up. Creases are always panel edges.');
+  stepper('fab', 64, 'Flat to within', () => lenText(PANEL_TOL[S.panelTol ?? 2]), () => { S.panelTol = Math.max(0, (S.panelTol ?? 2) - 1); scheduleSave(); }, () => { S.panelTol = Math.min(PANEL_TOL.length - 1, (S.panelTol ?? 2) + 1); scheduleSave(); });
+  stepper('fab', 64, () => 'Smallest cell · ' + mmText(VOR_MIN[S.vorMin ?? 2] * fabK()) + ' cut', () => lenText(VOR_MIN[S.vorMin ?? 2]), () => { S.vorMin = Math.max(0, (S.vorMin ?? 2) - 1); scheduleSave(); }, () => { S.vorMin = Math.min(VOR_MIN.length - 1, (S.vorMin ?? 2) + 1); scheduleSave(); }, { vis: () => S.panelShape === 'hex' });
+  stepper('fab', 64, () => 'Largest cell · ' + mmText(VOR_MAX[S.vorMax ?? 3] * fabK()) + ' cut', () => lenText(VOR_MAX[S.vorMax ?? 3]), () => { S.vorMax = Math.max(0, (S.vorMax ?? 3) - 1); scheduleSave(); }, () => { S.vorMax = Math.min(VOR_MAX.length - 1, (S.vorMax ?? 3) + 1); scheduleSave(); }, { vis: () => S.panelShape === 'hex' });
+  row('fab', 72, [{ id: 'seams-on', label: () => 'Creases are seams', on: () => S.panelSeams !== 0, act: () => { S.panelSeams = 1; scheduleSave(); } }, { id: 'seams-off', label: () => 'Cells cross creases', on: () => S.panelSeams === 0, act: () => { S.panelSeams = 0; scheduleSave(); } }], { vis: () => S.panelShape === 'hex' });
   row('fab', 72, [{ id: 'join-on', label: () => 'Join flat quads', on: () => S.panelJoin !== 0, act: () => { S.panelJoin = 1; scheduleSave(); } }, { id: 'join-off', label: () => 'Keep one per quad', on: () => S.panelJoin === 0, act: () => { S.panelJoin = 0; scheduleSave(); } }], { vis: () => S.panelShape !== 'hex' });
   { const goW = 620; blk('fab', 96, [
-    add({ id: 'panels-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => panels ? 'REMAKE' : 'MAKE PANELS', sub: () => panels ? (panels.list.length + panels.merged.length) + (panels.hex ? ' hexes · ' + lenText(panels.size) : ' panels · within ' + lenText(panels.tol)) : hasSurface() ? 'from the surface' : 'build a surface first', act: () => { flash('Making panels…'); setTimeout(S.panelShape === 'hex' ? makeHexPanels : makePanels, 30); } }),
+    add({ id: 'panels-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => panels ? 'REMAKE' : 'MAKE PANELS', sub: () => panels ? (panels.list.length + panels.merged.length) + (panels.hex ? ' cells · ' + (panels.chains ? panels.chains.length + ' strips' : '') : ' panels · within ' + lenText(panels.tol)) : hasSurface() ? 'from the surface' : 'build a surface first', act: () => { flash('Making panels…'); setTimeout(S.panelShape === 'hex' ? makeVoronoiPanels : makePanels, 30); } }),
     add({ id: 'panels-clear', x: P + goW + G, y: 0, w: W - goW - G, h: 96, style: 'danger', label: () => 'Clear', vis: () => !!panels, act: clearPanels })]); }
   row('fab', 72, [{ id: 'pc-panel', label: () => 'Colour: by panel', on: () => S.panelColor !== 1, act: () => { S.panelColor = 0; showPanels(); scheduleSave(); } },
-    { id: 'pc-flat', label: () => 'Colour: how flat', on: () => S.panelColor === 1, act: () => { S.panelColor = 1; showPanels(); scheduleSave(); flash('Green: flat. Red: at the limit you set.', 5); } }], { vis: () => !!panels });
-  row('fab', 80, [{ id: 'panels-obj', label: () => 'Save flat panels OBJ', sub: () => 'one flat quad per panel, to cut', act: exportPanels }], { vis: () => !!panels });
-  note('fab', 'Want bigger quad panels overall? Fewer quads in step 3 (Target quads) gives a coarser layout to start from.', { vis: () => S.panelShape !== 'hex' });
-  section('fab', 'COMING NEXT');
-  note('fab', 'Wood: CNC ribs under bendable sheets. Concrete: pour zones and formwork lines.');
+    { id: 'pc-flat', label: () => 'Colour: how flat', on: () => S.panelColor === 1, act: () => { S.panelColor = 1; showPanels(); scheduleSave(); flash('Green: flat. Red: at the limit you set.', 5); } },
+    { id: 'pc-labels', style: 'lock', label: () => 'Names', on: () => !!S.panelLabels, vis: () => !!(panels && panels.hex), act: () => { S.panelLabels = S.panelLabels ? 0 : 1; showPanelLabels(); scheduleSave(); } }], { vis: () => !!panels });
+  stepper('fab', 64, 'Panels per strip', () => String(S.chainLen ?? 6), () => { S.chainLen = Math.max(1, (S.chainLen ?? 6) - 1); if (panels && panels.hex){ labelPanels(); showPanels(); } scheduleSave(); }, () => { S.chainLen = Math.min(30, (S.chainLen ?? 6) + 1); if (panels && panels.hex){ labelPanels(); showPanels(); } scheduleSave(); }, { vis: () => !!(panels && panels.hex) });
+  row('fab', 80, [{ id: 'panels-svg', label: () => 'Save cut sheets SVG', sub: () => 'unrolled strips, named', vis: () => !!(panels && panels.hex), act: exportPanelSVG }, { id: 'panels-obj', label: () => 'Save panels OBJ', sub: () => 'flat panels in 3D', act: exportPanels }], { vis: () => !!panels });
+  section('fab', 'WAFFLE UNDERNEATH');
+  note('fab', 'Ribs both ways from the base up to just under the panels (by the sheet thickness), with half-depth slots where they cross, laid out on sheets to cut.');
+  stepper('fab', 64, 'Rib spacing', () => mmText(S.ribGap ?? 60), () => { S.ribGap = Math.max(15, (S.ribGap ?? 60) - (S.ribGap > 100 ? 25 : 10)); scheduleSave(); }, () => { S.ribGap = Math.min(600, (S.ribGap ?? 60) + ((S.ribGap ?? 60) >= 100 ? 25 : 10)); scheduleSave(); });
+  { const goW = 620; blk('fab', 96, [
+    add({ id: 'waffle-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => waffle ? 'REMAKE WAFFLE' : 'MAKE WAFFLE', sub: () => waffle ? waffle.ribs.length + ' ribs' : hasSurface() ? 'under the surface' : 'build a surface first', act: () => { flash('Making the waffle…'); setTimeout(makeWaffle, 30); } }),
+    add({ id: 'waffle-clear', x: P + goW + G, y: 0, w: W - goW - G, h: 96, style: 'danger', label: () => 'Clear', vis: () => !!waffle, act: clearWaffle })]); }
+  row('fab', 80, [{ id: 'waffle-svg', label: () => 'Save ribs SVG', sub: () => 'outlines, slots and names', act: exportWaffleSVG }], { vis: () => !!waffle });
   endSection('fab');
 
   // ===== 6 FILES
@@ -3589,7 +3743,7 @@ setupButtons();
 window.pentimento = { ops: { delPoint: (...a) => delPoint(...a), cornerPoint: (...a) => cornerPoint(...a), addPoint: (...a) => addPoint(...a) }, load(list){ commit(list.map(o => makeStroke(o.tag, Float32Array.from(o.pts), Float32Array.from(o.pts)))); },
   drag(tool, path, brush){ S.tool = tool; if (brush !== undefined) S.brush = brush; const d = toolDown('t', new V3(...path[0])); for (const q of path){ d.dt = 1 / 72; toolMove('t', d, new V3(...q)); } toolUp('t', d); },
   showDial(kind, hover){ const f = camera.getWorldDirection(new V3()); dialMesh.position.copy(camera.position).addScaledVector(f, 0.42); dialMesh.quaternion.copy(camera.quaternion); dialMesh.visible = true; dial = { kind, h: null, items: dialItems(kind), hover }; drawDial(); },
-  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { setStep({ layers: 'sketch', view: 'settings' }[t] || t, true); menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, live: () => cageSurfaceLive(), full: () => cageSurface(), nDabs: () => dabs.length, smoothedCage: () => cageSmoothed(), lastFlash: () => flashText, N: () => N(), stepScale: d => stepScale(d), hoverAt: p => { setHover(pickHover(p)); return cageHov; }, delHover: () => deleteHover(), creaseHov: () => creaseHover(), loopHov: p => loopHover(p), buildSecs: () => lastBuildSecs, rideTool: t => setRideTool(t), runHandles: () => runHandles, runGrab: (j, p) => runPointGrab(j, p), runSmooth: () => runSmoothStart(), smoothRun: i => smoothWholeRun(runs[i]), extrude: (d, p) => extrudeHeld(d, p), dropHeld: d => dropHeld(d), cageUndo, cageTool: t => setCageTool(t), cageDown: (p, r) => cageToolDown(p, r), cageMove: (d, p) => cageToolMove(d, p, 1 / 30), cageUp: d => cageToolUp(d), cageTopo: () => cageTopo(), V3: V3, loopCut: (k, p) => loopCut(k, p), straightTap: k => straightTap(k), edgeChain: (a, b) => edgeChain(a, b), edgeRing: k => edgeRing(k), cageSmoothed: () => cageSmoothed(), startCageEdit: () => startCageEdit(true), cageOddN: () => cageOddN,  get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
+  get strokes(){ return strokes; }, get fab(){ return { panels, waffle }; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { setStep({ layers: 'sketch', view: 'settings' }[t] || t, true); menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, live: () => cageSurfaceLive(), full: () => cageSurface(), nDabs: () => dabs.length, smoothedCage: () => cageSmoothed(), lastFlash: () => flashText, N: () => N(), stepScale: d => stepScale(d), hoverAt: p => { setHover(pickHover(p)); return cageHov; }, delHover: () => deleteHover(), creaseHov: () => creaseHover(), loopHov: p => loopHover(p), buildSecs: () => lastBuildSecs, rideTool: t => setRideTool(t), runHandles: () => runHandles, runGrab: (j, p) => runPointGrab(j, p), runSmooth: () => runSmoothStart(), smoothRun: i => smoothWholeRun(runs[i]), extrude: (d, p) => extrudeHeld(d, p), dropHeld: d => dropHeld(d), cageUndo, cageTool: t => setCageTool(t), cageDown: (p, r) => cageToolDown(p, r), cageMove: (d, p) => cageToolMove(d, p, 1 / 30), cageUp: d => cageToolUp(d), cageTopo: () => cageTopo(), V3: V3, loopCut: (k, p) => loopCut(k, p), straightTap: k => straightTap(k), edgeChain: (a, b) => edgeChain(a, b), edgeRing: k => edgeRing(k), cageSmoothed: () => cageSmoothed(), startCageEdit: () => startCageEdit(true), cageOddN: () => cageOddN,  get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid(); setTips(!!S.tips); applyLighting(); applyBackground();
 if (savedCage) try { cageRestore(savedCage); setTimeout(cageSurface, 0); } catch (e){}
 // runs handed over from Party Lines (its Bring to Pentimento button)
