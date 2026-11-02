@@ -100,7 +100,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '1.0';
+const VERSION = '1.1';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -1325,6 +1325,8 @@ const MAXCP = 20000, cagePtMat = new THREE.MeshBasicMaterial({ color: 0xFFD23F, 
 const cagePts = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 8), cagePtMat, MAXCP); cagePts.renderOrder = 11; cagePts.frustumCulled = false; cagePts.count = 0; cageEdG.add(cagePts);
 const cageLineMat = new THREE.LineBasicMaterial({ color: 0xFFD23F, transparent: true, opacity: 0.55 }), cageCreaseMat = new THREE.LineBasicMaterial({ color: 0xFF3348 });
 let cageLines = null, cageCreases = null, cageHot = -1, cageSnap = -1;
+const cagePickMs = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 12, 10), new THREE.MeshBasicMaterial({ color: 0x4FC3FF, depthTest: false, transparent: true }), 4); cagePickMs.renderOrder = 12; cagePickMs.count = 0; cagePickMs.frustumCulled = false; cageEdG.add(cagePickMs);
+function cagePickUpdate(){ const M4 = new THREE.Matrix4(), rr = 0.006 * N(); cagePickMs.count = cageEd ? cagePicks.length : 0; cagePicks.forEach((i, j) => { M4.makeScale(rr, rr, rr).setPosition(cageEd.V[3 * i], cageEd.V[3 * i + 1], cageEd.V[3 * i + 2]); cagePickMs.setMatrixAt(j, M4); }); cagePickMs.instanceMatrix.needsUpdate = true; }
 const snapRing = new THREE.Mesh(new THREE.TorusGeometry(1, 0.2, 8, 24), new THREE.MeshBasicMaterial({ color: 0x5FE0B8, depthTest: false, transparent: true })); snapRing.renderOrder = 13; snapRing.visible = false; cageEdG.add(snapRing);
 const cageSnapshot = () => ({ V: cageEd.V.slice(), F: cageEd.F.map(f => f.slice()), sharp: [...cageEd.sharp], levels: cageEd.levels });
 const cageRestore = o => { cageEd = { V: o.V.slice(), F: o.F.map(f => f.slice()), sharp: new Set(o.sharp), levels: o.levels || 2 }; };
@@ -1335,7 +1337,8 @@ function startCageEdit(){
   if (!cageEd){ if (!lastResult || !lastResult.cage) return flash('Build a surface first'); if (building) return flash('Wait for the build to finish');
     cageRestore(cageFromResult(lastResult)); cageUndoS = []; cageRedoS = []; }
   cageEditing = true; cancelBuild(); showCage(); cageSurface(); scheduleSave(); menuDirty = true;
-  flash('Edit cage: drag a point, drop it on another to merge them. ' + (mainHand() === 'right' ? 'X / Y' : 'A / B') + ' undo / redo. Done editing to go back to your lines.', 8);
+  menuTab = 'surface';
+  flash('Edit cage: pick a cage tool under Edit cage (or hold A for the tool dial). ' + (mainHand() === 'right' ? 'X / Y' : 'A / B') + ' undo / redo. Done editing to go back to your lines.', 8);
 }
 function stopCageEdit(){ cageEditing = false; cageHot = -1; snapRing.visible = false; showCage(); applySurfView(); menuDirty = true; flash('Your edited cage is the surface now. Build rebuilds it from your lines (the edits go).', 6); }
 // the edited cage, smoothed, as the surface (and the quad edges, creases and the export follow it)
@@ -1349,7 +1352,7 @@ function cageSurface(){
     cage: { V: new Float32Array(cageEd.V), F: new Int32Array(cageEd.F.flat()), C: new Int32Array(C), sharp: Int32Array.from([...cageEd.sharp].flatMap(k => [Math.floor(k / 2097152), k % 2097152])) } };
   applyResult(r); stale = false;
 }
-function cagePtsUpdate(){ if (!cageEd) return; const V = cageEd.V, nv = V.length / 3, rr = 0.0035 * N(), M4 = new THREE.Matrix4();
+function cagePtsUpdate(){ if (!cageEd) return; cagePickUpdate(); const V = cageEd.V, nv = V.length / 3, rr = 0.0035 * N(), M4 = new THREE.Matrix4();
   cagePts.count = Math.min(nv, MAXCP); for (let i = 0; i < cagePts.count; i++){ const s = i === cageHot ? rr * 1.7 : rr; M4.makeScale(s, s, s).setPosition(V[3 * i], V[3 * i + 1], V[3 * i + 2]); cagePts.setMatrixAt(i, M4); }
   cagePts.instanceMatrix.needsUpdate = true; }
 function showCage(){
@@ -1371,10 +1374,102 @@ function cageWeld(from, to){
   for (const f of cageEd.F){ const g = []; for (const v0 of f){ const v = v0 === from ? to : v0; if (g[g.length - 1] !== v) g.push(v); } while (g.length > 1 && g[0] === g[g.length - 1]) g.pop();
     if (g.length < 3 || new Set(g).size !== g.length) continue; const key = g.slice().sort((a, b) => a - b).join(','); if (seen.has(key)) continue; seen.add(key); F2.push(g); }
   const sh = new Set(); for (const k of cageEd.sharp){ let a = Math.floor(k / 2097152), b = k % 2097152; if (a === from) a = to; if (b === from) b = to; if (a !== b) sh.add(CEK(a, b)); }
-  // drop points no face uses any more
+  cageCompact(F2, sh);
+}
+// keep these faces and creases, and drop the points no face uses any more
+function cageCompact(F2, sh){
   const used = new Int32Array(cageEd.V.length / 3).fill(-1), V2 = []; F2.forEach(f => f.forEach(v => { if (used[v] < 0){ used[v] = V2.length / 3; V2.push(cageEd.V[3 * v], cageEd.V[3 * v + 1], cageEd.V[3 * v + 2]); } }));
   const sh2 = new Set(); for (const k of sh){ const a = used[Math.floor(k / 2097152)], b = used[k % 2097152]; if (a >= 0 && b >= 0) sh2.add(CEK(a, b)); }
-  cageEd.V = V2; cageEd.F = F2.map(f => f.map(v => used[v])); cageEd.sharp = sh2;
+  cageEd.V = V2; cageEd.F = F2.map(f => f.map(v => used[v])); cageEd.sharp = sh2; cagePicks = [];
+}
+// ---------- cage tools (while editing the cage): Move points (drop on another to merge), Soft move (a sphere of points
+// with falloff), Smooth (sweep to relax bumps; creases and borders slide along themselves), Crease (touch edges to make
+// them sharp or smooth), Patch (tap 3 or 4 points to add a face), Fill (touch a hole's edge to close it), Delete faces.
+const CAGE_TOOLS = ['cmove', 'csoft', 'csmooth', 'ccrease', 'cpatch', 'cfill', 'cdel'];
+const CAGE_NAME = { cmove: 'Move', csoft: 'Soft', csmooth: 'Smooth', ccrease: 'Crease', cpatch: 'Patch', cfill: 'Fill hole', cdel: 'Delete' };
+const CAGE_NOTE = {
+  cmove: 'Grab a point and drag it. Drop it on another point and the two merge.',
+  csoft: 'Grab anywhere: every point in the sphere comes along, fading toward its edge. Stick up / down sizes the sphere.',
+  csmooth: 'Hold the trigger and sweep the sphere over bumps to relax them. Creases and borders slide along themselves and stay put at corners.',
+  ccrease: 'Touch cage edges to make them sharp creases (red). Start on a crease to make edges smooth instead.',
+  cpatch: 'Tap three or four points in order to add a face between them. Tap the first again to close a triangle.',
+  cfill: 'Touch an edge of a hole to close it with a face.',
+  cdel: 'Touch faces to take them out (sweep to take several).' };
+let cagePicks = [], cageTopoF = null, cageTopoE = null;
+const cageTool = () => CAGE_TOOLS.includes(S.cageTool) ? S.cageTool : 'cmove';
+function setCageTool(t){ S.cageTool = t; cagePicks = []; cagePickUpdate(); menuDirty = true; scheduleSave(); flash(CAGE_NAME[t] + ': ' + CAGE_NOTE[t], 5); }
+// edges with how many faces use them (one: a border or a hole's edge), and each point's neighbours
+function cageTopo(){
+  if (cageTopoF === cageEd.F && cageTopoE) return cageTopoE;
+  const E = new Map(), nb = []; for (let i = 0; i < cageEd.V.length / 3; i++) nb.push(new Set());
+  for (const f of cageEd.F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length], k = CEK(a, b); const e = E.get(k); if (e) e.n++; else E.set(k, { a, b, n: 1 }); nb[a].add(b); nb[b].add(a); }
+  cageTopoF = cageEd.F; cageTopoE = { E, nb }; return cageTopoE;
+}
+const cv = (i, out = new V3()) => out.set(cageEd.V[3 * i], cageEd.V[3 * i + 1], cageEd.V[3 * i + 2]);
+function segDist2(p, a, b){ const ab = b.clone().sub(a), t = Math.max(0, Math.min(1, p.clone().sub(a).dot(ab) / Math.max(1e-12, ab.lengthSq()))); return a.clone().addScaledVector(ab, t).distanceToSquared(p); }
+function nearestCageEdge(p, r, onlyBorder){ const { E } = cageTopo(); let best = null, bd = r * r; const a = new V3(), b = new V3();
+  for (const [k, e] of E){ if (onlyBorder && e.n !== 1) continue; const d = segDist2(p, cv(e.a, a), cv(e.b, b)); if (d < bd){ bd = d; best = k; } } return best; }
+const faceMid = f => { const c = new V3(); for (const v of f) c.add(cv(v, new V3())); return c.multiplyScalar(1 / f.length); };
+function nearestCageFace(p, r){ let best = -1, bd = r * r; cageEd.F.forEach((f, i) => { const d = faceMid(f).distanceToSquared(p); if (d < bd){ bd = d; best = i; } }); return best; }
+const cageR = () => BRUSH[S.brush] * FLAT_K * N();
+// a new face winds the same way as the faces next to it
+function orientFace(g){ const { E } = cageTopo(); for (let i = 0; i < g.length; i++){ const a = g[i], b = g[(i + 1) % g.length], e = E.get(CEK(a, b)); if (e && e.a === a && e.b === b) return g.reverse(); } return g; }
+function addCageFace(g){ cagePush(); cageEd.F = [...cageEd.F, orientFace(g.slice())]; cagePicks = []; cagePickUpdate(); showCage(); cageSurface(); scheduleSave(); }
+function cagePatchTap(i){
+  if (i < 0){ if (cagePicks.length){ cagePicks = []; cagePickUpdate(); flash('Patch cleared'); } return; }
+  if (cagePicks.length >= 3 && i === cagePicks[0]){ addCageFace(cagePicks); return flash('Triangle added'); }
+  if (cagePicks.includes(i)) return; cagePicks.push(i); cagePickUpdate();
+  if (cagePicks.length === 4){ addCageFace(cagePicks); flash('Face added'); }
+  else flash('Patch: ' + cagePicks.length + ' of 4 picked' + (cagePicks.length === 3 ? ' (tap the first again for a triangle)' : ''), 3);
+}
+// the hole whose edge you touched, walked round its border edges; the park's outer border isn't a hole
+function cageFill(k){
+  const { E } = cageTopo(), next = new Map(); let total = 0;
+  for (const e of E.values()) if (e.n === 1){ next.set(e.b, e.a); total++; }        // border edges run a→b in their face; walk them backwards
+  const e0 = E.get(k); if (!e0 || e0.n !== 1) return flash('Touch an edge of a hole');
+  const loop = [e0.a]; let v = next.get(e0.a), guard = 0;
+  while (v !== undefined && v !== e0.a && guard++ < 5000){ loop.push(v); v = next.get(v); }
+  if (v !== e0.a || loop.length < 3) return flash('Couldn\'t follow that hole round');
+  if (loop.length > total / 2) return flash('That\'s the outside edge of the park. Touch the edge of a hole.');
+  cagePush(); cageEd.F = [...cageEd.F, loop]; showCage(); cageSurface(); scheduleSave(); flash('Hole filled (' + loop.length + ' sides)');
+}
+function cageDeleteFace(fi){ const F2 = cageEd.F.filter((f, i) => i !== fi); cageCompact(F2, cageEd.sharp); }
+// what the trigger (or a click) does with the current cage tool at p; returns a drag, or null
+function cageToolDown(p, pickR){
+  const t = cageTool(), r = pickR || 0.02 * N();
+  if (t === 'cmove'){ const i = nearestCagePt(p, r); return i >= 0 ? cageGrab(i, p) : null; }
+  if (t === 'csoft'){ const R = cageR(), idx = [], w = [], q = new V3(); for (let i = 0; i < cageEd.V.length / 3; i++){ const d = cv(i, q).distanceTo(p); if (d < R){ const u = 1 - (d / R) ** 2; idx.push(i); w.push(u * u); } }
+    if (!idx.length) return null; cagePush(); return { kind: 'csoft', p0: p.clone(), idx, w, q0: idx.map(i => cv(i)) }; }
+  if (t === 'csmooth'){ cagePush(); return { kind: 'csmooth', did: false }; }
+  if (t === 'ccrease'){ cagePush(); const d = { kind: 'ccrease', mode: null, done: new Set(), r: r * 0.75 }; cageToolMove(d, p); return d; }
+  if (t === 'cdel'){ cagePush(); const d = { kind: 'cdel', n: 0, r: r * 1.5 }; cageToolMove(d, p); return d; }
+  if (t === 'cpatch'){ cagePatchTap(nearestCagePt(p, r)); return null; }
+  if (t === 'cfill'){ const k = nearestCageEdge(p, r * 1.5, true); if (k === null) flash('Touch an edge of a hole'); else cageFill(k); return null; }
+  return null;
+}
+// returns how much happened, for the buzz
+function cageToolMove(d, p, dt){
+  if (d.kind === 'csoft'){ const dl = p.clone().sub(d.p0); d.idx.forEach((i, j) => { const q = d.q0[j].clone().addScaledVector(dl, d.w[j]); cageEd.V[3 * i] = q.x; cageEd.V[3 * i + 1] = q.y; cageEd.V[3 * i + 2] = q.z; }); cageDirty = true; showCage(); return dl.length(); }
+  if (d.kind === 'csmooth'){
+    const { E, nb } = cageTopo(), R = cageR(), q = new V3(), avg = new V3(), moves = []; let amt = 0;
+    for (let i = 0; i < cageEd.V.length / 3; i++){ const dd = cv(i, q).distanceTo(p); if (dd >= R) continue;
+      // a point on a crease or the border relaxes along it; where three or more meet (a corner) it stays put
+      let ns = [...nb[i]]; const along = ns.filter(j => { const e = E.get(CEK(i, j)); return cageEd.sharp.has(CEK(i, j)) || e.n === 1; });
+      if (along.length) { if (along.length !== 2) continue; ns = along; }
+      if (!ns.length) continue; avg.set(0, 0, 0); for (const j of ns) avg.add(cv(j, new V3())); avg.multiplyScalar(1 / ns.length);
+      const u = 1 - (dd / R) ** 2, k = Math.min(1, u * u * (dt || 1 / 72) * 6); moves.push([i, q.clone().lerp(avg, k)]); amt += avg.distanceTo(q) * k; }
+    for (const [i, v] of moves){ cageEd.V[3 * i] = v.x; cageEd.V[3 * i + 1] = v.y; cageEd.V[3 * i + 2] = v.z; }
+    if (moves.length){ d.did = true; cageDirty = true; showCage(); } return amt; }
+  if (d.kind === 'ccrease'){ const k = nearestCageEdge(p, d.r); if (k === null || d.done.has(k)) return 0; if (d.mode === null) d.mode = !cageEd.sharp.has(k);
+    d.done.add(k); if (d.mode) cageEd.sharp.add(k); else cageEd.sharp.delete(k); cageDirty = true; showCage(); return 1; }
+  if (d.kind === 'cdel'){ const fi = nearestCageFace(p, d.r); if (fi < 0) return 0; cageDeleteFace(fi); d.n++; cageDirty = true; showCage(); return 1; }
+  return 0;
+}
+function cageToolUp(d){
+  if (d.kind === 'csmooth' && !d.did) cageUndoS.pop();
+  if (d.kind === 'ccrease'){ if (!d.done.size) cageUndoS.pop(); else flash(d.done.size + (d.done.size === 1 ? ' edge ' : ' edges ') + (d.mode ? 'creased' : 'smoothed')); }
+  if (d.kind === 'cdel'){ if (!d.n) cageUndoS.pop(); else flash(d.n + (d.n === 1 ? ' face' : ' faces') + ' deleted'); }
+  showCage(); cageSurface(); scheduleSave();
 }
 // a drag: the point follows the hand (or the mouse); near another point it clicks onto it, and letting go merges them
 function screenCagePt(e){ if (!cageEd) return -1; let best = -1, bd = 14 * 14; const v = new V3(), V = cageEd.V;
@@ -1764,6 +1859,8 @@ function loadSample(){
 
   row('surface', sy(12) + 188, 72, [{ id: 'cage-edit', style: 'lock', label: () => cageEditing ? 'Done editing' : cageEd ? 'Edit cage again' : 'Edit cage', on: () => cageEditing, act: () => cageEditing ? stopCageEdit() : startCageEdit() },
     { id: 'cage-drop', style: 'danger', vis: () => !!cageEd, label: () => 'Drop cage edits', act: () => askUser('Drop your cage edits and rebuild from your lines?', [{ label: 'Drop them', act: () => { cageEd = null; cageEditing = false; showCage(); scheduleSave(); startBuild(); } }, { label: 'Keep them', act: () => {} }]) }]);
+  row('surface', sy(12) + 272, 64, CAGE_TOOLS.map(t => ({ id: 'ct-' + t, label: () => CAGE_NAME[t], on: () => cageTool() === t, act: () => setCageTool(t) })), { vis: () => cageEditing });
+  text({ tab: 'surface', kind: 'note', x: P, y: sy(12) + 352, vis: () => cageEditing, text: () => CAGE_NOTE[cageTool()] });
   // FILES: your saved sketches
   text({ tab: 'files', kind: 'label', x: P, y: 360, text: () => { const n = libList().length; return n ? 'SAVED SKETCHES · ' + n : 'SAVED SKETCHES'; } });
   for (let i = 0; i < LIB_ROWS; i++){
@@ -1813,6 +1910,7 @@ const TIP_PAGES = {
     'Smooth paint (the Smooth tool on the surface) has its own row: hide it, or clear it to start again.',
     'Runs from Party Lines (press Bring to Pentimento there) show here as paths with boards riding them. Grip a path to move that one run; swing your hand round while holding to turn it. While holding it, A lays ties under it: short loose lines across the path where the board rolled, so the surface follows your ride (B takes them away). Tie spacing and width are under Layers → Runs; lay them again to redo them. To lines turns the rolling parts into loose lines: the board\'s two wheel tracks, flips left out.']],
   surface: ['WHAT THE SETTINGS DO', [
+    'Edit cage (bottom of this tab) turns the finished surface into its SubD cage to clean up by hand. Cage tools: Move (drop a point on another to merge), Soft (a sphere of points with falloff), Smooth (sweep out bumps), Crease, Patch (tap 3 or 4 points for a new face), Fill hole, Delete faces. Hold A for them on the dial; stick up / down sizes the sphere.',
     'Start with Fit detail and Smoothness. The rest can stay as they are.',
     'Fit detail is the main knob. Smaller follows your lines more closely (tight bowls, small features) and builds slower. Larger is smoother and faster.',
     'Smoothness: higher irons out wobbly lines; lower keeps more of exactly what you drew.',
@@ -2006,6 +2104,7 @@ function ontoSurface(p){
 }
 function toolMove(id, d, p){
   if (d.kind === 'cage'){ d.snapHit = cageDrag(d, p); return 0; }
+  if (d.kind[0] === 'c' && CAGE_TOOLS.includes(d.kind)) return cageToolMove(d, p, d.dt);
   if (d.kind === 'runs'){ runDrag(d, p, d.h ? handYaw(d.h) : undefined); return 0; }
   if (d.kind === 'ride'){ rideSample(d); return 0; }
   const r = BRUSH[S.brush] * N();
@@ -2028,6 +2127,7 @@ function toolMove(id, d, p){
 }
 function toolUp(id, d){
   if (d.kind === 'cage'){ cageDrop(d); return; }
+  if (CAGE_TOOLS.includes(d.kind)){ cageToolUp(d); return; }
   if (d.kind === 'ride'){ rideEnd(d); return; }
   if (d.kind === 'runs'){ if (d.live){ undoS.push(d.before); if (undoS.length > 100) undoS.shift(); redoS = []; menuDirty = true; scheduleSave(); } return; }
   if (d.kind === 'draw'){
@@ -2157,6 +2257,7 @@ const dialMesh = new THREE.Mesh(new THREE.PlaneGeometry(DIAL_M, DIAL_M), new THR
 dialMesh.renderOrder = 50; dialMesh.visible = false; scene.add(dialMesh);
 const toolCol = t => t === 'ride' ? '#FF6B3D' : t === 'draw' || t === 'mark' ? TAG_CSS[S.tag] : t === 'smooth' ? '#5FE0B8' : t === 'bend' || t === 'flatten' ? '#FFD23F' : '#F04348';
 function dialItems(kind){
+  if (kind === 'tool' && cageEditing) return CAGE_TOOLS.map(t => ({ label: CAGE_NAME[t], icon: t, col: '#FFD23F', on: cageTool() === t, act: () => setCageTool(t) }));
   if (kind === 'tool') return TOOLS.map(t => ({ label: TOOL_NAME[t], icon: t, col: toolCol(t), on: S.tool === t, act: () => { setTool(t); flash(TOOL_NAME[t] + ': ' + TOOL_NOTE[t]); } }));
   if (kind === 'name') return NAME_WORDS.map(w => ({ label: w, act: () => { if (nameTarget) setSketchName(nameTarget, w + ' ' + nameTarget.no); } }));
   if (kind === 'type') return VT.map(t => ({ label: TAG_NAME[t], icon: STRICT(t) ? 'strict' : 'line', col: TAG_CSS[t], tint: TAG_CSS[t], sub: STRICT(t) ? 'exact' : '', on: S.tag === t, act: () => { setTag(t); flash(TAG_NAME[t] + ': ' + TAG_SUB[t]); } }));
@@ -2176,6 +2277,15 @@ function drawIcon(g, name, x, y, size, col){
   const B = f => { g.beginPath(); f(); g.stroke(); };
   if (name === 'draw' || name === 'line'){ B(() => { g.moveTo(-20, 12); g.bezierCurveTo(-8, -18, 4, 22, 20, -10); }); if (name === 'draw'){ g.beginPath(); g.arc(20, -10, 5, 0, 7); g.fill(); } }
   else if (name === 'strict'){ B(() => { g.moveTo(-20, 12); g.bezierCurveTo(-8, -18, 4, 22, 20, -10); }); for (const [a, b] of [[-20, 12], [0, 3], [20, -10]]){ g.beginPath(); g.arc(a, b, 5.5, 0, 7); g.fill(); } }
+  else if (name[0] === 'c' && CAGE_TOOLS.includes(name)){ const P4 = [[-16, -12], [16, -14], [18, 14], [-14, 16]];
+    g.globalAlpha = 0.5; L(...P4.flat(), -16, -12); g.globalAlpha = 1;
+    if (name === 'cmove'){ g.beginPath(); g.arc(16, -14, 6, 0, 7); g.fill(); L(16, -14, 22, -22); }
+    else if (name === 'csoft'){ g.beginPath(); g.arc(0, 0, 14, 0, 7); g.stroke(); g.beginPath(); g.arc(0, 0, 5, 0, 7); g.fill(); }
+    else if (name === 'csmooth'){ L(-20, 4, -12, -6, -4, 8, 4, -4, 12, 4, 20, 0); }
+    else if (name === 'ccrease'){ g.strokeStyle = '#FF3348'; L(-16, -12, 18, 14); }
+    else if (name === 'cpatch'){ for (const [a, b] of P4.slice(0, 3)){ g.beginPath(); g.arc(a, b, 5, 0, 7); g.fill(); } }
+    else if (name === 'cfill'){ g.globalAlpha = 0.45; g.beginPath(); g.moveTo(...P4[0]); for (const q of P4) g.lineTo(...q); g.fill(); g.globalAlpha = 1; }
+    else if (name === 'cdel'){ L(-10, -8, 10, 10); L(10, -8, -10, 10); } }
   else if (name === 'ride'){ L(-22, -6, -18, 0, 18, 0, 22, -6); for (const x of [-11, 11]){ g.beginPath(); g.arc(x, 8, 5, 0, 7); g.fill(); } B(() => { g.moveTo(-22, 20); g.quadraticCurveTo(0, 12, 22, 20); }); }
   else if (name === 'bend'){ B(() => { g.moveTo(-22, 16); g.quadraticCurveTo(0, -26, 22, 16); }); L(0, -2, 0, -20); L(-7, -13, 0, -20, 7, -13); }
   else if (name === 'flatten'){ B(() => { g.moveTo(-22, -14); g.bezierCurveTo(-10, -26, 6, -2, 22, -14); }); L(-22, 16, 22, 16); L(0, -6, 0, 8); L(-6, 2, 0, 8, 6, 2); }
@@ -2282,11 +2392,13 @@ function updateXRInput(dt){
     if (S.tool === 'flatten' && (mHit || h.grab)) showSense(null);
     // grip (middle finger) near a control point grabs it; near a strict line between points, adds one there
     const canPts = !mHit && !h.grab && !h.act && !myDial && S.ptsShow && S.lines !== 'hide';
-    if (cageEditing && !h.act && !isOff(h)){ const i = nearestCagePt(p, 0.02 * N()); if (i !== cageHot){ cageHot = i; cagePtsUpdate(); if (i >= 0) pulse(h, 0.1, 6); } }
+    if (cageEditing && !h.act && !isOff(h)){ const i = cageTool() === 'cmove' || cageTool() === 'cpatch' ? nearestCagePt(p, 0.02 * N()) : -1; if (i !== cageHot){ cageHot = i; cagePtsUpdate(); if (i >= 0) pulse(h, 0.1, 6); } }
     const hh = canPts && !cageEditing ? nearestHandle(p, 0.018 * N()) : null, hl = canPts && !hh && !cageEditing ? nearSpline(p, 0.012 * N()) : null;
     if (hh) hotH = hh; else if (hl) hi.push(hl.s);
     if ((hh || hl) && !h.wasNear){ pulse(h, 0.12, 8); } h.wasNear = !!(hh || hl);
-    if (S.tool !== 'draw' && S.tool !== 'ride' && !mHit && !h.grab && !myDial && !isOff(h)){
+    if (cageEditing && (cageTool() === 'csoft' || cageTool() === 'csmooth') && !mHit && !h.grab && !myDial && !isOff(h)){
+      h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush] * FLAT_K); h.brush.material.color.setHex(cageTool() === 'csmooth' ? 0x5FE0B8 : 0xFFD23F); }
+    else if (!cageEditing && S.tool !== 'draw' && S.tool !== 'ride' && !mHit && !h.grab && !myDial && !isOff(h)){
       h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush] * (S.tool === 'flatten' || S.tool === 'smooth' || S.tool === 'bend' ? FLAT_K : 1));
       h.brush.material.color.setHex(S.tool === 'mark' ? TAG_COL[S.tag] : S.tool === 'smooth' ? 0x5FE0B8 : S.tool === 'bend' || S.tool === 'flatten' ? 0xFFD23F : 0xF04348);
       const r = BRUSH[S.brush] * N();
@@ -2312,7 +2424,7 @@ function updateXRInput(dt){
     }
     else if (down(0) && !h.grab && !myDial){
       if (mHit && mHit.b){ pressMenu(mHit.b); pulse(h, 0.5, 20); }
-      else if (!mHit && !h.act && cageEditing){ const i = nearestCagePt(p, 0.02 * N()); if (i >= 0){ h.act = cageGrab(i, p); pulse(h, 0.4, 15); } }
+      else if (!mHit && !h.act && cageEditing){ h.act = cageToolDown(p); pulse(h, h.act ? 0.4 : 0.25, 15); }
       else if (!mHit && !h.act && S.tool === 'ride'){ h.act = rideStart(h); pulse(h, 0.4, 20); }
       else if (!mHit && !h.act){ h.act = toolDown(h.i, p, null); pulse(h, 0.25, 10); }
     }
@@ -2408,8 +2520,11 @@ renderer.domElement.addEventListener('pointerdown', e => {
   if (e.button !== 0 || renderer.xr.isPresenting) return;
   const ray = mouseRay(e);
   renderer.domElement.setPointerCapture(e.pointerId);
-  if (cageEditing){ const i = screenCagePt(e); if (i >= 0){ const w = world.localToWorld(new V3(cageEd.V[3 * i], cageEd.V[3 * i + 1], cageEd.V[3 * i + 2]));
-    drawPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new V3()).negate(), w); mouseAct = cageGrab(i, toPark(w)); } return; }
+  if (cageEditing){ const t = cageTool(); let w = null;
+    if (t === 'cmove' || t === 'cpatch'){ const i = screenCagePt(e); if (i >= 0) w = world.localToWorld(cv(i)); else if (t === 'cpatch'){ cagePatchTap(-1); return; } }
+    else { const hit = surfMesh && raycaster.intersectObject(surfMesh, false); if (hit && hit[0]) w = hit[0].point.clone(); }
+    if (!w) return; drawPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new V3()).negate(), w);
+    mouseAct = cageToolDown(toPark(w), t === 'cmove' || t === 'cpatch' ? 1e-3 * N() + 1e-6 : 0.04 * N()); return; }
   const hh = S.ptsShow && S.lines !== 'hide' ? screenHandle(e) : null;
   if (hh && e.altKey && !e.shiftKey){ const d = ctrlStart(hh, new V3(), false); if (ctrlSecond(d) === 'held') finishHeld(d); return; }
   if (hh && (e.shiftKey || e.altKey)){ beginEdit(); const tg = e.altKey ? pointToggle(hh.s, hh.k) : null, n = e.shiftKey ? delPoint(hh.s, hh.k) : tg.n;
@@ -2442,7 +2557,8 @@ renderer.domElement.addEventListener('pointermove', e => { lastPointer = { clien
     else if (!renderer.xr.isPresenting) setHighlight([]);
     return;
   }
-  if (mouseAct.kind === 'draw' || mouseAct.kind === 'bend' || mouseAct.kind === 'ctrl' || mouseAct.kind === 'cage'){ const w = drawPlane && ray.intersectPlane(drawPlane, new V3()); if (w) toolMove('m', mouseAct, toPark(w)); }
+  if (['csmooth', 'ccrease', 'cdel'].includes(mouseAct.kind)){ const hit = surfMesh && raycaster.intersectObject(surfMesh, false)[0]; if (hit){ mouseAct.dt = 1 / 30; toolMove('m', mouseAct, toPark(hit.point.clone())); } }
+  else if (mouseAct.kind === 'draw' || mouseAct.kind === 'bend' || mouseAct.kind === 'ctrl' || mouseAct.kind === 'cage' || mouseAct.kind === 'csoft'){ const w = drawPlane && ray.intersectPlane(drawPlane, new V3()); if (w) toolMove('m', mouseAct, toPark(w)); }
   else { const p = nearestLinePoint(ray); if (p){ mouseAct.dt = 1 / 30; toolMove('m', mouseAct, p); } }
 });
 const endMouse = () => { if (mouseAct){ toolUp('m', mouseAct); mouseAct = null; } };
@@ -2532,7 +2648,7 @@ setupButtons();
 window.pentimento = { ops: { delPoint: (...a) => delPoint(...a), cornerPoint: (...a) => cornerPoint(...a), addPoint: (...a) => addPoint(...a) }, load(list){ commit(list.map(o => makeStroke(o.tag, Float32Array.from(o.pts), Float32Array.from(o.pts)))); },
   drag(tool, path, brush){ S.tool = tool; if (brush !== undefined) S.brush = brush; const d = toolDown('t', new V3(...path[0])); for (const q of path){ d.dt = 1 / 72; toolMove('t', d, new V3(...q)); } toolUp('t', d); },
   showDial(kind, hover){ const f = camera.getWorldDirection(new V3()); dialMesh.position.copy(camera.position).addScaledVector(f, 0.42); dialMesh.quaternion.copy(camera.quaternion); dialMesh.visible = true; dial = { kind, h: null, items: dialItems(kind), hover }; drawDial(); },
-  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, cageUndo, get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
+  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { menuTab = t; menuOpen = true; menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, cageUndo, cageTool: t => setCageTool(t), cageDown: (p, r) => cageToolDown(p, r), cageMove: (d, p) => cageToolMove(d, p, 1 / 30), cageUp: d => cageToolUp(d), cageTopo: () => cageTopo(), V3: V3,  get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid(); setTips(!!S.tips); applyLighting(); applyBackground();
 if (savedCage) try { cageRestore(savedCage); setTimeout(cageSurface, 0); } catch (e){}
 // runs handed over from Party Lines (its Bring to Pentimento button)
