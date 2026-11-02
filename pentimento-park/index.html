@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p2.5"></script>
-<script src="solver.js?v=p2.5"></script>
+<script src="demo.js?v=p2.6"></script>
+<script src="solver.js?v=p2.6"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -106,7 +106,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '2.5';
+const VERSION = '2.6';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -1260,7 +1260,7 @@ function buildRuns(){
     const board = makeRunBoard(col, k); board.traverse(x => x.userData.shared = true);
     g.add(board); outer.userData = { r, board }; runsGroup.add(outer);
   });
-  applyRunsView();
+  applyRunsView(); try { if (typeof runHandleMs !== 'undefined') showRunHandles(); } catch (e){}
 }
 function applyRunsView(){ runsGroup.visible = !!runs.length && !!S.runsShow; }
 const _rq = new THREE.Quaternion(), _rq2 = new THREE.Quaternion();
@@ -1495,6 +1495,59 @@ function rideEnd(d){
   S.runsShow = 1; S.runsRide = 1; buildRuns(); scheduleSave(); menuDirty = true;
   flash('Run ' + runs.length + ' saved (' + d.t[n - 1].toFixed(1) + ' s). It rides on a loop; grip it to move it, Undo takes it out.', 5);
 }
+// ---------- editing runs: Points (control points along each path: drag one and the path bends smoothly between
+// its neighbours) and Smooth (sweep a sphere along a path to iron out wobbles; the board's tilt smooths with it).
+// Each edit works on a copy of the run, so Undo puts the old path back.
+const rideTool = () => menuTab === 'ride' && (S.rideTool === 'points' || S.rideTool === 'smooth') ? S.rideTool : 'record';
+const RIDE_TOOL_NAME = { record: 'Record', points: 'Points', smooth: 'Smooth' };
+function setRideTool(t){ S.rideTool = t; scheduleSave(); menuDirty = true; showRunHandles();
+  flash({ record: 'Record: hold A and ride the board', points: 'Points: trigger a point on a path and drag it; the path bends smoothly between its neighbours', smooth: 'Smooth: hold the trigger and sweep along a path to iron it out (stick up / down sizes the sphere)' }[t], 5); }
+// control points: about one every half a board length of travel (in run steps)
+function runHandleIdx(r){ const k = r.k || 10, gap = 0.06 * k, n = r.t.length, idx = [0]; let acc = 0;
+  for (let i = 1; i < n; i++){ acc += Math.hypot(r.P[3 * i] - r.P[3 * i - 3], r.P[3 * i + 1] - r.P[3 * i - 2], r.P[3 * i + 2] - r.P[3 * i - 1]); if (acc >= gap && i < n - 2){ idx.push(i); acc = 0; } }
+  idx.push(n - 1); return idx; }
+const runHandleMs = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 8), new THREE.MeshBasicMaterial({ color: 0xFFFFFF, depthTest: false, transparent: true, opacity: 0.9 }), 1200);
+runHandleMs.renderOrder = 11; runHandleMs.frustumCulled = false; runHandleMs.count = 0; world.add(runHandleMs);
+let runHandles = [], runHot = -1;                  // [{ r, i (sample), pos }]
+function showRunHandles(){
+  runHandles = []; const on = menuTab === 'ride' && rideTool() === 'points' && runsGroup.visible;
+  if (on) for (const r of runs){ const m = runMat(r); for (const i of runHandleIdx(r)) runHandles.push({ r, i, pos: runPt(r, i, m) }); }
+  const M4 = new THREE.Matrix4(), rr = 0.004 * N(); runHandleMs.count = Math.min(1200, runHandles.length);
+  runHandles.slice(0, 1200).forEach((h, j) => { const s = j === runHot ? rr * 1.8 : rr; M4.makeScale(s, s, s).setPosition(h.pos.x, h.pos.y, h.pos.z); runHandleMs.setMatrixAt(j, M4); runHandleMs.setColorAt(j, new THREE.Color(RUN_COLORS[(h.r.c || 0) % RUN_COLORS.length]).lerp(new THREE.Color(0xffffff), 0.5)); });
+  runHandleMs.instanceMatrix.needsUpdate = true; if (runHandleMs.instanceColor) runHandleMs.instanceColor.needsUpdate = true; }
+function nearestRunHandle(p, rad){ let b = -1, bd = rad * rad; runHandles.forEach((h, j) => { const d = h.pos.distanceToSquared(p); if (d < bd){ bd = d; b = j; } }); return b; }
+// swap a run for an editable copy (the old one stays in the undo history)
+function editCopy(r){ const c = { ...r, t: r.t, P: Float32Array.from(r.P), Q: Float32Array.from(r.Q), off: r.off.clone(), piv: r.piv.clone() }; undoS.push(snap()); if (undoS.length > 100) undoS.shift(); redoS = []; runs = runs.map(x => x === r ? c : x); return c; }
+let runsRebuildT = 0;
+function runsChanged(now){ const t = performance.now(); if (now || t - runsRebuildT > 110){ runsRebuildT = t; buildRuns(); showRunHandles(); } else runsDirtyLater = true; }
+let runsDirtyLater = false;
+function runPointGrab(j, p){ const h = runHandles[j]; if (!h) return null; const r = editCopy(h.r), idx = runHandleIdx(r), hi = idx.indexOf(h.i);
+  return { kind: 'rpoint', r, i: h.i, a: hi > 0 ? idx[hi - 1] : -1, b: hi < idx.length - 1 ? idx[hi + 1] : -1, base: Float32Array.from(r.P), p0: p.clone(), yaw: r.yaw }; }
+function runPointDrag(d, p){
+  const dl = p.clone().sub(d.p0).applyAxisAngle(_Y, -d.yaw), r = d.r, n = r.t.length, ss = u => u * u * (3 - 2 * u);
+  for (let j = 0; j < n; j++){ let w = 0;
+    if (j === d.i) w = 1; else if (j < d.i) w = d.a < 0 ? 1 : j <= d.a ? 0 : ss((j - d.a) / (d.i - d.a)); else w = d.b < 0 ? 1 : j >= d.b ? 0 : ss((d.b - j) / (d.b - d.i));
+    if (!w) continue; r.P[3 * j] = d.base[3 * j] + dl.x * w; r.P[3 * j + 1] = d.base[3 * j + 1] + dl.y * w; r.P[3 * j + 2] = d.base[3 * j + 2] + dl.z * w; }
+  runsChanged(false); return dl.length(); }
+function runSmoothStart(){ return { kind: 'rsmooth', copies: new Map() }; }
+const _sq = new THREE.Quaternion(), _sq2 = new THREE.Quaternion();
+function runSmoothAt(d, p, dt){
+  const R = BRUSH[S.brush] * FLAT_K * N(); let amt = 0;
+  for (let ri = 0; ri < runs.length; ri++){ let r = runs[ri]; const m = runMat(r), n = r.t.length, v = new V3(), hit = [];
+    for (let j = 1; j < n - 1; j++){ const dd = runPt(r, j, m, v).distanceTo(p); if (dd < R) hit.push([j, 1 - (dd / R) ** 2]); }
+    if (!hit.length) continue; if (!d.copies.has(r.id)){ r = editCopy(r); d.copies.set(r.id, r); } else r = d.copies.get(r.id);
+    const P = r.P, Q = r.Q, old = Float32Array.from(P), k0 = Math.min(1, (dt || 1 / 72) * 8);
+    for (const [j, u] of hit){ const k = k0 * u * u; let ax = 0, ay = 0, az = 0, c = 0;
+      for (let o = -3; o <= 3; o++){ if (!o) continue; const q = Math.max(0, Math.min(n - 1, j + o)); ax += old[3 * q]; ay += old[3 * q + 1]; az += old[3 * q + 2]; c++; }
+      const nx = old[3 * j] + (ax / c - old[3 * j]) * k, ny = old[3 * j + 1] + (ay / c - old[3 * j + 1]) * k, nz = old[3 * j + 2] + (az / c - old[3 * j + 2]) * k;
+      amt += Math.hypot(nx - P[3 * j], ny - P[3 * j + 1], nz - P[3 * j + 2]); P[3 * j] = nx; P[3 * j + 1] = ny; P[3 * j + 2] = nz;
+      // the board's tilt evens out too, unless it's mid-flip
+      if (!r.tricks.some(x => r.t[j] >= x.t - 0.06 && r.t[j] <= x.t + x.d + 0.06)){ _sq.fromArray(Q, 4 * (j - 1)); _sq2.fromArray(Q, 4 * (j + 1)); _sq.slerp(_sq2, 0.5); _sq2.fromArray(Q, 4 * j).slerp(_sq, k * 0.5); Q[4 * j] = _sq2.x; Q[4 * j + 1] = _sq2.y; Q[4 * j + 2] = _sq2.z; Q[4 * j + 3] = _sq2.w; } } }
+  if (amt) runsChanged(false); return amt; }
+// smooth a whole run in one go (the Smooth button on its row)
+function smoothWholeRun(r0){ const r = editCopy(r0), P = r.P, n = r.t.length;
+  for (let it = 0; it < 12; it++){ const old = Float32Array.from(P); for (let j = 2; j < n - 2; j++) for (let c = 0; c < 3; c++) P[3 * j + c] = old[3 * j + c] * 0.5 + (old[3 * (j - 1) + c] + old[3 * (j + 1) + c] + old[3 * (j - 2) + c] + old[3 * (j + 2) + c]) * 0.125; }
+  buildRuns(); showRunHandles(); scheduleSave(); flash('Run smoothed. Undo puts it back.'); }
 function deleteRun(r){ const i = runs.indexOf(r); if (i < 0) return; undoS.push(snap()); redoS = []; runs = runs.filter(x => x !== r); buildRuns(); scheduleSave(); menuDirty = true; flash('Run removed. Undo brings it back.'); }
 function clearRuns(){ undoS.push(snap()); redoS = []; runs = []; buildRuns(); scheduleSave(); menuDirty = true; flash('Runs removed'); }
 // over the middle of the sketch, then lowered (or raised) so the wheels sit on the surface where it's under them
@@ -2275,7 +2328,7 @@ function setStep(st, quiet){
   else if (st !== 'settings' && S.tool === 'ride') S.tool = SKETCH_TOOLS.includes(S.sketchTool) ? S.sketchTool : 'draw';
   if (st === 'shape' && !cageEditing && (cageEd || hasSurface())) startCageEdit(true);
   if (st !== 'settings') S.more = 0;
-  try { applySurfView(); } catch (e){}
+  try { applySurfView(); showRunHandles(); } catch (e){}
   menuDirty = true; scheduleSave(); if (S.tips) drawTips();
   if (!quiet && st !== 'settings') flash((STEPS.indexOf(st) + 1) + ' · ' + STEP_NAME[st] + ': ' + STEP_SUB[st] + (st === 'ride' && !S.rideAnyScale ? ' · park at 1:10' : ''));
 }
@@ -2327,7 +2380,10 @@ function setStep(st, quiet){
 
   // ===== 1 RIDE
   head('ride');
-  section('ride', 'RECORD A RUN');
+  section('ride', 'TOOL');
+  row('ride', 72, ['record', 'points', 'smooth'].map(t => ({ id: 'rt-' + t, label: () => RIDE_TOOL_NAME[t], on: () => rideTool() === t, act: () => setRideTool(t) })));
+  note('ride', () => ({ record: '', points: 'Trigger a white point on a path and drag it: the path bends smoothly to its neighbouring points. Undo puts it back.', smooth: 'Hold the trigger and sweep along a path to iron out wobbles. Stick up / down sizes the sphere. Each run row also has a Smooth button.' })[rideTool()], { vis: () => rideTool() !== 'record' });
+  section('ride', 'RECORD A RUN', { vis: () => rideTool() === 'record' });
   note('ride', () => (mainHand() === 'right' ? 'Hold A' : 'Hold X') + ' and ride the board under your controller over the park: that records a run. Trigger pops a flip, ' + (mainHand() === 'right' ? 'B' : 'Y') + ' refits the board. Runs replay on a loop.');
   modelSize('ride', { vis: () => !!S.rideAnyScale });
   note('ride', 'The park is at 1:10 while you ride, so your fingerboard is a real skateboard here. (Settings → Riding to change it.)', { vis: () => !S.rideAnyScale });
@@ -2339,6 +2395,7 @@ function setStep(st, quiet){
   // one row per run: its colour, how long it is, and a Delete
   for (let i = 0; i < 8; i++){ const h = 64, bw = 150, r = () => runs[i];
     blk('ride', h, [text({ kind: 'panel', x: P, y: 0, w: W, h }), text({ kind: 'runRow', x: P + 22, y: h / 2, i, text: () => 'Run ' + (i + 1) + ' · ' + r().dur.toFixed(1) + ' s' + (r().tricks.length ? ' · ' + r().tricks.length + (r().tricks.length === 1 ? ' flip' : ' flips') : '') }),
+      add({ id: 'run-smooth-' + i, x: MW - P - 2 * bw - G - 8, y: 8, w: bw, h: h - 16, label: () => 'Smooth', act: () => smoothWholeRun(runs[i]) }),
       add({ id: 'run-del-' + i, x: MW - P - bw - 8, y: 8, w: bw, h: h - 16, style: 'danger', label: () => 'Delete', act: () => deleteRun(runs[i]) })], { vis: () => !!r(), gap: 8 }); }
   note('ride', 'Grip a path to move that run (swing your hand to turn it). Holding it: A lays ties under it, B removes them, stick press deletes the run.', { vis: hasRuns });
   section('ride', 'TIES · SHORT LINES UNDER A RUN, SO THE SURFACE FOLLOWS IT', { vis: hasRuns });
@@ -2511,6 +2568,7 @@ if (menuTab === 'ride') S.tool = 'ride'; else if (S.tool === 'ride') S.tool = 'd
 // tips follow the menu tab you have open: drawing and controls on Sketch, what each setting does on Surface, ...
 const TIP_PAGES = {
   ride: ['1 · RIDE: RECORD RUNS', [
+    'Edit a path: pick Points and drag the white points on a path (it bends smoothly between its neighbours), or pick Smooth and sweep along a path to iron out wobbles. Each run row has a Smooth button for the whole run. Undo puts any edit back.',
     'A fingerboard hangs under your main controller. Hold A (X if your left hand is main) and ride it over the park: that records a run. Let go to keep it.',
     'Trigger pops a random flip, recorded into the run. B refits the board: it floats where it is, set your hand how you like, then B again locks it on.',
     'Runs replay on a loop. Undo takes the last one out. Model size decides how big the park is next to the board.',
@@ -2732,7 +2790,7 @@ function drawMenu(){
     if (ls.length > 2){ ls.length = 2; ls[1] = ls[1].replace(/\s*\S*$/, '…'); } ls.forEach((t, i) => g.fillText(t, 44, fy + i * 34)); }
   { g.fillStyle = '#6B7480'; g.font = '500 23px "IBM Plex Mono",monospace';
     const R = mainHand() === 'right', a = R ? 'A' : 'X', b = R ? 'B' : 'Y', u = R ? 'X/Y' : 'A/B', st = menuTab;
-    const l1 = st === 'ride' ? `hold ${a}: record · trigger: flip · ${b}: refit · grip a path: move`
+    const l1 = st === 'ride' ? (rideTool() === 'points' ? 'trigger a white point: drag it · the path bends with it' : rideTool() === 'smooth' ? 'hold the trigger and sweep along a path · stick ↑↓: sphere size' : `hold ${a}: record · trigger: flip · ${b}: refit · grip a path: move`)
       : st === 'shape' ? `trigger: ${CAGE_NAME[cageTool()]} · hold ${a}: point tools · hold ${b}: steps`
       : st === 'sketch' ? `trigger: ${TOOL_NAME[S.tool] || 'tool'} · hold ${a}: tools · hold ${b}: line types`
       : `trigger: ${TOOL_NAME[S.tool] || 'tool'} · hold ${a}: tools · hold ${b}: steps`;
@@ -2762,6 +2820,7 @@ if (document.fonts) document.fonts.ready.then(() => { menuDirty = true; if (S.ti
 const grabsHandles = () => (S.tool === 'draw' || S.tool === 'bend') && S.ptsShow && S.lines !== 'hide';
 function toolDown(id, p, handle){
   if (handle) return ctrlStart(handle, p);
+  if (S.tool === 'ride' && rideTool() === 'smooth') return runSmoothStart();
   if (S.tool === 'ride'){ flash('Ride needs the headset: hold the trigger and ride the board under your controller.'); return null; }
   if (S.tool === 'draw'){ p = ontoSurface(p) || p; const d = { kind: 'draw', raw: [p.x, p.y, p.z], mesh: liveMesh(), n: 0 }; return d; }
   beginEdit();
@@ -2787,6 +2846,8 @@ function toolMove(id, d, p){
   if ((d.kind[0] === 'c' && CAGE_TOOLS.includes(d.kind)) || d.kind === 'cgroup'){ try { return cageToolMove(d, p, d.dt); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'cage tool' }); return 0; } }
   if (d.kind === 'runs'){ runDrag(d, p, d.h ? handYaw(d.h) : undefined); return 0; }
   if (d.kind === 'ride'){ rideSample(d); return 0; }
+  if (d.kind === 'rpoint') return runPointDrag(d, p);
+  if (d.kind === 'rsmooth') return runSmoothAt(d, p, d.dt);
   const r = BRUSH[S.brush] * N();
   if (d.kind === 'draw'){
     p = ontoSurface(p) || p;
@@ -2809,6 +2870,7 @@ function toolUp(id, d){
   if (d.kind === 'cage'){ cageDrop(d); return; }
   if (CAGE_TOOLS.includes(d.kind) || d.kind === 'cgroup'){ try { cageToolUp(d); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'cage tool' }); flash('That tool hit a problem (' + e.message + '). Undo if anything looks off.'); } return; }
   if (d.kind === 'ride'){ rideEnd(d); return; }
+  if (d.kind === 'rpoint' || d.kind === 'rsmooth'){ runsChanged(true); scheduleSave(); return; }
   if (d.kind === 'runs'){ if (d.live){ undoS.push(d.before); if (undoS.length > 100) undoS.shift(); redoS = []; menuDirty = true; scheduleSave(); } return; }
   if (d.kind === 'draw'){
     world.remove(d.mesh); d.mesh.geometry.dispose();
@@ -3093,7 +3155,9 @@ function updateXRInput(dt){
       else if (x && x.uv) mHit = { b: menuButtonAt(x.uv, menuCropH), dist: x.distance }; }
     h.menuHit = !!mHit && !isOff(h);
     if (mHit){ hover = mHit.b || hover; h.beam.visible = true; h.beam.scale.z = mHit.dist; }
-    const riding = S.tool === 'ride' && !isOff(h) && (!mHit || (h.act && h.act.kind === 'ride'));
+    const riding = S.tool === 'ride' && rideTool() === 'record' && !isOff(h) && (!mHit || (h.act && h.act.kind === 'ride'));
+    if (S.tool === 'ride' && rideTool() === 'points' && !isOff(h) && !h.act){ const j = mHit ? -1 : nearestRunHandle(p, 0.02 * N()); if (j !== runHot){ runHot = j; showRunHandles(); if (j >= 0) pulse(h, 0.1, 6); } }
+    if (S.tool === 'ride' && rideTool() === 'smooth' && !isOff(h) && !mHit && !h.grab){ h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush] * FLAT_K); h.brush.material.color.setHex(0x5FE0B8); }
     h.tip.visible = h.stem.visible = !mHit && !isOff(h) && !riding; poseHeld(h, riding, performance.now() / 1000);
     const pw = penWorld(h), p = toPark(pw);
     const myDial = dial && dial.h === h; if (myDial) updateDial(h, gp, pw);
@@ -3139,6 +3203,8 @@ function updateXRInput(dt){
     else if (down(0) && !h.grab && !myDial){
       if (mHit && mHit.b){ pressMenu(mHit.b); pulse(h, 0.5, 20); }
       else if (!mHit && !h.act && cageEditing){ try { h.act = cageToolDown(p); } catch (e){ h.act = null; errLog.push({ t: Date.now(), msg: String(e.message), at: "cage tool" }); flash("That tool hit a problem (" + e.message + ")"); } pulse(h, h.act ? 0.4 : 0.25, 15); }
+      else if (!mHit && S.tool === 'ride' && !cageEditing && rideTool() === 'points'){ const j = nearestRunHandle(p, 0.02 * N()); if (j >= 0){ h.act = runPointGrab(j, p); pulse(h, 0.4, 15); } else flash('Point at one of the white points on a path'); }
+      else if (!mHit && S.tool === 'ride' && !cageEditing && rideTool() === 'smooth'){ h.act = runSmoothStart(); pulse(h, 0.25, 10); }
       else if (!mHit && S.tool === 'ride' && !cageEditing){ if (h.fitting) endRefit(h); else boardTrick(h); pulse(h, 0.9, 45); }
       else if (!mHit && !h.act){ h.act = toolDown(h.i, p, null); pulse(h, 0.25, 10); }
     }
@@ -3246,6 +3312,9 @@ renderer.domElement.addEventListener('pointerdown', e => {
   if (e.button !== 0 || renderer.xr.isPresenting) return;
   const ray = mouseRay(e);
   renderer.domElement.setPointerCapture(e.pointerId);
+  if (S.tool === 'ride' && rideTool() === 'points'){ let bj = -1, bd = 14 * 14; const v = new V3(); runHandles.forEach((h, j) => { world.localToWorld(v.copy(h.pos)).project(camera); if (v.z > 1) return; const dx = (v.x + 1) / 2 * innerWidth - e.clientX, dy = (1 - v.y) / 2 * innerHeight - e.clientY, d = dx * dx + dy * dy; if (d < bd){ bd = d; bj = j; } });
+    if (bj < 0) return; const w = world.localToWorld(runHandles[bj].pos.clone()); drawPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new V3()).negate(), w); mouseAct = runPointGrab(bj, toPark(w)); return; }
+  if (S.tool === 'ride' && rideTool() === 'smooth'){ mouseAct = runSmoothStart(); return; }
   if (cageEditing && cageTool() === 'cgrab'){ const hv = deskHover(e); setHover(hv); if (!hv) return; const ids = hovVerts(hv), c = new V3(); ids.forEach(i => c.add(cv(i))); c.multiplyScalar(1 / ids.length);
     const w = world.localToWorld(c.clone()); drawPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(new V3()).negate(), w); mouseAct = grabHover(toPark(w)); return; }
   if (cageEditing){ const t = cageTool(); let w = null;
@@ -3289,8 +3358,10 @@ renderer.domElement.addEventListener('pointermove', e => { lastPointer = { clien
     else if (!renderer.xr.isPresenting) setHighlight([]);
     return;
   }
+  if (mouseAct.kind === 'rsmooth'){ let best = null, bd = 30 * 30; const v = new V3(); for (const r of runs){ const m = runMat(r); for (let j = 0; j < r.t.length; j += 2){ const q = runPt(r, j, m); world.localToWorld(v.copy(q)).project(camera); if (v.z > 1) continue; const dx = (v.x + 1) / 2 * innerWidth - e.clientX, dy = (1 - v.y) / 2 * innerHeight - e.clientY, d = dx * dx + dy * dy; if (d < bd){ bd = d; best = q; } } }
+    if (best){ mouseAct.dt = 1 / 30; toolMove('m', mouseAct, best); } return; }
   if (['csmooth', 'ccrease', 'cdel', 'credraw'].includes(mouseAct.kind)){ const hit = surfMesh && raycaster.intersectObject(surfMesh, false)[0]; if (hit){ mouseAct.dt = 1 / 30; toolMove('m', mouseAct, toPark(hit.point.clone())); } }
-  else if (mouseAct.kind === 'draw' || mouseAct.kind === 'bend' || mouseAct.kind === 'ctrl' || mouseAct.kind === 'cage' || mouseAct.kind === 'csoft'){ const w = drawPlane && ray.intersectPlane(drawPlane, new V3()); if (w) toolMove('m', mouseAct, toPark(w)); }
+  else if (mouseAct.kind === 'draw' || mouseAct.kind === 'bend' || mouseAct.kind === 'ctrl' || mouseAct.kind === 'cage' || mouseAct.kind === 'csoft' || mouseAct.kind === 'rpoint' || mouseAct.kind === 'cgroup'){ const w = drawPlane && ray.intersectPlane(drawPlane, new V3()); if (w) toolMove('m', mouseAct, toPark(w)); }
   else { const p = nearestLinePoint(ray); if (p){ mouseAct.dt = 1 / 30; toolMove('m', mouseAct, p); } }
 });
 const endMouse = () => { if (mouseAct){ toolUp('m', mouseAct); mouseAct = null; } };
@@ -3383,7 +3454,7 @@ setupButtons();
 window.pentimento = { ops: { delPoint: (...a) => delPoint(...a), cornerPoint: (...a) => cornerPoint(...a), addPoint: (...a) => addPoint(...a) }, load(list){ commit(list.map(o => makeStroke(o.tag, Float32Array.from(o.pts), Float32Array.from(o.pts)))); },
   drag(tool, path, brush){ S.tool = tool; if (brush !== undefined) S.brush = brush; const d = toolDown('t', new V3(...path[0])); for (const q of path){ d.dt = 1 / 72; toolMove('t', d, new V3(...q)); } toolUp('t', d); },
   showDial(kind, hover){ const f = camera.getWorldDirection(new V3()); dialMesh.position.copy(camera.position).addScaledVector(f, 0.42); dialMesh.quaternion.copy(camera.quaternion); dialMesh.visible = true; dial = { kind, h: null, items: dialItems(kind), hover }; drawDial(); },
-  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { setStep({ layers: 'sketch', view: 'settings' }[t] || t, true); menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, live: () => cageSurfaceLive(), full: () => cageSurface(), nDabs: () => dabs.length, smoothedCage: () => cageSmoothed(), lastFlash: () => flashText, N: () => N(), stepScale: d => stepScale(d), hoverAt: p => { setHover(pickHover(p)); return cageHov; }, delHover: () => deleteHover(), creaseHov: () => creaseHover(), loopHov: p => loopHover(p), buildSecs: () => lastBuildSecs, cageUndo, cageTool: t => setCageTool(t), cageDown: (p, r) => cageToolDown(p, r), cageMove: (d, p) => cageToolMove(d, p, 1 / 30), cageUp: d => cageToolUp(d), cageTopo: () => cageTopo(), V3: V3, loopCut: (k, p) => loopCut(k, p), straightTap: k => straightTap(k), edgeChain: (a, b) => edgeChain(a, b), edgeRing: k => edgeRing(k), cageSmoothed: () => cageSmoothed(), startCageEdit: () => startCageEdit(true), cageOddN: () => cageOddN,  get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
+  get strokes(){ return strokes; }, S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { setStep({ layers: 'sketch', view: 'settings' }[t] || t, true); menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, live: () => cageSurfaceLive(), full: () => cageSurface(), nDabs: () => dabs.length, smoothedCage: () => cageSmoothed(), lastFlash: () => flashText, N: () => N(), stepScale: d => stepScale(d), hoverAt: p => { setHover(pickHover(p)); return cageHov; }, delHover: () => deleteHover(), creaseHov: () => creaseHover(), loopHov: p => loopHover(p), buildSecs: () => lastBuildSecs, rideTool: t => setRideTool(t), runHandles: () => runHandles, runGrab: (j, p) => runPointGrab(j, p), runSmooth: () => runSmoothStart(), smoothRun: i => smoothWholeRun(runs[i]), cageUndo, cageTool: t => setCageTool(t), cageDown: (p, r) => cageToolDown(p, r), cageMove: (d, p) => cageToolMove(d, p, 1 / 30), cageUp: d => cageToolUp(d), cageTopo: () => cageTopo(), V3: V3, loopCut: (k, p) => loopCut(k, p), straightTap: k => straightTap(k), edgeChain: (a, b) => edgeChain(a, b), edgeRing: k => edgeRing(k), cageSmoothed: () => cageSmoothed(), startCageEdit: () => startCageEdit(true), cageOddN: () => cageOddN,  get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid(); setTips(!!S.tips); applyLighting(); applyBackground();
 if (savedCage) try { cageRestore(savedCage); setTimeout(cageSurface, 0); } catch (e){}
 // runs handed over from Party Lines (its Bring to Pentimento button)
