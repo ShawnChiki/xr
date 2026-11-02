@@ -8,6 +8,7 @@ panelization for fabrication (concrete and wood approaches) → export to Rhino 
 
 ## Changelog
 
+- **v2.0** — Strict creases no longer crowd the quads: along a straightish strict line the edges are as long as anywhere else, and they only get shorter where it bends (so the density is even, crease or no crease). Riding locks the park at 1:10 (your fingerboard is a real board), with Settings → Riding → Ride at any size to change that.
 - **v1.9** — Redraw edges (SubD step): draw a curve along a row of edges, or where you want the row to go. The row of edges from the curve's start to its end is refit to follow it: the curve is smoothed and laid on the surface, the row's points spread evenly along it, and the points beside it come along partway so it blends in. Draw it closed to refit a loop; turn on New edges are creases to make it a sharp seam.
 - **v1.8** — Step 4 is now called SubD. New SubD tools: Loop cut (tap an edge: a new edge loop runs across the whole row of quads beside it) and Straighten (tap the edge where a row starts and the edge where it ends: every edge between them is lined up and evenly spaced, staying on the surface). The Edit in Subdeck link is gone.
 - **v1.7** — Shape gets Cut: tap an edge for a new point on it, tap points or edges one after another to cut new edges across the faces (optionally as creases, for sharp seams); tap the last point again to stop. Triangles show pink and 5+ sided faces purple, with a count in the menu, so they're easy to find and fix.
