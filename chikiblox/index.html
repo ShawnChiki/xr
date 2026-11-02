@@ -584,7 +584,13 @@ let busy = false;
 const DEFAULT_FFA = {game:'targets', ramp:'turn', set:'tetra', contact:2, stairs:99, moveStair:false, mercy:true, mode:'stairs', walk:3, spiderN:4, require:false, safe:0, inherit:true, winHalf:true, secret:false, boxStair:false, funny:true, drop:1, loot:'take', endWhen:'all', takeStair:false, wall:'box', kill:'push', mustMove:false, swap:false, ledge:true, shuffle:true, huntOrder:true, arm:3, across:false};
 let cfg = {...DEFAULT_FFA, count:6, bots:[false,true,true,true,true,true]};
 const rolled = () => !!(cfg.shuffle&&cfg.seatGi&&cfg.seatGi.length===cfg.count&&cfg.seatBots);
-const seatsNow = () => rolled() ? cfg.seatGi : SEATS[cfg.count];
+const seatsNow = () => cfg.teamGi&&cfg.teamGi.length===cfg.count ? cfg.teamGi : rolled() ? cfg.seatGi : SEATS[cfg.count];
+const teamOf = q => state&&state.teams ? state.teams[q.id] : q.id;                 // in team games each person runs several agents
+const teamsLeft = L => new Set(L.map(teamOf)).size;
+function teamTarget(s,q,t){                 // never hunt a teammate: fall through to the next enemy in turn order
+  if(!s.teams) return t; const tm=i=>s.teams[i];
+  if(t!=null&&s.players[t].alive&&tm(t)!==tm(q.id)) return t;
+  const n=s.players.length; for(let k=1;k<n;k++){ const o=s.players[(q.id+k)%n]; if(o.alive&&tm(o.id)!==tm(q.id)) return o.id; } return null; }
 function rollSeats(){                 // a new turn order each game; everyone keeps the colour (and fall) picked in the menu
   const n=cfg.count, turned=SEATS[n], perm=[...Array(n).keys()];
   const across=(a,b)=>(turned[a]>>1)===(turned[b]>>1), chain=cfg.game==='targets'&&cfg.huntOrder!==false&&!cfg.across&&n>=3;
@@ -606,7 +612,7 @@ const handOf = p => state.pile.filter(i=>owned(i)==null||owned(i)===p.id);
 const hand = () => handOf(cur());       // pieces the player on turn may use
 
 function newState(){
-  const s={started:false,over:false,seats:cfg.count,targets:[],opts:{ledge:!!cfg.ledge,set:cfg.set,game:cfg.game,require:cfg.require,safe:cfg.safe,inherit:cfg.inherit,huntOrder:cfg.huntOrder!==false,across:!!cfg.across,arm:cfg.arm||3,winHalf:true,secret:cfg.secret,boxStair:!!cfg.boxStair,takeStair:!!cfg.takeStair,funny:cfg.funny,drop:cfg.drop,wall:cfg.wall,kill:cfg.kill,mustMove:cfg.mustMove,swap:cfg.swap,loot:cfg.loot,endWhen:cfg.endWhen,ramp:cfg.ramp,contact:cfg.contact,moveStair:cfg.moveStair&&cfg.mode==='stairs',mercy:cfg.mercy,climb:cfg.mode==='poly',walk:cfg.walk,spiderN:cfg.spiderN},
+  const s={started:false,over:false,seats:cfg.count,targets:[],opts:{ledge:!!cfg.ledge,set:cfg.set,game:cfg.game,require:cfg.require,safe:cfg.safe,inherit:cfg.inherit,huntOrder:cfg.huntOrder!==false,across:!!cfg.across,arm:cfg.arm||3,winHalf:!(cfg.teams&&cfg.teamGi),secret:cfg.secret,boxStair:!!cfg.boxStair,takeStair:!!cfg.takeStair,funny:cfg.funny,drop:cfg.drop,wall:cfg.wall,kill:cfg.kill,mustMove:cfg.mustMove,swap:cfg.swap,loot:cfg.loot,endWhen:cfg.endWhen,ramp:cfg.ramp,contact:cfg.contact,moveStair:cfg.moveStair&&cfg.mode==='stairs',mercy:cfg.mercy,climb:cfg.mode==='poly',walk:cfg.walk,spiderN:cfg.spiderN},
     pieces:[],owner:[],colors:[],blocks:[],players:[],spider:null,pile:[],turnNo:0,cur:0,phase:'setup',stairUsed:false,pieceDone:false,winner:null,mark:null};
   const base=buildSet(cfg.set), hands=cfg.set==='tetra'?cfg.count:1;      // tetracubes: every player gets a full set of their own
   const h0=Math.random(), col=new THREE.Color();
@@ -620,12 +626,14 @@ function newState(){
   s.blocks.push({c:[0,0,0],t:0});
   const arm=cfg.arm||3; for(const d of DIRS) for(let k=1;k<=arm;k++) s.blocks.push({c:mul(d,k),t:0});
   seatsNow().forEach((gi,i)=>{ s.players.push({id:i,gi,cell:mul(DIRS[gi],-((cfg.arm||3)+1)),ci:gi,alive:true,bot:rolled()?cfg.seatBots[i]:cfg.bots[i],stairs:cfg.mode==='poly'?0:cfg.stairs,outs:0,placed:0,moved:false}); });
+  s.teams=cfg.teams&&cfg.teamGi&&cfg.teamGi.length===cfg.count?cfg.teams.slice(0,cfg.count):null;
   s.dealt=cfg.game==='ffa'; if(cfg.game==='targets'&&!cfg.safe){ s.dealt=true; drawTargets(s); }
   return s;
 }
 
 /* ---------- targets: everyone hunts someone ---------- */
-function drawTargets(s){             // every standing player gets a random other standing player; two can draw each other
+function drawTargets(s){ drawTargets0(s); if(s.teams) s.players.forEach(p=>{ if(p.alive) s.targets[p.id]=teamTarget(s,p,s.targets[p.id]); }); }
+function drawTargets0(s){             // every standing player gets a random other standing player; two can draw each other
   const ids=s.players.filter(p=>p.alive).map(p=>p.id);
   if(s.opts.huntOrder){              // you hunt whoever plays right after you: 1 hunts 2, 2 hunts 3 ... the last hunts 1
     s.targets=s.players.map(()=>null); ids.forEach((id,i)=>{ s.targets[id]=ids[(i+1)%ids.length]; }); return;
@@ -745,7 +753,7 @@ const pathTo = (map,k) => { const p=[]; while(k!==null){ const n=map.get(k); p.u
 const occupied = (c,except) => state.players.some(p=>p.alive&&p!==except&&eq(p.cell,c));
 const stoppable = (n,p) => n.d>0&&!n.pass&&!occupied(n.c,p);
 const knowsHunters = () => !state.opts.secret||state.opts.game==='ffa';
-const huntsMe = (X,p) => state.opts.game==='ffa'||targetOf(X)===p;
+const huntsMe = (X,p) => state.opts.game==='ffa'&&teamOf(X)!==teamOf(p)||targetOf(X)===p;
 const hunterAt = (c,p) => huntOpen()&&state.players.find(X=>X.alive&&X!==p&&eq(X.cell,c)&&prey(X).includes(p));
 const dangerPath = (p,path) => path.slice(1,-1).some(c=>hunterAt(c,p));      // walking past someone who's hunting you
 const canMove = p => [...walkReach(p,1).values()].some(n=>n.d>0&&!occupied(n.c,p));
@@ -1811,13 +1819,13 @@ function doSpider(path){
     const f=figs[victim.id], r=f.userData.rig;
     animate(750,u=>{ r.turn.rotation.y+=.45; r.armL.rotation.z=-2.6; r.armR.rotation.z=2.6; f.scale.setScalar(Math.max(.001,1-u*u)); },()=>{
       gChars.remove(f); busy=false; updateFaceColors();
-      const left=alive(); if(left.length===1){ gameOver(left[0]); return; }
+      const left=alive(); if(teamsLeft(left)===1){ gameOver(left[0]); return; }
       endTurn();
     });
   });
 }
 const hasMoved = q => q.moved!==false;           // nobody can be taken out before they've had a turn
-const prey = p => (state.opts.game==='ffa' ? alive().filter(q=>q!==p) : [targetOf(p)].filter(Boolean)).filter(hasMoved);
+const prey = p => (state.opts.game==='ffa' ? alive().filter(q=>q!==p&&teamOf(q)!==teamOf(p)) : [targetOf(p)].filter(Boolean)).filter(hasMoved);
 function cornerVictim(p,c){            // ending next to a cornered target (no free square to move to) takes them out
   if(!huntOpen()||!extraKills()) return null;
   return prey(p).find(v=>v.alive&&faceAdj(c,v.cell)&&!canMove(v))||null;
@@ -1855,7 +1863,7 @@ async function selfOut(p){             // cornered with "must move" on: you jump
     if(g!==gen) return; gChars.remove(f);
     if(!FAST()){ cineOpen(false); setCine('Oof',[nameSpan(p),' jumped'],'Cornered with nowhere to go.','slam'); await wait(2000); if(g!==gen) return; }
   }
-  if(left.length===1){ cineClose(); await camHome(400); gameOver(left[0],'last'); return; }
+  if(teamsLeft(left)===1){ cineClose(); await camHome(400); gameOver(left[0],'last'); return; }
   if(state.opts.game==='targets'){ const inh=state.targets[p.id];
     for(const q of left) if(state.targets[q.id]===p.id){ state.targets[q.id]=inh!=null&&inh!==q.id&&state.players[inh].alive?inh:rnd(left.filter(x=>x!==q)).id; if(!q.bot&&!FAST()){ await revealTarget(q,false,p); if(g!==gen) return; } }
     state.targets[p.id]=null; }
@@ -1932,12 +1940,12 @@ async function takeOut(h,v,opt={}){
     !v.bot&&!humansLeft.length?(state.players.filter(q=>!q.bot).length>1?'Everyone is out. Game over.':'You are out. Game over.'):left.length+' left standing'+(state.opts.winHalf&&!wonHalf&&left.length>1?' · '+NAMES[h.ci]+' needs '+toGo+' more to win':''),'slam');
   await wait(film?3200:2800); if(g!==gen) return;
   stageStop();
-  if(left.length===1||wonHalf){ cineClose(); await camHome(500); if(g!==gen) return; gameOver(wonHalf?h:left[0],wonHalf?'half':'last'); return; }
+  if(teamsLeft(left)===1||wonHalf){ cineClose(); await camHome(500); if(g!==gen) return; gameOver(wonHalf?h:left[0],wonHalf?'half':'last'); return; }
   if(!v.bot&&!humansLeft.length&&!state.attract){ cineClose(); await camHome(500); if(g!==gen) return; gameOver(h,'out'); return; }      // you're out: game over
   $('ticker').hidden=true;
   if(state.opts.game==='ffa'){ }
   else if(state.opts.inherit){            // the winner takes over the victim's target; nobody else changes
-    const pass=q=>inherited!=null&&inherited!==q.id&&state.players[inherited].alive ? inherited : rnd(left.filter(x=>x!==q)).id;
+    const pass=q=>teamTarget(state,q,inherited!=null&&inherited!==q.id&&state.players[inherited].alive ? inherited : rnd(left.filter(x=>x!==q)).id);
     const heirs=left.filter(q=>state.targets[q.id]===v.id);          // whoever was hunting the victim takes over their target
     const nt=wasTarget?pass(h):state.targets[h.id];
     for(const q of heirs) state.targets[q.id]=pass(q);
@@ -4463,7 +4471,7 @@ function ui(){
   if(setup){ renderSetup(); turn.textContent='A core cube with six arms. Everyone starts on the tip of their own.'; spi.textContent=''; return; }
   $('pileN').hidden=false;
   if(over){ const w=state.players[state.winner]||state.players[0]; const W=(state.winners||[w.id]).map(i=>NAMES[state.players[i].ci]);
-    $('winner').textContent=state.why==='out'?(state.players.filter(q=>!q.bot).length>1?'Game over: everyone is out':'Game over: '+NAMES[w.ci]+' took you out'):state.why==='half'?NAMES[w.ci]+' wins by taking out half the table':state.why==='score'?(W.length>1?W.join(' & ')+' tie on takedowns':NAMES[w.ci]+' wins on takedowns'):NAMES[w.ci]+' is the last one standing';
+    $('winner').textContent=state.teams?'Player '+(teamOf(w)+1)+' wins':state.why==='out'?(state.players.filter(q=>!q.bot).length>1?'Game over: everyone is out':'Game over: '+NAMES[w.ci]+' took you out'):state.why==='half'?NAMES[w.ci]+' wins by taking out half the table':state.why==='score'?(W.length>1?W.join(' & ')+' tie on takedowns':NAMES[w.ci]+' wins on takedowns'):NAMES[w.ci]+' is the last one standing';
     $('overNote').textContent=HUNT() ? NAMES[w.ci]+' took out '+w.outs+' player'+(w.outs===1?'':'s')+' over '+state.turnNo+' turns.' : (w.bot?'A bot':'You')+' outlasted the spider over '+state.turnNo+' turns and '+(state.pieces.length-state.pile.length)+' pieces.';
     turn.textContent='Game over'; spi.textContent=''; return; }
   const p=cur(), me=!p.bot, n=spiderMoves();
@@ -4629,7 +4637,7 @@ addEventListener('keydown',ev=>{
 /* ---------- XR: play in the Quest browser with your hands (MR passthrough, or a VR room) ---------- */
 /* The headset browser slows or pauses page timers while you're in XR, and the bots run on timers.
    So each timeout is also kept in a list that the XR frame loop checks every frame; whichever fires first runs it, once. */
-const XR_VERSION='1.8';
+const XR_VERSION='1.9';
 const TIMERS=(()=>{
   const nST=window.setTimeout.bind(window), nCT=window.clearTimeout.bind(window), list=new Map(); let next=1;
   function fire(id){ const e=list.get(id); if(!e) return; list.delete(id); nCT(e.n); try{ e.fn(...e.a); }catch(err){ console.warn(err); } }
@@ -4676,6 +4684,7 @@ const XR=(()=>{
     T.p.copy(A).sub(C.clone().multiplyScalar(T.s).applyQuaternion(T.q)); applyT();
     panel.position.copy(head.p).addScaledVector(head.f,.42).addScaledVector(head.r,-.33).add(new V3(0,-.34,0));
     panel.lookAt(head.p);
+    bank.position.copy(head.p).addScaledVector(head.f,.4).addScaledVector(head.r,.3).add(new V3(0,-.36,0)); bank.lookAt(head.p);
   }
 
   /* ---------- the floating panel: status, the game's own buttons, and the tray of pieces ---------- */
@@ -4686,7 +4695,12 @@ const XR=(()=>{
   const pmesh=new THREE.Mesh(new THREE.PlaneGeometry(PW,PH),new THREE.MeshBasicMaterial({map:ptex,transparent:true})); panel.add(pmesh);
   const handleMat=new THREE.MeshBasicMaterial({color:'#9599FF'});
   const handle=new THREE.Mesh(new THREE.CylinderGeometry(.007,.007,.13,12),handleMat); handle.rotation.z=Math.PI/2; handle.position.set(0,PH/2+.022,0); panel.add(handle);
-  const tray=new THREE.Group(); tray.position.set(0,-PH/2-.05,.012); panel.add(tray);
+  const bank=new THREE.Group(); ui3.add(bank); bank.visible=false;             // your blocks, in their own window you can move
+  const bankBgMat=new THREE.MeshBasicMaterial({color:'#F3F4F8',transparent:true,opacity:.92}), bankBg=new THREE.Mesh(new THREE.PlaneGeometry(1,1),bankBgMat); bank.add(bankBg);
+  const bankEdge=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(1,1)),new THREE.LineBasicMaterial({color:'#C6CAD8'})); bankBg.add(bankEdge);
+  const bankHandleMat=new THREE.MeshBasicMaterial({color:'#9599FF'}), bankHandle=new THREE.Mesh(new THREE.CylinderGeometry(.007,.007,.11,12),bankHandleMat); bankHandle.rotation.z=Math.PI/2; bank.add(bankHandle);
+  const tray=new THREE.Group(); tray.position.set(0,0,.012); bank.add(tray);
+  let bankW=.2, bankH=.1;
   let trayItems=[], traySig='';
   let hits=[], panelSig='', hoverId=null, lastClick={};
 
@@ -4706,10 +4720,21 @@ const XR=(()=>{
   function setRoom(on){ PREF.vr=on; X.room=on||!X.ar; room.visible=X.room; savePref(); }
   X.settings=false; X.picker=false;
   const humans=()=>state?state.players.filter(q=>!q.bot):[];
-  const multi=()=>humans().length>1;
+  const personOf=q=>state.teams?state.teams[q.id]:q.id;
+  const multi=()=>!!state&&new Set(humans().map(personOf)).size>1;
   const turnKey=()=>state.turnNo+':'+state.cur;
-  const handoff=()=>!!state&&state.started&&!state.over&&multi()&&!cur().bot&&!busy&&X.confirmed!==turnKey()&&$('cine').hidden;
-  function passPlay(k){ X.picker=false; hideTitle(); cfg={...quickCfg(),bots:[0,1,2,3,4,5].map(i=>i>=k)}; lastQuick=false; X.confirmed=''; startGame(); }
+  const personName=q=>state.teams?'Player '+(personOf(q)+1):NAMES[q.ci];
+  const handoff=()=>!!state&&state.started&&!state.over&&multi()&&!cur().bot&&!busy&&X.confirmedPerson!==personOf(cur())&&$('cine').hidden;
+  /* how the six directions are split between teams; seats listed in turn order, so people take turns */
+  const TEAM_LAYOUTS={
+    2:[{name:'Opposites are rivals',note:'Your three agents fall east, up and south. Every agent faces a rival falling the opposite way.',gi:[0,1,2,3,4,5],team:[0,1,0,1,0,1]},
+       {name:'Each team has a pair',note:'Each team has two agents that fall opposite ways (east and west, or south and north) plus one more.',gi:[0,3,1,4,2,5],team:[0,1,0,1,0,1]}],
+    3:[{name:'Partners fall opposite ways',note:"Partners stand on each other's ceilings: east and west, up and down, south and north.",gi:[0,2,4,1,3,5],team:[0,1,2,0,1,2]},
+       {name:'Partners at right angles',note:"Partners fall at 90° to each other: one's floor is the other's wall.",gi:[0,4,3,2,1,5],team:[0,1,2,0,1,2]}]};
+  function passPlay(k,layout){ X.picker=false; X.teamPick=0; hideTitle();
+    if(layout){ cfg={...quickCfg(),count:6,bots:[false,false,false,false,false,false],shuffle:false,teams:layout.team.slice(),teamGi:layout.gi.slice()}; }
+    else { cfg={...quickCfg(),count:k,bots:[false,false,false,false,false,false],shuffle:false}; delete cfg.teams; delete cfg.teamGi; }
+    lastQuick=false; X.confirmedPerson=null; startGame(); }
   function xrButtons(){
     const out=[{id:'x-set',label:'Settings',icon:'gear',go:()=>{ X.settings=true; }}];
     if(state&&state.started&&!state.over){ const me=state.players.find(q=>!q.bot&&q.alive)||cur(); out.push({id:'x-down',label:'My down',icon:'down',go:()=>turnToDown(me.gi)}); }
@@ -4789,7 +4814,8 @@ const XR=(()=>{
   }
   function drawPicker(c,F,pad){
     c.font='700 50px '+F; c.fillStyle='#1B1E2E'; c.textBaseline='top'; c.fillText('Pass the headset',pad,pad);
-    c.font='500 33px '+F; c.fillStyle='#4A5068'; wrap('Take turns wearing it. How many people are playing? Bots fill the other seats.',CW-2*pad,3).forEach((l,i)=>c.fillText(l,pad,pad+76+i*42));
+    if(X.teamPick) return pad+80;
+    c.font='500 33px '+F; c.fillStyle='#4A5068'; wrap('Take turns wearing it. With 2 or 3 people, each person runs a team of agents. With 4 to 6, everyone has one.',CW-2*pad,3).forEach((l,i)=>c.fillText(l,pad,pad+76+i*42));
     return pad+76+3*42+24;
   }
   function drawSettings(c,F,pad){
@@ -4829,7 +4855,7 @@ const XR=(()=>{
     if(out.length<maxL&&line) out.push(line); else if(line&&out.length>=maxL) out[maxL-1]=out[maxL-1].replace(/\s*\S*$/,'…'); return out; }
   function drawPanel(){
     const S=status(), gb=gameButtons(), xb=xrButtons();
-    const ho=handoff(), su=inSetup(), sig=JSON.stringify([su&&X.setPage,su&&setupRows().map(r=>[r.label,r.val,r.opts.map(o=>o.on)]),ho,X.picker,X.settings,X.settings&&settingRows().map(r=>r.v),S,gb.map(b=>[b.id,b.label,b.primary]),xb.map(b=>[b.id,b.label]),hoverId,shown($('quitBtn'))]);
+    const ho=handoff(), su=inSetup(), sig=JSON.stringify([X.teamPick,su&&X.setPage,su&&setupRows().map(r=>[r.label,r.val,r.opts.map(o=>o.on)]),ho,X.picker,X.settings,X.settings&&settingRows().map(r=>r.v),S,gb.map(b=>[b.id,b.label,b.primary]),xb.map(b=>[b.id,b.label]),hoverId,shown($('quitBtn'))]);
     if(sig===panelSig) return; panelSig=sig;
     const c=pctx, F='Figtree,"Segoe UI",system-ui,sans-serif', pad=40; hits=[];
     c.clearRect(0,0,CW,CH); rr(0,0,CW,CH,44); c.fillStyle='rgba(243,244,248,.97)'; c.fill(); c.lineWidth=4; c.strokeStyle='#C6CAD8'; c.stroke();
@@ -4847,16 +4873,23 @@ const XR=(()=>{
     if(inSetup()&&!X.settings){ drawSetup(c,F,pad,row); ptex.needsUpdate=true; return; }
     if(X.picker){
       const yy=drawPicker(c,F,pad);
-      row([2,3,4,5,6].map(k=>({id:'p-'+k,label:k+' people',primary:k===2,go:()=>passPlay(k)})),92,'700 38px '+F,yy);
-      row([{id:'p-cancel',label:'Cancel',go:()=>{ X.picker=false; }}],84,'700 36px '+F,CH-pad-84);
+      if(!X.teamPick) row([2,3,4,5,6].map(k=>({id:'p-'+k,label:k+' people',primary:k===2,go:()=>{ if(k<=3) X.teamPick=k; else passPlay(k); }})),92,'700 38px '+F,yy);
+      else { const k=X.teamPick, L=TEAM_LAYOUTS[k]; let y2=yy-6; c.font='700 34px '+F; c.fillStyle='#1B1E2E'; c.fillText(k+' people, '+(6/k)+' agents each. Split the six directions:',pad,y2); y2+=56;
+        L.forEach((lay,i)=>{ const bw=CW-2*pad, bh=118, id='p-lay'+i, hov=hoverId===id; rr(pad,y2,bw,bh,26); c.fillStyle=hov?'#DCDFF0':'#FFFFFF'; c.fill(); c.lineWidth=3; c.strokeStyle='#C6CAD8'; c.stroke();
+          // the agents as coloured dots, grouped by player
+          let dx=pad+24; for(let t=0;t<k;t++){ for(let s2=0;s2<6;s2++) if(lay.team[s2]===t){ c.fillStyle=DCOL[lay.gi[s2]]; c.beginPath(); c.arc(dx+12,y2+34,12,0,7); c.fill(); dx+=28; } dx+=20; }
+          c.font='700 32px '+F; c.fillStyle='#1B1E2E'; c.fillText(lay.name,dx+8,y2+16);
+          c.font='500 25px '+F; c.fillStyle='#4A5068'; wrap(lay.note,bw-48,2).forEach((l,j)=>c.fillText(l,pad+24,y2+60+j*28));
+          hits.push({id,x:pad,y:y2,w:bw,h:bh,go:()=>passPlay(k,lay)}); y2+=bh+14; }); }
+      row([{id:'p-cancel',label:X.teamPick?'‹ Back':'Cancel',go:()=>{ if(X.teamPick) X.teamPick=0; else X.picker=false; }}],84,'700 36px '+F,CH-pad-84);
       ptex.needsUpdate=true; return;
     }
     if(ho){
       const p=cur(); c.textBaseline='top';
       c.fillStyle=DCOL[p.ci]; c.beginPath(); c.arc(pad+26,pad+34,26,0,7); c.fill(); c.lineWidth=4; c.strokeStyle='#1B1E2E'; c.stroke();
-      c.font='700 56px '+F; c.fillStyle='#1B1E2E'; c.fillText('Pass to '+NAMES[p.ci],pad+72,pad+4);
-      c.font='500 34px '+F; c.fillStyle='#4A5068'; wrap("Hand the headset to "+NAMES[p.ci]+". Their turn starts when they press the button.",CW-2*pad,3).forEach((l,i)=>c.fillText(l,pad,pad+100+i*44));
-      row([{id:'x-ready',label:"I'm "+NAMES[p.ci]+", go",primary:true,go:()=>{ X.confirmed=turnKey(); X.lastHuman=cur().id; recenter(); turnToDown(cur().gi); }}],100,'700 42px '+F,pad+100+3*44+30);
+      const pn=personName(p); c.font='700 56px '+F; c.fillStyle='#1B1E2E'; c.fillText('Pass to '+pn,pad+72,pad+4);
+      c.font='500 34px '+F; c.fillStyle='#4A5068'; wrap("Hand the headset to "+pn+(state.teams?", who plays "+state.players.filter(q=>personOf(q)===personOf(p)).map(q=>NAMES[q.ci]).join(', ')+". It's "+NAMES[p.ci]+"'s move.":". Their turn starts when they press the button."),CW-2*pad,3).forEach((l,i)=>c.fillText(l,pad,pad+100+i*44));
+      row([{id:'x-ready',label:"I'm "+pn+", go",primary:true,go:()=>{ X.confirmedPerson=personOf(cur()); X.lastHuman=cur().id; recenter(); turnToDown(cur().gi); }}],100,'700 42px '+F,pad+100+3*44+30);
       const xh=72; row(xrButtons(),xh,'600 30px '+F,CH-pad-xh);
       ptex.needsUpdate=true; return;
     }
@@ -4905,13 +4938,15 @@ const XR=(()=>{
   function syncTray(t){
     const L=trayList(), sk=sel?(sel.kind==='stair'?'s':sel.id):'-', sig=JSON.stringify([L,sk,state&&state.cur]);
     if(sig!==traySig){ traySig=sig; clearGroup(tray); trayItems=[];
-      const per=6, sp=.058;
+      const per=Math.min(6,Math.max(3,Math.ceil(Math.sqrt(L.length*1.6)))), sp=.058, rows=Math.ceil(L.length/per)||1;
+      bankW=Math.min(per,Math.max(1,L.length))*sp+.03; bankH=rows*sp+.03; bankBg.scale.set(bankW,bankH,1); bankHandle.position.set(0,bankH/2+.02,0); tray.position.y=(rows-1)*sp/2;
       L.forEach((it,i)=>{ const r=Math.floor(i/per), n=Math.min(per,L.length-r*per), k=i%per;
         const g=it.stair?(()=>{ const s=makeStair([0,0,0],3,0,stairMatFor(stairCol(cur()))); const w=new THREE.Group(); w.add(s); w.scale.setScalar(.034); return w; })()
           :pieceGroup(state.pieces[it.id],state.opts.set==='mono'?DCOL[cur().ci]:state.colors[it.id],.042/Math.max(2,extent(state.pieces[it.id])));
         const holder=new THREE.Group(); holder.position.set((k-(n-1)/2)*sp,-r*sp,0); holder.add(g); tray.add(holder);
         trayItems.push({it,holder,g,i}); });
     }
+    bank.visible=trayItems.length>0;
     const aimed=HL.map(h=>h.probe&&h.probe.type==='tray'&&!h.mode?h.probe.holder:null);
     for(const T of trayItems){ T.g.rotation.set(.45,t*.0006+T.i*.9,0); const on=sel&&(T.it.stair?sel.kind==='stair':sel.kind==='piece'&&sel.id===T.it.id); const k=aimed.includes(T.holder)?1.45:on?1.3:1; T.holder.scale.setScalar(T.holder.scale.x+(k-T.holder.scale.x)*.3); }
   }
@@ -5046,8 +5081,8 @@ const XR=(()=>{
   }
   function applyGfx(){
     mergeKey=''; gfxSig='';
-    try{ const L=X.session&&X.session.renderState.baseLayer; if(L&&'fixedFoveation' in L) L.fixedFoveation=PREF.gfx==='low'?1:PREF.gfx==='med'?.5:.2; }catch(e){}
   }
+  function startFoveation(){ try{ const L=X.session&&X.session.renderState.baseLayer; if(L&&'fixedFoveation' in L) L.fixedFoveation=PREF.gfx==='low'?1:PREF.gfx==='med'?.5:.2; }catch(e){} }   // set once on entering: changing it mid-session can crash the headset browser
 
   /* ---------- hands and controllers ---------- */
   const curGeo=new THREE.SphereGeometry(1,14,10);
@@ -5078,6 +5113,7 @@ const XR=(()=>{
       if(src.hand){
         const J=n=>{ const j=src.hand.get?src.hand.get(n):null; return j?xf.getJointPose(j,ref):null; };
         const w=J('wrist'), t=J('thumb-tip'), i=J('index-finger-tip'); if(!w||!t||!i) continue;
+        h.wp=(h.wp||new V3()).copy(w.transform.position);
         const tp=new V3().copy(t.transform.position), ip=new V3().copy(i.transform.position), d=tp.distanceTo(ip);
         h.pinch=h.pinch?d<.032:d<.017;
         if(h.kind!=='hand'){ h.fp.x=h.ft.x=h.fq.x=h.fro.x=h.frq.x=null; }
@@ -5118,7 +5154,8 @@ const XR=(()=>{
   function probe(h){
     const pp=panelProbe(h); h.pp=pp; if(pp&&pp.b) return pp;          // the panel's empty space doesn't block grabbing the world
     const hw=panel.localToWorld(new V3(0,PH/2+.022,0)), hl=panel.localToWorld(new V3(-.065,PH/2+.022,0)), hr=panel.localToWorld(new V3(.065,PH/2+.022,0));
-    { const L=new THREE.Line3(hl,hr), cp=new V3(); L.closestPointToPoint(h.pos,true,cp); if(cp.distanceTo(h.pos)<.035) return {type:'handle'}; }
+    { const L=new THREE.Line3(hl,hr), cp=new V3(); L.closestPointToPoint(h.pos,true,cp); if(cp.distanceTo(h.pos)<.035) return {type:'handle',obj:panel}; }
+    if(bank.visible){ bank.updateMatrixWorld(true); const y=bankH/2+.02, L=new THREE.Line3(bank.localToWorld(new V3(-.055,y,0)),bank.localToWorld(new V3(.055,y,0))), cp=new V3(); L.closestPointToPoint(h.pos,true,cp); if(cp.distanceTo(h.pos)<.035) return {type:'handle',obj:bank}; }
     let best=null, bd=.035;
     for(const T_ of trayItems){ const d=T_.holder.getWorldPosition(W3).distanceTo(h.pos); if(d<bd){ bd=d; best=T_; } }
     if(best) return {type:'tray',item:best.it};
@@ -5266,6 +5303,50 @@ const XR=(()=>{
     else if(idle>7000){ quietSince=0; console.warn('bot turn stuck: skipping ahead'); X.nudges=(X.nudges||0)+1; recover(); }
   }
 
+  /* ---------- the watch: Undo and End turn on the back of your right hand (A and B on a right controller) ---------- */
+  const WW=.11, WH=.05, WCW=512, WCH=Math.round(WCW*WH/WW);
+  const wcv=document.createElement('canvas'); wcv.width=WCW; wcv.height=WCH; const wctx=wcv.getContext('2d'), wtex=new THREE.CanvasTexture(wcv);
+  const watch=new THREE.Mesh(new THREE.PlaneGeometry(WW,WH),new THREE.MeshBasicMaterial({map:wtex,transparent:true,depthTest:false})); watch.renderOrder=55; watch.visible=false; top3.add(watch);
+  let watchSig='', watchHits=[], watchLock=0;
+  function watchButtons(){
+    if(!state||!state.started||state.over||!human()||handoff()) return [];
+    const out=[]; if(shown($('undoBtn'))) out.push({id:'undo',label:'Undo',go:()=>$('undoBtn').click()});
+    if(shown($('skipBtn'))) out.push({id:'next',label:txt($('skipBtn')),primary:true,go:()=>$('skipBtn').click()});
+    else if(state.phase==='build'&&!state.opts.require&&!(sel&&(sel.from||sel.kind==='stair'))) out.push({id:'next',label:'Skip to Move',primary:true,go:()=>{ const li=document.querySelector('#steps li[data-p="walk"]'); if(li) li.click(); }});
+    else if(sel&&sel.kind==='stair'&&!sel.from) out.push({id:'next',label:'No stair',go:()=>{ X.declined=turnKey(); $('cancelBtn').click(); }});
+    return out;
+  }
+  function syncWatch(){
+    const h=hands.right, B=watchButtons();
+    let show=B.length&&h.present;
+    if(show&&h.kind==='hand'&&h.wp){ const up=new V3(0,1,0).applyQuaternion(h.q), toHead=head.p.clone().sub(h.wp).normalize(); show=up.dot(toHead)>.35; }   // only while you glance at the back of your hand
+    if(show&&h.kind==='ctrl') show=false;                                                                                                                 // controllers use A and B instead
+    watch.visible=!!show; if(!show){ X.watchHover=null; return; }
+    watch.quaternion.copy(h.q).multiply(new Quat().setFromAxisAngle(new V3(1,0,0),-Math.PI/2));
+    watch.position.copy(h.wp).add(new V3(0,.028,.035).applyQuaternion(h.q));
+    const hov=X.watchHover, sig=JSON.stringify([B.map(b=>[b.id,b.label]),hov]);
+    if(sig!==watchSig){ watchSig=sig; const c=wctx, F='Figtree,"Segoe UI",system-ui,sans-serif'; c.clearRect(0,0,WCW,WCH); watchHits=[];
+      const n=B.length, gap=12, bw=(WCW-gap*(n+1))/n, bh=WCH-2*gap;
+      B.forEach((b,i)=>{ const x0=gap+i*(bw+gap); c.beginPath(); c.roundRect?c.roundRect(x0,gap,bw,bh,bh/2):c.rect(x0,gap,bw,bh);
+        c.fillStyle=b.primary?(hov===b.id?'#5157E0':'#3A3FC9'):(hov===b.id?'#DCDFF0':'#FFFFFF'); c.fill(); c.lineWidth=4; c.strokeStyle=b.primary?'#3A3FC9':'#C6CAD8'; c.stroke();
+        c.fillStyle=b.primary?'#FFFFFF':'#1B1E2E'; c.font='700 '+(b.label.length>10?34:42)+'px '+F; c.textAlign='center'; c.textBaseline='middle'; c.fillText(b.label,x0+bw/2,gap+bh/2+2);
+        watchHits.push({id:b.id,x0:(x0/WCW-.5)*WW,x1:((x0+bw)/WCW-.5)*WW,go:b.go}); });
+      wtex.needsUpdate=true; }
+    // press with the left fingertip (poke) or a left pinch on the button
+    const L=hands.left, pe=L.pinch&&!X.wPinchPrev; X.wPinchPrev=L.pinch; X.watchHover=null; if(!L.present) return;
+    watch.updateMatrixWorld(true); const lp=watch.worldToLocal((L.kind==='hand'?L.tip:L.pos).clone());
+    if(Math.abs(lp.y)>WH/2+.01||lp.z>.03||lp.z<-.02) return;
+    const hit=watchHits.find(b=>lp.x>=b.x0-.004&&lp.x<=b.x1+.004); if(!hit) return; X.watchHover=hit.id;
+    const now=performance.now(); if((lp.z<.006||pe)&&now>watchLock){ watchLock=now+600; buzz(L,.5,30); sfx.snap&&sfx.snap(); hit.go(); watchSig=''; }
+  }
+  function controllerButtons(){                // right controller: A ends the turn (or skips ahead), B undoes
+    const h=hands.right, gp=h.kind==='ctrl'&&h.src&&h.src.gamepad; if(!gp) return;
+    const B=watchButtons(), down=k=>!!(gp.buttons[k]&&gp.buttons[k].pressed), prev=X.ctrlPrev||{};
+    if(down(4)&&!prev[4]){ const b=B.find(b=>b.id==='next'); if(b){ b.go(); buzz(h,.5,30); } }
+    if(down(5)&&!prev[5]){ const b=B.find(b=>b.id==='undo'); if(b){ b.go(); buzz(h,.5,30); } }
+    X.ctrlPrev={4:down(4),5:down(5)};
+  }
+
   /* panel dragging by its handle */
   let pdrag=null;
 
@@ -5278,7 +5359,7 @@ const XR=(()=>{
     readInputs(xf,ref);
     if(!X.placed&&vp&&state){ X.placed=true; const me=state.players.find(q=>!q.bot)||(state.started?cur():null); if(me) turnToDown(me.gi,true); recenter(); }
     applyT();
-    if(state&&state.started&&!state.over){ const k=state.turnNo+':'+state.cur; if(k!==X.turnKey){ X.turnKey=k; if(!cur().bot&&!X.grab&&!carry&&PREF.autoTurn&&!multi()) turnToDown(cur().gi); } }
+    if(state&&state.started&&!state.over){ const k=state.turnNo+':'+state.cur; if(k!==X.turnKey){ X.turnKey=k; if(!cur().bot&&!X.grab&&!carry&&PREF.autoTurn&&!handoff()){ X.lastHuman=cur().id; turnToDown(cur().gi); } } }
     if(X.anim){ const a=X.anim, u=Math.min(1,(performance.now()-a.t0)/a.dur), e=u<.5?2*u*u:1-Math.pow(-2*u+2,2)/2; keepCenter(()=>T.q.copy(a.qa).slerp(a.qb,e)); if(u>=1) X.anim=null; }
     // releases first
     let regrab=false;
@@ -5286,7 +5367,7 @@ const XR=(()=>{
     // new pinches
     for(const h of HL){
       if(!h.present){ if(h.mode==='grab') regrab=true; if(h.mode==='carry') endCarry(false); h.mode=null; h.was=false; continue; }
-      h.pp=null; let pr=h.mode?null:probe(h); h.probe=pr;
+      h.pp=null; let pr=h.mode?null:probe(h); if(h===hands.left&&X.watchHover&&!h.mode) pr={type:'watch'}; h.probe=pr;
       if(pr&&pr.type==='panel'&&h.kind==='hand'){                 // poke: push your fingertip through a button
         if(pr.z>.012) h.pokeLock=false;
         if(!h.pokeLock&&h.pokeZ>.006&&pr.z<=.004&&pr.b){ h.pokeLock=true; press(pr.b,h); }
@@ -5301,8 +5382,9 @@ const XR=(()=>{
         const gc=ghostCenter(); if(sel&&sel.ok&&gc&&gc.distanceTo(carry.vis.position)<PLACE_D){ buzz(h,.6,40); gXR.remove(carry.vis); carry=null; commitSel(); h.mode='used'; pr=null; }
       }
       if(h.pinch&&!h.was&&pr){
-        if(pr.type==='panel'){ if(pr.b) press(pr.b,h); h.mode='used'; }
-        else if(pr.type==='handle'){ h.mode='handle'; pdrag={h,off:panel.position.clone().sub(h.pos)}; }
+        if(pr.type==='watch'){ h.mode='used'; }
+        else if(pr.type==='panel'){ if(pr.b) press(pr.b,h); h.mode='used'; }
+        else if(pr.type==='handle'){ h.mode='handle'; pdrag={h,obj:pr.obj||panel,off:(pr.obj||panel).position.clone().sub(h.pos)}; }
         else if(pr.type==='tray'){ const it=pr.item;
           if(it.stair){ X.offered=state.turnNo+':'+state.cur; if(!(sel&&sel.kind==='stair'&&!sel.from)) selectStair(); }
           else if(!(sel&&sel.kind==='piece'&&sel.id===it.id)) selectPiece(it.id);
@@ -5318,7 +5400,7 @@ const XR=(()=>{
     }
     if(regrab) startGrab();
     updateGrab();
-    if(pdrag){ panel.position.copy(pdrag.h.pos).add(pdrag.off); panel.lookAt(head.p); }
+    if(pdrag){ pdrag.obj.position.copy(pdrag.h.pos).add(pdrag.off); pdrag.obj.lookAt(head.p); }
     if(carry&&carry.hold&&(!carry.h.present||sel!==carry.sel)){ endCarry(false); }
     if(carry) updateCarry();
     if(park&&(park.sel!==sel||!human())) dropPark();
@@ -5345,10 +5427,10 @@ const XR=(()=>{
     botNudge();
     if(PREF.skip&&!cineSkip&&state&&state.started&&!state.over&&!$('cine').hidden&&$('cineEnd').hidden&&$('credits').hidden&&$('revealBtn').hidden&&shown($('cineSkip'))) $('cineSkip').click();   // cut scenes off: skip each one as it starts
     if(PREF.fast&&SPD===1&&state&&state.players.some(q=>q.bot)) setFast(true);
-    handleMat.color.set(pdrag?'#5157E0':'#9599FF');
+    handleMat.color.set(pdrag&&pdrag.obj===panel?'#5157E0':'#9599FF'); bankHandleMat.color.set(pdrag&&pdrag.obj===bank?'#5157E0':'#9599FF');
     const nowT=performance.now();
     if(nowT-X.uiT>110||hoverId!==X.uiHover){ X.uiT=nowT; X.uiHover=hoverId; drawPanel(); syncChase(); }      // the panels read the page, which is slow: ~9 times a second is plenty
-    syncTray(nowT); syncTV(); syncMarkers(nowT); syncMerged(); syncFigures();
+    syncTray(nowT); syncTV(); syncMarkers(nowT); syncMerged(); syncFigures(); syncWatch(); controllerButtons();
     // a light that comes from over your shoulder
     const hl_=toL(head.p.clone().add(new V3(-.3,.6,.1))), C=centerL(); xrSun.position.copy(hl_); xrSun.target.position.copy(C);
   }
@@ -5380,7 +5462,7 @@ const XR=(()=>{
     renderer.xr.setReferenceSpaceType('local-floor'); renderer.xr.setFramebufferScaleFactor(PREF.gfx==='low'?.75:PREF.gfx==='med'?.9:1);
     await renderer.xr.setSession(s);
 
-    X.session=s; applyGfx(); X.on=true; X.placed=false; X.turnKey=''; renderer.autoClear=false;
+    X.session=s; applyGfx(); startFoveation(); X.on=true; X.placed=false; X.turnKey=''; renderer.autoClear=false;
     sun.intensity=0; xrSun.intensity=.55;
     hullMat.visible=false;                                   // no dark outline shells in the headset: a third fewer things to draw each frame
     Object.assign(TIPS,XR_TIPS); gGizmo.visible=false; panelSig=''; traySig=''; chaseSig='';
@@ -5402,7 +5484,7 @@ const XR=(()=>{
     if(!vr&&!ar) return; modeName=ar?'MR':'VR'; syncBtn(); btn.hidden=false; })();
 
   X.tick=tick; X.render=render; X.enter=enter;
-  X.dbg={PREF,botNudge,merged,syncMerged,handoff,passPlay,renderer,xrCam,scene,ui3,top3,T,hands,panel,head,toW,toL,hits:()=>hits,trayItems:()=>trayItems,carry:()=>carry,park:()=>park,PW,PH,CW,CH,room};
+  X.dbg={bank,watch,watchHits:()=>watchHits,syncWatch,TEAM_LAYOUTS,PREF,botNudge,merged,syncMerged,handoff,passPlay,renderer,xrCam,scene,ui3,top3,T,hands,panel,head,toW,toL,hits:()=>hits,trayItems:()=>trayItems,carry:()=>carry,park:()=>park,PW,PH,CW,CH,room};
   window.__xr=X;
   return X;
 })();
@@ -5430,5 +5512,4 @@ if(window.claude&&window.claude.hot&&window.claude.hot.ready) window.claude.hot.
 })();
 </script>
 
-<script src="../updated.js"></script>
 </body></html>
