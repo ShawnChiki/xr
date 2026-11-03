@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p3.8"></script>
-<script src="solver.js?v=p3.8"></script>
+<script src="demo.js?v=p3.9"></script>
+<script src="solver.js?v=p3.9"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -106,7 +106,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '3.8';
+const VERSION = '3.9';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -1488,47 +1488,68 @@ function heightGrid(cell){
 }
 function makeWaffle(){
   if (!surfMesh) return flash('Build a surface first (step 3)'); clearWaffle();
-  const K = fabK(), t = panelT() / K, gapP = (S.ribGap ?? 60) / K, bb = surfBox(), base = bb.min.y - (S.baseExtra ?? 0) / K, G = heightGrid(Math.max(0.002 / (1 / K), gapP / 12, (bb.max.x - bb.min.x) / 600));
+  const K = fabK(), t = panelT() / K, rt = ribT() / K, gapP = (S.ribGap ?? 60) / K, bb = surfBox(), base = bb.min.y - (S.baseExtra ?? 0) / K, G = heightGrid(Math.max(0.002 / (1 / K), gapP / 12, (bb.max.x - bb.min.x) / 600));
   const ribs = [], step = G.cell;
-  // ribs across x (constant x) and across z (constant z)
+  // ribs across x (constant x) and across z (constant z), each a full run under the surface
   for (const dir of ['x', 'z']){ const lo = dir === 'x' ? bb.min.x : bb.min.z, hi = dir === 'x' ? bb.max.x : bb.max.z, lo2 = dir === 'x' ? bb.min.z : bb.min.x, hi2 = dir === 'x' ? bb.max.z : bb.max.x;
-    // a rib longer than the sheet is cut into pieces, each cut halfway between two crossing ribs (so every piece
-    // is still held by its slots)
-    const maxL = (sheetWH()[0] - 24) / K;
     let k = 0; for (let c = lo + gapP / 2; c < hi; c += gapP){ k++; let run = []; const mine = [];
-      const keep = pr => { if (pr.length > 3 && Math.max(...pr.map(r => r[1])) - base > 8 / K) mine.push(pr); };
-      const flush = () => { let pr = run; run = [];
-        while (pr.length > 3 && pr[pr.length - 1][0] - pr[0][0] > maxL){ const st = pr[0][0]; let cut = lo2 + Math.floor((st + maxL - lo2) / gapP) * gapP; if (cut <= st + gapP * 0.5) cut = st + maxL;
-          const i = pr.findIndex(q => q[0] >= cut); keep(pr.slice(0, i + 1)); pr = pr.slice(i); }
-        keep(pr); };
+      const flush = () => { if (run.length > 3 && Math.max(...run.map(r => r[1])) - base > 8 / K) mine.push(run); run = []; };
       for (let u = lo2; u <= hi2 + 1e-9; u += step){ const y = dir === 'x' ? G.at(c, u) : G.at(u, c); if (y > -Infinity) run.push([u, y - t]); else flush(); } flush();
-      mine.forEach((pr, m) => ribs.push({ dir, c, prof: pr, name: (dir === 'x' ? 'X' : 'Z') + k + (mine.length > 1 ? String.fromCharCode(97 + m) : '') })); } }
+      mine.forEach((pr, m) => ribs.push({ dir, c, k, lo2, prof: pr, name: (dir === 'x' ? 'X' : 'Z') + k + (mine.length > 1 ? '.' + (m + 1) : '') })); } }
   // where ribs cross: slot both, half the height each (x ribs from the top, z ribs from the bottom)
   for (const r of ribs){ r.slots = []; for (const o of ribs){ if (o.dir === r.dir) continue; const u = o.c; if (u < r.prof[0][0] || u > r.prof[r.prof.length - 1][0]) continue; if (r.c < o.prof[0][0] || r.c > o.prof[o.prof.length - 1][0]) continue;
-    let top = -Infinity; for (const [uu, y] of r.prof) if (Math.abs(uu - u) <= step) top = Math.max(top, y); if (top <= base) continue; r.slots.push({ u, mid: base + (top - base) / 2, top, other: o.name }); } }
-  waffle = { ribs, base, t, K }; showWaffle();
-  flash(ribs.length + ' ribs (' + ribs.filter(r => r.dir === 'x').length + ' one way, ' + ribs.filter(r => r.dir === 'z').length + ' the other), every ' + fabLen(S.ribGap ?? 60) + ', ' + fabLen(ribT()) + ' thick', 7);
+    let top = -Infinity; for (const [uu, y] of r.prof) if (Math.abs(uu - u) <= step) top = Math.max(top, y); if (top <= base) continue; r.slots.push({ u, mid: base + (top - base) / 2, top }); } }
+  // pieces no bigger than the stock (a 4′ × 8′ sheet at scale, or the cut sheet). A waffle taller than the stock is
+  // built in layers, each its own egg-crate (slots half the layer's height, so no piece is cut apart by its slots),
+  // stacked and glued. Along a rib, joints go halfway between two crossing ribs, so every piece is held by its slots;
+  // they're staggered like brickwork, from one rib to the next and from one layer to the next
+  const [PL, PH] = pieceWH().map(x => (x - 4) / K), pieces = [];
+  const maxH = Math.max(...ribs.map(r => Math.max(...r.prof.map(p => p[1])))) - base, tiers = [base]; for (let y = base + PH; y < base + maxH - 1e-6; y += PH) tiers.push(y); tiers.push(Infinity);
+  for (const r of ribs){ const pr = r.prof, u0 = pr[0][0], u1 = pr[pr.length - 1][0], hw = rt / 2;
+    const topAt = u => { if (u <= pr[0][0]) return pr[0][1]; for (let i = 1; i < pr.length; i++) if (pr[i][0] >= u){ const a = pr[i - 1], b = pr[i], w = (u - a[0]) / ((b[0] - a[0]) || 1); return a[1] + (b[1] - a[1]) * w; } return pr[pr.length - 1][1]; };
+    let pc = 0;
+    for (let ti = 0; ti + 1 < tiers.length; ti++){ const ya = tiers[ti], yb = tiers[ti + 1], odd = (r.k + ti) % 2 === 1;
+      // this layer's slots: half its height where the rib crosses another, from the top for x ribs, the bottom for z
+      const sl = r.slots.map(q => { const tt = Math.min(topAt(q.u), yb); return tt > ya ? { u: q.u, mid: ya + (tt - ya) / 2 } : null; }).filter(Boolean);
+      const cutsU = [u0]; { let st = u0, first = true; while (u1 - st > PL){ const target = st + PL * (first && odd ? 0.5 : 1); let cu = r.lo2 + Math.floor((target - r.lo2) / gapP) * gapP; if (cu <= st + gapP * 0.4) cu = target; cutsU.push(cu); st = cu; first = false; } cutsU.push(u1); }
+      const us = new Set(pr.map(p => p[0])); for (const q of sl) for (const e of [-hw, hw]){ us.add(q.u + e - 1e-7); us.add(q.u + e + 1e-7); } for (const cu of cutsU) us.add(cu);
+      const U = [...us].filter(u => u >= u0 - 1e-9 && u <= u1 + 1e-9).sort((x, y) => x - y);
+      const col = u => { let a = ya, b = Math.min(topAt(u), yb); for (const q of sl) if (Math.abs(u - q.u) < hw){ if (r.dir === 'x') b = Math.min(b, q.mid); else a = Math.max(a, q.mid); } return [a, b]; };
+      for (let ci = 0; ci + 1 < cutsU.length; ci++){ let run = [];
+        const emit = () => { if (run.length >= 2){ const poly = [...run.map(c => [c[0], c[1]]), ...run.slice().reverse().map(c => [c[0], c[2]])]; let h = 0; run.forEach(c => { h = Math.max(h, c[2] - c[1]); });
+            if (h * K > 2 && run[run.length - 1][0] - run[0][0] > rt) pieces.push({ r, poly, tier: ti, name: r.name + letterOf(pc++) }); } run = []; };
+        for (const u of U){ if (u < cutsU[ci] - 1e-9 || u > cutsU[ci + 1] + 1e-9) continue; const [a, b] = col(u); if (b - a > 1e-5) run.push([u, a, b]); else emit(); }
+        emit(); } } }
+  const tall = tiers.length > 2;
+  waffle = { ribs, pieces, base, t, rt, K }; showWaffle();
+  flash(ribs.length + ' ribs in ' + pieces.length + ' pieces (' + ribs.filter(r => r.dir === 'x').length + ' one way, ' + ribs.filter(r => r.dir === 'z').length + ' the other), every ' + fabLen(S.ribGap ?? 60) + ', ' + fabLen(ribT()) + ' thick; each piece fits ' + fabLen(PL * K + 4) + ' × ' + fabLen(PH * K + 4) + ', joints staggered' + (tall ? '; ' + (tiers.length - 1) + ' layers stacked, each its own egg-crate' : '') + '.', 9);
 }
-function showWaffle(){ for (const o of [...waffleGroup.children]){ waffleGroup.remove(o); o.geometry.dispose(); } if (!waffle) return; const seg = [];
-  for (const r of waffle.ribs){ const P3 = (u, y) => r.dir === 'x' ? [r.c, y, u] : [u, y, r.c], pr = r.prof, a = pr[0][0], b = pr[pr.length - 1][0];
-    const loop = [P3(a, waffle.base), ...pr.map(([u, y]) => P3(u, y)), P3(b, waffle.base)]; for (let i = 0; i < loop.length; i++){ const p = loop[i], q = loop[(i + 1) % loop.length]; seg.push(...p, ...q); } }
-  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(seg, 3)); waffleGroup.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xF2C230 }))); waffleGroup.visible = menuTab === 'fab'; }
+// the ribs as solid parts, the thickness of their sheet, each piece its own shade of wood
+function showWaffle(){ for (const o of [...waffleGroup.children]){ waffleGroup.remove(o); o.geometry.dispose(); } if (!waffle) return;
+  const tones = [0xE2B97F, 0xC9965A, 0xEFD3A3, 0xB98450], geos = tones.map(() => []), edges = [];
+  waffle.pieces.forEach((pc, i) => { const r = pc.r, sh = new THREE.Shape(pc.poly.map(([u, y]) => new THREE.Vector2(u, y)));
+    const g = new THREE.ExtrudeGeometry(sh, { depth: waffle.rt, bevelEnabled: false, curveSegments: 1 }), m = new THREE.Matrix4();
+    if (r.dir === 'x') m.set(0, 0, 1, r.c - waffle.rt / 2, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1); else m.set(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, r.c - waffle.rt / 2, 0, 0, 0, 1);
+    g.applyMatrix4(m); geos[(r.k + (i % 2) * 2) % tones.length].push(g); edges.push(new THREE.EdgesGeometry(g, 25)); });
+  tones.forEach((c, i) => { if (!geos[i].length) return; const pos = []; for (const g of geos[i]){ const a = g.toNonIndexed().attributes.position.array; for (let k = 0; k < a.length; k++) pos.push(a[k]); g.dispose(); }
+    const gg = new THREE.BufferGeometry(); gg.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); gg.computeVertexNormals();
+    waffleGroup.add(new THREE.Mesh(gg, new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, side: THREE.DoubleSide }))); });
+  const ep = []; for (const e of edges){ const a = e.attributes.position.array; for (let k = 0; k < a.length; k++) ep.push(a[k]); e.dispose(); }
+  const eg = new THREE.BufferGeometry(); eg.setAttribute('position', new THREE.Float32BufferAttribute(ep, 3)); waffleGroup.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: 0x5A3E22 })));
+  waffleGroup.visible = menuTab === 'fab'; }
 function exportWaffleSVG(){
   if (!waffle) return flash('Make the waffle first'); const K = waffle.K, tmm = ribT(), [SW, SH] = sheetWH(), gap = 6, out = [];
-  const shapes = waffle.ribs.map(r => { const u0 = r.prof[0][0], pts = [[0, 0], ...r.prof.map(([u, y]) => [(u - u0) * K, (y - waffle.base) * K]), [(r.prof[r.prof.length - 1][0] - u0) * K, 0]];
-    const w = Math.max(...pts.map(p => p[0])), h = Math.max(...pts.map(p => p[1])); return { r, pts, w, h, u0 }; }).sort((a, b) => b.h - a.h);
+  const shapes = waffle.pieces.map(pc => { const xs = pc.poly.map(p => p[0]), ys = pc.poly.map(p => p[1]), x0 = Math.min(...xs), y0 = Math.min(...ys), pts = pc.poly.map(([u, y]) => [(u - x0) * K, (y - y0) * K]);
+    const w = Math.max(...pts.map(p => p[0])), h = Math.max(...pts.map(p => p[1])); return { pc, pts, w, h }; }).sort((a, b) => b.h - a.h);
   let sheet = 0, x = gap, y = gap, rowH = 0; for (const sh of shapes){ if (x + sh.w > SW - gap){ x = gap; y += rowH + gap; rowH = 0; } if (y + sh.h > SH - gap){ sheet++; x = gap; y = gap; rowH = 0; } sh.sheet = sheet; sh.x = x; sh.y = y; x += sh.w + gap; rowH = Math.max(rowH, sh.h); }
   const nS = sheet + 1; out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${SW}mm" height="${nS * (SH + 20)}mm" viewBox="0 0 ${SW} ${nS * (SH + 20)}">`);
   for (let k = 0; k < nS; k++) out.push(`<rect x="0" y="${k * (SH + 20)}" width="${SW}" height="${SH}" fill="none" stroke="#999" stroke-width="0.2"/><text x="2" y="${k * (SH + 20) + SH + 8}" font-size="5" fill="#999">ribs · sheet ${k + 1} of ${nS} · ${fabSize([SW, SH])} · ${fabLen(tmm)} sheet · 1:${FAB_SCALE[S.fabScale ?? 3]}</text>`);
   for (const sh of shapes){ const oy = sh.sheet * (SH + 20) + sh.y, X = px => (sh.x + px).toFixed(2), Y = py => (oy + sh.h - py).toFixed(2);
-    // outline with the slots cut in
-    let d = ''; const pts = sh.pts; d += `M${X(pts[0][0])} ${Y(pts[0][1])}`; for (const p of pts.slice(1)) d += ` L${X(p[0])} ${Y(p[1])}`; d += ' Z';
-    out.push(`<path d="${d}" fill="none" stroke="#ff0000" stroke-width="0.1"/>`);
-    for (const sl of sh.r.slots){ const cx = (sl.u - sh.u0) * K, hw = tmm / 2, yA = sh.r.dir === 'x' ? (sl.mid - waffle.base) * K : -1, yB = sh.r.dir === 'x' ? (sl.top - waffle.base) * K + 1 : (sl.mid - waffle.base) * K;
-      out.push(`<rect x="${X(cx - hw)}" y="${Y(yB)}" width="${tmm.toFixed(2)}" height="${(yB - yA).toFixed(2)}" fill="none" stroke="#ff0000" stroke-width="0.1"/>`); }
-    out.push(`<text x="${X(sh.w / 2)}" y="${Y(Math.min(8, sh.h / 3))}" font-size="${Math.max(2, Math.min(6, sh.h / 4)).toFixed(1)}" text-anchor="middle" fill="#0060ff">${sh.r.name}</text>`); }
+    // the outline, slots and all, as one cut
+    out.push(`<polygon points="${sh.pts.map(p => X(p[0]) + ',' + Y(p[1])).join(' ')}" fill="none" stroke="#ff0000" stroke-width="0.1"/>`);
+    out.push(`<text x="${X(sh.w / 2)}" y="${Y(Math.min(sh.h * 0.35, 6))}" font-size="${Math.max(2, Math.min(6, sh.h / 4)).toFixed(1)}" text-anchor="middle" fill="#0060ff">${sh.pc.name}</text>`); }
   out.push('</svg>'); const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out.join('\n')], { type: 'image/svg+xml' })); a.download = 'pentimento-park-waffle.svg'; a.click();
-  flash('Saved ' + waffle.ribs.length + ' ribs on ' + nS + (nS === 1 ? ' sheet' : ' sheets') + ' (SVG). The slots are cut where the ribs cross; the names are etched.', 7);
+  flash('Saved ' + waffle.pieces.length + ' rib pieces on ' + nS + (nS === 1 ? ' sheet' : ' sheets') + ' (SVG). Slots are cut where ribs cross; names (rib, then piece A, B …) are etched in blue.', 7);
 }
 // panel names in the headset: small tags on each panel
 const labelGroup = new THREE.Group(); world.add(labelGroup);
@@ -3030,12 +3051,12 @@ function setStep(st, quiet){
     { id: 'pc-labels', style: 'lock', label: () => 'Names', on: () => !!S.panelLabels, vis: () => !!(panels && (panels.hex || panels.strip)), act: () => { S.panelLabels = S.panelLabels ? 0 : 1; showPanelLabels(); scheduleSave(); } }], { vis: () => !!panels });
   row('fab', 80, [{ id: 'panels-svg', label: () => 'Save cut sheets SVG', sub: () => 'unrolled strips, named', vis: () => !!(panels && (panels.hex || panels.strip)), act: exportPanelSVG }, { id: 'panels-obj', label: () => 'Save panels OBJ', sub: () => 'flat panels in 3D', act: exportPanels }], { vis: () => !!panels });
   section('fab', 'WAFFLE UNDERNEATH');
-  note('fab', 'Ribs both ways from the base up to just under the panels (by the panel sheet\'s thickness), with half-depth slots where they cross, laid out on sheets to cut.');
+  note('fab', 'Ribs both ways from the base up to just under the panels (by the panel sheet\'s thickness), with half-depth slots where they cross. Each piece fits the stock above (4′×8′ at scale, or the cut sheet), joints staggered like brickwork; taller than the stock, it\'s built in stacked layers. Shown as solid parts.');
   stepper('fab', 64, 'Rib sheet', () => fabLen(ribT()), () => thickStep('ribT', -1), () => thickStep('ribT', 1));
   const ribStep = d => { const g0 = S.ribGap ?? 60, st = fabIn() ? (g0 + d * 0.01 < 4 * INCH ? INCH / 2 : INCH) : (g0 + d * 0.01 < 100 ? 10 : 25); S.ribGap = Math.max(fabIn() ? INCH / 2 : 10, Math.min(600, Math.round((g0 + d * st) / st) * st)); scheduleSave(); };
   stepper('fab', 64, 'Rib spacing', () => fabLen(S.ribGap ?? 60), () => ribStep(-1), () => ribStep(1));
   { const goW = 620; blk('fab', 96, [
-    add({ id: 'waffle-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => waffle ? 'REMAKE WAFFLE' : 'MAKE WAFFLE', sub: () => waffle ? waffle.ribs.length + ' ribs' : hasSurface() ? 'under the surface' : 'build a surface first', act: () => { flash('Making the waffle…'); setTimeout(makeWaffle, 30); } }),
+    add({ id: 'waffle-make', x: P, y: 0, w: goW, h: 96, style: 'big', label: () => waffle ? 'REMAKE WAFFLE' : 'MAKE WAFFLE', sub: () => waffle ? waffle.ribs.length + ' ribs · ' + waffle.pieces.length + ' pieces' : hasSurface() ? 'under the surface' : 'build a surface first', act: () => { flash('Making the waffle…'); setTimeout(makeWaffle, 30); } }),
     add({ id: 'waffle-clear', x: P + goW + G, y: 0, w: W - goW - G, h: 96, style: 'danger', label: () => 'Clear', vis: () => !!waffle, act: clearWaffle })]); }
   row('fab', 80, [{ id: 'waffle-svg', label: () => 'Save ribs SVG', sub: () => 'outlines, slots and names', act: exportWaffleSVG }], { vis: () => !!waffle });
   endSection('fab');
