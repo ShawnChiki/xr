@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p3.17"></script>
-<script src="solver.js?v=p3.17"></script>
+<script src="demo.js?v=p3.18"></script>
+<script src="solver.js?v=p3.18"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -107,7 +107,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '3.17';
+const VERSION = '3.18';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -3253,14 +3253,45 @@ const PLAY = (() => {
       sk.V.addScaledVector(n.y > 0.2 ? n.clone().lerp(UP, 0.35).normalize() : n, v);
       sk.Uair.copy(n); sk.grounded = false; sk.grind = null; sk.cool = 0.35; sk.leave = 0.12; sk.sinceOllie = 0; sk.tailDrag = false; sk.events.push('ollie');
     }
+    if (!sk.grounded && !sk.grind && sk.air > 0.05){ sk.planT = (sk.planT || 0) - dt; if (sk.planT <= 0){ sk.planT = 0.12; planLanding(g); } } else { sk.assistA = null; sk.planT = 0; }
     const steps = clamp(Math.ceil(sk.V.length() * dt / (r * 0.35)), 1, 16), h = dt / steps;
     for (let i = 0; i < steps && !sk.bail; i++) subStep(h, r, g, inp);
     if (!isFinite(sk.B.x + sk.B.y + sk.B.z + sk.V.x + sk.V.y + sk.V.z + sk.F.x + sk.N.y + sk.Uair.y) || sk.B.y < coll.yG - 5 * K) spawnAt(spawnIdx);
+  }
+  // ---- landing assist: in the air, look ahead along where you're falling. If you'd come down on a bad spot (flat on
+  // your wheels into a slope, or into a wall), try small nudges sideways and pick the one that lands you along a
+  // surface that matches your fall: a transition going your way. Then lean the flight that way, a little at a time,
+  // re-planning as you go, so it feels like you aimed it.
+  const ASSIST = [0, 0.12, 0.25];       // largest nudge, as a share of your speed: off, subtle, strong
+  const _pa = new V3(), _pb = new V3(), _pv = new V3(), _rd = new V3();
+  function predict(B, V, g){
+    _pa.copy(B); _pv.copy(V); const dt = 0.06, r = BOARD_R * K;
+    for (let t = 0; t < 1.6; t += dt){
+      _pb.copy(_pa).addScaledVector(_pv, dt); _pb.y -= 0.5 * g * dt * dt;
+      const L = _pa.distanceTo(_pb); if (L > 1e-6 && coll.bvh){ _rd.subVectors(_pb, _pa).divideScalar(L); _ray.set(_pa, _rd); const hit = coll.bvh.raycastFirst(_ray, THREE.DoubleSide);
+        if (hit && hit.distance < L + r){ let n = faceNormal(hit.faceIndex); if (n.dot(_rd) > 0) n.negate(); n = smoothNormal(hit.faceIndex, hit.point, n); return { t, v: _pv.clone(), n, p: hit.point.clone() }; } }
+      if (_pb.y < coll.yG + r) return { t, v: _pv.clone(), n: UP.clone(), p: _pb.clone() };
+      _pa.copy(_pb); _pv.y -= g * dt;
+    }
+    return null;
+  }
+  // how good a landing is: 0 rolling straight along the surface, 1 slamming into it; walls and overhangs are bad
+  const landScore = L => { if (!L) return 9; const vn = L.v.clone().normalize().dot(L.n); return Math.abs(vn) + (L.n.y < 0.25 ? 1.5 : 0) + (vn > 0 ? 2 : 0); };
+  function planLanding(g){
+    sk.assistA = null; const lvl = S.playLand ?? 1; if (!lvl || !coll.bvh) return;
+    const base = predict(sk.B, sk.V, g); if (!base || base.t < 0.12) return;
+    let best = { s: landScore(base), dv: null }; if (best.s < 0.25) return;           // already landing nicely
+    const vh = Math.hypot(sk.V.x, sk.V.z), mag = Math.max(vh, 1.5 * K) * ASSIST[lvl], dv = new V3();
+    for (const f of [0.5, 1]) for (let a = 0; a < 8; a++){ const an = a * Math.PI / 4; dv.set(Math.cos(an) * mag * f, 0, Math.sin(an) * mag * f);
+      const L = predict(sk.B, sk.V.clone().add(dv), g), sc = landScore(L) + 0.05 * f; if (sc < best.s - 0.06) best = { s: sc, dv: dv.clone(), t: L.t }; }
+    sk.planInfo = { base: +landScore(base).toFixed(2), best: +best.s.toFixed(2) };
+    if (best.dv) sk.assistA = best.dv.divideScalar(Math.max(best.t, 0.25));
   }
   function subStep(h, r, g, inp){
     const s = 1 / K, mu = P('friction') / 100 * 0.15, grip = P('grip') / 100 * 2.6, top = P('top') / s, acc = P('booster') / s * inp.boost;
     if (sk.grind){ sk.skid = 0; return grindStep(h, r, g, mu, top, acc, inp); }
     sk.V.y -= g * h;
+    if (!sk.grounded && sk.assistA) sk.V.addScaledVector(sk.assistA, h);
     const fw = sk.F.clone().multiplyScalar(sk.bdir);
     if (acc > 0 && sk.V.dot(fw) < top) sk.V.addScaledVector(fw, acc * h);
     if (sk.grounded){
@@ -4135,6 +4166,7 @@ function setStep(st, quiet){
   pstep('booster', 'Booster', v => v + ' m/s²'); pstep('top', 'Top speed', v => v + ' m/s'); pstep('grip', 'Grip', v => String(v)); pstep('pop', 'Ollie pop', v => v + ' m/s'); pstep('friction', 'Rolling drag', v => String(v));
   row('play', 72, [
     { id: 'play-lean', label: () => S.playTilt === 1 ? 'Tilt hands carves' : 'Tilt carving: off', on: () => S.playTilt === 1, act: () => { S.playTilt = S.playTilt === 1 ? 0 : 1; scheduleSave(); } },
+    { id: 'play-land', label: () => ['Land assist: off', 'Land assist', 'Land assist: strong'][S.playLand ?? 1], on: () => (S.playLand ?? 1) > 0, act: () => { S.playLand = ((S.playLand ?? 1) + 1) % 3; scheduleSave(); flash(['Landing assist off', 'Landing assist: a gentle nudge in the air toward a smooth landing', 'Landing assist strong: a firmer nudge toward a smooth landing'][S.playLand]); } },
     { id: 'play-auto', label: () => S.playAutoGrind === 0 ? 'Auto grind: off' : 'Auto grind', on: () => S.playAutoGrind !== 0, act: () => { S.playAutoGrind = S.playAutoGrind === 0 ? 1 : 0; scheduleSave(); } },
     { id: 'play-sound', label: () => S.playSound === 0 ? 'Sound: off' : 'Sound', on: () => S.playSound !== 0, act: () => { S.playSound = S.playSound === 0 ? 1 : 0; PLAY.setSound(); scheduleSave(); } },
     { id: 'play-board', label: () => 'Board look', act: () => { S.playColor = ((S.playColor || 0) + 1) % RUN_COLORS.length; PLAY.makePlayBoard(); scheduleSave(); } }], { ...MORE, gap: 10 });
