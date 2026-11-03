@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p3.20"></script>
-<script src="solver.js?v=p3.20"></script>
+<script src="demo.js?v=p4.0"></script>
+<script src="solver.js?v=p4.0"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -107,7 +107,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '3.20';
+const VERSION = '4.0';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -164,7 +164,7 @@ if (S.tag === 2) S.tag = 1;                                         // the two g
 if (S.surfWas === 'quads') S.surfWas = 'shaded';
 while (S.show.length < NT) S.show.push(1); while (S.lock.length < NT) S.lock.push(0);
 // lines you can touch with the tools: their layer is showing and unlocked
-const editable = s => S.show[s.tag] && !S.lock[s.tag];
+const editable = s => S.show[s.tag] && !S.lock[s.tag] && layerOf(s) === curLayer;
 const lenText = m => m >= 1 ? (Math.round(m * 10) / 10) + ' m' : Math.round(m * 100) + ' cm';
 
 // ======================================================================
@@ -258,6 +258,15 @@ function applyBackground(){
 // ======================================================================
 // stroke: { id, tag, raw (as drawn), pts (smoothed, what you see and what gets built from), box }
 let strokes = [], dabs = [], undoS = [], redoS = [], nextId = 1, linesDirty = true;
+// LAYERS: each line belongs to a layer, and each layer builds its own surface. You draw on (and build, shape and fab)
+// the current layer; the others keep the surface they last built and are only rebuilt when their own lines change.
+// They overlap where you put them (no blending), and in Play you ride all of them.
+let layers = [{ id: 1, name: 'Layer 1', show: 1 }], curLayer = 1;
+const LAYER_COLS = [0xFF6B3D, 0x4FC3FF, 0x5FE0B8, 0xFFD23F, 0xB48CFF, 0xFF5FA2, 0x6FD16A, 0xE8463B];
+const layerOf = s => s.layer || 1, layerById = id => layers.find(l => l.id === id), layerCol = L => LAYER_COLS[(L.id - 1) % LAYER_COLS.length];
+const activeStrokes = () => strokes.filter(s => layerOf(s) === curLayer), layerShown = id => { const L = layerById(id); return !L || L.show !== 0; };
+let strokeSerial = 0; const serialOf = s => s._v || (s._v = ++strokeSerial);
+const layerSig = id => strokes.filter(s => layerOf(s) === id).map(serialOf).join(',');
 // smooth paint: dabs {x,y,z,r,s} painted on the surface (park metres); kept with the sketch, undoable
 // runs' places ride along in the undo history, so a run moved by accident goes back with Undo
 const runsPoseNow = () => { try { return runsPose(); } catch (e){ return null; } };
@@ -271,12 +280,14 @@ function smoothed(raw, lv){
   for (let k = 0; k < it; k++){ b.set(a); for (let i = 1; i < n - 1; i++) for (let c = 0; c < 3; c++) b[3 * i + c] = a[3 * i + c] * 0.5 + (a[3 * i - 3 + c] + a[3 * i + 3 + c]) * 0.25; const t = a; a = b; b = t; }
   return a;
 }
-function makeStroke(tag, raw, pts){ pts = pts || smoothed(raw, S.smooth); return { id: nextId++, tag, raw, pts, box: boxOf(pts) }; }
+function makeStroke(tag, raw, pts){ pts = pts || smoothed(raw, S.smooth); return { id: nextId++, tag, raw, pts, box: boxOf(pts), layer: curLayer }; }
 function nearBox(s, p, r){ const b = s.box; return p.x > b[0] - r && p.x < b[3] + r && p.y > b[1] - r && p.y < b[4] + r && p.z > b[2] - r && p.z < b[5] + r; }
 function touches(s, p, r){ if (!nearBox(s, p, r)) return false; const a = s.pts, r2 = r * r; for (let i = 0; i < a.length; i += 3) if ((a[i] - p.x) ** 2 + (a[i + 1] - p.y) ** 2 + (a[i + 2] - p.z) ** 2 < r2) return true; return false; }
-function changed(){ linesDirty = true; menuDirty = true; scheduleBuild(); scheduleSave(); placeGrid();
-  // a blank sketch has no surface: clear the old build straight away
-  if (!strokes.length) try { cancelBuild(); clearSurface(); buildTimer = -1; stale = false; buildErr = ''; lastGood = null; } catch (e){} }
+function changed(){ linesDirty = true; menuDirty = true; scheduleSave(); placeGrid(); ensureLayers();
+  // only the layer whose lines changed rebuilds (the others are caught up in the background)
+  { const L = layerById(curLayer); if (!L || L.sig !== layerSig(curLayer) || !surfMesh) scheduleBuild(); }
+  // a blank layer has no surface: clear the old build straight away
+  if (!activeStrokes().length) try { cancelBuild(); clearSurface(); buildTimer = -1; stale = false; buildErr = ''; lastGood = null; } catch (e){} }
 // the park grid sits just under the lowest line so it never cuts through the terrain
 function placeGrid(){ const b = contentBox(); parkGrid.position.y = b ? b[1] - 0.15 : 0; }
 function commit(next, nextDabs){ undoS.push(snap()); if (undoS.length > 100) undoS.shift(); redoS = []; strokes = next; if (nextDabs) dabs = nextDabs; changed(); }
@@ -591,7 +602,8 @@ function catmull(c, closed, step){
 }
 function makeSpline(tag, ctrl, closed, id, kinks){
   if (kinks && !kinks.some(k => k)) kinks = null;
-  const sp = splinePts(ctrl, closed, 0.003 * N(), kinks); return { id: id || nextId++, tag, raw: sp.pts, pts: sp.pts, seg: sp.seg, box: boxOf(sp.pts), ctrl, closed, kinks };
+  const sp = splinePts(ctrl, closed, 0.003 * N(), kinks), was = id ? strokes.find(x => x.id === id) : null;      // a redrawn line stays on its own layer
+  return { id: id || nextId++, tag, raw: sp.pts, pts: sp.pts, seg: sp.seg, box: boxOf(sp.pts), ctrl, closed, kinks, layer: was ? layerOf(was) : curLayer };
 }
 function asSpline(s, tag){ const cl = isClosed(s.pts), f = fitCtrlCorners(s.pts, cl); return makeSpline(tag, f.ctrl, cl, s.id, f.kinks); }
 const respline = (s, ctrl, kinks) => { const n = makeSpline(s.tag, ctrl, s.closed, s.id, kinks === undefined ? s.kinks : kinks); if (s.ends) n.ends = s.ends.slice(); if (s.fold) n.fold = s.fold; return n; };
@@ -635,7 +647,7 @@ const _hm = new THREE.Matrix4();
 function rebuildHandles(){
   try { placeFoldGlyphs(); } catch (e){}
   handles = [];
-  if (S.ptsShow) for (const s of strokes){ if (!s.ctrl || !S.show[s.tag]) continue; for (let k = 0; k < s.ctrl.length / 3 && handles.length < MAXH; k++) handles.push({ s, k }); }
+  if (S.ptsShow) for (const s of strokes){ if (!s.ctrl || !S.show[s.tag] || layerOf(s) !== curLayer) continue; for (let k = 0; k < s.ctrl.length / 3 && handles.length < MAXH; k++) handles.push({ s, k }); }
   handleMesh.count = handles.length; handles.forEach((h, i) => setHandle(i));
   handleMesh.instanceMatrix.needsUpdate = true; if (handleMesh.instanceColor) handleMesh.instanceColor.needsUpdate = true;
 }
@@ -801,7 +813,7 @@ function updateFolds(){ folds = new Map(); for (const s of strokes) if (s.tag ==
 // helper lines that hold a pinned fold: a little way out on each side, a little down (outie) or up (innie)
 function foldHelpers(){
   const out = []; if (!foldGrid) return out;
-  for (const s of strokes){ if (!s.fold || s.tag !== 4 || !s.ctrl) continue; const n = s.pts.length / 3, f0 = folds.get(s.id), half = Math.max(25, Math.min(60, (f0 && f0.bend ? f0.bend : 40) / 2)) * Math.PI / 180;
+  for (const s of strokes){ if (!s.fold || s.tag !== 4 || !s.ctrl || layerOf(s) !== curLayer) continue; const n = s.pts.length / 3, f0 = folds.get(s.id), half = Math.max(25, Math.min(60, (f0 && f0.bend ? f0.bend : 40) / 2)) * Math.PI / 180;
     const w = Math.max(1.4 * QUAD[S.quad], foldGrid.R * 0.3), h = w * Math.tan(half), L = [], Rr = [], step = Math.max(1, Math.round(n / 40));
     for (let i = Math.round(n * 0.08); i < n * 0.92; i += step){ const f = foldFrame(s, i); if (!f) continue; const up = s.fold === 1 ? -h : h;
       L.push(...f.p.map((v, c) => v - f.sv[c] * w + f.nb[c] * up)); Rr.push(...f.p.map((v, c) => v + f.sv[c] * w + f.nb[c] * up)); }
@@ -891,7 +903,7 @@ function refreshBad(){ const list = strokes.filter(s => badIds.has(s.id)); if (l
 function setHighlight(list){ const key = list.map(s => s.id).join(','); if (key === hiKey) return; hiKey = key; hiMesh.visible = list.length > 0; if (list.length){ hiMesh.geometry.dispose(); hiMesh.geometry = new THREE.BufferGeometry(); mergeInto(hiMesh.geometry, list); } }
 function rebuildLines(){
   linesDirty = false;
-  for (let t = 0; t < NT; t++){ const me = lineMeshes[t]; me.geometry.dispose(); me.geometry = new THREE.BufferGeometry(); mergeInto(me.geometry, strokes.filter(s => s.tag === t), t); }
+  for (let t = 0; t < NT; t++){ const me = lineMeshes[t]; me.geometry.dispose(); me.geometry = new THREE.BufferGeometry(); mergeInto(me.geometry, strokes.filter(s => s.tag === t && layerShown(layerOf(s))), t); }
   applySurfView(); hiKey = '#'; setHighlight([]); rebuildHandles(); if (badIds.size) refreshBad();
 }
 // the line being drawn right now
@@ -930,7 +942,7 @@ const hasSurface = () => !!surfMesh;
 const GUIDE_LAYOUT = { '-3': 'Guides ×1', '-2': 'Guides ×4', '-1': 'Guides ×16' };
 const targetVal = () => (S.target || 0) < 0 ? -1 - ((S.target || 0) + 3) : TARGETS[S.target || 0];   // -1: one face per patch, -2: 4, -3: 16
 function params(){ const q = QUAD[S.quad]; return { detail: q, avg: q * 1.6, lines: S.avg, fair: S.fair / 10, reach: REACH[S.reach], group: GROUP[S.group], subd: S.subd, relax: S.relax || 0, target: targetVal(), hard: HARD[S.hard || 0], tipFade: TIPS_FADE[S.tipSoft ?? 1], rows: S.rows ?? 1, softCrease: SOFT_CREASE[S.softCrease ?? 4], creaseMin: CREASE_MIN[S.creaseMin ?? 2], bridges: !!S.bridges }; }
-function scheduleBuild(){ stale = true; menuDirty = true; if (building) cancelBuild(); if (cageEd) return; if (S.auto && S.surf !== 'hide') buildTimer = 0.6; }
+function scheduleBuild(){ const L = layerById(curLayer); if (L) L.sig = null; stale = true; menuDirty = true; if (building) cancelBuild(); if (cageEd) return; if (S.auto && S.surf !== 'hide') buildTimer = 0.6; }
 // stop a build that's out of date, so the next one can start straight away with the new lines
 function cancelBuild(){ if (!building) return; if (worker){ worker.terminate(); worker = null; } building = false; pending = false; buildId++; menuDirty = true; }
 // with the surface off nothing gets rebuilt, so sketching and flattening run at full speed; turning it on catches up once
@@ -939,7 +951,8 @@ function toggleSurface(){ setSurfView(S.surf === 'hide' ? (S.surfWas || 'shaded'
 function startBuild(){
   if (cageEd){ buildTimer = -1; return askUser('Rebuild from your lines? Your shaping goes (smoothing stays as smooth paint).', [{ label: 'Rebuild', act: () => { cageEd = null; cageEditing = false; showCage(); scheduleSave(); startBuild(); } }, { label: 'Keep edits', act: () => {} }]); }
   buildTimer = -1;
-  if (!strokes.length){ if (building){ buildId++; building = false; pending = false; } clearSurface(); stale = false; menuDirty = true; return; }
+  const mine = activeStrokes();
+  if (!mine.length){ if (building){ buildId++; building = false; pending = false; } clearSurface(); stale = false; menuDirty = true; return; }
   if (building) cancelBuild();
   if (!worker){
     worker = new Worker((S.builder === 'classic' ? 'solver-classic.js' : 'solver.js') + '?v=' + VERSION);    // the builder that matches this page, never an old cached one
@@ -953,13 +966,79 @@ function startBuild(){
     worker.onerror = e => { building = false; pending = false; buildErr = e.message || 'error'; flash('Builder stopped (' + buildErr + '). Press Build to retry.', 7); worker = null; };
   }
   building = true; stale = false; buildP = 0; buildMsg = 'Starting'; buildErr = ''; buildStart = performance.now(); buildT0 = buildStart; buildSnap = snap(); menuDirty = true;
-  const good = lastGood ? new Set(lastGood.s) : null, fresh = good ? strokes.filter(s => !good.has(s) || badIds.has(s.id)).map(s => s.id) : [];
-  worker.postMessage({ id: ++buildId, strokes: [...strokes.map(s => ({ id: s.id, tag: s.tag, pts: s.pts, corners: cornerPts(s), ends: s.ends ? s.ends.map(v => v == null ? null : TIPS_FADE[v]) : undefined })), ...foldHelpers()], prm: { ...params(), layout: S.layout === 'field' ? 'field' : 'pairs', dabs, fresh, warm: S.builder === 'classic' ? null : fitCache, ...(window.__crash ? { __crash: window.__crash } : {}) } });
+  { const L = layerById(curLayer); if (L) L.sig = layerSig(curLayer); }
+  const good = lastGood ? new Set(lastGood.s) : null, fresh = good ? mine.filter(s => !good.has(s) || badIds.has(s.id)).map(s => s.id) : [];
+  worker.postMessage({ id: ++buildId, strokes: [...mine.map(s => ({ id: s.id, tag: s.tag, pts: s.pts, corners: cornerPts(s), ends: s.ends ? s.ends.map(v => v == null ? null : TIPS_FADE[v]) : undefined })), ...foldHelpers()], prm: { ...params(), layout: S.layout === 'field' ? 'field' : 'pairs', dabs, fresh, warm: S.builder === 'classic' ? null : fitCache, ...(window.__crash ? { __crash: window.__crash } : {}) } });
 }
 function clearSurface(){
   for (const o of [surfMesh, wireLines, fineLines, creaseLines]) if (o){ surf.remove(o); o.geometry.dispose(); }
   if (foundGroup){ surf.remove(foundGroup); foundGroup.traverse(o => o.geometry && o.geometry.dispose()); }
   surfMesh = wireLines = fineLines = creaseLines = foundGroup = null; lastResult = null;
+}
+// ---------- layers: the ones you're not on show the surface they last built (or as you last shaped it)
+const layerG = new THREE.Group(); world.add(layerG);
+const layerMats = new Map();
+const layerMat = L => { let m = layerMats.get(L.id); if (!m){ const c = new THREE.Color(0xBDB7AB).lerp(new THREE.Color(layerCol(L)), 0.18); m = new THREE.MeshStandardMaterial({ color: c, roughness: 0.82, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }); layerMats.set(L.id, m); } return m; };
+function dropLayerMesh(L){ if (L.mesh){ layerG.remove(L.mesh); L.mesh.geometry.dispose(); L.mesh = null; } }
+function showLayerMesh(L){
+  dropLayerMesh(L); if (L.id === curLayer) return; const d = L.look || (L.res && L.res.surface); if (!d || !d.pos || !d.pos.length) return;
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(d.pos, 3)); g.setAttribute('normal', new THREE.BufferAttribute(d.nrm, 3));
+  L.mesh = new THREE.Mesh(g, layerMat(L)); L.mesh.visible = L.show !== 0 && S.surf !== 'hide'; L.mesh.userData.layer = L.id; layerG.add(L.mesh);
+}
+function applyLayerView(){ for (const L of layers) if (L.mesh) L.mesh.visible = L.show !== 0 && S.surf !== 'hide'; }
+// lines on a layer that isn't in the list (undo after deleting a layer, or a friend's new layer) bring it back
+function ensureLayers(){ for (const st of strokes){ const id = layerOf(st); if (!layerById(id)){ layers.push({ id, name: 'Layer ' + id, show: 1 }); layers.sort((a, b) => a.id - b.id); menuDirty = true; } } }
+// the surfaces of every layer, for riding and for Rhino: [{ L, pos, nrm }]
+function layerSurfaces(){ const out = []; if (surfMesh) out.push({ L: layerById(curLayer), pos: surfMesh.geometry.attributes.position.array, nrm: surfMesh.geometry.attributes.normal.array });
+  for (const L of layers) if (L.id !== curLayer && L.show !== 0 && L.mesh) out.push({ L, pos: L.mesh.geometry.attributes.position.array, nrm: L.mesh.geometry.attributes.normal.array }); return out; }
+// switch the layer you draw on: what's built and shaped on this one is kept with it, and the other's comes back
+function setLayer(id){
+  if (id === curLayer || !layerById(id)) return; if (cageEditing) stopCageEdit(true);
+  const A = layerById(curLayer), B = layerById(id);
+  if (building){ cancelBuild(); A.sig = null; }
+  A.res = lastResult; A.cache = fitCache; A.cage = packCage(); A.good = lastGood;
+  A.look = surfMesh ? { pos: surfMesh.geometry.attributes.position.array.slice(), nrm: surfMesh.geometry.attributes.normal.array.slice() } : null;
+  if (panels) clearPanels(); if (waffle) clearWaffle();
+  clearSurface(); cageEd = null; cageEditing = false; showCage(); lastGood = null; fitCache = null; stale = false; buildErr = ''; setBad([]);
+  curLayer = id; showLayerMesh(A); dropLayerMesh(B);
+  fitCache = B.cache || null; lastGood = B.good || null;
+  if (B.res && B.res.surface){ applyResult(B.res); if (B.look && !B.cage){ try { surfMesh.geometry.attributes.position.array.set(B.look.pos); surfMesh.geometry.attributes.position.needsUpdate = true; } catch (e){} } }
+  if (B.cage && B.cage.V){ cageRestore(B.cage); cageSurface(); }
+  B.look = null;
+  if (B.sig !== layerSig(id) && !B.cage) scheduleBuild();
+  linesDirty = true; rebuildHandles(); hiKey = '#'; setHighlight([]); menuDirty = true; scheduleSave(); try { PLAY.rebuild(); } catch (e){}
+  flash('Drawing on ' + B.name + (activeStrokes().length ? '' : ' (empty: start drawing)'));
+}
+function newLayer(){ const id = layers.reduce((m, L) => Math.max(m, L.id), 0) + 1; if (layers.length >= 8) return flash('Eight layers is the most'); layers.push({ id, name: 'Layer ' + id, show: 1 }); setLayer(id); try { NET.layersChanged(); } catch (e){} }
+let layerDelArmed = 0;
+function deleteLayer(){
+  if (layers.length < 2) return flash('This is your only layer');
+  const L = layerById(curLayer), n = activeStrokes().length;
+  if (n && layerDelArmed <= 0){ layerDelArmed = 3; menuDirty = true; return flash('Press Delete layer again: its ' + n + ' lines go too (Undo brings them back)'); }
+  layerDelArmed = 0; const next = layers.find(x => x.id !== L.id);
+  if (n) commit(strokes.filter(st => layerOf(st) !== L.id));
+  const keep = L.id; setLayer(next.id); layers = layers.filter(x => x.id !== keep); dropLayerMesh(L); menuDirty = true; scheduleSave(); flash(L.name + ' deleted'); try { NET.layersChanged(); } catch (e){}
+}
+function toggleLayerShow(id){ const L = layerById(id); if (!L) return; if (id === curLayer) return flash('You\'re drawing on this layer, so it stays showing');
+  L.show = L.show === 0 ? 1 : 0; if (L.show && !L.mesh) L.sig = null; applyLayerView(); linesDirty = true; scheduleSave(); try { PLAY.rebuild(); } catch (e){} flash(L.name + (L.show ? ' showing' : ' hidden')); }
+// the layers you aren't on are rebuilt one at a time in the background when their lines (or the build settings) change
+let bgWorker = null, bgJob = null, bgT = 0;
+function bgBuild(dt){
+  bgT -= dt; if (bgJob || bgT > 0 || S.surf === 'hide') return; bgT = 0.5;
+  // a shaped layer shows its own SubD (no build needed)
+  const SH = layers.find(x => x.id !== curLayer && x.show !== 0 && x.cage && x.cage.V && !x.look && !x.mesh);
+  if (SH){ try { const A = SV(), c = SH.cage, base = { V: c.V.slice(), F: c.F.map(f => f.slice()), sharp: new Set(c.sharp), corner: new Uint8Array(c.V.length / 3), cageE: A.allEdges(c.F) };
+    let sm = A.catmullClark(base, []); for (let i = 1; i < (c.levels || 2); i++) sm = A.catmullClark(sm, []); SH.look = A.shade(sm); showLayerMesh(SH); } catch (e){ SH.look = { pos: new Float32Array(0), nrm: new Float32Array(0) }; } SH.sig = layerSig(SH.id); return; }
+  const L = layers.find(x => x.id !== curLayer && x.show !== 0 && !x.cage && x.sig !== layerSig(x.id)); if (!L) return;
+  const mine = strokes.filter(st => layerOf(st) === L.id);
+  if (!mine.length){ L.sig = layerSig(L.id); L.res = null; L.look = null; dropLayerMesh(L); return; }
+  if (!bgWorker){ bgWorker = new Worker((S.builder === 'classic' ? 'solver-classic.js' : 'solver.js') + '?v=' + VERSION);
+    bgWorker.onmessage = e => { const m = e.data, J = bgJob; if (!J || m.id !== J.id) return;
+      if (m.type === 'done'){ bgJob = null; const T = layerById(J.layer); if (!T || T.id === curLayer) return; T.sig = J.sig; if (m.r && m.r.surface){ T.res = m.r; T.look = null; if (m.r.cache) T.cache = m.r.cache; showLayerMesh(T); try { PLAY.rebuild(); } catch (e){} } menuDirty = true; }
+      else if (m.type === 'error'){ bgJob = null; const T = layerById(J.layer); if (T) T.sig = J.sig; } };
+    bgWorker.onerror = () => { bgJob = null; bgWorker = null; }; }
+  bgJob = { id: Math.floor(Math.random() * 1e9), layer: L.id, sig: layerSig(L.id) };
+  bgWorker.postMessage({ id: bgJob.id, strokes: mine.map(st => ({ id: st.id, tag: st.tag, pts: st.pts, corners: cornerPts(st), ends: st.ends ? st.ends.map(v => v == null ? null : TIPS_FADE[v]) : undefined })), prm: { ...params(), layout: S.layout === 'field' ? 'field' : 'pairs', dabs, fresh: [], warm: S.builder === 'classic' ? null : L.cache || null } });
 }
 function applyResult(r){
   clearSurface(); if (panels) clearPanels(); if (waffle) clearWaffle();
@@ -1056,7 +1135,7 @@ function smoothAt(d, c, dt){
 function hasSurfaceNear(c, R){ if (!surfGrid) buildSurfGrid(); let any = false; const P = surfMesh.geometry.attributes.position.array; nearVerts(c.x, c.y, c.z, R, v => { if (!any && (P[3 * v] - c.x) ** 2 + (P[3 * v + 1] - c.y) ** 2 + (P[3 * v + 2] - c.z) ** 2 < R * R) any = true; }); return any; }
 function clearPaint(){ if (!dabs.length) return flash('No smooth paint to clear'); commit(strokes, []); paintTint(); flash('Smooth paint cleared. Undo brings it back.'); }
 function applySurfView(){
-  surf.visible = S.surf !== 'hide';
+  surf.visible = S.surf !== 'hide'; try { applyLayerView(); } catch (e){}
   // the Fab step shows the panels in place of the plain surface
   let pv = !!panels && menuTab === 'fab' && S.surf !== 'hide', sv = !pv;
   if (menuTab === 'fab' && (S.fabTab || 'piece') === 'waffle' && waffle){ const wv = S.waffleView || 'alone'; pv = !!panels && wv === 'panels'; sv = wv === 'surface'; }
@@ -1087,7 +1166,7 @@ function cycleView(){
 function setLineView(v){ S.lines = v; applySurfView(); scheduleSave(); }
 // which builder makes the surface: the new one, or 2.6's kept exactly as it was (a fallback you can flip to)
 function setBuilder(v){ S.builder = v; if (worker){ worker.terminate(); worker = null; building = false; } scheduleSave(); scheduleBuild(); flash(v === 'classic' ? 'Using the 2.6 builder' : 'Using the new builder'); }
-function setParam(fn){ fn(); scheduleSave(); scheduleBuild(); if (!S.auto) flash('Settings changed. Press Build to see them.'); }
+function setParam(fn){ fn(); scheduleSave(); for (const L of layers) if (L.id !== curLayer) L.sig = null; scheduleBuild(); if (!S.auto) flash('Settings changed. Press Build to see them.'); }
 
 function makeStrict(){
   if (!lastResult || stale || building) return flash('Wait for the surface to finish updating');
@@ -1669,7 +1748,10 @@ async function exportRhino(){
   // the surface, and its SubD control net (in Rhino: select it, ToSubD; the crease curves show where to crease)
   if (lastResult && surfMesh){ const P = surfMesh.geometry.attributes.position.array, key = new Map(), V = [], F = [];
     for (let t = 0; t < P.length; t += 9){ const f = []; for (let c = 0; c < 3; c++){ const i = t + 3 * c, k = Math.round(P[i] * 1e4) + ',' + Math.round(P[i + 1] * 1e4) + ',' + Math.round(P[i + 2] * 1e4); let v = key.get(k); if (v === undefined){ v = V.length; key.set(k, v); V.push(R3(P[i], P[i + 1], P[i + 2])); } f.push(v); } if (f[0] !== f[1] && f[1] !== f[2] && f[0] !== f[2]) F.push(f); }
-    doc.objects().add(meshOf(V, F), att(layer('Surface', [210, 200, 185]), 'surface')); n++;
+    doc.objects().add(meshOf(V, F), att(layer(layers.length > 1 ? 'Surface · ' + layerById(curLayer).name : 'Surface', [210, 200, 185]), 'surface')); n++;
+    for (const L of layers){ if (L.id === curLayer || !L.mesh) continue; const P2 = L.mesh.geometry.attributes.position.array, key2 = new Map(), V2 = [], F2 = [];
+      for (let t = 0; t < P2.length; t += 9){ const f = []; for (let c = 0; c < 3; c++){ const i = t + 3 * c, k = Math.round(P2[i] * 1e4) + ',' + Math.round(P2[i + 1] * 1e4) + ',' + Math.round(P2[i + 2] * 1e4); let v = key2.get(k); if (v === undefined){ v = V2.length; key2.set(k, v); V2.push(R3(P2[i], P2[i + 1], P2[i + 2])); } f.push(v); } F2.push(f); }
+      doc.objects().add(meshOf(V2, F2), att(layer('Surface · ' + L.name, [200, 190, 175]), 'surface')); n++; }
     const cg = lastResult.cage; if (cg){ const CL = layer('SubD control net', [240, 190, 40]), cf = []; let o = 0; for (let i = 0; i < cg.C.length; i++){ cf.push(Array.from(cg.F.slice(o, o + cg.C[i]))); o += cg.C[i]; }
       const cv = []; for (let i = 0; i < cg.V.length; i += 3) cv.push(R3(cg.V[i], cg.V[i + 1], cg.V[i + 2])); doc.objects().add(meshOf(cv, cf), att(CL, 'control net (ToSubD)')); n++;
       const CR = layer('SubD creases', [230, 60, 60], CL); for (let i = 0; i + 1 < cg.sharp.length; i += 2){ doc.objects().add(curve([cv[cg.sharp[i]], cv[cg.sharp[i + 1]]], false), att(CR)); n++; } }
@@ -1841,12 +1923,16 @@ function exportOBJ(){
 // ---------- saving ----------
 let saveT = -1;
 function scheduleSave(){ saveT = 1.2; }
-const packStroke = s => s.ctrl ? { t: s.tag, c: Array.from(s.ctrl, v => Math.round(v * 1000)), cl: s.closed ? 1 : 0, ...(s.kinks ? { k: Array.from(s.kinks) } : {}), ...(s.ends ? { e: s.ends } : {}), ...(s.fold ? { f: s.fold } : {}) } : { t: s.tag, r: Array.from(s.raw, v => Math.round(v * 1000)), ...(s.tieOf ? { u: s.tieOf } : {}) };
+const packStroke = s => Object.assign(packStroke0(s), layerOf(s) !== 1 ? { l: layerOf(s) } : {});
+const packStroke0 = s => s.ctrl ? { t: s.tag, c: Array.from(s.ctrl, v => Math.round(v * 1000)), cl: s.closed ? 1 : 0, ...(s.kinks ? { k: Array.from(s.kinks) } : {}), ...(s.ends ? { e: s.ends } : {}), ...(s.fold ? { f: s.fold } : {}) } : { t: s.tag, r: Array.from(s.raw, v => Math.round(v * 1000)), ...(s.tieOf ? { u: s.tieOf } : {}) };
 const packStrokes = () => strokes.map(packStroke);
 const packDabs = () => dabs.map(d => [d.x, d.y, d.z, d.r, d.s].map(v => Math.round(v * 1000) / 1000));
 // strict guides from before 2.3 become plain guides (there is one kind of guide now)
-function unpackStrokes(list){ return list.map(o => { if (o.c){ const sp = makeSpline(o.t, Float32Array.from(o.c, v => v / 1000), !!o.cl, 0, o.k ? Uint8Array.from(o.k) : null); if (o.e) sp.ends = o.e.slice(); if (o.f) sp.fold = o.f; return sp; }
-  const raw = Float32Array.from(o.r, v => v / 1000), st = makeStroke(o.t, raw, o.u ? raw : null); if (o.u) st.tieOf = o.u; return st; }); }
+function unpackStrokes(list){ return list.map(o => { if (o.c){ const sp = makeSpline(o.t, Float32Array.from(o.c, v => v / 1000), !!o.cl, 0, o.k ? Uint8Array.from(o.k) : null); if (o.e) sp.ends = o.e.slice(); if (o.f) sp.fold = o.f; sp.layer = o.l || 1; return sp; }
+  const raw = Float32Array.from(o.r, v => v / 1000), st = makeStroke(o.t, raw, o.u ? raw : null); if (o.u) st.tieOf = o.u; st.layer = o.l || 1; return st; }); }
+const packLayers = () => layers.map(L => ({ id: L.id, name: L.name, show: L.show === 0 ? 0 : 1, ...(L.id !== curLayer && L.cage ? { cage: L.cage } : {}) }));
+function unpackLayers(list, cur){ for (const L of layers) dropLayerMesh(L); layers = (list && list.length ? list : [{ id: 1, name: 'Layer 1', show: 1 }]).map(L => ({ id: L.id, name: L.name || 'Layer ' + L.id, show: L.show === 0 ? 0 : 1, cage: L.cage || null }));
+  curLayer = layers.some(L => L.id === cur) ? cur : layers[0].id; }
 const unpackDabs = list => (list || []).map(([x, y, z, r, s]) => ({ x, y, z, r, s }));
 // ---------- runs from Party Lines: the lines you rode there, as paths with boards rolling along them while you sketch.
 // They sit in the park at your model size (what was a fingerboard is a real board here), can be gripped and moved
@@ -2753,9 +2839,10 @@ function save(){
   saveT = -1;
   try {
     const yaw = new THREE.Euler().setFromQuaternion(world.quaternion, 'YXZ').y;
-    localStorage.setItem(KEY, JSON.stringify({ S, strokes: packStrokes(), dabs: packDabs(), runs: packRuns(), cage: packCage(), view: { p: world.position.toArray(), yaw, s: world.scale.x } }));
+    localStorage.setItem(KEY, JSON.stringify({ S, strokes: packStrokes(), dabs: packDabs(), runs: packRuns(), cage: packCage(), layers: packLayers(), cur: curLayer, view: { p: world.position.toArray(), yaw, s: world.scale.x } }));
   } catch (e) { flash('Sketch too big to keep in this browser. Download it from the Files tab.'); }
 }
+if (saved && saved.layers) try { unpackLayers(saved.layers, saved.cur); } catch (e){}
 if (saved && saved.strokes) strokes = unpackStrokes(saved.strokes);
 if (saved && saved.dabs) dabs = unpackDabs(saved.dabs);
 if (saved && saved.runs) try { unpackRuns(saved.runs); } catch (e){}
@@ -2788,7 +2875,7 @@ function libSet(l){ libCache = l.slice().sort((a, b) => b.t - a.t); menuDirty = 
     libSet(await libDB.all());
   } catch (e){ libSet([]); flash('Saved sketches are not available in this browser (no database). Use Download file.', 6); }
 })();
-function sketchData(name){ const set = {}; SKETCH_SET.forEach(k => set[k] = S[k]); return { app: 'pentimento', v: VERSION, name, strokes: packStrokes(), dabs: packDabs(), runs: packRuns(), cage: packCage(), set }; }
+function sketchData(name){ const set = {}; SKETCH_SET.forEach(k => set[k] = S[k]); return { app: 'pentimento', v: VERSION, name, strokes: packStrokes(), dabs: packDabs(), runs: packRuns(), cage: packCage(), layers: packLayers(), cur: curLayer, set }; }
 // a small picture of the model from above and to one side, for the list
 function makeThumb(){
   const b = contentBox(); if (!b) return null;
@@ -2837,6 +2924,7 @@ function useSketch(o, name){
   curSk = null;
   let next; try { next = unpackStrokes(o.strokes); } catch (e){ return flash('Could not read that sketch'); }
   if (o.set) SKETCH_SET.forEach(k => { if (o.set[k] !== undefined) S[k] = o.set[k]; });
+  if (panels) clearPanels(); if (waffle) clearWaffle(); clearSurface(); unpackLayers(o.layers, o.cur);
   commit(next, unpackDabs(o.dabs)); rebuildHandles(); unpackRuns(o.runs || null);
   cageEd = null; cageEditing = false; if (o.cage && o.cage.V){ cageRestore(o.cage); cageSurface(); }
   if (!renderer.xr.isPresenting) needsFit = true; else { const xc = renderer.xr.getCamera(), p = new V3(), q = new THREE.Quaternion(); xc.getWorldPosition(p); xc.getWorldQuaternion(q); fitView({ p, q }); }
@@ -2968,7 +3056,7 @@ function cycleTag(d){ const i = VT.indexOf(S.tag); setTag(VT[((i < 0 ? 0 : i) + 
 const canGoBack = () => !!buildErr && !!lastGood && lastGood.s !== strokes;
 function backToGood(){
   if (!lastGood) return flash('Nothing has built yet');
-  commit(lastGood.s, lastGood.d); buildErr = ''; flash('Back to the last sketch that built. Undo brings your newer lines back.', 5);
+  commit([...strokes.filter(s => layerOf(s) !== curLayer), ...lastGood.s.filter(s => layerOf(s) === curLayer)], lastGood.d); buildErr = ''; flash('Back to the last sketch that built. Undo brings your newer lines back.', 5);
 }
 function clearAll(){
   if (NET.guestBlock('clear the whole sketch')) return;
@@ -3037,9 +3125,11 @@ const PLAY = (() => {
   // ---- the world you ride: your surface, plus an apron that carries on from its open edges
   const smooth01 = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
   function buildWorld(){
-    const key = surfMesh ? surfMesh.geometry.uuid + ':' + K : 'none:' + K; if (builtFor === key) return; builtFor = key;
+    const SL = layerSurfaces(), key = SL.map(o => o.pos.length + ':' + (o.L ? o.L.id : 0)).join('|') + (surfMesh ? surfMesh.geometry.uuid : '') + layers.map(L => L.mesh ? L.mesh.geometry.uuid : '').join('') + ':' + K; if (builtFor === key) return; builtFor = key;
     for (const m of [apronMesh, groundMesh, copingMesh]) if (m){ G.remove(m); m.geometry.dispose(); } apronMesh = groundMesh = copingMesh = null; lines = []; segGrid = new Map(); loops = [];
-    const pos = surfMesh ? surfMesh.geometry.attributes.position.array : new Float32Array(0), nrm = surfMesh ? surfMesh.geometry.attributes.normal.array : new Float32Array(0), nT = pos.length / 9;
+    // every layer's surface, as one (they overlap where you put them)
+    const tot = SL.reduce((a, o) => a + o.pos.length, 0), pos = new Float32Array(tot), nrm = new Float32Array(tot); { let o2 = 0; for (const o of SL){ pos.set(o.pos, o2); nrm.set(o.nrm, o2); o2 += o.pos.length; } }
+    const nT = pos.length / 9;
     // weld by position so the open edges and the seams can be found
     const q = 2000, idOf = new Map(), V = [], I = new Int32Array(nT * 3), vn = [];
     for (let i = 0; i < nT * 3; i++){ const k = Math.round(pos[3 * i] * q) + ',' + Math.round(pos[3 * i + 1] * q) + ',' + Math.round(pos[3 * i + 2] * q); let j = idOf.get(k);
@@ -3575,7 +3665,7 @@ const PLAY = (() => {
   const HIDE = () => [parkGrid, handleMesh, foldGlyphs, cageEdG, panelGroup, waffleGroup, labelGroup, runsGroup, ...lineMeshes, wireLines, fineLines, creaseLines, foundGroup, hiMesh].filter(Boolean);
   async function start(){
     if (on) return;
-    if (!surfMesh) return flash('Build a surface first (step 3), then skate it here');
+    if (!surfMesh && !layers.some(L => L.mesh)) return flash('Build a surface first (step 3), then skate it here');
     if (cageEditing) stopCageEdit(true);
     audioInit();
     if (!MeshBVH){ flash('Getting the park ready…'); try { ({ MeshBVH } = await import('three-mesh-bvh')); } catch (e){ return flash('Couldn\'t load the physics (' + e.message + '). Check the connection and try again.'); } }
@@ -3661,7 +3751,9 @@ const NET = (() => {
   const unpackOne = o => { const s = unpackStrokes([o])[0]; s.id = o.i; return s; };
   const setNow = () => { const o = {}; SKETCH_SET.forEach(k => o[k] = S[k]); return o; };
   const runsSig = () => runs.map(r => r.id + ':' + r.t.length + ':' + r.yaw.toFixed(4) + ':' + r.off.toArray().map(x => x.toFixed(3)).join(',')).join('|') + '@' + runsGroup.position.toArray().map(x => x.toFixed(3)).join(',');
-  function full(){ return { strokes: strokes.map(packOne), dabs: packDabs(), runs: packRuns(), cage: packCage(), set: setNow() }; }
+  function full(){ return { strokes: strokes.map(packOne), dabs: packDabs(), runs: packRuns(), cage: packCage(), set: setNow(), cageLayer: curLayer, layers: layers.map(L => ({ id: L.id, name: L.name, ...(L.id !== curLayer && L.cage ? { cage: L.cage } : {}) })) }; }
+  const layersMsg = () => ({ t: 'layers', list: layers.map(L => ({ id: L.id, name: L.name })) });
+  function mergeLayers(list){ for (const o of list || []){ const L = layerById(o.id); if (L) L.name = o.name; else layers.push({ id: o.id, name: o.name, show: 1 }); } layers.sort((a, b) => a.id - b.id); menuDirty = true; }
   function remember(){ st.lastArr = strokes; st.lastDabs = dabs; st.lastIds = new Map(strokes.map(s => [s.id, s])); st.lastRuns = runsSig(); st.lastSet = JSON.stringify(setNow()); }
   // your change: what's new or different since last time, and what's gone
   function diff(){
@@ -3683,6 +3775,7 @@ const NET = (() => {
     st.applying = true; try { changed(); rebuildHandles(); } finally { st.applying = false; } remember();
   }
   function applyFull(o, first){
+    if (panels) clearPanels(); if (waffle) clearWaffle(); clearSurface(); unpackLayers(o.layers ? o.layers.map(L => ({ ...L, show: 1 })) : null, 1); if (o.cageLayer) curLayer = o.cageLayer;
     strokes = (o.strokes || []).map(unpackOne); dabs = unpackDabs(o.dabs); if (o.set) SKETCH_SET.forEach(k => { if (o.set[k] !== undefined) S[k] = o.set[k]; });
     undoS = []; redoS = []; try { unpackRuns(o.runs || null); } catch (e){}
     cageEd = null; cageEditing = false; if (o.cage && o.cage.V){ cageRestore(o.cage); cageSurface(); } else showCage();
@@ -3744,7 +3837,7 @@ const NET = (() => {
   function leave(){ if (st.on){ send({ t: 'bye' }); flash('Left the room'); } reset(); status(''); }
   function onData(m, from){
     if (!m || !m.t) return;
-    if (st.host && from !== 'host' && from !== 'queued' && ['ops', 'runs', 'set', 'pose'].includes(m.t)) send(m, from);   // pass it on to everyone else
+    if (st.host && from !== 'host' && from !== 'queued' && ['ops', 'runs', 'set', 'pose', 'layers'].includes(m.t)) send(m, from);   // pass it on to everyone else
     if ((m.t === 'ops' || m.t === 'full' || m.t === 'runs') && editOpen){ st.queue.push(m); return; }   // after your own edit is done
     if (m.t === 'welcome'){ st.slot = m.slot; st.synced = true; nextId = Math.max(nextId % ID_SPAN, 1) + m.slot * ID_SPAN; applyFull(m.state, true); st.roster = [{ slot: m.slot, pid: st.peer.id }, ...m.others];
       flash('Joined room ' + st.code + ' as player ' + (m.slot + 1), 4); chime(true); voice.ready = voiceStart().then(() => { for (const p of m.others) if (!NET_TEST && voice.local !== undefined) voiceAttach(st.peer.call(p.pid, voice.local || silentStream())); }); }
@@ -3754,6 +3847,7 @@ const NET = (() => {
     else if (m.t === 'runs'){ try { unpackRuns(m.runs); } catch (e){} st.lastRuns = runsSig(); }
     else if (m.t === 'set'){ SKETCH_SET.forEach(k => { if (m.set[k] !== undefined) S[k] = m.set[k]; }); st.lastSet = JSON.stringify(setNow()); scheduleBuild(); menuDirty = true; }
     else if (m.t === 'pose') poseIn(m);
+    else if (m.t === 'layers') mergeLayers(m.list);
     else if (m.t === 'full-room'){ status('That room is full (8 people)'); }
     else if (m.t === 'bye' && st.guest){ reset(); status('The host closed the room. Your copy of the park is still here.'); flash('The host closed the room', 4); }
   }
@@ -3856,7 +3950,7 @@ const NET = (() => {
   function hostReplaced(){ if (st.on && st.host){ remember(); send({ t: 'full', state: full() }); } }
   const guestBlock = what => { if (st.on && st.guest){ flash('Only the host can ' + what + ' while you\'re together', 4); return true; } return false; };
   const people = () => st.roster.length;
-  return { st, host, join, leave, frame, mute, hostReplaced, guestBlock, people, get on(){ return st.on; }, get muted(){ return voice.muted; }, get hasMic(){ return !!voice.local; }, avatars };
+  return { st, host, join, leave, frame, mute, hostReplaced, layersChanged: () => { if (st.on && st.synced) send(layersMsg()); }, guestBlock, people, get on(){ return st.on; }, get muted(){ return voice.muted; }, get hasMic(){ return !!voice.local; }, avatars };
 })();
 
 // ======================================================================
@@ -4033,6 +4127,13 @@ function setStep(st, quiet){
   section('sketch', 'SURFACE');
   buildCard('sketch', 96);
   row('sketch', 72, [{ id: 'rad-on-sk', style: 'lock', label: () => S.radCheck !== 0 ? 'Radius check: on' + (hasSurface() ? ' · ' + (RADIUS.count ? RADIUS.count + ' tight' : 'all clear') : '') : 'Radius check: off', sub: () => S.radCheck !== 0 ? 'inside curves under ' + fabLen(radMM()) : '', on: () => S.radCheck !== 0, act: () => { S.radCheck = S.radCheck === 0 ? 1 : 0; scheduleSave(); } }]);
+  section('sketch', () => 'LAYERS · EACH BUILDS ITS OWN SURFACE');
+  for (let i = 0; i < 8; i++){ const h = 64, bw = 170, L = () => layers[i];
+    blk('sketch', h, [text({ kind: 'panel', x: P, y: 0, w: W, h }), text({ kind: 'layerRow', x: P + 22, y: h / 2, i, text: () => { const l = L(), n = strokes.filter(st => layerOf(st) === l.id).length; return l.name + ' · ' + n + (n === 1 ? ' line' : ' lines') + (l.id !== curLayer && l.show !== 0 && n && !l.mesh ? ' · building…' : ''); } }),
+      add({ id: 'layer-show-' + i, x: MW - P - 2 * bw - G - 8, y: 8, w: bw, h: h - 16, label: () => L().show === 0 ? 'Hidden' : 'Showing', on: () => L().show !== 0, dim: () => L().id === curLayer, act: () => toggleLayerShow(L().id) }),
+      add({ id: 'layer-use-' + i, x: MW - P - bw - 8, y: 8, w: bw, h: h - 16, style: 'lock', label: () => L().id === curLayer ? 'Drawing' : 'Draw here', on: () => L().id === curLayer, act: () => setLayer(L().id) })], { vis: () => !!L(), gap: 8 }); }
+  row('sketch', 64, [{ id: 'layer-new', label: () => '+ New layer', act: newLayer }, { id: 'layer-del', style: 'danger', label: () => layerDelArmed > 0 ? 'Press again' : 'Delete layer', vis: () => layers.length > 1, act: deleteLayer }]);
+  note('sketch', 'You draw, build and shape on the layer marked Drawing; the others keep their surface and only rebuild when their own lines change. Layers overlap where you put them, and in Play you ride them all.', { vis: () => layers.length > 1 });
   section('sketch', 'TOOL');
   row('sketch', 76, SKETCH_TOOLS.slice(0, 4).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => S.tool === t, act: () => setTool(t) })), { gap: 10 });
   row('sketch', 76, SKETCH_TOOLS.slice(4).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => S.tool === t, act: () => setTool(t) })));
@@ -4048,7 +4149,7 @@ function setStep(st, quiet){
     { id: 'onsurf', label: () => ['On surface: off', 'On surface: guides', 'On surface: all'][S.onSurf || 0], sub: () => S.onSurf ? 'lines land on it' : 'draw in the air', on: () => !!S.onSurf,
       act: () => { S.onSurf = ((S.onSurf || 0) + 1) % 3; scheduleSave(); flash(['Lines are drawn in the air where your pen is', 'Guides land on the surface as you draw them', 'Every line lands on the surface as you draw it'][S.onSurf]); } },
     { id: 'clear', label: () => clearArmed > 0 ? 'Press again' : 'Clear all lines', sub: () => 'undo brings it back', style: 'danger', act: clearAll }]);
-  section('sketch', 'LAYERS · TAP: SHOWN → LOCKED → HIDDEN');
+  section('sketch', 'SHOW OR LOCK LINE TYPES · TAP: SHOWN → LOCKED → HIDDEN');
   const layerState = t => !S.show[t] ? 'hidden' : S.lock[t] ? 'locked' : 'shown';
   const cycleLayer = t => { const st = layerState(t); if (st === 'shown'){ S.lock[t] = 1; } else if (st === 'locked'){ S.lock[t] = 0; S.show[t] = 0; } else { S.show[t] = 1; S.lock[t] = 0; }
     if (t === 1){ S.show[2] = S.show[1]; S.lock[2] = S.lock[1]; } applySurfView(); rebuildHandles(); hiKey = '#'; setHighlight([]); scheduleSave();
@@ -4068,6 +4169,7 @@ function setStep(st, quiet){
 
   // ===== 3 SURFACE
   head('surface');
+  note('surface', () => 'Building ' + layerById(curLayer).name + '. Other layers keep theirs (switch in Sketch → Layers).', { vis: () => layers.length > 1 });
   section('surface', 'BUILD');
   buildCard('surface', 116);
   const setTarget = v => setParam(() => { const was = (S.target || 0) < 0; S.target = v; if (v < 0 && !was){ if (S.edges === 'off') setEdges('quads'); if (!S.onSurf) S.onSurf = 1; flash('Quads follow your guides: draw blue guides on the surface where the edges should run', 6); } });
@@ -4103,6 +4205,7 @@ function setStep(st, quiet){
   // ===== 4 SUBD
   const shaping = () => cageEditing;
   head('shape');
+  note('shape', () => 'Shaping ' + layerById(curLayer).name + '.', { vis: () => layers.length > 1 });
   section('shape', 'START', { vis: () => !shaping() });
   note('shape', 'Your surface is shaped by a loose net of control points floating around it (Rhino and Blender call it the SubD cage). Here you move those points, smooth them, crease edges and redraw polygons, like Gravity Sketch. Build a surface first (step 3).', { vis: () => !shaping() });
   row('shape', 72, [{ id: 'shape-start', label: () => 'Show the control points', sub: () => hasSurface() ? 'of the surface you built' : 'build a surface first', act: () => startCageEdit(true) }], { vis: () => !shaping() && (!!cageEd || hasSurface()) });
@@ -4122,6 +4225,7 @@ function setStep(st, quiet){
 
   // ===== 5 FAB
   head('fab');
+  note('fab', () => 'Fab works on ' + layerById(curLayer).name + ' (switch in Sketch → Layers).', { vis: () => layers.length > 1 });
   const FAB_TABS = [['piece', 'The piece', 'size, scale, sheet'], ['panels', 'Panels', 'the riding skin'], ['waffle', 'Waffle', 'ribs underneath'], ['export', 'Export', 'Rhino, OBJ']];
   row('fab', 64, FAB_TABS.map(([t, n]) => ({ id: 'fab-tab-' + t, label: () => n, style: 'lock', on: () => (S.fabTab || 'piece') === t, act: () => { S.fabTab = t; S.more = 0; scheduleSave(); applySurfView(); showPanelLabels(); } })), { gap: 10 });
   fabSect = 'piece';
@@ -4514,6 +4618,7 @@ function drawMenu(){
       g.textAlign = 'left'; g.font = '46px "Archivo Black","Arial Black",sans-serif'; g.fillStyle = '#EEF0F3'; g.fillText(STEP_NAME[st], t.x + 88, t.y + 26);
       g.font = '500 26px "Archivo",sans-serif'; g.fillStyle = '#9AA2AD'; g.fillText(STEP_SUB[st], t.x + 88, t.y + 64); }
     else if (t.kind === 'note'){ g.textAlign = 'left'; g.font = '500 27px "Archivo",sans-serif'; g.fillStyle = '#9AA2AD'; wrapText(g, t.text(), t.x, t.y, t.w || MW - 2 * t.x, 36); }
+    else if (t.kind === 'layerRow'){ const L = layers[t.i]; if (!L) continue; g.textAlign = 'left'; g.fillStyle = hexCss(layerCol(L)); g.beginPath(); g.arc(t.x + 14, t.y, 14, 0, 7); g.fill(); g.font = (L.id === curLayer ? '700' : '500') + ' 30px "Archivo",sans-serif'; g.fillStyle = L.show === 0 ? '#6B7480' : '#EEF0F3'; g.fillText(t.text(), t.x + 42, t.y + 1); }
     else if (t.kind === 'runRow'){ const r = runs[t.i]; g.textAlign = 'left'; g.fillStyle = hexCss(RUN_COLORS[((r && r.c) || 0) % RUN_COLORS.length]); rr2(g, t.x, t.y - 7, 40, 14, 7); g.fill(); g.font = '600 30px "Archivo",sans-serif'; g.fillStyle = '#EEF0F3'; g.fillText(t.text(), t.x + 58, t.y); }
     else if (t.kind === 'layer'){ const pt = t.tag === 'paint'; g.textAlign = 'left'; g.fillStyle = pt ? '#5FE0B8' : TAG_CSS[t.tag]; rr2(g, t.x, t.y - 7, 54, 14, 7); g.fill();
       g.font = '600 31px "Archivo",sans-serif'; g.fillStyle = (pt ? S.paintShow : S.show[t.tag]) ? '#EEF0F3' : '#6B7480'; g.fillText(t.text(), t.x + 72, t.y); }
@@ -5234,6 +5339,7 @@ renderer.setAnimationLoop(now => {
   }
   if (PLAY.on){ try { PLAY.update(dt); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'play' }); if (!PLAY.errT || now - PLAY.errT > 3000){ PLAY.errT = now; flash('Skating hit a problem (' + e.message + '). Press B to start again.', 5); } } } else if (xr) updateXRInput(dt); else orbit.update();
   try { NET.frame(real); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'net' }); }
+  try { bgBuild(real); } catch (e){ bgJob = null; }
   try { RADIUS.frame(); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'radius' }); }
   if (S.light === 'head' || (S.light === 'sun' && grabState.ids.length)) placeSun();
   if (xr && (backdrop.visible || sky.visible)){ const hp = renderer.xr.getCamera().getWorldPosition(_hp); backdrop.position.copy(hp); sky.position.copy(hp); }
@@ -5241,6 +5347,7 @@ renderer.setAnimationLoop(now => {
   if (buildTimer > 0){ buildTimer -= real; if (buildTimer <= 0){ if (drawing()) buildTimer = 0.25; else startBuild(); } }
   if (saveT > 0){ saveT -= real; if (saveT <= 0) save(); }
   if (clearArmed > 0){ clearArmed -= real; if (clearArmed <= 0) menuDirty = true; }
+  if (layerDelArmed > 0){ layerDelArmed -= real; if (layerDelArmed <= 0) menuDirty = true; }
   if (libDelT > 0){ libDelT -= real; if (libDelT <= 0){ libDel = null; menuDirty = true; } }
   if (linesDirty && (!editOpen || now - lastLines > 120)){ rebuildLines(); lastLines = now; }
   if (flashT > 0){ flashT -= real; if (flashT <= 0) menuDirty = true; }
