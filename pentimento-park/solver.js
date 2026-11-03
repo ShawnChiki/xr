@@ -1662,78 +1662,98 @@ function pushTris(cage, info, curves, opt = {}){
   let pushed = 0;
   for (let round = 0; round < 3; round++){
     let did = 0;
+    const tryOne = (ti, biIn) => {
+        const F = cage.F, t = F[ti]; if (!t || t.length !== 3) return false;
+        // the side on a crease, and the corner across from it
+        const D = (typeof globalThis !== 'undefined' && globalThis.PDBG) || {}, why = k => { D[k] = (D[k] || 0) + 1; };
+        let bi = biIn; if (bi < 0) for (let i = 0; i < 3; i++) if (cage.sharp.has(ek(t[i], t[(i + 1) % 3]))) { bi = i; break; } if (bi < 0){ why('noSharp'); return false; }
+        const r = t[(bi + 2) % 3]; if ((cage.corner && cage.corner[r]) || (info.corner && info.corner[r])){ why('corner'); return false; }
+        // the faces round r, in order
+        // the faces at r (and how many share each edge at r), found in one pass
+        const fs = []; for (let fi = 0; fi < F.length; fi++) if (F[fi].includes(r)) fs.push(fi);
+        const ecR = w => { let c = 0; for (const fi of fs){ const f = F[fi], i = f.indexOf(r); if (f[(i + 1) % f.length] === w || f[(i - 1 + f.length) % f.length] === w) c++; } return c; };
+        const nx = fi => { const f = F[fi], i = f.indexOf(r); return f[(i + 1) % f.length]; }, pv = fi => { const f = F[fi], i = f.indexOf(r); return f[(i - 1 + f.length) % f.length]; };
+        const fan = [ti]; let ok = true; for (let g = 0; g < 20; g++){ const w = nx(fan[fan.length - 1]), nf = fs.find(fi => pv(fi) === w); if (nf === undefined){ ok = false; break; } if (nf === ti) break; fan.push(nf); }
+        if (!ok || fan.length !== fs.length || fan.length < 4){ why('fan'); return false; }
+        let border = false; for (const fi of fan) if (ecR(nx(fi)) !== 2) border = true; if (border){ why('border'); return false; }
+        const lineAt = []; fan.forEach((fi, j) => { if (lineK(ek(r, nx(fi)))) lineAt.push(j); });
+        let free = false;
+        if (lineAt.length <= 1){ // r on no line (or where one ends): the extra corner goes to the face straight across from the crease
+          const bm = P(t[bi]).map((c, k) => (c + P(t[(bi + 1) % 3])[k]) / 2); let bj = -1, bd = -1;
+          for (let j = 2; j <= fan.length - 2; j++){ if (lineAt.includes(j - 1) || lineAt.includes(j)) continue; const f = F[fan[j]], c = [0, 0, 0]; for (const v of f){ const p = P(v); c[0] += p[0] / f.length; c[1] += p[1] / f.length; c[2] += p[2] / f.length; } const dd = d2(c, bm); if (dd > bd){ bd = dd; bj = j; } }
+          if (bj < 0){ why('free'); return false; } lineAt.length = 0; lineAt.push(bj - 1, bj); free = true; }
+        else if (lineAt.length !== 2 || lineAt[1] === fan.length - 1){ why('lines' + lineAt.length); return false; }      // r is on one line, and the triangle's own sides at r aren't on it
+        const [j1, j2] = lineAt, far = fan.slice(j1 + 1, j2 + 1); if (!far.length){ why('nofar'); return false; }
+        const g = far[Math.floor((far.length - 1) / 2)], G0 = F[g]; if (G0.length > 5){ why('big'); return false; }
+        const l2 = nx(fan[j1]), l1 = nx(fan[j2]);                  // the line's neighbours of r: l2 on the side of fan[1..j1], l1 on the other
+        // the snapshot, to put back if it goes wrong
+        const save = { V: cage.V.slice(), F: F.map(f => f.slice()), sharp: new Set(cage.sharp), feat: cage.feat ? new Map(cage.feat) : null, corner: cage.corner ? Uint8Array.from(cage.corner) : null, fc: info.fc.slice(), ic: info.corner.slice() };
+        // two tries: pass the extra corner on across (a column), or split it off right there; keep the first that folds nothing
+        const restore = () => { cage.V.length = 0; cage.V.push(...save.V); F.length = save.F.length; for (let i = 0; i < save.F.length; i++){ if (!F[i]) F[i] = []; F[i].length = 0; F[i].push(...save.F[i]); }
+          cage.sharp = new Set(save.sharp); if (save.feat) cage.feat = new Map(save.feat); if (save.corner) cage.corner = Uint8Array.from(save.corner); info.fc = save.fc.slice(); info.corner = save.ic.slice(); };
+        let okOp = false;
+        for (const simple of [false, true]){
+          const n = cage.V.length / 3, pr = P(r), p2 = P(l2), p1 = P(l1);
+          if (free){ // spread the two corners along the crease side, so the new quad is square
+            const tn = P(t[(t.indexOf(r) + 1) % 3]), tp = P(t[(t.indexOf(r) + 2) % 3]), near = Math.min(...fan.flatMap(fi => F[fi]).filter(w => w !== r).map(w => Math.sqrt(d2(pr, P(w))))), bl = Math.sqrt(d2(tn, tp)) || 1;
+            // the new corner goes toward the triangle's next corner and g's corner on that side; r the other way
+            const Gq = F[g][(F[g].indexOf(r) + 1) % F[g].length], gl2 = P(l2), gq = P(Gq), d1 = norm([tn[0] - tp[0], tn[1] - tp[1], tn[2] - tp[2]]), d2v = norm([gl2[0] - gq[0], gl2[1] - gq[1], gl2[2] - gq[2]]), dd = norm([d1[0] + d2v[0], d1[1] + d2v[1], d1[2] + d2v[2]]);
+            const dv = dd.map(c => c * Math.min(bl * 0.25, near * 0.3));
+            cage.V.push(pr[0] + dv[0], pr[1] + dv[1], pr[2] + dv[2]); for (let c = 0; c < 3; c++) cage.V[3 * r + c] = pr[c] - dv[c]; }
+          else { cage.V.push(pr[0] + (p2[0] - pr[0]) * 0.35, pr[1] + (p2[1] - pr[1]) * 0.35, pr[2] + (p2[2] - pr[2]) * 0.35);
+            for (let c = 0; c < 3; c++) cage.V[3 * r + c] = pr[c] + (p1[c] - pr[c]) * 0.35; }
+          if (cage.corner) cage.corner = Uint8Array.from([...cage.corner, 0]); info.fc.push(info.fc[r]); info.corner.push(false);
+          // faces on the l2 side take the new corner; the triangle and g take both
+          const gi = far.indexOf(g);
+          for (let j = 1; j <= j1; j++){ const f = F[fan[j]]; f[f.indexOf(r)] = n; }
+          for (let j = 0; j < gi; j++){ const f = F[far[j]]; f[f.indexOf(r)] = n; }
+          { const i = t.indexOf(r); t.splice(i + 1, 0, n); }                    // t: … r → n → t.next
+          { const f = F[g], i = f.indexOf(r); f.splice(i, 0, n); }              // g: … p → n → r → q …
+          // the line now runs l2 – n – r – l1
+          const kOld = ek(r, l2), kNew = ek(n, l2), kMid = ek(n, r);
+          if (!free){ if (cage.sharp.has(kOld)){ cage.sharp.delete(kOld); cage.sharp.add(kNew); cage.sharp.add(kMid); }
+            if (cage.feat && cage.feat.has(kOld)){ const id = cage.feat.get(kOld); cage.feat.delete(kOld); cage.feat.set(kNew, id); cage.feat.set(kMid, id); } }
+          else { // a line edge at r stays with whichever corner now holds it
+            const has = (u, w) => cage.F.some(f => { const i = f.indexOf(u); return i >= 0 && (f[(i + 1) % f.length] === w || f[(i - 1 + f.length) % f.length] === w); });
+            for (const fi of fan) for (const w of save.F[fi]){ if (w === r) continue; const k = ek(r, w); if (!(cage.sharp.has(k) || (cage.feat && cage.feat.has(k)))) continue;
+              if (!has(r, w) && has(n, w)){ if (cage.sharp.has(k)){ cage.sharp.delete(k); cage.sharp.add(ek(n, w)); } if (cage.feat && cage.feat.has(k)){ const id = cage.feat.get(k); cage.feat.delete(k); cage.feat.set(ek(n, w), id); } } } }
+          // g grew a corner: a triangle became a quad (both gone), a quad became a pentagon (split off a triangle on its far
+          // side), a pentagon a hexagon (two quads)
+          const nF0 = F.length;
+          if (!simple) columnPush(cage, info, g, n);
+          else { const Gf = F[g], gl = Gf.length, i = Gf.indexOf(n), R = k => Gf[(i + k) % gl];
+            if (gl === 5){ F[g] = [R(0), R(1), R(2), R(4)]; F.push([R(2), R(3), R(4)]); } else if (gl === 6){ F[g] = [R(0), R(1), R(2), R(3)]; F.push([R(0), R(3), R(4), R(5)]); } }
+          // no face may end up folded or bent inside out
+          let bad = false; const touched = [ti, g, ...fan, ...Array.from({ length: cage.F.length - nF0 }, (_, k) => nF0 + k)].filter((x, k, a) => a.indexOf(x) === k);
+          const nbN = new Map(); for (const fi of fan) nbN.set(fi, fN(save.F[fi]));
+          for (const fi of touched){ const f = cage.F[fi]; if (!f || new Set(f).size !== f.length) { bad = true; why('badDup'); break; } const nn = fN(f), ref = nbN.get(fi) || fN(save.F[g]), l = Math.hypot(...nn) * Math.hypot(...ref);
+            if (!(l > 0) || (nn[0] * ref[0] + nn[1] * ref[1] + nn[2] * ref[2]) / l < 0.3){ bad = true; why('badN'); break; }
+            if (f.length === 4){ const h1 = fN([f[0], f[1], f[2]]), h2 = fN([f[0], f[2], f[3]]), h3 = fN([f[1], f[2], f[3]]), h4 = fN([f[1], f[3], f[0]]); const big = Math.hypot(...fN(f)) * (opt.thin ?? 0), nd = (a, b) => Math.hypot(...a) < big || Math.hypot(...b) < big ? 1 : dot(a, b) / ((Math.hypot(...a) * Math.hypot(...b)) || 1); if (nd(h1, h2) < opt.bow || nd(h3, h4) < opt.bow){ bad = true; why('badBow' + (fi === ti ? 'T' : fi === g ? 'G' : fi >= nF0 ? 'New' : 'Fan') + (free ? 'f' : 'l')); if (D.dumpBad && fi === g && simple){ D.dumpBad--; console.log('G', JSON.stringify(f.map(v => [v === n ? 'n' : v === r ? 'r' : v, ...P(v).map(x => +x.toFixed(3))])), 'old g', JSON.stringify(save.F[g].map(v => [v === r ? 'r' : v, ...save.V.slice(3 * v, 3 * v + 3).map(x => +x.toFixed(3))])), 't', JSON.stringify(save.F[ti].map(v => [v === r ? 'r' : v, ...save.V.slice(3 * v, 3 * v + 3).map(x => +x.toFixed(3))]))); } break; } } }   // a dent squares up later; a fold doesn't
+          if (bad){ restore(); continue; }
+          okOp = true; break;
+        }
+        if (!okOp){ why('bad'); return false; }
+        why('ok'); return true;
+    };
+    // how bent the surface is at a face (degrees of the biggest turn to a neighbour across a non-crease edge)
+    const bendAt = fi => { const f = cage.F[fi], n0 = norm(fN(f)); let w = 1; for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; if (cage.sharp.has(ek(a, b))) continue;
+      for (let j = 0; j < cage.F.length; j++){ if (j === fi) continue; const g = cage.F[j], k = g.indexOf(b); if (k >= 0 && g[(k + 1) % g.length] === a) w = Math.min(w, dot(n0, norm(fN(g)))); } } return Math.acos(Math.max(-1, Math.min(1, w))) * 180 / Math.PI; };
+    const deep = () => ({ V: cage.V.slice(), F: cage.F.map(f => f.slice()), sharp: new Set(cage.sharp), feat: cage.feat ? new Map(cage.feat) : null, corner: cage.corner ? Uint8Array.from(cage.corner) : null, fc: info.fc.slice(), ic: info.corner.slice() });
+    const put = st => { cage.V = st.V.slice(); cage.F = st.F.map(f => f.slice()); cage.sharp = new Set(st.sharp); if (st.feat) cage.feat = new Map(st.feat); if (st.corner) cage.corner = Uint8Array.from(st.corner); info.fc = st.fc.slice(); info.corner = st.ic.slice(); };
     const tris = []; cage.F.forEach((f, i) => { if (f.length === 3) tris.push(i); });
     for (const ti of tris){
-      const F = cage.F, t = F[ti]; if (!t || t.length !== 3) continue;
-      if (!t.some((v, i) => cage.sharp.has(ek(v, t[(i + 1) % 3])))) continue;
-      const ec = new Map(), vf = new Map(); F.forEach((f, fi) => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); ec.set(k, (ec.get(k) || 0) + 1); (vf.get(a) || vf.set(a, []).get(a)).push(fi); }));
-      // the side on a crease, and the corner across from it
-      const D = (typeof globalThis !== 'undefined' && globalThis.PDBG) || {}, why = k => { D[k] = (D[k] || 0) + 1; };
-      let bi = -1; for (let i = 0; i < 3; i++) if (cage.sharp.has(ek(t[i], t[(i + 1) % 3]))) { bi = i; break; } if (bi < 0){ why('noSharp'); continue; }
-      const r = t[(bi + 2) % 3]; if ((cage.corner && cage.corner[r]) || (info.corner && info.corner[r])){ why('corner'); continue; }
-      // the faces round r, in order
-      const fs = vf.get(r) || [], nx = fi => { const f = F[fi], i = f.indexOf(r); return f[(i + 1) % f.length]; }, pv = fi => { const f = F[fi], i = f.indexOf(r); return f[(i - 1 + f.length) % f.length]; };
-      const fan = [ti]; let ok = true; for (let g = 0; g < 20; g++){ const w = nx(fan[fan.length - 1]), nf = fs.find(fi => pv(fi) === w); if (nf === undefined){ ok = false; break; } if (nf === ti) break; fan.push(nf); }
-      if (!ok || fan.length !== fs.length || fan.length < 4){ why('fan'); continue; }
-      let border = false; for (const fi of fan) if (ec.get(ek(r, nx(fi))) !== 2) border = true; if (border){ why('border'); continue; }
-      const lineAt = []; fan.forEach((fi, j) => { if (lineK(ek(r, nx(fi)))) lineAt.push(j); });
-      let free = false;
-      if (lineAt.length <= 1){ // r on no line (or where one ends): the extra corner goes to the face straight across from the crease
-        const bm = P(t[bi]).map((c, k) => (c + P(t[(bi + 1) % 3])[k]) / 2); let bj = -1, bd = -1;
-        for (let j = 2; j <= fan.length - 2; j++){ if (lineAt.includes(j - 1) || lineAt.includes(j)) continue; const f = F[fan[j]], c = [0, 0, 0]; for (const v of f){ const p = P(v); c[0] += p[0] / f.length; c[1] += p[1] / f.length; c[2] += p[2] / f.length; } const dd = d2(c, bm); if (dd > bd){ bd = dd; bj = j; } }
-        if (bj < 0){ why('free'); continue; } lineAt.length = 0; lineAt.push(bj - 1, bj); free = true; }
-      else if (lineAt.length !== 2 || lineAt[1] === fan.length - 1){ why('lines' + lineAt.length); continue; }      // r is on one line, and the triangle's own sides at r aren't on it
-      const [j1, j2] = lineAt, far = fan.slice(j1 + 1, j2 + 1); if (!far.length){ why('nofar'); continue; }
-      const g = far[Math.floor((far.length - 1) / 2)], G0 = F[g]; if (G0.length > 5){ why('big'); continue; }
-      const l2 = nx(fan[j1]), l1 = nx(fan[j2]);                  // the line's neighbours of r: l2 on the side of fan[1..j1], l1 on the other
-      // the snapshot, to put back if it goes wrong
-      const save = { V: cage.V.slice(), F: F.map(f => f.slice()), sharp: new Set(cage.sharp), feat: cage.feat ? new Map(cage.feat) : null, corner: cage.corner ? Uint8Array.from(cage.corner) : null, fc: info.fc.slice(), ic: info.corner.slice() };
-      // two tries: pass the extra corner on across (a column), or split it off right there; keep the first that folds nothing
-      const restore = () => { cage.V.length = 0; cage.V.push(...save.V); F.length = save.F.length; for (let i = 0; i < save.F.length; i++){ if (!F[i]) F[i] = []; F[i].length = 0; F[i].push(...save.F[i]); }
-        cage.sharp = new Set(save.sharp); if (save.feat) cage.feat = new Map(save.feat); if (save.corner) cage.corner = Uint8Array.from(save.corner); info.fc = save.fc.slice(); info.corner = save.ic.slice(); };
-      let okOp = false;
-      for (const simple of [false, true]){
-        const n = cage.V.length / 3, pr = P(r), p2 = P(l2), p1 = P(l1);
-        if (free){ // spread the two corners along the crease side, so the new quad is square
-          const tn = P(t[(t.indexOf(r) + 1) % 3]), tp = P(t[(t.indexOf(r) + 2) % 3]), near = Math.min(...fan.flatMap(fi => F[fi]).filter(w => w !== r).map(w => Math.sqrt(d2(pr, P(w))))), bl = Math.sqrt(d2(tn, tp)) || 1;
-          // the new corner goes toward the triangle's next corner and g's corner on that side; r the other way
-          const Gq = F[g][(F[g].indexOf(r) + 1) % F[g].length], gl2 = P(l2), gq = P(Gq), d1 = norm([tn[0] - tp[0], tn[1] - tp[1], tn[2] - tp[2]]), d2v = norm([gl2[0] - gq[0], gl2[1] - gq[1], gl2[2] - gq[2]]), dd = norm([d1[0] + d2v[0], d1[1] + d2v[1], d1[2] + d2v[2]]);
-          const dv = dd.map(c => c * Math.min(bl * 0.25, near * 0.3));
-          cage.V.push(pr[0] + dv[0], pr[1] + dv[1], pr[2] + dv[2]); for (let c = 0; c < 3; c++) cage.V[3 * r + c] = pr[c] - dv[c]; }
-        else { cage.V.push(pr[0] + (p2[0] - pr[0]) * 0.35, pr[1] + (p2[1] - pr[1]) * 0.35, pr[2] + (p2[2] - pr[2]) * 0.35);
-          for (let c = 0; c < 3; c++) cage.V[3 * r + c] = pr[c] + (p1[c] - pr[c]) * 0.35; }
-        if (cage.corner) cage.corner = Uint8Array.from([...cage.corner, 0]); info.fc.push(info.fc[r]); info.corner.push(false);
-        // faces on the l2 side take the new corner; the triangle and g take both
-        const gi = far.indexOf(g);
-        for (let j = 1; j <= j1; j++){ const f = F[fan[j]]; f[f.indexOf(r)] = n; }
-        for (let j = 0; j < gi; j++){ const f = F[far[j]]; f[f.indexOf(r)] = n; }
-        { const i = t.indexOf(r); t.splice(i + 1, 0, n); }                    // t: … r → n → t.next
-        { const f = F[g], i = f.indexOf(r); f.splice(i, 0, n); }              // g: … p → n → r → q …
-        // the line now runs l2 – n – r – l1
-        const kOld = ek(r, l2), kNew = ek(n, l2), kMid = ek(n, r);
-        if (!free){ if (cage.sharp.has(kOld)){ cage.sharp.delete(kOld); cage.sharp.add(kNew); cage.sharp.add(kMid); }
-          if (cage.feat && cage.feat.has(kOld)){ const id = cage.feat.get(kOld); cage.feat.delete(kOld); cage.feat.set(kNew, id); cage.feat.set(kMid, id); } }
-        else { // a line edge at r stays with whichever corner now holds it
-          const has = (u, w) => cage.F.some(f => { const i = f.indexOf(u); return i >= 0 && (f[(i + 1) % f.length] === w || f[(i - 1 + f.length) % f.length] === w); });
-          for (const fi of fan) for (const w of save.F[fi]){ if (w === r) continue; const k = ek(r, w); if (!(cage.sharp.has(k) || (cage.feat && cage.feat.has(k)))) continue;
-            if (!has(r, w) && has(n, w)){ if (cage.sharp.has(k)){ cage.sharp.delete(k); cage.sharp.add(ek(n, w)); } if (cage.feat && cage.feat.has(k)){ const id = cage.feat.get(k); cage.feat.delete(k); cage.feat.set(ek(n, w), id); } } } }
-        // g grew a corner: a triangle became a quad (both gone), a quad became a pentagon (split off a triangle on its far
-        // side), a pentagon a hexagon (two quads)
-        const nF0 = F.length;
-        if (!simple) columnPush(cage, info, g, n);
-        else { const Gf = F[g], gl = Gf.length, i = Gf.indexOf(n), R = k => Gf[(i + k) % gl];
-          if (gl === 5){ F[g] = [R(0), R(1), R(2), R(4)]; F.push([R(2), R(3), R(4)]); } else if (gl === 6){ F[g] = [R(0), R(1), R(2), R(3)]; F.push([R(0), R(3), R(4), R(5)]); } }
-        // no face may end up folded or bent inside out
-        let bad = false; const touched = [ti, g, ...fan, ...Array.from({ length: cage.F.length - nF0 }, (_, k) => nF0 + k)].filter((x, k, a) => a.indexOf(x) === k);
-        const nbN = new Map(); for (const fi of fan) nbN.set(fi, fN(save.F[fi]));
-        for (const fi of touched){ const f = cage.F[fi]; if (!f || new Set(f).size !== f.length) { bad = true; why('badDup'); break; } const nn = fN(f), ref = nbN.get(fi) || fN(save.F[g]), l = Math.hypot(...nn) * Math.hypot(...ref);
-          if (!(l > 0) || (nn[0] * ref[0] + nn[1] * ref[1] + nn[2] * ref[2]) / l < 0.3){ bad = true; why('badN'); break; }
-          if (f.length === 4){ const h1 = fN([f[0], f[1], f[2]]), h2 = fN([f[0], f[2], f[3]]), h3 = fN([f[1], f[2], f[3]]), h4 = fN([f[1], f[3], f[0]]); const big = Math.hypot(...fN(f)) * (opt.thin ?? 0), nd = (a, b) => Math.hypot(...a) < big || Math.hypot(...b) < big ? 1 : dot(a, b) / ((Math.hypot(...a) * Math.hypot(...b)) || 1); if (nd(h1, h2) < opt.bow || nd(h3, h4) < opt.bow){ bad = true; why('badBow' + (fi === ti ? 'T' : fi === g ? 'G' : fi >= nF0 ? 'New' : 'Fan') + (free ? 'f' : 'l')); if (D.dumpBad && fi === g && simple){ D.dumpBad--; console.log('G', JSON.stringify(f.map(v => [v === n ? 'n' : v === r ? 'r' : v, ...P(v).map(x => +x.toFixed(3))])), 'old g', JSON.stringify(save.F[g].map(v => [v === r ? 'r' : v, ...save.V.slice(3 * v, 3 * v + 3).map(x => +x.toFixed(3))])), 't', JSON.stringify(save.F[ti].map(v => [v === r ? 'r' : v, ...save.V.slice(3 * v, 3 * v + 3).map(x => +x.toFixed(3))]))); } break; } } }   // a dent squares up later; a fold doesn't
-        if (bad){ restore(); continue; }
-        okOp = true; break;
-      }
-      if (!okOp){ why('bad'); continue; }
-      did++; why('ok');
+      const t = cage.F[ti]; if (!t || t.length !== 3) continue;
+      if (t.some((v, i) => cage.sharp.has(ek(v, t[(i + 1) % 3])))){ if (!opt.relocate && tryOne(ti, -1)) did++; continue; }
+      if (!opt.relocate) continue;
+      // a triangle out on the surface where it bends: try moving it off each of its three sides, keep the move that
+      // lands it flattest (or meets another triangle and makes a quad of both), if that's clearly flatter
+      const here = bendAt(ti); if (here < (opt.minBend ?? 8)) continue;
+      const snap = deep(), nT0 = cage.F.filter(f => f.length === 3).length; let best = null;
+      for (let b = 0; b < 3; b++){ const nF = cage.F.length; if (tryOne(ti, b)){ const nT = cage.F.filter(f => f.length === 3).length;
+          let sc = nT < nT0 ? -1 : Infinity; if (sc > 0) for (let i = nF; i < cage.F.length; i++) if (cage.F[i].length === 3) sc = Math.min(sc, bendAt(i));
+          if (!best || sc < best.sc) best = { sc, st: deep() }; }
+        put(snap); }
+      if (best && best.sc < here - (opt.gain ?? 4)){ put(best.st); did++; const D = (typeof globalThis !== 'undefined' && globalThis.PDBG) || {}; D.moved = (D.moved || 0) + 1; }
     }
     pushed += did; if (!did) break;
   }
@@ -1768,16 +1788,23 @@ function cageCompactKeep(cage, info){
 // becomes a quad: both gone) or a five-sided face (two quads), else stop a couple of faces out with one triangle there
 function columnPush(cage, info, fi, m, maxLook = 10, minGo = 2){
   const P = v => [cage.V[3 * v], cage.V[3 * v + 1], cage.V[3 * v + 2]];
-  const ef = new Map(); cage.F.forEach((f, i) => f.forEach((a, k) => { const key = ek(a, f[(k + 1) % f.length]); (ef.get(key) || ef.set(key, []).get(key)).push(i); }));
-  const other = (i, a, b) => { const l = ef.get(ek(a, b)) || []; return l.length === 2 ? (l[0] === i ? l[1] : l[0]) : -1; };
-  const stopE = (a, b) => cage.sharp.has(ek(a, b)) || (ef.get(ek(a, b)) || []).length !== 2;
+  // faces across an edge, looked up as needed (a full edge map per call cost more than the whole walk)
+  const facesOn = (a, b) => { const out = []; for (let j = 0; j < cage.F.length; j++){ const f = cage.F[j], k = f.indexOf(a); if (k >= 0 && (f[(k + 1) % f.length] === b || f[(k - 1 + f.length) % f.length] === b)) out.push(j); } return out; };
+  const other = (i, a, b) => { const l = facesOn(a, b); return l.length === 2 ? (l[0] === i ? l[1] : l[0]) : -1; };
+  const stopE = (a, b) => cage.sharp.has(ek(a, b)) || facesOn(a, b).length !== 2;
   // look ahead: how far to the next triangle (or pentagon) straight across
+  // how bent the surface is at a face (the biggest turn to a neighbour): the leftover triangle, if there is one, is
+  // left where it's flattest, where an irregular point shows least
+  const fNrm = f => { const c = [0, 0, 0]; for (let k = 0; k < f.length; k++){ const a = P(f[k]), b = P(f[(k + 1) % f.length]); c[0] += (a[1] - b[1]) * (a[2] + b[2]); c[1] += (a[2] - b[2]) * (a[0] + b[0]); c[2] += (a[0] - b[0]) * (a[1] + b[1]); } return norm(c); };
+  const bend = i => { const f = cage.F[i], n0 = fNrm(f); let worst = 1; for (let k = 0; k < f.length; k++){ const o = other(i, f[k], f[(k + 1) % f.length]); if (o >= 0) worst = Math.min(worst, dot(n0, fNrm(cage.F[o]))); } return 1 - worst; };
+  const chain = [fi];
   let target = -1; { let g = cage.F[fi]; if (g.length === 5){ let i = g.indexOf(m), y = g[(i + 2) % 5], z = g[(i + 3) % 5], cur = fi;
     for (let k = 1; k <= maxLook; k++){ if (stopE(y, z)) break; const h = other(cur, y, z); if (h < 0) break; const H = cage.F[h];
-      if (H.length === 3 || H.length === 5){ target = k; break; } if (H.length !== 4) break; const iy = H.indexOf(y), iz = H.indexOf(z);
+      if (H.length === 3 || H.length === 5){ target = k; break; } if (H.length !== 4) break; chain.push(h); const iy = H.indexOf(y), iz = H.indexOf(z);
       // the side opposite (y, z) in this quad
       const ny = H[(iz + 2) % 4], nz = H[(iy + 2) % 4]; y = ny; z = nz; cur = h; } } }
-  const go = target > 0 ? target : minGo;
+  let go = target > 0 ? target : minGo;
+  if (target < 0 && chain.length > minGo){ let best = Infinity; for (let k = minGo; k < Math.min(chain.length, minGo + 5); k++){ const b = bend(chain[k]) + k * 0.004; if (b < best){ best = b; go = k; } } }
   for (let depth = 0; depth <= go + 1; depth++){
     const g = cage.F[fi], gl = g.length; if (gl === 4) return true;
     const i = g.indexOf(m); if (i < 0) return false;
@@ -1794,9 +1821,6 @@ function columnPush(cage, info, fi, m, maxLook = 10, minGo = 2){
     const k = ek(y, z); if (cage.feat && cage.feat.has(k)){ const id = cage.feat.get(k); cage.feat.delete(k); cage.feat.set(ek(y, n), id); cage.feat.set(ek(n, z), id); }
     cage.F[fi] = [u, m, n, z]; cage.F.push([m, w, y, n]);
     const H = cage.F[h], iy = H.indexOf(y); if (H[(iy + 1) % H.length] === z) H.splice(iy + 1, 0, n); else H.splice(iy, 0, n);
-    // the edge map for the next step
-    for (const [a, b] of [[y, z]]) ef.delete(ek(a, b));
-    for (const [ff, idx] of [[cage.F[fi], fi], [cage.F[cage.F.length - 1], cage.F.length - 1], [H, h]]) ff.forEach((a, q) => { const key = ek(a, ff[(q + 1) % ff.length]); const l = ef.get(key) || ef.set(key, []).get(key); if (!l.includes(idx)) l.push(idx); });
     fi = h; m = n;
   }
   return false;
@@ -2342,7 +2366,9 @@ function cleanSeams(cage, info, curves, prm, Mfit, L){
   const nTwin = prm.twins !== false ? twinBands(cage, info, curves, { rowsMax: !!prm.rowsMax, endSplit: prm.endSplit }) : 0;
   let nPush = 0;
   if (prm.heal !== false){ healTris(cage, prm.healLen ?? 8, curves);
-    if (prm.push !== false) for (let r = 0; r < 3; r++){ const k = pushTris(cage, info, curves, { thin: prm.pushThin ?? 0, bow: prm.pushBow ?? 0 }); nPush += k; if (!k) break; healTris(cage, prm.healLen ?? 12, curves); } }
+    if (prm.push !== false) for (let r = 0; r < 3; r++){ const k = pushTris(cage, info, curves, { thin: prm.pushThin ?? 0, bow: prm.pushBow ?? 0 }); nPush += k; if (!k) break; healTris(cage, prm.healLen ?? 12, curves); }
+    // triangles out where the surface bends get walked to flatter ground, where the irregular point shows least
+    if (prm.relocate !== false){ const k = pushTris(cage, info, curves, { relocate: true, thin: prm.pushThin ?? 0, bow: prm.pushBow ?? 0, minBend: prm.poleBend ?? 8 }); nPush += k; if (k) healTris(cage, prm.healLen ?? 12, curves); } }
   if (nTwin || nPush){ const onLine = new Uint8Array(cage.V.length / 3); for (const k of cage.sharp){ onLine[Math.floor(k / 2097152)] = 1; onLine[k % 2097152] = 1; }
     squareQuads(cage, Mfit, null, 12, L, Mfit, v => onLine[v] || info.fc[v] >= 0 || !!info.corner[v]); }
   return nTwin + nPush;
