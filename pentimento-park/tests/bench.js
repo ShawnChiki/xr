@@ -123,6 +123,21 @@ function handGuides(seed, target){
     const seen = new Set(); let loops = 0; for (const v of adj.keys()){ if (seen.has(v)) continue; loops++; const q = [v]; seen.add(v); while (q.length){ const x = q.pop(); for (const w of adj.get(x)) if (!seen.has(w)){ seen.add(w); q.push(w); } } }
     return { holes: Math.max(0, loops - 1) }; } };
 }
+// two strict creases close together, drawn by hand: a step face between a deck and a floor, straight or curved like
+// a bowl's lip, the gap wandering ±25% (the band between them should come out as clean rows of quads)
+function twin(seed, w, curved, drop = 0.35){
+  const R = 1.6, wv = (x, z) => w * (1 + 0.25 * Math.sin((curved ? Math.atan2(z + 2.6, x) * 2.2 : z * 0.9) + 1));
+  const U = curved ? (x, z) => Math.hypot(x, z + 2.6) - R : (x, z) => x - 0.08 * Math.sin(z * 1.3);
+  const H = (x, z) => { const u = U(x, z), W = wv(x, z); return u <= 0 ? 0.6 : u >= W ? 0.6 - drop : 0.6 - drop * u / W; };
+  const { rnd, g } = mk(seed + 5), st = [];
+  { const r2 = mk(seed); for (let i = 0; i < 260; i++){ const x = -2.2 + r2.rnd() * 4.4, z = -2.2 + r2.rnd() * 4.4, a = r2.rnd() * 6.28, off = r2.g() * 0.04, pts = [];
+    for (let k = 0; k < 50; k++){ const xx = x + Math.cos(a) * k * 0.05, zz = z + Math.sin(a) * k * 0.05; if (Math.abs(xx) > 2.6 || Math.abs(zz) > 2.6) break; pts.push(xx + r2.g() * 0.01, H(xx, zz) + off + r2.g() * 0.015, zz + r2.g() * 0.01); }
+    if (pts.length > 15) st.push({ tag: 0, pts }); } }
+  const line = (f, ph) => { const p = []; for (let k = 0; k <= 80; k++){ const q = f(k / 80); p.push(q[0] + 0.02 * Math.sin(k * 0.21 + ph) + g() * 0.006, H(q[0], q[2]) + g() * 0.006, q[2] + 0.02 * Math.cos(k * 0.17 + ph) + g() * 0.006); } return { tag: 4, pts: p }; };
+  if (curved) [0, 1].forEach(j => st.push(line(t => { const a = -0.3 + (j ? 0.15 : -0.1) + t * (Math.PI + 0.4), x0 = Math.cos(a), z0 = Math.sin(a), r = j ? R + wv(x0 * R, -2.6 + z0 * R) - 0.001 : R + 0.001; return [x0 * r, 0, -2.6 + z0 * r]; }, j * 2)));
+  else [0, 1].forEach(j => st.push(line(t => { const z = -2.2 + (j ? 0.3 : -0.1) + 4.4 * t * 0.93, x0 = 0.08 * Math.sin(z * 1.3); return [x0 + (j ? wv(x0, z) - 0.001 : 0.001), 0, z]; }, j * 2)));
+  return { st, prm: P, score: r => { const V = r.surface.pos, a = [], b = []; for (let i = 0; i < V.length; i += 3){ const x = V[i], y = V[i + 1], z = V[i + 2]; if (Math.abs(x) > 1.8 || Math.abs(z) > 1.8) continue; const d = Math.abs(y - H(x, z)); a.push(d); const u = U(x, z); if (u > -0.3 && u < wv(x, z) + 0.3) b.push(d); } return { band: rms(b), all: rms(a) }; } };
+}
 const CASES = [];
 for (const sd of [1, 2]){
   CASES.push(['spine 78° #' + sd, () => spine(sd, 78 * Math.PI / 180)], ['spine 88° #' + sd, () => spine(sd, 88 * Math.PI / 180)]);
@@ -133,6 +148,8 @@ CASES.push(['sample sketch #3, 20 cm', () => { const c = demo(3); c.prm = { ...c
 CASES.push(['tight bowl #1', () => bowl(1)], ['tight bowl #2', () => bowl(2, 1.1, 0.8)], ['crease overlap 5cm', () => overlap(1, 0.05)], ['crease overlap 12cm', () => overlap(2, 0.12)]);
 CASES.push(['deck corner, line turns', () => corner(2, 'turn')]);
 for (const sd of [1, 3, 4]) CASES.push(['hand guides ×4 #' + sd, () => handGuides(sd, -2)], ['hand guides ×16 #' + sd, () => handGuides(sd, -1)]);
+for (const w of [0.3, 0.5]) CASES.push(['twin creases ' + w * 100 + 'cm', () => twin(1, w, false)]);
+for (const w of [0.3, 0.5, 0.8]) CASES.push(['twin curved ' + w * 100 + 'cm', () => twin(1, w, true)]);
 CASES.push(['half pipe', () => halfpipe(3)], ['ridge', () => ridge(5)], ['sample sketch #7', () => demo(7)], ['sample sketch #3', () => demo(3)], ['edge loop', () => edgeLoop(4)], ['guide layout', () => guideLayout(7)]);
 const repDir = path.join(__dirname, 'reports');
 if (fs.existsSync(repDir)) for (const f of fs.readdirSync(repDir).filter(f => f.endsWith('.json'))){
@@ -150,7 +167,7 @@ function reportPrm(s){ const QUAD = [0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.8, 1
 // ---------------- run
 const basePath = path.join(__dirname, 'baseline.json'), base = fs.existsSync(basePath) ? JSON.parse(fs.readFileSync(basePath, 'utf8')) : {};
 const out = {}; let worse = 0, broke = 0, t0 = Date.now();
-const fmt = (k, v) => k === 'glitch' || k === 'holes' ? String(v) : k === 'notQuads' || k === 'odd' ? v.toFixed(1) + '%' : k === 'outside' ? (v * 100).toFixed(0) : (v * 100).toFixed(1) + 'cm';
+const fmt = (k, v) => k === 'glitch' || k === 'holes' || k === 'tris' || k === 'seamTris' ? String(v) : k === 'notQuads' || k === 'odd' ? v.toFixed(1) + '%' : k === 'outside' ? (v * 100).toFixed(0) : (v * 100).toFixed(1) + 'cm';
 for (const [name, make] of CASES){
   if (only.length && !only.some(w => name.toLowerCase().includes(w.toLowerCase()))) continue;
   const c = make(), t = Date.now(); let r, sc;
@@ -161,6 +178,8 @@ for (const [name, make] of CASES){
   { const F = r.quads.F, C = r.quads.C, val = new Map(), cnt = new Map(); let o = 0; for (let f = 0; f < C.length; f++){ const n = C[f]; for (let i = 0; i < n; i++){ const a = F[o + i], b = F[o + (i + 1) % n], k = a < b ? a * 1e7 + b : b * 1e7 + a; cnt.set(k, (cnt.get(k) || 0) + 1); } o += n; }
     const bv = new Set(); for (const [k, c] of cnt){ const a = Math.floor(k / 1e7), b = k % 1e7; val.set(a, (val.get(a) || 0) + 1); val.set(b, (val.get(b) || 0) + 1); if (c === 1){ bv.add(a); bv.add(b); } }
     let inner = 0, odd = 0; for (const [v, d] of val){ if (bv.has(v)) continue; inner++; if (d !== 4) odd++; } sc.odd = inner ? odd / inner * 100 : 0; }
+  // the cage's own faces that aren't quads, and how many of them touch a crease (lower is cleaner)
+  if (r.cage && r.cage.C){ const C = r.cage.C, F = r.cage.F, sv = new Set(r.cage.sharp || []); let o = 0, nq = 0, ns = 0; for (let f = 0; f < C.length; f++){ const n = C[f]; if (n !== 4){ nq++; for (let i = 0; i < n; i++) if (sv.has(F[o + i])){ ns++; break; } } o += n; } sc.tris = nq; sc.seamTris = ns; }
   // glitches: faces folded back against a neighbour, slivers far smaller than their neighbours, edges shared by 3+ faces
   { const F = r.quads.F, C = r.quads.C, V = r.quads.V, fn = [], fa = [], ef = new Map(); let o = 0;
     for (let f = 0; f < C.length; f++){ const n = C[f], ids = []; for (let i = 0; i < n; i++) ids.push(F[o + i]); o += n; const P = i => [V[3 * ids[i]], V[3 * ids[i] + 1], V[3 * ids[i] + 2]], nn = [0, 0, 0];
@@ -172,7 +191,7 @@ for (const [name, make] of CASES){
     for (const a of fa) if (a < med * 0.08) g++;
     sc.glitch = g; }
   out[name] = sc; const b = base[name], notes = [];
-  for (const [k, v] of Object.entries(sc)){ let s = k + ' ' + fmt(k, v); if (b && b[k] !== undefined){ const d = v - b[k], lim = Math.max(b[k] * 0.25, k === 'glitch' ? 2 : k === 'holes' ? 0.5 : k === 'notQuads' || k === 'odd' ? 2 : k === 'outside' ? 0.02 : 0.004); if (d > lim){ s += ' ▲ worse (was ' + fmt(k, b[k]) + ')'; worse++; } else if (-d > lim) s += ' ▼ better (was ' + fmt(k, b[k]) + ')'; } notes.push(s); }
+  for (const [k, v] of Object.entries(sc)){ let s = k + ' ' + fmt(k, v); if (b && b[k] !== undefined){ const d = v - b[k], lim = Math.max(b[k] * 0.25, k === 'glitch' || k === 'tris' || k === 'seamTris' ? 2 : k === 'holes' ? 0.5 : k === 'notQuads' || k === 'odd' ? 2 : k === 'outside' ? 0.02 : 0.004); if (d > lim){ s += ' ▲ worse (was ' + fmt(k, b[k]) + ')'; worse++; } else if (-d > lim) s += ' ▼ better (was ' + fmt(k, b[k]) + ')'; } notes.push(s); }
   console.log(name.padEnd(26), notes.join('   '), ' ' + (ms / 1000).toFixed(1) + 's');
 }
 console.log(`\n${Object.keys(out).length} cases in ${((Date.now() - t0) / 1000).toFixed(0)}s · ${broke} failed · ${worse} scores worse than the baseline`);
