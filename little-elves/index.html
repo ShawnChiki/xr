@@ -455,7 +455,7 @@ function clearRoom() {
   for (const k of ['occluder', 'scan', 'visual']) if (Room[k]) { scene.remove(Room[k]); Room[k] = null; }
   if (Room.geo && Room.geo !== Room.baseGeo) disposeGeo(Room.geo);
   if (Room.baseGeo && Room.kind !== 'preview' && Room.kind !== 'fallback') disposeGeo(Room.baseGeo);
-  Room.geo = Room.baseGeo = Room.collider = null; Room.spots = []; Room.kind = ''; Room.features = []; Room.anchor = null;
+  Room.geo = Room.baseGeo = Room.collider = null; Room.spots = []; Room.kind = ''; Room.features = []; Room.anchor = null; Room.boxes = [];
 }
 function setRoom(base, kind, visual) {
   clearRoom();
@@ -466,9 +466,9 @@ function setRoom(base, kind, visual) {
 // Each picture becomes a thin wedge on the wall: a flat ledge on top, and a gentle slope underneath so climbers can get onto it.
 const WEDGE_TRIS = [1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 0, 4, 5, 0, 5, 1, 0, 1, 2, 0, 2, 3, 4, 7, 6, 4, 6, 5];
 function buildRoomGeo() {
-  const old = Room.geo, arts = Room.features.filter(f => f.type === 'art');
+  const old = Room.geo, arts = Room.features.filter(f => f.type === 'art'), boxes = Room.boxes || [];
   let geo = Room.baseGeo;
-  if (arts.length) {
+  if (arts.length || boxes.length) {
     const P = Array.from(geo.attributes.position.array);
     const I = geo.index ? Array.from(geo.index.array) : [...Array(P.length / 3).keys()];
     for (const f of arts) {
@@ -478,6 +478,7 @@ function buildRoomGeo() {
       }
       for (const i of WEDGE_TRIS) I.push(base + i);
     }
+    for (const B of boxes) boxTris(B, P, I);   // furniture you drew
     geo = geoFrom(P, I);
   }
   if (!geo.boundsTree) geo.computeBoundsTree();
@@ -1187,6 +1188,13 @@ class Elf {
         if (this.p.distanceTo(this.target) < 0.12 || this.timer <= 0) { this.b = 'offer'; this.timer = 14; this.act = { hey: 0.2 }; }
         break;
       case 'scurry': want = 0.95; if (this.target) this.steerTo(this.target, 6, dt); break;
+      case 'bubble': {   // run under a low bubble and jump to pop it
+        const b = this.act.bub; if (!b || b.dead) { this.b = 'cheer'; this.timer = 0.5; break; }
+        want = 0.85; this.steerTo(_v3.set(b.p.x, this.p.y, b.p.z), 7, dt);
+        const dh = Math.hypot(b.p.x - this.p.x, b.p.z - this.p.z), hy = b.p.y - this.p.y;
+        if (dh < 0.13 && hy > 0.05 && hy < 0.5 && Math.abs(this.n.y) > 0.8) { this.vel.set((b.p.x - this.p.x) * 2, 2.2, (b.p.z - this.p.z) * 2); this.p.addScaledVector(this.n, 0.02); this.toAir({ T: 0.5, style: pick(['star', 'leap']) }); say(this, 'yip'); return; }
+        break;
+      }
       case 'roll': {
         const A = this.act; want = 0.5; A.a += dt * 9;
         this.flipOverride = { axis: 'x', a: A.a };
@@ -1361,7 +1369,7 @@ class Elf {
     if (Gift.giver || Gift.held) return false;
     const tgt = new V3(userPos.x, userPos.y, userPos.z).addScaledVector(camFwdH, 0.45);
     const h = cast(tgt, DOWN, 3); if (!h || h.n.y < 0.8 || Math.abs(h.p.y - Room.floorY) > 0.1) return false;
-    this.holdProp(makeFlower()); Gift.giver = this;
+    this.holdProp(!Bub.wand && Math.random() < (Bub.hadWand ? 0.35 : 0.6) ? makeWand() : makeFlower()); Gift.giver = this;
     this.b = 'gift'; this.timer = 10; this.target = h.p.clone(); say(this, 'hmm');
     return true;
   }
@@ -1872,6 +1880,7 @@ class Elf {
           break;
         case 'swim': A.shLz = A.shRz = 1.2 + Math.sin(t * 6) * 0.45; A.shL = A.shR = 0.6; A.elL = A.elR = 0.8; A.hipL = 0.4 + Math.sin(t * 5) * 0.4; A.hipR = 0.4 - Math.sin(t * 5) * 0.4; A.knL = A.knR = 0.6; A.bob = Math.sin(t * 3) * 0.015; look = camHead; if ((this.act.t || 0) < 0.5) mouth = 'o'; break;
         case 'gift': runPose(this.speed); A.shR = 1.3; A.elR = 0.4; break;
+        case 'bubble': runPose(this.speed); A.shL = A.shR = 2.4; A.elL = A.elR = 0.3; if (this.act.bub) look = this.act.bub.p; break;
         case 'kissrun': runPose(this.speed); A.shLz += 0.9; A.shRz += 0.9; look = camHead; break;
         case 'roll': A.hipL = A.hipR = 2.3; A.knL = A.knR = 2.4; A.shL = A.shR = 1.3; A.shLz = A.shRz = 0.1; A.elL = A.elR = 1.7; A.hp = 0.7; A.lean = 0.25; A.bob = -0.04; break;
         case 'munch': A.shR = 2.0; A.elR = 2.35; A.shRz = 0.25; A.shL = 0.5; A.elL = 1.2; A.hp = -0.05; A.bob = Math.abs(Math.sin(t * 8)) * 0.008; look = camHead; break;
@@ -2254,7 +2263,8 @@ function dropFlower(e) {
 function takeFlower(e, key) {
   const m = e.dropProp(); if (!m) return;
   m.scale.setScalar(1); m.rotation.set(0, 0, 0); scene.add(m);
-  Gift.held = { m, key, t: 30 }; Gift.giver = null;
+  if (m.userData.wand) takeWand(m, key); else Gift.held = { m, key, t: 30 };
+  Gift.giver = null;
   e.b = 'scurry'; e.timer = 3;
   e.target = e.p.clone().addScaledVector(_v1.subVectors(e.p, userPos).setY(0).normalize(), 1.8);
   say(e, 'eee'); laugh(e, 6, 0.4);
@@ -4096,6 +4106,298 @@ function startJig() {
   return beginAct(act);
 }
 
+// ================= bubbles: sometimes the gift is a bubble wand =================
+// Wave it, or hold it up to your mouth and blow: bubbles drift off, and the little people jump to pop them.
+const BUB_N = 140;
+const bubbleMat = new THREE.ShaderMaterial({
+  uniforms: { uT: { value: 0 } },
+  vertexShader: `varying vec3 vN; varying vec3 vV; varying float vS;
+    void main(){ mat4 m = modelMatrix * instanceMatrix; vec4 w = m * vec4(position, 1.0); vN = normalize(mat3(m) * normal); vV = cameraPosition - w.xyz;
+      vS = instanceMatrix[3][0] * 7.0 + instanceMatrix[3][2] * 5.0; gl_Position = projectionMatrix * viewMatrix * w; }`,
+  fragmentShader: `uniform float uT; varying vec3 vN; varying vec3 vV; varying float vS;
+    vec3 hue(float h){ return clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0); }
+    void main(){ vec3 n = normalize(vN), v = normalize(vV); float f = 1.0 - abs(dot(n, v)), rim = pow(f, 2.2);
+      vec3 col = mix(vec3(1.0), hue(fract(f * 1.3 + n.y * 0.4 + uT * 0.15 + vS)), 0.75);
+      float spec = pow(max(dot(reflect(-normalize(vec3(0.4, 0.8, 0.3)), n), v), 0.0), 60.0);
+      gl_FragColor = vec4(col + spec, 0.05 + rim * 0.7 + spec * 0.8); }`,
+  transparent: true, depthWrite: false,
+});
+const filmMat = new THREE.MeshBasicMaterial({ color: '#e8f6ff', transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthWrite: false });
+const Bub = { list: [], wand: null, emit: 0, chaseT: 0, popT: 0, pops: 0, hadWand: false, lastRing: new V3(), whoosh: 0,
+  mesh: (() => { const m = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 16, 12), bubbleMat, BUB_N); m.count = 0; m.frustumCulled = false; m.renderOrder = 8; scene.add(m); return m; })() };
+function makeWand() {
+  const g = new THREE.Group(), col = pick(['#ff3d7f', '#3d8bff', '#a45cff', '#1fd1c1']);
+  const stick = pmesh('wstick', () => new THREE.CylinderGeometry(0.003, 0.003, 0.11, 6), col); stick.position.y = 0.055; g.add(stick);
+  const ring = pmesh('wring', () => new THREE.TorusGeometry(0.022, 0.0035, 6, 20), col); ring.position.y = 0.134; g.add(ring);
+  const film = new THREE.Mesh(cached('wfilm', () => new THREE.CircleGeometry(0.02, 18)), filmMat); film.position.y = 0.134; g.add(film);
+  g.userData = { wand: true, col, ring };
+  return g;
+}
+function takeWand(m, key) {
+  Bub.wand = { m, key, t: 150, lost: 0, auto: 1, puff: 0 }; Bub.hadWand = true; Bub.lastRing.set(0, -99, 0);
+  if (AU.ctx) shimmer(4, 0.05);
+  showCard(['Bubbles!', 'Wave the wand, or hold it up', 'to your mouth and blow.'], 7);
+}
+function spawnBubble(p, v) {
+  if (Bub.list.length >= BUB_N) Bub.list.shift();
+  Bub.list.push({ p: p.clone().add(_s1.set(rand(-0.01, 0.01), rand(-0.01, 0.01), rand(-0.01, 0.01))), v: v.clone().add(_s1.set(rand(-0.12, 0.12), rand(-0.05, 0.15), rand(-0.12, 0.12))), r: rand(0.012, 0.042), age: 0, life: rand(5, 10), ph: Math.random() * TAU, dead: false });
+}
+function popBubble(i, quiet) {
+  const b = Bub.list[i]; b.dead = true; Bub.list.splice(i, 1);
+  burst(b.p, ['#ffffff', '#bfe6ff', '#ffd6f5', '#d6ffe8'], 5, 0.25, 0.8);
+  if (!quiet && AU.ctx && Bub.pops < 10 && b.p.distanceTo(camHead) < 3.5) { Bub.pops++; const t = now(); tone(AU.master, t, 0.035, rand(1600, 2200), rand(2800, 3600), 0.07); noiseBurst(AU.master, t, 0.02, 5000, 2, 0.06); }
+}
+function dropWand() {
+  const W = Bub.wand; if (!W) return; Bub.wand = null;
+  W.m.getWorldPosition(_s1); const h = cast(_s1, DOWN, 3);
+  W.m.position.copy(h ? h.p : _s1).addScaledVector(Y, 0.004); W.m.rotation.set(Math.PI / 2, 0, Math.random() * TAU);
+  Gift.ground.push({ m: W.m, t: 10 });
+}
+function updateBubbles(dt, t) {
+  bubbleMat.uniforms.uT.value = t; Bub.pops = Math.max(0, Bub.pops - dt * 10);
+  const W = Bub.wand;
+  if (W) {
+    W.t -= dt;
+    // where the wand is: in your hand (pinched or in a fist), on a controller, or (in the preview) in view
+    let pos = null; const up = new V3(), face = new V3();
+    if (W.key === 'cam') { pos = _s2.copy(camera.position).addScaledVector(camFwd, 0.42).addScaledVector(camRight, 0.15).addScaledVector(camUp, -0.14); up.copy(camUp).addScaledVector(camRight, -0.3).normalize(); face.copy(camFwd).negate(); }
+    else if (W.key[0] === 'h') { const h = HS[+W.key[1]]; if (h && h.valid) { pos = _s2.copy(h.grabP); up.copy(h.fwd).addScaledVector(Y, 0.8).normalize(); face.subVectors(camHead, pos); } }
+    else if (W.key[0] === 'c') { const c = ctrls[+W.key[1]]; if (c && c.userData.src) { pos = c.getWorldPosition(_s2); up.set(0, 0, -1).applyQuaternion(c.getWorldQuaternion(_sq)).addScaledVector(Y, 0.6).normalize(); face.subVectors(camHead, pos); } }
+    if (pos) { W.lost = 0; W.m.position.copy(pos); basisQuat(up, face, _sq); W.m.quaternion.slerp(_sq, Math.min(1, dt * 20)); }
+    else W.lost += dt;
+    if (W.lost > 2.5) dropWand();
+    else if (W.t <= 0) { burst(W.m.position, BRIGHT, 16, 0.4); scene.remove(W.m); Bub.wand = null; }
+    else {
+      W.m.updateMatrixWorld(); const ring = W.m.userData.ring.getWorldPosition(_s3);
+      const vel = Bub.lastRing.y < -50 ? new V3() : ring.clone().sub(Bub.lastRing).divideScalar(Math.max(dt, 1e-3)); Bub.lastRing.copy(ring);
+      const sp = vel.length(), blowing = W.key !== 'cam' && ring.distanceTo(mouthPos) < 0.17;
+      let rate = 0, push = vel.clone().multiplyScalar(0.3);
+      if (blowing) { rate = 11; push.copy(camFwd).multiplyScalar(0.45); W.whoosh = (W.whoosh || 0) - dt; if (W.whoosh <= 0 && AU.ctx) { W.whoosh = 0.35; noiseBurst(AU.master, now(), 0.35, 700, 0.6, 0.12, 'lowpass'); } }
+      else if (sp > 0.5 && sp < 8) rate = Math.min(14, (sp - 0.5) * 9);
+      if (W.key === 'cam') { W.auto -= dt; if (W.auto <= 0) { W.auto = rand(2.2, 3.6); W.puff = 0.9; } if (W.puff > 0) { W.puff -= dt; rate = 10; push.copy(camFwd).multiplyScalar(0.5).addScaledVector(camRight, -0.25); } }
+      Bub.emit += rate * dt;
+      while (Bub.emit >= 1) { Bub.emit--; spawnBubble(ring, push); }
+      filmMat.color.setHSL((t * 0.2) % 1, 0.6, 0.85);
+    }
+  }
+  // the bubbles drift, sink slowly, wobble, and pop on anything they touch (or after a while)
+  const heads = elves.map(e => e.state === 'held' ? null : e.headPos(new V3()));
+  for (let i = Bub.list.length - 1; i >= 0; i--) {
+    const b = Bub.list[i]; b.age += dt;
+    b.v.multiplyScalar(Math.exp(-1.4 * dt)); b.v.y -= 0.06 * dt; b.v.x += Math.sin(t * 1.3 + b.ph) * 0.03 * dt; b.v.z += Math.cos(t * 1.1 + b.ph) * 0.03 * dt;
+    const step = b.v.length() * dt;
+    if (step > 1e-5 && cast(b.p, _s1.copy(b.v).normalize(), step + b.r * 0.8)) { popBubble(i); continue; }
+    b.p.addScaledVector(b.v, dt);
+    if (b.age > b.life || b.p.y < Room.floorY + b.r * 0.5) { popBubble(i); continue; }
+    let popped = false;
+    for (const h of HS) if (h.valid && h.tip.distanceTo(b.p) < b.r + 0.012) { popBubble(i); popped = true; break; }
+    if (popped) continue;
+    for (let k = 0; k < elves.length; k++) {
+      const hd = heads[k]; if (!hd || Math.abs(hd.x - b.p.x) > 0.25 || Math.abs(hd.z - b.p.z) > 0.25) continue;
+      if (hd.distanceTo(b.p) < b.r + 0.06 * elves[k].s) { popBubble(i); const e = elves[k]; if (Math.random() < 0.7) laugh(e, 4); else say(e, 'yay'); if (e.state === 'ground' && e.b === 'bubble') { e.b = 'cheer'; e.timer = 0.6; } popped = true; break; }
+    }
+  }
+  // little ones run under the low bubbles and jump to pop them
+  Bub.chaseT -= dt;
+  if (Bub.chaseT <= 0 && Bub.list.length) {
+    Bub.chaseT = 0.5; let n = elves.filter(e => e.b === 'bubble').length;
+    for (const b of Bub.list) {
+      if (n >= 4) break; if (b.chased || b.p.y > Room.floorY + 0.55) continue;
+      let best = null, bd = 1.6; for (const e of elves) { if (!e.free() || Math.abs(e.p.y - Room.floorY) > 0.1) continue; const d = Math.hypot(e.p.x - b.p.x, e.p.z - b.p.z); if (d < bd){ bd = d; best = e; } }
+      if (best) { best.b = 'bubble'; best.act = { bub: b }; best.timer = 4; b.chased = true; n++; if (Math.random() < 0.5) say(best, 'woohoo'); }
+    }
+  }
+  const M = Bub.mesh, M4 = Bub.m4 || (Bub.m4 = new THREE.Matrix4()); M.count = Bub.list.length;
+  Bub.list.forEach((b, j) => { const w = Math.sin(t * 9 + b.ph) * 0.05, r = b.r * Math.min(1, b.age * 6); M4.makeScale(r * (1 + w), r * (1 - w), r * (1 + w * 0.5)).setPosition(b.p.x, b.p.y, b.p.z); M.setMatrixAt(j, M4); });
+  M.instanceMatrix.needsUpdate = true;
+}
+
+// ================= setting up, each time you enter your room =================
+// How should they find their way around: walls and floor only (your furniture just hides them, thanks to the
+// depth camera), or furniture too, from your room scan, boxes you draw yourself, or both? And hands or controllers?
+const SETUP_KEY = 'little-elves-setup-v1', BOX_KEY = 'little-elves-boxes-v1';
+const Setup = { active: false, step: '', group: new THREE.Group(), btns: [], room: 'depth', input: 'hands', saved: false, cool: 0, hover: null, prevZ: [1, 1] };
+try { const o = JSON.parse(localStorage.getItem(SETUP_KEY) || 'null'); if (o && o.room) { Setup.room = o.room; Setup.input = o.input || 'hands'; Setup.saved = true; } } catch (e) {}
+Setup.group.visible = false; scene.add(Setup.group);
+const ROOM_NAME = { depth: 'Walls and floor', scan: 'Scanned furniture', draw: 'Drawn furniture', both: 'Scanned + drawn furniture' };
+const wantsScanFurniture = () => Setup.room === 'scan' || Setup.room === 'both';
+const wantsDrawnFurniture = () => Setup.room === 'draw' || Setup.room === 'both';
+function saveSetup() { try { localStorage.setItem(SETUP_KEY, JSON.stringify({ room: Setup.room, input: Setup.input })); } catch (e) {} Setup.saved = true; }
+function setupBtnTex(label, sub, hot) {
+  return canvasTex(760, 150, (x, w, h) => {
+    x.fillStyle = hot ? '#ff3d7f' : '#ffd23f'; x.beginPath(); x.roundRect(4, 4, w - 8, h - 8, 44); x.fill();
+    x.textAlign = 'center'; x.fillStyle = hot ? '#ffffff' : '#2b2140';
+    x.font = '700 50px Fredoka, system-ui, sans-serif'; x.fillText(label, w / 2, sub ? 64 : 92);
+    if (sub) { x.font = '500 32px Fredoka, system-ui, sans-serif'; x.globalAlpha = 0.8; x.fillText(sub, w / 2, 112); }
+  });
+}
+// a panel: a title, a line or two of help, and big buttons; poke them with a finger, or point and pinch / pull the trigger
+function setupPanel(title, lines, buttons, where) {
+  const g = Setup.group; for (const o of [...g.children]) { g.remove(o); o.traverse(m => { if (m.material){ if (m.material.map) m.material.map.dispose(); m.material.dispose(); } if (m.geometry) m.geometry.dispose(); }); }
+  Setup.btns = []; Setup.hover = null;
+  const W = 0.4, BH = 0.075, GAP = 0.012, headH = 0.075 + lines.length * 0.03, H = headH + buttons.length * (BH + GAP) + 0.02;
+  const bg = new THREE.Mesh(new THREE.PlaneGeometry(W + 0.03, H), new THREE.MeshBasicMaterial({ transparent: true, depthTest: false, map: canvasTex(860, Math.round(860 * H / (W + 0.03)), (x, w, h) => {
+    x.fillStyle = 'rgba(255,253,248,.96)'; x.beginPath(); x.roundRect(4, 4, w - 8, h - 8, 50); x.fill();
+    x.textAlign = 'center'; x.fillStyle = '#ff3d7f'; x.font = '700 62px Fredoka, system-ui, sans-serif'; x.fillText(title, w / 2, 84);
+    x.fillStyle = '#2b2140'; x.font = '500 36px Fredoka, system-ui, sans-serif'; lines.forEach((l, i) => x.fillText(l, w / 2, 140 + i * 56));
+  }) }));
+  bg.renderOrder = 130; g.add(bg);
+  buttons.forEach((b, i) => {
+    const y = H / 2 - headH - BH / 2 - i * (BH + GAP);
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(W, BH), new THREE.MeshBasicMaterial({ map: setupBtnTex(b.label, b.sub, false), transparent: true, depthTest: false }));
+    m.position.set(0, y, 0.002); m.renderOrder = 131; m.userData = { id: b.id, label: b.label, sub: b.sub, hot: false, x: 0, y, w: W, h: BH }; g.add(m); Setup.btns.push(m);
+  });
+  updateCamVectors();
+  if (where === 'side') g.position.copy(camHead).addScaledVector(camFwdH, 0.45).addScaledVector(camRight, -0.3).addScaledVector(Y, -0.18);
+  else g.position.copy(camHead).addScaledVector(camFwdH, 0.55).addScaledVector(Y, -0.1);
+  g.lookAt(camHead); g.visible = true;
+}
+function startSetup() { Setup.active = true; showSetupStep('room'); }
+function showSetupStep(step) {
+  Setup.step = step;
+  if (step === 'room') setupPanel('Little Elves', ['How should they find their way', 'around your room?'], [
+    { id: 'depth', label: 'Walls and floor', sub: 'your furniture just hides them' },
+    { id: 'furn', label: 'Furniture too', sub: 'they climb your tables and couch' },
+    ...(Setup.saved ? [{ id: 'same', label: 'Same as last time', sub: ROOM_NAME[Setup.room] + ' · ' + (Setup.input === 'hands' ? 'hands' : 'controllers') }] : [])]);
+  else if (step === 'furn') setupPanel('Which furniture?', ['Use what your Quest found in Space Setup,', 'or outline boxes yourself.'], [
+    { id: 'scan', label: 'From my room scan', sub: 'tables, couches, beds, shelves' },
+    { id: 'draw', label: 'I\'ll draw it', sub: 'outline a box for each piece' },
+    { id: 'both', label: 'Both', sub: 'the scan, plus boxes you add' }]);
+  else if (step === 'input') setupPanel('Hands or controllers?', ['What will you play with?'], [
+    { id: 'hands', label: 'Hands', sub: 'pinch to grab, palm up for a ride' },
+    { id: 'controllers', label: 'Controllers', sub: 'squeeze the grip to grab' }]);
+  else if (step === 'draw') drawPanel();
+}
+function setupPress(id) {
+  click();
+  if (Setup.step === 'room') {
+    if (id === 'depth') { Setup.room = 'depth'; showSetupStep('input'); }
+    else if (id === 'furn') showSetupStep('furn');
+    else if (id === 'same') { if (wantsDrawnFurniture()) startDraw(); else finishSetup(); }
+  } else if (Setup.step === 'furn') { Setup.room = id; showSetupStep('input'); }
+  else if (Setup.step === 'input') { Setup.input = id; saveSetup(); if (wantsDrawnFurniture()) startDraw(); else finishSetup(); }
+  else if (Setup.step === 'draw') { if (id === 'done') finishSetup(); else if (id === 'undo') undoBox(); }
+}
+function finishSetup() {
+  Setup.active = false; Setup.group.visible = false; Draw.active = false; Draw.show(false); Mark.reticle.visible = false;
+  saveSetup(); applyInputMode();
+  Room.sig = ''; Room.builtAt = 0;   // read the room again, now with (or without) the furniture
+  World.setupDone = true;
+}
+// the panel's buttons: a finger poking it, or a pointing ray (controller, or a pinching hand)
+const setupRay = new THREE.Raycaster();
+function rayFrom(c, out) { out.origin.copy(c.getWorldPosition(_s1)); out.direction.set(0, 0, -1).applyQuaternion(c.getWorldQuaternion(_sq)); return out; }
+function setupHit(i) { const c = ctrls[i]; if (!c.userData.src) return null; rayFrom(c, setupRay.ray); setupRay.far = 3; const h = setupRay.intersectObjects(Setup.btns, false)[0]; return h || null; }
+function setBtnHot(m, hot) { if (m.userData.hot === hot) return; m.userData.hot = hot; m.material.map.dispose(); m.material.map = setupBtnTex(m.userData.label, m.userData.sub, hot); }
+function updateSetup(dt) {
+  Setup.cool -= dt;
+  const panelUp = Setup.active && Setup.group.visible;
+  let hov = null;
+  if (panelUp) for (let i = 0; i < 2; i++) { const h = setupHit(i); if (h) hov = h.object; }
+  // a finger poking from the front presses a button
+  if (panelUp) HS.forEach((h, i) => {
+    if (!h.valid) { Setup.prevZ[i] = 1; return; }
+    const q = Setup.group.worldToLocal(h.tip.clone());
+    for (const m of Setup.btns) { const u = m.userData; if (Math.abs(q.x - u.x) < u.w / 2 && Math.abs(q.y - u.y) < u.h / 2 && q.z < 0.012 && q.z > -0.04) { hov = m; if (Setup.prevZ[i] >= 0.012 && Setup.cool <= 0) { Setup.cool = 0.6; setupPress(u.id); Setup.prevZ[i] = q.z; return; } } }
+    Setup.prevZ[i] = q.z;
+  });
+  for (const m of Setup.btns) setBtnHot(m, m === hov);
+  updateLasers();
+  if (Draw.active) updateDraw(dt);
+}
+function setupSelect(i) {
+  if (Setup.step === 'draw') { const h = setupHit(i); if (h) { if (Setup.cool <= 0) { Setup.cool = 0.4; setupPress(h.object.userData.id); } return; } drawSelect(i); return; }
+  const h = setupHit(i); if (h && Setup.cool <= 0) { Setup.cool = 0.4; setupPress(h.object.userData.id); }
+}
+// pointing lines from your controllers (or pinching hands) while you set up and draw
+let lasers = null;
+const makeLasers = () => [0, 1].map(i => { const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: '#ff3d7f', transparent: true, opacity: 0.8, depthTest: false })); l.renderOrder = 129; l.visible = false; ctrls[i].add(l); return l; });
+function updateLasers() {
+  if (!lasers) lasers = makeLasers();
+  lasers.forEach((l, i) => {
+    const c = ctrls[i]; l.visible = Setup.active && !!c.userData.src;
+    if (!l.visible) return;
+    const h = setupHit(i); let d = h ? h.distance : 1.2;
+    if (!h && Draw.active) { const p = drawHit(i); if (p) d = c.getWorldPosition(_s1).distanceTo(p); }
+    l.scale.set(1, 1, Math.max(0.05, d));
+  });
+}
+// controllers get a little marker so you can see them in your room
+let ctrlMarks = null;
+const makeCtrlMarks = () => [0, 1].map(i => { const g = new THREE.Group(); g.add(new THREE.Mesh(new THREE.TorusGeometry(0.022, 0.006, 8, 20), toon('#ff3d7f'))); const tip = new THREE.Mesh(new THREE.SphereGeometry(0.008, 10, 8), toon('#ffd23f')); tip.position.z = -0.04; g.add(tip); g.visible = false; ctrls[i].add(g); return g; });
+function applyInputMode() { if (!ctrlMarks) ctrlMarks = makeCtrlMarks(); ctrlMarks.forEach((g, i) => { g.visible = Setup.input === 'controllers'; }); }
+
+// ---------- drawing your furniture: two corners on the floor, then lift to set the height ----------
+const Draw = { active: false, step: 0, a: null, b: null, h: 0.4, ax: new V3(1, 0, 0), az: new V3(0, 0, 1), ctrl: -1,
+  prev: (() => { const g = new THREE.Group(), geo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
+    g.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: '#ff3d7f', transparent: true, opacity: 0.22, depthWrite: false })), new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: '#ff3d7f' })));
+    g.visible = false; scene.add(g); return g; })(),
+  shown: new THREE.Group(),
+  show(on) { this.shown.visible = on; if (!on) this.prev.visible = false; } };
+scene.add(Draw.shown);
+const floorY = () => Room.collider ? Room.floorY : 0;
+function drawPanel() {
+  const n = (Room.boxes || []).length, verb = Setup.input === 'controllers' ? 'pull the trigger' : 'pinch';
+  const lines = Draw.step === 0 ? ['Point at one corner of a piece of', 'furniture, down on the floor, and ' + verb + '.'] : Draw.step === 1 ? ['Now point at the opposite corner', 'on the floor and ' + verb + '.'] : ['Raise or lower your hand to its', 'height, then ' + verb + '.'];
+  setupPanel(n ? 'Draw furniture · ' + n + (n === 1 ? ' box' : ' boxes') : 'Draw your furniture', lines, [{ id: 'done', label: 'Done', sub: 'start playing' }, ...(n ? [{ id: 'undo', label: 'Undo last box' }] : [])], 'side');
+}
+function startDraw() {
+  Setup.step = 'draw'; Draw.active = true; Draw.step = 0; Draw.show(true);
+  // boxes line up with the room scan if there is one, otherwise with the way you're facing
+  const ax = Room.anchor ? new V3(1, 0, 0).transformDirection(Room.anchor).setY(0) : new V3(-camFwdH.z, 0, camFwdH.x);
+  if (ax.lengthSq() < 1e-4) ax.set(1, 0, 0); Draw.ax.copy(ax.normalize()); Draw.az.crossVectors(Draw.ax, Y).negate();
+  Room.boxes = loadBoxes(); showBoxes(); drawPanel();
+}
+// where a pointing ray meets the floor (or, while setting the height, an upright plane through the box)
+function drawHit(i) {
+  const c = ctrls[i]; if (!c.userData.src) return null; const r = rayFrom(c, new THREE.Ray()), p = new V3();
+  if (Draw.step < 2) { const pl = new THREE.Plane(Y, -floorY()); if (!r.intersectPlane(pl, p) || p.distanceTo(r.origin) > 6) return null; return p; }
+  const mid = Draw.a.clone().add(Draw.b).multiplyScalar(0.5), nrm = _s4.subVectors(camHead, mid).setY(0).normalize();
+  return r.intersectPlane(new THREE.Plane().setFromNormalAndCoplanarPoint(nrm, mid), p) ? p : null;
+}
+function boxFrom(a, b, h) { const d = b.clone().sub(a), w = d.dot(Draw.ax), dd = d.dot(Draw.az); return { c: a.clone().addScaledVector(Draw.ax, w / 2).addScaledVector(Draw.az, dd / 2).setY(floorY()), ax: Draw.ax.clone(), w: Math.abs(w), d: Math.abs(dd), h }; }
+function placeBoxMesh(g, B) { g.position.copy(B.c); g.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(B.ax, Y, new V3().crossVectors(B.ax, Y))); g.scale.set(Math.max(0.005, B.w), Math.max(0.005, B.h), Math.max(0.005, B.d)); }
+function updateDraw() {
+  let i = Draw.ctrl >= 0 && ctrls[Draw.ctrl].userData.src ? Draw.ctrl : ctrls.findIndex(c => c.userData.src && c.userData.src.handedness === 'right'); if (i < 0) i = ctrls.findIndex(c => c.userData.src);
+  const p = i >= 0 ? drawHit(i) : null; Draw.hit = p;
+  Mark.reticle.visible = !!p && Draw.step < 2; if (p && Draw.step < 2) { Mark.reticle.position.copy(p).addScaledVector(Y, 0.004); Mark.reticle.quaternion.setFromUnitVectors(ZAX, Y); }
+  if (Draw.step === 1 && p) { placeBoxMesh(Draw.prev, boxFrom(Draw.a, p, 0.01)); Draw.prev.visible = true; }
+  else if (Draw.step === 2 && p) { Draw.h = clamp(p.y - floorY(), 0.05, 2.2); placeBoxMesh(Draw.prev, boxFrom(Draw.a, Draw.b, Draw.h)); Draw.prev.visible = true; }
+  else if (Draw.step === 0) Draw.prev.visible = false;
+}
+function drawSelect(i) {
+  Draw.ctrl = i; const p = drawHit(i); if (!p) return;
+  drawPoint(p);
+}
+function drawPoint(p) {
+  click();
+  if (Draw.step === 0) { Draw.a = p.clone(); Draw.step = 1; }
+  else if (Draw.step === 1) { const B = boxFrom(Draw.a, p, 0.01); if (B.w < 0.08 || B.d < 0.08) { Draw.step = 0; Draw.prev.visible = false; showCard(['Too small', 'Start again from a corner.'], 3); } else { Draw.b = p.clone(); Draw.step = 2; } }
+  else { const B = boxFrom(Draw.a, Draw.b, Draw.h); Room.boxes = [...(Room.boxes || []), B]; saveBoxes(); buildRoomGeo(); showBoxes(); Draw.step = 0; Draw.prev.visible = false; if (AU.ctx) shimmer(3, 0.05); }
+  drawPanel();
+}
+function undoBox() { if (!(Room.boxes || []).length) return; Room.boxes = Room.boxes.slice(0, -1); saveBoxes(); buildRoomGeo(); showBoxes(); Draw.step = 0; drawPanel(); }
+function showBoxes() {
+  for (const o of [...Draw.shown.children]) Draw.shown.remove(o);
+  for (const B of Room.boxes || []) { const g = new THREE.Group(); g.add(new THREE.Mesh(Draw.prev.children[0].geometry, new THREE.MeshBasicMaterial({ color: '#1fd1c1', transparent: true, opacity: 0.18, depthWrite: false })), new THREE.LineSegments(Draw.prev.children[1].geometry, new THREE.LineBasicMaterial({ color: '#1fd1c1' }))); placeBoxMesh(g, B); Draw.shown.add(g); }
+}
+// boxes are saved relative to the room scan (like marked pictures), so they line up again next time
+function saveBoxes() {
+  const inv = (Room.anchor || new THREE.Matrix4()).clone().invert();
+  const data = (Room.boxes || []).map(B => ({ c: B.c.clone().applyMatrix4(inv).toArray(), ax: B.ax.clone().transformDirection(inv).toArray(), w: B.w, d: B.d, h: B.h }));
+  try { localStorage.setItem(BOX_KEY, JSON.stringify(data)); } catch (e) {}
+}
+function loadBoxes() {
+  const A = Room.anchor || new THREE.Matrix4(); let d = []; try { d = JSON.parse(localStorage.getItem(BOX_KEY) || '[]'); } catch (e) {}
+  return d.map(o => { const ax = new V3().fromArray(o.ax).transformDirection(A).setY(0).normalize(); return { c: new V3().fromArray(o.c).applyMatrix4(A), ax, w: o.w, d: o.d, h: o.h }; });
+}
+// a drawn box as triangles for the room the little people walk on: the top and four sides
+function boxTris(B, P, I) {
+  const az = new V3().crossVectors(B.ax, Y).negate(), base = P.length / 3, v = new V3();
+  for (const y of [0, B.h]) for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) { v.copy(B.c).addScaledVector(B.ax, sx * B.w / 2).addScaledVector(az, sz * B.d / 2).addScaledVector(Y, y); P.push(v.x, v.y, v.z); }
+  for (const t of [[4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]]) I.push(base + t[0], base + t[1], base + t[2]);
+}
+
 // ================= the mushroom =================
 // A bolete with a little face. Grab it, bring it to your mouth, and a few crunchy bites later the little people show up.
 const Mush = { group: null, wedges: [], stem: null, glow: null, state: 'hidden', key: null, bites: 0, biteT: 0, home: new V3(), eaten: 0, wait: 0, onset: -1, pop: 1 };
@@ -4419,6 +4721,7 @@ function updateMark(dt) {
   }
 }
 function onSelect(i) {
+  if (Setup.active) { setupSelect(i); return; }
   if (!Mark.active || ctrls[i] !== Mark.ctrl || !Mark.hit) return;
   if (Mark.step === 0) {
     Mark.p1 = Mark.hit.p.clone(); Mark.n1 = Mark.hit.n.clone();
@@ -4485,7 +4788,7 @@ function onAte() {
   if (World.mode === 'preview') { hintEl.textContent = 'Drag a little person to pick them up and throw them. Click one to poke it, or click the floor to add one. Drag empty space to look around. Click the mushroom again when it comes back.'; addBtn.hidden = false; }
 }
 function onBatchDone() {
-  if (World.mode === 'mr' && Mush.eaten === 1) showCard(['Pick them up!', 'Pinch one to grab it, then throw.', 'Hold your palm up and still: one hops on.'], 10);
+  if (World.mode === 'mr' && Mush.eaten === 1) showCard(Setup.input === 'controllers' ? ['Pick them up!', 'Point at one and squeeze the grip,', 'then throw.'] : ['Pick them up!', 'Pinch one to grab it, then throw.', 'Hold your palm up and still: one hops on.'], 10);
 }
 function resetWorld() {
   for (const e of [...elves]) removeElf(e);
@@ -4498,13 +4801,15 @@ function resetWorld() {
   for (const k in Grab.held) delete Grab.held[k];
   HS.forEach(h => { h.rider = null; h.coming = null; });
   Scan.t = -1; hideCard(); if (Card.mesh) Card.mesh.visible = false; Mark.active = false;
+  Setup.active = false; Setup.group.visible = false; Draw.active = false; Draw.show(false); Mark.reticle.visible = false;
+  Bub.list.length = 0; Bub.mesh.count = 0; if (Bub.wand) { scene.remove(Bub.wand.m); Bub.wand = null; }
 }
 function enterWorld(mode) {
   World.mode = mode;
   resetWorld();
   if (mode === 'mr') {
     scene.background = null; renderer.setClearColor(0x000000, 0);
-    clearRoom(); Room.sig = ''; World.t0 = performance.now(); World.frames = 0; World.placed = false; World.noRoom = false;
+    clearRoom(); Room.sig = ''; World.t0 = performance.now(); World.frames = 0; World.placed = false; World.noRoom = false; World.setupDone = false;
   } else {
     scene.background = PREVIEW_BG;
     setRoom(preview.geo, 'preview', preview.group);
@@ -4514,11 +4819,12 @@ function enterWorld(mode) {
   }
 }
 // Read the room scan the Quest made in Space Setup. The little people's world is the floor, walls and ceiling,
-// plus the pictures on the walls; tables, couches, storage and other furniture are left out on purpose.
+// plus the pictures on the walls. Furniture is left out unless you chose it when you came in (the scan's, boxes you drew, or both).
 // Real furniture still hides them when they walk behind it, thanks to the headset's live depth camera.
 const ART_RE = /art|picture|painting|poster/i;
 const SKIP_RE = /table|desk|couch|sofa|storage|shelf|cabinet|bed|screen|monitor|lamp|plant|other|global|furniture|chair/i;
 const ROOM_RE = /floor|ceiling|wall|door|window/i;
+const FURN_RE = /table|desk|couch|sofa|storage|shelf|cabinet|bed|chair|furniture/i;
 function readRoom(frame) {
   const ref = renderer.xr.getReferenceSpace(); if (!ref) return;
   const meshes = frame.detectedMeshes, planes = frame.detectedPlanes;
@@ -4550,7 +4856,7 @@ function readRoom(frame) {
     const m = new THREE.Matrix4().fromArray(pose.transform.matrix), label = x.semanticLabel || '', V = x.vertices;
     if (V.length > anchorSize) { anchorSize = V.length; anchor = m.clone(); }
     if (ART_RE.test(label)) { if (V.length < 3000) { const xs = [], ys = [], zs = []; for (let i = 0; i < V.length; i += 3) { xs.push(V[i]); ys.push(V[i + 1]); zs.push(V[i + 2]); } featureFrom(label, m, xs, ys, zs, null); } continue; }
-    items.push({ mesh: x, m, label, room: ROOM_RE.test(label) && !SKIP_RE.test(label), skip: SKIP_RE.test(label) });
+    items.push({ mesh: x, m, label, room: ROOM_RE.test(label) && !SKIP_RE.test(label), skip: SKIP_RE.test(label), furn: FURN_RE.test(label) });
   }
   if (hasPlanes) for (const x of planes) {
     const pose = frame.getPose(x.planeSpace, ref); if (!pose) return;
@@ -4558,11 +4864,11 @@ function readRoom(frame) {
     if (poly.length < 3) continue;
     if (/floor/i.test(label) && !anchor) anchor = m.clone();
     if (ART_RE.test(label)) { featureFrom(label, m, poly.map(p => p.x), poly.map(() => 0), poly.map(p => p.z), 1); continue; }
-    items.push({ plane: x, m, label, room: !SKIP_RE.test(label) && (ROOM_RE.test(label) || !label), skip: SKIP_RE.test(label) });
+    items.push({ plane: x, m, label, room: !SKIP_RE.test(label) && (ROOM_RE.test(label) || !label), skip: SKIP_RE.test(label), furn: FURN_RE.test(label) });
   }
   // Walls and floor are usually planes. If this headset only gave us one big mesh, fall back to using it whole.
   const structural = items.filter(it => it.room && /floor|wall/i.test(it.label));
-  const use = structural.length ? items.filter(it => it.room) : items.filter(it => it.mesh || !hasMeshes);
+  const use = structural.length ? items.filter(it => it.room || (it.furn && wantsScanFurniture())) : items.filter(it => it.mesh || !hasMeshes);
   const pos = [], idx = [], v = new V3();
   for (const it of use) {
     const base = pos.length / 3;
@@ -4581,7 +4887,8 @@ function readRoom(frame) {
   setRoom(geoFrom(pos, idx), use.some(it => it.mesh) ? 'mesh' : 'planes');
   Room.anchor = anchor;
   Room.features = [...feats, ...loadMarks()];
-  if (Room.features.length) buildRoomGeo();
+  Room.boxes = wantsDrawnFurniture() ? loadBoxes() : [];
+  if (Room.features.length || Room.boxes.length) buildRoomGeo();
   Room.builtAt = t;
   if (Room.occluder && renderer.xr.hasDepthSensing && renderer.xr.hasDepthSensing()) Room.occluder.visible = false;
 }
@@ -4682,10 +4989,13 @@ function xrStep(frame) {
   if (World.frames % 15 === 1) readRoom(frame);
   if (!Room.collider && performance.now() - World.t0 > 6000) { setRoom(fallbackFloor, 'fallback'); World.noRoom = true; }
   if (!World.placed && World.frames > 20) {
-    World.placed = true; placeMushroom();
-    showCard(['Little Elves', 'for Eliza', 'Grab the floating mushroom with your hand', 'and bring it up to your mouth.']);
+    if (!Setup.active && !World.setupDone) startSetup();
+    if (World.setupDone) {
+      World.placed = true; placeMushroom();
+      showCard(['Little Elves', 'for Eliza', Setup.input === 'controllers' ? 'Squeeze the grip to grab the floating mushroom' : 'Grab the floating mushroom with your hand', 'and bring it up to your mouth.']);
+    }
   }
-  if (World.noRoom === true) {
+  if (World.noRoom === true && World.setupDone) {
     World.noRoom = 'told';
     showCard(['No room scan found', 'The little people will stay on the floor.', 'To fix it: Quest Settings > Physical space', '> Space setup. Then come back!'], 9);
   }
@@ -4728,6 +5038,8 @@ function simulate(dt, t, xr) {
   updateGrabs(grabbers);
   updatePokes(grabbers, dt);
   updateGifts(grabbers, dt);
+  updateSetup(dt);
+  updateBubbles(dt, t);
   if (xr) updateInvites();
   updateMushroom(dt, t, grabbers);
   updateSpawner(dt);
@@ -4747,7 +5059,7 @@ renderer.setAnimationLoop((time, frame) => {
 });
 
 enterWorld('preview');
-window.littleElves = { renderer, readRoom, ff: (secs) => { for (let i = 0; i < secs * 60; i++) { simT += 1 / 60; simulate(1 / 60, simT, false); } }, elves, visitors, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls, tryPeek, tryChase, startFlyer, start: { ...STARTERS, ring: startRing, giant: spawnGiant, kiss: tryKiss, pond: startPond, mantis: startMantis, buster: startBuster, gift: () => { const e = elves.find(x => x.free()); return e && e.startGift(); } }, acts, Gift, LOG, Flyer, Dir, Grab, Mouse, HS, LOD, AU, Trip, KINDS };
+window.littleElves = { renderer, readRoom, ff: (secs) => { for (let i = 0; i < secs * 60; i++) { simT += 1 / 60; simulate(1 / 60, simT, false); } }, elves, visitors, addElf, eat: () => { initAudio(); startEating(); }, Mush, Room, V3, camera, controls, tryPeek, tryChase, startFlyer, start: { ...STARTERS, ring: startRing, giant: spawnGiant, kiss: tryKiss, pond: startPond, mantis: startMantis, buster: startBuster, gift: () => { const e = elves.find(x => x.free()); return e && e.startGift(); } }, acts, Gift, LOG, Flyer, Dir, Grab, Mouse, HS, LOD, AU, Trip, KINDS, Bub, Setup, Draw, startSetup, setupPress, drawPoint, takeFlower, makeWand, World };
 </script>
 <script src="../updated.js"></script>
 </body>
