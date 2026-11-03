@@ -92,12 +92,13 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p3.11"></script>
-<script src="solver.js?v=p3.11"></script>
+<script src="demo.js?v=p3.12"></script>
+<script src="solver.js?v=p3.12"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js"
 } }
 </script>
 <script type="module">
@@ -106,7 +107,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '3.11';
+const VERSION = '3.12';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -2972,21 +2973,593 @@ function loadSample(){
   else { const xc = renderer.xr.getCamera(), p = new V3(), q = new THREE.Quaternion(); xc.getWorldPosition(p); xc.getWorldQuaternion(q); fitView({ p, q }); }
   flash('Sample sketch loaded: a bowl, a pyramid and a bank');
 }
+// ======================================================================
+// PLAY: skate your park with physics. The ride is Subdeck XR's (booster, ollies, grinds), with trucks that carve
+// when you lean, the board resting on both trucks over transitions, and sharp seams you can grind like coping.
+// Past the park's edge the surface carries straight on and flattens out into a big plain, so you can't fall off.
+// Physics is in park metres. k = how big your board is next to the park: a real board is 1; a fingerboard on the
+// park built at 1:N is 0.118·N (a 96 mm fingerboard next to an 813 mm deck). Speeds and forces are "how it feels"
+// at your size, so they're multiplied by k.
+// ======================================================================
+const PLAY_SIZES = [1, 10, 15, 20, 25];
+const playSizeName = i => PLAY_SIZES[i] === 1 ? 'Real board' : '1:' + PLAY_SIZES[i];
+const PLAY_DEF = { booster: 9, top: 13, grip: 92, pop: 3.8, friction: 16, gravity: 9.8 };
+const PLAY_STEPS = { booster: [4, 6, 9, 12, 16, 22], top: [6, 9, 13, 18, 25], grip: [55, 70, 82, 92, 100], pop: [2.6, 3.2, 3.8, 4.6, 5.6], friction: [6, 11, 16, 24, 34] };
+const PLAY = (() => {
+  const UP = new V3(0, 1, 0), FB = 0.813 / 0.096;                 // fingerboard model → real board
+  const BOARD_R = 0.06, TAIL = 0.2, TRUCK_X = 0.027 * FB, DECK_TOP = (DECK_Y + DECK_T) * FB, WHEELBASE = 2 * TRUCK_X;
+  const kOf = () => { const n = PLAY_SIZES[S.playSize ?? 0] || 1; return n === 1 ? 1 : 0.096 * n / 0.813; };
+  const P = key => S['play_' + key] ?? PLAY_DEF[key];
+  let on = false, paused = false, K = 1, coll = { bvh: null, geo: null, yG: 0 }, builtFor = null, lines = [], segGrid = new Map(), SEG_CS = 1;
+  let spawns = [], spawnIdx = 0, saved = null, skYaw = 0, wasAir = false, MeshBVH = null, loops = [];
+  const sk = { B: new V3(), V: new V3(), N: UP.clone(), F: new V3(1, 0, 0), Uair: UP.clone(), grounded: false, grind: null, bdir: 1, impact: 0, skid: 0, autoCool: 0, pitch: 0, hsign: 1, tailDrag: false, cool: 0, leave: 0, bail: 0, boost: 0, air: 0, sinceOllie: 9, events: [], disp: null, steer: 0, lean: 0, prevF: new V3(1, 0, 0) };
+  const hand = { mid: null, pitch0: null, prevPitch: null, pitchRate: 0, lean0: null };
+  const desk = { keys: {}, cam: null, heading: new V3(1, 0, 0), ollie: false };
+
+  // ---- what you see: the apron and plain past the park, the coping, the board
+  const G = new THREE.Group(); G.visible = false; world.add(G);
+  const tex = () => { const c = document.createElement('canvas'); c.width = c.height = 256; const g = c.getContext('2d');
+    g.fillStyle = '#A9C3CF'; g.fillRect(0, 0, 256, 256); for (let i = 0; i < 900; i++){ g.fillStyle = `rgba(${Math.random() < 0.5 ? '255,255,255' : '40,60,70'},${Math.random() * 0.1})`; g.fillRect(Math.random() * 256, Math.random() * 256, 2, 2); }
+    g.strokeStyle = 'rgba(35,55,68,.45)'; g.lineWidth = 5; g.strokeRect(0, 0, 256, 256);
+    const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t; };
+  const apronMat = new THREE.MeshStandardMaterial({ map: tex(), roughness: 0.9, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 });
+  const copingMat = new THREE.MeshStandardMaterial({ color: 0xD6DAE0, metalness: 0.75, roughness: 0.28 });
+  let apronMesh = null, groundMesh = null, copingMesh = null;
+  const rig = new THREE.Group(); G.add(rig);                        // at the wheels' contact point, in real metres × k
+  let boardM = null, deckG = null, trucks = [];
+  function makePlayBoard(){
+    if (boardM) rig.remove(boardM);
+    const b = makeBoard(RUN_COLORS[(S.playColor || 0) % RUN_COLORS.length]); boardM = new THREE.Group(); boardM.scale.setScalar(FB);
+    deckG = new THREE.Group(); deckG.position.y = WHEEL_R; boardM.add(deckG); trucks = [];
+    for (const x of [-0.027, 0.027]){ const t = new THREE.Group(); t.position.set(x, 0, 0); boardM.add(t); trucks.push(t); }
+    for (const m of [...b.children]){ const ti = Math.abs(m.position.x + 0.027) < 0.012 ? 0 : Math.abs(m.position.x - 0.027) < 0.012 ? 1 : -1;
+      if (ti >= 0 && m.position.y < DECK_Y - 0.0001){ m.position.x -= trucks[ti].position.x; trucks[ti].add(m); } else { m.position.y -= WHEEL_R; deckG.add(m); } }
+    rig.add(boardM);
+  }
+  const flame = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.3, 14, 1, true), new THREE.MeshBasicMaterial({ color: 0xFF8A1F, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false }));
+  const flameCore = new THREE.Mesh(new THREE.ConeGeometry(0.025, 0.18, 10, 1, true), new THREE.MeshBasicMaterial({ color: 0xFFF2A8, side: THREE.DoubleSide, depthWrite: false }));
+  for (const f of [flame, flameCore]){ f.rotation.z = Math.PI / 2; f.position.y = 0.06; rig.add(f); }
+  const blob = new THREE.Mesh(new THREE.CircleGeometry(1, 28), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.4, depthWrite: false })); G.add(blob);
+
+  // ---- the world you ride: your surface, plus an apron that carries on from its open edges
+  const smooth01 = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  function buildWorld(){
+    const key = surfMesh ? surfMesh.geometry.uuid + ':' + K : 'none:' + K; if (builtFor === key) return; builtFor = key;
+    for (const m of [apronMesh, groundMesh, copingMesh]) if (m){ G.remove(m); m.geometry.dispose(); } apronMesh = groundMesh = copingMesh = null; lines = []; segGrid = new Map(); loops = [];
+    const pos = surfMesh ? surfMesh.geometry.attributes.position.array : new Float32Array(0), nrm = surfMesh ? surfMesh.geometry.attributes.normal.array : new Float32Array(0), nT = pos.length / 9;
+    // weld by position so the open edges and the seams can be found
+    const q = 2000, idOf = new Map(), V = [], I = new Int32Array(nT * 3), vn = [];
+    for (let i = 0; i < nT * 3; i++){ const k = Math.round(pos[3 * i] * q) + ',' + Math.round(pos[3 * i + 1] * q) + ',' + Math.round(pos[3 * i + 2] * q); let j = idOf.get(k);
+      if (j === undefined){ j = V.length / 3; idOf.set(k, j); V.push(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]); vn.push(0, 0, 0); } I[i] = j; vn[3 * j] += nrm[3 * i]; vn[3 * j + 1] += nrm[3 * i + 1]; vn[3 * j + 2] += nrm[3 * i + 2]; }
+    const nv = V.length / 3, v = i => new V3(V[3 * i], V[3 * i + 1], V[3 * i + 2]);
+    let top = 0; for (let i = 0; i < nrm.length; i += 3) top += nrm[i + 1]; const sgn = top < 0 ? -1 : 1;
+    let yMin = Infinity, cx = 0, cz = 0; for (let i = 0; i < nv; i++){ yMin = Math.min(yMin, V[3 * i + 1]); cx += V[3 * i]; cz += V[3 * i + 2]; } if (!nv) yMin = 0; cx /= nv || 1; cz /= nv || 1;
+    const yG = yMin - 0.01 * K; coll.yG = yG;
+    // faces: their normal from the winding, turned to the riding side
+    const fN = new Float32Array(nT * 3), A = new V3(), Bv = new V3(), C = new V3(), e1 = new V3(), e2 = new V3(), n0 = new V3();
+    const edges = new Map(), ek = (a, b) => a < b ? a * nv + b : b * nv + a;
+    for (let f = 0; f < nT; f++){ const a = I[3 * f], b = I[3 * f + 1], c = I[3 * f + 2]; if (a === b || b === c || a === c) continue;
+      A.fromArray(V, 3 * a); Bv.fromArray(V, 3 * b); C.fromArray(V, 3 * c); n0.crossVectors(e1.subVectors(Bv, A), e2.subVectors(C, A)); if (n0.lengthSq() < 1e-16) continue; n0.normalize();
+      const sn = (nrm[9 * f] + nrm[9 * f + 3] + nrm[9 * f + 6]) * n0.x + (nrm[9 * f + 1] + nrm[9 * f + 4] + nrm[9 * f + 7]) * n0.y + (nrm[9 * f + 2] + nrm[9 * f + 5] + nrm[9 * f + 8]) * n0.z;
+      if (sn * sgn < 0) n0.negate(); fN[3 * f] = n0.x; fN[3 * f + 1] = n0.y; fN[3 * f + 2] = n0.z;
+      for (const [p, r, o] of [[a, b, c], [b, c, a], [c, a, b]]){ const kk = ek(p, r); let e = edges.get(kk); if (!e) edges.set(kk, e = { a: Math.min(p, r), b: Math.max(p, r), f: [], o: [] }); e.f.push(f); e.o.push(o); } }
+    const vN = i => { const n = new V3(vn[3 * i], vn[3 * i + 1], vn[3 * i + 2]).multiplyScalar(sgn); return n.lengthSq() > 1e-12 ? n.normalize() : UP.clone(); };
+    // --- the open edges, chained into loops
+    const bAdj = new Map(), bOut = new Map();
+    for (const e of edges.values()){ if (e.f.length !== 1) continue;
+      const a = v(e.a), b = v(e.b), c = v(e.o[0]), t = b.clone().sub(a).normalize(), w = a.clone().add(b).multiplyScalar(0.5).sub(c); w.addScaledVector(t, -w.dot(t)); w.normalize();
+      for (const [p, r] of [[e.a, e.b], [e.b, e.a]]){ (bAdj.get(p) || bAdj.set(p, []).get(p)).push(r); const o = bOut.get(p) || bOut.set(p, new V3()).get(p); o.add(w); } }
+    const seen = new Set(), rawLoops = [];
+    for (const s of bAdj.keys()){ if (seen.has(s)) continue; const L = [s]; seen.add(s); let prev = -1, cur = s;
+      for (;;){ const nx = (bAdj.get(cur) || []).find(x => x !== prev && !seen.has(x)); if (nx === undefined) break; L.push(nx); seen.add(nx); prev = cur; cur = nx; }
+      if (L.length >= 8){ L.closed = (bAdj.get(cur) || []).includes(s); rawLoops.push(L); } }
+    const box = L => { let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity; for (const i of L){ x0 = Math.min(x0, V[3 * i]); x1 = Math.max(x1, V[3 * i]); z0 = Math.min(z0, V[3 * i + 2]); z1 = Math.max(z1, V[3 * i + 2]); } return { x0, x1, z0, z1, d: Math.hypot(x1 - x0, z1 - z0) }; };
+    const boxes = rawLoops.map(box), big = boxes.reduce((m, b, i) => b.d > (boxes[m] ? boxes[m].d : -1) ? i : m, 0);
+    // the outer edge (and any other island's), not holes inside it
+    const keep = rawLoops.filter((L, i) => i === big || !(boxes[i].x0 > boxes[big].x0 && boxes[i].x1 < boxes[big].x1 && boxes[i].z0 > boxes[big].z0 && boxes[i].z1 < boxes[big].z1));
+    // --- the apron: from each edge point the surface carries on the way it was going (so there is no lip), bends
+    // over to level within a couple of board lengths, then eases down (or up) to the plain and runs on far out
+    // --- the apron. Its heights come from one smooth field: near the edge, the edge's own height (carrying on at the
+    // surface's slope, up to about 40°, so gentle edges join without a kink); then a level deck a few board lengths
+    // wide; then an easy ramp down (or up) to the plain. Its plan runs straight out from the edge, smoothed so the rows
+    // don't cross. Because the heights come from the field (not each column on its own), there are no ridges to snag on.
+    const AP = [], AI = [], AUV = [], LS = [];
+    for (const L of keep){
+      const n = L.length, Pp = L.map(v), Nn = L.map(vN), O = L.map(i => bOut.get(i).clone());
+      for (let i = 0; i < n; i++){ O[i].addScaledVector(Nn[i], -O[i].dot(Nn[i])); if (O[i].lengthSq() < 1e-10) O[i].set(Pp[i].x - cx, 0, Pp[i].z - cz); O[i].normalize(); }
+      for (let it = 0; it < 4; it++){ const O2 = O.map((o, i) => o.clone().multiplyScalar(2).add(O[(i + n - 1) % n]).add(O[(i + 1) % n])); for (let i = 0; i < n; i++){ O2[i].addScaledVector(Nn[i], -O2[i].dot(Nn[i])); O[i].copy(O2[i].normalize()); } }
+      const H = O.map((o, i) => { const h = new V3(o.x, 0, o.z), l = h.length(), c = new V3(Pp[i].x - cx, 0, Pp[i].z - cz).normalize(); if (l < 0.35) h.addScaledVector(c, 0.35 - l); return h.normalize(); });
+      for (let it = 0; it < 6; it++){ const H2 = H.map((h, i) => h.clone().multiplyScalar(2).add(H[(i + n - 1) % n]).add(H[(i + 1) % n]).setY(0).normalize()); H.forEach((h, i) => h.copy(H2[i])); }
+      const slope = O.map(o => clamp(o.y / Math.max(Math.hypot(o.x, o.z), 0.05), -0.8, 0.8)), steep = O.map(o => Math.abs(o.y / Math.max(Math.hypot(o.x, o.z), 0.05)) > 0.8);
+      LS.push({ L, n, Pp, Nn, O, H, slope, steep });
+    }
+    const bs = []; for (const l of LS){ const st = Math.max(1, Math.floor(l.n / 500)); for (let i = 0; i < l.n; i += st) bs.push(l.Pp[i]); }
+    const edgeH = (x, z, u) => { const sg = 0.6 * K + 0.35 * u, k2 = 1 / (2 * sg * sg); let w = 0, y = 0;
+      for (const b of bs){ const d2 = (b.x - x) ** 2 + (b.z - z) ** 2, ww = Math.exp(-d2 * k2) + 1e-12; w += ww; y += ww * b.y; } return y / w; };
+    const Lt = 1.6 * K, D0 = 4 * K, US = [0, 0.2, 0.45, 0.75, 1.1, 1.6, 2.2, 3, 4].map(x => x * K), EASE = 8;
+    for (const l of LS){
+      const { L, n, Pp, H, slope } = l, R = US.length + EASE, cols = [];
+      for (let i = 0; i < n; i++){ const col = []; for (let j = 0; j < US.length; j++) col.push(Pp[i].clone().addScaledVector(H[i], US[j])); cols.push(col); }
+      // smooth the plan of each row along the edge (more further out) so neighbouring columns don't fan out or cross
+      const smoothRow = j => { const iters = Math.min(40, Math.max(0, (j - 2) * 3)); if (!iters) return; let row = cols.map(c => c[j].clone());
+        for (let it = 0; it < iters; it++) row = row.map((q, i) => { const a = L.closed || i > 0 ? row[(i + n - 1) % n] : q, c = L.closed || i < n - 1 ? row[(i + 1) % n] : q; return q.clone().multiplyScalar(0.5).addScaledVector(a, 0.25).addScaledVector(c, 0.25); });
+        row.forEach((q, i) => { cols[i][j].x = q.x; cols[i][j].z = q.z; }); };
+      for (let j = 1; j < US.length; j++) smoothRow(j);
+      // heights near the edge, and how far each column's ramp runs
+      const ramp = [];
+      for (let i = 0; i < n; i++){ for (let j = 1; j < US.length; j++){ const c = cols[i][j], u = US[j], f = edgeH(c.x, c.z, u), w = smooth01(0, Lt, u);
+          c.y = (1 - w) * (Pp[i].y + slope[i] * u) + w * f; }
+        const top = cols[i][US.length - 1].y, dy = top - yG; ramp.push({ dy, Ld: Math.max(6 * K, 5 * Math.abs(dy)) }); }
+      // the ramp to the plain (its length smoothed along the edge too)
+      for (let it = 0; it < 20; it++){ const r2 = ramp.map((r, i) => ({ dy: r.dy, Ld: 0.5 * r.Ld + 0.25 * ramp[(i + n - 1) % n].Ld + 0.25 * ramp[(i + 1) % n].Ld })); ramp.forEach((r, i) => r.Ld = r2[i].Ld); }
+      for (let i = 0; i < n; i++){ const last = cols[i][US.length - 1], { dy, Ld } = ramp[i];
+        for (let j = 1; j <= EASE; j++){ const f = j / EASE, q2 = last.clone().addScaledVector(H[i], Ld * f); q2.y = yG + dy * (1 - smooth01(0, 1, f)); cols[i].push(q2); } }
+      for (let j = US.length; j < R; j++) smoothRow(j);
+      Object.assign(l, { R, cols, deckRow: US.length - 2 });
+    }
+    for (const l of LS){ const { L, n, R, cols } = l, base = l.base = AP.length / 3;
+      for (let i = 0; i < n; i++) for (let j = 0; j < R; j++){ const c = cols[i][j]; AP.push(c.x, c.y, c.z); AUV.push(c.x / (2 * K), (c.z + c.y) / (2 * K)); }
+      for (let i = 0; i < (L.closed ? n : n - 1); i++){ const i2 = (i + 1) % n; for (let j = 0; j + 1 < R; j++){ const a = base + i * R + j, b = base + i2 * R + j; AI.push(a, b, a + 1, b, b + 1, a + 1); } }
+      loops.push(l);
+    }
+    if (AP.length){
+      const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(AP, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(AUV, 2)); g.setIndex(AI); g.computeVertexNormals();
+      // turn the apron's faces to the riding side, and give its first row exactly the surface's normals (so the join is smooth)
+      const NA = g.attributes.normal; let agree = 0;
+      for (const L of loops) for (let i = 0; i < L.n; i++){ const k1 = L.base + i * L.R + 1; agree += NA.getX(k1) * L.Nn[i].x + NA.getY(k1) * L.Nn[i].y + NA.getZ(k1) * L.Nn[i].z; }
+      if (agree < 0){ for (let i = 0; i < AI.length; i += 3){ const t = AI[i + 1]; AI[i + 1] = AI[i + 2]; AI[i + 2] = t; } g.setIndex(AI); g.computeVertexNormals(); }
+      for (const L of loops) for (let i = 0; i < L.n; i++){ if (L.steep[i]) continue; const k0 = L.base + i * L.R; g.attributes.normal.setXYZ(k0, L.Nn[i].x, L.Nn[i].y, L.Nn[i].z); }
+      apronMesh = new THREE.Mesh(g, apronMat); G.add(apronMesh);
+    }
+    { const s = 4000 * K, x0 = cx - s, x1 = cx + s, z0 = cz - s, z1 = cz + s, g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute([x0, yG - 0.004 * K, z0, x1, yG - 0.004 * K, z0, x1, yG - 0.004 * K, z1, x0, yG - 0.004 * K, z1], 3));
+      g.setAttribute('uv', new THREE.Float32BufferAttribute([x0, z0, x1, z0, x1, z1, x0, z1].map(x => x / (2 * K)), 2)); g.setIndex([0, 2, 1, 0, 3, 2]); g.computeVertexNormals();
+      groundMesh = new THREE.Mesh(g, apronMat); G.add(groundMesh); }
+    // --- the collision mesh: your surface as it is (its normals kept, creases and all) plus the apron
+    { const nS = pos.length / 3, nA = AP.length / 3, cp = new Float32Array((nS + nA) * 3), cn = new Float32Array((nS + nA) * 3), ci = new Uint32Array(nS + AI.length);
+      cp.set(pos); cn.set(nrm); for (let i = 0; i < nS; i++) ci[i] = i;
+      if (apronMesh){ cp.set(apronMesh.geometry.attributes.position.array, nS * 3); cn.set(apronMesh.geometry.attributes.normal.array, nS * 3); const ai = apronMesh.geometry.index.array; for (let i = 0; i < ai.length; i++) ci[nS + i] = ai[i] + nS; }
+      const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(cp, 3)); g.setAttribute('normal', new THREE.BufferAttribute(cn, 3)); g.setIndex(new THREE.BufferAttribute(ci, 1));
+      coll.geo = ci.length ? g : null; coll.bvh = ci.length ? new MeshBVH(g) : null; }
+    // --- sharp seams you can grind: edges where the surface folds over (convex), not much steeper than 45°
+    const pairs = [];
+    for (const e of edges.values()){ if (e.f.length !== 2) continue; const [f1, f2] = e.f, n1 = new V3().fromArray(fN, 3 * f1), n2 = new V3().fromArray(fN, 3 * f2);
+      if (n1.dot(n2) > 0.866 || Math.max(n1.y, n2.y) < 0.25) continue; const a = v(e.a), b = v(e.b), T = b.clone().sub(a); if (T.lengthSq() < 1e-12) continue; T.normalize(); if (Math.abs(T.y) > 0.72) continue;
+      const tol = 1e-4 * K; if (v(e.o[1]).sub(a).dot(n1) > -tol || v(e.o[0]).sub(a).dot(n2) > -tol) continue;
+      pairs.push([e.a, e.b]); }
+    const adj = new Map(), used = new Set();
+    for (const [a, b] of pairs){ (adj.get(a) || adj.set(a, []).get(a)).push(b); (adj.get(b) || adj.set(b, []).get(b)).push(a); }
+    const dir = (a, b) => v(b).sub(v(a)).normalize();
+    const grow = Lc => { for (;;){ const cur = Lc[Lc.length - 1], prev = Lc[Lc.length - 2], all = adj.get(cur) || [], nb = all.filter(x => !used.has(ek(cur, x)));
+      if (nb.length !== 1 || all.length > 2) return; if (dir(prev, cur).dot(dir(cur, nb[0])) < 0.82) return; used.add(ek(cur, nb[0])); Lc.push(nb[0]); } };
+    const tubes = [];
+    for (const [a, b] of pairs){ if (used.has(ek(a, b))) continue; used.add(ek(a, b)); const Lc = [a, b]; grow(Lc); Lc.reverse(); grow(Lc);
+      const poly = Lc.map(v), len = poly.reduce((t, p, i) => i ? t + p.distanceTo(poly[i - 1]) : 0, 0);
+      if (len > 0.6 * K){ lines.push({ poly, rad: 0.006 * K, id: lines.length }); if (poly.length >= 2) tubes.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(poly, false, 'centripetal', 0), Math.min(400, poly.length * 2), 0.022 * K, 6, false)); } }
+    if (tubes.length){ const g = mergeTubes(tubes); copingMesh = new THREE.Mesh(g, copingMat); G.add(copingMesh); }
+    SEG_CS = Math.max(0.5, 1.5 * K);
+    for (const r of lines) for (let i = 1; i < r.poly.length; i++){ const a = r.poly[i - 1], b = r.poly[i];
+      for (let x = Math.floor(Math.min(a.x, b.x) / SEG_CS); x <= Math.floor(Math.max(a.x, b.x) / SEG_CS); x++) for (let y = Math.floor(Math.min(a.y, b.y) / SEG_CS); y <= Math.floor(Math.max(a.y, b.y) / SEG_CS); y++)
+        for (let z = Math.floor(Math.min(a.z, b.z) / SEG_CS); z <= Math.floor(Math.max(a.z, b.z) / SEG_CS); z++){ const kk = x + ',' + y + ',' + z; (segGrid.get(kk) || segGrid.set(kk, []).get(kk)).push([r, i]); } }
+    makeSpawns();
+  }
+  function mergeTubes(list){ let nP = 0, nI = 0; for (const g of list){ nP += g.attributes.position.count; nI += g.index.count; }
+    const p = new Float32Array(nP * 3), n = new Float32Array(nP * 3), idx = new Uint32Array(nI); let o = 0, oi = 0;
+    for (const g of list){ p.set(g.attributes.position.array, o * 3); n.set(g.attributes.normal.array, o * 3); const gi = g.index.array; for (let i = 0; i < gi.length; i++) idx[oi + i] = gi[i] + o; o += g.attributes.position.count; oi += gi.length; g.dispose(); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(p, 3)); g.setAttribute('normal', new THREE.BufferAttribute(n, 3)); g.setIndex(new THREE.BufferAttribute(idx, 1)); return g; }
+
+  // ---- collision queries (as in Subdeck)
+  const _a = new V3(), _b = new V3(), _c = new V3(), _bc = new V3(), _na = new V3(), _nb = new V3(), _nc = new V3(), _tri = new THREE.Triangle(), _ray = new THREE.Ray(), _cl = {}, _ln = new THREE.Line3(), _cp = new V3(), _m4 = new THREE.Matrix4();
+  function smoothNormal(fi, pt, side){
+    const Nn = coll.geo.attributes.normal, Pp = coll.geo.attributes.position, I = coll.geo.index, ia = I.getX(3 * fi), ib = I.getX(3 * fi + 1), ic = I.getX(3 * fi + 2);
+    _a.fromBufferAttribute(Pp, ia); _b.fromBufferAttribute(Pp, ib); _c.fromBufferAttribute(Pp, ic); THREE.Triangle.getBarycoord(pt, _a, _b, _c, _bc);
+    const n = _na.fromBufferAttribute(Nn, ia).multiplyScalar(_bc.x).add(_nb.fromBufferAttribute(Nn, ib).multiplyScalar(_bc.y)).add(_nc.fromBufferAttribute(Nn, ic).multiplyScalar(_bc.z));
+    if (n.lengthSq() < 1e-10 || !isFinite(n.x)) return side.clone(); n.normalize(); if (n.dot(side) < 0) n.negate();
+    return n.dot(side) < 0.5 ? side.clone() : n.clone();
+  }
+  function faceNormal(fi){ const Pp = coll.geo.attributes.position, I = coll.geo.index; _a.fromBufferAttribute(Pp, I.getX(3 * fi)); _b.fromBufferAttribute(Pp, I.getX(3 * fi + 1)); _c.fromBufferAttribute(Pp, I.getX(3 * fi + 2)); return _tri.set(_a, _b, _c).getNormal(new V3()); }
+  function closest(p, maxD){
+    let best = null; const yG = coll.yG;
+    if (coll.bvh){ const t = coll.bvh.closestPointToPoint(p, _cl, 0, maxD); if (t){ const n = p.clone().sub(t.point), d = t.distance; if (d < 1e-7){ const fn = faceNormal(t.faceIndex); n.copy(fn).multiplyScalar(sk.N.dot(fn) < 0 ? -1 : 1); } n.normalize();
+      best = { point: t.point.clone(), n, ns: smoothNormal(t.faceIndex, t.point, n), d }; } }
+    const dg = p.y - yG; if (dg < maxD && dg > -0.5 * K && (!best || dg < best.d)) best = { point: new V3(p.x, yG, p.z), n: UP.clone(), ns: UP.clone(), d: dg };
+    return best;
+  }
+  const segDist = (p, a, b, out) => { _ln.set(a, b); _ln.closestPointToPoint(p, true, out); return out.distanceTo(p); };
+  function railClosest(p, maxD){
+    let best = null; const seenR = new Set();
+    for (let x = Math.floor((p.x - maxD) / SEG_CS); x <= Math.floor((p.x + maxD) / SEG_CS); x++) for (let y = Math.floor((p.y - maxD) / SEG_CS); y <= Math.floor((p.y + maxD) / SEG_CS); y++) for (let z = Math.floor((p.z - maxD) / SEG_CS); z <= Math.floor((p.z + maxD) / SEG_CS); z++){
+      const L = segGrid.get(x + ',' + y + ',' + z); if (!L) continue;
+      for (const [r, i] of L){ const kk = r.id * 1e6 + i; if (seenR.has(kk)) continue; seenR.add(kk); const d = segDist(p, r.poly[i - 1], r.poly[i], _cp) - r.rad;
+        if (d < maxD && (!best || d < best.d)) best = { r, i, d, point: _cp.clone(), t: _ln.closestPointToPointParameter(p, true) }; } }
+    return best;
+  }
+  const railUp = T => { const q = UP.clone().addScaledVector(T, -UP.dot(T)); if (q.lengthSq() < 1e-4) q.set(1, 0, 0).addScaledVector(T, -T.x); return q.normalize(); };
+  const tangentOf = (d, n) => { const t = d.clone().addScaledVector(n, -d.dot(n)); if (t.lengthSq() < 1e-8) t.set(1, 0, 0).addScaledVector(n, -n.x); return t.normalize(); };
+
+  // ---- where you start: on the apron facing the park (the edge nearest you), then the start of each run, then the middle
+  function makeSpawns(){
+    spawns = [];
+    const view = (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldPosition(new V3()), vp = saved ? saved.viewPark : world.worldToLocal(view.clone());
+    for (const L of loops){ let bi = 0, bd = Infinity; for (let i = 0; i < L.n; i++){ const c = L.cols[i][0], d = (c.x - vp.x) ** 2 + (c.z - vp.z) ** 2; if (d < bd){ bd = d; bi = i; } }
+      const c = L.cols[bi][L.deckRow]; spawns.push({ p: c.clone(), d: L.H[bi].clone().negate(), n: UP.clone(), name: 'the edge nearest you' }); break; }
+    runs.forEach((r, i) => { if (!r.P || r.P.length < 6) return; const m = runMat(r), p0 = new V3(r.P[0], r.P[1], r.P[2]).applyMatrix4(m).add(runsGroup.position);
+      let p1 = null; for (let j = 3; j + 2 < r.P.length; j += 3){ const q = new V3(r.P[j], r.P[j + 1], r.P[j + 2]).applyMatrix4(m).add(runsGroup.position); if (q.distanceTo(p0) > 0.4 * K){ p1 = q; break; } }
+      if (!p1) return; const c = closest(p0, 2 * K); if (!c) return; spawns.push({ p: c.point.clone(), d: p1.sub(p0).normalize(), n: c.ns.clone(), name: 'run ' + (i + 1) }); });
+    if (coll.bvh){ coll.geo.computeBoundingBox(); const b = coll.geo.boundingBox, m = b.getCenter(new V3()); m.y = b.max.y + 1; const t = coll.bvh.raycastFirst(new THREE.Ray(m, new V3(0, -1, 0)), THREE.DoubleSide);
+      if (t){ const n = faceNormal(t.faceIndex); if (n.y < 0) n.negate(); if (n.y > 0.85) spawns.push({ p: t.point.clone(), d: new V3(1, 0, 0), n, name: 'the middle' }); } }
+    if (!spawns.length) spawns.push({ p: new V3(0, coll.yG, 0), d: new V3(1, 0, 0), n: UP.clone(), name: 'the plain' });
+  }
+  function spawnAt(i){
+    const r = BOARD_R * K; spawnIdx = ((i % spawns.length) + spawns.length) % spawns.length; const s = spawns[spawnIdx];
+    sk.B.copy(s.p).addScaledVector(s.n, r * 1.02); sk.N.copy(s.n); sk.F.copy(tangentOf(s.d, s.n)); sk.prevF.copy(sk.F); sk.disp = null;
+    sk.V.set(0, 0, 0); sk.skid = 0; sk.Uair.copy(sk.N); sk.grounded = true; sk.grind = null; sk.cool = 0.2; sk.leave = 0; sk.bail = 0; sk.air = 0; sk.steer = sk.lean = 0;
+    desk.heading.copy(sk.F); desk.cam = null;
+    if (renderer.xr.isPresenting) alignToHands();
+  }
+
+  // ---- the physics step
+  function stepSkate(dt, inp){
+    const s = 1 / K, r = BOARD_R * K, g = P('gravity') * K;
+    sk.cool -= dt; sk.leave -= dt; sk.sinceOllie += dt; sk.autoCool -= dt; sk.autoScan = (sk.autoScan || 0) - dt;
+    if (sk.bail > 0){ sk.bail -= dt; if (sk.bail <= 0) spawnAt(spawnIdx); return; }
+    sk.boost = inp.boost;
+    if (inp.heading){
+      const onto = (hd, n) => { const v = hd.clone();
+        if (inp.flat){ v.setY(0); if (v.lengthSq() < 1e-8 || n.y < -0.9) return null; v.normalize().applyQuaternion(new THREE.Quaternion().setFromUnitVectors(UP, n)); }
+        v.addScaledVector(n, -v.dot(n)); if (v.lengthSq() < 1e-6) return null; v.normalize();
+        if (inp.flat){ if (v.dot(sk.F) < 0){ v.negate(); sk.hsign = -1; } else sk.hsign = 1; }
+        return v; };
+      if (sk.grind){ const v = onto(inp.heading, railUp(sk.grind.T)); if (v) sk.F.copy(v); }
+      else if (sk.grounded){ const v = onto(inp.heading, sk.N); if (v) sk.F.copy(v); }
+      else if (!inp.airQ) sk.F.copy(inp.heading).normalize();
+    }
+    if (inp.look){ const d = sk.F.dot(inp.look); if (Math.abs(d) > 0.2) sk.bdir = Math.sign(d); }
+    if (!sk.grounded && !sk.grind && inp.airQ){ sk.F.set(1, 0, 0).applyQuaternion(inp.airQ); sk.Uair.set(0, 1, 0).applyQuaternion(inp.airQ); }
+    let pop = inp.ollie ? 1 : 0;
+    if (inp.pitch !== undefined){
+      const p = inp.pitch * sk.hsign, rate = (inp.pitchRate || 0) * sk.hsign;
+      if (sk.grounded){ const want = clamp(p, -TAIL, TAIL); sk.pitch += (want - sk.pitch) * (1 - Math.exp(-dt * (want === 0 ? 14 : 30))); sk.tailDrag = Math.abs(p) >= TAIL * 0.97;
+        if (Math.abs(p) >= TAIL * 0.85 && Math.sign(rate) === Math.sign(p) && Math.abs(rate) > 3 && sk.cool <= 0) pop = clamp(0.45 + (Math.abs(rate) - 3) / 6, 0.45, 1); }
+      else if (sk.grind){ sk.pitch = 0; sk.tailDrag = false; if (Math.abs(rate) > 3 && Math.abs(p) > TAIL * 0.6 && sk.cool <= 0) pop = 0.8; }
+      else sk.tailDrag = false;
+    } else sk.tailDrag = !!inp.brake && sk.grounded;
+    if (pop && (sk.grounded || sk.grind) && sk.cool <= 0){
+      const n = sk.grind ? railUp(sk.grind.T) : sk.N, v = P('pop') / s * pop;
+      sk.V.addScaledVector(n.y > 0.2 ? n.clone().lerp(UP, 0.35).normalize() : n, v);
+      sk.Uair.copy(n); sk.grounded = false; sk.grind = null; sk.cool = 0.35; sk.leave = 0.12; sk.sinceOllie = 0; sk.tailDrag = false; sk.events.push('ollie');
+    }
+    const steps = clamp(Math.ceil(sk.V.length() * dt / (r * 0.35)), 1, 16), h = dt / steps;
+    for (let i = 0; i < steps && !sk.bail; i++) subStep(h, r, g, inp);
+    if (!isFinite(sk.B.x + sk.B.y + sk.B.z + sk.V.x + sk.V.y + sk.V.z + sk.F.x + sk.N.y + sk.Uair.y) || sk.B.y < coll.yG - 5 * K) spawnAt(spawnIdx);
+  }
+  function subStep(h, r, g, inp){
+    const s = 1 / K, mu = P('friction') / 100 * 0.15, grip = P('grip') / 100 * 2.6, top = P('top') / s, acc = P('booster') / s * inp.boost;
+    if (sk.grind){ sk.skid = 0; return grindStep(h, r, g, mu, top, acc, inp); }
+    sk.V.y -= g * h;
+    const fw = sk.F.clone().multiplyScalar(sk.bdir);
+    if (acc > 0 && sk.V.dot(fw) < top) sk.V.addScaledVector(fw, acc * h);
+    if (sk.grounded){
+      const n = sk.N, vn = sk.V.dot(n), vt = sk.V.clone().addScaledVector(n, -vn);
+      let al = vt.dot(sk.F); const side = vt.addScaledVector(sk.F, -al), sm = side.length();
+      // the wheels grip sideways up to a limit. Turn harder than that and you skid. Pressing into a curve (more load) grips more.
+      const load = g * Math.max(0.3, n.y), cut = Math.min(sm, grip * load * h);
+      if (sm > 1e-12) side.multiplyScalar((sm - cut) / sm);
+      const slip = (sm - cut) * s; sk.skid = slip;
+      let dec = mu * load * h + 0.006 * al * al * s * h;
+      if (sk.tailDrag) dec += 0.35 * load * h;
+      if (slip > 0.25){ const scrub = 0.5 * load * h * Math.min(1, slip / 2); dec += scrub; side.multiplyScalar(Math.max(0, 1 - scrub / Math.max(sm, 1e-9))); }
+      al -= Math.sign(al) * Math.min(Math.abs(al), dec);
+      sk.V.copy(n).multiplyScalar(vn).addScaledVector(sk.F, al).add(side);
+    }
+    const move = sk.V.clone().multiplyScalar(h), len = move.length();
+    if (len > r * 0.4 && coll.bvh){ _ray.set(sk.B, move.clone().divideScalar(len)); const hit = coll.bvh.raycastFirst(_ray, THREE.DoubleSide);
+      if (hit && hit.distance < len + r * 0.5) sk.B.addScaledVector(_ray.direction, Math.max(0, hit.distance - r * 0.6)); else sk.B.add(move); }
+    else sk.B.add(move);
+    // sharp seams: drop onto one from above (or roll onto it lined up) to grind. They never block you.
+    if (lines.length && sk.leave <= 0){
+      const air = !sk.grounded, rc = railClosest(sk.B, r * (air ? 2.4 : 1.3));
+      if (rc){
+        const away = sk.B.clone().sub(rc.point), d = away.length(); away.divideScalar(d || 1);
+        const T = rc.r.poly[rc.i].clone().sub(rc.r.poly[rc.i - 1]).normalize(), up = railUp(T), vl = sk.V.length(), along = Math.abs(sk.V.dot(T)), lineUp = Math.abs(sk.F.dot(T));
+        const fromAir = air && (sk.sinceOllie < 2 || sk.air > 0.2) && (along > 0.3 * vl || lineUp > 0.65);
+        const rolling = sk.grounded && lineUp > 0.9 && along > 0.5 * vl;
+        if (away.dot(up) > 0.35 && sk.V.dot(away) < 0.4 / s && (fromAir || rolling)){ sk.grind = { r: rc.r, i: rc.i, t: rc.t, T, sp: sk.V.dot(T), slow: 0 }; sk.grounded = false; sk.events.push('grind'); return; }
+      }
+      if (S.playAutoGrind !== 0 && sk.grounded && sk.autoCool <= 0 && sk.autoScan <= 0 && sk.V.length() * s > 1.2){ sk.autoScan = 0.08; autoPop(r, g); }
+    }
+    let contact = null;
+    for (let it = 0; it < 2; it++){
+      const c = closest(sk.B, r * 1.8); if (!c) break;
+      if (c.d < r){ sk.B.copy(c.point).addScaledVector(c.n, r); const vn = sk.V.dot(c.n); if (vn < 0){ if (!sk.grounded) sk.impact = Math.max(sk.impact, -vn * s); sk.V.addScaledVector(c.n, -vn); } contact = c.ns; }
+      else if (sk.grounded && sk.leave <= 0 && it === 0){
+        const away = (c.d - r) / h, hold = g * Math.max(0, c.n.y) * h + 0.35 / s;
+        const vt2 = sk.V.lengthSq(), kap = Math.acos(clamp(sk.N.dot(c.n), -1, 1)) / Math.max(Math.sqrt(vt2) * h, 1e-9);
+        const holds = c.n.y > -0.05 || vt2 * kap > g * -c.n.y;
+        if (away < hold && holds && sk.V.dot(c.n) < 0.6 / s){ sk.B.copy(c.point).addScaledVector(c.n, r); const vn = sk.V.dot(c.n); if (vn > 0) sk.V.addScaledVector(c.n, -vn); contact = c.ns; }
+      }
+    }
+    if (contact){
+      if (!sk.grounded){ const steep = Math.abs(sk.F.dot(contact)) > 0.8;
+        if ((sk.Uair.dot(contact) < -0.15 || steep) && sk.air > 0.25){ sk.bail = 0.7; sk.events.push('bail'); return; }
+        sk.pitch = 0; sk.events.push('land'); sk.air = 0; }
+      sk.grounded = true; sk.N.lerp(contact, 0.6).normalize();
+      sk.F.addScaledVector(sk.N, -sk.F.dot(sk.N)); if (sk.F.lengthSq() < 1e-8) sk.F.copy(tangentOf(new V3(1, 0, 0), sk.N)); sk.F.normalize();
+    } else if (sk.grounded){ sk.grounded = false; sk.Uair.copy(sk.N); sk.events.push('air'); }
+    if (!sk.grounded){ sk.air += h; sk.skid = 0; }
+  }
+  function autoPop(r, g){
+    const s = 1 / K, reach = 1.1 / s, foot = sk.B.clone().addScaledVector(sk.N, -r); let best = null;
+    for (const Lr of lines){ const Pl = Lr.poly; for (let i = 1; i < Pl.length; i++){
+      const d = segDist(foot, Pl[i - 1], Pl[i], _cp); if (d > reach) continue;
+      const T = Pl[i].clone().sub(Pl[i - 1]).normalize(), dh = _cp.y + Lr.rad - foot.y; if (dh < 0.015 / s || dh > 1.0 / s) continue;
+      if (Math.abs(sk.F.dot(T)) < 0.8 || Math.abs(sk.V.dot(T)) < 0.65 * sk.V.length()) continue;
+      const off = _cp.clone().sub(foot); off.addScaledVector(T, -off.dot(T)); off.y = 0; if (off.length() > 0.9 / s) continue;
+      if (best && d >= best.d) continue; best = { d, dh, off: off.clone(), T }; } }
+    if (!best) return;
+    const up = Math.sqrt(2 * g * (best.dh + 0.12 / s)), tUp = up / g;
+    sk.V.addScaledVector(UP, up - Math.max(0, sk.V.y)).addScaledVector(best.off, 1 / Math.max(tUp, 0.15));
+    sk.grounded = false; sk.Uair.copy(sk.N); sk.cool = 0.3; sk.leave = 0.14; sk.sinceOllie = 0; sk.autoCool = 1.2; sk.events.push('ollie');
+  }
+  function grindStep(h, r, g, mu, top, acc, inp){
+    const Gd = sk.grind, Pl = Gd.r.poly;
+    let sp = Gd.sp - g * Gd.T.y * h;
+    const lk = inp.look ? inp.look.dot(Gd.T) : 0, dir = Math.abs(lk) > 0.2 ? Math.sign(lk) : Math.sign(sp || 1);
+    if (acc > 0 && Math.abs(sp) < top) sp += dir * acc * h;
+    sp -= Math.sign(sp) * Math.min(Math.abs(sp), mu * 0.5 * g * h); Gd.sp = sp;
+    let dist = sp * h, i = Gd.i, t = Gd.t;
+    while (Math.abs(dist) > 1e-12){ const a = Pl[i - 1], b = Pl[i], L = a.distanceTo(b) || 1e-9;
+      if (dist > 0){ const rem = (1 - t) * L; if (dist < rem){ t += dist / L; dist = 0; } else { dist -= rem; if (i + 1 >= Pl.length){ t = 1; break; } i++; t = 0; } }
+      else { const rem = t * L; if (-dist < rem){ t += dist / L; dist = 0; } else { dist += rem; if (i - 1 < 1){ t = 0; break; } i--; t = 1; } } }
+    Gd.i = i; Gd.t = t; Gd.T = Pl[i].clone().sub(Pl[i - 1]).normalize();
+    const at = Pl[i - 1].clone().lerp(Pl[i], t), up = railUp(Gd.T);
+    sk.B.copy(at).addScaledVector(up, Gd.r.rad + r * 0.9); sk.V.copy(Gd.T).multiplyScalar(sp); sk.N.copy(up); sk.Uair.copy(up);
+    if ((t >= 1 && i === Pl.length - 1 && sp > 0) || (t <= 0 && i === 1 && sp < 0)){ sk.grind = null; sk.leave = 0.15; sk.autoCool = 0.8; sk.events.push('off-rail'); return; }
+    Gd.slow = Math.abs(sp) / K < 0.25 ? Gd.slow + h : 0;
+    if (Gd.slow > 0.45){ const side = sk.F.clone().multiplyScalar(sk.bdir).addScaledVector(up, -sk.F.dot(up) * sk.bdir); sk.grind = null; sk.leave = 0.3; sk.V.copy(side.normalize()).multiplyScalar(0.6 * K); sk.events.push('off-rail'); }
+  }
+
+  // ---- how the board looks: resting on both trucks, the deck leaning into a carve and the trucks turned
+  const boardBasis = (fwd, up, out) => { const x = fwd.clone().addScaledVector(up, -fwd.dot(up)).normalize(), z = new V3().crossVectors(x, up).normalize(); return out.makeBasis(x, up, z); };
+  function boardPose(dt){
+    const r = BOARD_R * K, ground = sk.grounded && !sk.grind;
+    let up = ground || sk.grind ? sk.N.clone() : sk.Uair.clone(), fwd = sk.F.clone();
+    // both trucks: where the surface is under each one, so over a transition the board bridges it like a real one
+    if (ground && coll.bvh){ const side = new V3().crossVectors(fwd, up).normalize(), pts = [];
+      for (const sx of [TRUCK_X, -TRUCK_X]){ const q = sk.B.clone().addScaledVector(fwd, sx * K), c = closest(q, r * 2.5); pts.push(c ? c.point.clone().addScaledVector(c.ns, r) : q); }
+      const f2 = pts[0].clone().sub(pts[1]); if (f2.lengthSq() > 1e-10){ f2.normalize(); if (f2.dot(fwd) > 0.6){ fwd = f2; up = side.clone().cross(fwd).normalize(); if (up.dot(sk.N) < 0) up.negate(); } } }
+    // carve: how fast the board is turning tells the trucks how far to steer, and the deck how far to lean
+    const pf = sk.prevF.clone().addScaledVector(up, -sk.prevF.dot(up)), cf = sk.F.clone().addScaledVector(up, -sk.F.dot(up));
+    let yaw = 0; if (dt > 0 && pf.lengthSq() > 1e-8 && cf.lengthSq() > 1e-8){ pf.normalize(); cf.normalize(); yaw = Math.atan2(new V3().crossVectors(pf, cf).dot(up), pf.dot(cf)) / dt; }
+    sk.prevF.copy(sk.F);
+    const vReal = Math.abs(sk.V.dot(sk.F)) / K, curv = vReal > 0.3 ? yaw / Math.max(vReal, 0.3) : 0;
+    const wantSteer = ground ? clamp(Math.atan(curv * WHEELBASE / 2), -0.3, 0.3) : 0, wantLean = ground ? clamp(Math.atan(vReal * vReal * curv / 9.8), -0.3, 0.3) : 0;
+    const e = 1 - Math.exp(-dt * 10); sk.steer += (wantSteer - sk.steer) * e; sk.lean += (wantLean - sk.lean) * e;
+    const qT = new THREE.Quaternion().setFromRotationMatrix(boardBasis(fwd, up, _m4));
+    if (!sk.disp || dt <= 0){ rig.quaternion.copy(qT); sk.disp = sk.B.clone(); }
+    else { rig.quaternion.slerp(qT, 1 - Math.exp(-dt * (ground ? 24 : 40)));
+      const n = ground ? up : UP, off = sk.disp.clone().sub(sk.B).dot(n), lim = r; sk.disp.copy(sk.B).addScaledVector(n, clamp(off, -lim, lim) * Math.exp(-dt * 16)); }
+    const rUp = new V3(0, 1, 0).applyQuaternion(rig.quaternion);
+    rig.position.copy(sk.disp).addScaledVector(rUp, -r); rig.scale.setScalar(K);
+    const pp = ground ? sk.pitch : 0, piv = new V3(pp >= 0 ? -TRUCK_X : TRUCK_X, 0, 0);
+    boardM.rotation.set(0, 0, pp); boardM.position.copy(piv).sub(piv.clone().applyAxisAngle(new V3(0, 0, 1), pp));
+    deckG.rotation.x = -sk.lean; trucks[0].rotation.y = -sk.steer; trucks[1].rotation.y = sk.steer;
+    const f = sk.boost, b = sk.bdir; flame.visible = flameCore.visible = f > 0.02;
+    flame.scale.set(0.5 + f, 0.6 + f * 1.1 + Math.random() * 0.25 * f, 0.5 + f); flameCore.scale.copy(flame.scale);
+    flame.position.x = -0.55 * b; flameCore.position.x = -0.5 * b; flame.rotation.z = flameCore.rotation.z = b * Math.PI / 2;
+    let at = null, n = UP;
+    if (coll.bvh){ _ray.set(sk.B, new V3(0, -1, 0)); const t = coll.bvh.raycastFirst(_ray, THREE.DoubleSide); if (t){ at = t.point; n = faceNormal(t.faceIndex); if (n.y < 0) n.negate(); } }
+    if (sk.B.y > coll.yG && (!at || at.y < coll.yG)){ at = new V3(sk.B.x, coll.yG, sk.B.z); n = UP; }
+    blob.visible = !!at; if (at){ const hgt = sk.B.distanceTo(at) / K; blob.position.copy(at).addScaledVector(n, 0.004 * K); blob.quaternion.setFromUnitVectors(new V3(0, 0, 1), n); blob.scale.setScalar(0.32 * K * (1 + hgt * 0.15)); blob.material.opacity = 0.42 / (1 + hgt * 0.6); }
+  }
+
+  // ---- in the headset: your hands are your feet (as in Subdeck), and leaning them carves
+  const handBy = side => hands.find(hh => hh.hand === side && hh.source && hh.source.gamepad);
+  function frontBack(){ const L = handBy('left'), R = handBy('right'); if (!L || !R) return null; return { front: gripPos(L), back: gripPos(R), L, R }; }
+  function handUp(fb, x){ const u = new V3(0, 1, 0).applyQuaternion(fb.L.grip.getWorldQuaternion(new THREE.Quaternion())).add(new V3(0, 1, 0).applyQuaternion(fb.R.grip.getWorldQuaternion(new THREE.Quaternion())));
+    u.addScaledVector(x, -u.dot(x)); if (u.lengthSq() < 1e-6) u.set(0, 1, 0); return u.normalize(); }
+  function handFrame(fb){ const x = fb.front.clone().sub(fb.back).normalize(), u = handUp(fb, x); return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, u, new V3().crossVectors(x, u))); }
+  const _yawQ = new THREE.Quaternion(), _hQ0 = new THREE.Quaternion(), _bQ0 = new THREE.Quaternion();
+  function alignToHands(){
+    const d = sk.F.clone().setY(0); if (d.lengthSq() < 1e-6) return;
+    const f = frontBack(), fw = new V3(); renderer.xr.getCamera().getWorldDirection(fw); fw.setY(0).normalize();
+    let hv = f ? f.front.clone().sub(f.back).setY(0) : null; if (!hv || hv.lengthSq() < 1e-6) hv = new V3(fw.z, 0, -fw.x);
+    hv.normalize(); if (hv.dot(fw) < -0.3) hv.negate();
+    skYaw = Math.atan2(hv.x, hv.z) - Math.atan2(d.x, d.z); hand.mid = null; hand.pitch0 = null; hand.prevPitch = null; hand.pitchRate = 0; hand.lean0 = null; wasAir = false; sk.bdir = 1; sk.hsign = 1; sk.pitch = 0;
+  }
+  function placeWorldUnderFeet(feet, dt){
+    const s = 1 / K; boardPose(dt);
+    const up = new V3(0, 1, 0).applyQuaternion(rig.quaternion), deck = rig.position.clone().addScaledVector(up, (DECK_TOP + 0.02) * K);
+    world.scale.setScalar(s); world.quaternion.setFromAxisAngle(UP, skYaw);
+    world.position.copy(feet).sub(deck.multiplyScalar(s).applyQuaternion(world.quaternion));
+  }
+  function updateXR(dt){
+    const fb = frontBack(); let ollie = false, boost = 0, turn = 0;
+    for (const h of hands){
+      const gp = h.source && h.source.gamepad; if (!gp) continue; h.pprev = h.pprev || [];
+      const pressed = i => !!(gp.buttons[i] && gp.buttons[i].pressed), down = i => pressed(i) && !h.pprev[i];
+      const left = h.hand === 'left';
+      if (left && down(3)){ setPaused(!paused); pulse(h, 0.3, 15); }
+      else if (!paused){
+        boost = Math.max(boost, gp.buttons[0] ? gp.buttons[0].value : 0);
+        if (left){ if (down(4)){ spawnAt(spawnIdx + 1); flash('Start: ' + spawns[spawnIdx].name); } if (down(5)){ h.pprev = gp.buttons.map(b => b.pressed); stop(); return; } }
+        else { if (down(4)) ollie = true; if (down(5)){ spawnAt(spawnIdx); flash('Back to the start'); }
+          const ax = gp.axes[2] || 0; if (!h.pflick && Math.abs(ax) > 0.7){ h.pflick = 1; turn = Math.sign(ax); } else if (Math.abs(ax) < 0.3) h.pflick = 0; }
+      }
+      h.pprev = gp.buttons.map(b => b.pressed); h.prev = h.pprev.slice();
+    }
+    if (paused){ updateXRInput(dt); return; }
+    for (const h of hands){ h.tip.visible = h.stem.visible = h.beam.visible = h.brush.visible = false; if (h.rideBoard) h.rideBoard.visible = false; pointHint(h, null, h.hand === 'left'); }
+    menuMesh.visible = false;
+    if (!fb){ boardPose(dt); return; }
+    if (turn) skYaw -= turn * Math.PI / 6;
+    const mid = fb.front.clone().add(fb.back).multiplyScalar(0.5);
+    if (!hand.mid) hand.mid = mid.clone(); else hand.mid.lerp(mid, 1 - Math.exp(-dt * 30));
+    const hv = fb.front.clone().sub(fb.back), raw = Math.atan2(hv.y, Math.hypot(hv.x, hv.z));
+    if (hand.pitch0 === null) hand.pitch0 = raw;
+    if (sk.grounded && Math.abs(raw - hand.pitch0) < 0.2) hand.pitch0 += (raw - hand.pitch0) * (1 - Math.exp(-dt / 1.2));
+    let pitch = raw - hand.pitch0; const DZ = 0.13; pitch = Math.abs(pitch) < DZ ? 0 : pitch - Math.sign(pitch) * DZ;
+    const pr = hand.prevPitch === null ? 0 : (pitch - hand.prevPitch) / Math.max(dt, 1e-3); hand.prevPitch = pitch; hand.pitchRate = hand.pitchRate * 0.35 + pr * 0.65;
+    // lean: tip both hands toward your toes or heels (about the line between them) and the trucks carve that way.
+    // Small, slow tilts are your normal stance and get learned as level.
+    const xw = hv.clone().normalize(), sideW = new V3().crossVectors(xw, UP); if (sideW.lengthSq() > 1e-6){ sideW.normalize();
+      const leanRaw = Math.asin(clamp(handUp(fb, xw).dot(sideW), -1, 1)); if (hand.lean0 === null) hand.lean0 = leanRaw;
+      if (Math.abs(leanRaw - hand.lean0) < 0.1) hand.lean0 += (leanRaw - hand.lean0) * (1 - Math.exp(-dt / 3));
+      let lean = leanRaw - hand.lean0; const LZ = 0.07; lean = Math.abs(lean) < LZ ? 0 : lean - Math.sign(lean) * LZ;
+      // the trucks turn about half as far as the deck leans: curvature ≈ 2·sin(lean / 2) / wheelbase, and never tighter
+      // than the wheels can grip at this speed
+      if (S.playLean !== 0 && sk.grounded && lean){ const kap = 2 * Math.sin(clamp(lean, -0.6, 0.6) * 0.5) * 0.9 / (WHEELBASE * K), v = sk.V.dot(sk.F) * sk.hsign;
+        const wMax = 0.85 * P('grip') / 100 * 2.6 * P('gravity') * K / Math.max(Math.abs(v), 0.05 * K);
+        skYaw += clamp(kap * v, -wMax, wMax) * dt; } }       // the park turns round you, so the board carves while your feet stay put
+    _yawQ.setFromAxisAngle(UP, skYaw); const inv = _yawQ.clone().invert();
+    const heading = fb.front.clone().sub(fb.back).applyQuaternion(inv).normalize();
+    const air = !sk.grounded && !sk.grind; let airQ = null;
+    if (air){ if (!wasAir){ _hQ0.copy(handFrame(fb)); _bQ0.setFromRotationMatrix(boardBasis(sk.F, sk.Uair, _m4)).multiply(new THREE.Quaternion().setFromAxisAngle(new V3(0, 0, 1), sk.pitch)); }
+      const rel = handFrame(fb).multiply(_hQ0.clone().invert()); airQ = inv.clone().multiply(rel).multiply(_yawQ).multiply(_bQ0); }
+    wasAir = air;
+    const look = renderer.xr.getCamera().getWorldDirection(new V3()).applyQuaternion(inv);
+    stepSkate(dt, { heading, boost, ollie, airQ, look, flat: true, pitch, pitchRate: hand.pitchRate });
+    events(fb);
+    if (sk.grind && Math.random() < 0.5){ pulse(fb.L, 0.12, 12); pulse(fb.R, 0.12, 12); }
+    if (sk.grounded && sk.skid > 0.5 && Math.random() < 0.6){ const kk = Math.min(0.7, sk.skid / 6); pulse(fb.L, kk, 14); pulse(fb.R, kk, 14); }
+    if (boost > 0.05 && Math.random() < 0.15){ pulse(fb.L, 0.04 * boost, 8); pulse(fb.R, 0.04 * boost, 8); }
+    placeWorldUnderFeet(hand.mid, dt);
+  }
+  // ---- on a computer: W boost, A / D carve, S drag the tail, Space ollie, R back to the start, N next start, Esc stop
+  function updateDesk(dt){
+    const Kk = desk.keys, turn = (Kk.KeyA || Kk.ArrowLeft ? 1 : 0) - (Kk.KeyD || Kk.ArrowRight ? 1 : 0);
+    if (!paused){
+      const v = Math.abs(sk.V.dot(sk.F)) / K, rate = Math.min(2.8, 0.9 + v * 0.35);
+      if (turn) desk.heading.applyAxisAngle(sk.grounded || sk.grind ? sk.N : UP, turn * rate * dt).normalize();
+      if (sk.grounded) desk.heading.addScaledVector(sk.N, -desk.heading.dot(sk.N)).normalize();
+      stepSkate(dt, { heading: desk.heading.clone(), boost: Kk.KeyW || Kk.ArrowUp ? 1 : 0, brake: !!(Kk.KeyS || Kk.ArrowDown), ollie: desk.ollie, airQ: null, look: sk.F.clone().multiplyScalar(sk.bdir) });
+      desk.ollie = false; events(null);
+    }
+    world.position.set(0, 0, 0); world.quaternion.identity(); world.scale.setScalar(1); boardPose(paused ? 0 : dt);
+    const back = desk.heading.clone().setY(0); if (back.lengthSq() < 1e-6) back.set(1, 0, 0); back.normalize();
+    if (desk.freeze) return;
+    const want = sk.B.clone().addScaledVector(back, -2.3 * K).add(new V3(0, 0.8 * K, 0)), look = sk.B.clone().addScaledVector(back, 1.6 * K).add(new V3(0, 0.15 * K, 0));
+    // keep the camera out of the ground: if something is between the board and where it wants to be, come in closer
+    if (coll.bvh){ const from = sk.B.clone().addScaledVector(UP, 0.4 * K), d = want.clone().sub(from), L = d.length(); _ray.set(from, d.divideScalar(L)); const hit = coll.bvh.raycastFirst(_ray, THREE.DoubleSide);
+      if (hit && hit.distance < L) want.copy(from).addScaledVector(_ray.direction, Math.max(0.3 * K, hit.distance - 0.25 * K)); }
+    if (!desk.cam) desk.cam = want.clone(); desk.cam.lerp(want, 1 - Math.exp(-dt * 6));
+    camera.position.copy(desk.cam); camera.lookAt(look);
+  }
+  addEventListener('keydown', e => { if (!on || renderer.xr.isPresenting || (e.target.closest && e.target.closest('input,textarea'))) return; desk.keys[e.code] = true; audioInit();
+    if (e.code === 'Space'){ desk.ollie = true; e.preventDefault(); } if (e.code === 'KeyR') spawnAt(spawnIdx); if (e.code === 'KeyN'){ spawnAt(spawnIdx + 1); flash('Start: ' + spawns[spawnIdx].name); }
+    if (e.code === 'Escape') stop(); if (e.code === 'KeyP') setPaused(!paused); e.stopImmediatePropagation();
+    if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault(); }, true);
+  addEventListener('keyup', e => { desk.keys[e.code] = false; }, true);
+  function events(fb){
+    const buzz = (kk, ms) => { if (fb){ pulse(fb.L, kk, ms); pulse(fb.R, kk, ms); } };
+    for (const ev of sk.events.splice(0)){
+      if (ev === 'land'){ const kk = clamp(sk.impact / 5, 0.25, 1); buzz(0.5 + 0.5 * kk, 40); sfx('land', kk); sk.impact = 0; }
+      else if (ev === 'grind'){ buzz(0.6, 30); sfx('grind-on'); }
+      else if (ev === 'off-rail') sfx('clack', 0.8);
+      else if (ev === 'bail'){ flash('Bail!', 1); buzz(1, 120); sfx('bail'); }
+      else if (ev === 'ollie'){ buzz(0.4, 20); sfx('pop'); }
+    }
+  }
+
+  // ---- sound, all made live (from Subdeck): rolling, joints, grinding, the booster, wind, pops, landings
+  const AU = { ctx: null };
+  function audioInit(){
+    if (AU.ctx){ if (AU.ctx.state !== 'running') AU.ctx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    const Cx = new AC(); AU.ctx = Cx; AU.master = Cx.createGain(); const comp = Cx.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4;
+    AU.master.connect(comp); comp.connect(Cx.destination); AU.master.gain.value = S.playSound === 0 ? 0 : 0.9;
+    const nb = Cx.createBuffer(1, Cx.sampleRate * 2, Cx.sampleRate), d = nb.getChannelData(0); let b0 = 0; for (let i = 0; i < d.length; i++){ const w = Math.random() * 2 - 1; b0 = 0.97 * b0 + 0.03 * w; d[i] = w * 0.6 + b0 * 2.2; } AU.noise = nb;
+    const loop = (type, f, qq) => { const src = Cx.createBufferSource(); src.buffer = nb; src.loop = true; src.playbackRate.value = 0.8 + Math.random() * 0.4; const fl = Cx.createBiquadFilter(); fl.type = type; fl.frequency.value = f; fl.Q.value = qq; const g = Cx.createGain(); g.gain.value = 0; src.connect(fl); fl.connect(g); g.connect(AU.master); src.start(); return { fl, g }; };
+    AU.roll = loop('lowpass', 300, 0.8); AU.rollGrit = loop('bandpass', 2200, 1.4); AU.grind = loop('bandpass', 3400, 11); AU.grind2 = loop('bandpass', 1500, 7);
+    AU.boost = loop('lowpass', 700, 1); AU.boostHiss = loop('highpass', 4000, 0.6); AU.wind = loop('bandpass', 500, 0.7); AU.skid = loop('bandpass', 1100, 4); AU.skidLo = loop('lowpass', 380, 1);
+    const o = Cx.createOscillator(); o.type = 'sine'; o.frequency.value = 50; const of = Cx.createBiquadFilter(); of.type = 'lowpass'; of.frequency.value = 160; const og = Cx.createGain(); og.gain.value = 0; o.connect(of); of.connect(og); og.connect(AU.master); o.start(); AU.rumble = { o, g: og };
+  }
+  const to = (param, x, t = 0.04) => param.setTargetAtTime(x, AU.ctx.currentTime, t);
+  let jointKey = '', jointT = 0;
+  function audioUpdate(dt){
+    if (!AU.ctx || !AU.roll) return;
+    const live = on && !paused && sk.bail <= 0, sp = sk.V.length() / K, roll = live && sk.grounded ? Math.min(1, sp / 9) : 0;
+    to(AU.roll.g.gain, roll * 0.7); to(AU.roll.fl.frequency, 120 + sp * 55); to(AU.rollGrit.g.gain, roll * roll * 0.1); to(AU.rollGrit.fl.frequency, 1400 + sp * 160);
+    const gr = live && sk.grind ? Math.min(1, 0.35 + Math.abs(sk.grind.sp) / K / 7) : 0;
+    to(AU.grind.g.gain, gr * (0.25 + 0.2 * Math.random()), 0.015); to(AU.grind.fl.frequency, 2900 + Math.random() * 1400, 0.02); to(AU.grind2.g.gain, gr * 0.3, 0.03);
+    const bo = live ? sk.boost : 0; to(AU.boost.g.gain, bo * 0.16, 0.12); to(AU.boost.fl.frequency, 380 + bo * 260, 0.12); to(AU.boostHiss.g.gain, bo * 0.008, 0.12); to(AU.rumble.g.gain, bo * 0.07, 0.15); to(AU.rumble.o.frequency, 46 + bo * 8, 0.2);
+    const sl = live && sk.grounded ? Math.min(1, Math.max(0, sk.skid - 0.25) / 4 + (sk.tailDrag && sp > 0.4 ? 0.35 + sp / 25 : 0)) : 0;
+    to(AU.skid.g.gain, sl * (0.35 + 0.15 * Math.random()), 0.02); to(AU.skid.fl.frequency, 800 + sl * 900 + Math.random() * 300, 0.02); to(AU.skidLo.g.gain, sl * 0.5, 0.03);
+    const air = live && !sk.grounded && !sk.grind ? Math.min(1, sp / 12) : 0; to(AU.wind.g.gain, air * 0.3, 0.1); to(AU.wind.fl.frequency, 250 + sp * 60);
+    jointT -= dt;
+    if (live && sk.grounded && sp > 0.6){ const c = 1.6 * K, key = Math.floor(sk.B.x / c) + ',' + Math.floor(sk.B.z / c);
+      if (key !== jointKey && jointT <= 0){ const kk = Math.min(1, sp / 8); sfx('clack', kk); setTimeout(() => sfx('clack', kk * 0.8), 460 / sp); jointT = 0.07; } jointKey = key; }
+  }
+  function sfx(name, kk = 1){
+    if (!AU.ctx || S.playSound === 0) return; const Cx = AU.ctx, t = Cx.currentTime;
+    const burst = (type, f, qq, dur, gain, delay = 0) => { const s = Cx.createBufferSource(); s.buffer = AU.noise; const fl = Cx.createBiquadFilter(); fl.type = type; fl.frequency.value = f; fl.Q.value = qq;
+      const g = Cx.createGain(); g.gain.setValueAtTime(Math.max(gain, 0.0002), t + delay); g.gain.exponentialRampToValueAtTime(0.0001, t + delay + dur); s.connect(fl); fl.connect(g); g.connect(AU.master); s.start(t + delay, Math.random()); s.stop(t + delay + dur + 0.05); };
+    const thump = (f0, f1, dur, gain, delay = 0, type = 'sine') => { const o = Cx.createOscillator(); o.type = type; o.frequency.setValueAtTime(f0, t + delay); o.frequency.exponentialRampToValueAtTime(f1, t + delay + dur);
+      const g = Cx.createGain(); g.gain.setValueAtTime(Math.max(gain, 0.0002), t + delay); g.gain.exponentialRampToValueAtTime(0.0001, t + delay + dur); o.connect(g); g.connect(AU.master); o.start(t + delay); o.stop(t + delay + dur + 0.05); };
+    if (name === 'pop'){ burst('highpass', 1600, 0.8, 0.06, 0.9); thump(210, 70, 0.08, 0.7); burst('bandpass', 850, 4, 0.05, 0.5, 0.012); }
+    else if (name === 'land'){ thump(120, 38, 0.2, 0.5 + 0.6 * kk); burst('lowpass', 600, 0.7, 0.14, 0.3 + 0.6 * kk); burst('bandpass', 2400, 2, 0.05, 0.25 * kk, 0.015); }
+    else if (name === 'grind-on'){ burst('bandpass', 3800, 7, 0.14, 0.7); thump(340, 210, 0.07, 0.35, 0, 'triangle'); }
+    else if (name === 'bail'){ thump(95, 30, 0.4, 1); burst('lowpass', 450, 0.6, 0.45, 1); for (let i = 0; i < 5; i++) burst('bandpass', 1000 + Math.random() * 1800, 4, 0.06, 0.55, 0.07 + i * 0.08 + Math.random() * 0.04); }
+    else if (name === 'clack'){ burst('bandpass', 1300 + Math.random() * 500, 3, 0.03, 0.3 * kk); thump(170, 90, 0.04, 0.18 * kk); }
+  }
+  function setSound(){ if (AU.master) AU.master.gain.setTargetAtTime(S.playSound === 0 ? 0 : 0.9, AU.ctx.currentTime, 0.05); }
+
+  // ---- starting and stopping
+  const HIDE = () => [parkGrid, handleMesh, foldGlyphs, cageEdG, panelGroup, waffleGroup, labelGroup, runsGroup, ...lineMeshes, wireLines, fineLines, creaseLines, foundGroup, hiMesh].filter(Boolean);
+  async function start(){
+    if (on) return;
+    if (!surfMesh) return flash('Build a surface first (step 3), then skate it here');
+    if (cageEditing) stopCageEdit(true);
+    audioInit();
+    if (!MeshBVH){ flash('Getting the park ready…'); try { ({ MeshBVH } = await import('three-mesh-bvh')); } catch (e){ return flash('Couldn\'t load the physics (' + e.message + '). Check the connection and try again.'); } }
+    K = kOf();
+    const view = (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldPosition(new V3());
+    world.updateMatrixWorld();
+    saved = { p: world.position.clone(), q: world.quaternion.clone(), s: world.scale.x, cam: camera.position.clone(), tgt: orbit.target.clone(), vis: HIDE().map(o => [o, o.visible]), viewPark: world.worldToLocal(view.clone()) };
+    try { buildWorld(); makeSpawns(); } catch (e){ errLog.push({ t: Date.now(), msg: String(e.message), at: 'play' }); saved = null; return flash('Couldn\'t set up the park for skating (' + e.message + ')'); }
+    for (const [o] of saved.vis) o.visible = false;
+    if (!boardM) makePlayBoard();
+    on = true; paused = false; G.visible = true; orbit.enabled = false;
+    spawnAt(0);
+    if (renderer.xr.isPresenting){ setMenuShown(false); for (const h of hands){ if (h.act){ try { toolUp(h.i, h.act); } catch (e){} h.act = null; } h.grab = false; h.ctrlGrip = false; } grabReset(); }
+    menuDirty = true;
+    flash((renderer.xr.isPresenting ? 'Skating · trigger boosts, lean to carve, A ollies, left stick press pauses, Y stops' : 'Skating · W boost, A / D carve, Space ollie, S drag, R restart, Esc stop') + ' · ' + lines.length + ' seams to grind', 7);
+  }
+  function stop(){
+    if (!on) return; on = false; paused = false; G.visible = false; orbit.enabled = true;
+    if (saved){ world.position.copy(saved.p); world.quaternion.copy(saved.q); world.scale.setScalar(saved.s); for (const [o, v] of saved.vis) o.visible = v;
+      if (!renderer.xr.isPresenting){ camera.position.copy(saved.cam); orbit.target.copy(saved.tgt); orbit.update(); } }
+    saved = null; for (const h of hands) h.pprev = null;
+    try { applySurfView(); applyRunsView(); showPanelLabels(); waffleGroup.visible = menuTab === 'fab'; } catch (e){}
+    setMenuShown(true); linesDirty = true; menuDirty = true; audioUpdate(0); flash('Stopped skating');
+  }
+  function setPaused(v){ paused = v; if (renderer.xr.isPresenting) setMenuShown(v); menuDirty = true; flash(v ? 'Paused · left stick press to go on' : 'Go'); }
+  function update(dt){ if (!on) return; if (renderer.xr.isPresenting) updateXR(dt); else updateDesk(dt); audioUpdate(dt); }
+  function rebuild(){ builtFor = null; if (on){ K = kOf(); buildWorld(); spawnAt(spawnIdx); } }
+  // a check for the tests: drop onto the middle of the longest seam moving along it, and see if it grinds
+  function grindTest(){ if (!lines.length) return 'no seams'; const L = lines.reduce((a, b) => a.poly.length > b.poly.length ? a : b), m = L.poly.length >> 1, a = L.poly[m - 1], b = L.poly[m], T = b.clone().sub(a).normalize();
+    sk.B.copy(a).addScaledVector(railUp(T), BOARD_R * K * 1.5); sk.V.copy(T).multiplyScalar(4 * K).addScaledVector(UP, -0.5 * K); sk.F.copy(T); sk.grounded = false; sk.grind = null; sk.sinceOllie = 0.3; sk.leave = 0; sk.air = 0.3; sk.Uair.copy(UP);
+    const log = []; for (let i = 0; i < 40; i++){ stepSkate(1 / 60, { boost: 0, look: T }); if (i % 8 === 0) log.push((sk.grind ? 'G' : sk.grounded ? 'R' : 'A') + sk.B.distanceTo(a).toFixed(2)); }
+    return { pts: L.poly.length, len: L.poly.reduce((t, p, i) => i ? t + p.distanceTo(L.poly[i - 1]) : 0, 0).toFixed(2), log, grind: !!sk.grind }; }
+  return { start, stop, update, rebuild, grindTest, _xr: updateXR, setPaused, setSound, makePlayBoard, get on(){ return on; }, get paused(){ return paused; }, get seams(){ return lines.length; }, get sk(){ return sk; }, get spawns(){ return spawns; }, spawnAt, get K(){ return K; }, desk, stepSkate, get coll(){ return coll; } };
+})();
+
 // The menu is laid out as the steps you work through: 1 Ride, 2 Sketch, 3 Surface, 4 SubD, 5 Fab, 6 Files.
 // The step you're on decides what your buttons do and what the panel shows: a few controls you'll actually touch,
 // with the rest behind More. Undo, Redo, Save and the show / hide switches sit above the steps, on every step.
 // Blocks flow down the page, so anything hidden (by More or because it doesn't apply yet) closes up.
-const STEPS = ['ride', 'sketch', 'surface', 'shape', 'fab', 'files'];
-const STEP_NAME = { ride: 'Ride', sketch: 'Sketch', surface: 'Surface', shape: 'SubD', fab: 'Fab', files: 'Files', settings: 'Settings' };
-const RAIL = ['ride', 'sketch', 'surface', 'shape', 'fab', 'files', 'settings'];
-const STEP_SUB = { settings: 'the same on every step', ride: 'record runs', sketch: 'draw terrain', surface: 'build it', shape: 'clean up the SubD', fab: 'panels to build it', files: 'save and export' };
+const STEPS = ['ride', 'sketch', 'surface', 'shape', 'fab', 'files', 'play'];
+const STEP_NAME = { ride: 'Ride', sketch: 'Sketch', surface: 'Surface', shape: 'SubD', fab: 'Fab', files: 'Files', play: 'Play', settings: 'Settings' };
+const RAIL = ['ride', 'sketch', 'surface', 'shape', 'fab', 'files', 'play', 'settings'];
+const STEP_SUB = { settings: 'the same on every step', ride: 'record runs', sketch: 'draw terrain', surface: 'build it', shape: 'clean up the SubD', fab: 'panels to build it', files: 'save and export', play: 'skate it' };
 const BLOCKS = [], CONTENT_TOP = 196, flowBottom = {};
-const STEP_COL = { ride: '#FF6B3D', sketch: '#4FC3FF', surface: '#FF8A1F', shape: '#FFD23F', fab: '#5FE0B8', files: '#B48CFF', settings: '#C9CED6' };
+const STEP_COL = { ride: '#FF6B3D', sketch: '#4FC3FF', surface: '#FF8A1F', shape: '#FFD23F', fab: '#5FE0B8', files: '#B48CFF', play: '#FF3D7F', settings: '#C9CED6' };
 const SKETCH_TOOLS = TOOLS.filter(t => t !== 'ride');
 // leaving or entering a step does what that step needs: Ride holds the board, Shape opens the cage
 function setStep(st, quiet){
   const was = menuTab; if (st === was && st !== 'settings'){ menuShown || setMenuShown(true); return; }
   if (was === 'shape' && st !== 'shape' && st !== 'settings' && cageEditing) stopCageEdit(true);
+  if (PLAY.on && st !== 'play' && st !== 'settings') PLAY.stop();
   menuTab = st; if (st !== 'settings') S.step = st;
   if (st === 'ride'){ if (S.tool !== 'ride') S.sketchTool = S.tool; S.tool = 'ride'; rideScale(); }
   else if (st !== 'settings' && S.tool === 'ride') S.tool = SKETCH_TOOLS.includes(S.sketchTool) ? S.sketchTool : 'draw';
@@ -3004,12 +3577,14 @@ function setStep(st, quiet){
   add({ id: 'settings', x: MW - P - 160 - G - 160, y: 22, w: 160, h: 60, style: 'lock', vis: () => !updateTo, label: () => 'Settings', on: () => menuTab === 'settings', act: () => setStep(menuTab === 'settings' ? (S.step || 'sketch') : 'settings') });
   add({ id: 'room', x: MW - P - 160, y: 22, w: 160, h: 60, style: 'lock', label: () => S.bg === 'pass' && inAR() ? 'Room: on' : 'Room: off', on: () => S.bg === 'pass' && inAR(), act: toggleRoom });
   const bar = [
-    { id: 'undo', label: () => 'Undo', sub: () => mainHand() === 'right' ? 'X' : 'A', act: () => cageEditing ? cageUndo() : undo() },
-    { id: 'redo', label: () => canGoBack() ? 'Last good' : 'Redo', sub: () => { const y = mainHand() === 'right' ? 'Y' : 'B'; return canGoBack() ? y + ' · back' : y; }, style: 'lock', on: () => canGoBack(), act: () => cageEditing ? cageRedo() : canGoBack() ? backToGood() : redo() },
+    { id: 'undo', arrow: -1, label: () => 'Undo', sub: () => mainHand() === 'right' ? 'X' : 'A', act: () => cageEditing ? cageUndo() : undo() },
+    { id: 'redo', arrow: 1, label: () => canGoBack() ? 'Last good' : 'Redo', sub: () => { const y = mainHand() === 'right' ? 'Y' : 'B'; return canGoBack() ? y + ' · back' : y; }, style: 'lock', on: () => canGoBack(), act: () => cageEditing ? cageRedo() : canGoBack() ? backToGood() : redo() },
     { id: 'lines', label: () => 'Lines', sub: () => S.lines === 'hide' ? 'hidden' : 'showing', on: () => S.lines !== 'hide', act: toggleLines },
     { id: 'surface', label: () => 'Surface', sub: () => S.surf === 'hide' ? 'off' : 'on', on: () => S.surf !== 'hide', act: toggleSurface },
     { id: 'runs-show', label: () => 'Runs', sub: () => !runs.length ? 'none yet' : S.runsShow ? 'showing' : 'hidden', on: () => runs.length > 0 && !!S.runsShow, act: () => { if (!runs.length) return flash('No runs yet: step 1, Ride, records them'); S.runsShow = S.runsShow ? 0 : 1; applyRunsView(); scheduleSave(); } }];
-  { const w = (MW - 2 * P - 10 * (bar.length - 1)) / bar.length; bar.forEach((b, i) => add(Object.assign({ x: P + i * (w + 10), y: 96, w, h: 76, quiet: true }, b))); }
+  // Undo and Redo are arrows on their own at the left; the show / hide switches sit apart from them, to the right
+  { const aw = 196, gapA = 12, gapB = 40, x0 = P + 2 * aw + gapA + gapB, w = (MW - P - x0 - 10 * 2) / 3;
+    bar.forEach((b, i) => add(Object.assign(i < 2 ? { x: P + i * (aw + gapA), y: 96, w: aw, h: 76 } : { x: x0 + (i - 2) * (w + 10), y: 96, w, h: 76, quiet: true }, b))); }
   // the steps themselves live on the tiles beside the menu (STEP RAIL below); these are their buttons
   [...STEPS, 'settings'].forEach(st => add({ id: 'step-' + st, railOnly: true, x: 0, y: 0, w: 0, h: 0, label: () => STEP_NAME[st], on: () => menuTab === st, act: () => setStep(st === 'settings' && menuTab === 'settings' ? (S.step || 'sketch') : st) }));
 
@@ -3089,15 +3664,15 @@ function setStep(st, quiet){
     { id: 'onsurf', label: () => ['On surface: off', 'On surface: guides', 'On surface: all'][S.onSurf || 0], sub: () => S.onSurf ? 'lines land on it' : 'draw in the air', on: () => !!S.onSurf,
       act: () => { S.onSurf = ((S.onSurf || 0) + 1) % 3; scheduleSave(); flash(['Lines are drawn in the air where your pen is', 'Guides land on the surface as you draw them', 'Every line lands on the surface as you draw it'][S.onSurf]); } },
     { id: 'clear', label: () => clearArmed > 0 ? 'Press again' : 'Clear all lines', sub: () => 'undo brings it back', style: 'danger', act: clearAll }]);
-  section('sketch', 'DRAWING', MORE);
-  stepper('sketch', 72, 'Line smoothing', () => String(S.smooth), () => setSmooth(Math.max(0, S.smooth - 1)), () => setSmooth(Math.min(10, S.smooth + 1)), MORE);
-  modelSize('sketch', MORE);
-  section('sketch', 'LAYERS · TAP: SHOWN → LOCKED → HIDDEN', MORE);
+  section('sketch', 'LAYERS · TAP: SHOWN → LOCKED → HIDDEN');
   const layerState = t => !S.show[t] ? 'hidden' : S.lock[t] ? 'locked' : 'shown';
   const cycleLayer = t => { const st = layerState(t); if (st === 'shown'){ S.lock[t] = 1; } else if (st === 'locked'){ S.lock[t] = 0; S.show[t] = 0; } else { S.show[t] = 1; S.lock[t] = 0; }
     if (t === 1){ S.show[2] = S.show[1]; S.lock[2] = S.lock[1]; } applySurfView(); rebuildHandles(); hiKey = '#'; setHighlight([]); scheduleSave();
     flash(TAG_NAME[t] + ': ' + { shown: 'shown and editable', locked: 'locked, safe from erasing and bending', hidden: 'hidden (still shapes the surface)' }[layerState(t)]); };
-  for (const grp of [VT.slice(0, 3), VT.slice(3)]) row('sketch', 88, grp.map(t => ({ id: 'layer-' + t, label: () => TAG_NAME[t], sub: () => layerState(t), swatch: t, style: 'lock', on: () => layerState(t) === 'locked', dim: () => layerState(t) === 'hidden', act: () => cycleLayer(t) })), { ...MORE, gap: 10 });
+  for (const grp of [VT.slice(0, 3), VT.slice(3)]) row('sketch', 88, grp.map(t => ({ id: 'layer-' + t, label: () => TAG_NAME[t], sub: () => layerState(t), swatch: t, style: 'lock', on: () => layerState(t) === 'locked', dim: () => layerState(t) === 'hidden', act: () => cycleLayer(t) })), { gap: 10 });
+  section('sketch', 'DRAWING', MORE);
+  stepper('sketch', 72, 'Line smoothing', () => String(S.smooth), () => setSmooth(Math.max(0, S.smooth - 1)), () => setSmooth(Math.min(10, S.smooth + 1)), MORE);
+  modelSize('sketch', MORE);
   { const h = 72, bw = 170; blk('sketch', h, [
     text({ kind: 'panel', x: P, y: 0, w: W, h }), text({ kind: 'layer', x: P + 22, y: h / 2, tag: 'paint', text: () => 'Smooth paint' }),
     add({ id: 'paint-show', x: MW - P - 2 * bw - G - 8, y: 8, w: bw, h: h - 16, label: () => S.paintShow ? 'Showing' : 'Hidden', on: () => !!S.paintShow, act: () => { S.paintShow = S.paintShow ? 0 : 1; paintTint(); scheduleSave(); } }),
@@ -3245,6 +3820,27 @@ function setStep(st, quiet){
     { id: 'report', label: () => 'Problem report', sub: () => 'a file for Claude', act: problemReport }], MORE);
   endSection('files'); more('files');
 
+  // ===== 7 PLAY
+  head('play');
+  section('play', 'SKATE YOUR PARK');
+  row('play', 110, [{ id: 'play-go', style: 'big', label: () => PLAY.on ? 'STOP' : 'SKATE', sub: () => PLAY.on ? (PLAY.paused ? 'paused' : 'skating · ' + PLAY.seams + ' seams to grind') : hasSurface() ? 'ride it with physics' : 'build a surface first',
+    act: () => PLAY.on ? PLAY.stop() : PLAY.start() }]);
+  row('play', 64, [{ id: 'play-on', label: () => 'Keep going', sub: () => 'left stick press', vis: () => PLAY.on && PLAY.paused, act: () => PLAY.setPaused(false) }], { vis: () => PLAY.on && PLAY.paused });
+  note('play', () => renderer.xr.isPresenting || !PLAY.on ? 'Hands are your feet. Trigger boosts toward where you look · lean both hands toward toes or heels to carve · A (or snap the tail down) ollies · drop onto a sharp seam to grind · B back to the start, X the next start · left stick press pauses, Y stops.'
+    : 'W boost · A / D carve · S drag the tail · Space ollie · R back to the start · N next start · P pause · Esc stop.');
+  section('play', 'BOARD SIZE');
+  row('play', 72, PLAY_SIZES.map((n, i) => ({ id: 'play-size-' + i, label: () => playSizeName(i), on: () => (S.playSize ?? 0) === i, act: () => { S.playSize = i; scheduleSave(); PLAY.rebuild(); flash(i ? 'A fingerboard on your park built at 1:' + n + ' (feels like a board ' + (0.096 * n / 0.813).toFixed(1) + '× real size)' : 'A real board on the park at full size'); } })), { gap: 10 });
+  note('play', 'Real board: the park at full size. 1:N: a fingerboard on the park built at 1:N, so you can feel how the model will ride.');
+  section('play', 'FEEL', MORE);
+  const pstep = (key, name, fmt) => stepper('play', 64, name, () => fmt(S['play_' + key] ?? PLAY_DEF[key]), () => { S['play_' + key] = stepIn(PLAY_STEPS[key], S['play_' + key] ?? PLAY_DEF[key], -1); scheduleSave(); }, () => { S['play_' + key] = stepIn(PLAY_STEPS[key], S['play_' + key] ?? PLAY_DEF[key], 1); scheduleSave(); }, MORE);
+  pstep('booster', 'Booster', v => v + ' m/s²'); pstep('top', 'Top speed', v => v + ' m/s'); pstep('grip', 'Grip', v => String(v)); pstep('pop', 'Ollie pop', v => v + ' m/s'); pstep('friction', 'Rolling drag', v => String(v));
+  row('play', 72, [
+    { id: 'play-lean', label: () => S.playLean === 0 ? 'Lean: off' : 'Lean carves', on: () => S.playLean !== 0, act: () => { S.playLean = S.playLean === 0 ? 1 : 0; scheduleSave(); } },
+    { id: 'play-auto', label: () => S.playAutoGrind === 0 ? 'Auto grind: off' : 'Auto grind', on: () => S.playAutoGrind !== 0, act: () => { S.playAutoGrind = S.playAutoGrind === 0 ? 1 : 0; scheduleSave(); } },
+    { id: 'play-sound', label: () => S.playSound === 0 ? 'Sound: off' : 'Sound', on: () => S.playSound !== 0, act: () => { S.playSound = S.playSound === 0 ? 1 : 0; PLAY.setSound(); scheduleSave(); } },
+    { id: 'play-board', label: () => 'Board look', act: () => { S.playColor = ((S.playColor || 0) + 1) % RUN_COLORS.length; PLAY.makePlayBoard(); scheduleSave(); } }], { ...MORE, gap: 10 });
+  endSection('play'); more('play');
+
   // ===== SETTINGS (the button in the title bar)
   head('settings');
   section('settings', 'HANDS · THE OTHER HAND HOLDS THE MENU');
@@ -3315,6 +3911,12 @@ const TIP_PAGES = {
     'Save flat panels OBJ gives each panel as one flat quad (its corners laid on its own best plane), ready to cut; the name of each says how much it bows.',
     'For bigger panels everywhere, build with fewer Target quads (step 3).',
     'Hexes: one size all over, straight edges between the points where three panels meet, each laid on its own plane. Creases are seams unless you let them cross.']],
+  play: ['7 · PLAY: SKATE IT', [
+    'Press SKATE. Your hands are your feet on a real-size board; the park grows round you (or pick 1:10 to 1:25 to ride a fingerboard on the model you\'ll build).',
+    'Trigger is the booster, pushing toward where you look. Lean both hands toward your toes or heels to carve; turn your body to turn too.',
+    'Sharp seams are coping: ollie onto one (A, or snap the tail down) and you grind it.',
+    'Past the edge of your surface it carries on and flattens into a big plain (the blue-grey part), so you roll off and back on without catching.',
+    'Left stick press pauses and shows this menu. Y stops. B goes back to the start, X to the next start (the edge nearest you, then where each run starts).']],
   files: ['6 · FILES: SAVE AND EXPORT', [
     'Save (top of the menu) keeps your sketch here in this browser with a picture; your current work is always kept too. Name a sketch from its row.',
     'Save OBJ: the quad surface and its crease lines, for Rhino (ToSubD, then ToNURBS) or Blender.',
@@ -3439,6 +4041,18 @@ function drawMenu(){
   for (const t of TXT) if (visibleEl(t) && t.kind === 'panel'){ rr2(g, t.x, t.y, t.w, t.h, 20); g.fillStyle = '#2C3037'; g.fill(); }
   const drawBtn = b => {
     const on = b.on && b.on(), hot = menuHover === b, pr = menuPressed === b; g.globalAlpha = b.dim && b.dim() ? 0.45 : 1;
+    if (b.arrow){
+      // an arrow-shaped button: the point on the side it goes (back for Undo, forward for Redo)
+      const tip = 38, path = () => { g.beginPath(); const L = b.x, Rr = b.x + b.w, T = b.y, Bt = b.y + b.h, M = b.y + b.h / 2;
+        if (b.arrow < 0){ g.moveTo(L, M); g.lineTo(L + tip, T); g.lineTo(Rr - 14, T); g.quadraticCurveTo(Rr, T, Rr, T + 14); g.lineTo(Rr, Bt - 14); g.quadraticCurveTo(Rr, Bt, Rr - 14, Bt); g.lineTo(L + tip, Bt); }
+        else { g.moveTo(Rr, M); g.lineTo(Rr - tip, T); g.lineTo(L + 14, T); g.quadraticCurveTo(L, T, L, T + 14); g.lineTo(L, Bt - 14); g.quadraticCurveTo(L, Bt, L + 14, Bt); g.lineTo(Rr - tip, Bt); }
+        g.closePath(); };
+      path(); g.fillStyle = on ? '#FFD23F' : hot ? '#4D7DFF' : '#2F5FE0'; g.fill();
+      if (hot){ path(); g.lineWidth = 6; g.strokeStyle = '#FF8A1F'; g.stroke(); } if (pr){ path(); g.fillStyle = 'rgba(255,255,255,.25)'; g.fill(); }
+      const cx = b.x + b.w / 2 + (b.arrow < 0 ? tip / 3 : -tip / 3), cy = b.y + b.h / 2; g.textAlign = 'center'; g.fillStyle = on ? '#17191D' : '#ffffff';
+      g.font = '700 30px "Archivo",sans-serif'; g.fillText(b.label(), cx, cy - 12); g.font = '500 22px "IBM Plex Mono",monospace'; g.fillStyle = on ? '#4A4F59' : '#C9D6FF'; g.fillText(b.sub(), cx, cy + 22);
+      g.globalAlpha = 1; return;
+    }
     rr2(g, b.x, b.y, b.w, b.h, b.style === 'step' ? 14 : 22);
     g.fillStyle = b.style === 'big' ? '#FF8A1F' : b.style === 'danger' ? (hot ? '#F04348' : '#B3262B') : on && b.style === 'lock' ? '#FFD23F' : on ? '#EEF0F3' : b.style === 'step' ? (hot ? '#4A4F59' : '#3A3F48') : b.quiet ? (hot ? '#33373F' : '#272A30') : hot ? '#454B55' : '#353A42';
     g.fill();
@@ -3503,6 +4117,7 @@ function drawMenu(){
     const l1 = st === 'ride' ? (rideTool() === 'points' ? 'trigger a white point: drag it · the path bends with it' : rideTool() === 'smooth' ? 'hold the trigger and sweep along a path · stick ↑↓: sphere size' : `hold ${a}: record · trigger: flip · ${b}: refit · grip a path: move`)
       : st === 'shape' ? (cageTool() === 'cgrab' ? `grip: grab · grip + trigger: extrude · grip + ${a}: delete · ${b}: crease` : `trigger: ${CAGE_NAME[cageTool()]} · hold ${a}: point tools · hold ${b}: steps`)
       : st === 'sketch' ? `trigger: ${TOOL_NAME[S.tool] || 'tool'} · hold ${a}: tools · hold ${b}: line types`
+      : st === 'play' ? (PLAY.on ? 'skating: left stick press goes on · Y stops' : 'press SKATE · grip: move the model')
       : `trigger: ${TOOL_NAME[S.tool] || 'tool'} · hold ${a}: tools · hold ${b}: steps`;
     g.fillText(l1, 44, fy + 78); g.fillText(`other hand: trigger menu, hold for steps · ${u}: undo/redo`, 44, fy + 112); }
   menuTex.needsUpdate = true; drawRail(); drawDeskRail();
@@ -3636,14 +4251,19 @@ function placeMenuHand(){ if (S.menuPinned || hands.some(h => h.menuGrab)) retur
 function dockMenu(){ S.menuPinned = 0; hands.forEach(h => h.menuGrab = false); const off = hands.find(isOff); if (!off) return; off.grip.add(menuMesh);
   menuMesh.rotation.set(MENU_TILT, 0, 0); menuMesh.scale.x = 1; placeMenuMesh(MENU_H * menuCropH / MH); menuDirty = true; flash('Menu back on your hand'); }
 const menuDocked = () => hands.some(h => isOff(h) && menuMesh.parent === h.grip);
-// the undo button on the controller: red, with a back arrow (redo gets a small forward arrow)
+// the undo and redo buttons on the controller: bold curved arrows standing on the buttons (undo red, pointing back;
+// redo blue, pointing forward)
 function arrowSprite(back, red){
   const c = document.createElement('canvas'); c.width = c.height = 128; const g = c.getContext('2d');
-  g.beginPath(); g.arc(64, 64, 60, 0, 7); g.fillStyle = red ? '#F04348' : '#383D46'; g.fill();
-  g.strokeStyle = '#ffffff'; g.lineWidth = 13; g.lineCap = g.lineJoin = 'round'; g.save(); if (!back){ g.translate(128, 0); g.scale(-1, 1); }
-  g.beginPath(); g.arc(68, 70, 26, Math.PI * 1.05, Math.PI * 0.45, true); g.stroke(); g.beginPath(); g.moveTo(30, 40); g.lineTo(40, 66); g.lineTo(62, 52); g.stroke(); g.restore();
+  g.save(); if (!back){ g.translate(128, 0); g.scale(-1, 1); }
+  const arc = () => { g.beginPath(); g.arc(70, 76, 33, Math.PI * 0.12, Math.PI * 1.0, true); };
+  const head = () => { g.beginPath(); g.moveTo(9, 70); g.lineTo(65, 70); g.lineTo(37, 112); g.closePath(); };
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  arc(); g.lineWidth = 32; g.strokeStyle = '#111317'; g.stroke(); head(); g.lineWidth = 10; g.stroke(); g.fillStyle = '#111317'; g.fill();
+  const col = red ? '#FF4A50' : '#4D7DFF'; arc(); g.lineWidth = 20; g.strokeStyle = col; g.stroke(); head(); g.fillStyle = col; g.fill();
+  g.restore();
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true })); sp.scale.set(0.011, 0.011, 1); sp.renderOrder = 15; return sp;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true })); sp.scale.set(0.016, 0.016, 1); sp.renderOrder = 15; return sp;
 }
 function decorateButtons(h){
   if (h.decor || !h.model || !h.hand) return; const mc = h.model.motionController; if (!mc || !h.model.children.length) return;
@@ -3654,7 +4274,7 @@ function decorateButtons(h){
     if (i === 0) root.traverse(o => { if (o.isMesh && o.material){ o.material = o.material.clone(); if (o.material.color) o.material.color.set(0xF04348); if (o.material.emissive) o.material.emissive.set(0x3A0A0B); } });
     h.grip.updateMatrixWorld(true); const b = new THREE.Box3().setFromObject(root); if (b.isEmpty()) return;
     const cw = b.getCenter(new V3()); cw.y = b.max.y; const local = h.grip.worldToLocal(cw.clone());
-    const sp = arrowSprite(i === 0, i === 0); sp.position.copy(local).add(new V3(0, 0.006, 0)); if (i) sp.scale.multiplyScalar(0.75); h.grip.add(sp); h.decorObjs.push(sp); });
+    const sp = arrowSprite(i === 0, i === 0); sp.position.copy(local).add(new V3(0, 0.009, 0)); if (i) sp.scale.multiplyScalar(0.85); h.grip.add(sp); h.decorObjs.push(sp); });
 }
 function pulse(h, k = 0.4, ms = 18){ try { h.source?.gamepad?.hapticActuators?.[0]?.pulse(k, ms); } catch (e) {} }
 function penWorld(h){ h.ray.getWorldPosition(_o); h.ray.getWorldQuaternion(_q); _dir.set(0, 0, -1).applyQuaternion(_q); return _tw.copy(_o).addScaledVector(_dir, PEN).clone(); }
@@ -3754,6 +4374,8 @@ function drawIcon(g, name, x, y, size, col){
     else if (name === 'ccut'){ L(0, -13, 2, 15); g.beginPath(); g.arc(0, -13, 5, 0, 7); g.fill(); g.beginPath(); g.arc(2, 15, 5, 0, 7); g.fill(); } }
   else if (name === 'shape'){ L(-18, 14, -18, -10, 4, -18, 18, -4, 18, 16, -18, 14); for (const [a, b] of [[-18, -10], [4, -18], [18, -4], [18, 16], [-18, 14]]){ g.beginPath(); g.arc(a, b, 4.5, 0, 7); g.fill(); } }
   else if (name === 'fab'){ for (const dy of [-12, 0, 12]){ g.strokeRect(-18, dy - 4, 36, 8); } }
+  else if (name === 'play'){ B(() => { g.moveTo(-22, 18); g.lineTo(2, 18); g.quadraticCurveTo(20, 18, 20, -2); g.lineTo(20, -18); });
+    g.save(); g.translate(-6, 4); g.rotate(-0.12); L(-13, 0, 13, 0); L(-13, 0, -16, -4); L(13, 0, 16, -4); for (const wx of [-8, 8]){ g.beginPath(); g.arc(wx, 6, 3.4, 0, 7); g.fill(); } g.restore(); }
   else if (name === 'settings'){ g.beginPath(); g.arc(0, 0, 9, 0, 7); g.stroke(); for (let k = 0; k < 8; k++){ const a = k * Math.PI / 4; L(Math.cos(a) * 13, Math.sin(a) * 13, Math.cos(a) * 19, Math.sin(a) * 19); } }
   else if (name === 'ride'){ L(-22, -6, -18, 0, 18, 0, 22, -6); for (const x of [-11, 11]){ g.beginPath(); g.arc(x, 8, 5, 0, 7); g.fill(); } B(() => { g.moveTo(-22, 20); g.quadraticCurveTo(0, 12, 22, 20); }); }
   else if (name === 'bend'){ B(() => { g.moveTo(-22, 16); g.quadraticCurveTo(0, -26, 22, 16); }); L(0, -2, 0, -20); L(-7, -13, 0, -20, 7, -13); }
@@ -3877,7 +4499,7 @@ function updateXRInput(dt){
     h.tip.material.color.setHex(S.tool === 'cut' || S.tool === 'erase' ? 0xF04348 : S.tool === 'smooth' ? 0x5FE0B8 : S.tool === 'bend' || S.tool === 'flatten' ? 0xFFD23F : TAG_COL[S.tag]);
     if (S.tool === 'flatten' && (mHit || h.grab)) showSense(null);
     // grip (middle finger) near a control point grabs it; near a strict line between points, adds one there
-    const canPts = !mHit && !h.grab && !h.act && !myDial && S.ptsShow && S.lines !== 'hide';
+    const canPts = !mHit && !h.grab && !h.act && !myDial && S.ptsShow && S.lines !== 'hide' && menuTab !== 'play';
     if (cageEditing && !h.act && !isOff(h) && !myDial && cageTool() === 'cgrab'){ if (setHover(mHit ? null : pickHover(p)) && cageHov) pulse(h, 0.1, 6); }
     else if (cageEditing && !h.act && !isOff(h)){ const i = cageTool() === 'cmove' || cageTool() === 'cpatch' || cageTool() === 'ccut' ? nearestCagePt(p, 0.02 * N()) : -1; if (i !== cageHot){ cageHot = i; cagePtsUpdate(); if (i >= 0) pulse(h, 0.1, 6); } }
     const hh = canPts && !cageEditing ? nearestHandle(p, 0.018 * N()) : null, hl = canPts && !hh && !cageEditing ? nearSpline(p, 0.012 * N()) : null;
@@ -3886,7 +4508,7 @@ function updateXRInput(dt){
     if (cageEditing && cageTool() === 'cgrab' && !cageHov && !h.act && !mHit && !h.grab && !myDial && !isOff(h)){ h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush]); h.brush.material.color.setHex(0x4FC3FF); }
     else if (cageEditing && (cageTool() === 'csoft' || cageTool() === 'csmooth') && !mHit && !h.grab && !myDial && !isOff(h)){
       h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush] * FLAT_K); h.brush.material.color.setHex(cageTool() === 'csmooth' ? 0x5FE0B8 : 0xFFD23F); }
-    else if (!cageEditing && S.tool !== 'draw' && S.tool !== 'ride' && !mHit && !h.grab && !myDial && !isOff(h)){
+    else if (!cageEditing && menuTab !== 'play' && S.tool !== 'draw' && S.tool !== 'ride' && !mHit && !h.grab && !myDial && !isOff(h)){
       h.brush.visible = true; h.brush.position.copy(pw); h.brush.scale.setScalar(BRUSH[S.brush] * (S.tool === 'flatten' || S.tool === 'smooth' || S.tool === 'bend' ? FLAT_K : 1));
       h.brush.material.color.setHex(S.tool === 'mark' ? TAG_COL[S.tag] : S.tool === 'smooth' ? 0x5FE0B8 : S.tool === 'bend' || S.tool === 'flatten' ? 0xFFD23F : 0xF04348);
       const r = BRUSH[S.brush] * N();
@@ -3917,6 +4539,7 @@ function updateXRInput(dt){
     }
     else if (down(0) && !h.grab && !myDial){
       if (mHit && mHit.b){ pressMenu(mHit.b); pulse(h, 0.5, 20); }
+      else if (menuTab === 'play'){ /* nothing to draw on the Play step */ }
       else if (!mHit && h.act && h.ctrlGrip && cageEditing && cageTool() === 'cgrab' && (h.act.kind === 'cgroup' || h.act.kind === 'cage')){ extrudeHeld(h.act, p); pulse(h, 0.8, 35); }
       else if (!mHit && !h.act && cageEditing && cageTool() === 'cgrab'){ if (cageHov && cageHov.t === 'e'){ loopHover(p); pulse(h, 0.6, 25); } else { cagePatchTap(cageHov && cageHov.t === 'v' ? cageHov.id : -1, p, true); pulse(h, 0.4, 15); } }
       else if (!mHit && !h.act && cageEditing){ try { h.act = cageToolDown(p); } catch (e){ h.act = null; errLog.push({ t: Date.now(), msg: String(e.message), at: "cage tool" }); flash("That tool hit a problem (" + e.message + ")"); } pulse(h, h.act ? 0.4 : 0.25, 15); }
@@ -4028,7 +4651,7 @@ function groundHit(ray){
   return ray.intersectPlane(plane, new V3());
 }
 renderer.domElement.addEventListener('pointerdown', e => {
-  if (e.button !== 0 || renderer.xr.isPresenting) return;
+  if (e.button !== 0 || renderer.xr.isPresenting || menuTab === 'play') return;
   const ray = mouseRay(e);
   renderer.domElement.setPointerCapture(e.pointerId);
   if (S.tool === 'ride' && rideTool() === 'points'){ let bj = -1, bd = 14 * 14; const v = new V3(); runHandles.forEach((h, j) => { world.localToWorld(v.copy(h.pos)).project(camera); if (v.z > 1) return; const dx = (v.x + 1) / 2 * innerWidth - e.clientX, dy = (1 - v.y) / 2 * innerHeight - e.clientY, d = dx * dx + dy * dy; if (d < bd){ bd = d; bj = j; } });
@@ -4173,7 +4796,7 @@ setupButtons();
 window.pentimento = { ops: { delPoint: (...a) => delPoint(...a), cornerPoint: (...a) => cornerPoint(...a), addPoint: (...a) => addPoint(...a) }, load(list){ commit(list.map(o => makeStroke(o.tag, Float32Array.from(o.pts), Float32Array.from(o.pts)))); },
   drag(tool, path, brush){ S.tool = tool; if (brush !== undefined) S.brush = brush; const d = toolDown('t', new V3(...path[0])); for (const q of path){ d.dt = 1 / 72; toolMove('t', d, new V3(...q)); } toolUp('t', d); },
   showDial(kind, hover){ const f = camera.getWorldDirection(new V3()); dialMesh.position.copy(camera.position).addScaledVector(f, 0.42); dialMesh.quaternion.copy(camera.quaternion); dialMesh.visible = true; dial = { kind, h: null, items: dialItems(kind), hover }; drawDial(); },
-  get strokes(){ return strokes; }, get fab(){ return { panels, waffle, dbg: panelsDbg }; }, ev: src => eval(src), S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { setStep({ layers: 'sketch', view: 'settings' }[t] || t, true); menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, live: () => cageSurfaceLive(), full: () => cageSurface(), nDabs: () => dabs.length, smoothedCage: () => cageSmoothed(), lastFlash: () => flashText, N: () => N(), stepScale: d => stepScale(d), hoverAt: p => { setHover(pickHover(p)); return cageHov; }, delHover: () => deleteHover(), creaseHov: () => creaseHover(), loopHov: p => loopHover(p), buildSecs: () => lastBuildSecs, rideTool: t => setRideTool(t), runHandles: () => runHandles, runGrab: (j, p) => runPointGrab(j, p), runSmooth: () => runSmoothStart(), smoothRun: i => smoothWholeRun(runs[i]), extrude: (d, p) => extrudeHeld(d, p), dropHeld: d => dropHeld(d), cageUndo, cageTool: t => setCageTool(t), cageDown: (p, r) => cageToolDown(p, r), cageMove: (d, p) => cageToolMove(d, p, 1 / 30), cageUp: d => cageToolUp(d), cageTopo: () => cageTopo(), V3: V3, loopCut: (k, p) => loopCut(k, p), straightTap: k => straightTap(k), edgeChain: (a, b) => edgeChain(a, b), edgeRing: k => edgeRing(k), cageSmoothed: () => cageSmoothed(), startCageEdit: () => startCageEdit(true), cageOddN: () => cageOddN,  get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
+  get strokes(){ return strokes; }, play: PLAY, get fab(){ return { panels, waffle, dbg: panelsDbg }; }, ev: src => eval(src), S, lib: { save: saveSketch, list: libList, load: loadSketch, del: deleteSketch, rename: setSketchName }, tab: t => { setStep({ layers: 'sketch', view: 'settings' }[t] || t, true); menuDirty = true; }, makeReport, openReport, snapshot, press: id => { const b = BTN.find(b => b.id === id); if (b){ menuTab = b.tab || menuTab; pressMenu(b); } return !!b; }, build: startBuild, get result(){ return lastResult; }, get building(){ return building; }, get err(){ return buildErr; }, toolDown, toolMove, toolUp, ctrlStart, ctrlMove, ctrlSecond, finishHeld, makeSpline, rebuildHandles, setStrokes: l => commit(l), get ask(){ return ask; }, get cageEd(){ return cageEd; }, cageGrab, cageDrag, cageDrop, live: () => cageSurfaceLive(), full: () => cageSurface(), nDabs: () => dabs.length, smoothedCage: () => cageSmoothed(), lastFlash: () => flashText, N: () => N(), stepScale: d => stepScale(d), hoverAt: p => { setHover(pickHover(p)); return cageHov; }, delHover: () => deleteHover(), creaseHov: () => creaseHover(), loopHov: p => loopHover(p), buildSecs: () => lastBuildSecs, rideTool: t => setRideTool(t), runHandles: () => runHandles, runGrab: (j, p) => runPointGrab(j, p), runSmooth: () => runSmoothStart(), smoothRun: i => smoothWholeRun(runs[i]), extrude: (d, p) => extrudeHeld(d, p), dropHeld: d => dropHeld(d), cageUndo, cageTool: t => setCageTool(t), cageDown: (p, r) => cageToolDown(p, r), cageMove: (d, p) => cageToolMove(d, p, 1 / 30), cageUp: d => cageToolUp(d), cageTopo: () => cageTopo(), V3: V3, loopCut: (k, p) => loopCut(k, p), straightTap: k => straightTap(k), edgeChain: (a, b) => edgeChain(a, b), edgeRing: k => edgeRing(k), cageSmoothed: () => cageSmoothed(), startCageEdit: () => startCageEdit(true), cageOddN: () => cageOddN,  get runs(){ return runs; }, runMove: (i, from, to, turn = 0) => { const d = runGrab(i, from, 0); d.live = true; runDrag(d, to, turn); toolUp(0, d); }, undo: () => undo(), redo: () => redo(), nearRun: (p, r) => nearRun(p, r), runsToLines: () => runsToLines(), layTies: l => layTies(l), rideSim: (poses, tricks) => { const d = rideStart({ }); for (const o of poses) ridePush(d, o[0], new V3(o[1], o[2], o[3]), new THREE.Quaternion(o[4], o[5], o[6], o[7])); d.tricks = tricks || []; d.h = null; rideEnd(d); }, deleteRun: i => deleteRun(runs[i]), removeTies: l => removeTies(l), runPt: (i, j) => runPt(runs[i], j, runMat(runs[i])), get folds(){ return folds; }, foldHelpers, cycleFoldAt, get menuShown(){ return menuShown; }, get handles(){ return handles; }, ontoSurface, flattenAt, flatR, senseSurface, setBrush: i => { S.brush = i; } };
 applySurfView(); placeGrid(); setTips(!!S.tips); applyLighting(); applyBackground();
 if (savedCage) try { cageRestore(savedCage); setTimeout(cageSurface, 0); } catch (e){}
 // runs handed over from Party Lines (its Bring to Pentimento button)
@@ -4190,7 +4813,7 @@ renderer.setAnimationLoop(now => {
     if (xr){ const xc = renderer.xr.getCamera(), p = new V3(), q = new THREE.Quaternion(); xc.getWorldPosition(p); xc.getWorldQuaternion(q); if (p.lengthSq() > 0.01){ fitView({ p, q }); needsFit = false; linesDirty = true; } }
     else { fitView(); needsFit = false; }
   }
-  if (xr) updateXRInput(dt); else orbit.update();
+  if (PLAY.on) PLAY.update(dt); else if (xr) updateXRInput(dt); else orbit.update();
   if (S.light === 'head' || (S.light === 'sun' && grabState.ids.length)) placeSun();
   if (xr && (backdrop.visible || sky.visible)){ const hp = renderer.xr.getCamera().getWorldPosition(_hp); backdrop.position.copy(hp); sky.position.copy(hp); }
   if (building && performance.now() - buildStart > 60000){ cancelBuild(); buildErr = 'took over a minute'; flash('Build stopped after a minute. Try a bigger Fit detail, fewer Target quads, or Surface off while you sketch.', 7); }
