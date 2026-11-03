@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p3.19"></script>
-<script src="solver.js?v=p3.19"></script>
+<script src="demo.js?v=p3.20"></script>
+<script src="solver.js?v=p3.20"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -107,7 +107,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '3.19';
+const VERSION = '3.20';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -3860,12 +3860,17 @@ const NET = (() => {
 })();
 
 // ======================================================================
-// RADIUS CHECK (Sketch and Surface): marks where the surface curves tighter than a radius you set, measured in the
-// piece you'll build (Fab's Build it at, 1:10 by default), with a callout at the tightest spot of each patch.
-// Creases are meant to be sharp, so they don't count.
+// RADIUS CHECK (Sketch and Surface): marks the inside curves (transitions, bowl corners) too tight to ride, where a
+// board's nose or tail would hit the surface before its wheels sit on it. Measured in the piece you'll build (Fab's
+// Build it at, 1:10 by default), with a callout at the tightest spot of each patch. Outside curves (a hip, a rounded
+// edge) are always rideable, and creases are meant to be sharp, so neither counts.
+// A board resting in a curve of radius R with half its wheelbase a, half its length L and its nose / tail tips h
+// above the line through its wheels just touches when L² + (√(R² − a²) − h)² = R², so R² = a² + ((L² − a² + h²) / 2h)².
+// For a 96 mm fingerboard (a 33 mm, L 48 mm, tips 14 mm up with the kick) that's about 60 mm: 2⅜″.
 // ======================================================================
-const RAD_IN = [1, 2, 3, 4, 5, 6, 8, 10, 12, 18, 24].map(x => x * INCH), RAD_MM = [25, 50, 75, 100, 125, 150, 200, 250, 300, 450, 600];
-const radMM = () => S.radMin ?? 5 * INCH;
+const RAD_IN = [1, 1.5, 2, 2.375, 3, 4, 5, 6, 8, 10, 12].map(x => x * INCH), RAD_MM = [25, 40, 50, 60, 75, 100, 125, 150, 200, 250, 300];
+const BOARD_FIT_MM = (() => { const a = 33, L = 48, h = 14, d = (L * L - a * a + h * h) / (2 * h); return Math.round(Math.sqrt(a * a + d * d)); })();
+const radMM = () => S.radIn ?? BOARD_FIT_MM;
 const RADIUS = (() => {
   const G = new THREE.Group(); G.renderOrder = 11; world.add(G);
   const mat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.6, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 });
@@ -3875,12 +3880,14 @@ const RADIUS = (() => {
   function curvature(){
     const g = surfMesh.geometry; if (cache && cache.uuid === g.uuid) return cache;
     const P = g.attributes.position.array, Nn = g.attributes.normal.array, nc = P.length / 3, kap = new Float32Array(nc), onC = new Uint8Array(nc);
+    let up = 0; for (let i = 1; i < Nn.length; i += 3) up += Nn[i]; const sg = up < 0 ? -1 : 1;     // normals turned to the riding side
     const cr = lastResult && lastResult.creases, ck = new Set(); if (cr) for (let i = 0; i < cr.length; i += 3) ck.add(cr[i] + ',' + cr[i + 1] + ',' + cr[i + 2]);
     if (ck.size) for (let i = 0; i < nc; i++) if (ck.has(P[3 * i] + ',' + P[3 * i + 1] + ',' + P[3 * i + 2])) onC[i] = 1;
     for (let t = 0; t < nc; t += 3) for (const [a, b] of [[t, t + 1], [t + 1, t + 2], [t + 2, t]]){
       if (onC[a] || onC[b]) continue;
       const d = Math.hypot(P[3 * a] - P[3 * b], P[3 * a + 1] - P[3 * b + 1], P[3 * a + 2] - P[3 * b + 2]); if (d < 1e-6) continue;
-      const dn = Math.hypot(Nn[3 * a] - Nn[3 * b], Nn[3 * a + 1] - Nn[3 * b + 1], Nn[3 * a + 2] - Nn[3 * b + 2]), k = dn / d;
+      // curvature along this edge, + where the surface curves up toward you (inside), - where it rolls away
+      const k = -sg * ((Nn[3 * b] - Nn[3 * a]) * (P[3 * b] - P[3 * a]) + (Nn[3 * b + 1] - Nn[3 * a + 1]) * (P[3 * b + 1] - P[3 * a + 1]) + (Nn[3 * b + 2] - Nn[3 * a + 2]) * (P[3 * b + 2] - P[3 * a + 2])) / (d * d);
       if (k > kap[a]) kap[a] = k; if (k > kap[b]) kap[b] = k; }
     // the same point on several triangles is one vertex; average each with its neighbours twice so single noisy
     // triangles don't flicker red, while a real tight bend (several rows wide) stays
@@ -4025,7 +4032,7 @@ function setStep(st, quiet){
   head('sketch');
   section('sketch', 'SURFACE');
   buildCard('sketch', 96);
-  row('sketch', 72, [{ id: 'rad-on-sk', style: 'lock', label: () => S.radCheck !== 0 ? 'Radius check: on' + (hasSurface() ? ' · ' + (RADIUS.count ? RADIUS.count + ' tight' : 'all clear') : '') : 'Radius check: off', sub: () => S.radCheck !== 0 ? 'tighter than ' + fabLen(radMM()) + ' shows red' : '', on: () => S.radCheck !== 0, act: () => { S.radCheck = S.radCheck === 0 ? 1 : 0; scheduleSave(); } }]);
+  row('sketch', 72, [{ id: 'rad-on-sk', style: 'lock', label: () => S.radCheck !== 0 ? 'Radius check: on' + (hasSurface() ? ' · ' + (RADIUS.count ? RADIUS.count + ' tight' : 'all clear') : '') : 'Radius check: off', sub: () => S.radCheck !== 0 ? 'inside curves under ' + fabLen(radMM()) : '', on: () => S.radCheck !== 0, act: () => { S.radCheck = S.radCheck === 0 ? 1 : 0; scheduleSave(); } }]);
   section('sketch', 'TOOL');
   row('sketch', 76, SKETCH_TOOLS.slice(0, 4).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => S.tool === t, act: () => setTool(t) })), { gap: 10 });
   row('sketch', 76, SKETCH_TOOLS.slice(4).map(t => ({ id: 'tool-' + t, label: () => TOOL_NAME[t], on: () => S.tool === t, act: () => setTool(t) })));
@@ -4087,10 +4094,10 @@ function setStep(st, quiet){
     { id: 'builder', label: () => (S.builder || 'new') === 'new' ? 'Builder: New' : 'Builder: Classic (2.6)', on: () => S.builder === 'classic', style: 'lock', act: () => setBuilder(S.builder === 'classic' ? 'new' : 'classic') },
     { id: 'layout', label: () => S.layout === 'field' ? 'Quads: Flowing (beta)' : 'Quads: Even', on: () => S.layout === 'field', style: 'lock', act: () => setParam(() => { S.layout = S.layout === 'field' ? 'pairs' : 'field'; flash(S.layout === 'field' ? 'Flowing quads (beta): the grid follows creases and guides, but can leave small glitches' : 'Even quads: the steady layout', 5); }) }], MORE);
   section('surface', () => 'RADIUS CHECK' + (S.radCheck !== 0 && hasSurface() ? ' · ' + (RADIUS.count ? RADIUS.count + (RADIUS.count === 1 ? ' TIGHT SPOT' : ' TIGHT SPOTS') : 'ALL CLEAR') : ''));
-  const radStep = d => { S.radMin = stepIn(fabIn() ? RAD_IN : RAD_MM, radMM(), d); scheduleSave(); };
+  const radStep = d => { S.radIn = stepIn(fabIn() ? RAD_IN : RAD_MM, radMM(), d); scheduleSave(); };
   row('surface', 64, [{ id: 'rad-on', style: 'lock', label: () => S.radCheck !== 0 ? 'Showing tight bends' : 'Radius check: off', on: () => S.radCheck !== 0, act: () => { S.radCheck = S.radCheck === 0 ? 1 : 0; scheduleSave(); } }]);
-  stepper('surface', 64, () => 'Tightest radius', () => fabLen(radMM()), () => radStep(-1), () => radStep(1), { vis: () => S.radCheck !== 0 });
-  note('surface', () => 'Orange to red: the surface bends tighter than this radius in the piece you build (at ' + (FAB_SCALE[S.fabScale ?? 3] === 1 ? 'full size' : '1:' + FAB_SCALE[S.fabScale ?? 3]) + ', set in Fab). Callouts give the radius at the tightest spot of each patch. Creases are meant to be sharp, so they don\'t count.', { vis: () => S.radCheck !== 0 });
+  stepper('surface', 64, () => 'Tightest inside curve' + (Math.abs(radMM() - BOARD_FIT_MM) < 2 ? ' · a fingerboard fits' : ''), () => fabLen(radMM()), () => radStep(-1), () => radStep(1), { vis: () => S.radCheck !== 0 });
+  note('surface', () => 'Orange to red: inside curves (transitions, bowl corners) tighter than this in the piece you build (at ' + (FAB_SCALE[S.fabScale ?? 3] === 1 ? 'full size' : '1:' + FAB_SCALE[S.fabScale ?? 3]) + ', set in Fab), where a fingerboard\'s nose or tail would hit before its wheels sit down. ' + fabLen(BOARD_FIT_MM) + ' is the tightest a 96 mm fingerboard rides. Outside curves and creases don\'t count.', { vis: () => S.radCheck !== 0 });
   endSection('surface'); more('surface');
 
   // ===== 4 SUBD
