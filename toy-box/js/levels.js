@@ -5,29 +5,31 @@
 
 const LEVELS = [
   { id: 'vaneyck', name: 'Van Eyck Square', tag: 'Drawing',
-    blurb: "Stepping stones, steel domes and sandpits after Aldo van Eyck's postwar Amsterdam playgrounds, tucked into the city's leftover gaps.",
+    blurb: "An ink-drawn living room with a playset of stepping stones, steel domes and a sandpit, after Aldo van Eyck's postwar Amsterdam playgrounds.",
     swatch: ['#f4f2ec', '#9aa3a8', '#e23b2e', '#15121a'] },
   { id: 'noguchi', name: 'Noguchi Playscape', tag: 'Soft sculpture',
-    blurb: "Rolling mounds, a spiral slide and a primary-colored cube after Isamu Noguchi's playgrounds that you climb like sculpture.",
+    blurb: "Blanket hills, a spiral slide, a primary-colored cube and paper lanterns, after Isamu Noguchi's playgrounds you climb like sculpture.",
     swatch: ['#f6d7c3', '#cbb7ea', '#ffd400', '#2f5cff'] },
   { id: 'memphis', name: 'Memphis Park', tag: 'Flat pop',
-    blurb: "Squiggle walls, checkerboards and cones on pedestals after the Memphis Group's loud 1980s Milan furniture.",
+    blurb: "Squiggle wallpaper, a checkerboard floor and cones on pedestals, after the Memphis Group's loud 1980s Milan furniture.",
     swatch: ['#ffe9a8', '#ff3e8a', '#00c2b3', '#15121a'] },
   { id: 'junk', name: 'Junk Playground', tag: 'Textured',
-    blurb: 'Pallet forts, tire stacks and oil drums after the first junk playground at Emdrup, Copenhagen (1943), where kids built their own.',
+    blurb: 'A wood-panelled den full of pallet forts, tire stacks and oil drums, after the first junk playground at Emdrup, Copenhagen (1943).',
     swatch: ['#efe2c8', '#a0703f', '#2b2b2b', '#c8553d'] },
 ];
 
 function Builder(seed) {
   const rng = mulberry(seed), R = (a, b) => a + rng() * (b - a), pick = a => a[Math.floor(rng() * a.length)];
-  const b = { rng, R, pick, cols: [], vis: {}, devices: [], spots: [], extra: [] };
+  // design units: everything here is drawn at v1 toy size, then scaled by K into the real room (scaleBuilder)
+  const b = { rng, R, pick, cols: [], vis: {}, devices: [], spots: PRE_CLAIMS.map(c => Object.assign({}, c)), extra: [] };
   b.claim = (x, z, r) => b.spots.push({ x, z, r });
   b.free = (x, z, r) => {
-    if (Math.abs(x) > HALF - r - 0.12 || Math.abs(z) > HALF - r - 0.12) return false;
+    if (!AREA.inside(x * K, z * K, r * K + 0.12)) return false;
     for (const s of b.spots) if (Math.hypot(s.x - x, s.z - z) < s.r + r) return false;
     return true;
   };
-  b.spot = (r, tries = 200) => { for (let i = 0; i < tries; i++) { const x = R(-HALF + r, HALF - r), z = R(-HALF + r, HALF - r); if (b.free(x, z, r)) { b.claim(x, z, r); return { x, z }; } } return null; };
+  // find a free spot; in a small room, squeeze a little (the piece keeps its size, its elbow room shrinks)
+  b.spot = (r, tries = 220) => { for (const f of [1, 0.8, 0.65]) for (let i = 0; i < tries; i++) { const x = R(AREA.minX, AREA.maxX) / K, z = R(AREA.minZ, AREA.maxZ) / K; if (b.free(x, z, r * f)) { b.claim(x, z, r * f); return { x, z }; } } return null; };
   b.add = (fam, it) => { (b.vis[fam] || (b.vis[fam] = [])).push(it); return it; };
   // c = centre of the box; s = full size
   b.box = (c, s, q, col, fam, o = {}) => { q = typeof q === 'number' ? qYaw(q) : (q || Q()); b.add(fam, { g: 'box', p: c.clone(), q, s: s.clone(), col, uv: o.uv || Math.max(s.x, s.y, s.z) * 4 });
@@ -47,17 +49,8 @@ function Builder(seed) {
 const rotY = (v, a) => v.clone().applyAxisAngle(Y_AX, a);
 
 /* ---------- pieces every level shares ---------- */
-function commonBits(b, kerbCol, kerbFam) {
-  b.claim(BOX.c.x, BOX.c.z, 0.75); b.claim(TODDLER_START.p.x, TODDLER_START.p.z + 0.15, 0.5);
-  // the toy box: walls the toys bump into (the box itself is drawn in view.js)
-  const { c, w, d, h, t } = BOX;
-  b.cols.push(cBox(V(c.x, h / 2, c.z - d / 2 + t / 2), V(w / 2, h / 2, t / 2)), cBox(V(c.x, h / 2, c.z + d / 2 - t / 2), V(w / 2, h / 2, t / 2)),
-              cBox(V(c.x - w / 2 + t / 2, h / 2, c.z), V(t / 2, h / 2, d / 2)), cBox(V(c.x + w / 2 - t / 2, h / 2, c.z), V(t / 2, h / 2, d / 2)));
-  // a low kerb all the way round
-  const k = 0.06, kh = 0.05, L = HALF * 2 + k * 2;
-  for (const [x, z, sx, sz] of [[0, -HALF - k / 2, L, k], [0, HALF + k / 2, L, k], [-HALF - k / 2, 0, k, L], [HALF + k / 2, 0, k, L]])
-    b.box(V(x, kh / 2, z), V(sx, kh, sz), 0, kerbCol, kerbFam);
-}
+let PRE_CLAIMS = [];
+function commonBits() {}
 function musicBox(b, c, yaw, col, look) {
   b.box(V(c.x, 0.05, c.z), V(0.15, 0.1, 0.11), yaw, col, '_skip', { noCol: false }); // collider only; drawn by view
   b.vis._skip.pop();
@@ -71,15 +64,15 @@ function seesaw(b, c, yaw, col, look) {
 function mgr(b, c, col) { return b.device({ type: 'mgr', c: V(c.x, 0, c.z), r: 0.32, h: 0.05, col }); }
 function swing(b, top, yaw, len, col, look) { return b.device({ type: 'swing', pivot: top.clone(), yaw, len, col, look }); }
 function groundSpots(b, n, H) {
-  const out = [];
-  for (let i = 0; i < n * 30 && out.length < n; i++) {
-    const x = b.R(-HALF + 0.25, HALF - 0.25), z = b.R(-HALF + 0.25, HALF - 0.25);
-    if (Math.hypot(x - BOX.c.x, z - BOX.c.z) < 0.9) continue;
+  const out = [], bc = V(BOX.c.x / K, 0, BOX.c.z / K);
+  for (let i = 0; i < n * 40 && out.length < n; i++) {
+    const x = b.R(AREA.minX, AREA.maxX) / K, z = b.R(AREA.minZ, AREA.maxZ) / K;
+    if (!AREA.inside(x * K, z * K, 0.2) || Math.hypot(x - bc.x, z - bc.z) < 0.75) continue;
     let ok = true; for (const s of b.spots) if (Math.hypot(s.x - x, s.z - z) < s.r * 0.75) { ok = false; break; }
-    for (const o of out) if (Math.hypot(o.x - x, o.z - z) < 0.22) { ok = false; break; }
-    if (ok) out.push(V(x, (H ? H(x, z) : 0) + 0.12, z));
+    for (const o of out) if (Math.hypot(o.x - x, o.z - z) < 0.2) { ok = false; break; }
+    if (ok) out.push(V(x, (H ? H(x, z) : 0) + 0.1, z));
   }
-  while (out.length < n) out.push(V(b.R(-2, 2), 0.3, b.R(-0.5, 2.5)));
+  while (out.length < n) { const p = AREA.rand(b.rng, 0.3).divideScalar(K); p.y = 0.3; out.push(p); }
   return out;
 }
 
@@ -88,6 +81,13 @@ function genVanEyck(seed) {
   const b = Builder(seed), { R, pick } = b;
   const CON = '#e4e1da', CON2 = '#cfcbc2', STEEL = '#a3abb0', ACC = ['#e23b2e', '#2f5cff', '#ffd400'];
   commonBits(b, CON2, 'concrete');
+  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#ffd400', 'kiosk'); }
+  { const c = b.spot(0.42); if (c) seesaw(b, c, R(0, TAU), '#e23b2e', 'plank'); }
+  // the igloo dome of steel tubes
+  const dc = b.spot(0.52); if (dc) { const Rr = R(0.36, 0.44), M = 8, E = 6, pt = (e, f) => V(dc.x + Math.cos(e) * Math.cos(f) * Rr, Math.sin(e) * Rr, dc.z + Math.cos(e) * Math.sin(f) * Rr);
+    for (let m = 0; m < M; m++) { const f = m / M * TAU; for (let e = 0; e < E; e++) b.bar(pt(e / E * Math.PI / 2, f), pt((e + 1) / E * Math.PI / 2, f), 0.008, STEEL, 'steel'); }
+    for (const e of [0.02, 0.42, 0.85, 1.2]) { const n = 16; for (let i = 0; i < n; i++) b.bar(pt(e, i / n * TAU), pt(e, (i + 1) / n * TAU), 0.008, STEEL, 'steel'); }
+  }
   // sandpit with a rim and stones inside
   const sp = b.spot(0.72); if (sp) {
     const Rr = R(0.5, 0.62), n = 26;
@@ -103,11 +103,6 @@ function genVanEyck(seed) {
       for (let i = 0; i < n; i++) { const a = a0 + i / n * TAU * 0.92; b.cyl(V(c.x + Math.cos(a) * Rr, 0, c.z + Math.sin(a) * Rr), R(0.05, 0.065), 0.03 + i / n * 0.17, i === n - 1 ? pick(ACC) : CON, 'concrete'); } }
     else for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) b.cyl(V(c.x + i * 0.15, 0, c.z + j * 0.15), 0.06, R(0.03, 0.14), CON, 'concrete');
   }
-  // the igloo dome of steel tubes
-  const dc = b.spot(0.52); if (dc) { const Rr = R(0.36, 0.44), M = 8, E = 6, pt = (e, f) => V(dc.x + Math.cos(e) * Math.cos(f) * Rr, Math.sin(e) * Rr, dc.z + Math.cos(e) * Math.sin(f) * Rr);
-    for (let m = 0; m < M; m++) { const f = m / M * TAU; for (let e = 0; e < E; e++) b.bar(pt(e / E * Math.PI / 2, f), pt((e + 1) / E * Math.PI / 2, f), 0.008, STEEL, 'steel'); }
-    for (const e of [0.02, 0.42, 0.85, 1.2]) { const n = 16; for (let i = 0; i < n; i++) b.bar(pt(e, i / n * TAU), pt(e, (i + 1) / n * TAU), 0.008, STEEL, 'steel'); }
-  }
   // tumbling bars: three frames stepping up
   for (let k = 0; k < 2; k++) { const c = b.spot(0.34); if (!c) continue; const yaw = R(0, TAU), hs = [0.1, 0.16, 0.22];
     hs.forEach((h, i) => { const x = (i - 1) * 0.15, a = V(c.x, 0, c.z).add(rotY(V(x, 0, -0.17), yaw)), e = V(c.x, 0, c.z).add(rotY(V(x, 0, 0.17), yaw));
@@ -118,15 +113,13 @@ function genVanEyck(seed) {
     for (let i = 0; i < 5; i++) { const x = (i - 2) * 0.1; for (let s = 0; s < 8; s++) { const a0 = s / 8 * Math.PI, a1 = (s + 1) / 8 * Math.PI;
       const p0 = V(c.x, 0, c.z).add(rotY(V(x, Math.sin(a0) * Rr, Math.cos(a0) * Rr), yaw)), p1 = V(c.x, 0, c.z).add(rotY(V(x, Math.sin(a1) * Rr, Math.cos(a1) * Rr), yaw)); b.bar(p0, p1, 0.008, col, 'paint'); } }
     for (const zz of [-Rr, Rr]) b.bar(V(c.x, 0.002, c.z).add(rotY(V(-0.2, 0, zz), yaw)), V(c.x, 0.002, c.z).add(rotY(V(0.2, 0, zz), yaw)), 0.008, col, 'paint'); } }
-  // low concrete tables and blocks
-  for (let k = 0; k < 6; k++) { const c = b.spot(0.18); if (!c) continue; const s = V(R(0.12, 0.3), R(0.04, 0.12), R(0.12, 0.26)); b.box(V(c.x, s.y / 2, c.z), s, R(0, Math.PI), CON, 'concrete'); }
   // trees, drawn as lollipops
   for (let k = 0; k < 4; k++) { const c = b.spot(0.22); if (!c) continue; const h = R(0.45, 0.6); b.cyl(V(c.x, 0, c.z), 0.022, h, '#8f8a80', 'trunk', { climb: true }); b.sph(V(c.x, h + 0.14, c.z), R(0.17, 0.23), '#fbfaf6', 'canopy'); }
-  { const c = b.spot(0.42); if (c) seesaw(b, c, R(0, TAU), '#e23b2e', 'plank'); }
-  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#ffd400', 'kiosk'); }
+  // low concrete tables and blocks
+  for (let k = 0; k < 6; k++) { const c = b.spot(0.18); if (!c) continue; const s = V(R(0.12, 0.3), R(0.04, 0.12), R(0.12, 0.26)); b.box(V(c.x, s.y / 2, c.z), s, R(0, Math.PI), CON, 'concrete'); }
   return {
     id: 'vaneyck', seed, b, H: null,
-    style: { bg: '#f4f2ec', fog: ['#f4f2ec', 3.5, 13], hemi: ['#ffffff', '#cfcabe', 0.82], sun: ['#ffffff', 0.5, V(-0.4, 1, 0.3)], edges: '#26232b',
+    style: { bg: '#f4f2ec', fog: ['#f4f2ec', 6, 22], hemi: ['#ffffff', '#cfcabe', 0.82], sun: ['#ffffff', 0.5, V(-0.4, 1, 0.3)], edges: '#26232b',
       ground: { tex: 'paving', col: '#f1efe8' }, toyOutline: 0.0035,
       fams: { concrete: 'lambert', steel: 'lambert', paint: 'lambert', sand: { t: 'lambert', tex: 'sand' }, trunk: 'lambert', canopy: 'lambert' } },
     parts: [{ shape: 'sph', r: 0.034, cols: ['#e23b2e', '#2f5cff', '#ffd400'] }, { shape: 'box', r: 0.03, cols: ['#d9a066', '#e8c48a', '#c98f55'] }, { shape: 'bucket', r: 0.033, cols: ['#ff7a1a', '#00c2b3', '#e23b2e'] }],
@@ -139,20 +132,13 @@ function genNoguchi(seed) {
   const b = Builder(seed), { R, pick } = b;
   const PRI = ['#e8402f', '#ffd21f', '#2e5bea'], STONE = '#efe6da';
   commonBits(b, '#e9d9cf', 'stone');
-  // rolling mounds first; everything else is built in the flat ground between them
-  const mounds = [];
-  for (let k = 0; k < 12 && mounds.length < 5; k++) { const s = R(0.45, 0.75), c = b.spot(s * 0.78); if (!c) continue; mounds.push({ x: c.x, z: c.z, h: R(0.14, 0.3), s }); }
-  // cube jungle gym: a lattice, one primary colour per direction
-  { const c = b.spot(0.32); if (c) { const n = 3, s = 0.11, o = V(c.x - n * s / 2, 0.004, c.z - n * s / 2), P = (i, j, k) => V(o.x + i * s, o.y + j * s, o.z + k * s);
-    for (let i = 0; i <= n; i++) for (let j = 0; j <= n; j++) for (let k = 0; k <= n; k++) {
-      if (i < n) b.bar(P(i, j, k), P(i + 1, j, k), 0.0075, PRI[0], 'paint'); if (j < n) b.bar(P(i, j, k), P(i, j + 1, k), 0.0075, PRI[1], 'paint'); if (k < n) b.bar(P(i, j, k), P(i, j, k + 1), 0.0075, PRI[2], 'paint'); } } }
-  // stepped play pyramid with a slide down one face
-  { const c = b.spot(0.5); if (c) { const yaw = R(0, TAU), tiers = 4;
-    for (let i = 0; i < tiers; i++) { const s = 0.72 - i * 0.15; b.box(V(c.x, 0.05 * i + 0.025, c.z), V(s, 0.05, s), yaw, i % 2 ? '#e6dccd' : STONE, 'stone'); }
-    const top = 0.05 * tiers, a = V(c.x, top, c.z).add(rotY(V(0, 0, 0.14), yaw)), e = V(c.x, 0.012, c.z).add(rotY(V(0, 0, 0.62), yaw));
-    const mid = V().addVectors(a, e).multiplyScalar(0.5), dir = V().subVectors(e, a), L = dir.length(); dir.normalize();
-    const side = V().crossVectors(dir, Y_AX).normalize(), up = V().crossVectors(side, dir).normalize(), q = Q().setFromRotationMatrix(new THREE.Matrix4().makeBasis(side, up, dir));
-    b.box(mid, V(0.12, 0.014, L), q, PRI[0], 'paint'); } }
+  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#2e5bea', 'cube'); }
+  // swing set
+  let sw = b.spot(0.42); if (sw) { const yaw = R(0, TAU), H = 0.42, W = 0.36, col = PRI[2];
+    for (const sx of [-1, 1]) { const top = V(sw.x, H, sw.z).add(rotY(V(sx * W, 0, 0), yaw));
+      b.bar(V(sw.x, 0, sw.z).add(rotY(V(sx * W, 0, -0.14), yaw)), top, 0.009, col, 'paint'); b.bar(V(sw.x, 0, sw.z).add(rotY(V(sx * W, 0, 0.14), yaw)), top, 0.009, col, 'paint'); }
+    b.bar(V(sw.x, H, sw.z).add(rotY(V(-W, 0, 0), yaw)), V(sw.x, H, sw.z).add(rotY(V(W, 0, 0), yaw)), 0.01, col, 'paint');
+    for (const sx of [-0.15, 0.15]) swing(b, V(sw.x, H, sw.z).add(rotY(V(sx, 0, 0), yaw)), yaw, 0.32, sx < 0 ? PRI[0] : PRI[1], 'seat'); }
   // spiral slide round a pole, with a ladder up the back
   { const c = b.spot(0.34); if (c) { const top = 0.44, rr = 0.17, turns = 1.25, n = 18, a0 = R(0, TAU);
     b.cyl(V(c.x, 0, c.z), 0.026, top + 0.08, PRI[1], 'paint', { climb: true });
@@ -165,19 +151,26 @@ function genNoguchi(seed) {
     b.bar(l1, V(l1.x, top, l1.z), 0.008, PRI[0], 'paint'); b.bar(l2, V(l2.x, top, l2.z), 0.008, PRI[0], 'paint');
     for (let h = 0.05; h < top; h += 0.06) b.bar(V(l1.x, h, l1.z), V(l2.x, h, l2.z), 0.007, PRI[0], 'paint');
     b.box(V(lp.x, top - 0.008, lp.z).lerp(V(base.x, top - 0.008, base.z), 0.5), V(0.12, 0.016, 0.14), Math.atan2(ld.x, ld.z), STONE, 'stone'); } }
+  // cube jungle gym: a lattice, one primary colour per direction
+  { const c = b.spot(0.32); if (c) { const n = 3, s = 0.11, o = V(c.x - n * s / 2, 0.004, c.z - n * s / 2), P = (i, j, k) => V(o.x + i * s, o.y + j * s, o.z + k * s);
+    for (let i = 0; i <= n; i++) for (let j = 0; j <= n; j++) for (let k = 0; k <= n; k++) {
+      if (i < n) b.bar(P(i, j, k), P(i + 1, j, k), 0.0075, PRI[0], 'paint'); if (j < n) b.bar(P(i, j, k), P(i, j + 1, k), 0.0075, PRI[1], 'paint'); if (k < n) b.bar(P(i, j, k), P(i, j, k + 1), 0.0075, PRI[2], 'paint'); } } }
+  // rolling mounds first; everything else is built in the flat ground between them
+  const mounds = [];
+  for (let k = 0; k < 8 && mounds.length < 3; k++) { const s = R(0.4, 0.6), c = b.spot(s * 0.7); if (!c) continue; mounds.push({ x: c.x, z: c.z, h: R(0.14, 0.3), s }); }
+  // stepped play pyramid with a slide down one face
+  { const c = b.spot(0.5); if (c) { const yaw = R(0, TAU), tiers = 4;
+    for (let i = 0; i < tiers; i++) { const s = 0.72 - i * 0.15; b.box(V(c.x, 0.05 * i + 0.025, c.z), V(s, 0.05, s), yaw, i % 2 ? '#e6dccd' : STONE, 'stone'); }
+    const top = 0.05 * tiers, a = V(c.x, top, c.z).add(rotY(V(0, 0, 0.14), yaw)), e = V(c.x, 0.012, c.z).add(rotY(V(0, 0, 0.62), yaw));
+    const mid = V().addVectors(a, e).multiplyScalar(0.5), dir = V().subVectors(e, a), L = dir.length(); dir.normalize();
+    const side = V().crossVectors(dir, Y_AX).normalize(), up = V().crossVectors(side, dir).normalize(), q = Q().setFromRotationMatrix(new THREE.Matrix4().makeBasis(side, up, dir));
+    b.box(mid, V(0.12, 0.014, L), q, PRI[0], 'paint'); } }
   // a family of columns at different heights
   { const c = b.spot(0.3); if (c) { const n = 6; for (let i = 0; i < n; i++) { const a = i / n * TAU + R(0, 0.5), d = R(0.06, 0.2); b.cyl(V(c.x + Math.cos(a) * d, 0, c.z + Math.sin(a) * d), R(0.04, 0.065), R(0.06, 0.36), i % 2 ? pick(PRI) : '#f0b9c9', 'paint', { climb: true }); } } }
-  // swing set
-  let sw = b.spot(0.42); if (sw) { const yaw = R(0, TAU), H = 0.42, W = 0.36, col = PRI[2];
-    for (const sx of [-1, 1]) { const top = V(sw.x, H, sw.z).add(rotY(V(sx * W, 0, 0), yaw));
-      b.bar(V(sw.x, 0, sw.z).add(rotY(V(sx * W, 0, -0.14), yaw)), top, 0.009, col, 'paint'); b.bar(V(sw.x, 0, sw.z).add(rotY(V(sx * W, 0, 0.14), yaw)), top, 0.009, col, 'paint'); }
-    b.bar(V(sw.x, H, sw.z).add(rotY(V(-W, 0, 0), yaw)), V(sw.x, H, sw.z).add(rotY(V(W, 0, 0), yaw)), 0.01, col, 'paint');
-    for (const sx of [-0.15, 0.15]) swing(b, V(sw.x, H, sw.z).add(rotY(V(sx, 0, 0), yaw)), yaw, 0.32, sx < 0 ? PRI[0] : PRI[1], 'seat'); }
-  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#2e5bea', 'cube'); }
   const H = (x, z) => { let h = 0; for (const m of mounds) { const d2 = (x - m.x) ** 2 + (z - m.z) ** 2; h += m.h * Math.exp(-d2 / (m.s * m.s * 0.45)); } return h; };
   return {
     id: 'noguchi', seed, b, H, mounds,
-    style: { bg: '#f3dfe6', fog: ['#f1dbe6', 3.2, 12], hemi: ['#fff3f6', '#b9a2df', 0.72], sun: ['#fff1dc', 0.6, V(0.5, 0.8, 0.35)],
+    style: { bg: '#f3dfe6', fog: ['#f1dbe6', 6, 22], hemi: ['#fff3f6', '#b9a2df', 0.72], sun: ['#fff1dc', 0.6, V(0.5, 0.8, 0.35)],
       ground: { terrain: true, lo: '#f0b393', hi: '#9a7ddc' }, toyOutline: 0,
       fams: { paint: { t: 'standard', rough: 0.55 }, stone: { t: 'standard', rough: 0.95 } } },
     parts: [{ shape: 'ring', r: 0.034, cols: ['#e8402f', '#ffd21f', '#2e5bea', '#f0b9c9'] }, { shape: 'sph', r: 0.034, cols: ['#ffd21f', '#e8402f', '#7fd6c2'] }, { shape: 'cone', r: 0.033, cols: ['#ff9f43', '#cbb7ea'] }],
@@ -190,17 +183,9 @@ function genMemphis(seed) {
   const b = Builder(seed), { R, pick } = b;
   const PAL = ['#ff3e8a', '#ffd400', '#00c2b3', '#2f5cff', '#9b5cff', '#ff7a1a', '#9ff0d0'];
   commonBits(b, '#15121a', 'zig');
-  // terrazzo puddles on the checkerboard
-  for (let k = 0; k < 7; k++) { const x = R(-2.6, 2.6), z = R(-2.6, 2.6); if (Math.hypot(x - BOX.c.x, z - BOX.c.z) < 0.8) continue; b.disc(V(x, 0, z), R(0.25, 0.55), 0.004, pick(['#fff3dc', '#ffd6e6', '#d6f5ff']), 'terrazzo'); }
-  // squiggle walls
-  for (let k = 0; k < 3; k++) { const c = b.spot(0.55); if (!c) continue; const yaw = R(0, TAU), L = R(0.9, 1.3), amp = R(0.1, 0.17), waves = R(1.2, 2), h = R(0.1, 0.2), n = 16, col = pick(PAL);
-    const P = t => V(c.x, 0, c.z).add(rotY(V((t - 0.5) * L, 0, Math.sin(t * waves * TAU) * amp), yaw));
-    for (let i = 0; i < n; i++) { const p0 = P(i / n), p1 = P((i + 1) / n), m = V().addVectors(p0, p1).multiplyScalar(0.5), d = V().subVectors(p1, p0);
-      b.box(V(m.x, h / 2, m.z), V(d.length() + 0.03, h, 0.045), -Math.atan2(d.z, d.x), col, 'stripes', { climb: true }); } }
-  // pedestals with a ball, a cone or a drum on top
-  for (let k = 0; k < 7; k++) { const c = b.spot(0.16); if (!c) continue; const s = R(0.12, 0.2), h = R(0.07, 0.3), col = pick(PAL), top = pick(['sph', 'cone', 'cyl']), tc = pick(PAL);
-    b.box(V(c.x, h / 2, c.z), V(s, h, s), R(0, 1.5), col, k % 2 ? 'dots' : 'plain', { climb: true });
-    if (top === 'sph') b.sph(V(c.x, h + 0.06, c.z), 0.065, tc, 'plain'); else if (top === 'cone') b.cone(V(c.x, h, c.z), 0.07, 0.15, tc, 'plain'); else b.cyl(V(c.x, h, c.z), 0.06, 0.06, tc, 'stripes'); }
+  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#9b5cff', 'jukebox'); }
+  { const c = b.spot(0.42); if (c) mgr(b, c, '#ff3e8a'); }
+  { const c = b.spot(0.42); if (c) seesaw(b, c, R(0, TAU), '#00c2b3', 'plank'); }
   // lightning-bolt slide off a tower, stairs up the back
   { const c = b.spot(0.5); if (c) { const yaw = R(0, TAU), H = 0.36, T = V(c.x, 0, c.z);
     b.box(V(T.x, H / 2, T.z), V(0.18, H, 0.18), yaw, '#2f5cff', 'dots', { climb: true });
@@ -209,15 +194,23 @@ function genMemphis(seed) {
       const side = V().crossVectors(dir, Y_AX).normalize(), up = V().crossVectors(side, dir).normalize();
       b.box(mid, V(0.11, 0.016, L + 0.04), Q().setFromRotationMatrix(new THREE.Matrix4().makeBasis(side, up, dir)), '#ffd400', 'plain'); }
     for (let i = 0; i < 6; i++) { const h = (i + 1) * H / 6; b.box(T.clone().add(rotY(V(0, h / 2, -0.09 - 0.06 * (6 - i)), yaw)), V(0.14, h, 0.06), yaw, '#ff3e8a', 'plain'); } } }
+  // squiggle walls
+  for (let k = 0; k < 3; k++) { const c = b.spot(0.55); if (!c) continue; const yaw = R(0, TAU), L = R(0.9, 1.3), amp = R(0.1, 0.17), waves = R(1.2, 2), h = R(0.1, 0.2), n = 16, col = pick(PAL);
+    const P = t => V(c.x, 0, c.z).add(rotY(V((t - 0.5) * L, 0, Math.sin(t * waves * TAU) * amp), yaw));
+    for (let i = 0; i < n; i++) { const p0 = P(i / n), p1 = P((i + 1) / n), m = V().addVectors(p0, p1).multiplyScalar(0.5), d = V().subVectors(p1, p0);
+      b.box(V(m.x, h / 2, m.z), V(d.length() + 0.03, h, 0.045), -Math.atan2(d.z, d.x), col, 'stripes', { climb: true }); } }
   // a striped arch to run through and over
   { const c = b.spot(0.36); if (c) { const yaw = R(0, TAU), Rr = 0.3, n = 12; for (let i = 0; i < n; i++) { const a0 = i / n * Math.PI, a1 = (i + 1) / n * Math.PI;
     b.bar(V(c.x, 0, c.z).add(rotY(V(Math.cos(a0) * Rr, Math.sin(a0) * Rr, 0), yaw)), V(c.x, 0, c.z).add(rotY(V(Math.cos(a1) * Rr, Math.sin(a1) * Rr, 0), yaw)), 0.028, i % 2 ? '#15121a' : '#fffdf7', 'plain'); } } }
-  { const c = b.spot(0.42); if (c) mgr(b, c, '#ff3e8a'); }
-  { const c = b.spot(0.42); if (c) seesaw(b, c, R(0, TAU), '#00c2b3', 'plank'); }
-  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#9b5cff', 'jukebox'); }
+  // pedestals with a ball, a cone or a drum on top
+  for (let k = 0; k < 7; k++) { const c = b.spot(0.16); if (!c) continue; const s = R(0.12, 0.2), h = R(0.07, 0.3), col = pick(PAL), top = pick(['sph', 'cone', 'cyl']), tc = pick(PAL);
+    b.box(V(c.x, h / 2, c.z), V(s, h, s), R(0, 1.5), col, k % 2 ? 'dots' : 'plain', { climb: true });
+    if (top === 'sph') b.sph(V(c.x, h + 0.06, c.z), 0.065, tc, 'plain'); else if (top === 'cone') b.cone(V(c.x, h, c.z), 0.07, 0.15, tc, 'plain'); else b.cyl(V(c.x, h, c.z), 0.06, 0.06, tc, 'stripes'); }
+  // terrazzo puddles on the checkerboard
+  for (let k = 0; k < 7; k++) { const x = R(AREA.minX, AREA.maxX) / K, z = R(AREA.minZ, AREA.maxZ) / K; if (!AREA.inside(x * K, z * K, 0.3) || Math.hypot(x - BOX.c.x / K, z - BOX.c.z / K) < 0.8) continue; b.disc(V(x, 0, z), R(0.25, 0.55), 0.004, pick(['#fff3dc', '#ffd6e6', '#d6f5ff']), 'terrazzo'); }
   return {
     id: 'memphis', seed, b, H: null,
-    style: { bg: '#ffe9a8', fog: ['#ffe9a8', 4, 14], hemi: ['#ffffff', '#ffffff', 1.0], sun: ['#ffffff', 0.6, V(-0.3, 1, 0.5)],
+    style: { bg: '#ffe9a8', fog: ['#ffe9a8', 6, 22], hemi: ['#ffffff', '#ffffff', 1.0], sun: ['#ffffff', 0.6, V(-0.3, 1, 0.5)],
       ground: { tex: 'checker', col: '#ffffff' }, outline: 0.0045, toyOutline: 0.004,
       fams: { plain: 'toon', dots: { t: 'toon', tex: 'dots' }, stripes: { t: 'toon', tex: 'stripes' }, zig: { t: 'toon', tex: 'zig' }, terrazzo: { t: 'toon', tex: 'terrazzo', noOutline: true } } },
     parts: [{ shape: 'sph', r: 0.035, cols: ['#ff3e8a', '#00c2b3', '#ffd400'], tex: 'dots' }, { shape: 'box', r: 0.031, cols: ['#2f5cff', '#9b5cff', '#ff7a1a'] }, { shape: 'cone', r: 0.033, cols: ['#ffd400', '#ff3e8a'] }],
@@ -230,6 +223,14 @@ function genJunk(seed) {
   const b = Builder(seed), { R, pick } = b;
   const WOOD = ['#b98552', '#a0703f', '#c99a64', '#8e6239'], PAINT = ['#c8553d', '#3f7cac', '#e0b13a', '#5b8c5a'], RUB = '#2a2a2c';
   commonBits(b, '#8e6239', 'wood');
+  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#c8553d', 'radio'); }
+  // tire swing on an A-frame
+  { const c = b.spot(0.42); if (c) { const yaw = R(0, TAU), H = 0.46, W = 0.3;
+    for (const sx of [-1, 1]) { const top = V(c.x, H, c.z).add(rotY(V(sx * W, 0, 0), yaw));
+      b.bar(V(c.x, 0, c.z).add(rotY(V(sx * W, 0, -0.16), yaw)), top, 0.012, '#7d5634', 'wood'); b.bar(V(c.x, 0, c.z).add(rotY(V(sx * W, 0, 0.16), yaw)), top, 0.012, '#7d5634', 'wood'); }
+    b.bar(V(c.x, H, c.z).add(rotY(V(-W, 0, 0), yaw)), V(c.x, H, c.z).add(rotY(V(W, 0, 0), yaw)), 0.014, '#6e4f33', 'wood');
+    swing(b, V(c.x, H, c.z), yaw, 0.34, RUB, 'tire'); } }
+  { const c = b.spot(0.42); if (c) seesaw(b, c, R(0, TAU), '#c99a64', 'drum'); }
   // pallet forts: deck on posts, plank walls, a ramp and a ladder
   for (let k = 0; k < 2; k++) { const c = b.spot(0.5); if (!c) continue; const yaw = R(0, TAU), h = R(0.2, 0.3), W = 0.42, D = 0.34, T = V(c.x, 0, c.z), at = (x, y, z) => T.clone().add(rotY(V(x, y, z), yaw));
     b.box(at(0, h, 0), V(W, 0.022, D), yaw, pick(WOOD), 'wood');
@@ -259,28 +260,20 @@ function genJunk(seed) {
   for (let k = 0; k < 4; k++) { const c = b.spot(0.12); if (!c) continue; const n = 1 + Math.floor(R(1, 4));
     for (let i = 0; i < n; i++) { const y = 0.025 + i * 0.05; b.add('rubber', { g: 'tor', p: V(c.x, y, c.z), q: Q().setFromAxisAngle(X_AX, Math.PI / 2), s: V(0.062, 0.062, 0.07), col: RUB });
       b.cols.push(cCyl(V(c.x, y, c.z), 0.085, 0.025)); } }
-  { const c = b.spot(0.4); if (c) { const yaw = R(0, TAU); for (let i = 0; i < 4; i++) { const p = V(c.x, 0.045, c.z).add(rotY(V((i - 1.5) * 0.15, 0, 0), yaw));
-    b.add('rubber', { g: 'tor', p, q: qYaw(yaw), s: V(0.065, 0.065, 0.08), col: i % 2 ? RUB : pick(PAINT) }); b.cols.push(cBox(p, V(0.085, 0.07, 0.03), qYaw(yaw))); } } }
   // oil drums, some standing, some lying
   for (let k = 0; k < 6; k++) { const c = b.spot(0.09); if (!c) continue; const col = pick(PAINT);
     if (rng() < 0.6) b.cyl(V(c.x, 0, c.z), 0.05, 0.135, col, 'rust');
     else { const yaw = R(0, TAU), q = qYaw(yaw).multiply(Q().setFromAxisAngle(Z_AX, Math.PI / 2)); b.add('rust', { g: 'cyl', p: V(c.x, 0.05, c.z), q, s: V(0.05, 0.135, 0.05), col, uv: 2 }); b.cols.push(cBox(V(c.x, 0.05, c.z), V(0.0675, 0.045, 0.045), qYaw(yaw))); } }
   function rng() { return b.rng(); }
+  { const c = b.spot(0.4); if (c) { const yaw = R(0, TAU); for (let i = 0; i < 4; i++) { const p = V(c.x, 0.045, c.z).add(rotY(V((i - 1.5) * 0.15, 0, 0), yaw));
+    b.add('rubber', { g: 'tor', p, q: qYaw(yaw), s: V(0.065, 0.065, 0.08), col: i % 2 ? RUB : pick(PAINT) }); b.cols.push(cBox(p, V(0.085, 0.07, 0.03), qYaw(yaw))); } } }
   // cable spool tables
   for (let k = 0; k < 2; k++) { const c = b.spot(0.18); if (!c) continue; b.cyl(V(c.x, 0, c.z), 0.16, 0.022, '#b98552', 'wood'); b.cyl(V(c.x, 0.022, c.z), 0.07, 0.15, '#a0703f', 'wood'); b.cyl(V(c.x, 0.172, c.z), 0.16, 0.022, '#c99a64', 'wood'); }
   // loose planks lying around and leaning
   for (let k = 0; k < 5; k++) { const c = b.spot(0.16); if (!c) continue; b.box(V(c.x, 0.01, c.z), V(0.3, 0.018, 0.07), R(0, TAU), pick(WOOD), 'wood'); }
-  // tire swing on an A-frame
-  { const c = b.spot(0.42); if (c) { const yaw = R(0, TAU), H = 0.46, W = 0.3;
-    for (const sx of [-1, 1]) { const top = V(c.x, H, c.z).add(rotY(V(sx * W, 0, 0), yaw));
-      b.bar(V(c.x, 0, c.z).add(rotY(V(sx * W, 0, -0.16), yaw)), top, 0.012, '#7d5634', 'wood'); b.bar(V(c.x, 0, c.z).add(rotY(V(sx * W, 0, 0.16), yaw)), top, 0.012, '#7d5634', 'wood'); }
-    b.bar(V(c.x, H, c.z).add(rotY(V(-W, 0, 0), yaw)), V(c.x, H, c.z).add(rotY(V(W, 0, 0), yaw)), 0.014, '#6e4f33', 'wood');
-    swing(b, V(c.x, H, c.z), yaw, 0.34, RUB, 'tire'); } }
-  { const c = b.spot(0.42); if (c) seesaw(b, c, R(0, TAU), '#c99a64', 'drum'); }
-  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#c8553d', 'radio'); }
   return {
     id: 'junk', seed, b, H: null,
-    style: { bg: '#efe2c8', fog: ['#efe2c8', 3, 12], hemi: ['#fff3dc', '#8c7457', 0.85], sun: ['#ffd9a0', 0.75, V(-0.7, 0.8, 0.4)], dust: true,
+    style: { bg: '#efe2c8', fog: ['#efe2c8', 6, 22], hemi: ['#fff3dc', '#8c7457', 0.85], sun: ['#ffd9a0', 0.75, V(-0.7, 0.8, 0.4)], dust: true,
       ground: { tex: 'dirt', col: '#ffffff' }, toyOutline: 0.003,
       fams: { wood: { t: 'lambert', tex: 'wood' }, paintwood: { t: 'lambert', tex: 'wood' }, bark: { t: 'lambert', tex: 'bark' }, leaves: { t: 'lambert', tex: 'leaves' }, rubber: { t: 'lambert', tex: 'rubber' }, rust: { t: 'lambert', tex: 'rust' }, rope: 'lambert' } },
     parts: [{ shape: 'can', r: 0.03, cols: ['#c0c4c8', '#c8553d', '#3f7cac'] }, { shape: 'tire', r: 0.034, cols: ['#2a2a2c'] }, { shape: 'box', r: 0.03, cols: ['#b98552', '#c99a64', '#8e6239'], tex: 'wood' }],
@@ -289,13 +282,32 @@ function genJunk(seed) {
 }
 
 const GEN = { vaneyck: genVanEyck, noguchi: genNoguchi, memphis: genMemphis, junk: genJunk };
-// one call, same answer everywhere: the playground for (level, seed)
-function makeLevel(id, seed) {
+function scaleBuilder(L) {
+  const k = K, b = L.b;
+  for (const c of b.cols) { c.c.multiplyScalar(k); c.br *= k; if (c.k === 0) c.h.multiplyScalar(k); else { c.r *= k; if (c.k === 1) c.hh *= k; } }
+  for (const f in b.vis) for (const it of b.vis[f]) { it.p.multiplyScalar(k); it.s.multiplyScalar(k); }
+  for (const d of b.devices) { for (const key of ['c', 'pivot', 'crank']) if (d[key]) d[key].multiplyScalar(k); for (const key of ['len', 'w', 'th', 'r', 'h']) if (d[key]) d[key] *= k; }
+  for (const p of L.spawns) p.multiplyScalar(k);
+  L.parts = L.parts.map(p => Object.assign({}, p, { r: p.r * k }));
+  if (L.H) { const H = L.H; L.H = (x, z) => H(x / k, z / k) * k; }
+}
+// one call, same answer everywhere: the room and playset for (level, seed, area)
+function makeLevel(id, seed, area) {
+  area = setupArea(area || JSON.parse(JSON.stringify(DEFAULT_AREA)));
+  const room = genRoom(id, seed);
+  PRE_CLAIMS = room.claims.map(c => ({ x: c.x / K, z: c.z / K, r: c.r / K }));
+  PRE_CLAIMS.push({ x: BOX.c.x / K, z: BOX.c.z / K, r: (BOX.w / 2 + 0.35) / K });
   const L = GEN[id](seed);
+  scaleBuilder(L);
+  L.area = area; L.room = room;
   L.groundH = L.H || (() => 0);
-  L.cols = L.b.cols; L.vis = L.b.vis; L.devices = L.b.devices;
+  // the chest: four walls and a floor
+  const { w, d, h, t } = BOX, bw = (x, z, hx, hz) => cBox(V(x, h / 2, z).applyQuaternion(BOX.q).add(V(BOX.c.x, 0, BOX.c.z)).setY(h / 2), V(hx, h / 2, hz), BOX.q.clone());
+  const boxCols = [bw(0, -d / 2 + t / 2, w / 2, t / 2), bw(0, d / 2 - t / 2, w / 2, t / 2), bw(-w / 2 + t / 2, 0, t / 2, d / 2), bw(w / 2 - t / 2, 0, t / 2, d / 2)];
+  for (const c of boxCols) c.c.y = h / 2;
+  L.cols = L.b.cols.concat(room.cols, boxCols); L.vis = L.b.vis; L.devices = L.b.devices;
   L.devices.forEach((d, i) => d.i = i);
-  L.grid = makeGrid(L.cols, 0.5);
+  L.grid = makeGrid(L.cols, 0.6);
   L.name = LEVELS.find(l => l.id === id).name;
   return L;
 }

@@ -11,12 +11,50 @@ const Y_AX = V(0, 1, 0), X_AX = V(1, 0, 0), Z_AX = V(0, 0, 1);
 const qYaw = (a, out) => (out || Q()).setFromAxisAngle(Y_AX, a);
 const r3 = v => Math.round(v * 1000) / 1000;
 
-/* ---------- the room ---------- */
-const HALF = 2.6;                                   // playground is 5.2 m x 5.2 m
-const BOX = { c: V(0, 0, -HALF + 0.42), w: 0.58, d: 0.38, h: 0.30, t: 0.025 };   // the toy box (open top)
-const TODDLER_START = { p: V(0, 0, -HALF + 1.2), yaw: Math.PI };               // rig yaw PI: you face +z, into the playground
-const GRAV = 9.8;
-const MATCH_TIME = 180;
+/* ---------- the room and the toy chest ----------
+   The play area is the floor space the toddler traced in mixed reality (or a default room).
+   The toy world (toys and the little playset) is K times the v1 size; toy speeds grow by sqrt(K)
+   so jumps and runs feel the same at the bigger size. */
+const K = 1.5, VS = Math.sqrt(K);
+const HALF = 2.0;                                   // only for fallbacks
+const GRAV = 9.8, MATCH_TIME = 180, WALL_H = 2.5;
+const BOX = { c: V(), yaw: 0, q: Q(), inv: Q(), w: 0.95, d: 0.55, h: 0.42, t: 0.035 };   // open-top chest against a wall; local +z faces the room
+const AREA = { poly: [], edges: [], minX: -2, maxX: 2, minZ: -2, maxZ: 2, cx: 0, cz: 0, size: 0, start: V() };
+const DEFAULT_AREA = { poly: [[-2.1, -1.8], [2.1, -1.8], [2.1, 1.8], [-2.1, 1.8]], start: [0, -0.8] };
+function inPoly(P, x, z) { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j]; if ((a.z > z) !== (b.z > z) && x < (b.x - a.x) * (z - a.z) / (b.z - a.z) + a.x) c = !c; } return c; }
+function segDist(e, x, z, out) { const t = clamp(((x - e.a.x) * e.dx + (z - e.a.z) * e.dz), 0, e.len); const px = e.a.x + e.dx * t, pz = e.a.z + e.dz * t; if (out) { out.x = px; out.z = pz; out.t = t; } return Math.hypot(x - px, z - pz); }
+function setupArea(a) {
+  const P = a.poly.map(p => ({ x: p[0], z: p[1] })); AREA.poly = P; AREA.edges = [];
+  let sa = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; sa += p.x * q.z - q.x * p.z; } AREA.size = Math.abs(sa) / 2;
+  AREA.minX = Math.min(...P.map(p => p.x)); AREA.maxX = Math.max(...P.map(p => p.x)); AREA.minZ = Math.min(...P.map(p => p.z)); AREA.maxZ = Math.max(...P.map(p => p.z));
+  AREA.cx = P.reduce((s, p) => s + p.x, 0) / P.length; AREA.cz = P.reduce((s, p) => s + p.z, 0) / P.length;
+  for (let i = 0; i < P.length; i++) { const A = P[i], B = P[(i + 1) % P.length], len = Math.hypot(B.x - A.x, B.z - A.z), dx = (B.x - A.x) / len, dz = (B.z - A.z) / len;
+    let nx = -dz, nz = dx; const mx = (A.x + B.x) / 2, mz = (A.z + B.z) / 2; if (!inPoly(P, mx + nx * 0.02, mz + nz * 0.02)) { nx = -nx; nz = -nz; }
+    AREA.edges.push({ i, a: A, b: B, len, dx, dz, nx, nz, mx, mz }); }
+  AREA.start.set(a.start ? a.start[0] : AREA.cx, 0, a.start ? a.start[1] : AREA.cz);
+  if (!a.box) a.box = placeBox(AREA.start);
+  BOX.c.set(a.box[0], 0, a.box[1]); BOX.yaw = a.box[2]; BOX.q.setFromAxisAngle(Y_AX, BOX.yaw); BOX.inv.copy(BOX.q).invert();
+  return a;
+}
+// the chest goes against the wall nearest where the toddler starts
+function placeBox(s) {
+  let best = null, bd = 1e9;
+  for (const e of AREA.edges) { if (e.len < BOX.w + 0.3) continue; const d = segDist(e, s.x, s.z); if (d < bd) { bd = d; best = e; } }
+  if (!best) best = AREA.edges.reduce((m, e) => e.len > m.len ? e : m, AREA.edges[0]);
+  const o = {}; segDist(best, s.x, s.z, o); const m = Math.min(BOX.w / 2 + 0.15, best.len / 2), t = clamp(o.t, m, best.len - m);
+  const x = best.a.x + best.dx * t + best.nx * (BOX.d / 2 + 0.03), z = best.a.z + best.dz * t + best.nz * (BOX.d / 2 + 0.03);
+  return [r3(x), r3(z), r3(Math.atan2(best.nx, best.nz))];
+}
+AREA.dist = (x, z) => { let d = 1e9; for (const e of AREA.edges) d = Math.min(d, segDist(e, x, z)); return d; };
+AREA.inside = (x, z, m) => inPoly(AREA.poly, x, z) && (!m || AREA.dist(x, z) >= m);
+AREA.clampIn = (p, r) => { for (let k = 0; k < 3; k++) { if (AREA.inside(p.x, p.z, r)) return false; let best = null, bd = 1e9, o = {}, bo = {};
+    for (const e of AREA.edges) { const d = segDist(e, p.x, p.z, o); if (d < bd) { bd = d; best = e; bo.x = o.x; bo.z = o.z; } }
+    p.x = bo.x + best.nx * (r + 0.002); p.z = bo.z + best.nz * (r + 0.002); } return true; };
+AREA.rand = (rng, m) => { for (let i = 0; i < 400; i++) { const x = lerp(AREA.minX, AREA.maxX, rng()), z = lerp(AREA.minZ, AREA.maxZ, rng()); if (AREA.inside(x, z, m)) return V(x, 0, z); } return V(AREA.cx, 0, AREA.cz); };
+const _bl = new THREE.Vector3();
+function boxLocal(p, out) { return (out || _bl).set(p.x - BOX.c.x, p.y, p.z - BOX.c.z).applyQuaternion(BOX.inv); }
+function boxFront(d) { return V(0, 0, BOX.d / 2 + d).applyQuaternion(BOX.q).add(BOX.c); }
+setupArea(JSON.parse(JSON.stringify(DEFAULT_AREA)));
 
 /* ---------- colliders ----------
    kinds: 0 oriented box, 1 upright cylinder, 2 sphere. Each has c (centre) and br (bounding radius).
@@ -213,6 +251,15 @@ const sfx = {
       case 'go': this.tone('square', 523, 523, 0.15, 0.08 * v); this.tone('square', 784, 784, 0.3, 0.08 * v, t + 0.15); break;
       case 'win': [0, 4, 7, 12].forEach((s, i) => this.tone('triangle', 523 * Math.pow(2, s / 12), 0, 0.35, 0.1 * v, t + i * 0.12)); break;
       case 'yawn': this.voice(380, 1.4, 0.1 * v, 700, 3); break;
+      case 'boom': this.hiss(0.35, 0.3 * v, 500, 0.7, 0, null, 120); this.tone('sine', 140, 50, 0.3, 0.3 * v); break;
+      case 'launch': this.hiss(0.6, 0.15 * v, 800, 1, 0, null, 3000); this.tone('sawtooth', 120, 400, 0.4, 0.04 * v); break;
+      case 'cannon': this.tone('sine', 110, 40, 0.25, 0.4 * v); this.hiss(0.15, 0.2 * v, 400); break;
+      case 'pew': for (let i = 0; i < 3; i++) this.tone('square', 1400, 500, 0.08, 0.05 * v, t + i * 0.07); break;
+      case 'bubble': for (let i = 0; i < 4; i++) this.tone('sine', 600 + Math.random() * 600, 1500, 0.06, 0.05 * v, t + i * 0.06); break;
+      case 'heli': for (let i = 0; i < 8; i++) this.hiss(0.04, 0.1 * v, 300, 2, t + i * 0.06); break;
+      case 'chatter': for (let i = 0; i < 6; i++) this.tone('square', 900, 700, 0.03, 0.05 * v, t + i * 0.05); break;
+      case 'clock': this.tone('square', 2400 * P, 2200 * P, 0.025, 0.05 * v); break;
+      case 'door': this.tone('sawtooth', 120, 90, 0.6, 0.04 * v); this.hiss(0.5, 0.05 * v, 300, 1); break;
       case 'babble': this.voice(380 + Math.random() * 120, 0.25, 0.07 * v, 800 + Math.random() * 600, 6); this.voice(420 + Math.random() * 120, 0.22, 0.06 * v, 1000, 6); break;
     }
   },
