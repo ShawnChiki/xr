@@ -16,6 +16,8 @@ The launcher (`index.html`) is how he sees what's new from the headset, so every
    Card markup: `<a class="card" href="folder/"><b>App Name</b><span class="blurb">One line on what you do in it</span></a>`.
    Order inside a column doesn't matter; the page sorts newest first.
    If no column fits, ask Sean before adding a new one.
+   If phones can join the game too, add `<span class="xplay">Phone + Quest</span>` after the blurb, and add it to the
+   **Multiplayer · Multiplatform** section of the Chiki Games launcher (`games` repo, see its CLAUDE.md).
 3. **Every app page loads `updated.js`** just before `</body>`:
    `<script src="../updated.js"></script>` for an app in its own folder, `<script src="updated.js"></script>` for a top-level `.html`.
 4. **Times are Toronto time (ET).** `updated.js` handles this (`America/Toronto`); keep it that way.
@@ -24,4 +26,5 @@ The launcher (`index.html`) is how he sees what's new from the headset, so every
 ## Launcher look
 
 Memphis / postmodern: cream paper, thick black outlines, hard offset "slab" shadows, bright pink / yellow / teal / cobalt / violet,
-confetti background, floating 3D shapes. Keep it informative and uncluttered: name, one-line blurb, when, what's new. No extra stats.
+confetti background, floating 3D shapes. Chiki Games (phone) has its own different look; don't copy one into the other.
+The button bar at the top links to Chiki Games (https://shawnchiki.github.io/games/); keep it on both launchers. Keep it informative and uncluttered: name, one-line blurb, when, what's new. No extra stats.
