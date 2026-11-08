@@ -258,6 +258,7 @@ const sfx = {
       case 'bubble': for (let i = 0; i < 4; i++) this.tone('sine', 600 + Math.random() * 600, 1500, 0.06, 0.05 * v, t + i * 0.06); break;
       case 'heli': for (let i = 0; i < 8; i++) this.hiss(0.04, 0.1 * v, 300, 2, t + i * 0.06); break;
       case 'chatter': for (let i = 0; i < 6; i++) this.tone('square', 900, 700, 0.03, 0.05 * v, t + i * 0.05); break;
+      case 'clatter': for (let i = 0; i < 5; i++) this.tone('square', 300 + Math.random() * 500, 150, 0.05, 0.06 * v, t + i * 0.045 + Math.random() * 0.03); break;
       case 'clock': this.tone('square', 2400 * P, 2200 * P, 0.025, 0.05 * v); break;
       case 'door': this.tone('sawtooth', 120, 90, 0.6, 0.04 * v); this.hiss(0.5, 0.05 * v, 300, 1); break;
       case 'babble': this.voice(380 + Math.random() * 120, 0.25, 0.07 * v, 800 + Math.random() * 600, 6); this.voice(420 + Math.random() * 120, 0.22, 0.06 * v, 1000, 6); break;

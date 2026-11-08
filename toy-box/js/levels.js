@@ -343,6 +343,9 @@ function makeLevel(id, seed, area) {
   const L = GEN[id](seed);
   scaleBuilder(L);
   L.area = area; L.room = room;
+  // things the toys can knock over: stacked blocks (towers) and books on the furniture
+  L.nParts = L.parts.length; L.tidyBlock = L.parts.length; L.parts.push({ shape: 'box', r: 0.032 * K, cols: ['#e23b2e', '#2f5cff', '#ffd400', '#3fbf6f', '#ff7a1a', '#9b5cff'] });
+  L.tidyBook = L.parts.length; L.parts.push({ shape: 'book', r: 0.05, cols: ['#e23b2e', '#2f5cff', '#3fbf6f', '#ffd400', '#9b5cff', '#ff7a1a'] });
   L.groundH = L.H || (() => 0);
   // the chest: four walls and a floor
   const { w, d, h, t } = BOX, bw = (x, z, hx, hz) => cBox(V(x, h / 2, z).applyQuaternion(BOX.q).add(V(BOX.c.x, 0, BOX.c.z)).setY(h / 2), V(hx, h / 2, hz), BOX.q.clone());

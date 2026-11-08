@@ -219,8 +219,9 @@ function buildToyBox(W) {
   const lab = new THREE.Mesh(new THREE.PlaneGeometry(w * 0.7, w * 0.7 * 192 / 512), new THREE.MeshBasicMaterial({ map: tx, transparent: true })); lab.position.set(0, h * 0.5, d / 2 + 0.003); g.add(lab);
   // a glowing ring over the chest that pulses when you're holding something
   W.boxGlow = new THREE.Mesh(new THREE.RingGeometry(0.1, 0.13, 40), new THREE.MeshBasicMaterial({ color: '#ffd400', transparent: true, opacity: 0, side: THREE.DoubleSide, fog: false })); W.boxGlow.rotation.x = -Math.PI / 2; W.boxGlow.position.y = h + 0.03; W.boxGlow.scale.set(w * 4.4, d * 4.4, 1); g.add(W.boxGlow);
-  W.boxLabel = { cv, tx, draw(n) { const x = cv.getContext('2d'); x.clearRect(0, 0, 512, 192); x.fillStyle = '#fffdf7'; x.strokeStyle = '#15121a'; x.lineWidth = 10; rr(x, 8, 8, 496, 176, 30); x.fill(); x.stroke();
-    x.fillStyle = '#15121a'; x.textAlign = 'center'; x.font = '400 64px Bungee, Rubik, sans-serif'; x.fillText('TOY BOX', 256, 88); x.font = '800 48px Rubik, sans-serif'; x.fillStyle = n === 0 ? '#00a651' : '#e23b2e'; x.fillText(n === 0 ? 'All clean!' : n + ' still out', 256, 152); tx.needsUpdate = true; } };
+  W.boxLabel = { cv, tx, draw(n, m0) { const x = cv.getContext('2d'); x.clearRect(0, 0, 512, 192); x.fillStyle = '#fffdf7'; x.strokeStyle = '#15121a'; x.lineWidth = 10; rr(x, 8, 8, 496, 176, 30); x.fill(); x.stroke();
+    x.fillStyle = '#15121a'; x.textAlign = 'center'; x.font = '400 56px Bungee, Rubik, sans-serif'; x.fillText('MESS ' + n, 256, 80);
+    const d = n - m0; x.font = '800 40px Rubik, sans-serif'; x.fillStyle = n === 0 ? '#00a651' : d >= 0 ? '#e23b2e' : '#00a651'; x.fillText(n === 0 ? 'All clean!' : d >= 0 ? `${d} messier than the start` : `${-d} tidier than the start`, 256, 146); tx.needsUpdate = true; } };
 }
 function rr(x, a, b, w, h, r) { x.beginPath(); x.moveTo(a + r, b); x.arcTo(a + w, b, a + w, b + h, r); x.arcTo(a + w, b + h, a, b + h, r); x.arcTo(a, b + h, a, b, r); x.arcTo(a, b, a + w, b, r); x.closePath(); }
 
@@ -277,6 +278,7 @@ function partGeo(L, kind, colIdx) {
     case 'cone': ps = [P('cone', V(0, r * 0.1, 0), V(r * 0.85, r * 1.6, r * 0.85), col), P('box', V(0, -r * 0.75, 0), V(r * 1.6, r * 0.15, r * 1.6), '#fffdf7')]; break;
     case 'can': ps = [P('cyl', V(), V(r * 0.7, r * 1.7, r * 0.7), col), P('cyl', V(0, r * 0.86, 0), V(r * 0.72, r * 0.05, r * 0.72), '#9aa3a8'), P('cyl', V(0, 0, 0), V(r * 0.72, r * 0.5, r * 0.72), '#fffdf7')]; break;
     case 'tire': ps = [P('tor', V(), V(r * 0.75, r * 0.75, r * 0.95), col)]; break;
+    case 'book': ps = [P('box', V(), V(r * 0.6, r * 1.9, r * 1.4), col), P('box', V(0, 0, r * 0.06), V(r * 0.5, r * 1.8, r * 1.3), '#fffdf7'), P('box', V(0, r * 0.5, 0), V(r * 0.62, r * 0.12, r * 1.42), '#ffd400')]; break;
   }
   return PART_GEO[key] = mergeParts(ps);
 }
@@ -341,12 +343,12 @@ function buildToddler(W) {
     T.g.add(g); return g;
   });
   // the balls above only place things now; what you see is one squishy blob body and two blob hands
-  hm.visible = false; for (const m of [T.chest, T.butt, ...T.arms, ...T.legs, ...T.feet]) m.visible = false;
+  for (const m of [T.chest, T.butt, ...T.arms, ...T.legs, ...T.feet]) m.visible = false;
   for (const g of T.hands) g.traverse(o => { if (o.isMesh) o.visible = false; });
   T.head.scale.setScalar(1.08);
   const bm = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
   T.blob = makeBlob(30, bm, 0.025); T.g.add(T.blob.mesh);
-  T.hblobs = [0, 1].map(() => { const b = makeBlob(20, bm, 0.012); T.g.add(b.mesh); return b; });
+  T.hblobs = [0, 1].map(() => { const b = makeBlob(13, bm, 0); T.g.add(b.mesh); return b; });
   T.cSkin = new THREE.Color(SK); T.cOne = new THREE.Color('#5fb4ff'); T.cOne2 = new THREE.Color('#bfe3ff'); T.k = 0;
   W.root.add(T.g); return T;
 }
@@ -360,13 +362,12 @@ const _hb = V();
 function handBalls(T, h, joints, out) {
   const S = T.cSkin;
   if (joints) { const J = joints.j;
-    for (let k = 1; k < 25; k++) out.push({ x: J[k].x, y: J[k].y, z: J[k].z, r: (k % 5 === 4 ? 0.019 : 0.023) * (k < 5 ? 1.15 : 1) * HAND_SCALE / 2, c: S });
-    for (const [a, b] of HBONES) { _hb.addVectors(J[a], J[b]).multiplyScalar(0.5); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.022 * HAND_SCALE / 2, c: S }); }
+    for (const k of [3, 4, 7, 9, 12, 14, 17, 19, 22, 24]) out.push({ x: J[k].x, y: J[k].y, z: J[k].z, r: 0.026 * HAND_SCALE / 2, c: S });
     for (const t of [0.2, 0.5, 0.8]) for (const m of [6, 16]) { _hb.copy(J[0]).lerp(J[m], t); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.034 * HAND_SCALE / 2, c: S }); }
     out.push({ x: J[0].x, y: J[0].y, z: J[0].z, r: 0.03 * HAND_SCALE / 2, c: S }); return out; }
   const g = T.hands[h]; g.updateMatrixWorld(true); const W = (x, y, z, r) => { g.localToWorld(_hb.set(x, y, z)); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r, c: S }); };
   const hs = HAND_SCALE; W(0, 0, 0.005 * hs, 0.034 * hs); W(0, 0, -0.022 * hs, 0.03 * hs); W(0, 0, 0.045 * hs, 0.026 * hs);
-  for (const f of g.fingers) { for (const o of [f.children[0], f.j2.children[0]]) { o.getWorldPosition(_hb); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.0105 * hs, c: S }); } }
+  for (const f of g.fingers) { f.j2.children[0].getWorldPosition(_hb); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.013 * hs, c: S }); }
   g.thumb.children[0].getWorldPosition(_hb); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.012 * hs, c: S });
   return out;
 }
@@ -420,7 +421,7 @@ function drawSnap(W, s, s2, k, me, dt) {
   const self = viewer === 'toddler'; td.head.visible = !self;
   // one meatball body: head, chest, belly, bum, arms, legs, feet melt together
   if (!self && (td.k = (td.k + 1) % 2) === 0) { const balls = [], push = (p, r, c) => balls.push({ x: p.x, y: p.y, z: p.z, r, c });
-    push(td.head.position, 0.155, td.cSkin); push(td.chest.position, 0.19, td.cOne); push(td.butt.position, 0.18, td.cOne); push(_vb.lerpVectors(td.chest.position, td.butt.position, 0.5), 0.18, td.cOne2);
+    push(_vb.lerpVectors(td.head.position, td.chest.position, 0.6), 0.1, td.cOne); push(td.chest.position, 0.19, td.cOne); push(td.butt.position, 0.18, td.cOne); push(_vb.lerpVectors(td.chest.position, td.butt.position, 0.5), 0.18, td.cOne2);
     for (let h = 0; h < 2; h++) { const lg = td.legs[h].position, ft = td.feet[h].position; push(lg, 0.085, td.cOne); push(_vb.lerpVectors(lg, ft, 0.5), 0.07, td.cOne); push(ft, 0.065, td.cSkin);
       if (!td.hands[h].visible) continue; const a = td.arms[h], top = V(0, 0.5, 0).applyQuaternion(a.quaternion).multiplyScalar(a.scale.y).add(a.position), bot = V(0, -0.5, 0).applyQuaternion(a.quaternion).multiplyScalar(a.scale.y).add(a.position);
       for (const t of [0, 0.3, 0.6, 0.85]) push(_vb.lerpVectors(bot, top, t), lerp(0.075, 0.055, t), t > 0.8 ? td.cSkin : td.cOne); }
@@ -443,7 +444,7 @@ function drawSnap(W, s, s2, k, me, dt) {
     else if (o.d.type === 'swing') o.arm.rotation.x = v2 !== undefined ? lerp(v, v2, k) : v;
     else if (o.d.type === 'mbox') { o.crank.rotation.x = v[1]; o.dots.forEach((m, j) => m.material.color.set(v[2] ? '#cfc8d8' : j < Math.round(v[0] * 8) ? '#ffd400' : '#6a6470')); } });
   W.walls.forEach((m, i) => { const w = s.tw[i]; m.visible = !!w; if (w) { m.position.set(w[0], w[1], w[2]); m.rotation.y = w[3]; m.scale.y = Math.min(1, w[4] * 3); } });
-  if (s.ml !== W.lastMl) { W.lastMl = s.ml; W.boxLabel.draw(s.ml); }
+  if (s.ml !== W.lastMl || s.m0 !== W.lastM0) { W.lastMl = s.ml; W.lastM0 = s.m0; W.boxLabel.draw(s.ml, s.m0 === undefined ? s.ml : s.m0); }
   // the chest glows when the toddler is carrying something
   const carrying = (T[TD.H0 + 7] & 8) || (T[TD.H0 + TD.HS + 7] & 8); W.boxGlow.material.opacity = carrying && s.st === 1 ? 0.45 + Math.sin(now / 160) * 0.3 : 0;
   // clock face, TV
@@ -523,6 +524,9 @@ function onEvent(W, e, ear, viewer) {
     case 'roar': sfx.play('roar', vol); break;
     case 'lullaby': sfx.play('lullaby', 1); for (let i = 0; i < 12; i++) P(['#ffd400', '#cbb7ea', '#ff8fc7'][i % 3], 1, 0.4, 0.022, 2, -0.15); break;
     case 'launch': case 'cannon': case 'pew': case 'bubble': case 'heli': case 'chatter': sfx.play(code, vol); if (code === 'launch' || code === 'cannon') P('#d9d3cc', 10, 0.6, 0.025, 0.8, -0.2); break;
+    case 'topple': sfx.play('clatter', vol); P('#fff6c8', 5, 0.5, 0.014, 0.5); break;
+    case 'raid': sfx.play('boing', vol, 1.4); sfx.play('pop', vol); P('#ff3e8a', 10, 1.0, 0.018, 0.6); break;
+    case 'mess': if (viewer === 'toy') sfx.play('tick', 0.4, 1.6); break;
     case 'crank': sfx.play('crank', vol); break;
     case 'creak': sfx.play('creak', vol); break;
     case 'spin': case 'zip': case 'whistle': case 'boing': case 'squeak': case 'slip': case 'hop': sfx.play(code, vol, code === 'boing' && a ? 1.3 : 1); if (code === 'boing' || code === 'hop') P('#ffffff', 4, 0.4, 0.012, 0.4); break;

@@ -16,7 +16,7 @@ const THEMES = {
 };
 function genRoom(id, seed) {
   const T = THEMES[id], rng = mulberry(seed ^ 0x9e3779b9), R = (a, b) => a + rng() * (b - a), pick = a => a[Math.floor(rng() * a.length)];
-  const r = { theme: T, cols: [], vis: {}, claims: [], clock: null, door: null, win: null, pics: [], lamps: [], screens: [] };
+  const r = { theme: T, cols: [], vis: {}, claims: [], clock: null, door: null, win: null, pics: [], lamps: [], screens: [], tidy: [] };   // tidy: spots for books the toys can knock off
   const add = (fam, it) => { (r.vis[fam] || (r.vis[fam] = [])).push(it); };
   const yawOf = e => Math.atan2(e.nx, e.nz);
   const at = (e, s, y, u) => V(e.a.x + e.dx * s + e.nx * u, y, e.a.z + e.dz * s + e.nz * u);
@@ -66,11 +66,12 @@ function genRoom(id, seed) {
     const n = Math.max(2, Math.round(L / 0.6)); for (let i = 0; i < n; i++) ebox('r_fab', e, s - L / 2 + 0.2 + (i + 0.5) * (L - 0.4) / n, 0.45, D / 2 + 0.03, (L - 0.4) / n - 0.03, 0.1, D - 0.18, i % 2 ? T.cushion : T.sofa, { noCol: true });
     ebox('r_fab', e, s - L / 4, 0.62, 0.25, 0.36, 0.3, 0.12, T.cushion, { noCol: true });
     for (const k of [-1, 1]) ecyl('r_wood', e, s + k * (L / 2 - 0.1), 0, D - 0.1, 0.025, 0.06, T.wood, { noCol: true }); };
-  const shelf = (e, s) => { const L = 0.82, D = 0.3, H = 1.35;
+  const shelf = (e, s) => { const L = 0.82, D = 0.3, H = 1.35; books(e, s, 0.7, H - 0.02 + 0.015, D / 2);
     for (const k of [-1, 1]) ebox('r_wood', e, s + k * (L / 2 - 0.015), H / 2, D / 2, 0.03, H, D, T.wood);
     for (let i = 0; i < 4; i++) { const y = 0.02 + i * (H - 0.04) / 3; ebox('r_wood', e, s, y, D / 2, L, 0.03, D, T.wood);
       if (i < 3) { let x = -L / 2 + 0.05; while (x < L / 2 - 0.08) { const w = R(0.03, 0.06), h = R(0.18, 0.3); ebox('r_paint', e, s + x + w / 2, y + 0.015 + h / 2, D / 2, w, h, D * 0.8, pick(T.acc.concat(['#fffdf7', '#15121a'])), { noCol: true }); x += w + 0.005; if (rng() < 0.12) x += 0.1; } } } };
-  const cubby = (e, s) => { const L = 0.95, D = 0.32, H = 0.62;
+  const books = (e, s, len, y, u) => { const n = Math.floor(len / 0.1); for (let i = 0; i < n; i++) r.tidy.push({ p: at(e, s - len / 2 + (i + 0.5) * len / n, y, u), yaw: yawOf(e) }); };
+  const cubby = (e, s) => { const L = 0.95, D = 0.32, H = 0.62; books(e, s, 0.8, H + 0.0125, D / 2);
     for (let i = 0; i <= 3; i++) ebox('r_wood', e, s - L / 2 + i * L / 3, H / 2, D / 2, 0.025, H, D, T.wood);
     for (const y of [0.01, H / 2, H]) ebox('r_wood', e, s, y, D / 2, L, 0.025, D, T.wood);
     ebox('r_wood', e, s, H / 2, 0.01, L, H, 0.02, T.wood, { noCol: true });
@@ -80,7 +81,7 @@ function genRoom(id, seed) {
     if (T.lamp === 'akari') { add('r_glow', { g: 'sph', p: V(c.x, 1.55, c.z), q: Q(), s: V(0.2, 0.3, 0.2), col: '#fff6dd' }); for (let i = 0; i < 6; i++) add('r_paint', { g: 'ring', p: V(c.x, 1.32 + i * 0.09, c.z), q: qx(Math.PI / 2), s: V(0.2 * Math.sin(0.35 + i * 0.47) + 0.02, 0.2 * Math.sin(0.35 + i * 0.47) + 0.02, 0.2), col: '#e9dcc6' }); }
     else add('r_glow', { g: 'cone', p: V(c.x, 1.5, c.z), q: Q(), s: V(0.2, 0.25, 0.2), col: pick(T.acc) });
     r.lamps.push(V(c.x, 1.5, c.z)); };
-  const tv = (e, s) => { ebox('r_wood', e, s, 0.22, 0.2, 1.1, 0.44, 0.4, T.wood); ebox('r_paint', e, s, 0.75, 0.12, 0.92, 0.56, 0.06, '#15121a', { noCol: true });
+  const tv = (e, s) => { ebox('r_wood', e, s, 0.22, 0.2, 1.1, 0.44, 0.4, T.wood); books(e, s + 0.3, 0.4, 0.44, 0.3); ebox('r_paint', e, s, 0.75, 0.12, 0.92, 0.56, 0.06, '#15121a', { noCol: true });
     r.screens.push({ p: at(e, s, 0.75, 0.155), yaw: yawOf(e), w: 0.84, h: 0.48 }); };
   const crates = (e, s) => { for (let i = 0; i < 3; i++) ebox('r_wood', e, s + (i - 1) * 0.36, 0.17 + (i === 1 ? 0.34 : 0), 0.2, 0.34, 0.34, 0.36, T.wood); ebox('r_wood', e, s + 0.36, 0.17, 0.2, 0.34, 0.34, 0.36, T.wood); };
   const radiator = (e, s) => { for (let i = 0; i < 8; i++) ebox('r_paint', e, s - 0.3 + i * 0.085, 0.35, 0.07, 0.05, 0.55, 0.1, '#e9e4da'); };
@@ -92,7 +93,7 @@ function genRoom(id, seed) {
     ebox('r_fab', e, s + L * 0.15, 0.53, D / 2, L * 0.68, 0.05, D + 0.02, T.sofa); ebox('r_fab', e, s - L / 2 + 0.24, 0.55, D / 2, 0.36, 0.1, D * 0.6, '#ffffff');
     ebox('r_wood', e, s - L / 2 - 0.02, 0.45, D / 2, 0.05, 0.9, D, T.wood); ebox('r_wood', e, s + L / 2 + 0.02, 0.35, D / 2, 0.05, 0.7, D, T.wood);
     for (let i = 0; i < 5; i++) ebox('r_paint', e, s + L * 0.15 - L * 0.3 + i * L * 0.15, 0.556, D / 2, 0.06, 0.004, D + 0.03, i % 2 ? '#ffd400' : T.cushion, { noCol: true }); };
-  const desk = (e, s) => { ebox('r_wood', e, s, 0.68, 0.3, 1.0, 0.04, 0.55, T.wood); for (const k of [-1, 1]) ebox('r_wood', e, s + k * 0.46, 0.33, 0.3, 0.05, 0.66, 0.5, T.wood);
+  const desk = (e, s) => { ebox('r_wood', e, s, 0.68, 0.3, 1.0, 0.04, 0.55, T.wood); books(e, s + 0.15, 0.5, 0.7, 0.3); for (const k of [-1, 1]) ebox('r_wood', e, s + k * 0.46, 0.33, 0.3, 0.05, 0.66, 0.5, T.wood);
     ebox('r_paint', e, s + 0.1, 0.42, 0.62, 0.38, 0.04, 0.36, T.acc[0]); ebox('r_paint', e, s + 0.1, 0.62, 0.8, 0.38, 0.4, 0.04, T.acc[0]); for (const [x, u] of [[-0.15, 0.48], [0.35, 0.48], [-0.15, 0.76], [0.35, 0.76]]) ecyl('r_paint', e, s + x, 0, u, 0.015, 0.4, '#15121a', { noCol: true });
     add('r_glow', { g: 'cone', p: at(e, s - 0.35, 0.82, 0.2), q: Q(), s: V(0.08, 0.1, 0.08), col: T.acc[2] }); ecyl('r_paint', e, s - 0.35, 0.7, 0.2, 0.01, 0.12, '#15121a', { noCol: true }); };
   const longest = E.reduce((m, e) => e.len > m.len ? e : m, E[0]);

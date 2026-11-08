@@ -2,7 +2,7 @@
    Everything that moves lives here: toys, loose parts, foam missiles and bubbles, the toddler's head and giant hands,
    the seesaw, swings and merry-go-round, the music box, the nap clock. Phones send their stick and buttons;
    the host sends back a snapshot 30 times a second (see snap()). */
-const MESS = { small: { toys: 12, parts: 6 }, medium: { toys: 18, parts: 10 }, big: { toys: 26, parts: 14 } };
+const MESS = { small: { toys: 12, parts: 6, towers: 3, books: 8 }, medium: { toys: 18, parts: 10, towers: 4, books: 12 }, big: { toys: 26, parts: 14, towers: 6, books: 18 } };
 const PHASES = [
   { name: 'Epic!', sub: 'The giant toddler wakes up' },
   { name: 'Silly', sub: 'Everything gets bouncy' },
@@ -23,10 +23,18 @@ function newMatch(levelId, seed, messKey, opts = {}, area) {
   const kinds = TOYS.map((_, i) => i); for (let i = kinds.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [kinds[i], kinds[j]] = [kinds[j], kinds[i]]; }
   const spots = L.spawns.slice(); let si = 0; const nextSpot = () => spots[si++ % spots.length].clone();
   for (let i = 0; i < M.toys; i++) { const k = kinds[i % kinds.length], T = TOYS[k]; addBody(S, 'toy', k, T.r * K, nextSpot()); }
-  for (let i = 0; i < M.parts; i++) { const pt = i % L.parts.length, P = L.parts[pt]; const b = addBody(S, 'part', pt, P.r, nextSpot()); b.col = i % P.cols.length; }
+  for (let i = 0; i < M.parts; i++) { const pt = i % L.nParts, P = L.parts[pt]; const b = addBody(S, 'part', pt, P.r, nextSpot()); b.col = i % P.cols.length; }
   for (let i = 0; i < 3; i++) { const b = addBody(S, 'decoy', TOYS.findIndex(t => t.key === 'duck'), 0.04 * K, V(0, -1, 0)); b.away = true; }
   for (const b of S.bodies) { b.yaw = rng() * TAU; b.q.copy(qYaw(b.yaw)); if (b.type === 'toy') b.ctrl = 'bot'; }
-  S.messTotal = S.bodies.filter(b => b.type !== 'decoy').length; S.messLeft = S.messTotal;
+  // tidy things the toys can knock over: block towers on the floor, books on the furniture
+  S.groups = [];
+  const BR = L.parts[L.tidyBlock].r, nTow = M.towers;
+  for (let t = 0; t < nTow; t++) { const sp = nextSpot(); if (!AREA.inside(sp.x, sp.z, 0.25)) continue; const g = [], yaw = rng() * TAU, base = L.groundH(sp.x, sp.z), n = 3 + Math.floor(rng() * 3);
+    for (let k = 0; k < n; k++) { const b = addBody(S, 'part', L.tidyBlock, BR, V(sp.x, base + BR + k * BR * 2, sp.z)); b.col = Math.floor(rng() * 6); b.tidy = true; b.grp = S.groups.length; b.lvl = k; b.yaw = yaw; b.q.copy(qYaw(yaw)); g.push(b.i); }
+    S.groups.push(g); }
+  const shelf = L.room.tidy.slice(); for (let i = shelf.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [shelf[i], shelf[j]] = [shelf[j], shelf[i]]; }
+  for (const t of shelf.slice(0, M.books)) { const R = L.parts[L.tidyBook].r, b = addBody(S, 'part', L.tidyBook, R, t.p.clone().setY(t.p.y + R)); b.col = Math.floor(rng() * 6); b.tidy = true; b.grp = S.groups.length; b.lvl = 0; b.yaw = t.yaw; b.q.copy(qYaw(t.yaw)); S.groups.push([b.i]); }
+  S.messTotal = S.bodies.filter(b => b.type !== 'decoy').length; S.messLeft = countMess(S); S.m0 = S.messLeft; S.raidT = -9;
   return S;
 }
 function addBody(S, type, kind, r, p) {
@@ -35,6 +43,14 @@ function addBody(S, type, kind, r, p) {
     stun: 0, sticky: 0, slip: 0, boost: 0, glide: 0, float: 0, rise: 0, pogo: 0, magnet: 0, shrink: 0, bouncy: 0, charge: 0, fly: 0, hover: 0, chute: 0, bite: 0, life: 0,
     cd: 0, ctrl: null, inp: null, bot: { tgt: V(), t: 0, stuck: 0, jumpCd: 0, spCd: 2 + Math.random() * 4 }, thrownBy: null, thrownT: -9, touchTd: -9, col: 0 };
   S.bodies.push(b); return b;
+}
+// the mess: everything out of the toy box that isn't standing tidy
+function countMess(S) { let n = 0; for (const b of S.bodies) if (b.type !== 'decoy' && !b.away && !b.tidy) n++; return n; }
+// knock a tidy thing over (and everything stacked on it)
+function wake(S, b, kick) {
+  if (!b.tidy) return; const g = S.groups[b.grp] || [b.i];
+  for (const i of g) { const o = S.bodies[i]; if (!o.tidy || o.lvl < b.lvl) continue; o.tidy = false; o.v.set((S.rng() - 0.5) * 0.8, 0.3 + S.rng() * 0.4, (S.rng() - 0.5) * 0.8); if (kick) o.v.add(kick); o.w.set(S.rng() - 0.5, S.rng() - 0.5, S.rng() - 0.5).multiplyScalar(14); }
+  evAt(S, 'topple', b.p);
 }
 function emit(S, e) { S.ev.push(e); S.netEv.push(e); }   // e = [code, x, y, z, a]
 const evAt = (S, code, p, a) => emit(S, [code, r3(p.x), r3(p.y), r3(p.z), a === undefined ? 0 : a]);
@@ -89,7 +105,7 @@ function numbHand(S, i, t) { const h = S.td.hands[i]; h.numb = Math.max(h.numb, 
 function tantrum(S, at) {
   const td = S.td; if (td.slamCd > 0) return; td.slamCd = S.phase === 2 ? 4 : 7;
   const gh = S.L.groundH(at.x, at.z); at = V(at.x, gh, at.z); evAt(S, 'slam', at); td.mouth = 1;
-  for (const b of S.bodies) { if (b.away || b.held >= 0) continue; const d = V().subVectors(b.p, at); d.y = 0; const l = d.length(); if (l > 1.2) continue;
+  for (const b of S.bodies) { if (b.away || b.held >= 0) continue; const d = V().subVectors(b.p, at); d.y = 0; const l = d.length(); if (l > 1.2) continue; wake(S, b);
     const k = 1 - l / 1.2; if (l > 1e-3) d.divideScalar(l); else d.set(1, 0, 0);
     b.v.addScaledVector(d, 1.9 * VS * k).y += (2.4 * k + 0.4) * VS; b.stun = Math.max(b.stun, 0.6 + k * 1.2); b.thrownBy = 'toddler'; b.thrownT = S.t - 2;
     if (b.carriedBy >= 0) drop(S, b); b.w.set(S.rng() - 0.5, 0, S.rng() - 0.5).multiplyScalar(20); }
@@ -113,12 +129,14 @@ function toddlerPre(S, dt) {
       if (best) {
         if (best.slip > 0) { evAt(S, 'slip', best.p); best.v.add(V(S.rng() - 0.5, 0.8, S.rng() - 0.5).multiplyScalar(1.6 * VS)); }
         else if (best.type === 'decoy') { evAt(S, 'pop', best.p); best.away = true; best.p.set(0, -1, 0); }
-        else { h.held = best.i; best.held = i; best.holdQ.copy(h.q).invert().multiply(best.q); if (best.carriedBy >= 0) drop(S, best); if (best.carry >= 0) { const c = S.bodies[best.carry]; c.carriedBy = -1; best.carry = -1; }
+        else { wake(S, best); h.held = best.i; best.held = i; best.holdQ.copy(h.q).invert().multiply(best.q); if (best.carriedBy >= 0) drop(S, best); if (best.carry >= 0) { const c = S.bodies[best.carry]; c.carriedBy = -1; best.carry = -1; }
           best.stun = 0; best.fly = best.hover = 0; evAt(S, 'grab', best.p, best.type === 'toy' ? best.kind : -1); h.mouthT = 0; h.chomped = false; }
       }
     }
     if (rel && h.held >= 0) release(S, h, S.bodies[h.held]);
     if (h.held >= 0) { const b = S.bodies[h.held]; if (!h.chomped && holdPos(h, V()).distanceTo(mp) < 0.13) { h.mouthT += dt; if (h.mouthT > 0.3) { h.chomped = true; b.sticky = 8; td.mouth = 1; evAt(S, 'chomp', mp); } } }
+    // clumsy giant hands knock tidy things over
+    if (h.on && h.v.lengthSq() > 0.06) for (const b of S.bodies) if (b.tidy && h.held !== b.i && b.p.distanceTo(h.p) < b.r + HAND_R) wake(S, b, h.v.clone().multiplyScalar(0.5));
     // a quick slap down to the floor
     const gh = S.L.groundH(h.p.x, h.p.z);
     if (h.p.y < gh + 0.08) { if (!h.down) { h.down = true; if (h.v.y < -1.2) h.slamT = S.t; } } else if (h.p.y > gh + 0.13) h.down = false;
@@ -214,7 +232,7 @@ function stepProj(S, dt) {
     // hits on the room
     if (!gone) { if (P.p.y < S.L.groundH(P.p.x, P.p.z) + pr) { if (P.k === 'ball' && P.v.y < -0.8) { P.p.y = pr; P.v.y *= -0.45; P.v.x *= 0.7; P.v.z *= 0.7; } else gone = true; }
       else for (const c of S.L.grid.near(P.p, _nb)) if (hit(c, P.p, pr, _o)) { if (P.k === 'ball') { P.p.addScaledVector(_o.n, _o.pen); const vn = P.v.dot(_o.n); if (vn < 0) P.v.addScaledVector(_o.n, -1.5 * vn); } else gone = true; break; } }
-    if (P.k === 'ball' && !gone) for (const b of S.bodies) { if (b.away || b.held >= 0 || b.p.distanceTo(P.p) > b.r + pr) continue; const n = V().subVectors(b.p, P.p).normalize(); b.v.addScaledVector(n, 1.5 * VS); }
+    if (P.k === 'ball' && !gone) for (const b of S.bodies) { if (b.away || b.held >= 0 || b.p.distanceTo(P.p) > b.r + pr) continue; const n = V().subVectors(b.p, P.p).normalize(); wake(S, b); b.v.addScaledVector(n, 1.5 * VS); }
     if (gone) { if (P.k === 'missile' || P.k === 'bubble') evAt(S, P.k === 'missile' ? 'boom' : 'pop', P.p); S.proj.splice(i, 1); }
   }
 }
@@ -231,14 +249,14 @@ function special(S, b) {
     case 'duck': { const d = S.bodies.find(x => x.type === 'decoy' && x.away); if (d) { d.away = false; d.p.copy(b.p).addScaledVector(V(-f.z, 0, f.x), b.r * 2); d.p.y += 0.04; d.v.set(0, 1, 0); d.life = 5; d.yaw = b.yaw + (S.rng() - 0.5) * 2; d.q.copy(qYaw(d.yaw)); d.ctrl = 'decoy'; } say = 'squeak'; break; }
     case 'jack': b.v.y = 3.7 * s; say = 'boing'; break;
     case 'slinky': b.v.copy(f).multiplyScalar(1.9 * s).y = 2.3 * s; say = 'boing'; break;
-    case 'top': b.slip = 2.8; for (const o of S.bodies) if (o !== b && !o.away && o.held < 0 && o.p.distanceTo(b.p) < 0.18 * K) o.v.add(V().subVectors(o.p, b.p).setY(0).normalize().multiplyScalar(1.4 * s)); say = 'spin'; break;
+    case 'top': b.slip = 2.8; for (const o of S.bodies) if (o !== b && !o.away && o.held < 0 && o.p.distanceTo(b.p) < 0.18 * K) wake(S, o), o.v.add(V().subVectors(o.p, b.p).setY(0).normalize().multiplyScalar(1.4 * s)); say = 'spin'; break;
     case 'teddy': b.float = 3.2; b.v.y = Math.max(b.v.y, 1.7 * s); say = 'hop'; break;
     case 'robot': b.boost = 1.1; say = 'zip'; break;
     case 'train': b.charge = 1.8; say = 'whistle'; break;
     case 'yoyo': { if (b.carry >= 0) { b.cd = 0.5; return; } let best = null, bd = 1.35 * K; for (const o of S.bodies) if (o.type === 'part' && !o.away && o.held < 0 && o.carriedBy < 0) { const d = o.p.distanceTo(b.p); if (d < bd) { bd = d; best = o; } }
       if (best) { best.carriedBy = b.i; b.carry = best.i; } say = 'zip'; break; }
     case 'kite': b.glide = 3.5; b.v.y = Math.max(b.v.y, 1.6 * s); say = 'zip'; break;
-    case 'drum': for (const o of S.bodies) { if (o === b || o.away || o.held >= 0) continue; const d = V().subVectors(o.p, b.p); d.y = 0; const l = d.length(), R = 0.7 * K; if (l > R || l < 1e-4) continue; const k = 1 - l / R; o.v.addScaledVector(d.divideScalar(l), 2.2 * s * k).y += 1.3 * s * k; if (o.carriedBy >= 0) drop(S, o); }
+    case 'drum': for (const o of S.bodies) { if (o === b || o.away || o.held >= 0) continue; const d = V().subVectors(o.p, b.p); d.y = 0; const l = d.length(), R = 0.7 * K; if (l > R || l < 1e-4) continue; wake(S, o); const k = 1 - l / R; o.v.addScaledVector(d.divideScalar(l), 2.2 * s * k).y += 1.3 * s * k; if (o.carriedBy >= 0) drop(S, o); }
       for (let i = 0; i < 2; i++) if (td.hands[i].on && td.hands[i].p.distanceTo(b.p) < 0.6) numbHand(S, i, 1.0); say = 'drum'; break;
     case 'balloon': b.rise = 2.3; say = 'hop'; break;
     case 'dino': { let bit = false; for (let i = 0; i < 2; i++) if (td.hands[i].on && td.hands[i].p.distanceTo(b.p) < 0.32) { numbHand(S, i, 1.6); bit = true; evAt(S, 'bonk', td.hands[i].p); } say = 'roar'; if (bit) td.mouth = 1; break; }
@@ -246,7 +264,7 @@ function special(S, b) {
     case 'squirt': case 'firetruck': { const to = V().subVectors(td.head, b.p), l = to.length(); to.normalize(); const fl = V(f.x, 0.5, f.z).normalize(), range = T.key === 'firetruck' ? 2.6 : 1.9;
       if (l < range && to.dot(fl) > 0.5) { td.splat = 2.3; evAt(S, 'splash', td.head, 1); } else evAt(S, 'splash', b.p.clone().addScaledVector(fl, 0.5), 0);
       if (T.key === 'firetruck') { for (let i = 0; i < 2; i++) { const h = td.hands[i], dh = V().subVectors(h.p, b.p); if (h.on && dh.length() < range && dh.normalize().dot(fl) > 0.6) numbHand(S, i, 0.6); }
-        for (const o of S.bodies) { if (o === b || o.away || o.held >= 0) continue; const d = V().subVectors(o.p, b.p); if (d.length() < 0.8 * K && d.normalize().dot(f) > 0.7) o.v.addScaledVector(f, 1.6 * s); } }
+        for (const o of S.bodies) { if (o === b || o.away || o.held >= 0) continue; const d = V().subVectors(o.p, b.p); if (d.length() < 0.8 * K && d.normalize().dot(f) > 0.7) { wake(S, o); o.v.addScaledVector(f, 1.6 * s); } } }
       say = ''; break; }
     case 'plane': b.fly = 5; b.v.y = Math.max(b.v.y, 1.2 * s); say = 'zip'; break;
     case 'heli': b.hover = 5; b.v.y = Math.max(b.v.y, 1.0 * s); say = 'heli'; break;
@@ -256,7 +274,7 @@ function special(S, b) {
       const w = cBox(c, V(0.12, 0.075, 0.025).multiplyScalar(K), qYaw(b.yaw), { climb: true }); w.life = 7; w.yaw = b.yaw; S.walls.push(w); say = 'pop'; break; }
     case 'marble': b.shrink = 4.5; say = 'zip'; break;
     case 'ballerina': S.nap = Math.max(0.5, S.nap - 4); S.lullabies++; td.sleepy = 1; say = 'lullaby'; break;
-    case 'popper': { if (td.head.distanceTo(b.p) < 1.4) td.confetti = 2.2; for (const o of S.bodies) if (o !== b && !o.away && o.held < 0 && o.p.distanceTo(b.p) < 0.3 * K) o.v.y += 1.2 * s; say = 'confetti'; break; }
+    case 'popper': { if (td.head.distanceTo(b.p) < 1.4) td.confetti = 2.2; for (const o of S.bodies) if (o !== b && !o.away && o.held < 0 && o.p.distanceTo(b.p) < 0.3 * K) { wake(S, o); o.v.y += 1.2 * s; } say = 'confetti'; break; }
     case 'frog': b.v.copy(f).multiplyScalar(1.5 * s).y = 2.85 * s; say = 'boing'; break;
     case 'missile': for (let i = 0; i < 2; i++) { const side = V(-f.z, 0, f.x).multiplyScalar((i ? 1 : -1) * b.r); shoot(S, 'missile', muzzle.clone().add(side), V(f.x * 1.5, 2.2, f.z * 1.5)); } say = 'launch'; break;
     case 'tank': { const t = toddlerTarget(S, muzzle), d = V(t.x - muzzle.x, 0, t.z - muzzle.z), dist = Math.max(0.3, d.length()), sp = clamp(Math.sqrt(GRAV * dist * 1.05), 1.5, 6.5); d.normalize(); b.yaw = Math.atan2(d.x, d.z);
@@ -272,30 +290,77 @@ function special(S, b) {
 }
 const SHOOTERS = new Set(['missile', 'tank', 'dart', 'bubbles', 'squirt', 'firetruck']);
 
-/* ---------- toys thinking for themselves (bots) ---------- */
+/* ---------- toys thinking for themselves (bots) ----------
+   Each bot picks a job, sticks with it for a few seconds, and drops everything to run when a giant hand comes:
+   topple (knock a tower or a book over), raid (fling things back out of the chest while the toddler is away),
+   pester (pick up a loose part and throw it at the toddler's hands), rescue (shoot the hand holding a friend). */
+function botJob(S, b, o) {
+  const td = S.td, key = TOYS[b.kind].key, shooter = SHOOTERS.has(key), farFromBox = td.head.distanceTo(BOX.c) > 1.4;
+  const holding = td.hands.find(h => h.on && h.held >= 0 && S.bodies[h.held].type === 'toy');
+  const tidy = S.bodies.filter(t => t.tidy && t.p.y < b.p.y + 0.45 && t.p.distanceTo(b.p) < 3.2);
+  const loose = S.bodies.filter(t => t.type === 'part' && !t.tidy && !t.away && t.held < 0 && t.carriedBy < 0 && t.p.distanceTo(b.p) < 2);
+  const inBox = S.bodies.some(t => t.away && t.type !== 'decoy');
+  const jobs = [['wander', 0.4]];
+  if (tidy.length) jobs.push(['topple', 3]);
+  if (inBox) jobs.push(['raid', farFromBox ? 3.5 : 0.6]);
+  if (loose.length || b.carry >= 0) jobs.push(['pester', 1.4]);
+  if (holding && shooter) jobs.push(['rescue', 6]);
+  let tot = jobs.reduce((t, j) => t + j[1], 0), r = S.rng() * tot; o.job = jobs[0][0];
+  for (const j of jobs) { r -= j[1]; if (r <= 0) { o.job = j[0]; break; } }
+  o.jobT = 3 + S.rng() * 4; o.tgtI = -1;
+  if (o.job === 'topple') { let best = null, bd = 1e9; for (const t of tidy) { const d = t.p.distanceTo(b.p) + S.rng() * 0.5; if (d < bd) { bd = d; best = t; } } o.tgtI = best ? best.i : -1; }
+  if (o.job === 'pester' && b.carry < 0) { let best = null, bd = 1e9; for (const t of loose) { const d = t.p.distanceTo(b.p); if (d < bd) { bd = d; best = t; } } o.tgtI = best ? best.i : -1; }
+}
 function botInput(S, b, dt) {
   const td = S.td, o = b.bot, inp = b.inp || (b.inp = { mx: 0, mz: 0, jump: false, grab: false, sp: false, gh: false });
-  inp.jump = inp.grab = inp.sp = false; o.t -= dt; o.jumpCd -= dt; o.spCd -= dt;
-  let mx = 0, mz = 0, threat = 1e9, tp = null;
-  for (const h of td.hands) { if (!h.on) continue; const d = Math.hypot(h.p.x - b.p.x, h.p.z - b.p.z); if (d < threat) { threat = d; tp = h.p; } }
-  const dh = Math.hypot(td.head.x - b.p.x, td.head.z - b.p.z); if (dh < threat) { threat = dh; tp = td.head; }
-  const shooter = SHOOTERS.has(TOYS[b.kind].key);
-  if (S.state === 'play' && tp && threat < 0.75) {
+  inp.jump = inp.grab = inp.sp = false; inp.hy = null; o.t -= dt; o.jumpCd -= dt; o.spCd -= dt; o.jobT = (o.jobT || 0) - dt; o.grabCd = (o.grabCd || 0) - dt;
+  const key = TOYS[b.kind].key, shooter = SHOOTERS.has(key), playing = S.state === 'play';
+  let threat = 1e9, tp = null;
+  for (const h of td.hands) { if (!h.on) continue; const d = Math.hypot(h.p.x - b.p.x, h.p.z - b.p.z) - (h.v.length() > 0.5 ? 0.15 : 0); if (d < threat) { threat = d; tp = h.p; } }
+  const dh = Math.hypot(td.head.x - b.p.x, td.head.z - b.p.z) + 0.15; if (dh < threat) { threat = dh; tp = td.head; }
+  let gx = null, gz = null, mx = 0, mz = 0, avoidBox = true;
+  const go = (x, z) => { gx = x; gz = z; };
+  const aimAt = p => { const d = V(p.x - b.p.x, 0, p.z - b.p.z).normalize(); inp.ax = d.x; inp.az = d.z; return d; };
+  if (playing && tp && threat < 0.5) {
+    // run! sideways-ish away from the hand, hop if it's right on top of you, use your move to escape
     mx = b.p.x - tp.x; mz = b.p.z - tp.z; const l = Math.hypot(mx, mz) || 1; mx /= l; mz /= l;
-    const j = (o.seedJ || (o.seedJ = S.rng() * 2 - 1)); const c = Math.cos(j), s = Math.sin(j); [mx, mz] = [mx * c - mz * s, mx * s + mz * c];
-    if (threat < 0.32 && o.jumpCd <= 0) { inp.jump = true; o.jumpCd = 0.5 + S.rng(); }
-    if (threat < 0.4 && o.spCd <= 0 && S.rng() < 0.5) { inp.sp = true; o.spCd = 3 + S.rng() * 4; if (shooter) b.yaw = Math.atan2(tp.x - b.p.x, tp.z - b.p.z); }
-    o.t = 0;
-  } else {
-    if (o.t <= 0 || Math.hypot(o.tgt.x - b.p.x, o.tgt.z - b.p.z) < 0.15) { o.tgt.copy(AREA.rand(S.rng, 0.3)); o.t = 2 + S.rng() * 4; o.idle = S.rng() < 0.25 ? 1 + S.rng() * 2 : 0; }
-    if (o.idle > 0) o.idle -= dt; else { mx = o.tgt.x - b.p.x; mz = o.tgt.z - b.p.z; const l = Math.hypot(mx, mz) || 1; mx /= l; mz /= l; }
-    if (shooter && S.state === 'play' && threat < 1.8 && o.spCd <= 0 && S.rng() < 0.02) { inp.sp = true; o.spCd = 4 + S.rng() * 5; b.yaw = Math.atan2(tp.x - b.p.x, tp.z - b.p.z); mx = mz = 0; }
-    else if (o.spCd <= 0 && S.rng() < 0.004) { inp.sp = true; o.spCd = 5 + S.rng() * 6; }
-  }
-  const bx = b.p.x - BOX.c.x, bz = b.p.z - BOX.c.z, bd = Math.hypot(bx, bz); if (bd < 0.95) { mx += bx / bd * 1.2; mz += bz / bd * 1.2; }
-  const sp = Math.hypot(b.v.x, b.v.z); if ((mx || mz) && sp < 0.08 && b.grounded) { o.stuck += dt; if (o.stuck > 0.5 && o.jumpCd <= 0) { inp.jump = true; o.jumpCd = 0.6; o.stuck = 0; o.t = 0; } } else o.stuck = 0;
+    const j = (o.seedJ || (o.seedJ = (S.rng() < 0.5 ? -1 : 1) * (0.4 + S.rng() * 0.6))); const c = Math.cos(j), s = Math.sin(j); [mx, mz] = [mx * c - mz * s, mx * s + mz * c];
+    if (threat < 0.25 && o.jumpCd <= 0) { inp.jump = true; o.jumpCd = 0.5 + S.rng() * 0.6; }
+    if (threat < 0.3 && o.spCd <= 0) { inp.sp = true; o.spCd = 3 + S.rng() * 3; if (shooter) b.yaw = Math.atan2(tp.x - b.p.x, tp.z - b.p.z); }
+    if (b.carry >= 0 && o.grabCd <= 0) { aimAt(tp); inp.grab = true; o.grabCd = 1; }   // panic-throw what you're holding at the hand
+    o.jobT = Math.min(o.jobT, 0.5);
+  } else if (playing) {
+    if (o.jobT <= 0 || (o.tgtI >= 0 && (!S.bodies[o.tgtI] || S.bodies[o.tgtI].away))) botJob(S, b, o);
+    const t = o.tgtI >= 0 ? S.bodies[o.tgtI] : null;
+    if (o.job === 'topple' && t) {
+      if (!t.tidy) o.jobT = 0;
+      else { go(t.p.x, t.p.z); const d = Math.hypot(t.p.x - b.p.x, t.p.z - b.p.z); if (d < b.r + t.r + 0.25 && o.jumpCd <= 0 && t.p.y > b.p.y + 0.05) { inp.jump = true; o.jumpCd = 0.7; } }
+    } else if (o.job === 'raid') {
+      avoidBox = false; const f = boxFront(b.r + 0.08); go(f.x, f.z);
+      if (nearBox(b) && o.grabCd <= 0) { inp.grab = true; o.grabCd = 1.2 + S.rng(); }
+      if (td.head.distanceTo(BOX.c) < 1.0) o.jobT = 0;   // the toddler's coming back: scram
+    } else if (o.job === 'pester') {
+      if (b.carry >= 0) { const tgt = toddlerTarget(S, b.p), d = Math.hypot(tgt.x - b.p.x, tgt.z - b.p.z);
+        if (d > 1.1) go(tgt.x, tgt.z); else if (o.grabCd <= 0) { aimAt(tgt); inp.grab = true; o.grabCd = 1.5; o.jobT = 0.4; } }
+      else if (t && !t.away && t.held < 0 && t.carriedBy < 0) { go(t.p.x, t.p.z); if (t.p.distanceTo(b.p) < b.r + t.r + 0.08 && o.grabCd <= 0) { inp.grab = true; o.grabCd = 0.5; } }
+      else o.jobT = 0;
+    } else if (o.job === 'rescue') {
+      const h = td.hands.find(h => h.on && h.held >= 0); if (!h) o.jobT = 0;
+      else { const d = Math.hypot(h.p.x - b.p.x, h.p.z - b.p.z); if (d > 1.5) go(h.p.x, h.p.z); else { b.yaw = Math.atan2(h.p.x - b.p.x, h.p.z - b.p.z); if (o.spCd <= 0 && b.cd <= 0) { inp.sp = true; o.spCd = 2; } } }
+    } else {
+      if (o.t <= 0 || Math.hypot(o.tgt.x - b.p.x, o.tgt.z - b.p.z) < 0.15) { o.tgt.copy(AREA.rand(S.rng, 0.3)); o.t = 2 + S.rng() * 3; }
+      go(o.tgt.x, o.tgt.z);
+    }
+    if (gx !== null) { mx = gx - b.p.x; mz = gz - b.p.z; const l = Math.hypot(mx, mz); if (l < 0.04) mx = mz = 0; else { mx /= l; mz /= l; } }
+    // movement toys use their move to cover ground fast when the coast is clear
+    if ((mx || mz) && o.spCd <= 0 && threat > 1.2 && ['car', 'robot', 'train', 'frog', 'slinky', 'monster', 'teeth'].includes(key) && S.rng() < 0.01) { inp.sp = true; o.spCd = 5 + S.rng() * 4; }
+  } else { if (o.t <= 0) { o.tgt.copy(AREA.rand(S.rng, 0.3)); o.t = 2 + S.rng() * 3; } mx = o.tgt.x - b.p.x; mz = o.tgt.z - b.p.z; const l = Math.hypot(mx, mz) || 1; mx /= l * 3; mz /= l * 3; }
+  if (avoidBox) { const bx = b.p.x - BOX.c.x, bz = b.p.z - BOX.c.z, bd = Math.hypot(bx, bz); if (bd < 1.0) { mx += bx / bd; mz += bz / bd; } }
+  // keep a little space from each other
+  for (const q of S.bodies) { if (q === b || q.type !== 'toy' || q.away) continue; const dx = b.p.x - q.p.x, dz = b.p.z - q.p.z, d2 = dx * dx + dz * dz; if (d2 < 0.04 && d2 > 1e-6) { mx += dx / Math.sqrt(d2) * 0.3; mz += dz / Math.sqrt(d2) * 0.3; } }
+  const sp = Math.hypot(b.v.x, b.v.z); if ((mx || mz) && sp < 0.08 && b.grounded) { o.stuck += dt; if (o.stuck > 0.45 && o.jumpCd <= 0) { inp.jump = true; o.jumpCd = 0.6; o.stuck = 0; if (S.rng() < 0.3) o.jobT = 0; } } else o.stuck = 0;
   const l = Math.hypot(mx, mz); if (l > 1) { mx /= l; mz /= l; }
-  inp.mx = mx * 0.85; inp.mz = mz * 0.85; inp.jumpHeld = false;
+  inp.mx = mx * 0.9; inp.mz = mz * 0.9; inp.jumpHeld = false;
 }
 
 /* ---------- the bot toddler (no headset: practice, or a laptop host) ---------- */
@@ -308,9 +373,9 @@ function botToddler(S, dt) {
   if (S.state !== 'play') { goal = B.p.clone(); look = V(AREA.cx, 0.1, AREA.cz); }
   else if (holding) { goal = boxFront(0.45); look = BOX.c.clone(); }
   else {
-    if (B.reT <= 0 || B.tgt < 0 || S.bodies[B.tgt].away || S.bodies[B.tgt].held >= 0) {
+    if (B.reT <= 0 || B.tgt < 0 || S.bodies[B.tgt].away || S.bodies[B.tgt].held >= 0 || S.bodies[B.tgt].tidy) {
       B.reT = 0.6; let best = -1, bd = 1e9;
-      for (const b of S.bodies) { if (b.away || b.held >= 0 || b.type === 'decoy' && S.rng() < 0.5) continue; let d = Math.hypot(b.p.x - B.p.x, b.p.z - B.p.z) + b.p.y * 1.5; if (b.stun > 0) d *= 0.6; if (d < bd) { bd = d; best = b.i; } }
+      for (const b of S.bodies) { if (b.away || b.held >= 0 || b.tidy || b.type === 'decoy' && S.rng() < 0.5) continue; let d = Math.hypot(b.p.x - B.p.x, b.p.z - B.p.z) + b.p.y * 1.5; if (b.stun > 0) d *= 0.6; if (d < bd) { bd = d; best = b.i; } }
       B.tgt = best;
     }
     if (B.tgt >= 0) { const b = S.bodies[B.tgt]; const dir = V(b.p.x - B.p.x, 0, b.p.z - B.p.z), l = dir.length(); goal = l > 0.42 ? V(b.p.x, 0, b.p.z).addScaledVector(dir.normalize(), -0.38) : B.p.clone(); look = b.p.clone(); }
@@ -475,8 +540,18 @@ function toyGrab(S, b) {
     if (s.type === 'seesaw' && s.col.c.distanceTo(b.p) < d.len / 2 + 0.07 && b.p.y < 0.35) { const lx = V().subVectors(b.p, d.c).applyQuaternion(qYaw(-d.yaw)).x; s.av += (lx > 0 ? -1 : 1) * 3; return 'push'; }
   }
   let best = null, bd = 1e9; for (const o of S.bodies) { if (o.type !== 'part' || o.away || o.held >= 0 || o.carriedBy >= 0) continue; const d = o.p.distanceTo(b.p) - o.r - b.r; if (d < 0.09 && d < bd) { bd = d; best = o; } }
-  if (best) { best.carriedBy = b.i; b.carry = best.i; evAt(S, 'grab', b.p, -2); return 'pick'; }
+  if (best) { best.tidy = false; best.carriedBy = b.i; b.carry = best.i; evAt(S, 'grab', b.p, -2); return 'pick'; }
+  if (nearBox(b) && raidBox(S, b)) return 'raid';
   return '';
+}
+// next to the toy chest: fling something back out of it
+function nearBox(b) { const l = boxLocal(b.p, _lb); return Math.max(Math.abs(l.x) - BOX.w / 2, Math.abs(l.z) - BOX.d / 2) < b.r + 0.12; }
+function raidBox(S, b) {
+  if (S.t - S.raidT < 0.9) return false; const inside = S.bodies.filter(o => o.away && o.type !== 'decoy'); if (!inside.length) return false;
+  const parts = inside.filter(o => o.type === 'part'), o = (parts.length && S.rng() < 0.7 ? parts : inside)[Math.floor(S.rng() * (parts.length && S.rng() < 0.7 ? parts.length : inside.length))] || inside[0];
+  S.raidT = S.t; o.away = false; o.tidy = false; o.p.copy(BOX.c).setY(BOX.h + 0.12);
+  const out = V(b.p.x - BOX.c.x, 0, b.p.z - BOX.c.z).normalize(); o.v.copy(out).multiplyScalar(1.4 + S.rng()).add(V((S.rng() - 0.5) * 0.8, 2.6 + S.rng(), (S.rng() - 0.5) * 0.8)); o.w.set(S.rng() - 0.5, S.rng() - 0.5, S.rng() - 0.5).multiplyScalar(16);
+  o.thrownBy = null; if (o.type === 'toy') o.stun = 0.6; evAt(S, 'raid', o.p); return true;
 }
 function grabHint(S, b) {
   if (!b) return 'Grab'; if (b.carry >= 0) return 'Throw';
@@ -486,6 +561,7 @@ function grabHint(S, b) {
     if (s.type === 'mgr' && Math.hypot(b.p.x - d.c.x, b.p.z - d.c.z) < d.r + 0.1) return 'Spin';
     if (s.type === 'swing' && s.col.c.distanceTo(b.p) < 0.22) return 'Push'; }
   for (const o of S.bodies) if (o.type === 'part' && !o.away && o.held < 0 && o.carriedBy < 0 && o.p.distanceTo(b.p) - o.r - b.r < 0.09) return 'Pick up';
+  if (nearBox(b) && S.bodies.some(o => o.away && o.type !== 'decoy')) return 'Raid box';
   return 'Grab';
 }
 
@@ -493,10 +569,10 @@ function grabHint(S, b) {
 function stepMatch(S, dt) {
   dt = Math.min(dt, 0.05);
   S.ev.length = 0;
-  if (S.state === 'count') { const before = Math.ceil(S.countT); S.countT -= dt; if (Math.ceil(S.countT) !== before && S.countT > 0) evAt(S, 'count', V(), Math.ceil(S.countT)); if (S.countT <= 0) { S.state = 'play'; evAt(S, 'go', V()); evAt(S, 'phase', V(), 0); } }
+  if (S.state === 'count') { const before = Math.ceil(S.countT); S.countT -= dt; if (Math.ceil(S.countT) !== before && S.countT > 0) evAt(S, 'count', V(), Math.ceil(S.countT)); if (S.countT <= 0) { S.state = 'play'; S.m0 = countMess(S); evAt(S, 'go', V()); evAt(S, 'phase', V(), 0); } }
   else if (S.state === 'play') { const before = Math.ceil(S.nap); S.nap -= dt; if (Math.ceil(S.nap) !== before) evAt(S, 'tick', V(), Math.ceil(S.nap));
     const ph = phaseOf(S.nap); if (ph !== S.phase) { S.phase = ph; evAt(S, 'phase', V(), ph); if (ph === 3) evAt(S, 'yawn', S.td.head); }
-    if (S.nap <= 0) { S.nap = 0; S.state = 'end'; S.end = 1; S.endAt = S.t; evAt(S, 'end', V(), 1); } }
+    if (S.nap <= 0) { S.nap = 0; S.state = 'end'; S.end = countMess(S) >= S.m0 ? 1 : 2; S.endAt = S.t; evAt(S, 'end', V(), S.end); } }
   S.t += dt;
   if (S.bot) botToddler(S, dt);
   toddlerPre(S, dt);
@@ -515,14 +591,16 @@ function stepMatch(S, dt) {
       if (b.away) continue;
       if (b.held >= 0) { const hd = S.td.hands[b.held]; holdPos(hd, b.p); b.v.copy(hd.v); b.q.copy(hd.q).multiply(b.holdQ); continue; }
       if (b.carriedBy >= 0) { const c = S.bodies[b.carriedBy]; if (!c || c.away || c.held >= 0) { b.carriedBy = -1; if (c) c.carry = -1; } else { b.p.copy(c.p); b.p.y += c.r + b.r * 0.9; b.v.copy(c.v); b.q.copy(c.q); continue; } }
+      if (b.tidy) continue;
       stepBody(S, b, h);
     }
     const B = S.bodies;
     for (let i = 0; i < B.length; i++) { const a = B[i]; if (a.away || a.carriedBy >= 0) continue;
-      for (let j = i + 1; j < B.length; j++) { const c = B[j]; if (c.away || c.carriedBy >= 0) continue;
+      for (let j = i + 1; j < B.length; j++) { const c = B[j]; if (c.away || c.carriedBy >= 0 || (a.tidy && c.tidy)) continue;
         const dx = c.p.x - a.p.x, dy = c.p.y - a.p.y, dz = c.p.z - a.p.z, rr = a.r + c.r, d2 = dx * dx + dy * dy + dz * dz; if (d2 >= rr * rr || d2 < 1e-10) continue;
         const d = Math.sqrt(d2), nx = dx / d, ny = dy / d, nz = dz / d, pen = rr - d;
-        const ia = a.held >= 0 ? 0 : 1 / a.m, ic = c.held >= 0 ? 0 : 1 / c.m, it = ia + ic; if (it === 0) continue;
+        if (a.tidy || c.tidy) { const t = a.tidy ? a : c, o = a.tidy ? c : a; if (o.v.length() > 0.3) { wake(S, t, o.v.clone().multiplyScalar(0.6)); if (o.type === 'toy' && isPlayer(S, o)) evAt(S, 'mess', t.p); } }
+        const ia = a.held >= 0 || a.tidy ? 0 : 1 / a.m, ic = c.held >= 0 || c.tidy ? 0 : 1 / c.m, it = ia + ic; if (it === 0) continue;
         a.p.x -= nx * pen * ia / it; a.p.y -= ny * pen * ia / it; a.p.z -= nz * pen * ia / it; c.p.x += nx * pen * ic / it; c.p.y += ny * pen * ic / it; c.p.z += nz * pen * ic / it;
         const rv = (c.v.x - a.v.x) * nx + (c.v.y - a.v.y) * ny + (c.v.z - a.v.z) * nz;
         if (rv < 0) { const jimp = -1.3 * rv / it; a.v.x -= jimp * ia * nx; a.v.y -= jimp * ia * ny; a.v.z -= jimp * ia * nz; c.v.x += jimp * ic * nx; c.v.y += jimp * ic * ny; c.v.z += jimp * ic * nz;
@@ -542,7 +620,7 @@ function stepMatch(S, dt) {
       evAt(S, 'away', b.p, b.type === 'toy' ? b.kind : -1); b.p.copy(BOX.c).setY(0.05); b.v.set(0, 0, 0);
     }
   }
-  S.messLeft = S.bodies.reduce((n, b) => n + (b.type !== 'decoy' && !b.away ? 1 : 0), 0);
+  S.messLeft = countMess(S);
   if (S.state === 'play' && S.messLeft === 0) { S.state = 'end'; S.end = 2; S.endAt = S.t; evAt(S, 'end', V(), 2); }
 }
 
@@ -551,7 +629,7 @@ function snap(S, withEvents) {
   const B = [];
   for (const b of S.bodies) {
     let f = 0; if (b.away) f |= 1; if (b.stun > 0) f |= 2; if (b.sticky > 0) f |= 4; if (b.held >= 0) f |= 8; if (b.slip > 0) f |= 16;
-    if (b.boost > 0 || b.glide > 0 || b.charge > 0 || b.rise > 0 || b.float > 0 || b.fly > 0 || b.hover > 0 || b.chute > 0) f |= 32; if (isPlayer(S, b)) f |= 64; if (b.shrink > 0) f |= 128;
+    if (b.boost > 0 || b.glide > 0 || b.charge > 0 || b.rise > 0 || b.float > 0 || b.fly > 0 || b.hover > 0 || b.chute > 0) f |= 32; if (isPlayer(S, b)) f |= 64; if (b.shrink > 0) f |= 128; if (b.tidy) f |= 256;
     B.push(r3(b.p.x), r3(b.p.y), r3(b.p.z), r3(b.q.x), r3(b.q.y), r3(b.q.z), r3(b.q.w), f);
   }
   const td = S.td, P3 = v => [r3(v.x), r3(v.y), r3(v.z)], Q4 = q => [r3(q.x), r3(q.y), r3(q.z), r3(q.w)];
@@ -563,7 +641,7 @@ function snap(S, withEvents) {
     ctl[pid] = [pl.body, pl.slot, b && b.type === 'toy' ? r3(b.cd / TOYS[b.kind].cd) : 0, grabHint(S, b), b && b.carry >= 0 ? 1 : 0]; }
   const PR = []; for (const p of S.proj) PR.push(PROJ.indexOf(p.k), r3(p.p.x), r3(p.p.y), r3(p.p.z), r3(p.v.x), r3(p.v.y), r3(p.v.z));
   const o = { t: 's', T: r3(S.t), st: S.state === 'count' ? 0 : S.state === 'play' ? 1 : 2, cd: r3(S.countT), nap: Math.round(S.nap * 10) / 10, ph: S.phase,
-    ml: S.messLeft, mt: S.messTotal, end: S.end, et: S.state === 'end' ? r3(S.t - S.endAt) : 0, b: B, td: T, dv: DV, pr: PR,
+    ml: S.messLeft, m0: S.m0, mt: S.messTotal, end: S.end, et: S.state === 'end' ? r3(S.t - S.endAt) : 0, b: B, td: T, dv: DV, pr: PR,
     tw: S.walls.map(w => [r3(w.c.x), r3(w.c.y), r3(w.c.z), r3(w.yaw), r3(w.life)]), ctl };
   if (withEvents) { o.ev = S.netEv.slice(); S.netEv.length = 0; }
   return o;

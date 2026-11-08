@@ -318,7 +318,7 @@ function wristDraw(s) {
   x.clearRect(0, 0, w, h); x.fillStyle = '#fffdf7'; x.strokeStyle = '#15121a'; x.lineWidth = 10; rr(x, 6, 6, w - 12, h - 12, 24); x.fill(); x.stroke();
   x.fillStyle = '#15121a'; x.textAlign = 'left'; x.font = '800 30px Rubik, sans-serif'; x.fillText('NAP IN', 26, 46);
   x.font = '400 70px Bungee, Rubik, sans-serif'; x.fillText(fmtT(s.nap), 22, 120);
-  x.textAlign = 'right'; x.fillStyle = s.ml ? '#e23b2e' : '#00a651'; x.font = '400 64px Bungee, Rubik, sans-serif'; x.fillText(String(s.ml), w - 26, 104); x.font = '800 26px Rubik, sans-serif'; x.fillStyle = '#15121a'; x.fillText('STILL OUT', w - 26, 136);
+  x.textAlign = 'right'; x.fillStyle = s.ml ? '#e23b2e' : '#00a651'; x.font = '400 64px Bungee, Rubik, sans-serif'; x.fillText(String(s.ml), w - 26, 104); x.font = '800 26px Rubik, sans-serif'; x.fillStyle = '#15121a'; x.fillText('MESS', w - 26, 136);
   P.t.needsUpdate = true;
 }
 
@@ -339,8 +339,8 @@ function handleEvent(e) {
   const W = APP.W, ear = APP.viewer === 'toddler' ? headL : APP.viewer === 'toy' ? CAM.tgt : camera.getWorldPosition(V());
   onEvent(W, e, ear, APP.viewer);
   const [code, x, y, z, a] = e, toddler = APP.viewer === 'toddler';
-  if (code === 'count') banner(String(a), toddler ? 'Crawl around for real · make a fist (or pinch) to grab\nthrow toys at the TOY BOX · slap the floor with both hands: tantrum' : APP.viewer === 'toy' ? "Don't get put in the toy box!" : '', 1.05);
-  if (code === 'go') banner(toddler ? 'CLEAN UP!' : 'RUN!', toddler ? 'Every toy in the box before the clock says NAP' : 'Stay out of the box till nap time', 1.8);
+  if (code === 'count') banner(String(a), toddler ? 'Crawl around for real · make a fist (or pinch) to grab\nthrow things in the TOY BOX · careful, your hands knock stuff over' : APP.viewer === 'toy' ? 'Make a mess before nap time!' : '', 1.05);
+  if (code === 'go') banner(toddler ? 'CLEAN UP!' : 'MAKE A MESS!', toddler ? 'Get the room tidier than this before the clock says NAP' : 'Knock things over, raid the toy box, mess it up', 2.2);
   if (code === 'phase' && a > 0) banner(PHASES[a].name, PHASES[a].sub, 2.2);
   if (toddler) { const p = V(x, y, z), td = APP.S.td;
     for (let i = 0; i < 2; i++) { const d = td.hands[i].p.distanceTo(p); if (d < 0.25) { if (code === 'grab') buzz(i, 0.5, 40); if (code === 'bonk') buzz(i, 1, 160); } }
@@ -354,7 +354,7 @@ function hud(s) {
   if (APP.viewer !== 'toddler') {
     $('clock').lastChild.textContent = s.st === 0 ? fmtT(MATCH_TIME) : fmtT(s.nap);
     const ph = $('phase'); ph.textContent = s.st === 0 ? 'Get ready' : s.st === 2 ? 'Nap time' : PHASES[s.ph].name; ph.style.background = PHASE_COL[s.ph]; ph.style.color = '#15121a';
-    $('mess').textContent = s.ml + ' still out';
+    const m0 = s.m0 === undefined ? s.ml : s.m0, d = s.ml - m0, me = $('mess'); me.textContent = `Mess ${s.ml} · start ${m0}`; me.style.background = d >= 0 ? '#ffd0dc' : '#c9f5e2';
   }
   if (APP.viewer === 'toy') {
     const c = s.ctl[APP.myPid];
@@ -364,13 +364,13 @@ function hud(s) {
     APP.me.slotOf = {}; for (const pid in s.ctl) APP.me.slotOf[s.ctl[pid][0]] = s.ctl[pid][1];
   }
   if (s.st === 2) {
-    if (!APP.endShown) { APP.endShown = true; banner(s.end === 1 ? 'Time’s up!' : 'All clean!', s.end === 1 ? 'Uh oh… here comes mom' : 'Here comes mom!', 2.2); }
+    if (!APP.endShown) { APP.endShown = true; banner(s.end === 1 ? 'What a mess!' : 'Tidy!', s.end === 1 ? 'Uh oh… here comes mom' : 'Here comes mom!', 2.2); }
     if (s.et > 2.4 && !APP.momSaid) { APP.momSaid = true; speak(momLine(APP.W, s.end)); }
     if (s.et > 6.5 && !APP.endCard) { APP.endCard = true; const toysWon = s.end === 1;
-      if (APP.viewer === 'toddler') { APP.vrEnd = true; VRUI.show(toysWon ? 'Toys win' : 'You win!', toysWon ? `Grounded! ${s.ml} still out of the box.` : 'Everything is in the toy box.',
+      if (APP.viewer === 'toddler') { APP.vrEnd = true; VRUI.show(toysWon ? 'Toys win' : 'You win!', toysWon ? `Grounded! The room is messier than when mom left (${s.ml} vs ${s.m0}).` : s.ml === 0 ? 'Everything is in the toy box.' : `Tidier than when mom left (${s.ml} vs ${s.m0}).`,
         [{ label: 'Again', fn: vrAgain, col: '#ff3e8a' }, { label: 'Next room', fn: vrNext, col: '#ffd400' }, { label: 'Redraw space', fn: vrRedraw, col: '#00c2b3' }, { label: 'Leave', fn: () => toLobby('host'), col: '#fffdf7' }]); }
-      else { $('endT').textContent = toysWon ? 'Nap time! Toys win' : 'All clean! Toddler wins';
-        $('endP').textContent = toysWon ? `Mom says the toddler's grounded: ${s.ml} still out of the box.` : 'Everything\'s in the toy box. Mom says: good kid.';
+      else { $('endT').textContent = toysWon ? 'What a mess! Toys win' : 'Tidy! Toddler wins';
+        $('endP').textContent = toysWon ? `Messier than when mom left (${s.ml} vs ${s.m0}). The toddler's grounded.` : s.ml === 0 ? 'Everything\'s in the toy box. Mom says: good kid.' : `Tidier than when mom left (${s.ml} vs ${s.m0}). Mom says: good kid.`;
         if (APP.kind === 'client') $('endP').textContent += ' Waiting for the toddler to start the next round…'; $('end').classList.add('on'); } }
   } else if (APP.endShown) { APP.endShown = false; APP.endCard = false; APP.momSaid = false; $('end').classList.remove('on'); }
 }
