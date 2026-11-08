@@ -414,7 +414,8 @@ function generate(){
           pts.push([rx*c*se*wob,rz*s*se*wob]);}
         const bs=.025,bt=.02,yb=L*th*.85+bt;
         const geo=new THREE.ExtrudeGeometry(new THREE.Shape(pts.map(V2)),{depth:th-2*bt,bevelEnabled:true,bevelThickness:bt,bevelSize:bs,bevelOffset:-bs,bevelSegments:2,steps:1,curveSegments:1});
-        emit(geo,(x,y,z,o)=>{o[0]=cx+x;o[1]=yb+z;o[2]=cz+y;},true,pick(),pick(),rnd()<.5?.5:0,newUnit(pi),x=>clamp01((x/rx+1)/2));
+        const c1=pick(),uid=newUnit(pi);Object.assign(units[uid],{bax:1,col:[c1.r,c1.g,c1.b],closed:false});
+        emit(geo,(x,y,z,o)=>{o[0]=cx+x;o[1]=yb+z;o[2]=cz+y;},true,c1,pick(),rnd()<.5?.5:0,uid,x=>clamp01((x/rx+1)/2));
       }
       continue;
     }
@@ -432,7 +433,7 @@ function generate(){
     for(let j=0;j<ns;j++){let c=pick();if(j&&c===sheetC[j-1])c=pick();sheetC.push(c);}
     const colorOf=(j,k)=>cmode==='bands'?bandC[(k+(j%3===2&&rnd()<.3?1:0))%nb]
       :cmode==='sheets'?((k===nb-1&&nb>2)?bandC[0]:sheetC[j]):pick();
-    const sd=part.D/ns,gap=0,ub=units.length;for(let q=0;q<profs.length;q++)for(let k=0;k<nb;k++)newUnit(pi);   // one strip = one band of one profile
+    const sd=part.D/ns,gap=0,ub=units.length;for(let q=0;q<profs.length;q++)for(let k=0;k<nb;k++)for(let j=0;j<ns;j++)newUnit(pi);   // one strip = one band of one slice of one profile: a single colour
     const mirrored=(part.axis==='z')!==part.flip;
 
     for(let j=0;j<ns;j++){
@@ -462,7 +463,8 @@ function generate(){
             if(droop){const q=2*u/W-1,q2=q*q;v-=droop*q2*q2*Math.max(0,Math.min(1,v/h));}
             const uu=part.flip?W-u:u;
             if(part.axis==='x'){o[0]=part.x0+uu;o[1]=part.y0+v;o[2]=part.z0+w;}else{o[0]=part.x0+w;o[1]=part.y0+v;o[2]=part.z0+uu;}
-          },mirrored,c1,c2,marble,ub+pIdx*nb+kb,sig);
+          },mirrored,c1,c2,marble,ub+(pIdx*nb+kb)*ns+j,sig);
+          Object.assign(units[ub+(pIdx*nb+kb)*ns+j],{bax:part.axis==='x'?2:0,col:[c1.r,c1.g,c1.b],closed:!!prof.closed});
         }
       }
     }
@@ -926,7 +928,7 @@ const mouthIn=o=>head.localToWorld(o.set(0,-.44,.88));
 const mouthFront=o=>head.localToWorld(o.set(0,-.55,1.75));
 function headPos(o){const d=BB.R+BB.headR*1.05;return o.set(BB.C.x+Math.sin(BB.ang)*d,BB.top*.72+BB.headR*.3,BB.C.z+Math.cos(BB.ang)*d);}
 
-/* ---------------- strips: each peeled strip becomes a little jelly rope ---------------- */
+/* ---------------- strips: a peeled strip turns into a soft, puffy gummy ribbon ---------------- */
 function removeUnit(uid){
   const g=mesh.geometry,D=g.userData,ia=g.index.array,vu=D.vUnit,u=D.units[uid];if(D.dead[uid])return false;D.dead[uid]=1;
   for(let t=0;t<ia.length;t+=3)if(vu[ia[t]]===uid){const a=ia[t];ia[t+1]=a;ia[t+2]=a;}
@@ -934,109 +936,267 @@ function removeUnit(uid){
   for(const a of agents)if(Math.hypot(a.pos.x-u.cx,a.pos.y-u.cy,a.pos.z-u.cz)<2.2)a.startle=true;
   return true;
 }
-function makeBite(uid){   // a loose copy of one strip, in world coordinates
-  const g=mesh.geometry,D=g.userData,u=D.units[uid],O=D.orig,SG=D.vSig;
-  const P=g.attributes.position.array,C=g.attributes.color.array,N=g.attributes.normal.array;
-  let nv=0,ni=0;for(const r of u.ranges){nv+=r[1];ni+=r[3];}
-  const pos=new Float32Array(nv*3),col=new Float32Array(nv*3),nor=new Float32Array(nv*3),sig=new Float32Array(nv),ind=new Uint32Array(ni);
-  let ov=0,oi=0;
-  for(const[vs,vn,is,ic]of u.ranges){
-    pos.set(P.subarray(vs*3,(vs+vn)*3),ov*3);col.set(C.subarray(vs*3,(vs+vn)*3),ov*3);nor.set(N.subarray(vs*3,(vs+vn)*3),ov*3);sig.set(SG.subarray(vs,vs+vn),ov);
-    for(let i=0;i<ic;i++)ind[oi+i]=O[is+i]-vs+ov;
-    ov+=vn;oi+=ic;
-  }
-  const bg=new THREE.BufferGeometry();
-  const pa=new THREE.BufferAttribute(pos,3);pa.setUsage(THREE.DynamicDrawUsage);
-  bg.setAttribute('position',pa);bg.setAttribute('color',new THREE.BufferAttribute(col,3));
-  bg.setAttribute('normal',new THREE.BufferAttribute(nor,3));bg.setIndex(new THREE.BufferAttribute(ind,1));
-  const m=new THREE.Mesh(bg,mat);m.castShadow=true;m.frustumCulled=false;scene.add(m);
-  return {mesh:m,sig,J:null};
+// glossy candy with light glowing through its thin edges, and a soft, slightly lumpy gel surface
+let gumNrm=null;
+function gumNormalMap(){   // tileable soft bumps, made once
+  if(gumNrm)return gumNrm;
+  const S=128,hgt=new Float32Array(S*S),R=mulberry32(91);
+  for(const[f,a]of[[4,1],[8,.5],[16,.22]]){const g=new Float32Array(f*f);for(let i=0;i<f*f;i++)g[i]=R();
+    for(let y=0;y<S;y++)for(let x=0;x<S;x++){const fx=x/S*f,fy=y/S*f,x0=Math.floor(fx),y0=Math.floor(fy),u=fx-x0,v=fy-y0,su=u*u*(3-2*u),sv=v*v*(3-2*v);
+      const G=(i,j)=>g[((j%f+f)%f)*f+((i%f+f)%f)];hgt[y*S+x]+=a*((G(x0,y0)*(1-su)+G(x0+1,y0)*su)*(1-sv)+(G(x0,y0+1)*(1-su)+G(x0+1,y0+1)*su)*sv);}}
+  const d=new Uint8Array(S*S*4);
+  for(let y=0;y<S;y++)for(let x=0;x<S;x++){const H=(i,j)=>hgt[((j+S)%S)*S+((i+S)%S)],dx=(H(x+1,y)-H(x-1,y))*3,dy=(H(x,y+1)-H(x,y-1))*3,l=Math.hypot(dx,dy,1),o=4*(y*S+x);
+    d[o]=(-dx/l*.5+.5)*255;d[o+1]=(-dy/l*.5+.5)*255;d[o+2]=(1/l*.5+.5)*255;d[o+3]=255;}
+  gumNrm=new THREE.DataTexture(d,S,S);gumNrm.wrapS=gumNrm.wrapT=THREE.RepeatWrapping;gumNrm.magFilter=THREE.LinearFilter;gumNrm.minFilter=THREE.LinearMipmapLinearFilter;gumNrm.generateMipmaps=true;gumNrm.needsUpdate=true;
+  return gumNrm;
 }
-// a chain of nodes along the strip's own length; every vertex rides on it. Stuck nodes pop off when pulled.
-function jellySetup(c,G){
-  const P=c.mesh.geometry.attributes.position.array,n=P.length/3,sig=c.sig;
+const gumMats={};
+function gummyMat(col){
+  const key=col.map(v=>v.toFixed(3)).join();if(gumMats[key])return gumMats[key];
+  const c=new THREE.Color().setRGB(col[0],col[1],col[2]),glow=c.clone().offsetHSL(0,.08,.16);
+  const m=new THREE.MeshPhysicalMaterial({color:c,roughness:.22,metalness:0,clearcoat:1,clearcoatRoughness:.08,emissive:glow,emissiveIntensity:.14,
+    normalMap:gumNormalMap(),normalScale:new THREE.Vector2(.35,.35)});
+  m.onBeforeCompile=s=>{s.uniforms.uGlow={value:glow};
+    s.fragmentShader='uniform vec3 uGlow;\n'+s.fragmentShader.replace('#include <emissivemap_fragment>',
+`#include <emissivemap_fragment>
+  float gF=1.0-abs(dot(normal,normalize(vViewPosition)));
+  totalEmissiveRadiance+=uGlow*(.55*gF*gF+.05);
+  diffuseColor.rgb*=.78+.3*gF;`);};
+  return gumMats[key]=m;
+}
+const GK=12,GSUB=3,GCAP=3,GCOS=[],GSIN=[];
+for(let j=0;j<GK;j++){const a=j/GK*Math.PI*2;GCOS.push(Math.cos(a));GSIN.push(Math.sin(a));}
+const gA=new V3(),gB=new V3(),gC=new V3(),gD=new V3(),gT=new V3(),gN=new V3(),gBv=new V3(),gQ=new QT(),gP=new V3(),gCp=new V3();
+const AX=[new V3(1,0,0),new V3(0,1,0),new V3(0,0,1)];
+
+function makeBite(uid){
+  const g=mesh.geometry,D=g.userData,u=D.units[uid],P=g.attributes.position.array,SG=D.vSig,closed=!!u.closed;
+  let n=0;for(const r of u.ranges)n+=r[1];
+  const X=new Float32Array(n*3),S=new Float32Array(n);let o=0;
+  for(const[a,c]of u.ranges){X.set(P.subarray(a*3,(a+c)*3),o*3);S.set(SG.subarray(a,a+c),o);o+=c;}
+  // how long is it? (coarse bins along σ)
   const NB=24,acc=new Float32Array(NB*3),cnt=new Float32Array(NB);
-  for(let i=0;i<n;i++){const k=Math.min(NB-1,Math.floor(sig[i]*NB));acc[3*k]+=P[3*i];acc[3*k+1]+=P[3*i+1];acc[3*k+2]+=P[3*i+2];cnt[k]++;}
-  let L=0,prev=null;for(let k=0;k<NB;k++)if(cnt[k]){const v=new V3(acc[3*k]/cnt[k],acc[3*k+1]/cnt[k],acc[3*k+2]/cnt[k]);if(prev)L+=v.distanceTo(prev);prev=v;}
-  const N=clamp(Math.round(L/.2)+1,3,20);
-  const sums=new Float32Array(N*3),cn=new Float32Array(N);
-  for(let i=0;i<n;i++){const k=Math.min(N-1,Math.round(sig[i]*(N-1)));sums[3*k]+=P[3*i];sums[3*k+1]+=P[3*i+1];sums[3*k+2]+=P[3*i+2];cn[k]++;}
-  const rest=[];for(let k=0;k<N;k++)rest.push(cn[k]?new V3(sums[3*k]/cn[k],sums[3*k+1]/cn[k],sums[3*k+2]/cn[k]):null);
+  for(let i=0;i<n;i++){const k=Math.min(NB-1,Math.floor(S[i]*NB));acc[3*k]+=X[3*i];acc[3*k+1]+=X[3*i+1];acc[3*k+2]+=X[3*i+2];cnt[k]++;}
+  let L=0,pv=null;for(let k=0;k<NB;k++)if(cnt[k]){const v=new V3(acc[3*k]/cnt[k],acc[3*k+1]/cnt[k],acc[3*k+2]/cnt[k]);if(pv)L+=v.distanceTo(pv);pv=v;}
+  const pud=u.bax===1,N=pud?clamp(Math.round(L/.6)+1,3,5):clamp(Math.round(L/.22)+(closed?0:1),closed?6:3,22);
+  const bin=s=>closed?Math.min(N-1,Math.floor(s*N)):Math.min(N-1,Math.round(s*(N-1)));
+  // node centres = average of the strip's vertices around each point along it
+  const sum=new Float32Array(N*3),cn=new Float32Array(N);
+  for(let i=0;i<n;i++){const k=bin(S[i]);sum[3*k]+=X[3*i];sum[3*k+1]+=X[3*i+1];sum[3*k+2]+=X[3*i+2];cn[k]++;}
+  const rest=[];for(let k=0;k<N;k++)rest.push(cn[k]?new V3(sum[3*k]/cn[k],sum[3*k+1]/cn[k],sum[3*k+2]/cn[k]):null);
   for(let k=0;k<N;k++)if(!rest[k]){let a=k-1,b=k+1;while(a>=0&&!rest[a])a--;while(b<N&&!rest[b])b++;
-    rest[k]=a>=0&&b<N?rest[a].clone().lerp(rest[b],(k-a)/(b-a)):(a>=0?rest[a].clone():b<N?rest[b].clone():new V3().fromArray(P,0));}
-  const T0=[],N0=[],B0=[];
-  for(let k=0;k<N-1;k++){const t=new V3().subVectors(rest[k+1],rest[k]);if(t.lengthSq()<1e-8)t.set(1,0,0);T0.push(t.normalize());}
-  let B=new V3().crossVectors(T0[0],Math.abs(T0[0].y)<.9?UP:new V3(1,0,0)).normalize();
-  for(let k=0;k<N-1;k++){if(k){B=B.clone().applyQuaternion(new QT().setFromUnitVectors(T0[k-1],T0[k]));B.addScaledVector(T0[k],-B.dot(T0[k])).normalize();}
-    B0.push(B.clone());N0.push(new V3().crossVectors(B,T0[k]));}
-  const seg=new Uint8Array(n),wt=new Float32Array(n),off=new Float32Array(3*n);
-  for(let i=0;i<n;i++){
-    const f=sig[i]*(N-1),k=Math.min(N-2,Math.max(0,Math.floor(f))),t=f-k;seg[i]=k;wt[i]=t;
-    tv1.copy(rest[k]).lerp(rest[k+1],t);const ox=P[3*i]-tv1.x,oy=P[3*i+1]-tv1.y,oz=P[3*i+2]-tv1.z,Tk=T0[k],Nk=N0[k],Bk=B0[k];
-    off[3*i]=ox*Tk.x+oy*Tk.y+oz*Tk.z;off[3*i+1]=ox*Nk.x+oy*Nk.y+oz*Nk.z;off[3*i+2]=ox*Bk.x+oy*Bk.y+oz*Bk.z;
-  }
-  const rl=[],rb=[];for(let k=0;k<N-1;k++)rl.push(rest[k].distanceTo(rest[k+1]));for(let k=0;k<N-2;k++)rb.push(rest[k].distanceTo(rest[k+2]));
-  let pin=0,bd=1e9;for(let k=0;k<N;k++){const d=rest[k].distanceTo(G);if(d<bd){bd=d;pin=k;}}
-  const att=new Uint8Array(N).fill(1);att[pin]=0;
-  c.J={N,rest,p:rest.map(v=>v.clone()),q:rest.map(v=>v.clone()),att,rl,rb,pin,held:true,T0,N0,B0,seg,wt,off,sc:1,len:L,popT:0};
+    rest[k]=a>=0&&b<N?rest[a].clone().lerp(rest[b],(k-a)/(b-a)):(a>=0?rest[a].clone():b<N?rest[b].clone():new V3().fromArray(X,0));}
+  const nx=k=>closed?(k+1)%N:Math.min(N-1,k+1),pr=k=>closed?(k-1+N)%N:Math.max(0,k-1);
+  const Tn=[],Bn=[],ax=AX[u.bax??1];
+  for(let k=0;k<N;k++){const t=new V3().subVectors(rest[nx(k)],rest[pr(k)]);if(t.lengthSq()<1e-10)t.set(1,0,0);t.normalize();Tn.push(t);
+    const b=ax.clone().addScaledVector(t,-ax.dot(t));if(b.lengthSq()<1e-6)b.crossVectors(t,Math.abs(t.y)<.9?UP:AX[0]);Bn.push(b.normalize());}
+  // how thick and wide it is at each node, measured from the real vertices
+  const hw=new Float32Array(N),hd=new Float32Array(N);
+  for(let i=0;i<n;i++){const k=bin(S[i]),c=rest[k],T=Tn[k],B=Bn[k];
+    const dx=X[3*i]-c.x,dy=X[3*i+1]-c.y,dz=X[3*i+2]-c.z;
+    gN.crossVectors(B,T);const an=Math.abs(dx*gN.x+dy*gN.y+dz*gN.z),ab=Math.abs(dx*B.x+dy*B.y+dz*B.z);
+    if(an>hw[k])hw[k]=an;if(ab>hd[k])hd[k]=ab;}
+  let mw=0,md=0;for(let k=0;k<N;k++){mw=Math.max(mw,hw[k]);md=Math.max(md,hd[k]);}
+  for(let k=0;k<N;k++){hw[k]=Math.max(hw[k]*.97,mw*.25,.02);hd[k]=Math.max(hd[k]*.97,md*.25,.02);}
+  const NL=closed?N:N-1,NBd=closed?N:N-2,rl=new Float32Array(NL),rb=new Float32Array(Math.max(0,NBd));
+  for(let k=0;k<NL;k++)rl[k]=Math.max(.02,rest[k].distanceTo(rest[(k+1)%N]));
+  for(let k=0;k<NBd;k++)rb[k]=Math.max(.02,rest[k].distanceTo(rest[(k+2)%N]));
+  // the gummy mesh: rings of a puffy rounded box swept along a smooth curve through the nodes, with round ends
+  const body=closed?N*GSUB:(N-1)*GSUB+1,rings=closed?body:body+2*(GCAP+1);
+  const KV=GK+1,pos=new Float32Array(rings*KV*3),uv=new Float32Array(rings*KV*2),ind=[];
+  const perim=Math.max(1,Math.round(2*(mw+md)*2));for(let r=0;r<rings;r++)for(let j=0;j<KV;j++){uv[2*(r*KV+j)]=j/GK*perim;uv[2*(r*KV+j)+1]=r/rings*L*2;}
+  const RL=closed?rings:rings-1;
+  for(let r=0;r<RL;r++){const r2=(r+1)%rings;for(let j=0;j<GK;j++){const a=r*KV+j,b=r*KV+j+1,c=r2*KV+j,d=r2*KV+j+1;ind.push(a,b,c,b,d,c);}}
+  const bg=new THREE.BufferGeometry();
+  const pa=new THREE.BufferAttribute(pos,3);pa.setUsage(THREE.DynamicDrawUsage);bg.setAttribute('position',pa);
+  bg.setAttribute('uv',new THREE.BufferAttribute(uv,2));bg.setIndex(ind);
+  const m=new THREE.Mesh(bg,gummyMat(u.col||[1,.5,.7]));m.castShadow=true;m.frustumCulled=false;scene.add(m);
+  const V=()=>Array.from({length:N},()=>new V3());
+  const J={N,closed,rest,p:rest.map(v=>v.clone()),q:rest.map(v=>v.clone()),lv:V(),T:Tn.map(v=>v.clone()),B:Bn.map(v=>v.clone()),
+    hw,hd,rl,rb,att:new Uint8Array(N).fill(1),pf:new Float32Array(N),pfv:new Float32Array(N),wb:new Float32Array(N),wbv:new Float32Array(N),
+    vol:new Float32Array(N).fill(1),ext:new Float32Array(N),rc:new Float32Array(3*N),pin:0,held:true,hold:null,sc:1,len:L,popT:0,body,rings,pud,
+    stiff:pud?1:.35,r3:Array.from({length:closed?N:Math.max(0,N-3)},(_,k)=>Math.max(.02,rest[k].distanceTo(rest[(k+3)%N])))};
+  J.rc.fill(-1);for(let k=0;k<N;k++)J.ext[k]=Math.min(hw[k],hd[k]);
+  const c={mesh:m,J};jellySkin(c,null);
+  return c;
 }
+function jellySetup(c,G){
+  const J=c.J;let pin=0,bd=1e9;for(let k=0;k<J.N;k++){const d=J.rest[k].distanceTo(G);if(d<bd){bd=d;pin=k;}}
+  J.pin=pin;J.att[pin]=0;J.pfv[pin]=5;J.held=true;J.hold=J.p[pin].clone();
+}
+const nextK=(J,k)=>J.closed?(k+1)%J.N:k+1,prevK=(J,k)=>J.closed?(k-1+J.N)%J.N:k-1;
+const linkLen=(J,a,b)=>{if(J.closed){if((a+1)%J.N===b)return J.rl[a];if((b+1)%J.N===a)return J.rl[b];}return J.rl[Math.min(a,b)];};
 function jLink(J,a,b,r,k){
   const pa=J.p[a],pb=J.p[b],dx=pb.x-pa.x,dy=pb.y-pa.y,dz=pb.z-pa.z,d=Math.sqrt(dx*dx+dy*dy+dz*dz)||1e-6,e=(d-r)/d*k;
   const wa=J.att[a]||(J.held&&a===J.pin)?0:1,wb=J.att[b]||(J.held&&b===J.pin)?0:1,w=wa+wb;if(!w)return;
   pa.x+=dx*e*wa/w;pa.y+=dy*e*wa/w;pa.z+=dz*e*wa/w;pb.x-=dx*e*wb/w;pb.y-=dy*e*wb/w;pb.z-=dz*e*wb/w;
 }
+function popNode(J,k){J.att[k]=0;J.q[k].copy(J.rest[k]);J.pfv[k]+=5+Math.random()*3;J.popT=.045;
+  if(AC&&Math.random()<.45)tone(700+Math.random()*600,300,.05,'triangle',.05);}
+// push a ball out of the candy, but never further than it started (so a bit doesn't jump out of its own slot)
+const gHitN=new V3();
+function gumSphere(J,slot,c,r,acc){
+  let dmin=r,hit=false;const rc=J.rc[slot];
+  if(rc<0){bvh.shapecast({intersectsBounds:b=>b.distanceToPoint(c)<r,intersectsTriangle:(tri,ti)=>{if(isDead(ti))return false;tri.closestPointToPoint(c,gCp);const d=gCp.distanceTo(c);if(d<dmin)dmin=d;return false;}});
+    J.rc[slot]=Math.min(r,dmin*.95);return false;}
+  bvh.shapecast({intersectsBounds:b=>b.distanceToPoint(c)<rc,intersectsTriangle:(tri,ti)=>{
+    if(isDead(ti))return false;tri.closestPointToPoint(c,gCp);const d=gCp.distanceTo(c);if(d<dmin)dmin=d;
+    if(d<rc){if(d>1e-5)gN.subVectors(c,gCp).divideScalar(d);else tri.getNormal(gN);c.addScaledVector(gN,rc-d);acc.addScaledVector(gN,rc-d);gHitN.copy(gN);hit=true;}return false;}});
+  if(dmin>rc)J.rc[slot]=Math.min(r,dmin);
+  return hit;
+}
+const gAcc=new V3(),gE=new V3(),gW=new V3();
+function gumCollide(J,k){
+  const p=J.p[k],B=J.B[k],hw=J.hw[k],hd=J.hd[k],r=Math.min(hw,hd)*1.05,wide=Math.max(hw,hd)-r;
+  gAcc.set(0,0,0);gE.copy(p);let hit=gumSphere(J,3*k,gE,r,gAcc),edge=false;
+  if(wide>r*.6){   // wide ribbon: also feel along its two flat edges, and lie flat where it touches
+    if(hd>=hw)gW.copy(B);else gW.crossVectors(B,J.T[k]).normalize();
+    for(const sg of[-1,1]){gE.copy(p).add(gAcc).addScaledVector(gW,sg*wide*.85);
+      if(gumSphere(J,3*k+(sg<0?1:2),gE,r,gAcc)){edge=true;
+        if(hd>=hw)gBv.copy(B).addScaledVector(gHitN,-B.dot(gHitN));else gBv.copy(gHitN).multiplyScalar(gHitN.dot(B)<0?-1:1);
+        if(gBv.lengthSq()>1e-6)B.lerp(gBv.normalize(),.25);}}
+  }
+  if(hit||edge){p.add(gAcc);const q=J.q[k];q.x+=(p.x-q.x)*.3;q.y+=(p.y-q.y)*.3;q.z+=(p.z-q.z)*.3;}
+}
 function jellyStep(c,T,dt){   // T: where the fingers hold it (null = let go)
   const J=c.J;if(!J)return;
-  const sub=2,h=dt/sub,damp=.986,gy=-16*h*h;
+  dt=Math.min(dt,1/30);
+  const N=J.N,sub=3,h=dt/sub,damp=.988,gy=-20*h*h,maxD=.45,held=J.held&&T,NL=J.closed?N:N-1,NBd=J.closed?N:N-2;
+  if(held){if(!J.hold)J.hold=J.p[J.pin].clone();gP.copy(J.p[J.pin]);J.hold.lerp(T,Math.min(1,dt*22));}
   for(let s=0;s<sub;s++){
-    for(let k=0;k<J.N;k++){if(J.att[k]||(J.held&&k===J.pin))continue;const p=J.p[k],q=J.q[k];
-      const vx=(p.x-q.x)*damp,vy=(p.y-q.y)*damp,vz=(p.z-q.z)*damp;q.copy(p);p.x+=vx;p.y+=vy+gy;p.z+=vz;}
-    if(J.held&&T){J.q[J.pin].copy(J.p[J.pin]);J.p[J.pin].copy(T);}
-    for(let it=0;it<5;it++){
-      for(let k=0;k<J.N-1;k++)jLink(J,k,k+1,J.rl[k],.8);           // stretchy like jelly
-      for(let k=0;k<J.N-2;k++)jLink(J,k,k+2,J.rb[k],.1);           // a little bend stiffness: it wobbles
-      for(let k=0;k<J.N;k++){if(J.att[k])J.p[k].copy(J.rest[k]);else if(J.p[k].y<.06)J.p[k].y=.06;}
+    for(let k=0;k<N;k++){if(J.att[k]||(held&&k===J.pin))continue;const p=J.p[k],q=J.q[k];
+      let vx=(p.x-q.x)*damp,vy=(p.y-q.y)*damp+gy,vz=(p.z-q.z)*damp;const m=Math.sqrt(vx*vx+vy*vy+vz*vz);if(m>maxD){vx*=maxD/m;vy*=maxD/m;vz*=maxD/m;}
+      q.copy(p);p.x+=vx;p.y+=vy;p.z+=vz;}
+    if(held){J.q[J.pin].copy(J.p[J.pin]);J.p[J.pin].lerpVectors(gP,J.hold,(s+1)/sub);}
+    for(let it=0;it<6;it++){
+      for(let k=0;k<NL;k++)jLink(J,k,(k+1)%N,J.rl[k],.9);
+      for(let k=0;k<NBd;k++)jLink(J,k,(k+2)%N,J.rb[k],J.stiff);
+      if(it&1)for(let k=0;k<J.r3.length;k++)jLink(J,k,(k+3)%N,J.r3[k],J.stiff*.4);
+      for(let k=0;k<N;k++){if(J.att[k]){J.p[k].copy(J.rest[k]);continue;}
+        const p=J.p[k],e=J.ext[k];if(p.y<e){const q=J.q[k],vy=p.y-q.y;p.y=e;q.y=e+.3*vy;q.x+=(p.x-q.x)*.2;q.z+=(p.z-q.z)*.2;}}
     }
   }
-  // peel: a stuck node pops off when its loose neighbour pulls it too far (one at a time, so it peels like tape)
-  J.popT-=dt;if(J.popT>0)return;
-  for(let k=0;k<J.N;k++){if(!J.att[k])continue;
-    for(const j of[k-1,k+1]){if(j<0||j>=J.N||J.att[j])continue;
-      if(J.p[j].distanceTo(J.rest[k])>J.rl[Math.min(k,j)]*1.45){J.att[k]=0;J.q[k].copy(J.rest[k]);J.popT=.07;if(AC&&Math.random()<.5)tone(900+Math.random()*500,400,.04,'triangle',.05);break;}}}
+  // bump into the rest of the candy
+  let stuck=0;for(let k=0;k<N;k++)stuck+=J.att[k];
+  if(bvh&&J.sc>.6&&(!stuck||!held))for(let k=0;k<N;k++){if(J.att[k]||(held&&k===J.pin))continue;gumCollide(J,k);}
+  // peel: a stuck bit lets go when the loose bit next to it pulls too far (one after another, like tape)
+  J.popT-=dt;
+  for(let k=0;k<N;k++){if(!J.att[k])continue;
+    for(const j of[prevK(J,k),nextK(J,k)]){if(j<0||j>=N||J.att[j])continue;
+      const st=J.p[j].distanceTo(J.rest[k])/linkLen(J,j,k);
+      if(st>2.2||(st>1.3&&J.popT<=0)){popNode(J,k);break;}}}
+  // which way the ribbon's flat side faces: carried along as it bends (no flips), relaxed so it doesn't twist up
+  for(let k=0;k<N;k++){
+    const a=J.p[J.closed||k>0?prevK(J,k):k],b=J.p[J.closed||k<N-1?nextK(J,k):k];
+    gT.subVectors(b,a);if(gT.lengthSq()<1e-10)continue;gT.normalize();
+    const T0=J.T[k],B=J.B[k],d=T0.dot(gT);
+    if(d<.99999&&d>-.9){gQ.setFromUnitVectors(T0,gT);B.applyQuaternion(gQ);}
+    T0.copy(gT);
+  }
+  for(let k=0;k<N;k++){
+    const B=J.B[k],T0=J.T[k];
+    if(!J.att[k]){
+      for(const j of[prevK(J,k),nextK(J,k)]){if(j<0||j>=N)continue;const o=J.B[j],w=J.pud?1.5:.4,sg=o.dot(B)<0?-w:w;B.addScaledVector(o,sg);}
+      const a=prevK(J,k),b=nextK(J,k);
+      if(a>=0&&b<N&&a!==b){   // a flat ribbon bends across its thin side, so it twists to face the bend
+        gBv.addVectors(J.p[a],J.p[b]).addScaledVector(J.p[k],-2);gBv.addScaledVector(T0,-gBv.dot(T0));
+        const kl=gBv.length()/J.rl[Math.min(k,J.rl.length-1)],asp=Math.max(J.hd[k],J.hw[k])/Math.min(J.hd[k],J.hw[k]);
+        if(kl>.04&&asp>1.4){gBv.normalize();if(J.hd[k]>=J.hw[k])gBv.crossVectors(T0,gBv);if(gBv.dot(B)<0)gBv.negate();B.lerp(gBv,Math.min(.5,kl*dt*10));}
+      }
+      if(J.p[k].y<J.ext[k]+.03){   // lying on the floor: flop onto its flat side
+        if(J.hd[k]>=J.hw[k])gBv.crossVectors(T0,UP);else gBv.copy(UP).addScaledVector(T0,-T0.y);
+        if(gBv.lengthSq()>1e-6){gBv.normalize();if(gBv.dot(B)<0)gBv.negate();B.lerp(gBv,Math.min(1,dt*5));}
+      }
+    }
+    B.addScaledVector(T0,-B.dot(T0));if(B.lengthSq()<1e-8)B.crossVectors(T0,Math.abs(T0.y)<.9?UP:AX[0]);B.normalize();
+    gN.crossVectors(B,T0);const s=(1+.13*Math.max(0,J.pf[k]))*J.vol[k];
+    J.ext[k]=(Math.abs(gN.y)*J.hw[k]+Math.abs(B.y)*J.hd[k])*s*.92;
+  }
+  for(let k=1;k<N;k++)if(J.B[k].dot(J.B[k-1])<0)J.B[k].negate();   // keep the flat side's direction consistent so the mesh never flips through itself
+  // gummy springs: each bit puffs up as it pops loose, wobbles when jerked, thins when stretched
+  for(let k=0;k<N;k++){
+    const tg=J.att[k]?0:1;J.pfv[k]+=((tg-J.pf[k])*240-J.pfv[k]*15)*dt;J.pf[k]=clamp(J.pf[k]+J.pfv[k]*dt,-.2,1.5);
+    const p=J.p[k],q=J.q[k],v=J.lv[k],vx=(p.x-q.x)/h,vy=(p.y-q.y)/h,vz=(p.z-q.z)/h;
+    const dv=Math.hypot(vx-v.x,vy-v.y,vz-v.z);v.set(vx,vy,vz);
+    J.wbv[k]+=Math.min(dv,30)*.25+(-300*J.wb[k]-10*J.wbv[k])*dt;J.wb[k]=clamp(J.wb[k]+J.wbv[k]*dt,-.28,.28);
+    let st=0,c2=0;if(J.closed||k>0){const j=prevK(J,k);st+=J.p[j].distanceTo(p)/linkLen(J,j,k);c2++;}
+    if(J.closed||k<N-1){const j=nextK(J,k);st+=J.p[j].distanceTo(p)/linkLen(J,j,k);c2++;}
+    const want=J.att[k]?1:clamp(1/Math.sqrt(Math.max(.2,st/c2)),.55,1.25);J.vol[k]+=(want-J.vol[k])*Math.min(1,dt*18);
+  }
 }
-function jellyPopOne(c){   // help the peel along: pop the stuck node next to the loose part
-  const J=c.J;if(!J)return false;
-  if(J.popT>0)return false;
-  for(let k=0;k<J.N;k++)if(J.att[k]&&((k>0&&!J.att[k-1])||(k<J.N-1&&!J.att[k+1]))){J.att[k]=0;J.q[k].copy(J.rest[k]);J.popT=.07;return true;}
+function jellyPopOne(c){   // help the peel along: pop the stuck bit next to the loose part
+  const J=c.J;if(!J||J.popT>0)return false;
+  for(let k=0;k<J.N;k++){if(!J.att[k])continue;const a=prevK(J,k),b=nextK(J,k);
+    if((a>=0&&a<J.N&&!J.att[a])||(b>=0&&b<J.N&&!J.att[b])){popNode(J,k);return true;}}
   return false;
 }
-function jellyFree(c){if(c&&c.J)c.J.att.fill(0);}
-const jT=[],jN=[],jB=[],jQ=new QT();
+function jellyFree(c){const J=c&&c.J;if(!J)return;for(let k=0;k<J.N;k++)if(J.att[k]){J.att[k]=0;J.q[k].copy(J.rest[k]);J.pfv[k]+=3+Math.random()*4;}}
+// Catmull-Rom through the nodes (open ends are extended straight)
+function cNode(J,i,o){const N=J.N;if(J.closed)return o.copy(J.p[(i%N+N)%N]);
+  if(i<0)return o.copy(J.p[0]).multiplyScalar(2).sub(J.p[Math.min(1,N-1)]);
+  if(i>N-1)return o.copy(J.p[N-1]).multiplyScalar(2).sub(J.p[Math.max(0,N-2)]);return o.copy(J.p[i]);}
+const ringP=[],ringT=[],ringB=[],ringS=new Float32Array(400*4);
 function jellySkin(c,T){
-  const J=c.J,attr=c.mesh.geometry.attributes.position,P=attr.array,n=P.length/3,N=J.N;
-  for(let k=0;k<N-1;k++){
-    if(!jT[k]){jT[k]=new V3();jN[k]=new V3();jB[k]=new V3();}
-    jT[k].subVectors(J.p[k+1],J.p[k]);if(jT[k].lengthSq()<1e-10)jT[k].copy(J.T0[k]);jT[k].normalize();
-    if(k===0){jQ.setFromUnitVectors(J.T0[0],jT[0]);jB[0].copy(J.B0[0]).applyQuaternion(jQ);}
-    else{jQ.setFromUnitVectors(jT[k-1],jT[k]);jB[k].copy(jB[k-1]).applyQuaternion(jQ);}
-    jB[k].addScaledVector(jT[k],-jB[k].dot(jT[k])).normalize();jN[k].crossVectors(jB[k],jT[k]);
+  const J=c.J,N=J.N,attr=c.mesh.geometry.attributes.position,P=attr.array;
+  // 1. one ring per step along the curve
+  let r=0;const nseg=J.closed?N:N-1;
+  const addRing=(k,t)=>{
+    const k2=J.closed?(k+1)%N:Math.min(N-1,k+1);
+    cNode(J,k-1,gA);cNode(J,k,gB);cNode(J,k+1,gC);cNode(J,k+2,gD);
+    const t2=t*t,t3=t2*t;
+    if(!ringP[r]){ringP[r]=new V3();ringT[r]=new V3();ringB[r]=new V3();}
+    const p=ringP[r],tg=ringT[r],b=ringB[r];
+    p.set(0,0,0).addScaledVector(gB,2).addScaledVector(gA,-t).addScaledVector(gC,t)
+     .addScaledVector(gA,2*t2).addScaledVector(gB,-5*t2).addScaledVector(gC,4*t2).addScaledVector(gD,-t2)
+     .addScaledVector(gA,-t3).addScaledVector(gB,3*t3).addScaledVector(gC,-3*t3).addScaledVector(gD,t3).multiplyScalar(.5);
+    tg.set(0,0,0).addScaledVector(gA,-1).add(gC)
+     .addScaledVector(gA,4*t).addScaledVector(gB,-10*t).addScaledVector(gC,8*t).addScaledVector(gD,-2*t)
+     .addScaledVector(gA,-3*t2).addScaledVector(gB,9*t2).addScaledVector(gC,-9*t2).addScaledVector(gD,3*t2);
+    if(tg.lengthSq()<1e-10)tg.copy(J.T[k]);tg.normalize();
+    const B2=J.B[k2],sg=J.B[k].dot(B2)<0?-1:1;
+    b.copy(J.B[k]).multiplyScalar(1-t).addScaledVector(B2,sg*t);b.addScaledVector(tg,-b.dot(tg));
+    if(b.lengthSq()<1e-8)b.crossVectors(tg,Math.abs(tg.y)<.9?UP:AX[0]);b.normalize();
+    const L=(a,bb)=>a+(bb-a)*t,pf=L(J.pf[k],J.pf[k2]),sc=(1+.13*Math.max(0,pf))*L(J.vol[k],J.vol[k2])*(1+L(J.wb[k],J.wb[k2]));
+    const pp=clamp(pf,0,1)*(J.pud?.22:.16),w0=L(J.hw[k],J.hw[k2]),d0=L(J.hd[k],J.hd[k2]);
+    ringS[4*r]=Math.max(w0,d0*pp)*sc;ringS[4*r+1]=Math.max(d0,w0*pp)*sc;ringS[4*r+2]=clamp(5-2.6*pf,2.3,5);ringS[4*r+3]=1;
+    r++;
+  };
+  for(let k=0;k<nseg;k++)for(let s=0;s<GSUB;s++)addRing(k,s/GSUB);
+  if(!J.closed)addRing(N-2>=0?N-2:0,N>1?1:0);
+  // 2. write vertices (with rounded end caps on open ribbons)
+  let w=0;
+  const put=(p,tg,b,hw,hd,pe,sh)=>{
+    gN.crossVectors(b,tg);const e=2/pe;
+    for(let j=0;j<=GK;j++){const jj=j%GK,cs=GCOS[jj],sn=GSIN[jj],x=Math.sign(cs)*Math.pow(Math.abs(cs),e)*hw*sh,y=Math.sign(sn)*Math.pow(Math.abs(sn),e)*hd*sh,o=3*(w*(GK+1)+j);
+      P[o]=p.x+gN.x*x+b.x*y;P[o+1]=p.y+gN.y*x+b.y*y;P[o+2]=p.z+gN.z*x+b.z*y;}
+    w++;
+  };
+  if(!J.closed){
+    const i0=0,rc=Math.min(ringS[0],ringS[1])*.95;
+    for(let i=GCAP+1;i>=1;i--){const ph=i/(GCAP+1)*Math.PI/2;gP.copy(ringP[i0]).addScaledVector(ringT[i0],-rc*Math.sin(ph));put(gP,ringT[i0],ringB[i0],ringS[0],ringS[1],ringS[2],Math.cos(ph));}
   }
-  const sc=J.sc,C=T||J.p[J.pin];
-  for(let i=0;i<n;i++){
-    const k=J.seg[i],t=J.wt[i],a=J.p[k],b=J.p[k+1],o=3*i,ot=J.off[o],on=J.off[o+1],ob=J.off[o+2];
-    let x=a.x+(b.x-a.x)*t+ot*jT[k].x+on*jN[k].x+ob*jB[k].x;
-    let y=a.y+(b.y-a.y)*t+ot*jT[k].y+on*jN[k].y+ob*jB[k].y;
-    let z=a.z+(b.z-a.z)*t+ot*jT[k].z+on*jN[k].z+ob*jB[k].z;
-    if(sc!==1){x=C.x+(x-C.x)*sc;y=C.y+(y-C.y)*sc;z=C.z+(z-C.z)*sc;}
-    P[o]=x;P[o+1]=y;P[o+2]=z;
+  for(let i=0;i<r;i++)put(ringP[i],ringT[i],ringB[i],ringS[4*i],ringS[4*i+1],ringS[4*i+2],1);
+  if(!J.closed){
+    const i1=r-1,rc=Math.min(ringS[4*i1],ringS[4*i1+1])*.95;
+    for(let i=1;i<=GCAP+1;i++){const ph=i/(GCAP+1)*Math.PI/2;gP.copy(ringP[i1]).addScaledVector(ringT[i1],rc*Math.sin(ph));put(gP,ringT[i1],ringB[i1],ringS[4*i1],ringS[4*i1+1],ringS[4*i1+2],Math.cos(ph));}
   }
-  attr.needsUpdate=true;c.mesh.geometry.computeVertexNormals();
+  // 3. shrink toward the fingers / mouth while being eaten
+  const sc=J.sc;
+  if(sc!==1){const C=T||J.p[J.pin];for(let i=0;i<w*(GK+1);i++){const o=3*i;P[o]=C.x+(P[o]-C.x)*sc;P[o+1]=C.y+(P[o+1]-C.y)*sc;P[o+2]=C.z+(P[o+2]-C.z)*sc;}}
+  attr.needsUpdate=true;const g=c.mesh.geometry;g.computeVertexNormals();
+  const nr=g.attributes.normal.array,R=J.rings,KV=GK+1;
+  for(let i=0;i<R;i++){const a=3*i*KV,b=a+3*GK;for(let c=0;c<3;c++){const v=nr[a+c]+nr[b+c];nr[a+c]=nr[b+c]=v;}   // seam column shares one normal
+    const l=Math.hypot(nr[a],nr[a+1],nr[a+2])||1;for(let c=0;c<3;c++){nr[a+c]/=l;nr[b+c]=nr[a+c];}}
+  if(!J.closed)for(let j=0;j<KV;j++){let o=3*j;nr[o]=-ringT[0].x;nr[o+1]=-ringT[0].y;nr[o+2]=-ringT[0].z;
+      o=3*((R-1)*KV+j);nr[o]=ringT[r-1].x;nr[o+1]=ringT[r-1].y;nr[o+2]=ringT[r-1].z;}
 }
 function disposeBite(c){if(!c)return;scene.remove(c.mesh);c.mesh.geometry.dispose();}
-function dropBite(c){if(!c)return;if(c.J){c.J.held=false;falling.push({c,t:0});}else disposeBite(c);}
+function dropBite(c){if(!c)return;if(c.J){c.J.held=false;c.J.hold=null;falling.push({c,t:0});
+  while(falling.length>6){disposeBite(falling[0].c);falling.shift();}}else disposeBite(c);}
 function updateFalling(dt){
-  for(const f of falling){f.t+=dt;jellyFree(f.c);if(f.t>1)f.c.J.sc=Math.max(.02,1-(f.t-1)/.7);jellyStep(f.c,null,dt);jellySkin(f.c,null);}
-  falling=falling.filter(f=>{if(f.t>1.7){disposeBite(f.c);return false;}return true;});
+  for(const f of falling){f.t+=dt;jellyFree(f.c);const J=f.c.J;if(f.t>2.4)J.sc=Math.max(.02,1-(f.t-2.4)/.5);
+    jellyStep(f.c,null,dt);jellySkin(f.c,J.sc<1?J.p[J.N>>1]:null);}
+  falling=falling.filter(f=>{if(f.t>2.9){disposeBite(f.c);return false;}return true;});
 }
 // what the hand's strip or bear does this frame (same on every device)
 function handVisual(h,dt){
@@ -1967,7 +2127,7 @@ renderer.setAnimationLoop(()=>{
 });
 applyBackdrop();
 rebuild();
-window.__taffy={P,M,BB,NET,hands,get mesh(){return mesh;},get agents(){return agents;},get me(){return me;},get mode(){return mode;},solo,babyTap,camera,
+window.__taffy={P,M,BB,NET,hands,controls,act,get falling(){return falling;},get mesh(){return mesh;},get agents(){return agents;},get me(){return me;},get mode(){return mode;},solo,babyTap,camera,
   tick(sec){const dt=1/30;for(let i=0;i<sec*30;i++){if(mode==='play'){const bots=M.amHost?agents.filter(a=>a.owner==='bot'&&!a.carried).map(a=>[a,botThink(a,dt)]):[];for(let k=0;k<5;k++)for(const[a,m]of bots)stepAgent(a,m[0],m[1],dt/5);}updateBaby(dt);for(const a of agents)animBear(a,dt);updateFalling(dt);hostCheck();}
     const D=mesh.geometry.userData;return {mode,role:M.role,eaten:D.dead.reduce((a,b)=>a+b,0),units:D.units.length,states:hands.map(h=>h.st),bears:agents.map(a=>a.id+':'+a.owner+(a.carried?'(c)':''))};},
   fakeXR(inp){XR.in=inp;},vrBabyHands,XR,drawChubby,
