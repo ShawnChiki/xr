@@ -613,6 +613,7 @@ const SFX={
   nom:()=>{for(let i=0;i<3;i++)tone(170,115,.12,'sine',.13,i*.2);},
   squeak:()=>{tone(900,1500,.12,'sine',.08);tone(1400,900,.12,'sine',.07,.12);},
   gulp:()=>tone(320,80,.4,'sine',.18),
+  tok:()=>{tone(210,140,.07,'triangle',.16);tone(150,110,.09,'sine',.1,.03);},
 };
 
 /* ---------------- gummy bears: the blobby big-eyed Drop and Bounce character, made of gummy ---------------- */
@@ -838,7 +839,7 @@ function myMove(){
 // bot bears: sit tight, bolt to a new hiding spot when the baby can see them or eats right next to them
 function botThink(a,dt){
   a.t-=dt;
-  const hunted=hands.some(h=>h.st==='hunt'&&h.prey===a);
+  const hunted=hands.some(h=>HUNTING.includes(h.st)&&h.prey===a);
   if(a.t<=0){
     a.t=.3;
     const vis=canSee(BB.view,a);
@@ -918,6 +919,62 @@ const BB={on:false,owner:'bot',headR:3,C:new V3(),R:5,top:6,ang:.8,focus:new V3(
 const babyMine=()=>isMine(BB.owner);
 const babyCtrl=()=>BB.owner==='bot'?'bot':XR.on?'vr':'tap';
 let falling=[];
+/* ---------------- the sticky lollipop: the only way to get the gummy bears out ----------------
+   A long stick with a sticky ball. Poke it into the gaps: a bear that touches the ball sticks to it.
+   The ball can't go through solid candy, so tight gaps are safe places to hide. */
+const LL=4.2,LR=.21,LRC=.12;   // stick length, ball radius, and how big it is when squeezing through gaps (it's soft)
+const lollyTex=(()=>{const c=document.createElement('canvas');c.width=256;c.height=128;const x=c.getContext('2d');
+  const cols=['#ff4f7e','#fff3f7','#ff9ab6','#fff3f7'];
+  for(let i=-10;i<26;i++){x.fillStyle=cols[(i%4+4)%4];x.beginPath();x.moveTo(i*16,0);x.lineTo(i*16+16,0);x.lineTo(i*16+16-80,128);x.lineTo(i*16-80,128);x.fill();}   // slanted stripes wrap into a swirl
+  const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;t.wrapS=THREE.RepeatWrapping;return t;})();
+const lollyM=new THREE.MeshPhysicalMaterial({map:lollyTex,roughness:.1,clearcoat:1,clearcoatRoughness:.02,emissive:0xff6f95,emissiveIntensity:.07});
+const stickM=new THREE.MeshStandardMaterial({color:0xf7f2e8,roughness:.75});
+function makeLolly(){
+  const g=new THREE.Group();
+  const st=new THREE.Mesh(new THREE.CylinderGeometry(.055,.055,LL+.6,10),stickM);st.position.y=(LL+.6)/2-.6;st.castShadow=true;g.add(st);
+  const b=new THREE.Mesh(new THREE.SphereGeometry(LR,28,20),lollyM);b.position.y=LL;b.castShadow=true;g.add(b);
+  g.visible=false;baby.add(g);return {g,ball:b};
+}
+for(const h of hands){h.L=makeLolly();h.lolly=false;h.lollyS=0;h.lslide=0;h.bumpT=0;h.pokeD=new V3();h.bonked=false;}
+const HUNTING=['hunt','poke','unpoke'];
+const lB=new V3(),lD=new V3(),tv7=new V3();
+function lollyPose(h){   // where the fist holds it, and which way it points
+  const J=h.useTip&&(h.jw||h.nj);
+  if(J){   // your own tracked hand: across the palm, out between thumb and index, tipped a little toward your fingers
+    lB.set(0,0,0);for(const i of[10,11,15,16]){lB.x+=J[3*i]/4;lB.y+=J[3*i+1]/4;lB.z+=J[3*i+2]/4;}
+    lD.set(J[15]-J[60],J[16]-J[61],J[17]-J[62]).normalize();
+    tv7.set(J[30]-J[0],J[31]-J[1],J[32]-J[2]).normalize();lD.addScaledVector(tv7,.35).normalize();
+  }else{h.g.localToWorld(lB.set(0,0,.3));lD.set(0,0,1).applyQuaternion(h.g.quaternion);}
+}
+// how far out the ball can be from the fist before it would hit solid candy (it needs a clear straight line)
+function clearLen(){
+  if(reachable(lB,lD,-1,LL,LRC))return LL;
+  let lo=.3,hi=LL;for(let k=0;k<6;k++){const m=(lo+hi)/2;if(reachable(lB,lD,-1,m,LRC))lo=m;else hi=m;}return lo;
+}
+const lollyBall=(h,o)=>o.copy(lB).addScaledVector(lD,(LL-h.lslide)*h.lollyS);
+function stickyBear(ball){   // a bear touching the ball
+  for(const a of agents){if(a.carried)continue;tv3.copy(a.pos);tv3.y-=.2;if(tv3.distanceTo(ball)<LR+.24)return a;}
+  return null;
+}
+function lollyVisual(h,dt){   // same on every device
+  const L=h.L;h.lollyS+=((h.lolly?1:0)-h.lollyS)*Math.min(1,dt*10);
+  L.g.visible=h.lollyS>.02&&(h.g.visible||h.useTip);if(!L.g.visible)return;
+  lollyPose(h);
+  L.g.quaternion.setFromUnitVectors(YAX,lD);L.g.position.copy(lB).addScaledVector(lD,-h.lslide*h.lollyS);L.g.scale.setScalar(h.lollyS);
+}
+function bonk(h,ctrl){SFX.tok();if(ctrl==='tap'){BB.shake=.5;hud('Too tight in there! Turn and try another angle',1.8);}}
+// find a clear straight line in for the lollipop: the line you see it on if possible, else the nearest clear one around it
+const lineOK=(bc,d)=>reachable(bc,d,-1,LL+1.5,LRC);
+function pokeLine(h,bc,cone){
+  const v=tv1.subVectors(BB.view,bc).normalize();
+  if(lineOK(bc,v)){h.reachDir.copy(v);h.canReach=true;return;}
+  tv6.crossVectors(v,Math.abs(v.y)<.9?UP:AX[0]).normalize();tv7.crossVectors(v,tv6);
+  for(let ring=1;ring<=3;ring++){const a=cone*ring/3;
+    for(let k=0;k<8;k++){const th=k/8*Math.PI*2+ring;tv2.copy(v).multiplyScalar(Math.cos(a)).addScaledVector(tv6,Math.sin(a)*Math.cos(th)).addScaledVector(tv7,Math.sin(a)*Math.sin(th));
+      if(tv2.y>-.2&&lineOK(bc,tv2)){h.reachDir.copy(tv2);h.canReach=true;return;}}}
+  h.reachDir.copy(v);h.canReach=false;
+}
+
 
 const bez=(a,c,b,t,o)=>{const u=1-t;return o.set(a.x*u*u+c.x*2*t*u+b.x*t*t,a.y*u*u+c.y*2*t*u+b.y*t*t,a.z*u*u+c.z*2*t*u+b.z*t*t);};
 const bez3=(a,b,c,d,t,o)=>{const u=1-t,A=u*u*u,B=3*u*u*t,C=3*u*t*t,Dd=t*t*t;return o.set(a.x*A+b.x*B+c.x*C+d.x*Dd,a.y*A+b.y*B+c.y*C+d.y*Dd,a.z*A+b.z*B+c.z*C+d.z*Dd);};
@@ -1218,7 +1275,8 @@ function handVisual(h,dt){
   if(c&&c.J){const T=tip(h,tv3);c.J.held=true;const want=h.st==='feed'?.35:1;c.J.sc+=(want-c.J.sc)*Math.min(1,dt*6);
     if(h.st==='lift'||h.st==='feed')jellyFree(c);
     jellyStep(c,T,dt);jellySkin(c,T);}
-  if(h.bear){h.bear.pos.copy(tip(h,tv3));h.bear.pos.y+=.22;}
+  lollyVisual(h,dt);
+  if(h.bear){if(h.lolly){lollyBall(h,h.bear.pos).addScaledVector(lD,LR+.16);h.bear.pos.y+=.2;}else{h.bear.pos.copy(tip(h,tv3));h.bear.pos.y+=.22;}}
   for(const f of h.fingers)f.rotation.x=h.curl*1.35;h.th.rotation.x=h.curl*.9;
 }
 
@@ -1275,13 +1333,13 @@ function babyBrain(dt){
     BB.check=.2;
     for(const a of agents){if(a.carried)continue;const vis=canSee(BB.view,a);a.seenB=vis?Math.min(1.8,a.seenB+.2):Math.max(0,a.seenB-.25);a.hidB=vis?0:a.hidB+.2;}
     for(const h of hands)if(h.st==='hunt'&&(!agents.includes(h.prey)||h.prey.hidB>=1.2)){h.st='idle';h.prey=null;}
-    if(!hands.some(h=>h.st==='hunt')){
+    if(!hands.some(h=>HUNTING.includes(h.st))){
       const t=agents.filter(a=>!a.carried&&a.seenB>=1.1).sort((a,b)=>b.seenB-a.seenB)[0];
       if(t){const i=hands.findIndex(h=>h.st==='idle'||h.st==='reach');if(i>=0){startHunt(hands[i],t);}}
     }
   }
   BB.cool-=dt;
-  if(!hands.some(h=>h.st==='hunt'||h.st==='reach'||h.st==='grab'||h.st==='peel')&&BB.cool<=0){
+  if(!hands.some(h=>HUNTING.includes(h.st)||h.st==='reach'||h.st==='grab'||h.st==='peel')&&BB.cool<=0){
     const i=hands[BB.cur].st==='idle'?BB.cur:hands[1-BB.cur].st==='idle'?1-BB.cur:-1;
     if(i>=0){const r=pickUnit();if(r){startReach(hands[i],r.uid,r.p,r.dir);BB.cur=1-i;BB.cool=.35;}}
   }
@@ -1294,7 +1352,7 @@ function startReach(h,uid,G,dir){
   h.ctrl.copy(h.from).lerp(h.c2,.5);h.ctrl.y=Math.max(h.from.y,h.c2.y,BB.top+BB.headR*.25);   // arc over the top
   h.dur=.55+(h.from.distanceTo(h.ctrl)+h.ctrl.distanceTo(h.to))/18;
 }
-function startHunt(h,prey){h.st='hunt';h.prey=prey;h.huntT=0;h.hid=0;h.chk=0;h.canReach=false;}
+function startHunt(h,prey){h.st='hunt';h.prey=prey;h.huntT=0;h.hid=0;h.chk=0;h.canReach=false;h.bonked=false;h.lolly=true;h.lslide=LL*.65;}
 
 /* ---------------- phone / computer baby: tap to grab ---------------- */
 function tapFx(x,y,ok,txt){const d=document.createElement('div');d.className='tapfx'+(ok?'':' no');if(!ok)d.dataset.t=txt;d.style.left=x+'px';d.style.top=y+'px';document.body.appendChild(d);setTimeout(()=>d.remove(),1000);}
@@ -1317,7 +1375,7 @@ function babyTap(x,y){
     const a=live.find(a=>a.obj===o);
     if(a&&!hands.some(h=>h.prey===a)){
       const bc=a.pos.clone();bc.y-=.2;
-      babyCommand({prey:a});tapFx(x,y,true);SFX.pop();   // you can see it, so you can grab it
+      babyCommand({prey:a});tapFx(x,y,true);SFX.pop();   // out comes the lollipop
       return;
     }
   }
@@ -1376,9 +1434,10 @@ function vrBabyHands(dt){
       h.g.quaternion.copy(inp.quat).multiply(QFLIP);h.g.position.copy(inp.pos).addScaledVector(tv1.set(0,0,-1).applyQuaternion(inp.quat),.02*S);
       h.g.updateMatrixWorld(true);h.tipW.copy(tip(h,tv1));
     }
-    const grip=inp.grip;h.curl+=((grip?1:inp.squeeze*.5+.15)-h.curl)*Math.min(1,dt*14);
+    const grip=inp.grip;h.curl+=((grip||inp.fist?1:inp.squeeze*.5+.15)-h.curl)*Math.min(1,dt*14);
     const down=grip&&!h.wasGrip,up=!grip&&h.wasGrip;h.wasGrip=grip;
-    if(!['vr','vpeel','vbear','vdrag'].includes(h.st)){if(h.carry){dropBite(h.carry);h.carry=null;}h.st='vr';}
+    if(!['vr','vpeel','vbear','vdrag','vlolly'].includes(h.st)){if(h.carry){dropBite(h.carry);h.carry=null;}h.st='vr';}
+    if(h.st==='vr'&&inp.fist&&live){h.st='vlolly';h.lolly=true;h.lslide=LL*.5;}
     const T=h.tipW;
     switch(h.st){
       case 'vr':if(down)vrGrab(h,inp,live);break;
@@ -1388,6 +1447,15 @@ function vrBabyHands(dt){
         if(T.distanceTo(mouth)<1.6){jellyFree(h.carry);act({e:'swallow',h:i});h.st='vr';buzz(inp,.6,80);}   // close to your mouth = eaten
         else if(up){act({e:'drop',h:i});h.st='vr';}
         break;
+      case 'vlolly':{   // the stick slides back through your fist instead of going into solid candy
+        if(!inp.fist){if(h.bear){lollyPose(h);const p=lollyBall(h,new V3());act({e:'release',h:i,id:h.bear.id,p:p.toArray()});}h.lolly=false;h.st='vr';break;}
+        lollyPose(h);const want=LL-clearLen();h.bumpT-=dt;
+        if(want>h.lslide+.02){if(want>h.lslide+.15&&h.bumpT<=0){SFX.tok();buzz(inp,.8,30);h.bumpT=.25;}h.lslide=want;}
+        else h.lslide+=(want-h.lslide)*Math.min(1,dt*10);
+        const ball=lollyBall(h,tv2);
+        if(!h.bear){const a=stickyBear(ball);if(a){act({e:'catch',h:i,id:a.id});buzz(inp,.7,60);}}
+        else if(ball.distanceTo(mouth)<1.6){act({e:'eatbear',h:i,id:h.bear.id});buzz(inp,1,150);}   // lick it off
+        break;}
       case 'vbear':
         if(!h.bear){h.st='vr';break;}
         if(T.distanceTo(mouth)<1.8){act({e:'eatbear',h:i,id:h.bear.id});h.st='vr';buzz(inp,1,150);}
@@ -1414,12 +1482,7 @@ function vrGrab(h,inp,live){
   if(live){
     let best=null,bd=.75;
     for(const a of agents){if(a.carried||a===me)continue;const bc=tv4.copy(a.pos);bc.y-=.2;const d=bc.distanceTo(T);if(d<bd){bd=d;best=a;}}
-    if(best){
-      const bc=best.pos.clone();bc.y-=.2;
-      if(reachable(bc,eye.clone().sub(bc).normalize(),-1)){act({e:'catch',h:hands.indexOf(h),id:best.id});h.st='vbear';buzz(inp,.7,60);}
-      else{nope('too deep');buzz(inp,1,30);}
-      return;
-    }
+    if(best){SFX.squeak();hud('Too slippery for fingers! Make a fist to hold your sticky lollipop',2.2);buzz(inp,.6,30);return;}
     const hit=nearestAlive(T,.5);
     if(hit){
       const dir=eye.clone().sub(hit.p).normalize();
@@ -1456,7 +1519,7 @@ function setupBaby(){
   for(const f of falling)disposeBite(f.c);falling=[];
   baby.visible=true;BB.on=true;
 }
-function resetHand(h){disposeBite(h.carry);h.carry=null;if(h.bear){h.bear.carried=false;h.bear=null;}h.st='idle';h.uid=-1;h.t=0;h.prey=null;h.peelP=0;h.useTip=false;h.jw=null;}
+function resetHand(h){disposeBite(h.carry);h.carry=null;if(h.bear){h.bear.carried=false;h.bear=null;}h.lolly=false;h.lollyS=0;h.lslide=0;if(h.L)h.L.g.visible=false;h.st='idle';h.uid=-1;h.t=0;h.prey=null;h.peelP=0;h.useTip=false;h.jw=null;}
 function stopBaby(){BB.on=false;baby.visible=false;for(const h of hands)resetHand(h);for(const f of falling)disposeBite(f.c);falling=[];drawChubby([]);}
 function updateBaby(dt){
   if(!BB.on)return;
@@ -1470,7 +1533,7 @@ function driveBaby(dt){
   if(live&&ctrl==='bot')babyBrain(dt);
   if(live&&ctrl==='tap'&&BB.queue&&hands.some(h=>h.st==='idle')){const q=BB.queue;BB.queue=null;
     if(q.prey?agents.includes(q.prey):!D.dead[q.uid])babyCommand(q);}
-  const hunter=hands.find(h=>h.st==='hunt');
+  const hunter=hands.find(h=>h.prey&&HUNTING.includes(h.st));
   if(ctrl==='vr'){
     // your head is the baby's head
     head.position.copy(XR.headPos);head.quaternion.copy(XR.headQuat).multiply(QFLIP);head.scale.setScalar(.1*XR.scale);
@@ -1502,7 +1565,7 @@ function driveBaby(dt){
   // mouth
   let mt=hunter?.45:0;
   if(BB.chew>0)mt=.12+.25*(.5+.5*Math.sin(BB.clk*15));
-  if(hands.some(h=>(h.st==='lift'&&h.t>.55)||h.st==='feed'||((h.st==='vpeel'||h.st==='vbear')&&tip(h,tv1).distanceTo(mouthIn(tv2))<3)))mt=1;
+  if(hands.some(h=>(h.st==='lift'&&h.t>.55)||h.st==='feed'||(h.st==='lolift'&&h.t>.5)||h.st==='lofeed'||((h.st==='vpeel'||h.st==='vbear')&&tip(h,tv1).distanceTo(mouthIn(tv2))<3)||(h.st==='vlolly'&&h.L.ball.getWorldPosition(tv1).distanceTo(mouthIn(tv2))<3)))mt=1;
   BB.mouth+=(mt-BB.mouth)*Math.min(1,dt*12);
   cav.scale.y=.12+.85*BB.mouth;tongue.position.y=-.04-.08*BB.mouth;
 }
@@ -1516,8 +1579,8 @@ function handStep(h,dt,live,ctrl){
   h.g.visible=true;h.useTip=false;
   if(h.st.startsWith('v')){if(h.carry){dropBite(h.carry);h.carry=null;}h.st='idle';}
   switch(h.st){
-    case 'idle':restPos(h,tv4);p.lerp(tv4,Math.min(1,dt*4));handLook(h,tv5.set(BB.C.x,BB.top*.4,BB.C.z));break;
-    case 'reach':
+    case 'idle':h.lolly=false;restPos(h,tv4);p.lerp(tv4,Math.min(1,dt*4));handLook(h,tv5.set(BB.C.x,BB.top*.4,BB.C.z));break;
+    case 'reach':h.lolly=false;
       h.t=Math.min(1,h.t+dt/h.dur);bez3(h.from,h.ctrl,h.c2,h.to,ease(h.t),p);handLook(h,h.look);curl=0;
       if(h.t>=1){
         if(D.dead[h.uid]){h.st='idle';break;}
@@ -1525,23 +1588,55 @@ function handStep(h,dt,live,ctrl){
         h.st='grab';h.t=0;
       }
       break;
-    case 'hunt':{
-      const a=h.prey;
+    case 'hunt':{   // lollipop out: line it up with the bear from outside the candy
+      const a=h.prey;h.lolly=true;
       if(!agents.includes(a)||a.carried){h.st='idle';h.prey=null;break;}
       const bc=tv5.copy(a.pos);bc.y-=.2;
       h.chk-=dt;
-      if(h.chk<=0){h.chk=.2;h.reachDir.subVectors(BB.view,bc).normalize();h.canReach=ctrl==='tap'?canSee(BB.view,a):reachable(bc,h.reachDir,-1);   // fingers come in along the line you see it on
-        if(ctrl==='tap'){h.huntT+=.2;if(canSee(BB.view,a))h.hid=0;else h.hid+=.2;if(h.hid>=1.2||h.huntT>6){h.st='idle';h.prey=null;break;}}}
-      const A=tv6.copy(bc).addScaledVector(h.reachDir,1.6+.72*hs);              // just outside, on that line
+      if(h.chk<=0){h.chk=.2;h.huntT+=.2;
+        if(ctrl==='tap'){pokeLine(h,bc,.5);h.canReach=true;   // poke along the line you see it on (or close to it); if none is clear it'll bonk
+          if(canSee(BB.view,a))h.hid=0;else h.hid+=.2;if(h.hid>=1.2||h.huntT>6){h.st='idle';h.prey=null;break;}}
+        else{pokeLine(h,bc,1.2);if(h.huntT>(h.canReach?9:4)){h.st='idle';h.prey=null;BB.cool=1;break;}}}
+      const A=tv6.copy(bc).addScaledVector(h.reachDir,LL+1.5);              // the fist, out here: the ball starts just outside
       let want;
       if(p.distanceTo(A)>.8){                                                     // still travelling: go over the candy, not through it
         tv1.subVectors(A,p);const L=tv1.length();tv1.divideScalar(L);
         want=firstAlive(p,tv1,L)?tv4.set(A.x,Math.max(p.y,A.y,BB.top+.8),A.z):tv4.copy(A);
         if(want!==A&&Math.hypot(p.x-A.x,p.z-A.z)<.8)want.copy(A);
-      }else want=h.canReach?tv4.copy(bc).addScaledVector(h.reachDir,.72*hs):tv4.copy(A);   // can't reach: hover outside
-      const L=want.distanceTo(p);if(L>1e-3)p.addScaledVector(tv1.subVectors(want,p).normalize(),Math.min(L,(ctrl==='tap'?7.5:6.5)*dt));
-      handLook(h,bc);curl=h.canReach?0:.5;
-      if(live&&h.canReach&&tip(h,tv2).distanceTo(bc)<.45){act({e:'catch',h:hands.indexOf(h),id:a.id});h.prey=null;h.st='grab';h.t=0;}
+      }else want=tv4.copy(A);
+      const L=want.distanceTo(p);if(L>1e-3)p.addScaledVector(tv1.subVectors(want,p).normalize(),Math.min(L,(ctrl==='tap'?8:6.5)*dt));
+      handLook(h,bc);curl=1;
+      const near=p.distanceTo(A)<.35;h.lslide+=((near?0:LL*.65)-h.lslide)*Math.min(1,dt*7);
+      if(live&&near&&h.canReach&&h.lslide<.15){h.st='poke';h.t=0;h.from.copy(p);h.pokeD.copy(h.reachDir).negate();}
+      break;}
+    case 'poke':{   // push it straight in: a bear that touches the ball sticks; candy that's too tight goes bonk
+      const sp=ctrl==='tap'?5.5:4.5;h.t+=dt;curl=1;
+      p.addScaledVector(h.pokeD,sp*dt);handLook(h,tv4.copy(p).addScaledVector(h.pokeD,6));
+      h.g.updateMatrixWorld(true);lollyPose(h);const e=clearLen();h.lslide=LL-e;
+      const got=stickyBear(lollyBall(h,tv2));
+      if(got){act({e:'catch',h:hands.indexOf(h),id:got.id});h.prey=null;h.st='unpoke';break;}
+      if(e<LL-.08){bonk(h,ctrl);h.bonked=true;h.st='unpoke';break;}
+      if(h.t*sp>LR+2.4)h.st='unpoke';   // missed: it moved
+      break;}
+    case 'unpoke':{   // pull back out the way it went in
+      curl=1;const L=h.from.distanceTo(p);if(L>1e-3)p.addScaledVector(tv1.subVectors(h.from,p).normalize(),Math.min(L,5*dt));
+      handLook(h,tv4.copy(p).addScaledVector(h.pokeD,6));h.g.updateMatrixWorld(true);lollyPose(h);h.lslide=LL-clearLen();
+      if(L<.12){
+        if(h.bear){h.st='lolift';h.t=0;h.from.copy(p);}
+        else if(h.prey&&!(ctrl==='tap'&&h.bonked)&&agents.includes(h.prey)){h.st='hunt';h.bonked=false;}
+        else{h.st='idle';h.prey=null;}
+      }
+      break;}
+    case 'lolift':{   // bring the ball up to your lips
+      h.t=Math.min(1,h.t+dt/.8);curl=1;h.lslide*=Math.max(0,1-dt*8);
+      const f=tv3.set(0,0,1).applyQuaternion(head.quaternion),mi=mouthIn(tv5),dest=tv4.copy(mi).addScaledVector(f,LL+.8);
+      h.ctrl.copy(h.from).lerp(dest,.5);h.ctrl.y+=BB.headR*.3;bez(h.from,h.ctrl,dest,ease(h.t),p);handLook(h,mi);
+      if(h.t>=1&&BB.chew<=.15){h.st='lofeed';h.t=0;h.from.copy(p);}
+      break;}
+    case 'lofeed':{   // chomp the bear right off the ball
+      h.t=Math.min(1,h.t+dt/.35);curl=1;const f=tv3.set(0,0,1).applyQuaternion(head.quaternion);
+      p.copy(h.from).addScaledVector(f,-1.1*ease(h.t));handLook(h,mouthIn(tv5));
+      if(h.t>=1){const i=hands.indexOf(h);h.st='idle';h.lolly=false;if(h.bear&&live)act({e:'eatbear',h:i,id:h.bear.id});}
       break;}
     case 'grab':h.t+=dt/.18;curl=1;h.peelP=0;
       if(h.t>=1){h.t=0;h.from.copy(p);
@@ -1697,7 +1792,7 @@ function handleMsg(m,from){
     BB.hp.fromArray(m.h,0);BB.hq.fromArray(m.h,3);BB.hs=m.h[7];BB.nm=m.m;BB.ne.fromArray(m.e);BB.nch=m.c;BB.view.fromArray(m.v);
     if(!BB.has){head.position.copy(BB.hp);head.quaternion.copy(BB.hq);}BB.has=true;
     m.hs.forEach((x,i)=>{const h=hands[i];h.np.fromArray(x,0);h.nq.fromArray(x,3);h.ns=x[7];h.ncurl=x[8];h.st=x[9];h.peelP=x[10];h.npr=x[11]||'';h.g.visible=!!x[12];
-      h.ntip=(h.ntip||new V3()).fromArray(x,13);h.nj=x[16]?Float32Array.from(x[16]):null;h.njs=x[17]||10;
+      h.ntip=(h.ntip||new V3()).fromArray(x,13);h.nj=x[16]?Float32Array.from(x[16]):null;h.njs=x[17]||10;h.lolly=!!x[18];h.lslide=x[19]||0;
       if(!h.has){h.g.position.copy(h.np);h.g.quaternion.copy(h.nq);h.tipW.copy(h.ntip);}h.has=true;});
   }
   else if(m.t==='ev')applyEvent(m,false);
@@ -1709,7 +1804,7 @@ function netTick(dt){
   if(babyMine()){BB.sendT-=dt;if(BB.sendT<=0){BB.sendT=.066;
     const p=head.position,q=head.quaternion,eT=eyes[0].localToWorld(tv1.set(0,0,10));
     netSend({t:'k',h:[r3(p.x),r3(p.y),r3(p.z),r3(q.x),r3(q.y),r3(q.z),r3(q.w),r3(head.scale.x)],m:r3(BB.mouth),e:eT.toArray().map(r3),c:BB.chew>0?1:0,v:BB.view.toArray().map(r3),
-      hs:hands.map(h=>{const a=h.g.position,b=h.g.quaternion,tp=tip(h,tv2);return[r3(a.x),r3(a.y),r3(a.z),r3(b.x),r3(b.y),r3(b.z),r3(b.w),r3(h.g.scale.x),r3(h.curl),h.st,r3(h.peelP),h.prey?h.prey.id:'',h.g.visible?1:0,r3(tp.x),r3(tp.y),r3(tp.z),h.jw?Array.from(h.jw,r3):0,XR.scale];})});}}
+      hs:hands.map(h=>{const a=h.g.position,b=h.g.quaternion,tp=tip(h,tv2);return[r3(a.x),r3(a.y),r3(a.z),r3(b.x),r3(b.y),r3(b.z),r3(b.w),r3(h.g.scale.x),r3(h.curl),h.st,r3(h.peelP),h.prey?h.prey.id:'',h.g.visible?1:0,r3(tp.x),r3(tp.y),r3(tp.z),h.jw?Array.from(h.jw,r3):0,XR.scale,h.lolly?1:0,r3(h.lslide)];})});}}
 }
 
 /* ---------------- a match ---------------- */
@@ -1763,12 +1858,12 @@ function showHint(){
   const h=$('hint');h.style.transition='none';h.style.opacity=1;void h.offsetWidth;h.style.transition='';
   const vr=XR.on;
   h.innerHTML=M.role==='baby'
-    ?(vr?'You\'re the baby! Pinch a strip and pull to peel it, then bring it to your mouth. Pinch a gummy bear to grab it.<br>Pinch the empty air to drag the world: raise or lower the candy, or use two hands to turn it.'
-        :'You\'re the baby! Tap the candy to peel off a strip and eat it.<br>Gummy bears hide inside: tap one when you can see it to grab it.')
+    ?(vr?'You\'re the baby! Pinch a strip and pull to peel it, then bring it to your mouth.<br>Make a fist (or hold the trigger) for your sticky lollipop: poke it in, a bear that touches it sticks. Lick it off!<br>Pinch the empty air to drag the world: raise or lower the candy, or use two hands to turn it.'
+        :'You\'re the baby! Tap the candy to peel off a strip and eat it.<br>Tap a gummy bear and you\'ll poke your sticky lollipop in after it. Tight gaps go bonk: turn and try another angle.')
     :M.role==='bear'
     ?('You\'re a gummy bear. The giant baby eats the candy strip by strip, so stay hidden for 3 minutes!<br>'+
       (vr?'Left stick moves · right stick turns · A jumps':touchy?'Left thumb moves · right thumb looks':'WASD moves · drag to look · Space jumps')+
-      '<br>Walk into a wall to grab it, push up to climb, sideways to shimmy, pull back to let go. Jump kicks off (push up + Jump to lunge). Your grip runs out!')
+      '<br>The baby pokes a sticky lollipop in after you. It can\'t fit through tight gaps!<br>Walk into a wall to grab it, push up to climb, sideways to shimmy, pull back to let go. Jump kicks off (push up + Jump to lunge). Your grip runs out!')
     :'Watching this round. You can join the next one.';
   hud(M.role==='baby'?'You\'re the baby: grab, pull, eat':M.role==='bear'?'Hide! Survive 3 minutes':'Watching',4);
   clearTimeout(h._t);h._t=setTimeout(()=>h.style.opacity=0,7000);
@@ -1867,13 +1962,15 @@ function readXR(){
           const pd=Math.hypot(raw[12]-raw[27],raw[13]-raw[28],raw[14]-raw[29])/XR.scale;   // thumb tip ↔ index tip, in real metres
           if(!s.pinch&&pd<.02)s.pinch=true;else if(s.pinch&&pd>.04)s.pinch=false;
           const sc=new V3();o.pos=new V3();o.quat=new QT();w.matrixWorld.decompose(o.pos,o.quat,sc);
-          o.grip=s.pinch;o.squeeze=clamp(1-(pd-.02)/.06,0,1);o.ok=true;o.tracked=true;o.J=J;
+          const cr=k=>Math.hypot(raw[3*(k+4)]-raw[0],raw[3*(k+4)+1]-raw[1],raw[3*(k+4)+2]-raw[2])/Math.max(1e-4,Math.hypot(raw[3*(k+1)]-raw[0],raw[3*(k+1)+1]-raw[1],raw[3*(k+1)+2]-raw[2]));
+          const fc=(cr(10)+cr(15)+cr(20))/3;if(!s.fist&&fc<1.3)s.fist=true;else if(s.fist&&fc>1.5)s.fist=false;   // fingertip-to-wrist vs knuckle-to-wrist
+          o.fist=s.fist;o.grip=s.pinch&&!s.fist;o.squeeze=clamp(1-(pd-.02)/.06,0,1);o.ok=true;o.tracked=true;o.J=J;
         }
       }
     }else if(src.gamepad){
       const gp=src.gamepad,bt=k=>!!(gp.buttons[k]&&(gp.buttons[k].pressed||gp.buttons[k].value>.5)),ax=gp.axes||[];
       const sc=new V3();o.pos=new V3();o.quat=new QT();s.g.matrixWorld.decompose(o.pos,o.quat,sc);
-      o.grip=bt(1)||bt(0);o.squeeze=Math.max(gp.buttons[1]?gp.buttons[1].value:0,gp.buttons[0]?gp.buttons[0].value:0);
+      o.grip=bt(1);o.fist=bt(0);o.squeeze=gp.buttons[1]?gp.buttons[1].value:0;
       o.a=bt(4);o.b=bt(5);o.stick=[ax.length>=4?ax[2]:ax[0]||0,ax.length>=4?ax[3]:ax[1]||0];o.ok=true;o.gp=gp;
     }
     XR.in[side]=o;
@@ -2145,7 +2242,7 @@ renderer.setAnimationLoop(()=>{
 });
 applyBackdrop();
 rebuild();
-window.__taffy={P,M,BB,NET,hands,controls,act,get falling(){return falling;},get mesh(){return mesh;},get agents(){return agents;},get me(){return me;},get mode(){return mode;},solo,babyTap,camera,
+window.__taffy={P,M,BB,NET,hands,controls,act,get agents(){return agents;},canSee,babyCommand,head,reach:(p,d,r)=>reachable(p,d,-1,LL+1.5,r),get falling(){return falling;},get mesh(){return mesh;},get agents(){return agents;},get me(){return me;},get mode(){return mode;},solo,babyTap,camera,
   tick(sec){const dt=1/30;for(let i=0;i<sec*30;i++){if(mode==='play'){const bots=M.amHost?agents.filter(a=>a.owner==='bot'&&!a.carried).map(a=>[a,botThink(a,dt)]):[];for(let k=0;k<5;k++)for(const[a,m]of bots)stepAgent(a,m[0],m[1],dt/5);}updateBaby(dt);for(const a of agents)animBear(a,dt);updateFalling(dt);hostCheck();}
     const D=mesh.geometry.userData;return {mode,role:M.role,eaten:D.dead.reduce((a,b)=>a+b,0),units:D.units.length,states:hands.map(h=>h.st),bears:agents.map(a=>a.id+':'+a.owner+(a.carried?'(c)':''))};},
   fakeXR(inp){XR.in=inp;},vrBabyHands,XR,drawChubby,
