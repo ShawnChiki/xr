@@ -35,6 +35,17 @@ function tex(name) {
       x.strokeStyle = 'rgba(60,30,10,.15)'; for (let i = 0; i < 40; i++) { x.beginPath(); const px = Math.random() * s; x.moveTo(px, 0); x.bezierCurveTo(px + 5, s / 3, px - 5, s * 0.6, px, s); x.stroke(); } }),
     braid: () => canvasTex(256, (x, s) => { const C = ['#c8553d', '#e0b13a', '#3f7cac', '#5b8c5a', '#efe2c8']; for (let i = 0; i < 16; i++) { x.fillStyle = C[i % 5]; x.fillRect(0, i * 16, s, 16); x.fillStyle = 'rgba(0,0,0,.15)'; for (let k = 0; k < 16; k++) x.fillRect(k * 16 + (i % 2) * 8, i * 16, 8, 16); } }),
     fabric: () => canvasTex(128, (x, s) => { x.fillStyle = '#fff'; x.fillRect(0, 0, s, s); x.fillStyle = 'rgba(0,0,0,.06)'; for (let i = 0; i < s; i += 4) { x.fillRect(i, 0, 2, s); x.fillRect(0, i, s, 2); } }),
+    clouds: () => canvasTex(512, (x, s) => { x.fillStyle = '#7cc6ff'; x.fillRect(0, 0, s, s); x.fillStyle = '#ffffff';
+      const cloud = (cx, cy, k) => { for (const [dx, dy, r] of [[0, 0, 34], [36, -14, 40], [76, 0, 32], [30, 14, 30], [58, 16, 28], [-26, 10, 24], [100, 12, 22]]) { x.beginPath(); x.arc(cx + dx * k, cy + dy * k, r * k, 0, TAU); x.fill(); } };
+      for (const [cx, cy, k] of [[60, 80, 1], [320, 60, 0.8], [190, 230, 1.1], [420, 300, 0.9], [80, 400, 0.85], [300, 450, 1]]) for (const ox of [-s, 0, s]) for (const oy of [-s, 0, s]) cloud(cx + ox, cy + oy, k); }),
+    abc: () => canvasTex(512, (x, s) => { const L = 'ABCDEFGHIJKLMNOP', q = s / 4; x.fillStyle = '#ffffff'; x.fillRect(0, 0, s, s);
+      for (let i = 0; i < 16; i++) { const px = (i % 4) * q, py = s - (Math.floor(i / 4) + 1) * q; x.strokeStyle = 'rgba(0,0,0,.28)'; x.lineWidth = 12; x.strokeRect(px + 10, py + 10, q - 20, q - 20);
+        x.fillStyle = 'rgba(21,18,26,.6)'; x.font = '900 86px Rubik, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(L[i], px + q / 2, py + q / 2 + 4); } }),
+    cardboard: () => canvasTex(256, (x, s) => { x.fillStyle = '#ffffff'; x.fillRect(0, 0, s, s); x.fillStyle = 'rgba(120,80,30,.12)'; for (let i = 0; i < s; i += 8) x.fillRect(i, 0, 3, s); x.fillStyle = 'rgba(200,170,120,.7)'; x.fillRect(0, s * 0.45, s, 26); noiseFill(x, s, 0.92, 1.02); }),
+    roadrug: () => canvasTex(512, (x, s) => { x.fillStyle = '#62b35c'; x.fillRect(0, 0, s, s); noiseFill(x, s, 0.92, 1.04); x.strokeStyle = '#5b5f66'; x.lineWidth = 46; x.lineJoin = 'round'; rr(x, 70, 70, s - 140, s - 140, 90); x.stroke();
+      x.strokeStyle = '#ffffff'; x.lineWidth = 4; x.setLineDash([18, 16]); rr(x, 70, 70, s - 140, s - 140, 90); x.stroke(); x.setLineDash([]);
+      for (const [hx, hy, c] of [[s / 2 - 40, s / 2 - 30, '#e23b2e'], [s / 2 + 40, s / 2 + 20, '#2f5cff'], [s / 2 - 50, s / 2 + 60, '#ffd400']]) { x.fillStyle = c; x.fillRect(hx - 22, hy - 16, 44, 32); x.fillStyle = '#5a3a2a'; x.beginPath(); x.moveTo(hx - 26, hy - 16); x.lineTo(hx, hy - 38); x.lineTo(hx + 26, hy - 16); x.fill(); }
+      x.fillStyle = '#7fd6ff'; x.beginPath(); x.ellipse(s * 0.72, s * 0.3, 40, 26, 0.3, 0, TAU); x.fill(); }),
     quilt: () => canvasTex(256, (x, s) => { x.fillStyle = '#fff'; x.fillRect(0, 0, s, s); x.strokeStyle = 'rgba(80,60,90,.3)'; x.setLineDash([6, 6]); x.lineWidth = 2; for (let i = 0; i <= 4; i++) { x.beginPath(); x.moveTo(i * s / 4, 0); x.lineTo(i * s / 4, s); x.moveTo(0, i * s / 4); x.lineTo(s, i * s / 4); x.stroke(); } }),
   }[name]; TEX[name] = T(); return TEX[name];
 }
@@ -81,7 +92,7 @@ function buildWorld(scene, L, rost) {
     // fade the blanket where there are no hills so the floor shows through
     blanket.material.onBeforeCompile = sh => { sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvH = position.y;').replace('void main() {', 'varying float vH;\nvoid main() {'); sh.fragmentShader = sh.fragmentShader.replace('void main() {', 'varying float vH;\nvoid main() {').replace('#include <dithering_fragment>', '#include <dithering_fragment>\ngl_FragColor.a *= smoothstep(0.006, 0.03, vH);'); };
     W.root.add(blanket);
-  } else if (L.room.rug) { const R = L.room.rug, t = tex(R.tex).clone(); t.needsUpdate = true; t.repeat.set(R.w / 0.9, R.d / 0.9);
+  } else if (L.room.rug) { const R = L.room.rug, t = tex(R.tex).clone(); t.needsUpdate = true; if (R.tex === 'roadrug') t.repeat.set(1, 1); else t.repeat.set(R.w / 0.9, R.d / 0.9);
     const m = new THREE.Mesh(new THREE.PlaneGeometry(R.w, R.d), new THREE.MeshLambertMaterial({ map: t, color: th.rugCol || '#ffffff' })); m.rotation.set(-Math.PI / 2, 0, BOX.yaw); m.position.set(R.c.x, 0.004, R.c.z); W.root.add(m);
     const brd = new THREE.Mesh(new THREE.PlaneGeometry(R.w + 0.1, R.d + 0.1), new THREE.MeshLambertMaterial({ color: th.trim === '#ffffff' ? '#15121a' : th.trim })); brd.rotation.copy(m.rotation); brd.position.set(R.c.x, 0.002, R.c.z); W.root.add(brd); }
   { const m = new THREE.Mesh(new THREE.PlaneGeometry(bw, bd), new THREE.MeshLambertMaterial({ color: th.ceil, side: THREE.DoubleSide })); m.rotation.x = Math.PI / 2; m.position.set(cx, WALL_H, cz); W.root.add(m);
@@ -195,14 +206,14 @@ function drawEnd(W, s, dt) {
 
 function buildToyBox(W) {
   const { w, d, h, t } = BOX, id = W.L.id;
-  const col = { vaneyck: '#e23b2e', noguchi: '#2e5bea', memphis: '#ff3e8a', junk: '#a0703f' }[id], rim = { vaneyck: '#ffd400', noguchi: '#ffd21f', memphis: '#15121a', junk: '#6e4f33' }[id];
+  const col = { bedroom: '#c98a4b', vaneyck: '#e23b2e', noguchi: '#2e5bea', memphis: '#ff3e8a', junk: '#a0703f' }[id], rim = { bedroom: '#e23b2e', vaneyck: '#ffd400', noguchi: '#ffd21f', memphis: '#15121a', junk: '#6e4f33' }[id];
   const parts = [P('box', V(0, h / 2, -d / 2 + t / 2), V(w, h, t), col), P('box', V(0, h / 2, d / 2 - t / 2), V(w, h, t), col), P('box', V(-w / 2 + t / 2, h / 2, 0), V(t, h, d), col), P('box', V(w / 2 - t / 2, h / 2, 0), V(t, h, d), col), P('box', V(0, 0.01, 0), V(w, 0.02, d), '#5a3a2a')];
   for (const z of [-1, 1]) parts.push(P('box', V(0, h + 0.008, z * (d / 2 - t / 2)), V(w + 0.014, 0.018, t + 0.016), rim));
   for (const x of [-1, 1]) parts.push(P('box', V(x * (w / 2 - t / 2), h + 0.008, 0), V(t + 0.016, 0.018, d + 0.014), rim));
   for (const x of [-1, 1]) parts.push(P('box', V(x * (w / 2 + 0.005), h * 0.6, 0), V(0.02, 0.05, 0.14), rim));
   parts.push(P('box', V(0, h + 0.2, -d / 2 - 0.06), V(w, 0.035, d), col, Q().setFromAxisAngle(X_AX, -1.95)));
   const g = new THREE.Group(); g.position.copy(BOX.c); g.rotation.y = BOX.yaw; W.root.add(g);
-  const geo = mergeParts(parts.map(p => Object.assign(p, { uv: 2 }))), m = new THREE.Mesh(geo, makeMat(id === 'junk' ? { t: 'lambert', tex: 'wood' } : id === 'memphis' ? 'toon' : 'lambert'));
+  const geo = mergeParts(parts.map(p => Object.assign(p, { uv: 2 }))), m = new THREE.Mesh(geo, makeMat(id === 'junk' || id === 'bedroom' ? { t: 'lambert', tex: 'wood' } : id === 'memphis' ? 'toon' : 'lambert'));
   g.add(m); if (W.st.outline || W.st.toyOutline) g.add(new THREE.Mesh(geo, outlineMat(0.007)));
   const cv = document.createElement('canvas'); cv.width = 512; cv.height = 192; const tx = new THREE.CanvasTexture(cv);
   const lab = new THREE.Mesh(new THREE.PlaneGeometry(w * 0.7, w * 0.7 * 192 / 512), new THREE.MeshBasicMaterial({ map: tx, transparent: true })); lab.position.set(0, h * 0.5, d / 2 + 0.003); g.add(lab);
@@ -329,6 +340,14 @@ function buildToddler(W) {
     const th = new THREE.Group(); th.position.set((i === 0 ? -1 : 1) * 0.04, -0.004, -0.012); const tm = new THREE.Mesh(PRIM.sphLo, skin); tm.scale.set(0.011, 0.011, 0.022); tm.position.set((i === 0 ? -1 : 1) * 0.006, 0, -0.013); th.add(tm); s.add(th); g.thumb = th; g.side = i === 0 ? -1 : 1;
     T.g.add(g); return g;
   });
+  // the balls above only place things now; what you see is one squishy blob body and two blob hands
+  hm.visible = false; for (const m of [T.chest, T.butt, ...T.arms, ...T.legs, ...T.feet]) m.visible = false;
+  for (const g of T.hands) g.traverse(o => { if (o.isMesh) o.visible = false; });
+  T.head.scale.setScalar(1.08);
+  const bm = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  T.blob = makeBlob(30, bm, 0.025); T.g.add(T.blob.mesh);
+  T.hblobs = [0, 1].map(() => { const b = makeBlob(20, bm, 0.012); T.g.add(b.mesh); return b; });
+  T.cSkin = new THREE.Color(SK); T.cOne = new THREE.Color('#5fb4ff'); T.cOne2 = new THREE.Color('#bfe3ff'); T.k = 0;
   W.root.add(T.g); return T;
 }
 // in the headset: giant hands that follow your real fingers (hand tracking)
@@ -336,22 +355,20 @@ const HJ = ['wrist', 'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalan
   'middle-finger-metacarpal', 'middle-finger-phalanx-proximal', 'middle-finger-phalanx-intermediate', 'middle-finger-phalanx-distal', 'middle-finger-tip', 'ring-finger-metacarpal', 'ring-finger-phalanx-proximal', 'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
   'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal', 'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'];
 const HBONES = []; for (const f of [[1, 2, 3, 4], [6, 7, 8, 9], [11, 12, 13, 14], [16, 17, 18, 19], [21, 22, 23, 24]]) for (let i = 0; i < f.length - 1; i++) HBONES.push([f[i], f[i + 1]]);
-HBONES.push([2, 6], [6, 11], [11, 16], [16, 21]);
-function buildGiantHands(scene, mat) {
-  const n = HJ.length * 2, sph = new THREE.InstancedMesh(PRIM.sph, mat, n + 2), cyl = new THREE.InstancedMesh(PRIM.cyl, mat, HBONES.length * 2), palm = new THREE.InstancedMesh(PRIM.sph, mat, 2);
-  for (const m of [sph, cyl, palm]) { m.frustumCulled = false; m.count = 0; scene.add(m); }
-  return { sph, cyl, palm, o: new THREE.Object3D(), v: Array.from({ length: 25 }, () => V()) };
-}
-const _ga = V(), _gb = V();
-function drawGiantHands(G, hands) {   // hands: [{ joints: [25 V] | null, center: V }] in world space, already scaled by HAND_SCALE
-  let si = 0, ci = 0, pi = 0; const o = G.o;
-  for (const h of hands) { if (!h || !h.j) continue; const J = h.j;
-    for (let k = 1; k < 25; k++) { const r = (k % 5 === 4 ? 0.0095 : 0.011) * HAND_SCALE * (k < 5 ? 1.15 : 1); o.position.copy(J[k]); o.quaternion.identity(); o.scale.setScalar(r); o.updateMatrix(); G.sph.setMatrixAt(si++, o.matrix); }
-    for (const [a, b] of HBONES) { _ga.copy(J[a]); _gb.copy(J[b]); const L = _ga.distanceTo(_gb); o.position.addVectors(_ga, _gb).multiplyScalar(0.5); o.quaternion.setFromUnitVectors(Y_AX, _gb.sub(_ga).divideScalar(L || 1)); o.scale.set(0.0105 * HAND_SCALE, L, 0.0105 * HAND_SCALE); o.updateMatrix(); G.cyl.setMatrixAt(ci++, o.matrix); }
-    // the palm: a squashed ball between the wrist and the knuckles
-    o.position.copy(J[0]).lerp(J[11], 0.55); o.quaternion.copy(h.q); o.scale.set(0.045 * HAND_SCALE, 0.022 * HAND_SCALE, 0.05 * HAND_SCALE); o.updateMatrix(); G.palm.setMatrixAt(pi++, o.matrix);
-  }
-  G.sph.count = si; G.cyl.count = ci; G.palm.count = pi; for (const m of [G.sph, G.cyl, G.palm]) m.instanceMatrix.needsUpdate = true;
+// blob balls for one hand: from tracked joints (headset) or from the posed mitt (controllers, phones)
+const _hb = V();
+function handBalls(T, h, joints, out) {
+  const S = T.cSkin;
+  if (joints) { const J = joints.j;
+    for (let k = 1; k < 25; k++) out.push({ x: J[k].x, y: J[k].y, z: J[k].z, r: (k % 5 === 4 ? 0.019 : 0.023) * (k < 5 ? 1.15 : 1) * HAND_SCALE / 2, c: S });
+    for (const [a, b] of HBONES) { _hb.addVectors(J[a], J[b]).multiplyScalar(0.5); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.022 * HAND_SCALE / 2, c: S }); }
+    for (const t of [0.2, 0.5, 0.8]) for (const m of [6, 16]) { _hb.copy(J[0]).lerp(J[m], t); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.034 * HAND_SCALE / 2, c: S }); }
+    out.push({ x: J[0].x, y: J[0].y, z: J[0].z, r: 0.03 * HAND_SCALE / 2, c: S }); return out; }
+  const g = T.hands[h]; g.updateMatrixWorld(true); const W = (x, y, z, r) => { g.localToWorld(_hb.set(x, y, z)); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r, c: S }); };
+  const hs = HAND_SCALE; W(0, 0, 0.005 * hs, 0.034 * hs); W(0, 0, -0.022 * hs, 0.03 * hs); W(0, 0, 0.045 * hs, 0.026 * hs);
+  for (const f of g.fingers) { for (const o of [f.children[0], f.j2.children[0]]) { o.getWorldPosition(_hb); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.0105 * hs, c: S }); } }
+  g.thumb.children[0].getWorldPosition(_hb); out.push({ x: _hb.x, y: _hb.y, z: _hb.z, r: 0.012 * hs, c: S });
+  return out;
 }
 const _qa = Q(), _qb = Q(), _va = V(), _vb = V();
 function setArm(m, a, b, r) { const d = _vb.subVectors(b, a), L = d.length(); m.position.addVectors(a, b).multiplyScalar(0.5); m.quaternion.setFromUnitVectors(Y_AX, d.divideScalar(L || 1)); m.scale.set(r, L, r); }
@@ -385,7 +402,7 @@ function drawSnap(W, s, s2, k, me, dt) {
   td.head.position.set(L(0), L(1), L(2)); _qa.set(T[3], T[4], T[5], T[6]); if (T2) { _qb.set(T2[3], T2[4], T2[5], T2[6]); _qa.slerp(_qb, k); } td.head.quaternion.copy(_qa);
   for (let h = 0; h < 2; h++) { const o = TD.H0 + h * TD.HS, g = td.hands[h], fl = T[o + 7];
     g.position.set(L(o), L(o + 1), L(o + 2)); _qa.set(T[o + 3], T[o + 4], T[o + 5], T[o + 6]); if (T2) { _qb.set(T2[o + 3], T2[o + 4], T2[o + 5], T2[o + 6]); _qa.slerp(_qb, k); } g.quaternion.copy(_qa);
-    g.visible = !!(fl & 2) && !(viewer === 'toddler' && me.giant && me.giant[h]);
+    g.visible = !!(fl & 2);
     for (let f = 0; f < 4; f++) { const c = T[o + 9 + f]; g.fingers[f].rotation.x = -c * 1.0; g.fingers[f].j2.rotation.x = -c * 1.3; }
     g.thumb.rotation.y = -g.side * T[o + 8] * 0.9; g.thumb.rotation.x = -T[o + 8] * 0.5;
     if (fl & 4 && Math.random() < 0.15) fxPuff(W.fx, g.position, '#ffd400', 1, 0.5, 0.01); }
@@ -396,11 +413,21 @@ function drawSnap(W, s, s2, k, me, dt) {
   const spooky = s.ph === 2 && s.st === 1; for (const p of td.pupils) p.scale.set(spooky ? 0.024 : 0.019, spooky ? 0.03 : 0.024, 0.012);
   td.brows.forEach((b, i) => { b.rotation.z = spooky ? (i ? 0.45 : -0.45) : 0; });
   const hq = td.head.quaternion, side = _va.set(1, 0, 0).applyQuaternion(hq); side.y = 0; side.normalize();
-  for (let h = 0; h < 2; h++) { const sx = h === 0 ? 1 : -1, sh0 = td.chest.position.clone().addScaledVector(side, sx * 0.12); sh0.y += 0.04; setArm(td.arms[h], sh0, td.hands[h].position, 0.045); td.arms[h].visible = !!(T[TD.H0 + h * TD.HS + 7] & 2); }
+  for (let h = 0; h < 2; h++) { const sx = h === 0 ? 1 : -1, sh0 = td.chest.position.clone().addScaledVector(side, sx * 0.12); sh0.y += 0.04; setArm(td.arms[h], sh0, td.hands[h].position, 0.045); }
   const back = V().subVectors(td.butt.position, td.chest.position); back.y = 0; back.normalize();
   for (let h = 0; h < 2; h++) { const sx = h === 0 ? 1 : -1, lg = td.legs[h], ft = td.feet[h]; lg.position.copy(td.butt.position).addScaledVector(side, sx * 0.08).addScaledVector(back, 0.12); lg.position.y = Math.max(0.06, td.butt.position.y - 0.08);
     lg.quaternion.setFromUnitVectors(Z_AX, back); ft.position.copy(lg.position).addScaledVector(back, 0.12); ft.position.y = Math.max(0.035, lg.position.y - 0.02); ft.quaternion.copy(lg.quaternion); }
-  const self = viewer === 'toddler'; td.head.visible = td.chest.visible = td.butt.visible = !self; for (const m of [...td.legs, ...td.feet]) m.visible = !self; if (self) for (const m of td.arms) m.visible = false;
+  const self = viewer === 'toddler'; td.head.visible = !self;
+  // one meatball body: head, chest, belly, bum, arms, legs, feet melt together
+  if (!self && (td.k = (td.k + 1) % 2) === 0) { const balls = [], push = (p, r, c) => balls.push({ x: p.x, y: p.y, z: p.z, r, c });
+    push(td.head.position, 0.155, td.cSkin); push(td.chest.position, 0.19, td.cOne); push(td.butt.position, 0.18, td.cOne); push(_vb.lerpVectors(td.chest.position, td.butt.position, 0.5), 0.18, td.cOne2);
+    for (let h = 0; h < 2; h++) { const lg = td.legs[h].position, ft = td.feet[h].position; push(lg, 0.085, td.cOne); push(_vb.lerpVectors(lg, ft, 0.5), 0.07, td.cOne); push(ft, 0.065, td.cSkin);
+      if (!td.hands[h].visible) continue; const a = td.arms[h], top = V(0, 0.5, 0).applyQuaternion(a.quaternion).multiplyScalar(a.scale.y).add(a.position), bot = V(0, -0.5, 0).applyQuaternion(a.quaternion).multiplyScalar(a.scale.y).add(a.position);
+      for (const t of [0, 0.3, 0.6, 0.85]) push(_vb.lerpVectors(bot, top, t), lerp(0.075, 0.055, t), t > 0.8 ? td.cSkin : td.cOne); }
+    td.blob.update(balls); }
+  td.blob.mesh.visible = !self;
+  // giant blob hands (from your real fingers in the headset when hand tracking is on)
+  for (let h = 0; h < 2; h++) { const on = !!(T[TD.H0 + h * TD.HS + 7] & 2); td.hblobs[h].mesh.visible = on; if (on) td.hblobs[h].update(handBalls(td, h, viewer === 'toddler' && me.joints ? me.joints[h] : null, [])); }
   for (const p of [td.chest.position, td.butt.position]) { const gh = W.L.groundH(p.x, p.z); dummy.position.set(p.x, gh + 0.006, p.z); dummy.scale.set(0.5, 1, 0.5); dummy.updateMatrix(); W.shadows.setMatrixAt(sh++, dummy.matrix); }
   for (let h = 0; h < 2; h++) { const p = td.hands[h].position, gh = W.L.groundH(p.x, p.z), hg = Math.max(0, p.y - gh); dummy.position.set(p.x, gh + 0.006, p.z); dummy.scale.setScalar(0.22 * (1 + hg)); dummy.updateMatrix(); W.shadows.setMatrixAt(sh++, dummy.matrix); }
   W.shadows.count = sh; W.shadows.instanceMatrix.needsUpdate = true;

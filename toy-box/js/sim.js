@@ -359,10 +359,8 @@ function removePlayer(S, pid) { const pl = S.players[pid]; if (!pl) return; poss
 function playerInput(S, pl, b) {
   const i = pl.inp, l = pl.last, inp = b.inp || (b.inp = {});
   inp.mx = clamp(i.mx, -1, 1); inp.mz = clamp(i.mz, -1, 1); inp.jumpHeld = !!i.jh;
-  inp.jump = i.jc !== l.jc; inp.grab = i.gc !== l.gc; inp.sp = i.sc !== l.sc; inp.gh = !!i.gh; inp.ax = i.ax; inp.az = i.az;
+  inp.jump = i.jc !== l.jc; inp.grab = i.gc !== l.gc; inp.sp = i.sc !== l.sc; inp.gh = !!i.gh; inp.ax = i.ax; inp.az = i.az; inp.hy = typeof i.hy === 'number' ? i.hy : null;
   const swap = i.wc !== l.wc; l.jc = i.jc; l.gc = i.gc; l.sc = i.sc; l.wc = i.wc;
-  // shooting toys aim where your camera looks
-  if (inp.sp && SHOOTERS.has(TOYS[b.kind].key) && (i.ax || i.az) && !(i.mx || i.mz)) b.yaw = Math.atan2(i.ax, i.az);
   if (swap && pl.swapCd <= 0) { let best = null, bd = 1e9; for (const o of freeToys(S)) { const d = o.p.distanceTo(b.p); if (d < bd) { bd = d; best = o; } }
     if (best) { possess(S, pl, best); pl.swapCd = 2.5; evAt(S, 'hop', best.p, pl.slot); } }
 }
@@ -381,7 +379,10 @@ function stepBody(S, b, dt) {
   if (canMove && inp) { mx = inp.mx || 0; mz = inp.mz || 0; }
   if (b.type === 'decoy') { const f = fwd(b); mx = f.x; mz = f.z; }
   if (b.charge > 0) { const f = fwd(b); mx = f.x; mz = f.z; }
-  if (mx || mz) { const want = Math.atan2(mx, mz); let d = want - b.yaw; d = Math.atan2(Math.sin(d), Math.cos(d)); b.yaw += d * Math.min(1, dt * (b.fly > 0 ? 3 : 14)); }
+  // phone players steer: their heading comes straight from the phone; everyone else faces where they go
+  const hy = inp && inp.hy !== undefined && inp.hy !== null && b.type === 'toy' && b.charge <= 0 ? inp.hy : null;
+  if (hy !== null && canMove) { let d = hy - b.yaw; d = Math.atan2(Math.sin(d), Math.cos(d)); b.yaw += d * Math.min(1, dt * 16); }
+  else if (mx || mz) { const want = Math.atan2(mx, mz); let d = want - b.yaw; d = Math.atan2(Math.sin(d), Math.cos(d)); b.yaw += d * Math.min(1, dt * (b.fly > 0 ? 3 : 14)); }
   if (canMove) {
     let sp = TOY_SPEED; if (b.boost > 0) sp *= TOYS[b.kind].key === 'robot' ? 3 : 2.6; if (b.charge > 0) sp *= 2.1; if (b.sticky > 0) sp *= 0.4; if (b.shrink > 0) sp *= 1.3; if (S.td.sleepy > 0.9 && S.state === 'end') sp = 0;
     if (b.fly > 0) { const f = fwd(b), fs = 1.5 * VS; b.v.x = lerp(b.v.x, f.x * fs, 1 - Math.exp(-3 * dt)); b.v.z = lerp(b.v.z, f.z * fs, 1 - Math.exp(-3 * dt)); b.v.y = lerp(b.v.y, inp && inp.jumpHeld ? 0.9 * VS : -0.25, 1 - Math.exp(-3 * dt)); if (b.fly < 0.05) b.glide = 1.5; }

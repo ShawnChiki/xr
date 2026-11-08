@@ -18,7 +18,7 @@ const r3 = v => Math.round(v * 1000) / 1000;
 const K = 1.5, VS = Math.sqrt(K);
 const HALF = 2.0;                                   // only for fallbacks
 const GRAV = 9.8, MATCH_TIME = 180, WALL_H = 2.5;
-const BOX = { c: V(), yaw: 0, q: Q(), inv: Q(), w: 0.95, d: 0.55, h: 0.42, t: 0.035 };   // open-top chest against a wall; local +z faces the room
+const BOX = { c: V(), yaw: 0, q: Q(), inv: Q(), w: 1.35, d: 0.78, h: 0.5, t: 0.04 };   // open-top chest against a wall; local +z faces the room
 const AREA = { poly: [], edges: [], minX: -2, maxX: 2, minZ: -2, maxZ: 2, cx: 0, cz: 0, size: 0, start: V() };
 const DEFAULT_AREA = { poly: [[-2.1, -1.8], [2.1, -1.8], [2.1, 1.8], [-2.1, 1.8]], start: [0, -0.8] };
 function inPoly(P, x, z) { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j]; if ((a.z > z) !== (b.z > z) && x < (b.x - a.x) * (z - a.z) / (b.z - a.z) + a.x) c = !c; } return c; }
@@ -145,7 +145,7 @@ function mergeParts(parts) {
       _pv.fromBufferAttribute(sp, i).applyMatrix4(_m4); _nv.fromBufferAttribute(sn, i).applyMatrix3(_n3).normalize();
       P[o * 3] = _pv.x; P[o * 3 + 1] = _pv.y; P[o * 3 + 2] = _pv.z; N[o * 3] = _nv.x; N[o * 3 + 1] = _nv.y; N[o * 3 + 2] = _nv.z;
       C[o * 3] = col.r; C[o * 3 + 1] = col.g; C[o * 3 + 2] = col.b;
-      U[o * 2] = su.getX(i) * uvs * us; U[o * 2 + 1] = su.getY(i) * uvs;
+      U[o * 2] = su.getX(i) * uvs * us + (it.uo || 0); U[o * 2 + 1] = su.getY(i) * uvs + (it.vo || 0);
       _cv.subVectors(_pv, it.p); const l = _cv.length(); if (l > 1e-6) _cv.divideScalar(l); else _cv.copy(_nv);
       _cv.add(_nv).normalize(); O[o * 3] = _cv.x; O[o * 3 + 1] = _cv.y; O[o * 3 + 2] = _cv.z;
     }

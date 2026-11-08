@@ -3,6 +3,8 @@
    One wall gets the nap-time clock, one gets the door mom comes through, one gets a window.
    Furniture lines the walls; the playset (levels.js) fills the middle. Real-life sizes, in metres. */
 const THEMES = {
+  bedroom: { wall: '#ffffff', wallTex: 'clouds', floorTex: 'boards', floorCol: '#e6b27a', rug: 'roadrug', rugCol: '#ffffff', trim: '#ffffff', ceil: '#ffffff',
+    sofa: '#2f5cff', cushion: '#e23b2e', wood: '#d79a5c', acc: ['#e23b2e', '#2f5cff', '#ffd400', '#3fbf6f', '#ff7a1a'], lamp: 'cone', door: '#c98a4b', light: ['#ffffff', '#e8d2b0', 0.95, 0.6] },
   vaneyck: { wall: '#f7f5ef', wallTex: 'sketch', floorTex: 'boards', floorCol: '#ead7b8', rug: 'paving', rugCol: '#ffffff', trim: '#ffffff', ceil: '#fbfaf6',
     sofa: '#d4cfc4', cushion: '#e23b2e', wood: '#d8b98e', acc: ['#e23b2e', '#2f5cff', '#ffd400'], lamp: 'cone', door: '#e23b2e', edges: true, light: ['#ffffff', '#d9d3c7', 0.85, 0.55] },
   noguchi: { wall: '#f6ede0', wallTex: 'washi', floorTex: 'boards', floorCol: '#e6c79c', rug: null, trim: '#e3d5c0', ceil: '#fff8ef',
@@ -83,8 +85,19 @@ function genRoom(id, seed) {
   const crates = (e, s) => { for (let i = 0; i < 3; i++) ebox('r_wood', e, s + (i - 1) * 0.36, 0.17 + (i === 1 ? 0.34 : 0), 0.2, 0.34, 0.34, 0.36, T.wood); ebox('r_wood', e, s + 0.36, 0.17, 0.2, 0.34, 0.34, 0.36, T.wood); };
   const radiator = (e, s) => { for (let i = 0; i < 8; i++) ebox('r_paint', e, s - 0.3 + i * 0.085, 0.35, 0.07, 0.05, 0.55, 0.1, '#e9e4da'); };
   const table = (e, s) => { ebox('r_wood', e, s, 0.32, 0.35, 0.9, 0.04, 0.55, T.wood); for (const k of [-1, 1]) ebox('r_wood', e, s + k * 0.38, 0.15, 0.35, 0.05, 0.3, 0.45, T.wood); };
+  // a kid's bed on legs: toys can hide underneath
+  const bed = (e, s, L) => { const D = 0.95;
+    for (const [x, u] of [[-1, 0.06], [1, 0.06], [-1, D - 0.06], [1, D - 0.06]]) ecyl('r_wood', e, s + x * (L / 2 - 0.06), 0, u, 0.03, 0.26, T.wood);
+    ebox('r_wood', e, s, 0.3, D / 2, L, 0.1, D, T.wood); ebox('r_fab', e, s, 0.43, D / 2, L - 0.04, 0.16, D - 0.04, '#fffdf7');
+    ebox('r_fab', e, s + L * 0.15, 0.53, D / 2, L * 0.68, 0.05, D + 0.02, T.sofa); ebox('r_fab', e, s - L / 2 + 0.24, 0.55, D / 2, 0.36, 0.1, D * 0.6, '#ffffff');
+    ebox('r_wood', e, s - L / 2 - 0.02, 0.45, D / 2, 0.05, 0.9, D, T.wood); ebox('r_wood', e, s + L / 2 + 0.02, 0.35, D / 2, 0.05, 0.7, D, T.wood);
+    for (let i = 0; i < 5; i++) ebox('r_paint', e, s + L * 0.15 - L * 0.3 + i * L * 0.15, 0.556, D / 2, 0.06, 0.004, D + 0.03, i % 2 ? '#ffd400' : T.cushion, { noCol: true }); };
+  const desk = (e, s) => { ebox('r_wood', e, s, 0.68, 0.3, 1.0, 0.04, 0.55, T.wood); for (const k of [-1, 1]) ebox('r_wood', e, s + k * 0.46, 0.33, 0.3, 0.05, 0.66, 0.5, T.wood);
+    ebox('r_paint', e, s + 0.1, 0.42, 0.62, 0.38, 0.04, 0.36, T.acc[0]); ebox('r_paint', e, s + 0.1, 0.62, 0.8, 0.38, 0.4, 0.04, T.acc[0]); for (const [x, u] of [[-0.15, 0.48], [0.35, 0.48], [-0.15, 0.76], [0.35, 0.76]]) ecyl('r_paint', e, s + x, 0, u, 0.015, 0.4, '#15121a', { noCol: true });
+    add('r_glow', { g: 'cone', p: at(e, s - 0.35, 0.82, 0.2), q: Q(), s: V(0.08, 0.1, 0.08), col: T.acc[2] }); ecyl('r_paint', e, s - 0.35, 0.7, 0.2, 0.01, 0.12, '#15121a', { noCol: true }); };
   const longest = E.reduce((m, e) => e.len > m.len ? e : m, E[0]);
-  { const L = clamp(longest.len * 0.45, 1.1, 1.9); place(L, 0.66, (e, s) => sofa(e, s, L)); }
+  if (id === 'bedroom') { const L = clamp(longest.len * 0.5, 1.4, 1.9); place(L, 0.95, (e, s) => bed(e, s, L)); place(1.0, 0.85, desk); }
+  else { const L = clamp(longest.len * 0.45, 1.1, 1.9); place(L, 0.66, (e, s) => sofa(e, s, L)); }
   place(0.82, 0.3, shelf); place(0.95, 0.32, cubby); place(0.3, 0.3, plant); place(0.3, 0.3, lamp);
   if (id === 'vaneyck' || id === 'memphis') place(1.1, 0.4, tv);
   if (id === 'noguchi') { place(0.9, 0.55, table); place(0.3, 0.3, plant); place(0.3, 0.3, lamp); }

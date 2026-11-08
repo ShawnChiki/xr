@@ -1,6 +1,6 @@
 /* ================= Toy Box: the app (lobby, mixed-reality setup, cameras, controls, the loop) ================= */
 const $ = id => document.getElementById(id);
-const APP = { mode: 'lobby', kind: null, viewer: null, S: null, W: null, L: null, lv: 'vaneyck', mess: 'medium', bot: 'normal', soloLv: 'memphis', soloMess: 'medium', soloBot: 'normal',
+const APP = { mode: 'lobby', kind: null, viewer: null, S: null, W: null, L: null, lv: 'bedroom', mess: 'medium', bot: 'normal', soloLv: 'bedroom', soloMess: 'medium', soloBot: 'normal',
   roster: null, snaps: [], off: null, me: { viewer: 'toy', body: -1, slotOf: {} }, myPid: 'local', sendT: 0, lastBody: -1, cur: null, lobbyPlayers: {}, endShown: false, area: null, momSaid: false };
 const BOT_SPEED = { easy: 0.5, normal: 0.72, hard: 0.98 };
 const NORENDER = /[?&]norender/.test(location.search);   // test hook
@@ -14,7 +14,7 @@ $('stage').appendChild(renderer.domElement);
 const scene = new THREE.Scene(); scene.background = new THREE.Color('#fff3dc');
 const camera = new THREE.PerspectiveCamera(70, 1, 0.012, 60);
 const rig = new THREE.Group(); rig.add(camera); scene.add(rig);
-function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; if (!renderer.xr.isPresenting) camera.fov = camera.aspect < 1 ? 84 : 70; camera.updateProjectionMatrix(); }
 addEventListener('resize', resize); resize();
 const xrOn = () => renderer.xr.isPresenting;
 const fmtT = n => { n = Math.max(0, Math.ceil(n)); return Math.floor(n / 60) + ':' + String(n % 60).padStart(2, '0'); };
@@ -113,7 +113,6 @@ function enterGameUI() {
   const toy = APP.viewer === 'toy'; $('pad').hidden = !toy; $('who').hidden = !toy;
   $('keys').hidden = !(toy && !matchMedia('(pointer:coarse)').matches);
   $('again').hidden = APP.kind === 'client'; $('toLobby').textContent = APP.kind === 'client' ? 'Leave' : 'Lobby';
-  try { if (toy && matchMedia('(pointer:coarse)').matches && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().then(() => screen.orientation.lock('landscape')).catch(() => {}); } catch (e) {}
 }
 function toLobby(pg) {
   APP.mode = 'lobby'; APP.S = null; musicStop(); disposeWorld(scene, APP.W); APP.W = null; endDraw(); VRUI.hide();
@@ -132,7 +131,7 @@ renderer.xr.addEventListener('sessionend', () => { if (APP.mode === 'draw' || (A
 
 /* ---------- phone controls ---------- */
 const INP = { jx: 0, jy: 0, jc: 0, gc: 0, sc: 0, wc: 0, gh: false, jh: false };
-const CAM = { yaw: 0, pitch: 0.36, dist: 0.6, tgt: V(), have: false, fly: 0 };
+const CAM = { heading: 0, yawS: 0, pitch: 0.3, dist: 0.62, tgt: V(), have: false, fly: 0, t: 0 };   // heading: where your toy faces; the camera swings round behind it
 const CAMW = { yaw: Math.PI, pitch: 0.62, dist: 5.2, tgt: V(0, 0, 0) };
 (function touch() {
   const joy = $('joy'), stick = $('stick'), nub = stick.querySelector('i'); let jid = null, jx0 = 0, jy0 = 0;
@@ -142,7 +141,7 @@ const CAMW = { yaw: Math.PI, pitch: 0.62, dist: 5.2, tgt: V(0, 0, 0) };
   joy.addEventListener('pointerup', jend); joy.addEventListener('pointercancel', jend);
   const look = $('look'); let lid = null, lx = 0, ly = 0;
   look.addEventListener('pointerdown', e => { sfx.init(); lid = e.pointerId; lx = e.clientX; ly = e.clientY; try { look.setPointerCapture(e.pointerId); } catch (_) {} });
-  look.addEventListener('pointermove', e => { if (e.pointerId !== lid) return; CAM.yaw -= (e.clientX - lx) * 0.009; CAM.pitch = clamp(CAM.pitch + (e.clientY - ly) * 0.006, -0.15, 1.25); lx = e.clientX; ly = e.clientY; });
+  look.addEventListener('pointermove', e => { if (e.pointerId !== lid) return; CAM.heading -= (e.clientX - lx) * 0.009; CAM.pitch = clamp(CAM.pitch + (e.clientY - ly) * 0.006, -0.25, 1.2); lx = e.clientX; ly = e.clientY; });
   const lend = e => { if (e.pointerId === lid) lid = null; }; look.addEventListener('pointerup', lend); look.addEventListener('pointercancel', lend);
   const btn = (id, down, up) => { const el = $(id); el.addEventListener('pointerdown', e => { sfx.init(); e.preventDefault(); el.classList.add('down'); down(); try { el.setPointerCapture(e.pointerId); } catch (_) {} });
     const u = () => { el.classList.remove('down'); up && up(); }; el.addEventListener('pointerup', u); el.addEventListener('pointercancel', u); el.addEventListener('lostpointercapture', u); };
@@ -156,15 +155,19 @@ const CAMW = { yaw: Math.PI, pitch: 0.62, dist: 5.2, tgt: V(0, 0, 0) };
   cv.addEventListener('pointerdown', e => { if (e.pointerType === 'touch') return; md = true; mx = e.clientX; my = e.clientY; });
   addEventListener('pointerup', () => md = false);
   addEventListener('pointermove', e => { if (!md || APP.mode !== 'game') return; const dx = e.clientX - mx, dy = e.clientY - my; mx = e.clientX; my = e.clientY;
-    if (APP.viewer === 'watch') { CAMW.yaw -= dx * 0.006; CAMW.pitch = clamp(CAMW.pitch + dy * 0.004, 0.3, 1.5); } else { CAM.yaw -= dx * 0.007; CAM.pitch = clamp(CAM.pitch + dy * 0.005, -0.15, 1.25); } });
+    if (APP.viewer === 'watch') { CAMW.yaw -= dx * 0.006; CAMW.pitch = clamp(CAMW.pitch + dy * 0.004, 0.3, 1.5); } else { CAM.heading -= dx * 0.007; CAM.pitch = clamp(CAM.pitch + dy * 0.005, -0.25, 1.2); } });
   addEventListener('wheel', e => { if (APP.viewer === 'watch') CAMW.dist = clamp(CAMW.dist * (1 + e.deltaY * 0.001), 0.8, 5); else CAM.dist = clamp(CAM.dist * (1 + e.deltaY * 0.001), 0.3, 1.5); }, { passive: true });
 })();
+// steering, like driving or flying: left/right turns your toy (and the camera with it), up/down goes forward/back
 function toyMove() {
+  const now = performance.now(), dt = Math.min(0.1, (now - (CAM.t || now)) / 1000); CAM.t = now;
   let jx = INP.jx, jy = INP.jy; const k = APP.keys || {};
   const kx = (k.KeyD || k.ArrowRight ? 1 : 0) - (k.KeyA || k.ArrowLeft ? 1 : 0), ky = (k.KeyW || k.ArrowUp ? 1 : 0) - (k.KeyS || k.ArrowDown ? 1 : 0);
-  if (kx || ky) { jx = kx; jy = ky; const l = Math.hypot(jx, jy); jx /= l; jy /= l; }
-  const s = Math.sin(CAM.yaw), c = Math.cos(CAM.yaw);
-  return { mx: -s * jy + c * jx, mz: -c * jy - s * jx, ax: -s, az: -c, jc: INP.jc, gc: INP.gc, sc: INP.sc, wc: INP.wc, gh: INP.gh, jh: INP.jh };
+  if (kx || ky) { jx = kx; jy = ky; }
+  const turn = Math.sign(jx) * Math.max(0, Math.abs(jx) - 0.12) / 0.88;
+  CAM.heading -= turn * (jy < -0.2 ? -1 : 1) * 2.7 * dt;
+  const s = Math.sin(CAM.heading), c = Math.cos(CAM.heading), fwdIn = Math.abs(jy) < 0.15 ? 0 : jy;
+  return { mx: s * fwdIn, mz: c * fwdIn, ax: s, az: c, hy: CAM.heading, jc: INP.jc, gc: INP.gc, sc: INP.sc, wc: INP.wc, gh: INP.gh, jh: INP.jh };
 }
 
 /* ---------- the headset: hands (tracked or controllers), buttons you poke ---------- */
@@ -182,7 +185,6 @@ const BUB = canvasPanel(0.5, 0.3, 600); BUB.m.position.set(0, 0, -0.165); camera
 (() => { const w = SPLAT.cv.width, h = SPLAT.cv.height, x = SPLAT.x; for (let i = 0; i < 40; i++) { const px = Math.random() * w, py = Math.random() * h, r = 8 + Math.random() * 40; const g = x.createRadialGradient(px - r * 0.3, py - r * 0.3, 1, px, py, r); g.addColorStop(0, 'rgba(255,255,255,.9)'); g.addColorStop(0.4, 'rgba(160,215,255,.55)'); g.addColorStop(1, 'rgba(90,170,255,.15)'); x.fillStyle = g; x.beginPath(); x.arc(px, py, r, 0, TAU); x.fill(); } SPLAT.t.needsUpdate = true;
   const y = CONF.x, C = ['#ff3e8a', '#ffd400', '#00c2b3', '#2f5cff', '#9b5cff']; for (let i = 0; i < 160; i++) { y.save(); y.translate(Math.random() * w, Math.random() * h); y.rotate(Math.random() * 3); y.fillStyle = C[i % 5]; y.fillRect(-6, -3, 12, 6); y.restore(); } CONF.t.needsUpdate = true;
   const z = BUB.x; for (let i = 0; i < 22; i++) { const px = Math.random() * w, py = Math.random() * h, r = 20 + Math.random() * 60; z.strokeStyle = 'rgba(200,230,255,.8)'; z.lineWidth = 4; z.fillStyle = 'rgba(190,140,255,.18)'; z.beginPath(); z.arc(px, py, r, 0, TAU); z.fill(); z.stroke(); z.fillStyle = 'rgba(255,255,255,.8)'; z.beginPath(); z.arc(px - r * 0.4, py - r * 0.4, r * 0.15, 0, TAU); z.fill(); } BUB.t.needsUpdate = true; })();
-let GIANT = null;
 function banner(big, small, secs) {
   if (APP.viewer === 'toddler' || APP.mode === 'draw') { const P = BANNER, x = P.x, w = P.cv.width, h = P.cv.height; x.clearRect(0, 0, w, h);
     x.fillStyle = 'rgba(255,253,247,.94)'; x.strokeStyle = '#15121a'; x.lineWidth = 8; rr(x, 6, 6, w - 12, h - 12, 26); x.fill(); x.stroke();
@@ -302,9 +304,7 @@ function xrToddler(dt, frame) {
   rig.updateMatrixWorld(true);
   const head = headL.clone(), hq = headLQ.clone();
   setToddlerPose(S, { head, hq, hands: hands.map(h => h.on ? h : { on: false, p: V(0, -1, 0), q: Q() }) });
-  APP.me.giant = hands.map(h => !!(h.on && h.tracked));
-  if (!GIANT) GIANT = buildGiantHands(scene, new THREE.MeshLambertMaterial({ color: '#ffd2b8' }));
-  drawGiantHands(GIANT, hands.map(h => h.on && h.tracked ? h : null));
+  APP.me.joints = hands.map(h => h.on && h.tracked ? { j: h.j, q: h.q } : null);
   const tips = HANDS.filter(H => H.ok).map(H => H.tip.clone());
   VRUI.update(dt, tips);
   // controllers: trigger/A/B also work between rounds
@@ -312,7 +312,7 @@ function xrToddler(dt, frame) {
 }
 function vrAgain() { startMatch('xr'); }
 function vrNext() { const i = LEVELS.findIndex(l => l.id === APP.lv); APP.lv = LEVELS[(i + 1) % LEVELS.length].id; hostLevels(); lobbyInfo(); startMatch('xr'); }
-function vrRedraw() { disposeWorld(scene, APP.W); APP.W = null; APP.S = null; musicStop(); if (NET.host) sendAll({ t: 'lobby', lv: APP.lv, mess: APP.mess, n: Object.keys(APP.lobbyPlayers).length, back: true }); if (GIANT) for (const m of [GIANT.sph, GIANT.cyl, GIANT.palm]) m.count = 0; startDraw(); }
+function vrRedraw() { disposeWorld(scene, APP.W); APP.W = null; APP.S = null; musicStop(); if (NET.host) sendAll({ t: 'lobby', lv: APP.lv, mess: APP.mess, n: Object.keys(APP.lobbyPlayers).length, back: true }); startDraw(); }
 function wristDraw(s) {
   const P = WRIST, x = P.x, w = P.cv.width, h = P.cv.height, key = [Math.ceil(s.nap), s.ml, s.ph, s.st].join(); if (key === P.last) return; P.last = key;
   x.clearRect(0, 0, w, h); x.fillStyle = '#fffdf7'; x.strokeStyle = '#15121a'; x.lineWidth = 10; rr(x, 6, 6, w - 12, h - 12, 24); x.fill(); x.stroke();
@@ -359,7 +359,7 @@ function hud(s) {
   if (APP.viewer === 'toy') {
     const c = s.ctl[APP.myPid];
     if (c) { const bi = c[0], r = APP.roster[bi]; APP.me.body = bi;
-      if (bi !== APP.lastBody) { if (bi >= 0 && r) { const T = TOYS[r[1]]; $('who').innerHTML = `${T.name}<small>Special: ${T.sp}</small>`; $('spName').textContent = T.sp.replace(/ \(.*\)/, ''); if (APP.lastBody >= 0) { toast("Put away! You're the " + T.name + ' now'); sfx.play('hop'); } CAM.fly = 0.5; } APP.lastBody = bi; }
+      if (bi !== APP.lastBody) { if (bi >= 0 && r) { const T = TOYS[r[1]]; $('who').innerHTML = `${T.name}<small>Special: ${T.sp}</small>`; $('spName').textContent = T.sp.replace(/ \(.*\)/, ''); if (APP.lastBody >= 0) { toast("Put away! You're the " + T.name + ' now'); sfx.play('hop'); } CAM.fly = 0.5; CAM.have = false; } APP.lastBody = bi; }
       $('spCd').style.height = Math.round(c[2] * 100) + '%'; $('bGrab').textContent = c[3] || 'Grab'; }
     APP.me.slotOf = {}; for (const pid in s.ctl) APP.me.slotOf[s.ctl[pid][0]] = s.ctl[pid][1];
   }
@@ -408,11 +408,12 @@ function loop(t, frame) {
   if (!document.hidden && !NORENDER) renderer.render(scene, camera);
 }
 function toyCam(dt, s) {
-  const bi = APP.me.body; if (bi < 0 || !APP.W.bodies[bi]) return; const p = APP.W.bodies[bi].g.position.clone(), r = APP.W.bodies[bi].r;
-  if (!CAM.have) { const d = V(p.x - s.td[0], 0, p.z - s.td[2]); CAM.yaw = Math.atan2(d.x, d.z); CAM.tgt.copy(p); CAM.have = true; }
+  const bi = APP.me.body; if (bi < 0 || !APP.W.bodies[bi]) return; const o = APP.W.bodies[bi], p = o.g.position.clone(), r = o.r;
+  if (!CAM.have) { const f = V(0, 0, 1).applyQuaternion(o.g.quaternion); CAM.heading = Math.atan2(f.x, f.z); CAM.yawS = CAM.heading + Math.PI; CAM.tgt.copy(p); CAM.have = true; }
   CAM.fly = Math.max(0, CAM.fly - dt);
   CAM.tgt.lerp(p, 1 - Math.exp(-(CAM.fly > 0 ? 5 : 16) * dt));
-  const cp = Math.cos(CAM.pitch), up = r * 0.6, pos = V(CAM.tgt.x + Math.sin(CAM.yaw) * cp * CAM.dist, CAM.tgt.y + up + Math.sin(CAM.pitch) * CAM.dist, CAM.tgt.z + Math.cos(CAM.yaw) * cp * CAM.dist);
+  let d = CAM.heading + Math.PI - CAM.yawS; d = Math.atan2(Math.sin(d), Math.cos(d)); CAM.yawS += d * (1 - Math.exp(-7 * dt));
+  const cp = Math.cos(CAM.pitch), up = r * 0.7, pos = V(CAM.tgt.x + Math.sin(CAM.yawS) * cp * CAM.dist, CAM.tgt.y + up + Math.sin(CAM.pitch) * CAM.dist, CAM.tgt.z + Math.cos(CAM.yawS) * cp * CAM.dist);
   if (!AREA.inside(pos.x, pos.z, 0.08)) { const tg = V(CAM.tgt.x, pos.y, CAM.tgt.z); for (let t = 0.95; t > 0.15; t -= 0.05) { const q = tg.clone().lerp(pos, t); if (AREA.inside(q.x, q.z, 0.08)) { pos.copy(q); break; } } AREA.clampIn(pos, 0.05); }
   const gh = APP.L.groundH(pos.x, pos.z); if (pos.y < gh + 0.04) pos.y = gh + 0.04; if (pos.y > WALL_H - 0.08) pos.y = WALL_H - 0.08;
   camera.position.copy(pos); camera.lookAt(CAM.tgt.x, CAM.tgt.y + up, CAM.tgt.z);
