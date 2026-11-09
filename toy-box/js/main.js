@@ -62,7 +62,7 @@ $('startVR').onclick = async () => { sfx.init(); primeVoice();
   try { const s = await navigator.xr.requestSession(xrMode, { requiredFeatures: ['local-floor'], optionalFeatures: ['hand-tracking', 'bounded-floor'] }); await renderer.xr.setSession(s); startDraw(); }
   catch (e) { $('hostNote').textContent = "Couldn't start the headset: " + (e && e.message || e); } };
 $('soloGo').onclick = () => { sfx.init(); primeVoice(); startMatch('solo'); };
-$('joinBtn').onclick = () => { sfx.init(); primeVoice(); netJoin($('joinCode').value, st => {
+$('joinBtn').onclick = () => { sfx.init(); primeVoice(); if (CAN_FS && matchMedia('(pointer:coarse)').matches && !document.fullscreenElement) try { document.documentElement.requestFullscreen().catch(() => {}); } catch (e) {} netJoin($('joinCode').value, st => {
   if (st === 'ok') { $('joinStatus').textContent = 'Connected!'; $('joinWait').hidden = false; sfx.play('hop'); }
   else $('joinStatus').textContent = st; }); };
 $('joinCode').addEventListener('keydown', e => { if (e.key === 'Enter') $('joinBtn').click(); });
@@ -83,6 +83,31 @@ function speak(line) {
   try { if (window.speechSynthesis && !sfx.muted) { speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(line); if (voice) u.voice = voice; u.pitch = 1.15; u.rate = 1.02; u.volume = 1; speechSynthesis.speak(u); return; } } catch (e) {}
   sfx.play('babble', 1); setTimeout(() => sfx.play('babble', 1), 300);
 }
+
+/* ---------- phones: no stuck zoom, and full screen where the phone allows it ---------- */
+const IS_IOS = /iP(hone|od)/.test(navigator.userAgent);
+const STANDALONE = (navigator.standalone === true) || matchMedia('(display-mode: standalone)').matches || matchMedia('(display-mode: fullscreen)').matches;
+const CAN_FS = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen) && !IS_IOS;
+// Safari ignores "no zoom" in the page settings, so stop pinches and double-taps by hand
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+document.addEventListener('touchmove', e => { if (e.touches.length > 1 || APP.mode !== 'lobby') e.preventDefault(); }, { passive: false });
+let lastTouchEnd = 0;
+document.addEventListener('touchend', e => { const now = performance.now(); if (now - lastTouchEnd < 350 && e.target.tagName !== 'INPUT') e.preventDefault(); lastTouchEnd = now; }, { passive: false });
+document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
+// if it zoomed in anyway, snap it back out
+function unzoom() { const m = document.querySelector('meta[name=viewport]'), c = 'width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover';
+  m.setAttribute('content', c + ',minimum-scale=1'); setTimeout(() => m.setAttribute('content', c), 60); }
+if (window.visualViewport) visualViewport.addEventListener('resize', () => { if (visualViewport.scale > 1.02) unzoom(); });
+addEventListener('orientationchange', () => setTimeout(unzoom, 300));
+function goFull() {
+  if (CAN_FS && !document.fullscreenElement) { const el = document.documentElement; const r = (el.requestFullscreen || el.webkitRequestFullscreen).call(el); if (r && r.catch) r.catch(() => {}); }
+  else if (IS_IOS && !STANDALONE) $('homeSheet').classList.add('on');
+  else if (document.fullscreenElement) document.exitFullscreen();
+}
+$('fs').onclick = goFull; $('homeTipBtn').onclick = () => $('homeSheet').classList.add('on'); $('homeClose').onclick = () => $('homeSheet').classList.remove('on');
+$('fs').hidden = STANDALONE || !(CAN_FS || IS_IOS); $('homeTip').hidden = !(IS_IOS && !STANDALONE);
+// opened from the Home Screen: go straight to joining
+if (/[?&]app=1/.test(location.search)) setTimeout(() => page('join'), 0);
 
 /* ---------- starting and ending a match ---------- */
 function startMsg(slot) { return { t: 'start', lv: APP.S.L.id, seed: APP.S.L.seed, mess: APP.messKey, area: APP.S.L.area, roster: APP.roster, slot }; }
@@ -113,6 +138,7 @@ function enterGameUI() {
   const toy = APP.viewer === 'toy'; $('pad').hidden = !toy; $('who').hidden = !toy;
   $('keys').hidden = !(toy && !matchMedia('(pointer:coarse)').matches);
   $('again').hidden = APP.kind === 'client'; $('toLobby').textContent = APP.kind === 'client' ? 'Leave' : 'Lobby';
+  unzoom(); $('fs').hidden = !toy || STANDALONE || !(CAN_FS || IS_IOS);
 }
 function toLobby(pg) {
   APP.mode = 'lobby'; APP.S = null; musicStop(); disposeWorld(scene, APP.W); APP.W = null; endDraw(); VRUI.hide();
