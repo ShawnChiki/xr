@@ -69,3 +69,24 @@ const TOYS = [
       P('box', V(0, -r * 0.55, -r * 0.35), V(r * 0.45, r * 0.7, r * 0.35), '#ff7a1a', qx(0.25)), P('cyl6', V(0, r * 0.15, r * 1.3), V(r * 0.1, r * 0.15, r * 0.1), '#ff3e8a', qx(Math.PI / 2))]; eyes(o, r * 0.85, r * 0.1, r * 0.2, r * 0.12); return o; } },
 ];
 const TOY_KEYS = TOYS.map(t => t.key);
+// the toys that play: each has one clear job. role: wreck (make mess), prank (mess with the toddler), move (get places, get away)
+const TOY_INFO = {
+  train:     { role: 'wreck', sp: 'Charge', desc: 'Barrel straight ahead and smash through towers and stuff.' },
+  monster:   { role: 'wreck', sp: 'Big Air', desc: 'Leap forward and slam down: everything where you land gets knocked over.' },
+  ball:      { role: 'wreck', sp: 'Super Bounce', desc: 'Bounce up onto tables and shelves and land with a thump.' },
+  tank:      { role: 'wreck', sp: 'Cannon', desc: 'Fire where you look: knock books off shelves, make hands drop toys.' },
+  drum:      { role: 'wreck', sp: 'Boom', desc: 'A shockwave that knocks over everything around you.' },
+  missile:   { role: 'prank', sp: 'Missiles', desc: "Homing foam missiles at the toddler's hands: they drop what they hold." },
+  popper:    { role: 'prank', sp: 'Confetti', desc: 'Blind the toddler with confetti when they get close.' },
+  squirt:    { role: 'prank', sp: 'Squirt', desc: "Soak the toddler's eyes from across the room." },
+  bubbles:   { role: 'prank', sp: 'Bubbles', desc: "Bubbles float into the toddler's face and block the view." },
+  dino:      { role: 'prank', sp: 'Chomp', desc: 'Bite a giant finger: the toddler drops what they hold.' },
+  ballerina: { role: 'prank', sp: 'Lullaby', desc: "Make the toddler sleepy: their eyes start to close." },
+  heli:      { role: 'move', sp: 'Hover', desc: 'Fly up to shelves and the table. Hold Jump to rise.' },
+  frog:      { role: 'move', sp: 'Leap', desc: 'A huge jump onto furniture.' },
+  duck:      { role: 'move', sp: 'Decoy', desc: 'Drop a fake duck. If the toddler grabs it, it pops.' },
+  chicken:   { role: 'move', sp: 'Flop', desc: "Go floppy and slippery: you can't be grabbed for 3 seconds." },
+};
+for (const k in TOY_INFO) { const t = TOYS.find(x => x.key === k); if (t) Object.assign(t, { sp: TOY_INFO[k].sp, desc: TOY_INFO[k].desc, role: TOY_INFO[k].role }); }
+const PLAY_TOYS = TOYS.map((t, i) => i).filter(i => TOY_INFO[TOYS[i].key]);
+const ROLE_ICON = { wreck: '💥', prank: '😜', move: '🪽' };

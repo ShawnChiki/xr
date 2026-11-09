@@ -261,6 +261,12 @@ const sfx = {
       case 'clatter': for (let i = 0; i < 5; i++) this.tone('square', 300 + Math.random() * 500, 150, 0.05, 0.06 * v, t + i * 0.045 + Math.random() * 0.03); break;
       case 'clock': this.tone('square', 2400 * P, 2200 * P, 0.025, 0.05 * v); break;
       case 'door': this.tone('sawtooth', 120, 90, 0.6, 0.04 * v); this.hiss(0.5, 0.05 * v, 300, 1); break;
+      case 'click': this.tone('square', 1800 * P, 1600 * P, 0.03, 0.09 * v); this.tone('square', 900 * P, 800 * P, 0.04, 0.07 * v, t + 0.05); break;
+      case 'scratch': this.hiss(0.35, 0.2 * v, 2500, 3, 0, null, 400); this.tone('sawtooth', 300, 80, 0.3, 0.05 * v); break;
+      case 'needle': for (let i = 0; i < 8; i++) this.hiss(0.02, 0.06 * v, 3000 + Math.random() * 2000, 4, t + Math.random() * 0.5); break;
+      case 'shove': this.hiss(0.12, 0.08 * v, 900, 1.5, 0, null, 300); if (P > 1) this.tone('sine', 160, 70, 0.12, 0.18 * v, t + 0.05); break;
+      case 'thud': this.tone('sine', 100 * P, 38, 0.32, 0.4 * v); this.hiss(0.2, 0.14 * v, 260, 0.8); break;
+      case 'eat': for (let i = 0; i < 3; i++) { this.hiss(0.06, 0.14 * v, 800, 3, t + i * 0.16); this.tone('sine', 220, 140, 0.08, 0.1 * v, t + i * 0.16 + 0.03); } this.voice(520, 0.4, 0.08 * v, 900, 4); break;
       case 'babble': this.voice(380 + Math.random() * 120, 0.25, 0.07 * v, 800 + Math.random() * 600, 6); this.voice(420 + Math.random() * 120, 0.22, 0.06 * v, 1000, 6); break;
     }
   },
@@ -294,6 +300,11 @@ const SONGS = [
   { bpm: 84, play(i, t) { // SLEEPY: twinkle on a music box over soft pads
       const s = TWINKLE[i]; if (s > -99) sfx.tone('sine', NOTE(s + 12) * 2, 0, 0.6, 0.07, t, sfx.musicG);
       if (i % 8 === 0) for (const k of [0, 4, 7]) sfx.tone('triangle', NOTE(k - 12), 0, 1.4, 0.04, t, sfx.musicG);
+    } },
+  { bpm: 60, play(i, t) { // the RECORD PLAYER's lullaby (Brahms): slow music box, warm and woozy
+      const m = [4, 4, 7, -99, 4, 4, 7, -99, 4, 7, 12, 11, 9, 9, 7, -99][i]; if (m > -99) { sfx.tone('sine', NOTE(m + 12) * 2, 0, 0.9, 0.08, t, sfx.musicG); sfx.tone('sine', NOTE(m + 12) * 2.01, 0, 0.9, 0.03, t, sfx.musicG); }
+      if (i % 4 === 0) sfx.tone('triangle', NOTE([0, 0, 5, 7][i >> 2] - 12), 0, 1.6, 0.05, t, sfx.musicG);
+      if (i % 3 === 0) sfx.hiss(0.03, 0.012, 3000, 3, t, sfx.musicG);
     } },
 ];
 function musicPhase(ph) {

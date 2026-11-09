@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const APP = { mode: 'lobby', kind: null, viewer: null, S: null, W: null, L: null, lv: 'bedroom', mess: 'medium', bot: 'normal', soloLv: 'bedroom', soloMess: 'medium', soloBot: 'normal',
   roster: null, snaps: [], off: null, me: { viewer: 'toy', body: -1, slotOf: {} }, myPid: 'local', sendT: 0, lastBody: -1, cur: null, lobbyPlayers: {}, endShown: false, area: null, momSaid: false };
-const BOT_SPEED = { easy: 0.5, normal: 0.72, hard: 0.98 };
+const BOT_SPEED = { easy: 0.55, normal: 0.8, hard: 1.05 };
 const NORENDER = /[?&]norender/.test(location.search);   // test hook
 
 /* ---------- renderer, scene, cameras ---------- */
@@ -23,13 +23,15 @@ const fmtT = n => { n = Math.max(0, Math.ceil(n)); return Math.floor(n / 60) + '
 function page(id) { document.querySelectorAll('.page').forEach(p => p.classList.toggle('on', p.id === 'pg-' + id)); APP.page = id;
   if (id === 'host') hostPage(); if (id === 'home') { if (NET.on || NET.peer) netReset(); APP.lobbyPlayers = {}; } }
 document.querySelectorAll('[data-go]').forEach(b => b.addEventListener('click', () => { sfx.init(); primeVoice(); page(b.dataset.go); }));
+const SHOWN = LEVELS.filter(l => !l.hidden);   // only the Cloud Bedroom for now; the other rooms are tucked away
 function levelPicker(el, get, set) {
-  el.innerHTML = ''; for (const L of LEVELS) { const b = document.createElement('button'); b.className = 'lv' + (get() === L.id ? ' on' : '');
+  el.hidden = SHOWN.length < 2; if (el.previousElementSibling && el.previousElementSibling.tagName === 'H2' && el.id === 'hostLevels') el.previousElementSibling.hidden = SHOWN.length < 2;
+  el.innerHTML = ''; for (const L of SHOWN) { const b = document.createElement('button'); b.className = 'lv' + (get() === L.id ? ' on' : '');
     b.innerHTML = `<em>${L.tag}</em><span class="sw">${L.swatch.map(c => `<i style="background:${c}"></i>`).join('')}</span><b>${L.name}</b><small>${L.blurb}</small>`;
     b.onclick = () => { set(L.id); levelPicker(el, get, set); }; el.append(b); }
 }
 function seg(el, opts, get, set) { el.innerHTML = ''; for (const [k, label] of opts) { const b = document.createElement('button'); b.textContent = label; b.className = get() === k ? 'on' : ''; b.onclick = () => { set(k); seg(el, opts, get, set); }; el.append(b); } }
-const MESS_OPTS = [['small', 'Small (18)'], ['medium', 'Medium (28)'], ['big', 'Big (40)']], BOT_OPTS = [['easy', 'Easy'], ['normal', 'Normal'], ['hard', 'Hard']];
+const MESS_OPTS = [['small', 'Small'], ['medium', 'Medium'], ['big', 'Big']], BOT_OPTS = [['easy', 'Easy'], ['normal', 'Normal'], ['hard', 'Hard']];
 const hostLevels = () => levelPicker($('hostLevels'), () => APP.lv, v => { APP.lv = v; lobbyInfo(); });
 hostLevels();
 seg($('hostMess'), MESS_OPTS, () => APP.mess, v => { APP.mess = v; lobbyInfo(); });
@@ -134,6 +136,7 @@ function clientStart(m) {
   enterGameUI();
 }
 function enterGameUI() {
+  $('toyCard').classList.remove('on');
   $('ui').style.display = 'none'; $('hud').classList.add('on'); $('end').classList.remove('on'); document.body.classList.add('playing');
   const toy = APP.viewer === 'toy'; $('pad').hidden = !toy; $('who').hidden = !toy;
   $('keys').hidden = !(toy && !matchMedia('(pointer:coarse)').matches);
@@ -208,6 +211,13 @@ const BANNER = canvasPanel(0.9, 0.34, 900); BANNER.m.position.set(0, 0.12, -0.85
 const SPLAT = canvasPanel(0.5, 0.3, 600); SPLAT.m.position.set(0, 0, -0.16); camera.add(SPLAT.m); SPLAT.m.material.opacity = 0;
 const CONF = canvasPanel(0.5, 0.3, 600); CONF.m.position.set(0, 0, -0.17); camera.add(CONF.m); CONF.m.material.opacity = 0;
 const BUB = canvasPanel(0.5, 0.3, 600); BUB.m.position.set(0, 0, -0.165); camera.add(BUB.m); BUB.m.material.opacity = 0;
+// drowsy eyelids (the record player's lullaby): close from the top and bottom down to a slit
+const LIDS = [0, 1].map(i => { const P = canvasPanel(0.8, 0.4, 300), x = P.x, w = P.cv.width, h = P.cv.height, g = x.createLinearGradient(0, i ? h : 0, 0, i ? 0 : h);
+  g.addColorStop(0, 'rgba(26,14,22,1)'); g.addColorStop(0.86, 'rgba(46,20,34,.98)'); g.addColorStop(1, 'rgba(90,40,60,0)'); x.fillStyle = g; x.fillRect(0, 0, w, h); P.t.needsUpdate = true;
+  P.m.position.set(0, i ? -0.5 : 0.5, -0.15); P.m.renderOrder = 12; camera.add(P.m); P.m.visible = false; return P.m; });
+function lids(d) { const t = performance.now() / 1000, f = d > 0.05 ? clamp(d * 0.9 + Math.sin(t * 1.4) * 0.05 * d, 0, 0.93) : 0;
+  const half = renderer.xr.isPresenting ? 0.17 : 0.15 * Math.tan(camera.fov * Math.PI / 360), edge = half * (1 - f), c = edge + 0.2 - 0.4 * 0.07;   // where the lid's soft edge sits, from the middle of your view
+  LIDS[0].visible = LIDS[1].visible = f > 0; LIDS[0].position.y = c; LIDS[1].position.y = -c; }
 (() => { const w = SPLAT.cv.width, h = SPLAT.cv.height, x = SPLAT.x; for (let i = 0; i < 40; i++) { const px = Math.random() * w, py = Math.random() * h, r = 8 + Math.random() * 40; const g = x.createRadialGradient(px - r * 0.3, py - r * 0.3, 1, px, py, r); g.addColorStop(0, 'rgba(255,255,255,.9)'); g.addColorStop(0.4, 'rgba(160,215,255,.55)'); g.addColorStop(1, 'rgba(90,170,255,.15)'); x.fillStyle = g; x.beginPath(); x.arc(px, py, r, 0, TAU); x.fill(); } SPLAT.t.needsUpdate = true;
   const y = CONF.x, C = ['#ff3e8a', '#ffd400', '#00c2b3', '#2f5cff', '#9b5cff']; for (let i = 0; i < 160; i++) { y.save(); y.translate(Math.random() * w, Math.random() * h); y.rotate(Math.random() * 3); y.fillStyle = C[i % 5]; y.fillRect(-6, -3, 12, 6); y.restore(); } CONF.t.needsUpdate = true;
   const z = BUB.x; for (let i = 0; i < 22; i++) { const px = Math.random() * w, py = Math.random() * h, r = 20 + Math.random() * 60; z.strokeStyle = 'rgba(200,230,255,.8)'; z.lineWidth = 4; z.fillStyle = 'rgba(190,140,255,.18)'; z.beginPath(); z.arc(px, py, r, 0, TAU); z.fill(); z.stroke(); z.fillStyle = 'rgba(255,255,255,.8)'; z.beginPath(); z.arc(px - r * 0.4, py - r * 0.4, r * 0.15, 0, TAU); z.fill(); } BUB.t.needsUpdate = true; })();
@@ -334,10 +344,10 @@ function xrToddler(dt, frame) {
   const tips = HANDS.filter(H => H.ok).map(H => H.tip.clone());
   VRUI.update(dt, tips);
   // controllers: trigger/A/B also work between rounds
-  if (S.state === 'end' && APP.vrEnd) for (const H of HANDS) { const b = H.btn; if (!b || H.src && H.src.hand) continue; if (b.t) return vrAgain(); if (b.a) return vrNext(); if (b.b) return toLobby('host'); }
+  if (S.state === 'end' && APP.vrEnd) for (const H of HANDS) { const b = H.btn; if (!b || H.src && H.src.hand) continue; if (b.t) return vrAgain(); if (b.a && SHOWN.length > 1) return vrNext(); if (b.b) return toLobby('host'); }
 }
 function vrAgain() { startMatch('xr'); }
-function vrNext() { const i = LEVELS.findIndex(l => l.id === APP.lv); APP.lv = LEVELS[(i + 1) % LEVELS.length].id; hostLevels(); lobbyInfo(); startMatch('xr'); }
+function vrNext() { const i = SHOWN.findIndex(l => l.id === APP.lv); APP.lv = SHOWN[(i + 1) % SHOWN.length].id; hostLevels(); lobbyInfo(); startMatch('xr'); }
 function vrRedraw() { disposeWorld(scene, APP.W); APP.W = null; APP.S = null; musicStop(); if (NET.host) sendAll({ t: 'lobby', lv: APP.lv, mess: APP.mess, n: Object.keys(APP.lobbyPlayers).length, back: true }); startDraw(); }
 function wristDraw(s) {
   const P = WRIST, x = P.x, w = P.cv.width, h = P.cv.height, key = [Math.ceil(s.nap), s.ml, s.ph, s.st].join(); if (key === P.last) return; P.last = key;
@@ -371,8 +381,16 @@ function handleEvent(e) {
   if (toddler) { const p = V(x, y, z), td = APP.S.td;
     for (let i = 0; i < 2; i++) { const d = td.hands[i].p.distanceTo(p); if (d < 0.25) { if (code === 'grab') buzz(i, 0.5, 40); if (code === 'bonk') buzz(i, 1, 160); } }
     if (code === 'slam') { buzz(0, 1, 220); buzz(1, 1, 220); } if (code === 'away') { buzz(0, 0.3, 50); buzz(1, 0.3, 50); } if (code === 'giggle') { buzz(0, 0.6, 600); buzz(1, 0.6, 600); } }
+  if (code === 'mess' && APP.viewer === 'toy' && Math.floor(a / 100) === APP.mySlot) popMess(a % 100);
+  if (code === 'record' && a) { if (toddler) banner('Lullaby…', 'Your eyes are closing · slap the record player to stop it', 2.4); else toast('🎵 Lullaby! The toddler is getting sleepy', 2.4); }
+  if (code === 'click' && !a) { if (toddler) banner('Lights out!', 'Touch the lamp to switch it back on', 2.4); else toast('💡 Lights out! The toddler can barely see', 2.4); }
+  if (code === 'eat' && !toddler) toast('😋 The toddler ate a snack', 1.6);
   if (code === 'end') sfx.play('door', 1);
 }
+function popMess(n) { const el = document.createElement('div'); el.className = 'pop'; el.textContent = '+' + n + ' mess!'; el.style.left = (Math.random() * 60 - 30) + 'px'; $('pops').append(el); setTimeout(() => el.remove(), 1300); sfx.play('tick', 0.5, 1.4 + Math.min(n, 6) * 0.1); }
+function showToyCard(T) { if (!T) return; $('tcIcon').textContent = ROLE_ICON[T.role] || '🧸'; $('tcName').textContent = T.name; $('tcSp').textContent = 'Special: ' + T.sp; $('tcDesc').textContent = (T.desc || '') + ' Grab shoves stuff over.';
+  const el = $('toyCard'); el.classList.add('on'); clearTimeout(el._t); el._t = setTimeout(() => el.classList.remove('on'), 5000); }
+$('who').addEventListener('click', () => { const r = APP.roster && APP.roster[APP.me.body]; if (r) showToyCard(TOYS[r[1]]); });
 
 /* ---------- HUD on phones and the watching screen ---------- */
 const PHASE_COL = ['#ff7a1a', '#00c2b3', '#9b5cff', '#ff8fc7'];
@@ -385,18 +403,20 @@ function hud(s) {
   if (APP.viewer === 'toy') {
     const c = s.ctl[APP.myPid];
     if (c) { const bi = c[0], r = APP.roster[bi]; APP.me.body = bi;
-      if (bi !== APP.lastBody) { if (bi >= 0 && r) { const T = TOYS[r[1]]; $('who').innerHTML = `${T.name}<small>Special: ${T.sp}</small>`; $('spName').textContent = T.sp.replace(/ \(.*\)/, ''); if (APP.lastBody >= 0) { toast("Put away! You're the " + T.name + ' now'); sfx.play('hop'); } CAM.fly = 0.5; CAM.have = false; } APP.lastBody = bi; }
-      $('spCd').style.height = Math.round(c[2] * 100) + '%'; $('bGrab').textContent = c[3] || 'Grab'; }
+      if (bi !== APP.lastBody) { if (bi >= 0 && r) { const T = TOYS[r[1]]; $('who').innerHTML = `${ROLE_ICON[T.role] || ''} ${T.name}<small>Special: ${T.sp}</small><span class="mine" id="mine">💥 You made 0 mess</span>`; $('mine')._n = -1; $('spName').textContent = T.sp.replace(/ \(.*\)/, ''); showToyCard(T); if (APP.lastBody >= 0) { toast("Put away! You're the " + T.name + ' now'); sfx.play('hop'); } CAM.fly = 0.5; CAM.have = false; } APP.lastBody = bi; }
+      $('spCd').style.height = Math.round(c[2] * 100) + '%'; $('bGrab').textContent = c[3] || 'Shove'; APP.mySlot = c[1];
+      const mine = $('mine'); if (mine && mine._n !== c[5]) { mine._n = c[5]; mine.textContent = '💥 You made ' + (c[5] || 0) + ' mess'; } }
     APP.me.slotOf = {}; for (const pid in s.ctl) APP.me.slotOf[s.ctl[pid][0]] = s.ctl[pid][1];
   }
   if (s.st === 2) {
     if (!APP.endShown) { APP.endShown = true; banner(s.end === 1 ? 'What a mess!' : 'Tidy!', s.end === 1 ? 'Uh oh… here comes mom' : 'Here comes mom!', 2.2); }
     if (s.et > 2.4 && !APP.momSaid) { APP.momSaid = true; speak(momLine(APP.W, s.end)); }
     if (s.et > 6.5 && !APP.endCard) { APP.endCard = true; const toysWon = s.end === 1;
-      if (APP.viewer === 'toddler') { APP.vrEnd = true; VRUI.show(toysWon ? 'Toys win' : 'You win!', toysWon ? `Grounded! The room is messier than when mom left (${s.ml} vs ${s.m0}).` : s.ml === 0 ? 'Everything is in the toy box.' : `Tidier than when mom left (${s.ml} vs ${s.m0}).`,
-        [{ label: 'Again', fn: vrAgain, col: '#ff3e8a' }, { label: 'Next room', fn: vrNext, col: '#ffd400' }, { label: 'Redraw space', fn: vrRedraw, col: '#00c2b3' }, { label: 'Leave', fn: () => toLobby('host'), col: '#fffdf7' }]); }
+      if (APP.viewer === 'toddler') { APP.vrEnd = true; VRUI.show(toysWon ? 'Toys win' : 'You win!', toysWon ? `Grounded! The room is messier than when mom left (${s.ml} vs ${s.m0}). The toys made ${s.tm || 0} mess.` : s.ml === 0 ? 'Everything is in the toy box.' : `Tidier than when mom left (${s.ml} vs ${s.m0}).`,
+        [{ label: 'Again', fn: vrAgain, col: '#ff3e8a' }].concat(SHOWN.length > 1 ? [{ label: 'Next room', fn: vrNext, col: '#ffd400' }] : [], [{ label: 'Redraw space', fn: vrRedraw, col: '#00c2b3' }, { label: 'Leave', fn: () => toLobby('host'), col: '#fffdf7' }])); }
       else { $('endT').textContent = toysWon ? 'What a mess! Toys win' : 'Tidy! Toddler wins';
         $('endP').textContent = toysWon ? `Messier than when mom left (${s.ml} vs ${s.m0}). The toddler's grounded.` : s.ml === 0 ? 'Everything\'s in the toy box. Mom says: good kid.' : `Tidier than when mom left (${s.ml} vs ${s.m0}). Mom says: good kid.`;
+        const c = APP.viewer === 'toy' && s.ctl[APP.myPid]; if (c) $('endP').textContent += ` You made ${c[5] || 0} mess${s.tm ? ' (all the toys: ' + s.tm + ')' : ''}.`;
         if (APP.kind === 'client') $('endP').textContent += ' Waiting for the toddler to start the next round…'; $('end').classList.add('on'); } }
   } else if (APP.endShown) { APP.endShown = false; APP.endCard = false; APP.momSaid = false; $('end').classList.remove('on'); }
 }
@@ -422,7 +442,7 @@ function loop(t, frame) {
     const last = APP.snaps[APP.snaps.length - 1]; s = Object.assign({}, s, { ctl: last.ctl, nap: last.nap, st: last.st, ml: last.ml, end: last.end, ph: last.ph, et: last.et });
   }
   APP.cur = s;
-  const playing = s.st === 1; if (s.st === 0) musicStop(); else musicPhase(s.st === 2 ? 3 : s.ph);
+  const playing = s.st === 1, rec = playing && APP.L && APP.L.devices.some((d, i) => d.type === 'record' && s.dv[i] && s.dv[i][0]); if (s.st === 0) musicStop(); else musicPhase(rec ? 4 : s.st === 2 ? 3 : s.ph);
   hud(s); if (APP.viewer === 'toddler') wristDraw(s);
   drawSnap(W, s, s2, k, APP.me, dt);
   if (APP.kind === 'client' && APP.me.body >= 0 && APP.snaps.length > 1) { const n = APP.snaps.length, A = APP.snaps[n - 2].b, B = APP.snaps[n - 1].b, j = APP.me.body * 8, g = W.bodies[APP.me.body].g, dT = Math.max(0.016, APP.snaps[n - 1].T - APP.snaps[n - 2].T);
@@ -430,7 +450,7 @@ function loop(t, frame) {
   phaseLight(W, scene, s.st === 2 ? 3 : s.ph, playing || s.st === 2, dt);
   fxStep(W.fx, dt);
   if (APP.viewer === 'toy') toyCam(dt, s); else if (APP.viewer === 'watch') watchCam(dt);
-  if (APP.viewer === 'toddler') { const T = s.td; SPLAT.m.material.opacity = clamp(T[TD.SPLAT], 0, 1) * 0.9; CONF.m.material.opacity = clamp(T[TD.CONF], 0, 1); BUB.m.material.opacity = clamp(T[TD.BUB], 0, 1) * 0.9; BANNER.m.visible = performance.now() < BANNER.until; }
+  if (APP.viewer === 'toddler') { const T = s.td; SPLAT.m.material.opacity = clamp(T[TD.SPLAT], 0, 1) * 0.9; CONF.m.material.opacity = clamp(T[TD.CONF], 0, 1); BUB.m.material.opacity = clamp(T[TD.BUB], 0, 1) * 0.9; lids(s.st === 1 ? T[TD.DROWSY] || 0 : 0); BANNER.m.visible = performance.now() < BANNER.until; }
   if (!document.hidden && !NORENDER) renderer.render(scene, camera);
 }
 function toyCam(dt, s) {
@@ -440,6 +460,11 @@ function toyCam(dt, s) {
   CAM.tgt.lerp(p, 1 - Math.exp(-(CAM.fly > 0 ? 5 : 16) * dt));
   let d = CAM.heading + Math.PI - CAM.yawS; d = Math.atan2(Math.sin(d), Math.cos(d)); CAM.yawS += d * (1 - Math.exp(-7 * dt));
   const cp = Math.cos(CAM.pitch), up = r * 0.7, pos = V(CAM.tgt.x + Math.sin(CAM.yawS) * cp * CAM.dist, CAM.tgt.y + up + Math.sin(CAM.pitch) * CAM.dist, CAM.tgt.z + Math.cos(CAM.yawS) * cp * CAM.dist);
+  // don't let a tower (or anything else) sit between the camera and your toy: pull in in front of it
+  { const tg = V(CAM.tgt.x, CAM.tgt.y + up, CAM.tgt.z), seg = V().subVectors(pos, tg), L2 = seg.lengthSq(); let tmin = 1;
+    if (L2 > 1e-4) for (const o of APP.W.bodies) { if (o.i === bi || !o.g.visible) continue; const t = clamp(V().subVectors(o.g.position, tg).dot(seg) / L2, 0, 1); if (t < 0.15 || t >= tmin) continue;
+      if (o.g.position.distanceTo(V().copy(tg).addScaledVector(seg, t)) < o.r * 1.1 + 0.03) tmin = t; }
+    if (tmin < 1) pos.copy(tg).addScaledVector(seg, Math.max(0.2, tmin - 0.12)); }
   if (!AREA.inside(pos.x, pos.z, 0.08)) { const tg = V(CAM.tgt.x, pos.y, CAM.tgt.z); for (let t = 0.95; t > 0.15; t -= 0.05) { const q = tg.clone().lerp(pos, t); if (AREA.inside(q.x, q.z, 0.08)) { pos.copy(q); break; } } AREA.clampIn(pos, 0.05); }
   const gh = APP.L.groundH(pos.x, pos.z); if (pos.y < gh + 0.04) pos.y = gh + 0.04; if (pos.y > WALL_H - 0.08) pos.y = WALL_H - 0.08;
   camera.position.copy(pos); camera.lookAt(CAM.tgt.x, CAM.tgt.y + up, CAM.tgt.z);

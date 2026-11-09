@@ -7,16 +7,16 @@ const LEVELS = [
   { id: 'bedroom', name: 'Cloud Bedroom', tag: "Kid's room",
     blurb: "A kid's bedroom with sky-and-clouds wallpaper: a bed to hide under, letter-block towers, a cardboard fort and a car ramp off a stack of books.",
     swatch: ['#78c4ff', '#ffffff', '#d9a26b', '#e23b2e'] },
-  { id: 'vaneyck', name: 'Van Eyck Square', tag: 'Drawing',
+  { id: 'vaneyck', hidden: true, name: 'Van Eyck Square', tag: 'Drawing',
     blurb: "An ink-drawn living room with a playset of stepping stones, steel domes and a sandpit, after Aldo van Eyck's postwar Amsterdam playgrounds.",
     swatch: ['#f4f2ec', '#9aa3a8', '#e23b2e', '#15121a'] },
-  { id: 'noguchi', name: 'Noguchi Playscape', tag: 'Soft sculpture',
+  { id: 'noguchi', hidden: true, name: 'Noguchi Playscape', tag: 'Soft sculpture',
     blurb: "Blanket hills, a spiral slide, a primary-colored cube and paper lanterns, after Isamu Noguchi's playgrounds you climb like sculpture.",
     swatch: ['#f6d7c3', '#cbb7ea', '#ffd400', '#2f5cff'] },
-  { id: 'memphis', name: 'Memphis Park', tag: 'Flat pop',
+  { id: 'memphis', hidden: true, name: 'Memphis Park', tag: 'Flat pop',
     blurb: "Squiggle wallpaper, a checkerboard floor and cones on pedestals, after the Memphis Group's loud 1980s Milan furniture.",
     swatch: ['#ffe9a8', '#ff3e8a', '#00c2b3', '#15121a'] },
-  { id: 'junk', name: 'Junk Playground', tag: 'Textured',
+  { id: 'junk', hidden: true, name: 'Junk Playground', tag: 'Textured',
     blurb: 'A wood-panelled den full of pallet forts, tire stacks and oil drums, after the first junk playground at Emdrup, Copenhagen (1943).',
     swatch: ['#efe2c8', '#a0703f', '#2b2b2b', '#c8553d'] },
 ];
@@ -83,14 +83,10 @@ function groundSpots(b, n, H) {
 function genBedroom(seed) {
   const b = Builder(seed), { R, pick } = b;
   const PRI = ['#e23b2e', '#2f5cff', '#ffd400', '#3fbf6f', '#ff7a1a', '#9b5cff'], CARD = '#c9965a';
-  { const c = b.spot(0.2); if (c) musicBox(b, c, R(0, TAU), '#c98a4b', 'cube'); }
   { const c = b.spot(0.42); if (c) seesaw(b, c, R(0, TAU), '#ffd400', 'plank'); }
-  { const c = b.spot(0.4); if (c) mgr(b, c, '#e23b2e'); }
-  const block = (p, s, yaw) => { const k = Math.floor(b.rng() * 16); b.box(p, V(s, s, s), yaw, pick(PRI), 'abc', { climb: true, uv: 0.25 }); const it = b.vis.abc[b.vis.abc.length - 1]; it.uo = (k % 4) * 0.25; it.vo = Math.floor(k / 4) * 0.25; };
-  // letter-block towers and a little pyramid
-  for (let k = 0; k < 4; k++) { const c = b.spot(0.15); if (!c) continue; const n = 2 + Math.floor(R(0, 4)), s = 0.085, yaw = R(0, TAU);
-    for (let i = 0; i < n; i++) block(V(c.x + R(-0.01, 0.01), s / 2 + i * s, c.z + R(-0.01, 0.01)), s, yaw + R(-0.25, 0.25)); }
-  { const c = b.spot(0.22); if (c) { const s = 0.085, yaw = R(0, TAU); [3, 2, 1].forEach((n, r) => { for (let i = 0; i < n; i++) block(V(c.x, s / 2 + r * s, c.z).add(rotY(V((i - (n - 1) / 2) * s, 0, 0), yaw)), s, yaw); }); } }
+  // clear spots for real letter-block towers and a block pyramid (built as knock-over-able things in sim.js)
+  b.towerSpots = []; for (let k = 0; k < 7; k++) { const c = b.spot(0.12); if (c) b.towerSpots.push(V(c.x, 0, c.z)); }
+  { const c = b.spot(0.2); if (c) b.pyramidSpot = V(c.x, 0, c.z); }
   // a cardboard box fort with a doorway (a good hiding spot)
   { const c = b.spot(0.3); if (c) { const yaw = R(0, TAU), w = 0.36, H = 0.28, t = 0.012, at = (x, y, z) => V(c.x, 0, c.z).add(rotY(V(x, y, z), yaw));
     b.box(at(0, H / 2, -w / 2), V(w, H, t), yaw, CARD, 'card', { climb: true }); b.box(at(-w / 2, H / 2, 0), V(t, H, w), yaw, CARD, 'card', { climb: true }); b.box(at(w / 2, H / 2, 0), V(t, H, w), yaw, CARD, 'card', { climb: true });
@@ -111,7 +107,7 @@ function genBedroom(seed) {
   // a ring of floor cushions
   for (let k = 0; k < 2; k++) { const c = b.spot(0.12); if (c) b.cyl(V(c.x, 0, c.z), 0.1, 0.05, pick(PRI), 'paint'); }
   return {
-    id: 'bedroom', seed, b, H: null,
+    id: 'bedroom', seed, b, H: null, towerSpots: b.towerSpots, pyramidSpot: b.pyramidSpot,
     style: { bg: '#bfe6ff', fog: ['#bfe6ff', 6, 22], toyOutline: 0.003,
       fams: { abc: { t: 'lambert', tex: 'abc' }, card: { t: 'lambert', tex: 'cardboard' }, paint: 'lambert', steel: 'lambert' } },
     parts: [{ shape: 'box', r: 0.03, cols: ['#e23b2e', '#2f5cff', '#ffd400', '#3fbf6f'] }, { shape: 'sph', r: 0.034, cols: ['#e23b2e', '#2f5cff', '#3fbf6f'] }, { shape: 'can', r: 0.028, cols: ['#ff7a1a', '#9b5cff', '#ffd400'] }],
@@ -331,6 +327,7 @@ function scaleBuilder(L) {
   for (const f in b.vis) for (const it of b.vis[f]) { it.p.multiplyScalar(k); it.s.multiplyScalar(k); }
   for (const d of b.devices) { for (const key of ['c', 'pivot', 'crank']) if (d[key]) d[key].multiplyScalar(k); for (const key of ['len', 'w', 'th', 'r', 'h']) if (d[key]) d[key] *= k; }
   for (const p of L.spawns) p.multiplyScalar(k);
+  if (L.towerSpots) for (const p of L.towerSpots) p.multiplyScalar(k); if (L.pyramidSpot) L.pyramidSpot.multiplyScalar(k);
   L.parts = L.parts.map(p => Object.assign({}, p, { r: p.r * k }));
   if (L.H) { const H = L.H; L.H = (x, z) => H(x / k, z / k) * k; }
 }
@@ -346,11 +343,16 @@ function makeLevel(id, seed, area) {
   // things the toys can knock over: stacked blocks (towers) and books on the furniture
   L.nParts = L.parts.length; L.tidyBlock = L.parts.length; L.parts.push({ shape: 'box', r: 0.032 * K, cols: ['#e23b2e', '#2f5cff', '#ffd400', '#3fbf6f', '#ff7a1a', '#9b5cff'] });
   L.tidyBook = L.parts.length; L.parts.push({ shape: 'book', r: 0.05, cols: ['#e23b2e', '#2f5cff', '#3fbf6f', '#ffd400', '#9b5cff', '#ff7a1a'] });
+  if (id === 'bedroom') L.parts[L.tidyBlock] = { shape: 'abc', r: 0.032 * K, cols: ['#e23b2e', '#2f5cff', '#ffd400', '#3fbf6f', '#ff7a1a', '#9b5cff'], tex: 'abc' };
+  L.tidyFood = L.parts.length; L.parts.push({ shape: 'food', r: 0.04, cols: ['#c98a4b', '#e23b2e', '#ffd400', '#f3d39a', '#ff8fc7', '#3fbf6f'] });
+  L.tidyCup = L.parts.length; L.parts.push({ shape: 'cup', r: 0.05, cols: ['#2f5cff', '#ff3e8a', '#00c2b3'] });
+  L.tidyCrayon = L.parts.length; L.parts.push({ shape: 'crayon', r: 0.016, cols: ['#e23b2e', '#2f5cff', '#ffd400', '#3fbf6f', '#ff7a1a', '#9b5cff', '#15121a'] });
   L.groundH = L.H || (() => 0);
   // the chest: four walls and a floor
   const { w, d, h, t } = BOX, bw = (x, z, hx, hz) => cBox(V(x, h / 2, z).applyQuaternion(BOX.q).add(V(BOX.c.x, 0, BOX.c.z)).setY(h / 2), V(hx, h / 2, hz), BOX.q.clone());
   const boxCols = [bw(0, -d / 2 + t / 2, w / 2, t / 2), bw(0, d / 2 - t / 2, w / 2, t / 2), bw(-w / 2 + t / 2, 0, t / 2, d / 2), bw(w / 2 - t / 2, 0, t / 2, d / 2)];
   for (const c of boxCols) c.c.y = h / 2;
+  for (const d of room.devices) L.b.devices.push(d);
   L.cols = L.b.cols.concat(room.cols, boxCols); L.vis = L.b.vis; L.devices = L.b.devices;
   L.devices.forEach((d, i) => d.i = i);
   L.grid = makeGrid(L.cols, 0.6);

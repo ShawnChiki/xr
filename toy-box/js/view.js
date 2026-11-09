@@ -62,7 +62,7 @@ function addMerged(W, vis, fams, opt) {
   for (const fam in vis) {
     if (fam[0] === '_' || !vis[fam].length) continue;
     const spec = fams[fam] || 'lambert', list = vis[fam], geo = mergeParts(list);
-    W.root.add(new THREE.Mesh(geo, makeMat(spec)));
+    const mesh = new THREE.Mesh(geo, makeMat(spec)); W.root.add(mesh); if (fam === 'r_glow') W.glowMat = mesh.material;
     if (opt.outline && !(spec && spec.noOutline) && fam !== 'r_wall') W.root.add(new THREE.Mesh(geo, outlineMat(opt.outline)));
     if (opt.edges && fam !== 'r_wall') { const eg = edgesOf(list.filter(p => p.g !== 'cyl6' && p.g !== 'sphLo'), 35); W.root.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: opt.edges }))); }
   }
@@ -226,7 +226,30 @@ function buildToyBox(W) {
 function rr(x, a, b, w, h, r) { x.beginPath(); x.moveTo(a + r, b); x.arcTo(a + w, b, a + w, b + h, r); x.arcTo(a + w, b + h, a, b + h, r); x.arcTo(a, b + h, a, b, r); x.arcTo(a, b, a + w, b, r); x.closePath(); }
 
 // devices are drawn at design size inside a group scaled up by K
+function buildRoomDevice(W, d0) {
+  const mat = new THREE.MeshLambertMaterial({ vertexColors: true }), o = { d: d0, g: new THREE.Group() }; W.root.add(o.g);
+  const mesh = ps => new THREE.Mesh(mergeParts(ps), mat);
+  if (d0.type === 'record') {
+    o.g.position.copy(d0.c); o.g.rotation.y = d0.yaw;
+    o.g.add(mesh([P('box', V(0, 0.142, 0), V(0.42, 0.006, 0.32), '#15121a'), P('cyl6', V(0.16, 0.155, -0.1), V(0.018, 0.02, 0.018), '#c0c4c8'),
+      P('box', V(0.12, 0.165, -0.02), V(0.012, 0.01, 0.17), '#c0c4c8', qy(0.35)), P('box', V(0.09, 0.165, 0.065), V(0.025, 0.012, 0.03), '#15121a', qy(0.35))]));
+    o.disc = new THREE.Group(); o.disc.position.set(-0.05, 0.15, 0); o.g.add(o.disc);
+    o.disc.add(mesh([P('cyl', V(0, 0, 0), V(0.13, 0.008, 0.13), '#1d1a22'), P('ring', V(0, 0.005, 0), V(0.1, 0.1, 0.05), '#2c2832', qx(Math.PI / 2)), P('ring', V(0, 0.005, 0), V(0.07, 0.07, 0.05), '#2c2832', qx(Math.PI / 2)),
+      P('cyl', V(0, 0.006, 0), V(0.045, 0.004, 0.045), '#ff3e8a'), P('box', V(0.02, 0.009, 0), V(0.03, 0.002, 0.008), '#ffd400')]));
+    o.btn = new THREE.Mesh(PRIM.cyl, new THREE.MeshBasicMaterial({ color: 0x3fbf6f })); o.btn.scale.set(0.028, 0.02, 0.028); o.btn.position.set(0.17, 0.15, 0.12); o.g.add(o.btn);
+    o.notes = []; for (let i = 0; i < 4; i++) { const n = new THREE.Sprite(new THREE.SpriteMaterial({ map: noteTex(), transparent: true, depthWrite: false, color: ['#ff3e8a', '#ffd400', '#00c2b3', '#9b5cff'][i] })); n.scale.setScalar(0.09); n.visible = false; W.root.add(n); o.notes.push(n); }
+  } else {   // the lamp's floor switch, on its cord
+    const c = d0.c, sw = d0.sw, mid = V().addVectors(c, sw).multiplyScalar(0.5), len = Math.hypot(sw.x - c.x, sw.z - c.z);
+    const cord = mesh([P('box', V(0, 0.006, 0), V(0.012, 0.012, len), '#15121a')]); cord.position.set(mid.x, 0, mid.z); cord.rotation.y = Math.atan2(sw.x - c.x, sw.z - c.z); W.root.add(cord);
+    o.g.position.set(sw.x, 0, sw.z); o.g.add(mesh([P('cyl', V(0, 0.014, 0), V(0.06, 0.028, 0.06), '#15121a'), P('cyl', V(0, 0.029, 0), V(0.064, 0.004, 0.064), '#fffdf7')]));
+    o.btn = new THREE.Mesh(PRIM.cyl, new THREE.MeshBasicMaterial({ color: 0xff3e8a })); o.btn.scale.set(0.04, 0.02, 0.04); o.btn.position.y = 0.04; o.g.add(o.btn);
+  }
+  return o;
+}
+let _noteTex = null;
+function noteTex() { return _noteTex || (_noteTex = canvasTex(64, (x, s) => { x.clearRect(0, 0, s, s); x.fillStyle = '#ffffff'; x.font = '900 52px sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText('♪', s / 2, s / 2); })); }
 function buildDevice(W, d0) {
+  if (d0.type === 'record' || d0.type === 'lamp') return buildRoomDevice(W, d0);
   const d = Object.assign({}, d0); for (const k of ['len', 'w', 'th', 'r', 'h']) if (d[k]) d[k] /= K;
   const mat = W.st.outline ? new THREE.MeshToonMaterial({ vertexColors: true, gradientMap: GRAD3 }) : new THREE.MeshLambertMaterial({ vertexColors: true });
   const ol = W.st.outline || W.st.toyOutline ? outlineMat(0.004) : null;
@@ -278,6 +301,17 @@ function partGeo(L, kind, colIdx) {
     case 'cone': ps = [P('cone', V(0, r * 0.1, 0), V(r * 0.85, r * 1.6, r * 0.85), col), P('box', V(0, -r * 0.75, 0), V(r * 1.6, r * 0.15, r * 1.6), '#fffdf7')]; break;
     case 'can': ps = [P('cyl', V(), V(r * 0.7, r * 1.7, r * 0.7), col), P('cyl', V(0, r * 0.86, 0), V(r * 0.72, r * 0.05, r * 0.72), '#9aa3a8'), P('cyl', V(0, 0, 0), V(r * 0.72, r * 0.5, r * 0.72), '#fffdf7')]; break;
     case 'tire': ps = [P('tor', V(), V(r * 0.75, r * 0.75, r * 0.95), col)]; break;
+    case 'abc': { const L = colIdx % 16, q = qy(0); ps = [Object.assign(P('box', V(), V(r * 1.9, r * 1.9, r * 1.9), col, q), { uv: 0.25, uo: (L % 4) * 0.25, vo: Math.floor(L / 4) * 0.25 })]; break; }
+    case 'food': switch (colIdx % 6) {
+      case 0: ps = [P('cyl', V(0, -r * 0.5, 0), V(r * 1.0, r * 0.3, r * 1.0), '#c98a4b')]; for (let i = 0; i < 5; i++) { const a = i * 2.4; ps.push(P('sphLo', V(Math.cos(a) * r * 0.55, -r * 0.33, Math.sin(a) * r * 0.55), V(r * 0.13, r * 0.08, r * 0.13), '#4a2a14')); } break;   // cookie
+      case 1: ps = [P('sph', V(0, -r * 0.1, 0), V(r * 0.85, r * 0.8, r * 0.85), '#e23b2e'), P('cyl6', V(0, r * 0.75, 0), V(r * 0.06, r * 0.3, r * 0.06), '#5a3a1a'), P('sphLo', V(r * 0.2, r * 0.75, 0), V(r * 0.25, r * 0.08, r * 0.14), '#3fbf6f', qz(0.4))]; break;   // apple
+      case 2: ps = [P('sph', V(0, -r * 0.3, 0), V(r * 1.1, r * 0.35, r * 0.4), '#ffd400', qy(0.3)), P('cyl6', V(r * 1.0, -r * 0.2, r * 0.3), V(r * 0.08, r * 0.15, r * 0.08), '#5a3a1a', qz(1.2))]; break;   // banana
+      case 3: ps = [P('box', V(0, -r * 0.62, 0), V(r * 1.4, r * 0.18, r * 1.0), '#f3d39a'), P('box', V(0, -r * 0.48, 0), V(r * 1.45, r * 0.1, r * 1.05), '#3fbf6f'), P('box', V(0, -r * 0.4, 0), V(r * 1.4, r * 0.08, r * 1.0), '#e23b2e'), P('box', V(0, -r * 0.28, 0), V(r * 1.4, r * 0.18, r * 1.0), '#f3d39a')]; break;   // sandwich
+      case 4: ps = [P('cyl', V(0, -r * 0.45, 0), V(r * 0.6, r * 0.55, r * 0.6), '#7fd6ff'), P('sph', V(0, r * 0.0, 0), V(r * 0.72, r * 0.5, r * 0.72), '#ff8fc7'), P('sphLo', V(0, r * 0.5, 0), V(r * 0.16, r * 0.16, r * 0.16), '#e23b2e')]; break;   // cupcake
+      default: ps = []; for (let i = 0; i < 7; i++) { const a = i * 1.7, y = -r * 0.6 + (i > 3 ? r * 0.35 : 0) + (i === 6 ? r * 0.35 : 0); ps.push(P('sphLo', V(Math.cos(a) * r * (i === 6 ? 0 : 0.35), y, Math.sin(a) * r * (i === 6 ? 0 : 0.35)), V(r * 0.3, r * 0.3, r * 0.3), '#9b5cff')); }   // grapes
+    } break;
+    case 'cup': ps = [P('cyl', V(0, -r * 0.1, 0), V(r * 0.75, r * 1.8, r * 0.75), col), P('cyl', V(0, r * 0.79, 0), V(r * 0.66, r * 0.02, r * 0.66), '#15121a'), P('ring', V(0, r * 0.8, 0), V(r * 0.75, r * 0.75, r * 0.75), '#fffdf7', qx(Math.PI / 2))]; break;
+    case 'crayon': ps = [P('cyl6', V(), V(r * 0.38, r * 3.2, r * 0.38), col), P('cone', V(0, r * 1.9, 0), V(r * 0.38, r * 0.6, r * 0.38), col), P('cyl6', V(0, -r * 0.2, 0), V(r * 0.4, r * 1.6, r * 0.4), '#fffdf7')]; break;
     case 'book': ps = [P('box', V(), V(r * 0.6, r * 1.9, r * 1.4), col), P('box', V(0, 0, r * 0.06), V(r * 0.5, r * 1.8, r * 1.3), '#fffdf7'), P('box', V(0, r * 0.5, 0), V(r * 0.62, r * 0.12, r * 1.42), '#ffd400')]; break;
   }
   return PART_GEO[key] = mergeParts(ps);
@@ -285,7 +319,7 @@ function partGeo(L, kind, colIdx) {
 function buildBody(W, r, i) {
   const [type, kind, rad, col] = r, o = { i, type, kind, r: rad, g: new THREE.Group() };
   const geo = type === 1 ? partGeo(W.L, kind, col) : toyGeo(kind, rad);
-  const m = new THREE.Mesh(geo, W.L.parts[kind] && type === 1 && W.L.parts[kind].tex ? (W.partTexMat || (W.partTexMat = makeMat({ t: W.toyMat.isMeshToonMaterial ? 'toon' : 'lambert', tex: W.L.parts[kind].tex }))) : W.toyMat);
+  const m = new THREE.Mesh(geo, W.L.parts[kind] && type === 1 && W.L.parts[kind].tex ? (W.partTexMat || (W.partTexMat = makeMat({ t: 'lambert', tex: W.L.parts[kind].tex }))) : W.toyMat);
   o.g.add(m); o.body = m; if (W.toyOl) m.add(new THREE.Mesh(geo, W.toyOl));
   if (type === 2) { m.material = W.toyMat.clone(); m.material.transparent = true; m.material.opacity = 0.75; }
   if (type === 0) {
@@ -378,6 +412,7 @@ function setArm(m, a, b, r) { const d = _vb.subVectors(b, a), L = d.length(); m.
 function lp(a, b, i, k) { return b ? a[i] + (b[i] - a[i]) * k : a[i]; }
 function drawSnap(W, s, s2, k, me, dt) {
   const B = s.b, B2 = s2 && s2.b, viewer = me.viewer, now = performance.now();
+  W.darkOn = s.dk > 0 && s.st === 1; W.darkMin = viewer === 'toddler' ? 0.1 : 0.4; W.darkFog = viewer === 'toddler' ? [0.2, 3.0] : [1, 8];
   let sh = 0; const dummy = drawSnap.d || (drawSnap.d = new THREE.Object3D());
   for (let i = 0; i < W.bodies.length; i++) {
     const o = W.bodies[i], j = i * 8, f = B[j + 7];
@@ -410,7 +445,7 @@ function drawSnap(W, s, s2, k, me, dt) {
   td.chest.position.set(L(TD.CHEST), L(TD.CHEST + 1), L(TD.CHEST + 2)); td.butt.position.set(L(TD.BUTT), L(TD.BUTT + 1), L(TD.BUTT + 2));
   const mouth = T[TD.MOUTH], sleepy = T[TD.SLEEPY], giggle = T[TD.GIGGLE];
   td.mouth.scale.set(0.03 + mouth * 0.012 + giggle * 0.01, 0.008 + mouth * 0.04 + (giggle > 0 ? 0.02 + Math.sin(now / 50) * 0.01 : 0), 0.012);
-  for (const l of td.lids) { l.scale.y = 0.04 * (sleepy > 0.2 ? sleepy : 0.05); l.visible = sleepy > 0.2; }
+  const lid = Math.max(sleepy, T[TD.DROWSY] || 0); for (const l of td.lids) { l.scale.y = 0.04 * (lid > 0.2 ? lid : 0.05); l.visible = lid > 0.2; }
   const spooky = s.ph === 2 && s.st === 1; for (const p of td.pupils) p.scale.set(spooky ? 0.024 : 0.019, spooky ? 0.03 : 0.024, 0.012);
   td.brows.forEach((b, i) => { b.rotation.z = spooky ? (i ? 0.45 : -0.45) : 0; });
   const hq = td.head.quaternion, side = _va.set(1, 0, 0).applyQuaternion(hq); side.y = 0; side.normalize();
@@ -442,6 +477,9 @@ function drawSnap(W, s, s2, k, me, dt) {
     if (o.d.type === 'seesaw') o.arm.rotation.z = v2 !== undefined ? lerp(v, v2, k) : v;
     else if (o.d.type === 'mgr') o.arm.rotation.y = -(v2 !== undefined ? v + (v2 - v) * k : v);
     else if (o.d.type === 'swing') o.arm.rotation.x = v2 !== undefined ? lerp(v, v2, k) : v;
+    else if (o.d.type === 'record') { o.disc.rotation.y = -v[1]; const t = now / 1000; o.btn.material.color.set(v[0] ? '#ffd400' : v[2] ? '#6a6470' : (Math.sin(t * 6) > 0 ? '#3fbf6f' : '#bff5d6'));
+      o.notes.forEach((n, j) => { n.visible = !!v[0]; if (!v[0]) return; const ph = (t * 0.5 + j / 4) % 1; n.position.copy(o.d.c).add(_va.set(Math.sin(t * 2 + j * 1.7) * 0.12, 0.25 + ph * 0.6, Math.cos(t * 1.6 + j) * 0.12)); n.material.opacity = Math.sin(ph * Math.PI); }); }
+    else if (o.d.type === 'lamp') { const t = now / 1000; o.btn.material.color.set(!v[0] ? '#15121a' : v[1] ? '#6a6470' : (Math.sin(t * 6) > 0 ? '#ff3e8a' : '#ffc2d6')); o.btn.position.y = v[0] ? 0.04 : 0.032; }
     else if (o.d.type === 'mbox') { o.crank.rotation.x = v[1]; o.dots.forEach((m, j) => m.material.color.set(v[2] ? '#cfc8d8' : j < Math.round(v[0] * 8) ? '#ffd400' : '#6a6470')); } });
   W.walls.forEach((m, i) => { const w = s.tw[i]; m.visible = !!w; if (w) { m.position.set(w[0], w[1], w[2]); m.rotation.y = w[3]; m.scale.y = Math.min(1, w[4] * 3); } });
   if (s.ml !== W.lastMl || s.m0 !== W.lastM0) { W.lastMl = s.ml; W.lastM0 = s.m0; W.boxLabel.draw(s.ml, s.m0 === undefined ? s.ml : s.m0); }
@@ -463,8 +501,15 @@ const PH_TINT = [
 ];
 function phaseLight(W, scene, ph, playing, dt) {
   const t = PH_TINT[playing ? ph : 1], k = Math.min(1, dt * 1.2), c = new THREE.Color(), b = W.base;
-  W.light.hemi.intensity = lerp(W.light.hemi.intensity, b.hemi * t.hemi, k); W.light.sun.intensity = lerp(W.light.sun.intensity, b.sun * t.sun, k);
-  c.copy(b.fog).lerp(new THREE.Color(t.fog), t.mix); scene.fog.color.lerp(c, k); c.copy(b.bg).lerp(new THREE.Color(t.fog), t.mix); scene.background.lerp(c, k);
+  // lights out (a toy hit the lamp switch): the toddler can barely see, the phones see a little
+  W.darkAmt = lerp(W.darkAmt || 0, W.darkOn ? 1 : 0, Math.min(1, dt * 4)); const da = W.darkAmt, dk = lerp(1, W.darkMin || 0.35, da);
+  W.phI = W.phI || { hemi: W.light.hemi.intensity, sun: W.light.sun.intensity }; W.phI.hemi = lerp(W.phI.hemi, b.hemi * t.hemi, k); W.phI.sun = lerp(W.phI.sun, b.sun * t.sun, k);
+  W.light.hemi.intensity = W.phI.hemi * dk; W.light.sun.intensity = W.phI.sun * dk; W.light.amb.intensity = 0.12 * (0.5 + 0.5 * dk);
+  W.fogC = W.fogC || scene.fog.color.clone(); W.bgC = W.bgC || scene.background.clone();
+  c.copy(b.fog).lerp(new THREE.Color(t.fog), t.mix); W.fogC.lerp(c, k); c.copy(b.bg).lerp(new THREE.Color(t.fog), t.mix); W.bgC.lerp(c, k);
+  const night = new THREE.Color('#0b0a1c'), df = W.darkFog || [1, 7]; scene.fog.color.copy(W.fogC).lerp(night, da * 0.9); scene.background.copy(W.bgC).lerp(night, da * 0.9);
+  scene.fog.near = lerp(b.near, df[0], da); scene.fog.far = lerp(b.far, df[1], da);
+  if (W.glowMat) W.glowMat.color.setScalar(lerp(1, 0.15, da)); if (W.ceil) W.ceil[1].material.color.setScalar(lerp(1, 0.15, da));
   if (W.sky) W.sky.material.color.lerp(new THREE.Color(t.sky), k);
   if (W.dust) { W.dust.rotation.y += dt * 0.02; W.dust.position.y = Math.sin(performance.now() / 4000) * 0.05; }
   if (playing && ph === 3 && Math.random() < dt * 6) fxPuff(W.fx, AREA.rand(Math.random, 0.2).setY(0.1 + Math.random() * 0.8), '#fff6c8', 1, 0.05, 0.018, 2.5);
@@ -524,9 +569,15 @@ function onEvent(W, e, ear, viewer) {
     case 'roar': sfx.play('roar', vol); break;
     case 'lullaby': sfx.play('lullaby', 1); for (let i = 0; i < 12; i++) P(['#ffd400', '#cbb7ea', '#ff8fc7'][i % 3], 1, 0.4, 0.022, 2, -0.15); break;
     case 'launch': case 'cannon': case 'pew': case 'bubble': case 'heli': case 'chatter': sfx.play(code, vol); if (code === 'launch' || code === 'cannon') P('#d9d3cc', 10, 0.6, 0.025, 0.8, -0.2); break;
-    case 'topple': sfx.play('clatter', vol); P('#fff6c8', 5, 0.5, 0.014, 0.5); break;
+    case 'topple': sfx.play('clatter', vol * Math.min(1.4, 0.6 + (a || 1) * 0.15)); P('#fff6c8', 4 + Math.min(12, (a || 1) * 2), 0.6, 0.014, 0.5); break;
     case 'raid': sfx.play('boing', vol, 1.4); sfx.play('pop', vol); P('#ff3e8a', 10, 1.0, 0.018, 0.6); break;
-    case 'mess': if (viewer === 'toy') sfx.play('tick', 0.4, 1.6); break;
+    case 'mess': break;   // the phone shows its own '+N mess!' (main.js)
+    case 'shove': sfx.play('shove', vol, a ? 1.5 : 1); if (a) P('#ffffff', 5, 0.6, 0.012, 0.4); break;
+    case 'thud': sfx.play('thud', vol * (0.5 + (a || 0.5) * 0.5)); P('#d9cfc0', 16, 1.2, 0.022, 0.6); break;
+    case 'eat': sfx.play('eat', viewer === 'toddler' ? 1 : vol); P('#f3d39a', 10, 0.5, 0.012, 0.6); break;
+    case 'click': sfx.play('click', viewer === 'toddler' ? 1 : vol); break;
+    case 'scratch': sfx.play('scratch', viewer === 'toddler' ? 1 : vol); break;
+    case 'record': if (a) { sfx.play('needle', vol); for (let i = 0; i < 8; i++) P(['#ff3e8a', '#ffd400', '#00c2b3'][i % 3], 1, 0.5, 0.02, 1.5, -0.2); } break;
     case 'crank': sfx.play('crank', vol); break;
     case 'creak': sfx.play('creak', vol); break;
     case 'spin': case 'zip': case 'whistle': case 'boing': case 'squeak': case 'slip': case 'hop': sfx.play(code, vol, code === 'boing' && a ? 1.3 : 1); if (code === 'boing' || code === 'hop') P('#ffffff', 4, 0.4, 0.012, 0.4); break;
