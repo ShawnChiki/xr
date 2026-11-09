@@ -454,6 +454,22 @@ renderer.setAnimationLoop(loop);
 setInterval(() => { if (document.hidden && APP.mode === 'game' && APP.kind !== 'client' && !xrOn()) loop(performance.now(), null); }, 33);
 window.APP = APP;
 
+/* ---------- a newer version on GitHub? offer a reload ----------
+   Checks the game's own files now and then (and whenever you come back to the app), compares them to what's running. */
+(function updates() {
+  const files = [location.pathname.replace(/[^/]*$/, '') + 'index.html'].concat(Array.from(document.scripts).map(s => s.src).filter(u => u && u.startsWith(location.origin) && /\/js\//.test(u)));
+  const hash = t => { let h = 2166136261; for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+  const read = () => Promise.all(files.map(u => fetch(u, { cache: 'no-store' }).then(r => r.ok ? r.text() : '').catch(() => ''))).then(ts => ts.every(t => !t) ? null : hash(ts.join('\u0001')));
+  let base = null, busy = false;
+  read().then(h => base = h);
+  const check = () => { if (busy || base === null || document.hidden || /[?&](auto|nettest)/.test(location.search)) return; busy = true;
+    read().then(h => { busy = false; if (h !== null && h !== base) $('newVer').classList.add('on'); }); };
+  $('newVer').onclick = () => location.reload();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) setTimeout(check, 500); });
+  setInterval(check, 120000);
+  window.__checkUpdate = check; window.__updBase = v => base = v;
+})();
+
 /* ---------- test hooks: ?auto=solo&lv=junk, ?auto=host (bot toddler), ?auto=join&code=1234 ---------- */
 (function auto() {
   const q = new URLSearchParams(location.search), a = q.get('auto'); if (q.get('lv')) APP.lv = APP.soloLv = q.get('lv');
