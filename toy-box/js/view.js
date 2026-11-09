@@ -192,16 +192,27 @@ function drawBubble(M, text) {
   x.fillStyle = '#15121a'; x.textAlign = 'center'; x.font = '800 46px Rubik, sans-serif'; const words = text.split(' '), lines = ['']; for (const wd of words) { const tst = lines[lines.length - 1] + (lines[lines.length - 1] ? ' ' : '') + wd; if (x.measureText(tst).width > w - 80) lines.push(wd); else lines[lines.length - 1] = tst; }
   lines.slice(0, 3).forEach((l, i, a) => x.fillText(l, w / 2, (h - 52) / 2 + (i - (a.length - 1) / 2) * 54 + 16)); M.t.needsUpdate = true;
 }
-// the end of the match: the door opens, mom steps in and says her piece
-function drawEnd(W, s, dt) {
-  if (!W.door) return; const et = s.st === 2 ? s.et : -1;
-  const openT = et < 0 ? 0 : clamp((et - 0.8) / 1.0, 0, 1); W.door.open = lerp(W.door.open, openT, 1 - Math.exp(-6 * dt)); W.door.g.rotation.y = Math.atan2(-AREA.edges[W.L.room.door.e].dz, AREA.edges[W.L.room.door.e].dx) + W.door.open * 1.7 * W.door.zs;
-  const M = W.mom; if (!M) return;
-  M.g.visible = et > 1.3; if (!M.g.visible) { M.bubble.visible = false; return; }
-  const k = clamp((et - 1.3) / 1.1, 0, 1); M.g.position.lerpVectors(M.from, M.to, k * (2 - k)); M.g.position.y = Math.abs(Math.sin(et * 7)) * 0.02 * (k < 1 ? 1 : 0);
-  M.armR.rotation.x = et > 2.4 ? -1.4 + Math.sin(et * 6) * 0.15 : -0.2;
-  const talking = et > 2.4 && et < 6.5; M.mouth.scale.y = talking ? 0.008 + Math.abs(Math.sin(et * 18)) * 0.02 : 0.008;
-  M.bubble.visible = et > 2.4; if (M.bubble.visible) drawBubble(M, momLine(W, s.end));
+// mom's visits: at the start she tells you to clean up, at two minutes and one minute she checks in,
+// and at nap time she steps in and says her piece
+const MOM_VISIT_LINES = {
+  s: ["You better clean ALL these toys up before nap time!", "Look at this room! Clean it up before nap time, mister!", "Every toy in the toy box before nap time. I mean it!"],
+  m120: { tidy: ["Two more minutes! Good job, keep cleaning!", "Two minutes till nap time! It's looking better!"], messy: ["Two minutes! This room is getting WORSE!", "Two minutes till nap! What happened in here?!"] },
+  m60: { tidy: ["One minute! Almost nap time, sweetie!", "One more minute! Nearly there!"], messy: ["One minute! I'm coming up to check!", "ONE minute! Those toys better be put away!"] },
+};
+function momVisitLine(W, id, s) { W.momLines = W.momLines || {}; if (W.momLines[id]) return W.momLines[id]; let L = MOM_VISIT_LINES[id] || MOM_VISIT_LINES.s;
+  if (!Array.isArray(L)) L = s.m0 !== undefined && s.ml > s.m0 ? L.messy : L.tidy; return W.momLines[id] = L[W.L.seed % L.length]; }
+function drawMom(W, s, dt) {
+  if (!W.door) return; const e = AREA.edges[W.L.room.door.e], M = W.mom;
+  let open = 0, show = false, k = 0, talk = false, line = null, t = 0;
+  if (s.st === 2) { t = s.et; open = clamp((t - 0.8) / 1.0, 0, 1); show = t > 1.3; const q = clamp((t - 1.3) / 1.1, 0, 1); k = q * (2 - q); talk = t > 2.4 && t < 6.5; if (t > 2.4) line = momLine(W, s.end); }
+  else { const v = momVisit(s.st, s.cd, s.nap); if (v) { t = v.t; open = t < 0.8 ? t / 0.8 : t < 4.8 ? 1 : Math.max(0, 1 - (t - 4.8) / 0.8);
+    const ki = clamp((t - 0.5) / 0.6, 0, 1), ko = clamp((t - 4.0) / 0.7, 0, 1); k = 0.75 * ki * (2 - ki) * (1 - ko); show = t > 0.45 && t < 4.8; talk = t > 1.1 && t < 3.9; if (t > 1.05 && t < 4.3) line = momVisitLine(W, v.id, s); } }
+  W.door.open = lerp(W.door.open, open, 1 - Math.exp(-6 * dt)); W.door.g.rotation.y = Math.atan2(-e.dz, e.dx) + W.door.open * 1.7 * W.door.zs;
+  if (!M) return; M.g.visible = show; if (!show) { M.bubble.visible = false; return; }
+  M.g.position.lerpVectors(M.from, M.to, k); M.g.position.y = Math.abs(Math.sin(t * 7)) * 0.02 * (k > 0.02 && !talk ? 1 : 0);
+  M.armR.rotation.x = talk ? -1.4 + Math.sin(t * 6) * 0.15 : -0.2;
+  M.mouth.scale.y = talk ? 0.008 + Math.abs(Math.sin(t * 18)) * 0.02 : 0.008;
+  M.bubble.visible = !!line; if (line) drawBubble(M, line);
 }
 
 function buildToyBox(W) {
@@ -382,7 +393,8 @@ function buildToddler(W) {
   T.head.scale.setScalar(1.08);
   const bm = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
   T.blob = makeBlob(30, bm, 0.025); T.g.add(T.blob.mesh);
-  T.hblobs = [0, 1].map(() => { const b = makeBlob(13, bm, 0); T.g.add(b.mesh); return b; });
+  // the chubby hands (Taffy Strata's): index 0 is the right hand, 1 the left
+  const hmat = new THREE.MeshLambertMaterial({ color: SK }); T.sk = [makeHandMesh(1, hmat, W.root), makeHandMesh(-1, hmat, W.root)]; T.wrist = [V(), V()]; T.curls = [0, 0, 0, 0, 0];
   T.cSkin = new THREE.Color(SK); T.cOne = new THREE.Color('#5fb4ff'); T.cOne2 = new THREE.Color('#bfe3ff'); T.k = 0;
   W.root.add(T.g); return T;
 }
@@ -438,9 +450,10 @@ function drawSnap(W, s, s2, k, me, dt) {
   td.head.position.set(L(0), L(1), L(2)); _qa.set(T[3], T[4], T[5], T[6]); if (T2) { _qb.set(T2[3], T2[4], T2[5], T2[6]); _qa.slerp(_qb, k); } td.head.quaternion.copy(_qa);
   for (let h = 0; h < 2; h++) { const o = TD.H0 + h * TD.HS, g = td.hands[h], fl = T[o + 7];
     g.position.set(L(o), L(o + 1), L(o + 2)); _qa.set(T[o + 3], T[o + 4], T[o + 5], T[o + 6]); if (T2) { _qb.set(T2[o + 3], T2[o + 4], T2[o + 5], T2[o + 6]); _qa.slerp(_qb, k); } g.quaternion.copy(_qa);
-    g.visible = !!(fl & 2);
-    for (let f = 0; f < 4; f++) { const c = T[o + 9 + f]; g.fingers[f].rotation.x = -c * 1.0; g.fingers[f].j2.rotation.x = -c * 1.3; }
-    g.thumb.rotation.y = -g.side * T[o + 8] * 0.9; g.thumb.rotation.x = -T[o + 8] * 0.5;
+    g.visible = !!(fl & 2); const HM = td.sk[h]; HM.mesh.visible = g.visible;
+    if (g.visible) { const J = viewer === 'toddler' && me.joints && me.joints[h];   // your own tracked fingers, or the five finger curls everyone else gets
+      if (J) { poseHandMesh(HM, J.j, HAND_SCALE * 1.1); td.wrist[h].copy(J.j[0]); }
+      else { for (let f = 0; f < 5; f++) td.curls[f] = T[o + 8 + f]; td.wrist[h].copy(poseCurledHand(HM, g.position, g.quaternion, td.curls, HAND_SCALE, HAND_SCALE * 1.1)); } }
     if (fl & 4 && Math.random() < 0.15) fxPuff(W.fx, g.position, '#ffd400', 1, 0.5, 0.01); }
   td.chest.position.set(L(TD.CHEST), L(TD.CHEST + 1), L(TD.CHEST + 2)); td.butt.position.set(L(TD.BUTT), L(TD.BUTT + 1), L(TD.BUTT + 2));
   const mouth = T[TD.MOUTH], sleepy = T[TD.SLEEPY], giggle = T[TD.GIGGLE];
@@ -449,7 +462,7 @@ function drawSnap(W, s, s2, k, me, dt) {
   const spooky = s.ph === 2 && s.st === 1; for (const p of td.pupils) p.scale.set(spooky ? 0.024 : 0.019, spooky ? 0.03 : 0.024, 0.012);
   td.brows.forEach((b, i) => { b.rotation.z = spooky ? (i ? 0.45 : -0.45) : 0; });
   const hq = td.head.quaternion, side = _va.set(1, 0, 0).applyQuaternion(hq); side.y = 0; side.normalize();
-  for (let h = 0; h < 2; h++) { const sx = h === 0 ? 1 : -1, sh0 = td.chest.position.clone().addScaledVector(side, sx * 0.12); sh0.y += 0.04; setArm(td.arms[h], sh0, td.hands[h].position, 0.045); }
+  for (let h = 0; h < 2; h++) { const sx = h === 0 ? 1 : -1, sh0 = td.chest.position.clone().addScaledVector(side, sx * 0.12); sh0.y += 0.04; setArm(td.arms[h], sh0, td.hands[h].visible ? td.wrist[h] : td.hands[h].position, 0.045); }
   const back = V().subVectors(td.butt.position, td.chest.position); back.y = 0; back.normalize();
   for (let h = 0; h < 2; h++) { const sx = h === 0 ? 1 : -1, lg = td.legs[h], ft = td.feet[h]; lg.position.copy(td.butt.position).addScaledVector(side, sx * 0.08).addScaledVector(back, 0.12); lg.position.y = Math.max(0.06, td.butt.position.y - 0.08);
     lg.quaternion.setFromUnitVectors(Z_AX, back); ft.position.copy(lg.position).addScaledVector(back, 0.12); ft.position.y = Math.max(0.035, lg.position.y - 0.02); ft.quaternion.copy(lg.quaternion); }
@@ -462,8 +475,6 @@ function drawSnap(W, s, s2, k, me, dt) {
       for (const t of [0, 0.3, 0.6, 0.85]) push(_vb.lerpVectors(bot, top, t), lerp(0.075, 0.055, t), t > 0.8 ? td.cSkin : td.cOne); }
     td.blob.update(balls); }
   td.blob.mesh.visible = !self;
-  // giant blob hands (from your real fingers in the headset when hand tracking is on)
-  for (let h = 0; h < 2; h++) { const on = !!(T[TD.H0 + h * TD.HS + 7] & 2); td.hblobs[h].mesh.visible = on; if (on) td.hblobs[h].update(handBalls(td, h, viewer === 'toddler' && me.joints ? me.joints[h] : null, [])); }
   for (const p of [td.chest.position, td.butt.position]) { const gh = W.L.groundH(p.x, p.z); dummy.position.set(p.x, gh + 0.006, p.z); dummy.scale.set(0.5, 1, 0.5); dummy.updateMatrix(); W.shadows.setMatrixAt(sh++, dummy.matrix); }
   for (let h = 0; h < 2; h++) { const p = td.hands[h].position, gh = W.L.groundH(p.x, p.z), hg = Math.max(0, p.y - gh); dummy.position.set(p.x, gh + 0.006, p.z); dummy.scale.setScalar(0.22 * (1 + hg)); dummy.updateMatrix(); W.shadows.setMatrixAt(sh++, dummy.matrix); }
   W.shadows.count = sh; W.shadows.instanceMatrix.needsUpdate = true;
@@ -489,7 +500,7 @@ function drawSnap(W, s, s2, k, me, dt) {
   if (W.clock) { const n = s.st === 0 ? MATCH_TIME : s.nap, sec = Math.ceil(n); if (sec !== W.clock.last) { W.clock.last = sec; W.clock.draw(n); }
     W.clock.big.rotation.z = -(1 - clamp(n / MATCH_TIME, 0, 1)) * TAU; W.clock.sec.rotation.z = -((MATCH_TIME - sec) % 60) / 60 * TAU; }
   if (W.tv && (W.tv.k = (W.tv.k + 1) % 6) === 0) { const x = W.tv.cv.getContext('2d'), C = W.th.acc; for (let i = 0; i < 8; i++) { x.fillStyle = C[(i + Math.floor(now / 300)) % C.length]; x.fillRect(i * 16, 0, 16, 72); } x.fillStyle = 'rgba(255,255,255,.8)'; x.beginPath(); x.arc(64 + Math.sin(now / 400) * 40, 36 + Math.cos(now / 300) * 14, 10, 0, TAU); x.fill(); W.tv.t.needsUpdate = true; }
-  drawEnd(W, s, dt || 0.016);
+  drawMom(W, s, dt || 0.016);
 }
 
 /* ---------- phase lighting: epic, silly, spooky, sleepy ---------- */

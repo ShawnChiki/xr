@@ -18,6 +18,10 @@ const r3 = v => Math.round(v * 1000) / 1000;
 const K = 1.5, VS = Math.sqrt(K);
 const HALF = 2.0;                                   // only for fallbacks
 const GRAV = 9.8, MATCH_TIME = 180, WALL_H = 2.5;
+// mom pops in: at the start (while everyone gets ready), with two minutes and with one minute to go, and at nap time
+const COUNT_T = 6.5, MOM_AT = [120, 60], MOM_VISIT = 5.6;
+function momVisit(st, cd, nap) { if (st === 0) return { id: 's', t: COUNT_T - cd }; if (st === 1) for (const a of MOM_AT) { const t = a + 1.2 - nap; if (t >= 0 && t < MOM_VISIT) return { id: 'm' + a, t }; } return null; }
+const momLooking = v => !!v && v.t > 1.0 && v.t < 4.6;   // the toys freeze while she's looking (like toys do)
 const BOX = { c: V(), yaw: 0, q: Q(), inv: Q(), w: 1.35, d: 0.78, h: 0.5, t: 0.04 };   // open-top chest against a wall; local +z faces the room
 const AREA = { poly: [], edges: [], minX: -2, maxX: 2, minZ: -2, maxZ: 2, cx: 0, cz: 0, size: 0, start: V() };
 const DEFAULT_AREA = { poly: [[-2.1, -1.8], [2.1, -1.8], [2.1, 1.8], [-2.1, 1.8]], start: [0, -0.8] };
@@ -41,7 +45,8 @@ function placeBox(s) {
   let best = null, bd = 1e9;
   for (const e of AREA.edges) { if (e.len < BOX.w + 0.3) continue; const d = segDist(e, s.x, s.z); if (d < bd) { bd = d; best = e; } }
   if (!best) best = AREA.edges.reduce((m, e) => e.len > m.len ? e : m, AREA.edges[0]);
-  const o = {}; segDist(best, s.x, s.z, o); const m = Math.min(BOX.w / 2 + 0.15, best.len / 2), t = clamp(o.t, m, best.len - m);
+  const o = {}; segDist(best, s.x, s.z, o); const m = Math.min(BOX.w / 2 + 0.02, best.len / 2); let t = clamp(o.t, m, best.len - m);
+  if (t - m < 0.5) t = m; else if (best.len - m - t < 0.5) t = best.len - m;
   const x = best.a.x + best.dx * t + best.nx * (BOX.d / 2 + 0.03), z = best.a.z + best.dz * t + best.nz * (BOX.d / 2 + 0.03);
   return [r3(x), r3(z), r3(Math.atan2(best.nx, best.nz))];
 }

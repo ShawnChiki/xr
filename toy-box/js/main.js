@@ -122,7 +122,7 @@ function startMatch(kind, area) {
   const seed = (Math.random() * 1e9) | 0;
   if (kind === 'xr') { area = area || APP.area; APP.area = area; } else area = JSON.parse(JSON.stringify(DEFAULT_AREA));
   const S = newMatch(lv, seed, mess, { botToddler: kind !== 'xr' }, JSON.parse(JSON.stringify(area))); S.botSpeed = BOT_SPEED[solo ? APP.soloBot : APP.bot];
-  APP.S = S; APP.kind = kind; APP.messKey = mess; APP.mode = 'game'; APP.endShown = false; APP.endCard = false; APP.momSaid = false; APP.vrEnd = false;
+  APP.S = S; APP.kind = kind; APP.messKey = mess; APP.mode = 'game'; APP.endShown = false; APP.endCard = false; APP.momSaid = false; APP.momSpoke = {}; APP.vrEnd = false;
   buildFor(S.L, roster(S));
   if (solo) addPlayer(S, 'local', 0);
   for (const pid in APP.lobbyPlayers) addPlayer(S, pid, APP.lobbyPlayers[pid]);
@@ -133,7 +133,7 @@ function startMatch(kind, area) {
 }
 function clientStart(m) {
   const L = makeLevel(m.lv, m.seed, m.area); buildFor(L, m.roster); APP.messKey = m.mess;
-  APP.mode = 'game'; APP.kind = 'client'; APP.viewer = 'toy'; APP.me = { viewer: 'toy', body: -1, slotOf: {} }; APP.myPid = NET.myId; APP.snaps = []; APP.off = null; APP.cur = null; APP.endShown = false; APP.endCard = false; APP.momSaid = false;
+  APP.mode = 'game'; APP.kind = 'client'; APP.viewer = 'toy'; APP.me = { viewer: 'toy', body: -1, slotOf: {} }; APP.myPid = NET.myId; APP.snaps = []; APP.off = null; APP.cur = null; APP.endShown = false; APP.endCard = false; APP.momSaid = false; APP.momSpoke = {};
   CAM.have = false; APP.lastBody = -1;
   enterGameUI();
 }
@@ -325,7 +325,7 @@ const floorHit = (o, d) => { if (d.y > -0.03) return null; const t = -o.y / d.y;
 
 const DRAW = { step: 'floor', pts: [], strokes: [], line: null, close: null, fill: null, grid: null, end: null };
 function startDraw() {
-  APP.mode = 'draw'; APP.viewer = 'toddler'; endDraw(); DRAW.pts = []; DRAW.strokes = []; DRAW.step = 'floor'; DRAW.msg = '';
+  APP.mode = 'draw'; APP.viewer = 'toddler'; endDraw(); DRAW.pts = []; DRAW.strokes = []; DRAW.step = 'floor'; DRAW.msg = ''; DRAW.room = null;
   $('ui').style.display = 'none';
   if (xrMode === 'immersive-ar') { scene.background = null; renderer.setClearColor(0x000000, 0); } else scene.background = new THREE.Color('#2a2340');
   scene.fog = null; setFloor(APP.floorH || 0);
@@ -346,24 +346,28 @@ function drawPanel(keep) {
   if (DRAW.step === 'floor') VRUI.show('1 · Set the floor', `The grid is the game's floor: ${cm === 0 ? 'on your real floor' : cm + ' cm ' + (cm > 0 ? 'above' : 'below') + ' your real floor'}.\nPinch or pull the trigger to move it to your hand.\nRaise it to a table or chest height to play standing.`,
     [{ label: '▲ Up', fn: () => { moveFloor(APP.floorH + 0.05); drawPanel(true); }, col: '#fffdf7' }, { label: '▼ Down', fn: () => { moveFloor(APP.floorH - 0.05); drawPanel(true); }, col: '#fffdf7' }, { label: 'Real floor', fn: () => { moveFloor(0); drawPanel(true); }, col: '#00c2b3' },
      { label: 'Confirm ✓', fn: () => { DRAW.step = 'outline'; sfx.play('go', 0.6); drawPanel(); }, col: '#ff3e8a' }], keep);
-  else { const a = DRAW.pts.length > 2 ? polyArea(simplifyArea(DRAW.pts)) : 0;
-    VRUI.show('2 · Outline your space', (DRAW.msg ? '⚠ ' + DRAW.msg + '\n' : '') + `Point at the floor and hold the trigger (or pinch) to draw\nround your clear space. ${a ? 'That\'s ' + a.toFixed(1) + ' m² so far.' : 'Lines join up on their own.'}\nPress Done when you're happy. It won't close till you do.`,
+  else { const a = roomArea();
+    VRUI.show('2 · Outline your space', (DRAW.msg ? '⚠ ' + DRAW.msg + '\n' : '') + `Point at the floor and hold the trigger (or pinch) to draw\nround your clear space. ${a ? 'The room that fits (pink) is ' + a.toFixed(1) + ' m².' : 'Lines join up on their own.'}\nPress Done when you're happy. It won't close till you do.`,
       [{ label: 'Done ✓', fn: doneOutline, col: '#ff3e8a' }, { label: 'Undo', fn: () => { if (DRAW.strokes.length) { DRAW.pts.length = DRAW.strokes.pop(); drawLine(); drawFill(); drawPanel(true); } }, col: '#fffdf7' },
        { label: 'Clear', fn: () => { DRAW.pts = []; DRAW.strokes = []; drawLine(); drawFill(); drawPanel(true); }, col: '#fffdf7' },
-       { label: '2×2 m here', fn: useSquare, col: '#00c2b3' }].concat(XRF.guardian ? [{ label: 'Quest boundary', fn: () => confirmArea(simplifyArea(XRF.guardian.map(([x, z]) => ({ x, z })))), col: '#ffd400' }] : [],
+       { label: '2×2 m here', fn: useSquare, col: '#00c2b3' }].concat(XRF.guardian ? [{ label: 'Quest boundary', fn: () => confirmArea(orthoRoom(XRF.guardian) || simplifyArea(XRF.guardian.map(([x, z]) => ({ x, z })))), col: '#ffd400' }] : [],
        [{ label: '← Floor', fn: () => { DRAW.step = 'floor'; drawPanel(); }, col: '#fffdf7' }]), keep); }
 }
 function doneOutline() {
   if (DRAW.pts.length < 3) { DRAW.msg = 'Draw first: point at the floor and hold the trigger (or pinch).'; sfx.play('tick', 1); drawPanel(true); return; }
-  const poly = simplifyArea(DRAW.pts), a = polyArea(poly);
+  const poly = DRAW.room || orthoRoom(DRAW.pts), a = poly ? polyArea(poly) : 0;
   if (a < 1.0) { DRAW.msg = `A bit small (${a.toFixed(1)} m²): keep drawing round a bigger space, or use 2×2 m.`; sfx.play('tick', 1); drawPanel(true); return; }
   sfx.play('win', 0.8); buzz(0, 0.6, 120); buzz(1, 0.6, 120); confirmArea(poly);
 }
 function drawLine() { const P = DRAW.pts, a = DRAW.line.geometry.attributes.position; let n = Math.min(P.length, 2999); for (let i = 0; i < n; i++) a.setXYZ(i, P[i].x, 0.006, P[i].z); a.needsUpdate = true; DRAW.line.geometry.setDrawRange(0, n);
   DRAW.close.visible = P.length > 2; if (P.length > 2) { const c = DRAW.close.geometry.attributes.position, l = P[P.length - 1]; c.setXYZ(0, l.x, 0.006, l.z); c.setXYZ(1, P[0].x, 0.006, P[0].z); c.needsUpdate = true; } }
-function drawFill() { if (DRAW.fill) { scene.remove(DRAW.fill); DRAW.fill = null; } if (DRAW.pts.length < 3) return;
-  const poly = simplifyArea(DRAW.pts), sh = new THREE.Shape(poly.map(p => new THREE.Vector2(p[0], -p[1])));
-  DRAW.fill = new THREE.Mesh(new THREE.ShapeGeometry(sh), new THREE.MeshBasicMaterial({ color: 0xffd400, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false })); DRAW.fill.rotation.x = -Math.PI / 2; DRAW.fill.position.y = 0.004; scene.add(DRAW.fill); }
+// the room that fits inside your outline (straight walls, square corners): filled pink with its walls drawn on the floor
+function drawFill() { if (DRAW.fill) { scene.remove(DRAW.fill); DRAW.fill = null; } DRAW.room = DRAW.pts.length >= 3 ? orthoRoom(DRAW.pts) : null; if (!DRAW.room) return;
+  const poly = DRAW.room, sh = new THREE.Shape(poly.map(p => new THREE.Vector2(p[0], -p[1]))), g = new THREE.Group();
+  const f = new THREE.Mesh(new THREE.ShapeGeometry(sh), new THREE.MeshBasicMaterial({ color: 0xff3e8a, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false })); f.rotation.x = -Math.PI / 2; f.position.y = 0.004; g.add(f);
+  const lg = new THREE.BufferGeometry().setFromPoints(poly.concat([poly[0]]).map(p => V(p[0], 0.012, p[1]))); g.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0xff3e8a })));
+  DRAW.fill = g; scene.add(g); }
+const roomArea = () => DRAW.room ? polyArea(DRAW.room) : 0;
 // the headset's own boundary (if the browser shares it), turned into our floor's coordinates
 function guardianPoly(frame) { try { const pose = frame.getPose(XRF.bounded, XRF.base); if (!pose) return; const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
   XRF.guardian = Array.from(XRF.bounded.boundsGeometry).map(p => { const v = V(p.x, 0, p.z).applyMatrix4(m); return [r3(v.x), r3(v.z)]; }); if (APP.mode === 'draw' && DRAW.step === 'outline') drawPanel(true); } catch (e) { XRF.bounded = null; } }
@@ -390,7 +394,9 @@ function drawStep(dt, frame) {
 function endDraw() { for (const k of ['end', 'line', 'close', 'fill', 'grid']) { if (DRAW[k]) scene.remove(DRAW[k]); DRAW[k] = null; } hideRays(); for (const H of HANDS) H.painting = false; }
 function useSquare() { const f = V(0, 0, -1).applyQuaternion(headLQ); f.y = 0; f.normalize(); const r = V(-f.z, 0, f.x), c = headL.clone(); c.y = 0; const s = 1.1;
   const poly = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => { const p = c.clone().addScaledVector(r, a * s).addScaledVector(f, b * s); return [r3(p.x), r3(p.z)]; }); confirmArea(poly); }
-function confirmArea(poly) { VRUI.hide(); hideRays(); const area = { poly, start: [r3(headL.x), r3(headL.z)] }; startMatch('xr', area); }
+function confirmArea(poly) { VRUI.hide(); hideRays(); const P = poly.map(([x, z]) => ({ x, z })); let st = [r3(headL.x), r3(headL.z)];
+  if (!inPoly(P, st[0], st[1])) st = [r3(P.reduce((t, p) => t + p.x, 0) / P.length), r3(P.reduce((t, p) => t + p.z, 0) / P.length)];   // you're standing outside it: start in the middle
+  startMatch('xr', { poly, start: st }); }
 function polyArea(P) { let s = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a[0] * b[1] - b[0] * a[1]; } return Math.abs(s) / 2; }
 // tidy a traced loop into a few straight walls
 function simplifyArea(pts) {
@@ -406,6 +412,52 @@ function simplifyArea(pts) {
     for (let i = 0; i < n; i++) for (let j = i + 2; j < n; j++) { if (i === 0 && j === n - 1) continue; if (X(S[i], S[(i + 1) % n], S[j], S[(j + 1) % n])) return true; } return false; };
   if (S.length < 3 || crosses()) S = hull(P);
   return S.map(p => [r3(p[0]), r3(p[1])]);
+}
+// the room is orthogonal: the biggest rectangle that fits inside your outline (tried at many angles), plus up to two
+// wings (an L or a T) where the outline has room for them. Returns [[x, z], ...] corners, or null if nothing fits.
+function orthoRoom(pts) {
+  let P = pts.map(p => Array.isArray(p) ? { x: p[0], z: p[1] } : { x: p.x, z: p.z }); if (P.length < 3) return null;
+  if (P.length > 240) { const st = P.length / 240; P = Array.from({ length: 240 }, (_, i) => P[Math.floor(i * st)]); }
+  const C = 0.08, Q2 = Math.PI / 2, angles = []; for (let a = 0; a < 90; a += 3) angles.push(a * Math.PI / 180);
+  const S = simplifyArea(P); for (let i = 0; i < S.length; i++) { const a = S[i], b = S[(i + 1) % S.length]; if (Math.hypot(b[0] - a[0], b[1] - a[1]) > 0.8) angles.push(((Math.atan2(b[1] - a[1], b[0] - a[0]) % Q2) + Q2) % Q2); }
+  const minW = Math.ceil(0.9 / C), minD = Math.ceil(0.5 / C), minA = 0.6 / (C * C);
+  let best = null;
+  for (const th of angles) {
+    const c = Math.cos(th), s = Math.sin(th), R = P.map(p => ({ x: p.x * c + p.z * s, z: -p.x * s + p.z * c }));
+    let x0 = 1e9, x1 = -1e9, z0 = 1e9, z1 = -1e9; for (const p of R) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); z0 = Math.min(z0, p.z); z1 = Math.max(z1, p.z); }
+    const nx = Math.ceil((x1 - x0) / C), nz = Math.ceil((z1 - z0) / C); if (nx < 3 || nz < 3 || nx * nz > 40000) continue;
+    // cells wholly inside the outline (row by row: where the row crosses the outline)
+    const In = new Uint8Array(nx * nz);
+    for (let j = 0; j < nz; j++) for (const zz of [z0 + j * C + 0.01, z0 + (j + 1) * C - 0.01]) {
+      const xs = []; for (let i = 0, k = R.length - 1; i < R.length; k = i++) { const a = R[i], b = R[k]; if ((a.z > zz) !== (b.z > zz)) xs.push(a.x + (zz - a.z) / (b.z - a.z) * (b.x - a.x)); } xs.sort((a, b) => a - b);
+      const row = new Uint8Array(nx); for (let q = 0; q + 1 < xs.length; q += 2) for (let i = Math.max(0, Math.ceil((xs[q] - x0) / C)); i <= Math.min(nx - 1, Math.floor((xs[q + 1] - x0) / C) - 1); i++) row[i] = 1;
+      for (let i = 0; i < nx; i++) In[i + j * nx] = (zz === z0 + j * C + 0.01 ? row[i] : In[i + j * nx] & row[i]); }
+    // the biggest rectangle of inside cells
+    const h = new Int32Array(nx); let r1 = { a: 0 };
+    for (let j = 0; j < nz; j++) { for (let i = 0; i < nx; i++) h[i] = In[i + j * nx] ? h[i] + 1 : 0;
+      const st = []; for (let i = 0; i <= nx; i++) { const hi = i < nx ? h[i] : 0; let start = i; while (st.length && st[st.length - 1][1] >= hi) { const [si, sh] = st.pop(), a = sh * (i - si); if (a > r1.a) r1 = { a, i0: si, i1: i - 1, j0: j - sh + 1, j1: j }; start = si; } st.push([start, hi]); } }
+    if (!r1.a) continue;
+    const at = (i, j) => i >= 0 && j >= 0 && i < nx && j < nz && In[i + j * nx];
+    // a wing off one side: the best rectangle standing on that side, at least 0.9 m wide and 0.5 m deep
+    const wing = side => { const along = side < 2 ? [r1.i0, r1.i1] : [r1.j0, r1.j1], dep = [];
+      for (let u = along[0]; u <= along[1]; u++) { let d = 0; for (;;) { const i = side === 0 || side === 1 ? u : side === 2 ? r1.i0 - 1 - d : r1.i1 + 1 + d, j = side === 0 ? r1.j0 - 1 - d : side === 1 ? r1.j1 + 1 + d : u; if (!at(i, j)) break; d++; } dep.push(d); }
+      let w = null; for (let a = 0; a < dep.length; a++) { let m = 1e9; for (let b = a; b < dep.length; b++) { m = Math.min(m, dep[b]); if (m < minD) break; const ar = (b - a + 1) * m; if (b - a + 1 >= minW && ar >= minA && (!w || ar > w.a)) w = { a: ar, u0: along[0] + a, u1: along[0] + b, d: m, side }; } } return w; };
+    const wings = [0, 1, 2, 3].map(wing).filter(Boolean).sort((a, b) => b.a - a.a).slice(0, 2);
+    const score = r1.a + wings.reduce((t, w) => t + w.a, 0);
+    if (!best || score > best.score + 0.5) best = { score, th, x0, z0, nx, nz, r1, wings };
+  }
+  if (!best) return null;
+  // the room as cells, then its outline
+  const { th, x0, z0, nx, nz, r1, wings } = best, M = new Uint8Array(nx * nz), set = (i, j) => { if (i >= 0 && j >= 0 && i < nx && j < nz) M[i + j * nx] = 1; };
+  for (let j = r1.j0; j <= r1.j1; j++) for (let i = r1.i0; i <= r1.i1; i++) set(i, j);
+  for (const w of wings) for (let u = w.u0; u <= w.u1; u++) for (let d = 0; d < w.d; d++) { if (w.side === 0) set(u, r1.j0 - 1 - d); else if (w.side === 1) set(u, r1.j1 + 1 + d); else if (w.side === 2) set(r1.i0 - 1 - d, u); else set(r1.i1 + 1 + d, u); }
+  const m = (i, j) => i >= 0 && j >= 0 && i < nx && j < nz && M[i + j * nx], next = new Map(), key = (i, j) => i + ',' + j;
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) { if (!m(i, j)) continue;
+    if (!m(i, j - 1)) next.set(key(i, j), [i + 1, j]); if (!m(i + 1, j)) next.set(key(i + 1, j), [i + 1, j + 1]); if (!m(i, j + 1)) next.set(key(i + 1, j + 1), [i, j + 1]); if (!m(i - 1, j)) next.set(key(i, j + 1), [i, j]); }
+  const start = [r1.i0, r1.j0], loop = [start]; let cur = next.get(key(...start)); for (let n = 0; cur && n < 4000 && (cur[0] !== start[0] || cur[1] !== start[1]); n++) { loop.push(cur); cur = next.get(key(...cur)); }
+  const corners = loop.filter((p, i) => { const a = loop[(i + loop.length - 1) % loop.length], b = loop[(i + 1) % loop.length]; return (p[0] - a[0]) * (b[1] - p[1]) - (p[1] - a[1]) * (b[0] - p[0]) !== 0; });
+  const c = Math.cos(th), s = Math.sin(th);
+  return corners.map(([i, j]) => { const X = x0 + i * C, Z = z0 + j * C; return [r3(X * c - Z * s), r3(X * s + Z * c)]; });
 }
 function hull(P) { const p = P.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]), cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]), lo = [], up = [];
   for (const q of p) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q); }
@@ -487,6 +539,9 @@ function hud(s) {
       const mine = $('mine'); if (mine && mine._n !== c[5]) { mine._n = c[5]; mine.textContent = '💥 You made ' + (c[5] || 0) + ' mess'; } }
     APP.me.slotOf = {}; for (const pid in s.ctl) APP.me.slotOf[s.ctl[pid][0]] = s.ctl[pid][1];
   }
+  // mom's visits: she says her line out loud (and the toys freeze)
+  const mv = s.st !== 2 && APP.W && momVisit(s.st, s.cd, s.nap); APP.momSpoke = APP.momSpoke || {};
+  if (mv && mv.t > 1.1 && mv.t < 3 && !APP.momSpoke[mv.id]) { APP.momSpoke[mv.id] = true; speak(momVisitLine(APP.W, mv.id, s)); if (APP.viewer !== 'toddler' && mv.id !== 's') banner('Mom!', 'Freeze, toys!', 2.4); }
   if (s.st === 2) {
     if (!APP.endShown) { APP.endShown = true; banner(s.end === 1 ? 'What a mess!' : 'Tidy!', s.end === 1 ? 'Uh oh… here comes mom' : 'Here comes mom!', 2.2); }
     if (s.et > 2.4 && !APP.momSaid) { APP.momSaid = true; speak(momLine(APP.W, s.end)); }
@@ -557,6 +612,7 @@ function watchCam(dt) {
 renderer.setAnimationLoop(loop);
 setInterval(() => { if (document.hidden && APP.mode === 'game' && APP.kind !== 'client' && !xrOn()) loop(performance.now(), null); }, 33);
 window.APP = APP;
+setTimeout(() => { try { if (!handRest) buildHandRest(); } catch (e) {} }, 1500);   // build the chubby hands while you're in the lobby, not when the game starts
 
 /* ---------- a newer version on GitHub? offer a reload ----------
    Checks the game's own files now and then (and whenever you come back to the app), compares them to what's running. */

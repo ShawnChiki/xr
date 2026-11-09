@@ -21,7 +21,7 @@ const _o = { n: V(), pen: 0 }, _cv2 = V(), _rel = V(), _tq = Q(), _ax = V(), _nb
 
 function newMatch(levelId, seed, messKey, opts = {}, area) {
   const L = makeLevel(levelId, seed, area), rng = mulberry(seed ^ 0x5bd1e995), M = MESS[messKey] || MESS.medium;
-  const S = { L, rng, t: 0, nap: MATCH_TIME, phase: 0, state: 'count', countT: 3.6, end: 0, endAt: 0, bodies: [], players: {}, walls: [], proj: [], ev: [], netEv: [],
+  const S = { L, rng, t: 0, nap: MATCH_TIME, phase: 0, state: 'count', countT: COUNT_T, end: 0, endAt: 0, bodies: [], players: {}, walls: [], proj: [], ev: [], netEv: [],
     td: newToddler(), bot: opts.botToddler ? newBotToddler() : null, devs: L.devices.map(d => initDevice(d)), messTotal: 0, messLeft: 0, lullabies: 0, dark: 0, toyMess: 0, botDevT: -99, botWreckT: -99, botBudget: 2 };
   const kinds = PLAY_TOYS.slice(); for (let i = kinds.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [kinds[i], kinds[j]] = [kinds[j], kinds[i]]; }
   const spots = L.spawns.slice(); let si = 0; const nextSpot = () => spots[si++ % spots.length].clone();
@@ -384,7 +384,9 @@ function botJob(S, b, o) {
 }
 function botInput(S, b, dt) {
   const td = S.td, o = b.bot, inp = b.inp || (b.inp = { mx: 0, mz: 0, jump: false, grab: false, sp: false, gh: false });
-  inp.jump = inp.grab = inp.sp = false; inp.hy = null; o.t -= dt; o.jumpCd -= dt; o.spCd -= dt; o.jobT = (o.jobT || 0) - dt; o.grabCd = (o.grabCd || 0) - dt;
+  inp.jump = inp.grab = inp.sp = false; inp.hy = null;
+  if (momLooking(momVisit(S.state === 'count' ? 0 : S.state === 'play' ? 1 : 2, S.countT, S.nap))) { inp.mx = inp.mz = 0; inp.jumpHeld = false; return; }   // freeze! mom's at the door
+  o.t -= dt; o.jumpCd -= dt; o.spCd -= dt; o.jobT = (o.jobT || 0) - dt; o.grabCd = (o.grabCd || 0) - dt;
   const key = TOYS[b.kind].key, shooter = SHOOTERS.has(key), playing = S.state === 'play';
   let threat = 1e9, tp = null;
   for (const h of td.hands) { if (!h.on) continue; const d = Math.hypot(h.p.x - b.p.x, h.p.z - b.p.z) - (h.v.length() > 0.5 ? 0.15 : 0); if (d < threat) { threat = d; tp = h.p; } }
@@ -551,6 +553,8 @@ function stepBody(S, b, dt) {
     }
   }
   b.v.y -= g * dt;
+  // a toy-sized slot behind or between things: roll back out where the toddler can see it
+  if (L.pocket && L.pocket.n && b.p.y < 0.3 && b.held < 0) { const d = pocketDir(L.pocket, b.p.x, b.p.z); if (d) { b.v.x += d[0] * 3.5 * dt; b.v.z += d[1] * 3.5 * dt; b.p.x += d[0] * 0.15 * dt; b.p.z += d[1] * 0.15 * dt; } }
   if (b.v.length() > 9) b.v.setLength(9);
   b.p.addScaledVector(b.v, dt);
   // collide
@@ -620,9 +624,10 @@ function toyGrab(S, b) {
     p.v.copy(ax).multiplyScalar(3.0 * VS).add(V(0, 1.45 * VS, 0)).addScaledVector(b.v, 0.5); p.p.copy(b.p).addScaledVector(ax, b.r + p.r + 0.01); p.p.y += b.r * 0.6;
     p.thrownBy = 'toy'; p.thrownT = S.t; p.blameI = b.i; p.blameT = S.t; p.w.set(S.rng() * 20 - 10, 0, S.rng() * 20 - 10); evAt(S, 'throw', b.p, 0.6); return 'throw'; }
   if (S.t - b.touchTd < 0.25 || td.cols.some(c => !c.off && c.c.distanceTo(b.p) < c.r + b.r + 0.04)) { td.tickle += 0.1; evAt(S, 'tickle', b.p); checkGiggle(S); return 'tickle'; }
-  for (const s of S.devs) { const d = s.d;
+  for (const s of S.devs) { const d = s.d;   // the pranks come first
     if (s.type === 'record' && s.play <= 0 && s.cd <= 0 && nearDev(b, d.c, 0.32, 0.5)) { s.play = RECORD_T; evAt(S, 'record', d.c, 1); credit(S, b, 1, d.c); return 'record'; }
-    if (s.type === 'lamp' && s.on && s.cd <= 0 && nearDev(b, d.sw, 0.28, 0.35)) { s.on = false; S.dark = DARK_T; evAt(S, 'click', d.sw, 0); credit(S, b, 1, d.sw); return 'lamp'; }
+    if (s.type === 'lamp' && s.on && s.cd <= 0 && nearDev(b, d.sw, 0.28, 0.35)) { s.on = false; S.dark = DARK_T; evAt(S, 'click', d.sw, 0); credit(S, b, 1, d.sw); return 'lamp'; } }
+  for (const s of S.devs) { const d = s.d;
     if (s.type === 'mgr') { const dx = b.p.x - d.c.x, dz = b.p.z - d.c.z, rr = Math.hypot(dx, dz); if (rr < d.r + 0.1 && b.p.y < d.h + 0.2) { const f = fwd(b), sgn = Math.sign(dz * f.x - dx * f.z) || 1; s.av = clamp(s.av + sgn * 1.6, -7, 7); evAt(S, 'spin', d.c, 0.5); return 'push'; } }
     if (s.type === 'swing' && s.col.c.distanceTo(b.p) < 0.22) { s.av += 1.7 * (Math.sign(s.av) || 1); evAt(S, 'creak', s.col.c, 1); return 'push'; }
     if (s.type === 'seesaw' && s.col.c.distanceTo(b.p) < d.len / 2 + 0.07 && b.p.y < 0.35) { const lx = V().subVectors(b.p, d.c).applyQuaternion(qYaw(-d.yaw)).x; s.av += (lx > 0 ? -1 : 1) * 3; return 'push'; }
@@ -672,7 +677,7 @@ function grabHint(S, b) {
 function stepMatch(S, dt) {
   dt = Math.min(dt, 0.05);
   S.ev.length = 0;
-  if (S.state === 'count') { const before = Math.ceil(S.countT); S.countT -= dt; if (Math.ceil(S.countT) !== before && S.countT > 0) evAt(S, 'count', V(), Math.ceil(S.countT)); if (S.countT <= 0) { S.state = 'play'; S.m0 = countMess(S); evAt(S, 'go', V()); evAt(S, 'phase', V(), 0); } }
+  if (S.state === 'count') { const before = Math.ceil(S.countT); S.countT -= dt; if (Math.ceil(S.countT) !== before && S.countT > 0 && Math.ceil(S.countT) <= 3) evAt(S, 'count', V(), Math.ceil(S.countT)); if (S.countT <= 0) { S.state = 'play'; S.m0 = countMess(S); evAt(S, 'go', V()); evAt(S, 'phase', V(), 0); } }
   else if (S.state === 'play') { const before = Math.ceil(S.nap); S.nap -= dt; if (Math.ceil(S.nap) !== before) evAt(S, 'tick', V(), Math.ceil(S.nap));
     const ph = phaseOf(S.nap); if (ph !== S.phase) { S.phase = ph; evAt(S, 'phase', V(), ph); if (ph === 3) evAt(S, 'yawn', S.td.head); }
     if (S.nap <= 0) { S.nap = 0; S.state = 'end'; S.end = countMess(S) >= S.m0 ? 1 : 2; S.endAt = S.t; evAt(S, 'end', V(), S.end); } }

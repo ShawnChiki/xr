@@ -98,7 +98,7 @@ function genBedroom(seed) {
     for (let i = 0; i < 6; i++) { const h = R(0.025, 0.04); b.box(at(-0.25, y + h / 2, 0), V(R(0.18, 0.22), h, R(0.13, 0.16)), yaw + R(-0.15, 0.15), pick(PRI.concat(['#fffdf7'])), 'paint', { climb: true }); y += h; }
     const a = at(-0.17, y - 0.004, 0), e = at(0.38, 0.008, 0), mid = V().addVectors(a, e).multiplyScalar(0.5), dir = V().subVectors(e, a), L = dir.length(); dir.normalize();
     const side = V().crossVectors(dir, Y_AX).normalize(), up = V().crossVectors(side, dir).normalize(), q = Q().setFromRotationMatrix(new THREE.Matrix4().makeBasis(side, up, dir));
-    b.box(mid, V(0.12, 0.01, L), q, '#ff7a1a', 'paint'); for (const sx of [-1, 1]) b.box(mid.clone().addScaledVector(side, sx * 0.06).addScaledVector(up, 0.01), V(0.008, 0.02, L), q, '#ff7a1a', 'paint', { noCol: true }); } }
+    b.box(mid, V(0.12, 0.01, L), q, '#ff7a1a', 'paint'); for (let k = 0; k < 4; k++) { const x = -0.17 + (k + 0.5) * 0.55 / 4, hh = Math.max(0.01, (y - 0.004) * (1 - (k + 1) / 4)); b.cols.push(cBox(at(x, hh / 2, 0), V(0.55 / 8, hh / 2, 0.06), qYaw(yaw), { climb: true })); } for (const sx of [-1, 1]) b.box(mid.clone().addScaledVector(side, sx * 0.06).addScaledVector(up, 0.01), V(0.008, 0.02, L), q, '#ff7a1a', 'paint', { noCol: true }); } }
   // a dollhouse to climb
   { const c = b.spot(0.2); if (c) { const yaw = R(0, TAU), at = (x, y, z) => V(c.x, 0, c.z).add(rotY(V(x, y, z), yaw));
     b.box(at(0, 0.1, 0), V(0.24, 0.2, 0.18), yaw, '#ffe0cf', 'paint', { climb: true });
@@ -321,6 +321,28 @@ function genJunk(seed) {
 }
 
 const GEN = { bedroom: genBedroom, vaneyck: genVanEyck, noguchi: genNoguchi, memphis: genMemphis, junk: genJunk };
+// toy-sized slots and dead ends (between furniture, beside the chest, in corners) where things would get stuck
+// out of sight: find them on a 5 cm floor grid (free space too narrow for a ~25 cm ball to roll through) and work
+// out which way is out. Things that end up in one get nudged back into the open (sim.js, stepBody).
+function findPockets(L) {
+  const c = 0.05, r = 0.07, x0 = AREA.minX, z0 = AREA.minZ, nx = Math.ceil((AREA.maxX - x0) / c) + 1, nz = Math.ceil((AREA.maxZ - z0) / c) + 1, N = nx * nz;
+  const free = new Uint8Array(N), p = V(), o = { n: V(), pen: 0 }, nb = [], bl = V();
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) { const x = x0 + i * c, z = z0 + j * c; if (!AREA.inside(x, z, r)) continue;
+    boxLocal(p.set(x, 0, z), bl); if (Math.abs(bl.x) < BOX.w / 2 + 0.02 && Math.abs(bl.z) < BOX.d / 2 + 0.02) continue;   // the chest itself
+    p.set(x, r + 0.01, z); let ok = true; for (const col of L.grid.near(p, nb)) if (hit(col, p, r, o)) { ok = false; break; } free[i + j * nx] = ok ? 1 : 0; }
+  // distance (in cells) from blocked cells, then from the cells with room to spare: a two-pass chamfer each way
+  const chamfer = (D) => { const s2 = Math.SQRT2;
+    for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) { const g = i + j * nx; let d = D[g]; if (i > 0) d = Math.min(d, D[g - 1] + 1); if (j > 0) { d = Math.min(d, D[g - nx] + 1); if (i > 0) d = Math.min(d, D[g - nx - 1] + s2); if (i < nx - 1) d = Math.min(d, D[g - nx + 1] + s2); } D[g] = d; }
+    for (let j = nz - 1; j >= 0; j--) for (let i = nx - 1; i >= 0; i--) { const g = i + j * nx; let d = D[g]; if (i < nx - 1) d = Math.min(d, D[g + 1] + 1); if (j < nz - 1) { d = Math.min(d, D[g + nx] + 1); if (i < nx - 1) d = Math.min(d, D[g + nx + 1] + s2); if (i > 0) d = Math.min(d, D[g + nx - 1] + s2); } D[g] = d; }
+    return D; };
+  const rho = 0.13 / c, d1 = chamfer(Float32Array.from(free, f => f ? 1e6 : 0)), d2 = chamfer(Float32Array.from(d1, d => d >= rho ? 0 : 1e6));
+  const dir = new Float32Array(N * 2); let n = 0;
+  for (let j = 1; j < nz - 1; j++) for (let i = 1; i < nx - 1; i++) { const g = i + j * nx; if (!free[g] || d2[g] <= rho + 0.5) continue;
+    const gx = d2[g + 1] - d2[g - 1], gz = d2[g + nx] - d2[g - nx], l = Math.hypot(gx, gz); if (l < 1e-6) continue; dir[g * 2] = -gx / l; dir[g * 2 + 1] = -gz / l; n++; }
+  return { x0, z0, c, nx, nz, dir, n };
+}
+function pocketDir(P, x, z) { const i = Math.round((x - P.x0) / P.c), j = Math.round((z - P.z0) / P.c); if (i < 0 || j < 0 || i >= P.nx || j >= P.nz) return null; const g = (i + j * P.nx) * 2; return P.dir[g] || P.dir[g + 1] ? P.dir.subarray(g, g + 2) : null; }
+
 function scaleBuilder(L) {
   const k = K, b = L.b;
   for (const c of b.cols) { c.c.multiplyScalar(k); c.br *= k; if (c.k === 0) c.h.multiplyScalar(k); else { c.r *= k; if (c.k === 1) c.hh *= k; } }
@@ -356,6 +378,7 @@ function makeLevel(id, seed, area) {
   L.cols = L.b.cols.concat(room.cols, boxCols); L.vis = L.b.vis; L.devices = L.b.devices;
   L.devices.forEach((d, i) => d.i = i);
   L.grid = makeGrid(L.cols, 0.6);
+  L.pocket = findPockets(L);
   L.name = LEVELS.find(l => l.id === id).name;
   return L;
 }
