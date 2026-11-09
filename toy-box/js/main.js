@@ -280,19 +280,21 @@ const VRUI = { g: new THREE.Group(), btns: [], cool: 0,
 /* ---------- mixed-reality setup: trace your clear floor space ---------- */
 const DRAW = { pts: [], closed: false, line: null, fill: null, dots: [], grid: null };
 function startDraw() {
-  APP.mode = 'draw'; APP.viewer = 'toddler'; DRAW.pts = []; DRAW.closed = false;
+  APP.mode = 'draw'; APP.viewer = 'toddler'; DRAW.pts = []; DRAW.closed = false; DRAW.first = -1; DRAW.t0 = performance.now(); DRAW.warnT = undefined;
   $('ui').style.display = 'none';
   if (xrMode === 'immersive-ar') { scene.background = null; renderer.setClearColor(0x000000, 0); } else { scene.background = new THREE.Color('#2a2340'); DRAW.grid = new THREE.GridHelper(10, 20, 0x9b5cff, 0x55507a); scene.add(DRAW.grid); }
   scene.fog = null;
   const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3 * 3000), 3)); geo.setDrawRange(0, 0);
   DRAW.line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffd400 })); DRAW.line.frustumCulled = false; scene.add(DRAW.line);
   for (let i = 0; i < 2; i++) { const d = new THREE.Mesh(new THREE.RingGeometry(0.02, 0.035, 24), new THREE.MeshBasicMaterial({ color: 0xff3e8a, side: THREE.DoubleSide })); d.rotation.x = -Math.PI / 2; d.visible = false; scene.add(d); DRAW.dots.push(d); }
+  // the end of the line: put a finger back here to keep drawing
+  DRAW.end = new THREE.Mesh(new THREE.RingGeometry(0.06, 0.09, 32), new THREE.MeshBasicMaterial({ color: 0xffd400, side: THREE.DoubleSide, transparent: true })); DRAW.end.rotation.x = -Math.PI / 2; DRAW.end.visible = false; scene.add(DRAW.end);
   if (NET.host) sendAll({ t: 'lobby', lv: APP.lv, mess: APP.mess, n: Object.keys(APP.lobbyPlayers).length, drawing: true });
   setTimeout(drawPanel, 400);
 }
 function drawPanel() {
   if (APP.mode !== 'draw') return;
-  if (!DRAW.closed) VRUI.show('Trace your play space', 'Touch the floor with a fingertip (or controller)\nand crawl around the edge of your clear space.\nCome back to where you started to close it.',
+  if (!DRAW.closed) VRUI.show('Trace your play space', 'Touch the floor with a fingertip (or controller)\nand crawl around the edge of your clear space.\nThe line follows one hand (it glows yellow).\nCome back to where you started to close it.',
     [{ label: '2×2 m square here', fn: () => useSquare(), col: '#00c2b3' }, { label: 'Clear', fn: () => { DRAW.pts = []; DRAW.closed = false; drawLine(); drawPanel(); }, col: '#fffdf7' }]);
   else { const poly = simplifyArea(DRAW.pts), a = polyArea(poly); if (a < 1.2) { VRUI.show('A bit small', `That's ${a.toFixed(1)} m². Trace at least about 1.2 m across\nso there's room to crawl.`, [{ label: 'Redraw', fn: () => { DRAW.pts = []; DRAW.closed = false; drawLine(); drawPanel(); } }]); return; }
     VRUI.show('Play here?', `${a.toFixed(1)} m² of floor. The living room's walls\nwill stand on your line. Stay inside it while you play.`,
@@ -302,14 +304,25 @@ function drawLine() { const P = DRAW.pts, a = DRAW.line.geometry.attributes.posi
   if (DRAW.fill) { scene.remove(DRAW.fill); DRAW.fill = null; }
   if (DRAW.closed) { const poly = simplifyArea(P), sh = new THREE.Shape(poly.map(p => new THREE.Vector2(p[0], -p[1]))); DRAW.fill = new THREE.Mesh(new THREE.ShapeGeometry(sh), new THREE.MeshBasicMaterial({ color: 0xffd400, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false })); DRAW.fill.rotation.x = -Math.PI / 2; DRAW.fill.position.y = 0.004; scene.add(DRAW.fill); } }
 function drawStep(dt, frame) {
-  const hands = readHands(frame), tips = [];
-  for (let i = 0; i < 2; i++) { const H = HANDS[i], d = DRAW.dots[i]; d.visible = !!H.ok; if (!H.ok) continue; const t = H.realTip; tips.push(t.clone()); const on = t.y < 0.07; d.position.set(t.x, 0.008, t.z); d.material.color.set(on ? 0x00c2b3 : 0xff3e8a);
-    if (on && !DRAW.closed) { const P = DRAW.pts, last = P[P.length - 1]; if (!last || Math.hypot(last.x - t.x, last.z - t.z) > 0.04) { P.push({ x: t.x, z: t.z }); drawLine();
-      let len = 0; for (let k = 1; k < P.length; k++) len += Math.hypot(P[k].x - P[k - 1].x, P[k].z - P[k - 1].z);
-      if (P.length > 25 && len > 2.6 && Math.hypot(P[0].x - t.x, P[0].z - t.z) < 0.3) { DRAW.closed = true; drawLine(); sfx.play('win', 0.8); buzz(0, 0.6, 120); buzz(1, 0.6, 120); drawPanel(); } } } }
+  const hands = readHands(frame), tips = [], P = DRAW.pts, last = P[P.length - 1];
+  // the line follows ONE fingertip: whichever touching hand is nearest the end of the line. (Crawling puts both hands on
+  // the floor; taking points from both made the line zigzag between them and snap shut in half a second.)
+  let pen = null, pd = 1e9;
+  for (let i = 0; i < 2; i++) { const H = HANDS[i], d = DRAW.dots[i]; if (!d) continue; d.visible = !!H.ok; if (!H.ok) continue; const t = H.realTip; tips.push(t.clone()); const on = t.y < 0.07; d.position.set(t.x, 0.008, t.z);
+    const dl = last ? Math.hypot(last.x - t.x, last.z - t.z) : (i === DRAW.first ? 0 : 1);
+    if (on && dl < pd) { pd = dl; pen = t; } d.material.color.set(on ? 0x00c2b3 : 0xff3e8a); }
+  if (pen && !DRAW.closed && !last) { DRAW.first = HANDS.findIndex(H => H.realTip === pen); DRAW.t0 = performance.now(); }
+  if (pen && !DRAW.closed && (!last || (pd > 0.04 && pd < 0.35))) { P.push({ x: pen.x, z: pen.z }); drawLine();
+    let len = 0, far = 0, sa = 0; for (let k = 1; k < P.length; k++) { len += Math.hypot(P[k].x - P[k - 1].x, P[k].z - P[k - 1].z); far = Math.max(far, Math.hypot(P[k].x - P[0].x, P[k].z - P[0].z)); sa += P[k - 1].x * P[k].z - P[k].x * P[k - 1].z; }
+    sa = Math.abs(sa + P[P.length - 1].x * P[0].z - P[0].x * P[P.length - 1].z) / 2;
+    // close only once it's a real loop: back near the start after going round something big enough to crawl in
+    if (P.length > 25 && len > 3 && far > 1 && sa > 1.0 && performance.now() - DRAW.t0 > 3000 && Math.hypot(P[0].x - pen.x, P[0].z - pen.z) < 0.3) { DRAW.closed = true; drawLine(); sfx.play('win', 0.8); buzz(0, 0.6, 120); buzz(1, 0.6, 120); drawPanel(); }
+    else if (P.length > 12 && len > 1.2 && sa < 1.0 && Math.hypot(P[0].x - pen.x, P[0].z - pen.z) < 0.3 && performance.now() - (DRAW.warnT || -1e9) > 4000) { DRAW.warnT = performance.now(); banner('Bigger!', 'Keep going round a bigger space (about 1 m across or more),\nor use the 2×2 m square button', 2.5); sfx.play('tick', 1); } }
+  for (let i = 0; i < 2; i++) if (DRAW.dots[i] && HANDS[i].ok && HANDS[i].realTip === pen && !DRAW.closed) DRAW.dots[i].material.color.set(0xffd400);   // the drawing hand glows yellow
+  const end = P[P.length - 1]; if (DRAW.end) { DRAW.end.visible = !!end && !DRAW.closed; if (end) { DRAW.end.position.set(end.x, 0.007, end.z); DRAW.end.material.opacity = 0.55 + Math.sin(performance.now() / 180) * 0.35; } }
   VRUI.update(dt, tips);
 }
-function endDraw() { if (DRAW.line) scene.remove(DRAW.line); if (DRAW.fill) scene.remove(DRAW.fill); if (DRAW.grid) scene.remove(DRAW.grid); for (const d of DRAW.dots) scene.remove(d); DRAW.line = DRAW.fill = DRAW.grid = null; DRAW.dots = []; }
+function endDraw() { if (DRAW.end) scene.remove(DRAW.end); DRAW.end = null; if (DRAW.line) scene.remove(DRAW.line); if (DRAW.fill) scene.remove(DRAW.fill); if (DRAW.grid) scene.remove(DRAW.grid); for (const d of DRAW.dots) scene.remove(d); DRAW.line = DRAW.fill = DRAW.grid = null; DRAW.dots = []; }
 function useSquare() { const f = V(0, 0, -1).applyQuaternion(headLQ); f.y = 0; f.normalize(); const r = V(-f.z, 0, f.x), c = headL.clone(); c.y = 0; const s = 1.1;
   const poly = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => { const p = c.clone().addScaledVector(r, a * s).addScaledVector(f, b * s); return [r3(p.x), r3(p.z)]; }); confirmArea(poly); }
 function confirmArea(poly) { VRUI.hide(); const area = { poly, start: [r3(headL.x), r3(headL.z)] }; startMatch('xr', area); }
