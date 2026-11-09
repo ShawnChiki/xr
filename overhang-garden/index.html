@@ -1,0 +1,2839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Overhang Garden</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#15161a;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#e9ecf1}
+  canvas#gl{display:block}
+  #panelWrap{position:fixed;right:14px;top:14px;width:460px;max-height:calc(100% - 28px);border-radius:16px;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.45);display:none}
+  #panelWrap canvas{width:100%;height:auto;display:block;cursor:pointer}
+  #hud{position:fixed;left:14px;bottom:14px;font-size:13px;color:#9aa3b2;background:rgba(20,22,27,.8);padding:8px 12px;border-radius:10px;display:none;line-height:1.5}
+  #vrBtn,#mrBtn{position:fixed;left:14px;top:14px;display:none;background:#7cf0b2;color:#101114;border:0;border-radius:12px;padding:12px 18px;font-weight:800;font-size:15px;cursor:pointer}
+  #mrBtn{left:130px;background:#c58cff}
+  #go-mr{background:#c58cff;color:#101114}
+  #splash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(1200px 700px at 30% 20%,#2a2f3a 0%,#15161a 70%);z-index:10}
+  .card{max-width:620px;padding:36px 40px;background:rgba(28,30,36,.92);border:1px solid #343944;border-radius:24px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .card h1{margin:0 0 6px;font-size:40px;letter-spacing:.5px;color:#7cf0b2;font-weight:900}
+  .card p.sub{margin:0 0 22px;color:#b8c0cc;font-size:17px;line-height:1.45}
+  .row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:22px}
+  .row button{flex:1;min-width:200px;border:0;border-radius:14px;padding:16px 18px;font-size:18px;font-weight:800;cursor:pointer}
+  #go-vr{background:#7cf0b2;color:#101114}
+  #go-vr:disabled{background:#3a3f4a;color:#8a92a0;cursor:default}
+  #go-desk{background:#2f333c;color:#e9ecf1}
+  .ctl{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:14px;color:#aab2bf;line-height:1.4}
+  .ctl b{color:#e9ecf1;font-weight:700}
+  .note{margin-top:16px;font-size:13px;color:#7f8896}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="splash">
+  <div class="card">
+    <h1>Overhang Garden</h1>
+    <p class="sub">Sculpt smooth clay inside a Bambu Lab print bed. Red stripes show what won't print on its own. Tree-like supports grow under those spots as you work and fuse into the sculpture as permanent clay, so the whole thing prints in one piece.</p>
+    <div class="row">
+      <button id="go-vr" disabled>Checking for VR…</button>
+      <button id="go-mr" style="display:none">Enter MR (passthrough)</button>
+      <button id="go-desk">Sculpt on desktop</button>
+    </div>
+    <div class="ctl">
+      <div><b>Right trigger</b> sculpt (squeeze harder = bigger)</div>
+      <div><b>A</b> add ↔ carve &nbsp; <b>B</b> undo</div>
+      <div><b>Right stick</b> ↕ size, ↔ shape, click = smooth</div>
+      <div><b>Grips</b> grab the world, both = turn + scale</div>
+      <div><b>Left stick</b> fly · click it to flip VR ↔ MR</div>
+      <div><b>X</b> menu &nbsp; <b>Y</b> see-through supports</div>
+    </div>
+    <div class="note">You start at 1:10, about 7 in tall, standing on the bed. The grid squares are 10 mm. MR puts the printer in your room with passthrough.</div>
+  </div>
+</div>
+<button id="vrBtn">Enter VR</button>
+<button id="mrBtn">Enter MR</button>
+<div id="panelWrap"></div>
+<div id="hud">Left-drag sculpt · Right-drag orbit · Shift+right-drag pan · Wheel zoom<br>A add · C carve · S smooth · F flatten · B bridge · T texture · 1–5 shapes · [ ] size · Z undo · Y redo</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ───────────────────────── constants
+const N = 160, VS = 1.6, NC = 10, HALF = 128, ISO = 0.5;
+const DEG = Math.PI / 180;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const vx = i => -HALF + (i + 0.5) * VS, vy = j => (j - 0.5) * VS, vz = k => -HALF + (k + 0.5) * VS;
+const ix = x => (x + HALF) / VS - 0.5, iy = y => y / VS + 0.5, iz = z => (z + HALF) / VS - 0.5;
+const PALETTE = ['#f2f0ea', '#e2cdb0', '#9a9ea6', '#3a3a40', '#ff6f5e', '#ff9a3c', '#ffc93c', '#5fd3a6', '#4fa3ff', '#3b5bdb', '#9b6dff', '#ff8fcf'];
+const SHAPES = ['Sphere', 'Cube', 'Cone', 'Cylinder', 'Torus'];
+const BOUND = [1.0, 1.45, 1.45, 1.45, 1.05];
+// sculpting together: room state (filled in by the "Together" code further down)
+const NET = { host: false, code: '', peer: null, conns: {}, conn: null, on: false, test: /[?&]nettest/.test(location.search), ice: null };
+const SYNC = { synced: false, me: '', col: 0, touched: new Map(), lsig: new Map(), stSig: '', stVer: 0, deleted: new Set(), lyVer: 0, lastTick: 0, lastMe: 0, busy: false, rq: Promise.resolve(), peers: new Map(), status: '', entry: '' };
+let netApplying = false;
+const PEERC = ['#ff6f5e', '#4fa3ff', '#ffc93c', '#9b6dff', '#5fd3a6'];
+const ACC = '#7cf0b2', CARVE = '#ff7a6b', SMOOTH = '#7ab8ff', BRIDGEC = '#ffd166', TEXC = '#c58cff', FLATC = '#5fd3d3';
+const SCALE_MIN = 0.0003, SCALE_MAX = 0.1;
+
+const ST = {
+  tool: 'add', lastTool: 'add', shape: 0, brushVR: 0.06, mirror: false, pressure: true, carveAll: true, autoSmooth: 0.3,
+  tex: { pattern: 0, depth: 1.2, scale: 6 },
+  sup: { auto: true, stripes: true, seeThrough: false, plateOnly: false, angle: 35, bridge: 5, maxBridge: 40, branchAngle: 40, branchD: 8, tipD: 3, spacing: 7, brim: true, brimW: 6, brimJoin: 14, style: 'fused', footFlare: true },
+};
+
+// ───────────────────────── renderer / scene
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.xr.enabled = true;
+renderer.localClippingEnabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+renderer.domElement.id = 'gl';
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x17181c);
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 300);
+camera.position.set(0, 1.9, 2.4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.45, -1.0);
+controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+controls.enableDamping = true;
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xfff4ea, 0x2c3038, 1.7));
+const sun = new THREE.DirectionalLight(0xffffff, 2.1); sun.position.set(1.5, 4, 2.5); scene.add(sun);
+const fill = new THREE.DirectionalLight(0xb8d4ff, 0.8); fill.position.set(-3, 1.5, -2); scene.add(fill);
+
+const modelRoot = new THREE.Group();
+scene.add(modelRoot);
+
+// ───────────────────────── printer environment (model units = mm)
+function makeBedTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 2048;
+  const g = c.getContext('2d'); const P = 8;
+  g.fillStyle = '#25272c'; g.fillRect(0, 0, 2048, 2048);
+  for (let n = 0; n < 9000; n++) { g.fillStyle = `rgba(255,255,255,${Math.random() * 0.035})`; g.fillRect(Math.random() * 2048, Math.random() * 2048, 2, 2); }
+  // origin = front-left corner, like the Bambu bed
+  for (let mm = 0; mm <= 256; mm += 10) {
+    const major = mm % 50 === 0;
+    g.fillStyle = major ? '#59606b' : '#363940';
+    const w = major ? 5 : 2;
+    g.fillRect(mm * P - w / 2, 0, w, 2048); g.fillRect(0, (256 - mm) * P - w / 2, 2048, w);
+  }
+  g.fillStyle = '#7cf0b2'; g.fillRect(1024 - 3, 1024 - 40, 6, 80); g.fillRect(1024 - 40, 1024 - 3, 80, 6);
+  g.strokeStyle = '#8a929e'; g.lineWidth = 8; g.strokeRect(4, 4, 2040, 2040);
+  g.fillStyle = '#9aa3b2'; g.font = '700 46px system-ui,sans-serif'; g.textBaseline = 'middle';
+  for (let mm = 50; mm <= 250; mm += 50) {
+    g.textAlign = 'center'; g.fillText(String(mm), mm * P, 2048 - 44);
+    g.textAlign = 'left'; g.fillText(String(mm), 22, (256 - mm) * P);
+  }
+  g.textAlign = 'right'; g.font = '700 40px system-ui'; g.fillStyle = '#7f8896';
+  g.fillText('256 × 256 mm · grid 10 mm', 2048 - 30, 40);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
+  return t;
+}
+function labelSprite(text, h = 9) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 96;
+  const g = c.getContext('2d'); g.fillStyle = 'rgba(20,22,27,0.75)'; g.beginPath(); g.roundRect(8, 8, 240, 80, 22); g.fill();
+  g.fillStyle = '#cfd6e0'; g.font = '800 52px system-ui'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 128, 50);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, depthWrite: false })); s.scale.set(h * 2.67, h, 1); return s;
+}
+const env = {};
+(function buildPrinter() {
+  const dark = new THREE.MeshStandardMaterial({ color: 0x1c1d21, roughness: 0.7 });
+  const mid = new THREE.MeshStandardMaterial({ color: 0x2c2e34, roughness: 0.6, metalness: 0.2 });
+  const side = new THREE.MeshStandardMaterial({ color: 0x31343b, roughness: 0.5, metalness: 0.4 });
+  const top = new THREE.MeshStandardMaterial({ map: makeBedTexture(), roughness: 0.85 });
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(256, 3, 256), [side, side, top, side, side, side]);
+  plate.position.y = -1.5; modelRoot.add(plate);
+  const base = new THREE.Mesh(new THREE.BoxGeometry(350, 70, 350), dark); base.position.y = -38; modelRoot.add(base); env.base = base;
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(2200, 64), new THREE.MeshStandardMaterial({ color: 0x202227, roughness: 0.95 }));
+  ground.rotation.x = -Math.PI / 2; ground.position.y = -73; modelRoot.add(ground); env.ground = ground;
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    const post = new THREE.Mesh(new THREE.BoxGeometry(14, 310, 14), mid); post.position.set(sx * 168, 152, sz * 168); modelRoot.add(post);
+  }
+  for (const sz of [-1, 1]) { const b = new THREE.Mesh(new THREE.BoxGeometry(350, 14, 14), mid); b.position.set(0, 300, sz * 168); modelRoot.add(b); }
+  for (const sx of [-1, 1]) { const b = new THREE.Mesh(new THREE.BoxGeometry(14, 14, 350), mid); b.position.set(sx * 168, 300, 0); modelRoot.add(b); }
+  const rail = new THREE.Mesh(new THREE.BoxGeometry(336, 8, 10), side); rail.position.set(0, 282, -20); modelRoot.add(rail);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(52, 58, 46), new THREE.MeshStandardMaterial({ color: 0xe8e8e4, roughness: 0.4 }));
+  head.position.set(-60, 270, -8); modelRoot.add(head);
+  const nozzle = new THREE.Mesh(new THREE.ConeGeometry(5, 12, 16), new THREE.MeshStandardMaterial({ color: 0xc9a24a, metalness: 0.8, roughness: 0.3 }));
+  nozzle.rotation.x = Math.PI; nozzle.position.set(-60, 235, -8); modelRoot.add(nozzle);
+  const led = new THREE.Mesh(new THREE.BoxGeometry(320, 3, 4), new THREE.MeshBasicMaterial({ color: 0xfff2d6 }));
+  led.position.set(0, 292, 160); modelRoot.add(led);
+  const vol = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(256, 256, 256)),
+    new THREE.LineBasicMaterial({ color: 0x4f8fd8, transparent: true, opacity: 0.35 }));
+  vol.position.y = 128; modelRoot.add(vol);
+  const tickPts = [];
+  for (let mm = 10; mm <= 250; mm += 10) { const L = mm % 50 === 0 ? 8 : 4; tickPts.push(-128, mm, -128, -128 + L, mm, -128, -128, mm, -128, -128, mm, -128 + L); }
+  const tg = new THREE.BufferGeometry(); tg.setAttribute('position', new THREE.Float32BufferAttribute(tickPts, 3));
+  modelRoot.add(new THREE.LineSegments(tg, new THREE.LineBasicMaterial({ color: 0x8fb8e8 })));
+  for (let mm = 50; mm <= 250; mm += 50) { const s = labelSprite(mm + ' mm'); s.position.set(-128 - 14, mm, -128); modelRoot.add(s); }
+})();
+
+// ───────────────────────── clay material w/ overhang stripes
+const overU = { uShowOver: { value: 1 } };
+const clsU = { value: null };
+const noStripeU = { value: 0 };
+const cutPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e6);
+function makeClayMaterial(hex, stripes = true) {
+  const m = new THREE.MeshStandardMaterial({ color: hex, roughness: 0.56, metalness: 0 });
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uCls = clsU; sh.uniforms.uShowOver = stripes ? overU.uShowOver : noStripeU;
+    sh.vertexShader = 'varying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjN = normal; vObjP = position;');
+    sh.fragmentShader = 'uniform highp sampler3D uCls;\nuniform float uShowOver;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.fragmentShader.replace('#include <color_fragment>', `#include <color_fragment>
+      vec3 ovHot = vec3(0.0);
+      if (uShowOver > 0.5) {
+        vec3 nn = normalize(vObjN);
+        if (nn.y < 0.35) {
+          vec3 q = vObjP - nn * 0.9;
+          float c = texture(uCls, vec3((q.x + 128.0) / 256.0, (q.y / 1.6 + 1.0) / 160.0, (q.z + 128.0) / 256.0)).r * 255.0;
+          if (c > 2.5) {
+            float st = step(0.5, fract((vObjP.x + vObjP.z + vObjP.y * 0.6) * 0.16));
+            vec3 a = c > 3.5 ? vec3(1.0, 0.1, 0.38) : vec3(1.0, 0.45, 0.12);
+            ovHot = mix(a, vec3(1.0, 0.85, 0.6), st * 0.45);
+            diffuseColor.rgb = mix(diffuseColor.rgb, ovHot, 0.8);
+          }
+        }
+      }`).replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += ovHot * 0.4;');
+  };
+  m.customProgramCacheKey = () => 'clay' + (stripes ? 1 : 0);
+  if (typeof CUT !== 'undefined' && CUT.on) m.clippingPlanes = [cutPlane];
+  return m;
+}
+
+// ───────────────────────── layers + voxel storage
+const sculptRoot = new THREE.Group(); modelRoot.add(sculptRoot);
+let layerSeq = 1;
+const layers = [];
+let activeLayer = null;
+let supLayer = null; // auto-grown support clay, always last in the list
+class Layer {
+  constructor(name, colorIdx, auto = false) {
+    this.id = layerSeq++; this.name = name; this.colorIdx = colorIdx; this.visible = true; this.locked = false; this.auto = auto;
+    this.chunks = new Map(); this.meshes = new Map(); this.dirty = new Set();
+    this.group = new THREE.Group(); sculptRoot.add(this.group);
+    this.material = makeClayMaterial(PALETTE[colorIdx], !auto);
+    this.bridge = false; this.beams = []; this.beamMeshes = [];   // bridge layers hold clean beams instead of clay
+    this.uid = Math.random().toString(36).slice(2, 10);            // same on every headset in a shared room
+  }
+  setColor(ci) { this.colorIdx = ci; this.material.color.set(PALETTE[ci]); }
+  rebuildBeams() {
+    for (const m of this.beamMeshes) { this.group.remove(m); m.geometry.dispose(); }
+    this.beamMeshes = this.beams.map(b => { const m = new THREE.Mesh(beamGeometry(b), this.material); placeBeam(m, b); this.group.add(m); return m; });
+    dimsDirty = true;
+  }
+  dispose() {
+    for (const m of this.meshes.values()) m.geometry.dispose();
+    for (const m of this.beamMeshes) m.geometry.dispose();
+    sculptRoot.remove(this.group); this.material.dispose();
+  }
+}
+// a bridge beam: A and B at the same height, half width hw, half height hh; it runs a little past both ends into the clay
+const beamLen = (b) => Math.hypot(b.bx - b.ax, b.bz - b.az) + 2 * b.hw;
+const beamGeometry = (b) => new RoundedBoxGeometry(beamLen(b), 2 * b.hh, 2 * b.hw, 2, Math.min(b.hw, b.hh) * 0.3);
+function placeBeam(m, b) {
+  m.position.set((b.ax + b.bx) / 2, b.ay, (b.az + b.bz) / 2);
+  m.rotation.set(0, -Math.atan2(b.bz - b.az, b.bx - b.ax), 0); m.updateMatrix(); m.matrixAutoUpdate = false;
+}
+function insideBeam(b, x, y, z, pad = 0) {
+  let ux = b.bx - b.ax, uz = b.bz - b.az; const len = Math.hypot(ux, uz) || 1; ux /= len; uz /= len;
+  const px = x - (b.ax + b.bx) / 2, pz = z - (b.az + b.bz) / 2;
+  return Math.abs(px * ux + pz * uz) <= len / 2 + b.hw + pad && Math.abs(y - b.ay) <= b.hh + pad && Math.abs(-px * uz + pz * ux) <= b.hw + pad;
+}
+function addBridgeLayer(name) {
+  const L = new Layer(name || 'Bridges', 0); L.bridge = true;
+  L.material.dispose(); L.material = makeClayMaterial(PALETTE[0], false);
+  const at = supLayer ? layers.indexOf(supLayer) : -1;
+  if (at >= 0) layers.splice(at, 0, L); else layers.push(L);
+  return L;
+}
+const clayLayers = () => layers.filter(l => !l.auto && !l.bridge);
+const userLayers = () => layers.filter(l => !l.auto);
+function addLayer(name, colorIdx) {
+  if (colorIdx === undefined) colorIdx = 0;
+  const L = new Layer(name || ('Layer ' + (clayLayers().length + 1)), colorIdx);
+  const at = supLayer ? layers.indexOf(supLayer) : -1;
+  if (at >= 0) layers.splice(at, 0, L); else layers.push(L);
+  activeLayer = L; return L;
+}
+function ensureSupLayer() {
+  if (supLayer && layers.includes(supLayer)) return supLayer;
+  supLayer = new Layer('Supports', 0, true); layers.push(supLayer); applySeeThrough(); return supLayer;
+}
+function applySeeThrough() {
+  if (!supLayer) return;
+  const m = supLayer.material, on = ST.sup.seeThrough;
+  m.transparent = on; m.opacity = on ? 0.3 : 1; m.depthWrite = !on; m.needsUpdate = true;
+}
+function getD(L, i, j, k) {
+  if (i < 0 || j < 0 || k < 0 || i >= N || j >= N || k >= N) return 0;
+  const c = L.chunks.get((i >> 4) + NC * ((j >> 4) + NC * (k >> 4)));
+  return c ? c[(i & 15) + 16 * ((j & 15) + 16 * (k & 15))] : 0;
+}
+function markDirtyRange(L, i0, i1, j0, j1, k0, k1) {
+  const a0 = Math.max(0, Math.ceil((i0 - 17) / 16)), a1 = Math.min(NC - 1, Math.floor((i1 + 1) / 16));
+  const b0 = Math.max(0, Math.ceil((j0 - 17) / 16)), b1 = Math.min(NC - 1, Math.floor((j1 + 1) / 16));
+  const c0 = Math.max(0, Math.ceil((k0 - 17) / 16)), c1 = Math.min(NC - 1, Math.floor((k1 + 1) / 16));
+  for (let c = c0; c <= c1; c++) for (let b = b0; b <= b1; b++) for (let a = a0; a <= a1; a++) L.dirty.add(a + NC * (b + NC * c));
+}
+function markChunkDirty(L, key) {
+  netTouch(L, key);
+  const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+  markDirtyRange(L, cx * 16, cx * 16 + 15, cy * 16, cy * 16 + 15, cz * 16, cz * 16 + 15);
+}
+
+// ───────────────────────── brush SDFs + stamping
+function sdCappedCone(qx, qy, h, r1, r2) {
+  const k2x = r2 - r1, k2y = 2 * h;
+  const cax = qx - Math.min(qx, qy < 0 ? r1 : r2), cay = Math.abs(qy) - h;
+  const t = clamp(((r2 - qx) * k2x + (h - qy) * k2y) / (k2x * k2x + k2y * k2y), 0, 1);
+  const cbx = qx - r2 + k2x * t, cby = qy - h + k2y * t;
+  const s = (cbx < 0 && cay < 0) ? -1 : 1;
+  return s * Math.sqrt(Math.min(cax * cax + cay * cay, cbx * cbx + cby * cby));
+}
+function sdf(shape, x, y, z, r) {
+  switch (shape) {
+    case 0: return Math.sqrt(x * x + y * y + z * z) - r;
+    case 1: {
+      const b = r * 0.82, rr = r * 0.12;
+      const qx = Math.abs(x) - b + rr, qy = Math.abs(y) - b + rr, qz = Math.abs(z) - b + rr;
+      const mx = Math.max(qx, 0), my = Math.max(qy, 0), mz = Math.max(qz, 0);
+      return Math.sqrt(mx * mx + my * my + mz * mz) + Math.min(Math.max(qx, qy, qz), 0) - rr;
+    }
+    case 2: return sdCappedCone(Math.sqrt(x * x + y * y), z, r, r * 0.04, r); // tip toward -Z (forward)
+    case 3: {
+      const dx = Math.sqrt(x * x + y * y) - r * 0.85, dz = Math.abs(z) - r;
+      const ax = Math.max(dx, 0), az = Math.max(dz, 0);
+      return Math.min(Math.max(dx, dz), 0) + Math.sqrt(ax * ax + az * az);
+    }
+    case 4: { const q = Math.sqrt(x * x + y * y) - r * 0.72; return Math.sqrt(q * q + z * z) - r * 0.28; }
+  }
+  return 1;
+}
+// ───────────────────────── brushes write voxels (every write is snapshotted for undo)
+function snap(rec, L, key, ch) {
+  if (!rec) return;
+  let m = rec.saves.get(L); if (!m) { m = new Map(); rec.saves.set(L, m); }
+  if (!m.has(key)) m.set(key, ch ? ch.slice() : null);
+}
+function origAt(rec, L, key, ch, li) {
+  const m = rec && rec.saves.get(L);
+  if (m && m.has(key)) { const a = m.get(key); return a ? a[li] : 0; }
+  return ch ? ch[li] : 0;
+}
+function voxBox(x0, x1, y0, y1, z0, z1) {
+  return [Math.max(1, Math.floor(ix(x0))), Math.min(N - 2, Math.ceil(ix(x1))), Math.max(1, Math.floor(iy(y0))), Math.min(N - 2, Math.ceil(iy(y1))), Math.max(1, Math.floor(iz(z0))), Math.min(N - 2, Math.ceil(iz(z1)))];
+}
+// visit every voxel in a box, chunk by chunk; fn(i,j,k,x,y,z,ch,li,key) returns new value or undefined
+function forVox(L, box, fn, rec, allocate) {
+  const [i0, i1, j0, j1, k0, k1] = box;
+  if (i0 > i1 || j0 > j1 || k0 > k1) return false;
+  let changed = false;
+  for (let CZ = k0 >> 4; CZ <= k1 >> 4; CZ++) for (let CY = j0 >> 4; CY <= j1 >> 4; CY++) for (let CX = i0 >> 4; CX <= i1 >> 4; CX++) {
+    const key = CX + NC * (CY + NC * CZ);
+    let ch = L.chunks.get(key) || null;
+    if (!ch && !allocate) continue;
+    const a0 = Math.max(i0, CX * 16), a1 = Math.min(i1, CX * 16 + 15), b0 = Math.max(j0, CY * 16), b1 = Math.min(j1, CY * 16 + 15), c0 = Math.max(k0, CZ * 16), c1 = Math.min(k1, CZ * 16 + 15);
+    let wrote = false;
+    for (let k = c0; k <= c1; k++) for (let j = b0; j <= b1; j++) for (let i = a0; i <= a1; i++) {
+      const li = (i & 15) + 16 * ((j & 15) + 16 * (k & 15));
+      const nv = fn(i, j, k, vx(i), vy(j), vz(k), ch, li, key);
+      if (nv === undefined) continue;
+      if (!ch) { snap(rec, L, key, null); ch = new Float32Array(4096); L.chunks.set(key, ch); } else snap(rec, L, key, ch);
+      ch[li] = nv; changed = true; wrote = true;
+    }
+    if (wrote) netTouch(L, key);
+  }
+  if (changed) markDirtyRange(L, i0, i1, j0, j1, k0, k1);
+  return changed;
+}
+const INVW = 1 / (VS * 1.2);
+function stamp(L, cx, cy, cz, m, shape, r, tool, rec) {
+  const R = r * BOUND[shape] + VS * 1.5;
+  return forVox(L, voxBox(cx - R, cx + R, cy - R, cy + R, cz - R, cz + R), (i, j, k, x, y, z, ch, li) => {
+    const px = x - cx, py = y - cy, pz = z - cz;
+    let t = 0.5 - sdf(shape, m[0] * px + m[1] * py + m[2] * pz, m[3] * px + m[4] * py + m[5] * pz, m[6] * px + m[7] * py + m[8] * pz, r) * INVW;
+    if (t <= 0) return; if (t > 1) t = 1;
+    const old = ch ? ch[li] : 0;
+    if (tool === 'add') return t > old ? t : undefined;
+    if (tool === 'carve') { const c = 1 - t; return c < old ? c : undefined; }
+    const avg = (getD(L, i - 1, j, k) + getD(L, i + 1, j, k) + getD(L, i, j - 1, k) + getD(L, i, j + 1, k) + getD(L, i, j, k - 1) + getD(L, i, j, k + 1)) / 6;
+    const nv = old + (avg - old) * t * 0.55; return Math.abs(nv - old) < 2e-4 ? undefined : nv;
+  }, rec, tool !== 'carve');
+}
+// flat-bottomed beam between two points at the same height
+function stampBeam(L, A, B, hw, hh, rec) {
+  let ux = B.x - A.x, uz = B.z - A.z; const len = Math.hypot(ux, uz) || 1; ux /= len; uz /= len;
+  const cx = (A.x + B.x) / 2, cz = (A.z + B.z) / 2, cy = A.y, hl = len / 2 + hw, rr = Math.min(hw, hh) * 0.25;
+  const R = hl + hw + VS * 2;
+  return forVox(L, voxBox(cx - R, cx + R, cy - hh - VS * 2, cy + hh + VS * 2, cz - R, cz + R), (i, j, k, x, y, z, ch, li) => {
+    const px = x - cx, pz = z - cz;
+    const qa = Math.abs(px * ux + pz * uz) - hl + rr, qb = Math.abs(y - cy) - hh + rr, qc = Math.abs(-px * uz + pz * ux) - hw + rr;
+    const d = Math.hypot(Math.max(qa, 0), Math.max(qb, 0), Math.max(qc, 0)) + Math.min(Math.max(qa, qb, qc), 0) - rr;
+    let t = 0.5 - d * INVW; if (t <= 0) return; if (t > 1) t = 1;
+    const old = ch ? ch[li] : 0; return t > old ? t : undefined;
+  }, rec, true);
+}
+// surface texture: pushes the skin in/out by a pattern, only near the surface
+function hash3(i, j, k) { let h = (Math.imul(i, 374761393) + Math.imul(j, 668265263) + Math.imul(k, 1274126177)) | 0; h = Math.imul(h ^ (h >>> 13), 1103515245); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+function vnoise(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z), fx = x - xi, fy = y - yi, fz = z - zi;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy), w = fz * fz * (3 - 2 * fz);
+  const l = (a, b, t) => a + (b - a) * t;
+  return l(l(l(hash3(xi, yi, zi), hash3(xi + 1, yi, zi), u), l(hash3(xi, yi + 1, zi), hash3(xi + 1, yi + 1, zi), u), v),
+           l(l(hash3(xi, yi, zi + 1), hash3(xi + 1, yi, zi + 1), u), l(hash3(xi, yi + 1, zi + 1), hash3(xi + 1, yi + 1, zi + 1), u), v), w);
+}
+const TEXTURES = ['Bumps', 'Ribs', 'Cells', 'Knurl', 'Bricks'];
+function pattern(kind, x, y, z, s) {
+  if (kind === 0) return (vnoise(x / s, y / s, z / s) * 0.7 + vnoise(x / s * 2.1 + 5.3, y / s * 2.1, z / s * 2.1) * 0.3) * 2 - 1;
+  if (kind === 1) return Math.sin(2 * Math.PI * y / s);
+  if (kind === 2) {
+    const gx = Math.floor(x / s), gy = Math.floor(y / s), gz = Math.floor(z / s); let d = 1e9;
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
+      const X = gx + a, Y = gy + b, Z = gz + c;
+      const fx = (X + hash3(X, Y, Z)) * s - x, fy = (Y + hash3(Y, Z, X)) * s - y, fz = (Z + hash3(Z, X, Y)) * s - z;
+      d = Math.min(d, fx * fx + fy * fy + fz * fz);
+    }
+    return clamp(Math.sqrt(d) / (0.55 * s), 0, 1) * 2 - 1;
+  }
+  if (kind === 4) {
+    // running-bond bricks: courses half the pattern size tall, every other course shifted half a brick
+    const h = s * 0.5, row = Math.floor(y / h), fy = y / h - row;
+    const u = (x + z) * 0.7071 / s + (row & 1) * 0.5, fu = u - Math.floor(u);
+    const e = Math.min(Math.min(fy, 1 - fy) * h, Math.min(fu, 1 - fu) * s), m = s * 0.05;
+    return e < m ? -1 : e < m * 2.5 ? -1 + 1.35 * (e - m) / (m * 1.5) : 0.35;
+  }
+  return Math.sin(2 * Math.PI * (x + y) / s) * Math.sin(2 * Math.PI * (z - y) / s);
+}
+function stampTexture(L, cx, cy, cz, r, rec) {
+  const { pattern: kind, depth, scale } = ST.tex;
+  const R = r + VS;
+  return forVox(L, voxBox(cx - R, cx + R, cy - R, cy + R, cz - R, cz + R), (i, j, k, x, y, z, ch, li, key) => {
+    const dist = Math.hypot(x - cx, y - cy, z - cz); if (dist > r) return;
+    const fall = 1 - clamp((dist - r * 0.45) / (r * 0.55), 0, 1);
+    const orig = origAt(rec, L, key, ch, li);
+    const inside = orig >= 0.5;
+    let band = orig > 0.03 && orig < 0.97;
+    if (!band) { const nb = [getD(L, i - 1, j, k), getD(L, i + 1, j, k), getD(L, i, j - 1, k), getD(L, i, j + 1, k), getD(L, i, j, k - 1), getD(L, i, j, k + 1)]; for (const v of nb) if ((v >= 0.5) !== inside) { band = true; break; } }
+    if (!band) return;
+    const disp = depth * pattern(kind, x, y, z, scale) * fall;
+    const target = clamp(orig + disp * INVW, 0, 1), cur = ch ? ch[li] : 0;
+    const nv = disp > 0 ? Math.max(cur, target) : Math.min(cur, target);
+    return Math.abs(nv - cur) < 1e-4 ? undefined : nv;
+  }, rec, true);
+}
+// flatten: when a stroke starts it finds the plane of the surface under the brush, then shaves bumps down to
+// that plane and fills dips up to it (like ZBrush's flatten)
+function surfacePlane(L, cx, cy, cz, r) {
+  let sx = 0, sy = 0, sz = 0, sw = 0, nx = 0, ny = 0, nz = 0;
+  const [i0, i1, j0, j1, k0, k1] = voxBox(cx - r, cx + r, cy - r, cy + r, cz - r, cz + r);
+  for (let k = k0; k <= k1; k++) for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const x = vx(i), y = vy(j), z = vz(k), dist = Math.hypot(x - cx, y - cy, z - cz); if (dist > r) continue;
+    const gx = getD(L, i + 1, j, k) - getD(L, i - 1, j, k), gy = getD(L, i, j + 1, k) - getD(L, i, j - 1, k), gz = getD(L, i, j, k + 1) - getD(L, i, j, k - 1);
+    const g = Math.hypot(gx, gy, gz); if (g < 0.05) continue;
+    const w = g * (1 - dist / r), d = getD(L, i, j, k);
+    nx -= gx * w; ny -= gy * w; nz -= gz * w;
+    if (d > 0.15 && d < 0.85) { sx += x * w; sy += y * w; sz += z * w; sw += w; }
+  }
+  const nl = Math.hypot(nx, ny, nz); if (nl < 1e-6) return null;
+  return sw > 0 ? { px: sx / sw, py: sy / sw, pz: sz / sw, nx: nx / nl, ny: ny / nl, nz: nz / nl } : { px: cx, py: cy, pz: cz, nx: nx / nl, ny: ny / nl, nz: nz / nl };
+}
+function stampFlatten(L, cx, cy, cz, r, pl, rec) {
+  const R = r + VS;
+  return forVox(L, voxBox(cx - R, cx + R, cy - R, cy + R, cz - R, cz + R), (i, j, k, x, y, z, ch, li) => {
+    const dist = Math.hypot(x - cx, y - cy, z - cz); if (dist > r) return;
+    const sd = (x - pl.px) * pl.nx + (y - pl.py) * pl.ny + (z - pl.pz) * pl.nz;   // + is above the plane
+    if (sd < -r * 0.4) return;                                                     // never builds up deep under it
+    const target = clamp(0.5 - sd * INVW, 0, 1), old = ch ? ch[li] : 0;
+    const fall = 1 - clamp((dist - r * 0.5) / (r * 0.5), 0, 1);
+    const nv = old + (target - old) * fall * 0.6;
+    return Math.abs(nv - old) < 2e-4 ? undefined : nv;
+  }, rec, true);
+}
+const IDM = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+function quatToInvM(q, out) {
+  const e = new THREE.Matrix4().makeRotationFromQuaternion(q).elements;
+  out[0] = e[0]; out[1] = e[1]; out[2] = e[2]; out[3] = e[4]; out[4] = e[5]; out[5] = e[6]; out[6] = e[8]; out[7] = e[9]; out[8] = e[10];
+  return out;
+}
+function mirrorM(m) { const o = Float32Array.from(m); o[1] = -o[1]; o[2] = -o[2]; o[3] = -o[3]; o[6] = -o[6]; return o; }
+function clayNear(p, rad) {
+  const ls = layers.filter(l => l.visible && !l.auto);
+  const [i0, i1, j0, j1, k0, k1] = voxBox(p.x - rad, p.x + rad, p.y - rad, p.y + rad, p.z - rad, p.z + rad);
+  for (let k = k0; k <= k1; k++) for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    if ((vx(i) - p.x) ** 2 + (vy(j) - p.y) ** 2 + (vz(k) - p.z) ** 2 > rad * rad) continue;
+    for (const L of ls) if (getD(L, i, j, k) > ISO) return true;
+  }
+  return false;
+}
+
+// ───────────────────────── undo / strokes
+const undoStack = [], redoStack = [];
+let editCount = 0;
+const newRec = () => ({ saves: new Map(), bsaves: new Map() });
+const recSize = (rec) => { let n = rec.bsaves ? rec.bsaves.size : 0; for (const m of rec.saves.values()) n += m.size; return n; };
+function snapBeams(rec, L) { if (rec && !rec.bsaves.has(L)) rec.bsaves.set(L, L.beams.slice()); }
+function applySwap(rec) {
+  if (rec.bsaves) for (const [L, arr] of rec.bsaves) { if (!layers.includes(L)) continue; const cur = L.beams; L.beams = arr; rec.bsaves.set(L, cur); L.rebuildBeams(); }
+  for (const [L, m] of rec.saves) {
+    if (!layers.includes(L)) continue;
+    for (const [key, arr] of m) {
+      const cur = L.chunks.get(key) || null;
+      if (arr) L.chunks.set(key, arr); else L.chunks.delete(key);
+      m.set(key, cur); markChunkDirty(L, key);
+    }
+  }
+  afterEdit();
+}
+function pushUndo(rec) { if (!recSize(rec)) return; undoStack.push(rec); if (undoStack.length > 40) undoStack.shift(); redoStack.length = 0; afterEdit(); }
+function undo() { const r = undoStack.pop(); if (!r) return toast('Nothing to undo'); applySwap(r); redoStack.push(r); toast('Undo'); }
+function redo() { const r = redoStack.pop(); if (!r) return toast('Nothing to redo'); applySwap(r); undoStack.push(r); toast('Redo'); }
+function afterEdit() { editCount++; supNeed = true; lastEditAt = performance.now(); autosaveDue = performance.now() + 12000; dimsDirty = true; }
+
+const stroke = { active: false, rec: null, targets: [], last: new THREE.Vector3(), hasLast: false, lastHaptic: 0 };
+function strokeTargets() {
+  if (ST.tool === 'carve' && ST.carveAll) {
+    const t = layers.filter(l => !l.auto && !l.bridge && l.visible && !l.locked);
+    if (!t.length) toast('Every layer is hidden or locked');
+    return t;
+  }
+  const L = activeLayer;
+  if (!L) return [];
+  if (!L.visible) { toast(`${L.name} is hidden, show it to sculpt`); return []; }
+  if (L.auto) { toast('Supports grow by themselves. Tap Keep as clay to sculpt them'); return []; }
+  if (L.locked) { toast(`${L.name} is locked`); return []; }
+  if (L.bridge && ST.tool !== 'bridge' && ST.tool !== 'carve') { toast(`${L.name} only holds bridges. Pick a clay layer to sculpt`); return []; }
+  if (L.bridge && ST.tool === 'carve') return [];   // carving there only removes beams (below)
+  return [L];
+}
+function strokeBegin() {
+  const t = strokeTargets();
+  if (!t.length && !(ST.tool === 'carve' && activeLayer && activeLayer.bridge)) return false;
+  stroke.active = true; stroke.targets = t; stroke.rec = newRec(); stroke.hasLast = false; stroke.plane = null;
+  return true;
+}
+function strokeApply(c, m, rmm) {
+  if (!stroke.active) return false;
+  const tool = ST.tool, shape = ST.shape;
+  const pts = [];
+  const again = tool === 'smooth' || tool === 'texture';
+  if (!stroke.hasLast) pts.push(c.clone());
+  else {
+    const d = c.distanceTo(stroke.last);
+    const step = Math.max(rmm * 0.3, VS * 0.6);
+    const n = Math.min(30, Math.floor(d / step));
+    for (let s = 1; s <= n; s++) pts.push(stroke.last.clone().lerp(c, s / n));
+    if (n === 0) { if (tool !== 'smooth' && tool !== 'flatten') return false; pts.push(c.clone()); }
+  }
+  let changed = false;
+  const mm = ST.mirror ? mirrorM(m) : null;
+  if (tool === 'carve') {
+    const bl = ST.carveAll ? layers.filter(l => l.bridge && l.visible && !l.locked) : (activeLayer && activeLayer.bridge && !activeLayer.locked ? [activeLayer] : []);
+    for (const L of bl) {
+      const keepB = L.beams.filter(b => !pts.some(p => insideBeam(b, p.x, p.y, p.z, rmm * 0.8) || (ST.mirror && insideBeam(b, -p.x, p.y, p.z, rmm * 0.8))));
+      if (keepB.length !== L.beams.length) { snapBeams(stroke.rec, L); L.beams = keepB; L.rebuildBeams(); changed = true; }
+    }
+  }
+  if (tool === 'flatten' && !stroke.plane) {
+    stroke.plane = surfacePlane(stroke.targets[0], c.x, c.y, c.z, rmm);
+    if (!stroke.plane) return false;
+  }
+  for (const L of stroke.targets) for (const p of pts) {
+    if (tool === 'flatten') {
+      const pl = stroke.plane;
+      changed = stampFlatten(L, p.x, p.y, p.z, rmm, pl, stroke.rec) || changed;
+      if (mm) changed = stampFlatten(L, -p.x, p.y, p.z, rmm, { px: -pl.px, py: pl.py, pz: pl.pz, nx: -pl.nx, ny: pl.ny, nz: pl.nz }, stroke.rec) || changed;
+    } else if (tool === 'texture') {
+      changed = stampTexture(L, p.x, p.y, p.z, rmm, stroke.rec) || changed;
+      if (mm) changed = stampTexture(L, -p.x, p.y, p.z, rmm, stroke.rec) || changed;
+    } else {
+      changed = stamp(L, p.x, p.y, p.z, m, shape, rmm, tool, stroke.rec) || changed;
+      if (mm) changed = stamp(L, -p.x, p.y, p.z, mm, shape, rmm, tool, stroke.rec) || changed;
+    }
+  }
+  stroke.last.copy(c); stroke.hasLast = true;
+  if (changed) { dimsDirty = true; lastEditAt = performance.now(); }
+  return changed;
+}
+function strokeEnd() {
+  if (!stroke.active) return;
+  stroke.active = false;
+  pushUndo(stroke.rec);
+  stroke.rec = null;
+}
+// bridge tool: press on clay, drag across, release on clay → flat beam
+const bridge = { active: false, A: new THREE.Vector3(), B: new THREE.Vector3(), ok: false, why: '', r: 4 };
+function bridgeBegin(p, rmm) {
+  if (activeLayer && activeLayer.bridge && (activeLayer.locked || !activeLayer.visible)) { toast(`${activeLayer.name} is ${activeLayer.locked ? 'locked' : 'hidden'}`); return false; }
+  if (!clayNear(p, rmm + VS)) { toast('Start a bridge on clay'); return false; }
+  bridge.active = true; bridge.A.copy(p); bridge.B.copy(p); bridge.r = rmm; bridge.ok = false; bridgeUpdate(p); return true;
+}
+function bridgeUpdate(p) {
+  bridge.B.set(p.x, bridge.A.y, p.z);
+  const len = Math.hypot(bridge.B.x - bridge.A.x, bridge.B.z - bridge.A.z);
+  if (len < bridge.r * 2) { bridge.ok = false; bridge.why = 'Drag farther'; }
+  else if (len > ST.sup.maxBridge) { bridge.ok = false; bridge.why = `Too long: max ${ST.sup.maxBridge} mm`; }
+  else if (!clayNear(bridge.B, bridge.r + VS)) { bridge.ok = false; bridge.why = 'A bridge has to land on clay'; }
+  else { bridge.ok = true; bridge.why = ''; }
+  showBridgeGhost(true);
+}
+function bridgeEnd() {
+  if (!bridge.active) return;
+  bridge.active = false; showBridgeGhost(false);
+  if (!bridge.ok) { toast(bridge.why || 'No bridge'); return; }
+  // bridges are clean beams on their own Bridges layer, never voxel clay
+  const L = activeLayer && activeLayer.bridge ? activeLayer : (layers.find(l => l.bridge && l.visible && !l.locked) || addBridgeLayer('Bridges'));
+  const rec = newRec(), hh = Math.max(VS * 1.1, bridge.r * 0.55), A = bridge.A, B = bridge.B;
+  snapBeams(rec, L);
+  L.beams = L.beams.concat([{ ax: A.x, ay: A.y, az: A.z, bx: B.x, by: A.y, bz: B.z, hw: bridge.r, hh }]);
+  if (ST.mirror) L.beams.push({ ax: -A.x, ay: A.y, az: A.z, bx: -B.x, by: A.y, bz: B.z, hw: bridge.r, hh });
+  L.rebuildBeams();
+  pushUndo(rec);
+  toast(`Bridge ${Math.round(Math.hypot(bridge.B.x - bridge.A.x, bridge.B.z - bridge.A.z))} mm`);
+}
+
+// ───────────────────────── surface nets mesher
+const P = 19, P2 = P * P;
+const SAMP = new Float32Array(P * P * P);
+const CELLV = new Int32Array(18 * 18 * 18);
+const VP = new Float32Array(18 * 18 * 18 * 3), VN = new Float32Array(18 * 18 * 18 * 3);
+const IDX = new Uint16Array(16 * 16 * 16 * 3 * 6);
+const E0 = [], E1 = [];
+for (let c = 0; c < 8; c++) for (let b = 0; b < 3; b++) if (!(c & (1 << b))) { E0.push(c); E1.push(c | (1 << b)); }
+const CV = new Float32Array(8);
+let dimsDirty = true;
+function removeMesh(L, key) {
+  const m = L.meshes.get(key); if (!m) return;
+  L.group.remove(m); m.geometry.dispose(); L.meshes.delete(key); dimsDirty = true;
+}
+const PB = 23, PB2 = PB * PB;
+const BIG = new Float32Array(PB * PB2), BLA = new Float32Array(PB * PB2), BLB = new Float32Array(PB * PB2);
+function smoothPass(mix) {
+  for (let c = 0; c < PB; c++) for (let b = 0; b < PB; b++) {
+    const row = PB * b + PB2 * c; BLA[row] = BIG[row]; BLA[row + PB - 1] = BIG[row + PB - 1];
+    for (let a = 1; a < PB - 1; a++) BLA[row + a] = (BIG[row + a - 1] + 2 * BIG[row + a] + BIG[row + a + 1]) * 0.25;
+  }
+  for (let c = 0; c < PB; c++) for (let b = 0; b < PB; b++) {
+    const row = PB * b + PB2 * c, edge = b === 0 || b === PB - 1;
+    for (let a = 0; a < PB; a++) { const o = row + a; BLB[o] = edge ? BLA[o] : (BLA[o - PB] + 2 * BLA[o] + BLA[o + PB]) * 0.25; }
+  }
+  for (let c = 0; c < PB; c++) {
+    const edge = c === 0 || c === PB - 1;
+    for (let b = 0; b < PB; b++) { const row = PB * b + PB2 * c; for (let a = 0; a < PB; a++) { const o = row + a; const v = edge ? BLB[o] : (BLB[o - PB2] + 2 * BLB[o] + BLB[o + PB2]) * 0.25; BIG[o] += (v - BIG[o]) * mix; } }
+  }
+}
+// gather one chunk plus padding into BIG and apply the auto-smooth, exactly as the mesh sees it; false when it has no surface
+function gatherSmoothed(chunks, key, smOverride) {
+  const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+  const bi = cx * 16 - 1, bj = cy * 16 - 1, bk = cz * 16 - 1;
+  // gather with 2 extra samples of padding so the auto-smooth blur stays seamless across chunks
+  let bmax = 0, bmin = 1;
+  for (let c = 0; c < PB; c++) {
+    const gk = bk - 2 + c;
+    for (let b = 0; b < PB; b++) {
+      // the clay carries on straight down one voxel into the bed (j=0 copies j=1); the mesh is cut flat at the bed
+      // afterwards, so the bottom layer is never smaller than the one above it
+      const gj0 = bj - 2 + b, gj = gj0 === 0 ? 1 : gj0, row = PB * b + PB2 * c;
+      if (gk < 0 || gk >= N || gj0 < 0 || gj >= N) { for (let a = 0; a < PB; a++) BIG[row + a] = 0; bmin = 0; continue; }
+      let lastKey = -1, arr = null;
+      for (let a = 0; a < PB; a++) {
+        const gi = bi - 2 + a; let v = 0;
+        if (gi >= 0 && gi < N) {
+          const kk = (gi >> 4) + NC * ((gj >> 4) + NC * (gk >> 4));
+          if (kk !== lastKey) { lastKey = kk; arr = chunks.get(kk) || null; }
+          if (arr) v = arr[(gi & 15) + 16 * ((gj & 15) + 16 * (gk & 15))];
+        }
+        BIG[row + a] = v; if (v > bmax) bmax = v; if (v < bmin) bmin = v;
+      }
+    }
+  }
+  if (bmax <= ISO) return false;
+  const sm = smOverride ?? ST.autoSmooth;
+  if (sm > 0) { smoothPass(Math.min(1, sm * 2)); if (sm > 0.5) smoothPass((sm - 0.5) * 2); }
+  return true;
+}
+function surfaceNets(chunks, key) {
+  const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+  const bi = cx * 16 - 1, bj = cy * 16 - 1, bk = cz * 16 - 1;
+  if (!gatherSmoothed(chunks, key)) return null;
+  let mn = 2, mx = -1;
+  for (let c = 0; c < P; c++) for (let b = 0; b < P; b++) {
+    const src = (b + 2) * PB + (c + 2) * PB2 + 2, dst = P * b + P2 * c;
+    for (let a = 0; a < P; a++) { const v = BIG[src + a]; SAMP[dst + a] = v; if (v < mn) mn = v; if (v > mx) mx = v; }
+  }
+  if (mx <= ISO || mn > ISO) return null;
+  let nv = 0;
+  for (let c = 0; c < 18; c++) for (let b = 0; b < 18; b++) for (let a = 0; a < 18; a++) {
+    const base = a + P * b + P2 * c;
+    let mask = 0;
+    for (let q = 0; q < 8; q++) { const v = SAMP[base + (q & 1) + P * ((q >> 1) & 1) + P2 * ((q >> 2) & 1)]; CV[q] = v; if (v > ISO) mask |= 1 << q; }
+    const ci = a + 18 * b + 324 * c;
+    if (mask === 0 || mask === 255) { CELLV[ci] = -1; continue; }
+    let sx = 0, sy = 0, sz = 0, cnt = 0;
+    for (let e = 0; e < 12; e++) {
+      const e0 = E0[e], e1 = E1[e], v0 = CV[e0], v1 = CV[e1];
+      if ((v0 > ISO) !== (v1 > ISO)) {
+        const t = (ISO - v0) / (v1 - v0);
+        const x0 = e0 & 1, y0 = (e0 >> 1) & 1, z0 = (e0 >> 2) & 1;
+        sx += x0 + ((e1 & 1) - x0) * t; sy += y0 + (((e1 >> 1) & 1) - y0) * t; sz += z0 + (((e1 >> 2) & 1) - z0) * t; cnt++;
+      }
+    }
+    sx /= cnt; sy /= cnt; sz /= cnt;
+    const o = nv * 3;
+    VP[o] = -HALF + (bi + a + sx + 0.5) * VS; VP[o + 1] = Math.max(0, (bj + b + sy - 0.5) * VS); VP[o + 2] = -HALF + (bk + c + sz + 0.5) * VS;
+    const gx = (CV[1] + CV[3] + CV[5] + CV[7]) - (CV[0] + CV[2] + CV[4] + CV[6]);
+    const gy = (CV[2] + CV[3] + CV[6] + CV[7]) - (CV[0] + CV[1] + CV[4] + CV[5]);
+    const gz = (CV[4] + CV[5] + CV[6] + CV[7]) - (CV[0] + CV[1] + CV[2] + CV[3]);
+    const gl = Math.hypot(gx, gy, gz) || 1;
+    VN[o] = -gx / gl; VN[o + 1] = -gy / gl; VN[o + 2] = -gz / gl;
+    CELLV[ci] = nv++;
+  }
+  let ni = 0;
+  const quad = (q0, q1, q2, q3, flip) => {
+    if (q0 < 0 || q1 < 0 || q2 < 0 || q3 < 0) return;
+    if (flip) { IDX[ni++] = q0; IDX[ni++] = q1; IDX[ni++] = q2; IDX[ni++] = q0; IDX[ni++] = q2; IDX[ni++] = q3; }
+    else { IDX[ni++] = q0; IDX[ni++] = q2; IDX[ni++] = q1; IDX[ni++] = q0; IDX[ni++] = q3; IDX[ni++] = q2; }
+  };
+  for (let c = 1; c <= 16; c++) for (let b = 1; b <= 16; b++) for (let a = 1; a <= 16; a++) {
+    const s = a + P * b + P2 * c; const inside = SAMP[s] > ISO;
+    if (inside !== (SAMP[s + 1] > ISO))
+      quad(CELLV[a + 18 * (b - 1) + 324 * (c - 1)], CELLV[a + 18 * b + 324 * (c - 1)], CELLV[a + 18 * b + 324 * c], CELLV[a + 18 * (b - 1) + 324 * c], inside);
+    if (inside !== (SAMP[s + P] > ISO))
+      quad(CELLV[(a - 1) + 18 * b + 324 * (c - 1)], CELLV[(a - 1) + 18 * b + 324 * c], CELLV[a + 18 * b + 324 * c], CELLV[a + 18 * b + 324 * (c - 1)], inside);
+    if (inside !== (SAMP[s + P2] > ISO))
+      quad(CELLV[(a - 1) + 18 * (b - 1) + 324 * c], CELLV[a + 18 * (b - 1) + 324 * c], CELLV[a + 18 * b + 324 * c], CELLV[(a - 1) + 18 * b + 324 * c], inside);
+  }
+  return ni ? { nv, ni } : null;
+}
+function meshChunk(L, key) {
+  const r = surfaceNets(L.chunks, key);
+  if (!r) { removeMesh(L, key); return; }
+  const { nv, ni } = r;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(VP.slice(0, nv * 3), 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(VN.slice(0, nv * 3), 3));
+  geo.setIndex(new THREE.BufferAttribute(IDX.slice(0, ni), 1));
+  geo.computeBoundingSphere(); geo.computeBoundingBox();
+  let mesh = L.meshes.get(key);
+  if (mesh) { mesh.geometry.dispose(); mesh.geometry = geo; }
+  else { mesh = new THREE.Mesh(geo, L.material); mesh.matrixAutoUpdate = false; L.group.add(mesh); L.meshes.set(key, mesh); }
+  dimsDirty = true;
+}
+function processRemesh(budgetMs) {
+  const t0 = performance.now();
+  let did = false;
+  for (const L of layers) {
+    for (const key of L.dirty) {
+      L.dirty.delete(key); meshChunk(L, key); did = true;
+      if (performance.now() - t0 > budgetMs) return did;
+    }
+  }
+  return did;
+}
+const anyDirty = () => layers.some(l => l.dirty.size > 0);
+
+// ───────────────────────── print analysis (slice by slice) + support solver
+const occ = new Uint8Array(N * N * N);
+const below = new Uint8Array(N * N * N);
+const firmM = new Uint8Array(N * N * N); let firmUsed = false;   // bridge beams whose ends still sit on clay count as firm
+let cls = new Uint8Array(N * N * N); // 0 empty · 1 prints on what's below · 2 bridges from nearby · 3 needs support · 4 floating island
+const clsTex = new THREE.Data3DTexture(cls, N, N, N);
+clsTex.format = THREE.RedFormat; clsTex.type = THREE.UnsignedByteType; clsTex.minFilter = clsTex.magFilter = THREE.NearestFilter; clsTex.unpackAlignment = 1; clsTex.needsUpdate = true;
+clsU.value = clsTex;
+const OI = (i, j, k) => i + N * (j + N * k);
+function occAt(x, y, z) {
+  const i = Math.round(ix(x)), j = Math.round(iy(y)), k = Math.round(iz(z));
+  if (i < 0 || j < 0 || k < 0 || i >= N || j >= N || k >= N) return 0;
+  return occ[OI(i, j, k)];
+}
+function belowAt(x, y, z) {
+  const i = Math.round(ix(x)), j = Math.round(iy(y)), k = Math.round(iz(z));
+  if (i < 0 || j < 0 || k < 0 || i >= N || j >= N || k >= N) return 0;
+  return below[OI(i, j, k)] || occ[OI(i, j, k)];
+}
+function ringBlocked(x, y, z, c) {
+  if (occAt(x, y, z) || occAt(x, y - 1.0, z)) return true;
+  for (let a = 0; a < 8; a++) {
+    const ang = a * Math.PI / 4, px = x + Math.cos(ang) * c, pz = z + Math.sin(ang) * c;
+    if (occAt(px, y, pz) || occAt(px, y - 1.0, pz)) return true;
+  }
+  return false;
+}
+// ── burying support ends: every rounded end must finish deep inside solid clay
+const DIRS14 = (() => { const d = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]]; for (const a of [-1,1]) for (const b of [-1,1]) for (const c of [-1,1]) d.push([a/Math.sqrt(3), b/Math.sqrt(3), c/Math.sqrt(3)]); return d; })();
+function solidScore(x, y, z, rad) {
+  if (!occAt(x, y, z)) return -1;
+  let n = 0; for (const d of DIRS14) if (occAt(x + d[0] * rad, y + d[1] * rad, z + d[2] * rad)) n++;
+  return n; // 14 = a ball of this radius fits inside
+}
+function massDir(x, y, z) {
+  let sx = 0, sy = 0, sz = 0;
+  for (let a = -3; a <= 3; a++) for (let b = -3; b <= 3; b++) for (let c = -3; c <= 3; c++) {
+    if (a * a + b * b + c * c > 9) continue;
+    if (occAt(x + a * VS, y + b * VS, z + c * VS)) { sx += a; sy += b; sz += c; }
+  }
+  const l = Math.hypot(sx, sy, sz); return l < 1e-6 ? null : [sx / l, sy / l, sz / l];
+}
+// march from p along d; return the first point where a ball of radius rad fits, else the most-buried point (never past where we pop out the far side)
+function burrow(p, d, rad, maxLen) {
+  let best = null, bs = -2, entered = false;
+  for (let t = 0; t <= maxLen; t += 0.7) {
+    const x = p.x + d[0] * t, y = p.y + d[1] * t, z = p.z + d[2] * t;
+    const sc = solidScore(x, y, z, rad);
+    if (sc >= 0) entered = true; else if (entered && t > rad) break;
+    if (sc > bs) { bs = sc; best = { x, y, z, score: sc }; }
+    if (sc === 14) return best;
+  }
+  return best;
+}
+function fitRadius(p, r) {
+  for (const f of [1, 0.85, 0.72, 0.6, 0.5, 0.42, 0.35]) { const rr = Math.max(1.0, r * f); if (solidScore(p.x, p.y, p.z, rr) === 14) return rr; }
+  return 1.0;
+}
+function buryEnd(a, dir, rad) {
+  let pick = burrow(a, dir, rad, rad * 4 + 10);
+  if (!pick || pick.score < 14) {
+    const m = massDir(a.x, a.y, a.z);
+    if (m) { const inward = burrow(a, m, rad, rad * 3 + 8); if (inward && (!pick || inward.score > pick.score)) pick = inward; }
+  }
+  pick = pick || { x: a.x, y: a.y, z: a.z, score: 0 };
+  pick.fit = fitRadius(pick, rad);   // the end shrinks to whatever fits inside the part it lands on
+  return pick;
+}
+const TAPER = 0.9; // how fast a branch may slim down going downward (mm per mm) and stay printable
+
+// nearest solid surface below (x,y,z) inside a printable cone; null if the plate is closer
+function findAnchor(x, y, z, tanA) {
+  if (y < 4) return null;
+  const R = Math.min(70, y * tanA), ri = Math.ceil(R / VS);
+  const ci = Math.round(ix(x)), ck = Math.round(iz(z));
+  let best = null, bd = y * 0.95;
+  for (let dk = -ri; dk <= ri; dk += 2) {
+    const k = ck + dk; if (k < 1 || k >= N - 1) continue;
+    for (let di = -ri; di <= ri; di += 2) {
+      const i = ci + di; if (i < 1 || i >= N - 1) continue;
+      const r = Math.hypot(vx(i) - x, vz(k) - z); if (r > R) continue;
+      const hc = y - Math.max(1.5, r / tanA);           // highest point of this column inside the cone
+      const jc = Math.floor(iy(hc)); if (jc < 1) continue;
+      const o = OI(i, jc, k);
+      const jb = occ[o] ? jc : below[o]; if (!jb) continue;
+      const ay = jb === jc ? hc : vy(jb) + VS * 0.5;
+      const d = Math.hypot(r, y - ay); if (d < bd) { bd = d; best = { x: vx(i), y: ay, z: vz(k) }; }
+    }
+  }
+  if (!best) return null;
+  for (let t = 0.15; t < 0.8; t += 0.13) if (occAt(x + (best.x - x) * t, y + (best.y - y) * t, z + (best.z - z) * t)) return null;
+  return best;
+}
+let supNeed = true, supRunning = null, lastEditAt = 0, lastSolveStart = 0;
+const supStats = { contacts: 0, dead: 0, islands: 0, growing: false };
+let solveTick = 0;
+const solveMaybe = () => performance.now() - solveTick > 4;
+// occupancy of the sculpt (plus support clay when checking the finished result)
+function* occGen(vis, extra) {
+  occ.fill(0);
+  let bi0 = N, bi1 = -1, bj1 = -1, bk0 = N, bk1 = -1;
+  const add = function* (map) {
+    for (const [key, ch] of map) {
+      const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+      let any = false;
+      // judge the clay as it will actually be printed: after the same auto-smooth the mesh gets
+      // (the first layer keeps its raw shape so a smoothed foot never lifts off the bed)
+      if (gatherSmoothed(map, key)) for (let k = 0; k < 16; k++) for (let j = 0; j < 16; j++) {
+        if (cy === 0 && j === 0) continue;   // the bed itself
+        const rl = 16 * (j + 16 * k), g0 = cx * 16 + N * ((cy * 16 + j) + N * (cz * 16 + k)), bl = (j + 3) * PB + (k + 3) * PB2 + 3, first = cy * 16 + j === 1;
+        for (let i = 0; i < 16; i++) if (BIG[bl + i] > ISO || (first && ch[rl + i] > ISO)) { occ[g0 + i] = 1; any = true; }
+      }
+      if (any) { bi0 = Math.min(bi0, cx * 16); bi1 = Math.max(bi1, cx * 16 + 15); bj1 = Math.max(bj1, cy * 16 + 15); bk0 = Math.min(bk0, cz * 16); bk1 = Math.max(bk1, cz * 16 + 15); }
+      if (solveMaybe()) { yield; solveTick = performance.now(); }
+    }
+  };
+  for (const L of vis) yield* add(L.chunks);
+  if (extra) yield* add(extra);
+  if (firmUsed) { firmM.fill(0); firmUsed = false; }
+  for (const L of vis) if (L.bridge) for (const b of L.beams) {
+    const anchored = clayNear({ x: b.ax, y: b.ay, z: b.az }, b.hw + VS) && clayNear({ x: b.bx, y: b.ay, z: b.bz }, b.hw + VS);
+    const cx = (b.ax + b.bx) / 2, cz = (b.az + b.bz) / 2, R = beamLen(b) / 2 + b.hw + VS;
+    const [i0, i1, j0, j1, k0, k1] = voxBox(cx - R, cx + R, b.ay - b.hh - VS, b.ay + b.hh + VS, cz - R, cz + R);
+    for (let k = k0; k <= k1; k++) for (let j = Math.max(1, j0); j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      if (!insideBeam(b, vx(i), vy(j), vz(k))) continue;
+      const g = OI(i, j, k); occ[g] = 1; if (anchored) { firmM[g] = 1; firmUsed = true; }
+      bi0 = Math.min(bi0, i); bi1 = Math.max(bi1, i); bj1 = Math.max(bj1, j); bk0 = Math.min(bk0, k); bk1 = Math.max(bk1, k);
+    }
+  }
+  below.fill(0);
+  if (bi1 < 0) return null;
+  bi0 = Math.max(1, bi0 - 1); bk0 = Math.max(1, bk0 - 1); bi1 = Math.min(N - 2, bi1 + 1); bk1 = Math.min(N - 2, bk1 + 1); bj1 = Math.min(N - 2, bj1 + 1);
+  for (let k = bk0; k <= bk1; k++) for (let i = bi0; i <= bi1; i++) { let last = 0; for (let j = 0; j < N; j++) { const o = i + N * (j + N * k); below[o] = last; if (occ[o]) last = j; } }
+  yield; solveTick = performance.now();
+  return { bi0, bi1, bj1, bk0, bk1 };
+}
+// walk the slices bottom → top like a slicer; returns per-voxel classes + spots that need help
+function* classifyGen(bb, sup, nextCls) {
+  const sp = sup.spacing;
+  const contacts = [];
+  let islands = 0;
+  if (!bb) return { contacts, islands };
+  const { bi0, bi1, bj1, bk0, bk1 } = bb;
+    // 2) walk the slices bottom → top like a slicer
+    const W = bi1 - bi0 + 1, H = bk1 - bk0 + 1, WH = W * H;
+    const dB = new Float32Array(WH), dS = new Float32Array(WH), lab = new Int32Array(WH), stack = new Int32Array(WH);
+    const reg = new Int32Array(WH), okB = new Uint8Array(WH), tc = new Int32Array(WH).fill(-1), seen2 = new Int32Array(WH).fill(-1), stack2 = new Int32Array(WH);
+    const maxB = sup.maxBridge / 2 / VS; let rid = 0;
+    const reach = 1 / Math.tan(clamp(sup.angle, 5, 85) * DEG);      // voxels a layer may step out over the one below
+    const bridge = sup.bridge / VS;                                   // voxels an overhang may cantilever, added up across layers
+    const reachT = reach + 0.25;
+    const DISK = []; { const R = Math.ceil(reachT); for (let dk = -R; dk <= R; dk++) for (let di = -R; di <= R; di++) if (di * di + dk * dk <= reachT * reachT) DISK.push([di, dk]); }
+    let cantPrev = new Float32Array(WH), cantCur = new Float32Array(WH);
+    const D2 = Math.SQRT2, INF = 1e9;
+    const chamfer = (d, mask) => { // two-pass distance; mask limits propagation to solid cells when given
+      for (let r = 0; r < 2; r++) {
+        for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
+          const o = i + W * k; if (mask && !mask(o, i, k)) continue; let v = d[o];
+          if (i > 0) v = Math.min(v, d[o - 1] + 1); if (k > 0) { v = Math.min(v, d[o - W] + 1); if (i > 0) v = Math.min(v, d[o - W - 1] + D2); if (i < W - 1) v = Math.min(v, d[o - W + 1] + D2); }
+          d[o] = v;
+        }
+        for (let k = H - 1; k >= 0; k--) for (let i = W - 1; i >= 0; i--) {
+          const o = i + W * k; if (mask && !mask(o, i, k)) continue; let v = d[o];
+          if (i < W - 1) v = Math.min(v, d[o + 1] + 1); if (k < H - 1) { v = Math.min(v, d[o + W] + 1); if (i < W - 1) v = Math.min(v, d[o + W + 1] + D2); if (i > 0) v = Math.min(v, d[o + W - 1] + D2); }
+          d[o] = v;
+        }
+      }
+    };
+    for (let j = 1; j <= bj1; j++) {
+      const base = (i, k) => (bi0 + i) + N * (j + N * (bk0 + k));
+      let anySolid = false;
+      for (let k = 0; k < H && !anySolid; k++) for (let i = 0; i < W; i++) if (occ[base(i, k)]) { anySolid = true; break; }
+      if (!anySolid) { cantPrev.fill(0); continue; }
+      if (j === 1) { for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) if (occ[base(i, k)]) nextCls[base(i, k)] = 1; cantPrev.fill(0); continue; }
+      // distance to the slice below
+      for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) dB[i + W * k] = occ[(bi0 + i) + N * ((j - 1) + N * (bk0 + k))] ? 0 : INF;
+      chamfer(dB, null);
+      // components of this slice
+      lab.fill(-1); let nComp = 0; const compSup = [];
+      for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
+        const o = i + W * k; if (!occ[base(i, k)] || lab[o] >= 0) continue;
+        let top = 0; stack[top++] = o; lab[o] = nComp; let s = false;
+        while (top) {
+          const c = stack[--top], ci = c % W, ck = (c / W) | 0; if (dB[c] <= reachT || firmM[base(ci, ck)]) s = true;
+          for (let dk = -1; dk <= 1; dk++) for (let di = -1; di <= 1; di++) {
+            const ni = ci + di, nk = ck + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue;
+            const q = ni + W * nk; if (lab[q] < 0 && occ[base(ni, nk)]) { lab[q] = nComp; stack[top++] = q; }
+          }
+        }
+        compSup.push(s); nComp++;
+      }
+      // how far each overhanging cell is from material that is supported
+      // cantilever: how far each cell hangs out from firmly supported clay, carried up from the layers below
+      for (let o = 0; o < WH; o++) {
+        if (lab[o] >= 0 && firmUsed && firmM[base(o % W, (o / W) | 0)]) { dS[o] = 0; continue; }
+        if (lab[o] < 0 || dB[o] > reachT) { dS[o] = INF; continue; }
+        const i = o % W, k = (o / W) | 0; let mn = INF;
+        for (const [di, dk] of DISK) {
+          const ni = i + di, nk = k + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue;
+          if (occ[(bi0 + ni) + N * ((j - 1) + N * (bk0 + nk))]) { const v = cantPrev[ni + W * nk]; if (v < mn) mn = v; }
+        }
+        dS[o] = mn === INF ? 0 : mn;
+      }
+      chamfer(dS, (o) => lab[o] >= 0);
+      // flat bridges: an unsupported patch that touches supported clay in two separate places is fine up to the max bridge length
+      okB.fill(0); reg.fill(-1);
+      const supd = (q) => lab[q] >= 0 && dB[q] <= reachT;
+      for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
+        const o0 = i + W * k, L0 = lab[o0];
+        if (L0 < 0 || !compSup[L0] || supd(o0) || reg[o0] >= 0) continue;
+        const id = rid++; let top = 0; stack[top++] = o0; reg[o0] = id; const cells = []; let far = 0;
+        while (top) {
+          const c = stack[--top]; cells.push(c); if (dS[c] > far) far = dS[c];
+          const ci = c % W, ck = (c / W) | 0;
+          for (let dk = -1; dk <= 1; dk++) for (let di = -1; di <= 1; di++) {
+            const ni = ci + di, nk = ck + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue;
+            const q = ni + W * nk; if (reg[q] < 0 && lab[q] >= 0 && !supd(q)) { reg[q] = id; stack[top++] = q; }
+          }
+        }
+        if (far <= bridge || far > maxB) continue;
+        const touch = [];
+        for (const c of cells) {
+          const ci = c % W, ck = (c / W) | 0; let t = false;
+          for (let dk = -1; dk <= 1 && !t; dk++) for (let di = -1; di <= 1; di++) { const ni = ci + di, nk = ck + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue; if (supd(ni + W * nk)) { t = true; break; } }
+          if (t) { touch.push(c); tc[c] = id; }
+        }
+        const cents = [];
+        for (const t0 of touch) {
+          if (seen2[t0] === id) continue;
+          let tp = 0; stack2[tp++] = t0; seen2[t0] = id; let sx = 0, sz = 0, n = 0;
+          while (tp) {
+            const c = stack2[--tp], ci = c % W, ck = (c / W) | 0; sx += ci; sz += ck; n++;
+            for (let dk = -1; dk <= 1; dk++) for (let di = -1; di <= 1; di++) { const ni = ci + di, nk = ck + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue; const q = ni + W * nk; if (tc[q] === id && seen2[q] !== id) { seen2[q] = id; stack2[tp++] = q; } }
+          }
+          cents.push([sx / n, sz / n]);
+        }
+        let spread = 0;
+        for (let a = 0; a < cents.length; a++) for (let b = a + 1; b < cents.length; b++) spread = Math.max(spread, Math.hypot(cents[a][0] - cents[b][0], cents[a][1] - cents[b][1]));
+        if (cents.length >= 2 && spread >= 3) for (const c of cells) okB[c] = 1;
+      }
+      const needBins = new Map();
+      for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
+        const o = i + W * k, L = lab[o]; if (L < 0) continue;
+        let c;
+        if (firmUsed && firmM[base(i, k)]) c = 1; else if (!compSup[L]) c = 4; else if (dS[o] < 0.05) c = 1; else if (dS[o] <= bridge || okB[o]) c = 2; else c = 3;
+        nextCls[base(i, k)] = c;
+        cantCur[o] = (c === 2 && !okB[o]) ? dS[o] : 0;
+        if (c >= 3) {
+          const x = vx(bi0 + i), z = vz(bk0 + k);
+          const bx = Math.floor((x + HALF) / sp), bz = Math.floor((z + HALF) / sp), key = bx + 1000 * bz + (c === 4 ? 1e7 * (L + 1) : 0);
+          const dx = x - ((bx + 0.5) * sp - HALF), dz = z - ((bz + 0.5) * sp - HALF), dd = dx * dx + dz * dz;
+          const B = needBins.get(key); if (!B || dd < B.d) needBins.set(key, { d: dd, x, z, island: c === 4, isle: c === 4 ? j * 100000 + L : 0 });
+        }
+      }
+      for (let L = 0; L < nComp; L++) if (!compSup[L]) islands++;
+      for (const B of needBins.values()) contacts.push({ x: B.x, y: (j - 1) * VS, z: B.z, island: B.island, isle: B.isle });
+      { const t = cantPrev; cantPrev = cantCur; cantCur = t; cantCur.fill(0); }
+      if (solveMaybe()) { yield; solveTick = performance.now(); }
+    }
+  return { contacts, islands };
+}
+function dedupeContacts(contacts, sp) {
+  contacts.sort((a, b) => (a.island ? 0 : 1) - (b.island ? 0 : 1) || a.y - b.y);
+  const keep = [], dh = new Map(), cell = sp * 0.75, isleSeen = new Set();
+  for (const c of contacts) {
+    const gx = Math.floor(c.x / cell), gy = Math.floor(c.y / cell), gz = Math.floor(c.z / cell);
+    let close = false;
+    const mustKeep = c.island && !isleSeen.has(c.isle); if (c.island) isleSeen.add(c.isle);
+    if (!mustKeep) for (let a = -1; a <= 1 && !close; a++) for (let b = -1; b <= 1 && !close; b++) for (let d = -1; d <= 1 && !close; d++) {
+      const arr = dh.get((gx + a) + ',' + (gy + b) + ',' + (gz + d)); if (!arr) continue;
+      for (const o of arr) if ((o.x - c.x) ** 2 + (o.y - c.y) ** 2 + (o.z - c.z) ** 2 < cell * cell) { close = true; break; }
+    }
+    if (close) continue;
+    keep.push(c); const k = gx + ',' + gy + ',' + gz; if (!dh.has(k)) dh.set(k, []); dh.get(k).push(c);
+  }
+  return keep;
+}
+// grow branches for a set of contact spots; returns capsule segments to rasterize
+// Supports are built layer by layer as stacks of disks, using the exact same rule as the overhang check:
+// every disk cell must sit within reach of clay in the layer below. A branch stops the moment the
+// sculpture underneath covers it, shrinking as it lands, so no support ever ends in a hanging lump.
+function* strandGen(keep, sup, fresh) {
+  const plateOnly = sup.plateOnly;
+  const reachV = 1 / Math.tan(clamp(sup.angle, 5, 85) * DEG), reachT = reachV + 0.25;
+  const tanB = Math.tan(clamp(sup.branchAngle, 5, 80) * DEG);
+  const moveV = Math.min(reachV * 0.85, tanB);                 // sideways drift per layer, always inside reach
+  const tipRv = Math.max(0.9, sup.tipD / 2 / VS), baseRv = Math.max(tipRv, sup.branchD / 2 / VS);
+  const rMax = (lv, isl) => baseRv * Math.min(1.8, 1 + 0.2 * Math.log2(lv)) * (isl ? 1.3 : 1);
+  const attract = Math.max(6, sup.spacing * 2.5 / VS);
+  const DT = []; { const R = Math.ceil(reachT); for (let dk = -R; dk <= R; dk++) for (let di = -R; di <= R; di++) if (di * di + dk * dk <= reachT * reachT) DT.push([di, dk]); }
+  const covered = (i, k, j) => {
+    if (j <= 0) return true;
+    for (const [di, dk] of DT) { const ii = i + di, kk = k + dk; if (ii < 0 || kk < 0 || ii >= N || kk >= N) continue; if (occ[ii + N * (j + N * kk)]) return true; }
+    return false;
+  };
+  const cellsOf = (d) => { const out = [], R = Math.ceil(d.r); for (let k = Math.round(d.z) - R; k <= Math.round(d.z) + R; k++) for (let i = Math.round(d.x) - R; i <= Math.round(d.x) + R; i++) { if (i < 1 || k < 1 || i > N - 2 || k > N - 2) continue; if ((i - d.x) ** 2 + (k - d.z) ** 2 <= d.r * d.r) out.push(i, k); } return out; };
+  const write = (j, cx, cz, r) => {
+    const R = r + 1;
+    for (let k = Math.max(1, Math.floor(cz - R)); k <= Math.min(N - 2, Math.ceil(cz + R)); k++) for (let i = Math.max(1, Math.floor(cx - R)); i <= Math.min(N - 2, Math.ceil(cx + R)); i++) {
+      const d = Math.hypot(i - cx, k - cz); const v = d <= r ? 1 : (d <= r + 0.9 ? 0.48 - (d - r) / 1.9 : 0); if (v <= 0) continue;
+      const key = (i >> 4) + NC * ((j >> 4) + NC * (k >> 4)); let ch = fresh.get(key); if (!ch) { ch = new Float32Array(4096); fresh.set(key, ch); }
+      const li = (i & 15) + 16 * ((j & 15) + 16 * (k & 15)); if (v > ch[li]) ch[li] = v;
+    }
+  };
+  const S = [];
+  for (const c of keep) {
+    const start = Math.round(iy(c.y) - 0.5);
+    if (start < 1) continue;
+    S.push({ x: ix(c.x), z: iz(c.z), start, r: tipRv * (c.island ? 1.35 : 1), lv: 1, isl: !!c.island, prev: null, done: false, ax: undefined, src: c });
+  }
+  if (!S.length) return { dead: [] };
+  const top = Math.max(...S.map(s => s.start));
+  for (let j = top; j >= 0; j--) {
+    const live = S.filter(s => !s.done && s.start >= j);
+    for (const s of live) {
+      let unc = null, total = 0;
+      if (s.prev) {
+        unc = []; const seen = new Set();
+        for (const d of s.prev) { const c = cellsOf(d); for (let q = 0; q < c.length; q += 2) { const key = c[q] + N * c[q + 1]; if (seen.has(key)) continue; seen.add(key); total++; if (j > 0 && (plateOnly || !covered(c[q], c[q + 1], j))) unc.push(c[q], c[q + 1]); } }
+        if (!unc.length) { s.done = true; continue; }
+      }
+      if (j === 0) { s.done = true; continue; }
+      // steer: toward sculpt it can land on, else toward a neighbour to merge, else straight down
+      if (s.prev) {
+        let tx = null, tz = null, half = false;
+        if (!plateOnly) {
+          if (s.ax === undefined || j % 3 === 0) { const a = findAnchor(vx(s.x), vy(j), vz(s.z), tanB); s.ax = a ? ix(a.x) : null; s.az = a ? iz(a.z) : null; }
+          if (s.ax !== null) { tx = s.ax; tz = s.az; }
+        }
+        if (tx === null) {
+          let bd = attract * attract, best = null;
+          for (const o of live) { if (o === s || o.done || !o.prev) continue; const d2 = (o.x - s.x) ** 2 + (o.z - s.z) ** 2; if (d2 < bd) { bd = d2; best = o; } }
+          if (best) { tx = best.x; tz = best.z; half = true; }
+        }
+        if (tx !== null) {
+          let dx = tx - s.x, dz = tz - s.z; const l = Math.hypot(dx, dz);
+          if (l > 1e-6) { const m = Math.min(moveV, half ? l / 2 : l); s.x += dx / l * m; s.z += dz / l * m; }
+        }
+        s.x = clamp(s.x, 2, N - 3); s.z = clamp(s.z, 2, N - 3);
+        // the new disk must reach every uncovered cell of the disk above
+        let need = 0; for (let q = 0; q < unc.length; q += 2) need = Math.max(need, Math.hypot(unc[q] - s.x, unc[q + 1] - s.z) - reachV);
+        const free = unc.length / 2 === total;
+        s.r = free ? Math.max(need, Math.min(rMax(s.lv, s.isl), s.r + 0.12)) : Math.max(need, 0.9);
+        if (free && j <= 2) s.r += 0.6;  // little foot
+      }
+      write(j, s.x, s.z, s.r);
+      s.prev = [{ x: s.x, z: s.z, r: s.r }];
+    }
+    // merge branches that touch, as long as the joined trunk stays reasonable
+    const L2 = S.filter(s => !s.done && s.prev && s.start >= j);
+    for (let a = 0; a < L2.length; a++) {
+      const A = L2[a]; if (A.done) continue;
+      for (let b = a + 1; b < L2.length; b++) {
+        const B = L2[b]; if (B.done) continue;
+        const d = Math.hypot(A.x - B.x, A.z - B.z); if (d > (A.r + B.r) * 0.9 + 1) continue;
+        const lv = A.lv + B.lv, mx = (A.x * A.lv + B.x * B.lv) / lv, mz = (A.z * A.lv + B.z * B.lv) / lv;
+        const req = Math.max(Math.hypot(mx - A.x, mz - A.z) + A.r, Math.hypot(mx - B.x, mz - B.z) + B.r) - reachV;
+        if (req > rMax(lv, A.isl || B.isl) * 1.25) continue;
+        A.prev = A.prev.concat(B.prev); A.x = mx; A.z = mz; A.lv = lv; A.isl = A.isl || B.isl; A.r = Math.max(A.r, B.r); A.ax = undefined; B.done = true;
+      }
+    }
+    if (solveMaybe()) { yield; solveTick = performance.now(); }
+  }
+  return { dead: [] };
+}
+// how deep inside the clay every voxel sits, plus a walk to the middle of a part from any spot on it
+function* depthGen(bb) {
+  const { bi0, bi1, bj1, bk0, bk1 } = bb;
+  const W = bi1 - bi0 + 1, HJ = bj1 + 1;
+  const dist = new Uint16Array(W * HJ * (bk1 - bk0 + 1));
+  const L = (i, j, k) => (i - bi0) + W * (j + HJ * (k - bk0));
+  for (let k = bk0; k <= bk1; k++) for (let j = 0; j <= bj1; j++) for (let i = bi0; i <= bi1; i++) dist[L(i, j, k)] = occ[OI(i, j, k)] ? 60000 : 0;
+  const FW = [];
+  for (let dk = -1; dk <= 0; dk++) for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+    if (dk === 0 && (dj > 0 || (dj === 0 && di >= 0))) continue;
+    const n = (di !== 0) + (dj !== 0) + (dk !== 0); FW.push([n === 1 ? 3 : n === 2 ? 4 : 5, di + W * (dj + HJ * dk)]);
+  }
+  for (let k = bk0 + 1; k < bk1; k++) { for (let j = 1; j < bj1; j++) for (let i = bi0 + 1; i < bi1; i++) { const o = L(i, j, k); let v = dist[o]; if (!v) continue; for (const f of FW) { const w = dist[o + f[1]] + f[0]; if (w < v) v = w; } dist[o] = v; } if (solveMaybe()) { yield; solveTick = performance.now(); } }
+  for (let k = bk1 - 1; k > bk0; k--) { for (let j = bj1 - 1; j >= 1; j--) for (let i = bi1 - 1; i > bi0; i--) { const o = L(i, j, k); let v = dist[o]; if (!v) continue; for (const f of FW) { const w = dist[o - f[1]] + f[0]; if (w < v) v = w; } dist[o] = v; } if (solveMaybe()) { yield; solveTick = performance.now(); } }
+  const depth = (i, j, k) => (i <= bi0 || i >= bi1 || k <= bk0 || k >= bk1 || j < 1 || j >= bj1) ? 0 : dist[L(i, j, k)] / 3;
+  // walk uphill in depth to the middle of the part, staying near the starting column so it doesn't wander off
+  const middle = (i0, j0, k0, enough) => {
+    i0 = Math.round(i0); j0 = Math.round(j0); k0 = Math.round(k0);
+    let i = i0, j = j0, k = k0, d = depth(i, j, k);
+    for (let step = 0; step < 40 && d < enough; step++) {
+      let bi = i, bj = j, bk = k, bd = d;
+      for (let dk = -1; dk <= 1; dk++) for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        const ni = i + di, nj = j + dj, nk = k + dk;
+        if (Math.hypot(ni - i0, nk - k0) > 5) continue;
+        const v = depth(ni, nj, nk); if (v > bd + 1e-3) { bd = v; bi = ni; bj = nj; bk = nk; }
+      }
+      if (bd <= d) break; i = bi; j = bj; k = bk; d = bd;
+    }
+    return { i, j, k, d };
+  };
+  return { depth, middle };
+}
+// a tapered tube of clay from a to b (voxel coords), radius ra at a and rb at b
+function stampTube(fresh, a, b, ra, rb) {
+  const len2 = (b.i - a.i) ** 2 + (b.j - a.j) ** 2 + (b.k - a.k) ** 2 || 1e-6;
+  const R = Math.max(ra, rb) + 2;
+  const i0 = Math.max(1, Math.floor(Math.min(a.i, b.i) - R)), i1 = Math.min(N - 2, Math.ceil(Math.max(a.i, b.i) + R));
+  const j0 = Math.max(1, Math.floor(Math.min(a.j, b.j) - R)), j1 = Math.min(N - 2, Math.ceil(Math.max(a.j, b.j) + R));
+  const k0 = Math.max(1, Math.floor(Math.min(a.k, b.k) - R)), k1 = Math.min(N - 2, Math.ceil(Math.max(a.k, b.k) + R));
+  const dx = b.i - a.i, dy = b.j - a.j, dz = b.k - a.k;
+  for (let k = k0; k <= k1; k++) for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const t = clamp(((i - a.i) * dx + (j - a.j) * dy + (k - a.k) * dz) / len2, 0, 1);
+    const d = Math.hypot(i - a.i - dx * t, j - a.j - dy * t, k - a.k - dz * t);
+    const v = clamp(0.5 + (ra + (rb - ra) * t - d) * 0.6, 0, 1); if (v <= 0) continue;
+    const key = (i >> 4) + NC * ((j >> 4) + NC * (k >> 4)); let ch = fresh.get(key); if (!ch) { ch = new Float32Array(4096); fresh.set(key, ch); }
+    const li = (i & 15) + 16 * ((j & 15) + 16 * (k & 15)); if (v > ch[li]) ch[li] = v;
+  }
+}
+// FUSED (default): load-carrying trees. Every branch starts in the middle of the part it holds up. Going down,
+// branches gather toward the weighted middle of the load around them and join into trunks, which get thicker
+// with the share of the sculpture they carry. A trunk ends in the middle of the part (or plate) it stands on.
+function* treeGen(keep, sup, fresh, bb, clsArr) {
+  if (!bb || !keep.length) return;
+  const { depth, middle } = yield* depthGen(bb);
+  const { bi0, bi1, bj1, bk0, bk1 } = bb;
+  const tanB = Math.tan(clamp(sup.branchAngle, 5, 60) * DEG);
+  const reachV = 1 / Math.tan(clamp(sup.angle, 5, 85) * DEG);
+  const tanMax = Math.min(tanB * 1.2, 1 / Math.tan(clamp(sup.angle + 8, 10, 85) * DEG));
+  const rMin = Math.max(2.0, sup.branchD / 2) / VS + 0.25;          // never thinner than 4 mm across, even after smoothing
+  const rCap = rMin * 2.6;
+  const sp = Math.max(sup.spacing, sup.branchD + 2 * sup.bridge) / VS;
+  const wRef = sp * sp * 4;                                          // about what one contact carries on a typical arm
+  const rOf = (w) => clamp(rMin * Math.sqrt(Math.max(1, w / wRef)), rMin, rCap);
+  const C = [];
+  for (const c of keep) {
+    const ci = Math.round(ix(c.x)), ck = Math.round(iz(c.z)); let cj = Math.floor(iy(c.y)) + 1;
+    for (let t = 0; t < 4 && !occ[OI(ci, cj, ck)]; t++) cj++;
+    if (!occ[OI(ci, cj, ck)]) continue;
+    C.push({ ci, cj, ck, w: 0, isl: !!c.island });
+  }
+  if (!C.length) return;
+  // how much clay each contact holds: the overhanging cells nearest to it, each counting the clay stacked on it
+  for (let k = bk0; k <= bk1; k++) {
+    for (let j = 1; j <= bj1; j++) for (let i = bi0; i <= bi1; i++) {
+      const g = OI(i, j, k); if (!occ[g] || clsArr[g] < 3) continue;
+      let t = 1; while (t < 40 && j + t < N - 1 && occ[g + N * t]) t++;
+      let best = null, bd = Infinity;
+      for (const c of C) { const d = (c.ci - i) ** 2 + 0.5 * (c.cj - j) ** 2 + (c.ck - k) ** 2; if (d < bd) { bd = d; best = c; } }
+      if (best && bd < 9 * sp * sp) best.w += t;
+    }
+    if (solveMaybe()) { yield; solveTick = performance.now(); }
+  }
+  const okLean = (P, B) => { const v = P.j - B.j; return v > 0.5 && Math.hypot(P.i - B.i, P.k - B.k) <= v * tanMax; };
+  // nearest part below the spot (inside a printable cone) that is thick enough to bury a branch end of radius r in
+  const anchorFor = (ci, cy, ck, A, r) => {
+    const R = Math.min(70 / VS, cy * tanB), ri = Math.ceil(R), cand = [];
+    for (let dk = -ri; dk <= ri; dk += 2) for (let di = -ri; di <= ri; di += 2) {
+      const i = Math.round(ci) + di, k = Math.round(ck) + dk; if (i <= bi0 || k <= bk0 || i >= bi1 || k >= bk1) continue;
+      const rr = Math.hypot(i - ci, k - ck); if (rr > R) continue;
+      const jc = Math.floor(cy - Math.max(1, rr / tanB)); if (jc < 1) continue;
+      const o = OI(i, jc, k), jb = occ[o] ? jc : below[o]; if (!jb) continue;
+      cand.push({ i, j: jb, k, d: Math.hypot(rr, cy - jb) });
+    }
+    cand.sort((p, q) => p.d - q.d);
+    for (let q = 0; q < Math.min(10, cand.length); q++) {
+      const h = cand[q], B = middle(h.i, h.j, h.k, r + 1.5);
+      if (B.d >= r - 0.4 && okLean(A, B)) return { B, d: h.d };
+    }
+    return null;
+  };
+  const T = [];
+  for (const c of C) {
+    const A = middle(c.ci, c.cj, c.ck, rMin + 1.5);
+    const w = (c.w + wRef * 0.25) * (c.isl ? 1.5 : 1), r = rOf(w);
+    T.push({ c, A, w, r, rTop: Math.max(1.2, Math.min(r, A.d - 0.2)) });
+  }
+  // 1) a spot with sculpt close underneath leans straight into the middle of it
+  const free = [];
+  for (const t of T) {
+    const a = sup.plateOnly ? null : anchorFor(t.c.ci, t.c.cj - 1, t.c.ck, t.A, t.r);
+    if (a && a.d < 0.6 * t.c.cj) stampTube(fresh, t.A, a.B, t.rTop, t.r); else free.push(t);
+  }
+  if (solveMaybe()) { yield; solveTick = performance.now(); }
+  // 2) the rest gather into trunks: group nearby spots while every one of them can still reach the group's
+  //    weighted middle at the branch angle, high enough above the plate to join cleanly
+  const lean = tanB * 0.9, minJoin = 6, Rmax = 45 / VS;
+  const fits = (m, ci, ck) => m.every(t => { const d = Math.hypot(t.A.i - ci, t.A.k - ck); return d <= Rmax && t.A.j - d / lean >= minJoin; });
+  let G = free.map(t => ({ m: [t], w: t.w, ci: t.A.i, ck: t.A.k }));
+  for (;;) {
+    let best = null, bd = Infinity;
+    for (let p = 0; p < G.length; p++) for (let q = p + 1; q < G.length; q++) {
+      const A = G[p], B = G[q], d = Math.hypot(A.ci - B.ci, A.ck - B.ck); if (d >= bd) continue;
+      const w = A.w + B.w, ci = (A.ci * A.w + B.ci * B.w) / w, ck = (A.ck * A.w + B.ck * B.w) / w;
+      if (!fits(A.m.concat(B.m), ci, ck)) continue;
+      bd = d; best = { p, q, w, ci, ck };
+    }
+    if (!best) break;
+    const A = G[best.p], B = G[best.q];
+    G[best.p] = { m: A.m.concat(B.m), w: best.w, ci: best.ci, ck: best.ck }; G.splice(best.q, 1);
+  }
+  // 3) each group: branches run from their spots to the trunk, the trunk stands under the weighted middle and
+  //    thickens every time a branch joins, then ends in the middle of the part below it or on the plate
+  for (const g of G) {
+    const joins = g.m.map(t => { const d = Math.hypot(t.A.i - g.ci, t.A.k - g.ck); return { t, y: d < 0.6 ? t.A.j : t.A.j - d / lean }; }).sort((p, q) => q.y - p.y);
+    const trunk = []; let W = 0;
+    for (const jn of joins) {
+      W += jn.t.w; const rT = rOf(W), M = { i: g.ci, j: jn.y, k: g.ck };
+      if (jn.y < jn.t.A.j - 0.5) stampTube(fresh, jn.t.A, M, jn.t.rTop, jn.t.r);
+      trunk.push({ ...M, r: trunk.length ? rT : Math.max(jn.t.rTop, Math.min(rT, jn.t.r)) });
+      if (trunk.length > 1) trunk[trunk.length - 1].r = rT;
+    }
+    const rT = rOf(W), low = trunk[trunk.length - 1].j, ci = Math.round(g.ci), ck = Math.round(g.ck);
+    let end = null;
+    if (!sup.plateOnly) for (let y = Math.floor(low) - 1; y >= 1 && !end; y--) {
+      if (!occ[OI(ci, y, ck)] || occ[OI(ci, y + 1, ck)]) continue;            // the top of a part under the trunk
+      const B = middle(ci, y, ck, rT + 1.5);
+      if (B.d >= rT - 0.4 && okLean({ i: g.ci, j: y + 1, k: g.ck }, B)) end = [{ i: g.ci, j: y + 1, k: g.ck, r: rT }, { i: B.i, j: B.j, k: B.k, r: rT }];
+    }
+    if (!end) {
+      // standing on the plate: the trunk flares out toward its base like a tree
+      end = []; const H = Math.max(1, low), F = 2.4;
+      for (let q = 1; q <= 8; q++) end.push({ i: g.ci, j: q === 8 ? -rT * 0.4 : H * (1 - q / 8) + 0.6 * (q / 8), k: g.ck, r: rT * (1 + (F - 1) * Math.pow(q / 8, 1.8)) });
+    }
+    const P = trunk.concat(end.filter(p => p.j < low - 0.01));
+    for (let q = 0; q + 1 < P.length; q++) stampTube(fresh, P[q], P[q + 1], P[q].r, P[q + 1].r);
+    if (solveMaybe()) { yield; solveTick = performance.now(); }
+  }
+}
+// FUSED (default): the sculpture itself grows down to hold its overhangs. Working down one layer at a time,
+// every cell that needs help gets a cell of new clay right under it, nudged toward the nearest firmly
+// supported clay at the overhang angle. The new clay becomes webs, gussets and cones fused into the part.
+function* fuseGen(sup, fresh, bb, clsArr) {
+  if (!bb) return;
+  const plateOnly = sup.plateOnly;
+  const reachV = 1 / Math.tan(clamp(sup.angle, 5, 85) * DEG), reachT = reachV + 0.25;
+  const minR = Math.max(2.0, sup.branchD / 2) / VS + 0.25;          // stalks never thinner than 4 mm
+  const pad = 2, bi0 = Math.max(1, bb.bi0 - pad), bi1 = Math.min(N - 2, bb.bi1 + pad), bk0 = Math.max(1, bb.bk0 - pad), bk1 = Math.min(N - 2, bb.bk1 + pad);
+  const W = bi1 - bi0 + 1, H = bk1 - bk0 + 1, WH = W * H, INF = 1e9, D2 = Math.SQRT2;
+  const NB = []; for (let dk = -2; dk <= 2; dk++) for (let di = -2; di <= 2; di++) { const d = Math.hypot(di, dk); if (d > 0 && d <= reachV + 1e-6) NB.push([di, dk]); }
+  const chamfer = (d, mask) => {
+    for (let r = 0; r < 2; r++) {
+      for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) { const o = i + W * k; if (mask && !mask[o]) continue; let v = d[o];
+        if (i > 0) v = Math.min(v, d[o - 1] + 1); if (k > 0) { v = Math.min(v, d[o - W] + 1); if (i > 0) v = Math.min(v, d[o - W - 1] + D2); if (i < W - 1) v = Math.min(v, d[o - W + 1] + D2); } d[o] = v; }
+      for (let k = H - 1; k >= 0; k--) for (let i = W - 1; i >= 0; i--) { const o = i + W * k; if (mask && !mask[o]) continue; let v = d[o];
+        if (i < W - 1) v = Math.min(v, d[o + 1] + 1); if (k < H - 1) { v = Math.min(v, d[o + W] + 1); if (i < W - 1) v = Math.min(v, d[o + W + 1] + D2); if (i > 0) v = Math.min(v, d[o + W - 1] + D2); } d[o] = v; }
+    }
+  };
+  const G = (i, j, k) => (bi0 + i) + N * (j + N * (bk0 + k));
+  let Fprev = new Uint8Array(WH), Fcur = new Uint8Array(WH);
+  const sig = new Float32Array(WH), dAir = new Float32Array(WH), cm = new Uint8Array(WH), lab = new Int32Array(WH), stack = new Int32Array(WH);
+  const leanMax = 40 / VS;
+  // spots that need help, grown a few voxels across the ok-cantilever clay next to them so the fill comes out as
+  // one solid web instead of a ladder of thin ribs
+  const needM = new Uint8Array(N * N * N), q0 = [];
+  for (let k = bk0; k <= bk1; k++) for (let j = 1; j <= bb.bj1; j++) for (let i = bi0; i <= bi1; i++) { const g = OI(i, j, k); if (occ[g] && clsArr[g] >= 3) { needM[g] = 1; q0.push(g); } }
+  for (let step = 0, cur = q0; step < 3 && cur.length; step++) {
+    const nxt = [];
+    for (const g of cur) { const i = g % N, j = ((g / N) | 0) % N, k = (g / (N * N)) | 0;
+      for (let dk = -1; dk <= 1; dk++) for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        const ni = i + di, nj = j + dj, nk = k + dk; if (ni < bi0 || nk < bk0 || ni > bi1 || nk > bk1 || nj < 1 || nj > bb.bj1) continue;
+        const q = OI(ni, nj, nk); if (!needM[q] && occ[q] && clsArr[q] === 2) { needM[q] = 1; nxt.push(q); } } }
+    cur = nxt;
+  }
+  for (let j = Math.min(N - 3, bb.bj1); j >= 1; j--) {
+    // what in the layer above still needs holding up?
+    const U = [];
+    let anyFirm = false;
+    for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
+      const o = i + W * k, g = G(i, j, k);
+      const firm = occ[g] && clsArr[g] === 1; sig[o] = firm ? 0 : INF; if (firm) anyFirm = true;
+    }
+    if (anyFirm && !plateOnly) chamfer(sig, null); else if (anyFirm) chamfer(sig, null);
+    for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
+      const o = i + W * k, gu = G(i, j + 1, k);
+      const need = Fprev[o] || needM[gu];
+      if (need && sig[o] > reachT) U.push(o);
+    }
+    Fcur.fill(0);
+    if (U.length) {
+      // the outline of the layer above: new clay stays tucked under what it holds up
+      for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) { const o = i + W * k; cm[o] = (occ[G(i, j + 1, k)] || Fprev[o]) ? 1 : 0; }
+      let needFloat = false;
+      for (const o of U) if (plateOnly || sig[o] >= INF || sig[o] > leanMax || (sig[o] - reachV) > j * reachV * 0.95) { needFloat = true; break; }
+      let compMax = null; const compMid = [];
+      if (needFloat) {
+        for (let o = 0; o < WH; o++) dAir[o] = cm[o] ? INF : 0;
+        chamfer(dAir, null);
+        lab.fill(-1); compMax = [];
+        for (let o0 = 0; o0 < WH; o0++) {
+          if (!cm[o0] || lab[o0] >= 0) continue;
+          const id = compMax.length; let top = 0, mx = 0, mc = o0; stack[top++] = o0; lab[o0] = id;
+          while (top) { const c = stack[--top]; if (dAir[c] > mx) { mx = dAir[c]; mc = c; } const ci = c % W, ck = (c / W) | 0;
+            for (let dk = -1; dk <= 1; dk++) for (let di = -1; di <= 1; di++) { const ni = ci + di, nk = ck + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue; const q = ni + W * nk; if (cm[q] && lab[q] < 0) { lab[q] = id; stack[top++] = q; } } }
+          compMax.push(mx); compMid.push(mc);
+        }
+      }
+      const thinDone = new Set();
+      for (const o of U) {
+        const i = o % W, k = (o / W) | 0;
+        const lean = !plateOnly && sig[o] < INF && sig[o] <= leanMax && (sig[o] - reachV) <= j * reachV * 0.95;
+        let best = o;
+        if (lean) {
+          let bs = sig[o];
+          for (const [di, dk] of NB) { const ni = i + di, nk = k + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue; const q = ni + W * nk; if (sig[q] < bs) { bs = sig[q]; best = q; } }
+        } else if (compMax && lab[o] >= 0 && compMax[lab[o]] > minR + 0.5 && dAir[o] < minR) {
+          let bd = dAir[o];
+          for (const [di, dk] of NB) { const ni = i + di, nk = k + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue; const q = ni + W * nk; if (dAir[q] > bd) { bd = dAir[q]; best = q; } }
+        }
+        Fcur[best] = 1;
+        if (!lean && compMax && lab[o] >= 0 && compMax[lab[o]] <= minR + 0.5 && !thinDone.has(lab[o])) {
+          // something skinny hanging free: hold it with a full-width stalk under its middle (wider below is fine)
+          thinDone.add(lab[o]); const m = compMid[lab[o]], mi = m % W, mk = (m / W) | 0, R = Math.ceil(minR);
+          for (let dk = -R; dk <= R; dk++) for (let di = -R; di <= R; di++) {
+            if (di * di + dk * dk > minR * minR) continue;
+            const ni = mi + di, nk = mk + dk; if (ni >= 0 && nk >= 0 && ni < W && nk < H) Fcur[ni + W * nk] = 1;
+          }
+        }
+        if (!Fprev[o]) {
+          // a spot on the sculpt that needs help gets a solid footing as thick as the stem setting
+          const R = Math.ceil(minR);
+          for (let dk = -R; dk <= R; dk++) for (let di = -R; di <= R; di++) {
+            if (di * di + dk * dk > minR * minR) continue;
+            const ni = i + di, nk = k + dk; if (ni < 0 || nk < 0 || ni >= W || nk >= H) continue;
+            const q = ni + W * nk; if (cm[q]) Fcur[q] = 1;
+          }
+        }
+      }
+      // write the new clay for this layer
+      for (let o = 0; o < WH; o++) {
+        if (!Fcur[o]) continue;
+        const i = o % W, k = (o / W) | 0, gi = bi0 + i, gk = bk0 + k, g = G(i, j, k);
+        if (occ[g] && clsArr[g] === 1) { Fcur[o] = 0; continue; }
+        const key = (gi >> 4) + NC * ((j >> 4) + NC * (gk >> 4)); let ch = fresh.get(key); if (!ch) { ch = new Float32Array(4096); fresh.set(key, ch); }
+        ch[(gi & 15) + 16 * ((j & 15) + 16 * (gk & 15))] = 1;
+      }
+    }
+    const t = Fprev; Fprev = Fcur; Fcur = t;
+    if (solveMaybe()) { yield; solveTick = performance.now(); }
+  }
+}
+// new support clay gets one extra smoothing and a slight puff, so thin bits come out round instead of jagged
+function* smoothSupport(map) {
+  const out = [];
+  for (const key of map.keys()) {
+    if (!gatherSmoothed(map, key, 0.5)) continue;
+    const cy = ((key / NC) | 0) % NC, ch = new Float32Array(4096);
+    for (let k = 0; k < 16; k++) for (let j = 0; j < 16; j++) {
+      if (cy === 0 && j === 0) continue;
+      const bl = (j + 3) * PB + (k + 3) * PB2 + 3, rl = 16 * (j + 16 * k);
+      for (let i = 0; i < 16; i++) { const v = BIG[bl + i]; if (v > 0.02) ch[rl + i] = Math.min(1, v * 1.3); }
+    }
+    out.push([key, ch]);
+    if (solveMaybe()) { yield; solveTick = performance.now(); }
+  }
+  map.clear(); for (const [k, ch] of out) map.set(k, ch);
+}
+function* solveGen() {
+  const sup = ST.sup;
+  const vis = layers.filter(l => l.visible && !l.auto);
+  solveTick = performance.now();
+  const fresh = new Map();
+  let firstCount = 0, islands0 = 0, left = [];
+  // pass 0 supports the sculpt; the next passes check sculpt + supports together and fix anything still hanging; the last only reports
+  const passes = sup.style === 'removable' ? 3 : 5;
+  for (let pass = 0; pass < passes; pass++) {
+    const bb = yield* occGen(vis, pass ? fresh : null);
+    const nextCls = pass === 0 ? new Uint8Array(N * N * N) : scratchCls();
+    const res = yield* classifyGen(bb, sup, nextCls);
+    if (pass === 0) { cls = nextCls; clsTex.image.data = cls; clsTex.needsUpdate = true; if (CUT.on) drawCap(); islands0 = res.islands; }
+    const keep = dedupeContacts(res.contacts, sup.spacing);
+    if (pass === 0) { firstCount = keep.length; supStats.passLog = []; }
+    supStats.passLog.push(keep.length);
+    left = keep;
+    if (!keep.length || pass === passes - 1) break;
+    if (sup.style === 'removable') { yield* strandGen(keep, sup, fresh); continue; }
+    const made = new Map();
+    if (pass <= 2) yield* treeGen(dedupeContacts(res.contacts, pass === 0 ? Math.max(sup.spacing, sup.branchD + 2 * sup.bridge) : sup.spacing), sup, made, bb, nextCls);
+    else yield* fuseGen(sup, made, bb, nextCls);    // smooth out under anything that still hangs
+    yield* smoothSupport(made);
+    for (const [key, ch] of made) { const f = fresh.get(key); if (!f) fresh.set(key, ch); else for (let q = 0; q < 4096; q++) if (ch[q] > f[q]) f[q] = ch[q]; }
+  }
+  if (sup.style !== 'removable' && sup.footFlare !== false) { addFootFlare(fresh); yield; }
+  if (sup.brim) { addBrim(fresh, sup); yield; }
+  supRunning = null;
+  const L = ensureSupLayer();
+  const keys = new Set([...L.chunks.keys(), ...fresh.keys()]);
+  L.chunks = fresh;
+  for (const k of keys) markChunkDirty(L, k);
+  showDead(left);
+  supStats.contacts = firstCount; supStats.dead = left.length; supStats.islands = islands0; supStats.growing = false;
+  dimsDirty = true; capDirty = true; UIS.dirty = true;
+}
+let _scratch = null;
+const scratchCls = () => { if (!_scratch) _scratch = new Uint8Array(N * N * N); else _scratch.fill(0); return _scratch; };
+// skinny parts of the sculpture that stand on the plate get a flared foot (wider below, so it always prints)
+function addFootFlare(fresh) {
+  const NN = N * N, lab = new Int32Array(NN).fill(-1), stack = new Int32Array(NN);
+  const isFresh = (i, j, k) => { const ch = fresh.get((i >> 4) + NC * ((j >> 4) + NC * (k >> 4))); return !!ch && ch[(i & 15) + 16 * ((j & 15) + 16 * (k & 15))] > ISO; };
+  const model = (i, j, k) => occ[OI(i, j, k)] && !isFresh(i, j, k);
+  const big = (15 * 15) / (VS * VS);
+  const put = (i, j, k, v) => { const key = (i >> 4) + NC * ((j >> 4) + NC * (k >> 4)); let ch = fresh.get(key); if (!ch) { ch = new Float32Array(4096); fresh.set(key, ch); } const li = (i & 15) + 16 * ((j & 15) + 16 * (k & 15)); if (v > ch[li]) ch[li] = v; };
+  for (let o = 0; o < NN; o++) {
+    const i0 = o % N, k0 = (o / N) | 0;
+    if (lab[o] >= 0 || i0 < 1 || k0 < 1 || i0 > N - 2 || k0 > N - 2 || !model(i0, 1, k0)) continue;
+    let top = 0; stack[top++] = o; lab[o] = o; const cells = [];
+    while (top) {
+      const c = stack[--top]; cells.push(c);
+      for (const q of [c - 1, c + 1, c - N, c + N]) { const qi = q % N, qk = (q / N) | 0; if (qi < 1 || qk < 1 || qi > N - 2 || qk > N - 2 || lab[q] >= 0 || !model(qi, 1, qk)) continue; lab[q] = o; stack[top++] = q; }
+    }
+    if (cells.length >= big) continue;                     // big flat bases stand fine on their own
+    let cx = 0, cz = 0; for (const c of cells) { cx += c % N; cz += (c / N) | 0; } cx /= cells.length; cz /= cells.length;
+    const rf = Math.sqrt(cells.length / Math.PI), R0 = Math.max(rf * 1.3, 4 / VS), hF = Math.ceil(R0 * 2.5);
+    for (let j = 1; j <= hF && j < N - 1; j++) {
+      const f = R0 * Math.pow(1 - (j - 1) / hF, 2); if (f < 0.4) break;
+      const near = rf + 3 + j * 1.5, sec = []; let nx = 0, nz = 0;
+      for (let k = Math.max(1, Math.floor(cz - near)); k <= Math.min(N - 2, Math.ceil(cz + near)); k++) for (let i = Math.max(1, Math.floor(cx - near)); i <= Math.min(N - 2, Math.ceil(cx + near)); i++) {
+        if ((i - cx) ** 2 + (k - cz) ** 2 > near * near || !model(i, j, k)) continue;
+        sec.push(i, k); nx += i; nz += k;
+      }
+      if (!sec.length) break;
+      cx = nx / (sec.length / 2); cz = nz / (sec.length / 2);
+      const R = Math.ceil(f + 1);
+      for (let q = 0; q < sec.length; q += 2) {
+        const si = sec[q], sk = sec[q + 1];
+        if (model(si - 1, j, sk) && model(si + 1, j, sk) && model(si, j, sk - 1) && model(si, j, sk + 1)) continue; // outline only
+        for (let dk = -R; dk <= R; dk++) for (let di = -R; di <= R; di++) {
+          const i = si + di, k = sk + dk; if (i < 1 || k < 1 || i > N - 2 || k > N - 2) continue;
+          const v = clamp(0.5 + (f - Math.hypot(di, dk)) * 0.6, 0, 1); if (v > 0) put(i, j, k, v);
+        }
+      }
+    }
+  }
+}
+// a one-layer skirt on the bed around support feet and thin bases, joining ones that sit close together
+function addBrim(fresh, sup) {
+  const NN = N * N, foot = new Uint8Array(NN), isSup = new Uint8Array(NN), j = 1;
+  for (let k = 1; k < N - 1; k++) for (let i = 1; i < N - 1; i++) {
+    const o = i + N * k;
+    if (occ[OI(i, j, k)]) foot[o] = 1;
+    const ch = fresh.get((i >> 4) + NC * ((j >> 4) + NC * (k >> 4)));
+    if (ch && ch[(i & 15) + 16 * ((j & 15) + 16 * (k & 15))] > ISO) { foot[o] = 1; isSup[o] = 1; }
+  }
+  // seeds: support feet + small footprints (thin parts)
+  const seed = new Uint8Array(NN), lab = new Int32Array(NN).fill(-1), stack = new Int32Array(NN);
+  const thinCells = (15 * 15) / (VS * VS);
+  for (let o = 0; o < NN; o++) {
+    if (!foot[o] || lab[o] >= 0) continue;
+    let top = 0; stack[top++] = o; lab[o] = o; const cells = []; let anySup = false;
+    while (top) {
+      const c = stack[--top]; cells.push(c); if (isSup[c]) anySup = true;
+      const ci = c % N, ck = (c / N) | 0;
+      for (const q of [c - 1, c + 1, c - N, c + N]) { const qi = q % N, qk = (q / N) | 0; if (qi < 1 || qk < 1 || qi >= N - 1 || qk >= N - 1) continue; if (foot[q] && lab[q] < 0) { lab[q] = o; stack[top++] = q; } }
+    }
+    if (anySup || cells.length < thinCells) for (const c of cells) seed[c] = 1;
+  }
+  const D2 = Math.SQRT2, INF = 1e9;
+  const chamfer = (d) => {
+    for (let r = 0; r < 2; r++) {
+      for (let k = 1; k < N - 1; k++) for (let i = 1; i < N - 1; i++) { const o = i + N * k; let v = d[o]; v = Math.min(v, d[o - 1] + 1, d[o - N] + 1, d[o - N - 1] + D2, d[o - N + 1] + D2); d[o] = v; }
+      for (let k = N - 2; k >= 1; k--) for (let i = N - 2; i >= 1; i--) { const o = i + N * k; let v = d[o]; v = Math.min(v, d[o + 1] + 1, d[o + N] + 1, d[o + N + 1] + D2, d[o + N - 1] + D2); d[o] = v; }
+    }
+  };
+  const dS = new Float32Array(NN); for (let o = 0; o < NN; o++) dS[o] = seed[o] ? 0 : INF; chamfer(dS);
+  const w = sup.brimW / VS, jr = sup.brimJoin / 2 / VS;
+  // closing (grow by jr, shrink by jr) joins neighbours closer than the join gap
+  const dOut = new Float32Array(NN); for (let o = 0; o < NN; o++) dOut[o] = dS[o] <= jr ? INF : 0; chamfer(dOut);
+  for (let k = 2; k < N - 2; k++) for (let i = 2; i < N - 2; i++) {
+    const o = i + N * k;
+    const inBrim = dS[o] <= w || (jr > 0.5 && dOut[o] > jr);
+    if (!inBrim) continue;
+    const key = (i >> 4) + NC * ((j >> 4) + NC * (k >> 4));
+    let ch = fresh.get(key); if (!ch) { ch = new Float32Array(4096); fresh.set(key, ch); }
+    ch[(i & 15) + 16 * ((j & 15) + 16 * (k & 15))] = 1;
+  }
+}
+const deadMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 10, 8), new THREE.MeshBasicMaterial({ color: 0xff2d55 }), 600);
+deadMesh.count = 0; modelRoot.add(deadMesh);
+function showDead(pts) {
+  const m = new THREE.Matrix4();
+  deadMesh.count = Math.min(600, pts.length);
+  for (let i = 0; i < deadMesh.count; i++) { const p = pts[i]; m.makeScale(2.2, 2.2, 2.2).setPosition(p.x, p.y, p.z); deadMesh.setMatrixAt(i, m); }
+  deadMesh.instanceMatrix.needsUpdate = true;
+}
+function clearSupports() {
+  supRunning = null;
+  if (supLayer) { const keys = [...supLayer.chunks.keys()]; supLayer.chunks = new Map(); for (const k of keys) markChunkDirty(supLayer, k); }
+  showDead([]); supStats.contacts = supStats.dead = supStats.islands = 0; supStats.growing = false; UIS.dirty = true;
+}
+function keepSupportsAsClay() {
+  if (!supLayer || !supLayer.chunks.size) return toast('No supports to keep yet');
+  const L = supLayer;
+  L.auto = false; L.name = 'Supports ' + (layers.filter(l => /^Supports \d/.test(l.name)).length + 1);
+  const old = L.material; L.material = makeClayMaterial(PALETTE[L.colorIdx], true); for (const m of L.meshes.values()) m.material = L.material; old.dispose();
+  supLayer = null; ensureSupLayer(); supLayer.setColor(L.colorIdx);
+  for (const key of L.chunks.keys()) netTouch(L, key);
+  supSettingChanged(); toast(`Supports are now clay on ${L.name}`);
+}
+function supportTick(now) {
+  if (!ST.sup.auto) return;
+  if (supNeed && !anyDirtyUser()) {
+    const ready = stroke.active ? (now - lastSolveStart > 1600) : (now - lastEditAt > 120);
+    if (ready) { supNeed = stroke.active; supRunning = solveGen(); lastSolveStart = now; supStats.growing = true; UIS.dirty = true; }
+  }
+  if (stroke.active && performance.now() - lastSolveStart > 1600) supNeed = true;
+  if (supRunning) {
+    const t0 = performance.now();
+    try {
+      while (supRunning && performance.now() - t0 < (renderer.xr.isPresenting ? 4 : 9)) { const r = supRunning.next(); if (r.done) { supRunning = null; break; } }
+    } catch (e) { console.error(e); supRunning = null; supStats.growing = false; }
+  }
+}
+const anyDirtyUser = () => layers.some(l => !l.auto && l.dirty.size > 0);
+function supSettingChanged() { supNeed = true; lastEditAt = performance.now() - 1000; supRunning = null; UIS.dirty = true; }
+
+// ───────────────────────── view helpers
+function resetView(s) {
+  modelRoot.quaternion.identity(); modelRoot.scale.setScalar(s);
+  if (s >= 0.005) modelRoot.position.set(0, 0, -100 * s);
+  else modelRoot.position.set(0, 0.85, -0.42);
+  UIS.dirty = true;
+}
+const S = () => modelRoot.scale.x;
+const brushMM = () => clamp(ST.brushVR / S(), 1.0, 80);
+function scaleLabel() {
+  const r = S() / 0.001;
+  const ratio = r >= 1 ? `1:${r >= 10 ? Math.round(r) : r.toFixed(1)}` : `${(1 / r).toFixed(1)}:1`;
+  const inches = 69 / r;
+  return `${ratio} · you ≈ ${inches >= 10 ? Math.round(inches) : inches.toFixed(1)} in tall`;
+}
+let dimsCache = 'Empty bed';
+function dimsLabel() {
+  if (!dimsDirty) return dimsCache;
+  dimsDirty = false;
+  const bb = new THREE.Box3(); let any = false;
+  for (const L of layers) if (L.visible) for (const m of L.meshes.values()) { bb.union(m.geometry.boundingBox); any = true; }
+  dimsCache = any ? `Model ${Math.round(bb.max.x - bb.min.x)} × ${Math.round(bb.max.z - bb.min.z)} × ${Math.round(bb.max.y)} mm` : 'Empty bed';
+  topCache = any ? bb.max.y : 0;
+  return dimsCache;
+}
+let topCache = 0;
+const modelTop = () => { dimsLabel(); return topCache; };
+
+// ───────────────────────── plan cut (watch the print slice by slice)
+const CUT = { on: false, h: 30, playing: false, j: -1 };
+let capDirty = true;
+const capCanvas = document.createElement('canvas'); capCanvas.width = capCanvas.height = N;
+const capCtx = capCanvas.getContext('2d'), capImg = capCtx.createImageData(N, N);
+const capTex = new THREE.CanvasTexture(capCanvas); capTex.colorSpace = THREE.SRGBColorSpace;
+capTex.magFilter = THREE.NearestFilter; capTex.minFilter = THREE.NearestFilter; capTex.generateMipmaps = false;
+const capMesh = new THREE.Mesh(new THREE.PlaneGeometry(256, 256), new THREE.MeshBasicMaterial({ map: capTex, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
+capMesh.rotation.x = -Math.PI / 2; capMesh.visible = false; capMesh.renderOrder = 5; modelRoot.add(capMesh);
+const capFrame = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(256, 256)), new THREE.LineBasicMaterial({ color: 0x7cf0b2 }));
+capMesh.add(capFrame);
+const hexRGB = (h) => { const c = new THREE.Color(h); return [c.r * 255, c.g * 255, c.b * 255]; };
+const TINT = { 2: hexRGB('#ffd166'), 3: hexRGB('#ff7a2f'), 4: hexRGB('#ff1a5c') };
+function setCut(on) {
+  CUT.on = on; if (!on) CUT.playing = false;
+  for (const L of layers) { L.material.clippingPlanes = on ? [cutPlane] : null; L.material.needsUpdate = true; }
+  deadMesh.material.clippingPlanes = on ? [cutPlane] : null; deadMesh.material.needsUpdate = true;
+  capMesh.visible = on; if (on && CUT.h > modelTop() + 1) CUT.h = Math.max(1, modelTop() * 0.3);
+  capDirty = true; UIS.dirty = true;
+}
+function updateCutPlane() {
+  const p = modelRoot.localToWorld(new THREE.Vector3(0, CUT.h, 0));
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(modelRoot.quaternion);
+  cutPlane.setFromNormalAndCoplanarPoint(up.negate(), p);
+  capMesh.position.y = CUT.h + 0.05;
+}
+function drawCap() {
+  capDirty = false;
+  const j = clamp(Math.round(iy(CUT.h)), 1, N - 2); CUT.j = j;
+  const user = layers.filter(l => l.visible && !l.auto).map(L => [L, hexRGB(PALETTE[L.colorIdx])]);
+  const supC = supLayer ? hexRGB(PALETTE[supLayer.colorIdx]) : null;
+  const d = capImg.data;
+  for (let k = 0; k < N; k++) for (let i = 0; i < N; i++) {
+    const p = (k * N + i) * 4;
+    let col = null;
+    for (const [L, c] of user) if (L.bridge ? L.beams.some(b => insideBeam(b, vx(i), vy(j), vz(k))) : getD(L, i, j, k) > ISO) { col = c; break; }
+    if (col) { const t = TINT[cls[OI(i, j, k)]]; if (t) col = [col[0] * 0.25 + t[0] * 0.75, col[1] * 0.25 + t[1] * 0.75, col[2] * 0.25 + t[2] * 0.75]; }
+    else if (supC && supLayer.visible && getD(supLayer, i, j, k) > ISO) col = supC;
+    if (col) { d[p] = col[0]; d[p + 1] = col[1]; d[p + 2] = col[2]; d[p + 3] = 245; } else { d[p + 3] = 0; }
+  }
+  capCtx.putImageData(capImg, 0, 0); capTex.needsUpdate = true;
+}
+function cutTick(dt) {
+  if (!CUT.on) return;
+  updateCutPlane();
+  if (CUT.playing) {
+    const top = Math.max(10, modelTop());
+    CUT.h += dt * Math.max(10, top / 9);
+    if (CUT.h >= top) { CUT.h = top; CUT.playing = false; }
+    UIS.dirty = true;
+  }
+  if (capDirty || Math.round(iy(CUT.h)) !== CUT.j) drawCap();
+}
+
+// ───────────────────────── panel UI (one canvas, used on desktop + wrist in VR)
+const UIW = 1184, UIH = 1280, RAIL = 168;
+const uiCanvas = document.createElement('canvas'); uiCanvas.width = UIW; uiCanvas.height = UIH;
+const ui = uiCanvas.getContext('2d');
+const uiTex = new THREE.CanvasTexture(uiCanvas); uiTex.colorSpace = THREE.SRGBColorSpace; uiTex.anisotropy = 4;
+let W = [];
+const UIS = { supSec: 'rules', picker: null, tab: 'brush', hover: -1, drag: null, dirty: true, confirm: null, confirmT: 0, toast: '', toastT: 0 };
+function toast(msg) { UIS.toast = msg; UIS.toastT = performance.now(); UIS.dirty = true; }
+function rr(x, y, w, h, r) { ui.beginPath(); ui.roundRect(x, y, w, h, r); }
+function txt(s, x, y, size = 32, color = '#e9ecf1', align = 'left', weight = 600) {
+  ui.fillStyle = color; ui.font = `${weight} ${size}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`; ui.textAlign = align; ui.textBaseline = 'middle'; ui.fillText(s, x, y);
+}
+function button(x, y, w, h, label, o = {}) {
+  const id = W.length, hov = UIS.hover === id;
+  ui.fillStyle = o.on ? (o.accent || ACC) : (hov ? '#3b3f49' : '#2a2d34'); rr(x, y, w, h, 18); ui.fill();
+  if (o.outline) { ui.strokeStyle = o.outline; ui.lineWidth = 5; ui.stroke(); }
+  txt(label, x + w / 2, y + h / 2 + 1, o.fs || 32, o.on ? '#111317' : (o.dim ? '#7f8896' : '#e9ecf1'), 'center', 700);
+  W.push({ x, y, w, h, click: o.click });
+  return id;
+}
+function confirmButton(x, y, w, h, key, label, action, o = {}) {
+  const armed = UIS.confirm === key && performance.now() - UIS.confirmT < 2500;
+  button(x, y, w, h, armed ? 'Tap again' : label, { ...o, on: armed, accent: CARVE, click: () => {
+    if (armed) { UIS.confirm = null; action(); } else { UIS.confirm = key; UIS.confirmT = performance.now(); }
+  } });
+}
+function slider(x, y, w, label, u, valText, set, hint) {
+  txt(label, x, y, 32, '#e9ecf1', 'left', 700);
+  txt(valText, x + w, y, 32, ACC, 'right', 800);
+  if (hint) txt(hint, x, y + 34, 24, '#7f8896', 'left', 500);
+  const ty = y + (hint ? 74 : 56);
+  ui.fillStyle = '#2a2d34'; rr(x, ty - 8, w, 16, 8); ui.fill();
+  ui.fillStyle = ACC; rr(x, ty - 8, Math.max(16, w * u), 16, 8); ui.fill();
+  ui.beginPath(); ui.arc(x + w * u, ty, 22, 0, Math.PI * 2); ui.fillStyle = '#f2f4f7'; ui.fill();
+  W.push({ x: x - 16, y: ty - 34, w: w + 32, h: 68, drag: (px) => { set(clamp((px - x) / w, 0, 1)); } });
+}
+function shapeIcon(s, cx, cy, sz, col) {
+  ui.strokeStyle = col; ui.fillStyle = col; ui.lineWidth = 6; ui.lineJoin = 'round';
+  ui.beginPath();
+  if (s === 0) { ui.arc(cx, cy, sz, 0, Math.PI * 2); ui.stroke(); }
+  else if (s === 1) { ui.rect(cx - sz * 0.8, cy - sz * 0.8, sz * 1.6, sz * 1.6); ui.stroke(); }
+  else if (s === 2) { ui.moveTo(cx, cy - sz); ui.lineTo(cx + sz * 0.85, cy + sz * 0.8); ui.lineTo(cx - sz * 0.85, cy + sz * 0.8); ui.closePath(); ui.stroke(); }
+  else if (s === 3) { ui.ellipse(cx, cy - sz * 0.7, sz * 0.75, sz * 0.25, 0, 0, Math.PI * 2); ui.moveTo(cx - sz * 0.75, cy - sz * 0.7); ui.lineTo(cx - sz * 0.75, cy + sz * 0.7); ui.moveTo(cx + sz * 0.75, cy - sz * 0.7); ui.lineTo(cx + sz * 0.75, cy + sz * 0.7); ui.stroke(); ui.beginPath(); ui.ellipse(cx, cy + sz * 0.7, sz * 0.75, sz * 0.25, 0, 0, Math.PI); ui.stroke(); }
+  else { ui.arc(cx, cy, sz, 0, Math.PI * 2); ui.moveTo(cx + sz * 0.42, cy); ui.arc(cx, cy, sz * 0.42, 0, Math.PI * 2); ui.stroke(); }
+}
+function icon(name, cx, cy, s, col) {
+  const g = ui; g.save(); g.strokeStyle = col; g.fillStyle = col; g.lineWidth = Math.max(3, s * 0.11); g.lineCap = 'round'; g.lineJoin = 'round';
+  g.beginPath();
+  if (name === 'brush') { g.arc(cx - s * 0.22, cy + s * 0.22, s * 0.34, 0, Math.PI * 2); g.fill(); g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + s * 0.55, cy - s * 0.55); g.stroke(); }
+  else if (name === 'layers') { for (let k = 0; k < 3; k++) { const y = cy - s * 0.38 + k * s * 0.36; g.beginPath(); g.moveTo(cx - s * 0.62, y); g.lineTo(cx, y - s * 0.24); g.lineTo(cx + s * 0.62, y); g.lineTo(cx, y + s * 0.24); g.closePath(); if (k === 0) g.fill(); else g.stroke(); } }
+  else if (name === 'supports') { g.moveTo(cx, cy + s * 0.62); g.lineTo(cx, cy + s * 0.05); g.lineTo(cx - s * 0.5, cy - s * 0.55); g.moveTo(cx, cy + s * 0.05); g.lineTo(cx + s * 0.5, cy - s * 0.55); g.moveTo(cx, cy - s * 0.15); g.lineTo(cx, cy - s * 0.62); g.moveTo(cx - s * 0.62, cy + s * 0.62); g.lineTo(cx + s * 0.62, cy + s * 0.62); g.stroke(); }
+  else if (name === 'slice') { g.rect(cx - s * 0.5, cy - s * 0.6, s, s * 1.2); g.stroke(); g.beginPath(); for (const f of [-0.25, 0.05, 0.35]) { g.moveTo(cx - s * 0.5, cy + s * f); g.lineTo(cx + s * 0.5, cy + s * f); } g.stroke(); g.beginPath(); g.moveTo(cx - s * 0.75, cy - s * 0.05); g.lineTo(cx + s * 0.75, cy - s * 0.05); g.lineWidth *= 1.6; g.stroke(); }
+  else if (name === 'scene') { g.arc(cx, cy, s * 0.3, 0, Math.PI * 2); g.stroke(); g.beginPath(); for (let a = 0; a < 8; a++) { const t = a * Math.PI / 4; g.moveTo(cx + Math.cos(t) * s * 0.48, cy + Math.sin(t) * s * 0.48); g.lineTo(cx + Math.cos(t) * s * 0.66, cy + Math.sin(t) * s * 0.66); } g.stroke(); }
+  else if (name === 'undo' || name === 'redo') { const d = name === 'undo' ? 1 : -1; g.arc(cx, cy + s * 0.1, s * 0.45, Math.PI * (d > 0 ? 1.15 : -0.15), Math.PI * (d > 0 ? 2.1 : -1.1), d < 0); g.stroke(); g.beginPath(); const ax = cx - d * s * 0.42, ay = cy - s * 0.08; g.moveTo(ax - d * s * 0.05, ay - s * 0.32); g.lineTo(ax, ay + s * 0.02); g.lineTo(ax + d * s * 0.34, ay - s * 0.1); g.stroke(); }
+  else if (name === 'together') { for (const [dx, r] of [[-0.3, 0.2], [0.3, 0.2]]) { g.beginPath(); g.arc(cx + dx * s, cy - s * 0.22, s * r, 0, Math.PI * 2); g.fill(); g.beginPath(); g.arc(cx + dx * s, cy + s * 0.52, s * 0.34, Math.PI, 0); g.fill(); } }
+  else if (name === 'mr') { g.roundRect(cx - s * 0.7, cy - s * 0.3, s * 0.62, s * 0.6, s * 0.2); g.roundRect(cx + s * 0.08, cy - s * 0.3, s * 0.62, s * 0.6, s * 0.2); g.stroke(); g.beginPath(); g.moveTo(cx - s * 0.08, cy - s * 0.05); g.lineTo(cx + s * 0.08, cy - s * 0.05); g.stroke(); }
+  g.restore();
+}
+function railButton(y, name, label, on, click, accent) {
+  const id = W.length, hov = UIS.hover === id;
+  ui.fillStyle = on ? (accent || ACC) : (hov ? '#2b2e36' : 'rgba(0,0,0,0)'); rr(14, y, RAIL - 28, 124, 24); ui.fill();
+  const col = on ? '#111317' : '#cfd6e0';
+  icon(name, RAIL / 2, y + 50, 52, col);
+  txt(label, RAIL / 2, y + 102, 24, col, 'center', 700);
+  W.push({ x: 14, y, w: RAIL - 28, h: 124, click });
+}
+function drawUI() {
+  UIS.dirty = false; W = [];
+  ui.clearRect(0, 0, UIW, UIH);
+  ui.fillStyle = 'rgba(21,23,28,0.96)'; rr(0, 0, UIW, UIH, 44); ui.fill();
+  ui.strokeStyle = '#3a3f4a'; ui.lineWidth = 4; ui.stroke();
+  // icon rail
+  ui.fillStyle = '#111217'; ui.beginPath(); ui.roundRect(0, 0, RAIL, UIH, [44, 0, 0, 44]); ui.fill();
+  const TABS = [['brush', 'Brush'], ['layers', 'Layers'], ['supports', 'Supports'], ['slice', 'Slice'], ['scene', 'Scene'], ['together', NET.on ? 'Room ' + NET.code : 'Together']];
+  TABS.forEach(([k, label], i) => railButton(24 + i * 138, k, label, UIS.tab === k, () => { UIS.tab = k; }));
+  railButton(UIH - 418, 'undo', 'Undo', false, undo);
+  railButton(UIH - 284, 'redo', 'Redo', false, redo);
+  if (XRS.inSession) railButton(UIH - 150, 'mr', XRS.passthrough ? 'MR' : 'VR', XRS.passthrough, () => setPassthrough(!XRS.passthrough), TEXC);
+  const X = RAIL + 28, FW = 952;
+  txt('OVERHANG GARDEN', X, 52, 30, ACC, 'left', 900);
+  txt(scaleLabel(), UIW - 36, 40, 24, '#9aa3b2', 'right', 600);
+  txt(dimsLabel(), UIW - 36, 72, 24, '#9aa3b2', 'right', 600);
+  const HEAD = { brush: ['Brush', 'Sculpt, carve, bridge and texture the clay'], layers: ['Layers', 'Pick a layer to sculpt on, recolor, hide or merge'], supports: ['Supports', 'What needs help, how branches grow, and the brim'], slice: ['Slice', 'Watch the print build up one layer at a time'], scene: ['Scene', 'View, saves and export'], together: ['Together', 'Sculpt the same bed live with friends in a room'] }[UIS.tab];
+  txt(HEAD[0], X, 126, 46, '#e9ecf1', 'left', 900);
+  txt(HEAD[1], X, 172, 26, '#7f8896', 'left', 500);
+  if (UIS.tab === 'brush') {
+    txt('Tool', X, 244, 30, '#9aa3b2', 'left', 700);
+    const tools = [['add', 'Add', ACC], ['carve', 'Carve', CARVE], ['smooth', 'Smooth', SMOOTH], ['flatten', 'Flatten', FLATC], ['bridge', 'Bridge', BRIDGEC], ['texture', 'Texture', TEXC]];
+    tools.forEach((t, i) => button(X + i * 161, 270, 150, 96, t[1], { on: ST.tool === t[0], accent: t[2], fs: 27, click: () => { ST.tool = t[0]; if (t[0] === 'add' || t[0] === 'carve') ST.lastTool = t[0]; updateGhost(); } }));
+    const tool = ST.tool;
+    if (tool === 'texture') {
+      txt('Pattern', X, 404, 30, '#9aa3b2', 'left', 700);
+      TEXTURES.forEach((n, i) => {
+        const bx = X + i * 194, on = ST.tex.pattern === i;
+        button(bx, 430, 180, 156, '', { on, accent: TEXC, click: () => { ST.tex.pattern = i; } });
+        ui.drawImage(texPreview(i), bx + 30, 444, 120, 96);
+        txt(n, bx + 90, 564, 26, on ? '#111317' : '#cfd6e0', 'center', 700);
+      });
+    } else if (tool === 'bridge') {
+      txt('Bridge', X, 404, 30, '#9aa3b2', 'left', 700);
+      ['Press on clay, drag across, let go on clay.', 'You get a clean beam on its own Bridges layer.', 'It prints with no supports while both ends sit', 'on clay. Carve an end away and that end gets one.'].forEach((l, i) => txt(l, X, 446 + i * 38, 28, '#cfd6e0', 'left', 500));
+    } else if (tool === 'flatten') {
+      txt('Flatten', X, 404, 30, '#9aa3b2', 'left', 700);
+      ['Where you start the stroke it finds the plane of', 'the surface, then shaves bumps down to it and fills', 'dips up to it. Start a new stroke for a new plane.'].forEach((l, i) => txt(l, X, 446 + i * 38, 28, '#cfd6e0', 'left', 500));
+    } else {
+      txt('Shape', X, 404, 30, '#9aa3b2', 'left', 700);
+      SHAPES.forEach((s, i) => {
+        const bx = X + i * 192, on = ST.shape === i;
+        button(bx, 430, 176, 156, '', { on, click: () => { ST.shape = i; updateGhost(); } });
+        shapeIcon(i, bx + 88, 492, 34, on ? '#111317' : '#cfd6e0');
+        txt(s, bx + 88, 562, 26, on ? '#111317' : '#cfd6e0', 'center', 700);
+      });
+      txt('Cone points down when adding, up when carving.', X, 612, 24, '#7f8896', 'left', 500);
+    }
+    const rmm = brushMM();
+    slider(X, 652, FW, tool === 'bridge' ? 'Beam width' : 'Brush size', Math.log(rmm) / Math.log(80), `${(tool === 'bridge' ? rmm * 2 : rmm).toFixed(1)} mm`, (u) => { ST.brushVR = Math.pow(80, u) * S(); }, 'Stays with your hand when you scale the world');
+    if (tool === 'texture') {
+      const dep = ST.tex.depth;
+      slider(X, 774, FW, 'Depth', Math.log(dep / 0.01) / Math.log(300), `${dep < 1 ? dep.toFixed(2) : dep.toFixed(1)} mm`, (u) => { ST.tex.depth = +(0.01 * Math.pow(300, u)).toFixed(u < 0.4 ? 3 : 2); });
+      slider(X, 862, FW, 'Pattern size', (ST.tex.scale - 3) / 11, `${ST.tex.scale.toFixed(0)} mm`, (u) => { ST.tex.scale = Math.round(3 + u * 11); TEXPREV.length = 0; });
+    } else if (tool === 'bridge') {
+      slider(X, 782, FW, 'Max bridge', (ST.sup.maxBridge - 10) / 90, `${ST.sup.maxBridge} mm`, (u) => { ST.sup.maxBridge = Math.round(10 + u * 90); supSettingChanged(); }, 'Longer spans need supports');
+    } else {
+      button(X, 790, 304, 92, `Mirror X: ${ST.mirror ? 'On' : 'Off'}`, { on: ST.mirror, fs: 28, click: () => { ST.mirror = !ST.mirror; } });
+      button(X + 324, 790, 304, 92, `Pressure: ${ST.pressure ? 'On' : 'Off'}`, { on: ST.pressure, fs: 28, click: () => { ST.pressure = !ST.pressure; } });
+      button(X + 648, 790, 304, 92, ST.carveAll ? 'Carve: all layers' : 'Carve: this layer', { on: ST.carveAll, accent: CARVE, fs: 28, click: () => { ST.carveAll = !ST.carveAll; } });
+    }
+    slider(X, 962, FW, 'Auto smooth', ST.autoSmooth, ST.autoSmooth === 0 ? 'Off' : `${Math.round(ST.autoSmooth * 100)}%`, (u) => { ST.autoSmooth = Math.round(u * 20) / 20; smoothDirtyAt = performance.now(); }, 'Softens every surface a little; very high can melt thin bits');
+  } else if (UIS.tab === 'layers') {
+    let y = 230;
+    layers.forEach((L) => {
+      const act = L === activeLayer;
+      button(X, y, FW, 92, '', { outline: act ? ACC : null, click: () => { if (L.auto) return toast('Supports grow by themselves. Tap Keep clay to sculpt them'); activeLayer = L; } });
+      ui.beginPath(); ui.arc(X + 56, y + 46, 30, 0, Math.PI * 2); ui.fillStyle = PALETTE[L.colorIdx]; ui.fill();
+      ui.strokeStyle = UIS.picker === L.id ? ACC : '#111317'; ui.lineWidth = UIS.picker === L.id ? 6 : 3; ui.stroke();
+      W.push({ x: X + 12, y: y + 4, w: 88, h: 84, click: () => { UIS.picker = UIS.picker === L.id ? null : L.id; } });
+      txt(L.name + (L.auto ? ' (grows itself)' : L.bridge ? (act ? '  ← new bridges' : '  (bridges)') : act ? '  ← sculpting' : ''), X + 112, y + 46, 30, L.visible ? '#e9ecf1' : '#7f8896', 'left', 700);
+      button(X + 560, y + 12, 186, 68, L.visible ? 'Shown' : 'Hidden', { on: L.visible, fs: 28, click: () => { L.visible = !L.visible; L.group.visible = L.visible; dimsDirty = true; if (!L.auto) afterEdit(); } });
+      if (L.auto) button(X + 756, y + 12, 186, 68, 'Keep clay', { fs: 28, click: keepSupportsAsClay });
+      else button(X + 756, y + 12, 186, 68, L.locked ? 'Locked' : 'Lock', { on: L.locked, accent: '#ffc93c', fs: 28, click: () => { L.locked = !L.locked; } });
+      y += 102;
+      if (UIS.picker === L.id) {
+        ui.fillStyle = '#1b1d23'; rr(X, y - 4, FW, 92, 18); ui.fill();
+        PALETTE.forEach((c, i) => {
+          const cx = X + 44 + i * 78, cy = y + 42;
+          ui.beginPath(); ui.arc(cx, cy, 30, 0, Math.PI * 2); ui.fillStyle = c; ui.fill();
+          if (i === L.colorIdx) { ui.strokeStyle = ACC; ui.lineWidth = 6; ui.stroke(); }
+          W.push({ x: cx - 36, y: cy - 38, w: 72, h: 76, click: () => { L.setColor(i); UIS.picker = null; capDirty = true; } });
+        });
+        y += 100;
+      }
+    });
+    y += 8;
+    const nUser = userLayers().length;
+    const u = clayLayers(), ai = u.indexOf(activeLayer), mergeTo = ai < 0 ? null : (u[ai - 1] || u[ai + 1]);
+    button(X, y, 304, 96, '+ New layer', { dim: nUser >= 6, click: () => { if (nUser >= 6) return toast('Max 6 layers'); addLayer(); } });
+    confirmButton(X + 324, y, 304, 96, 'merge', mergeTo ? `Merge into ${mergeTo.name}` : 'Merge layers', () => mergeLayer(activeLayer), { dim: !mergeTo, fs: 26 });
+    confirmButton(X + 648, y, 304, 96, 'del', 'Delete layer', () => deleteLayer(activeLayer), { dim: !(activeLayer && activeLayer.bridge) && clayLayers().length < 2 });
+    confirmButton(X, y + 112, 304, 80, 'clear', 'Clear layer', () => clearLayer(activeLayer), { fs: 28 });
+    txt('Tap a color dot to pick its color.', X + 324, y + 140, 26, '#7f8896', 'left', 500);
+    txt("Hidden layers don't print or get supports.", X + 324, y + 174, 26, '#7f8896', 'left', 500);
+  } else if (UIS.tab === 'supports') {
+    const s = ST.sup;
+    button(X, 226, 304, 84, `Auto: ${s.auto ? 'On' : 'Off'}`, { on: s.auto, fs: 30, click: () => { s.auto = !s.auto; if (s.auto) supSettingChanged(); else clearSupports(); } });
+    button(X + 324, 226, 304, 84, `Stripes: ${s.stripes ? 'On' : 'Off'}`, { on: s.stripes, accent: '#ff8a6b', fs: 30, click: () => { s.stripes = !s.stripes; overU.uShowOver.value = s.stripes ? 1 : 0; } });
+    button(X + 648, 226, 304, 84, `See-through: ${s.seeThrough ? 'On' : 'Off'}`, { on: s.seeThrough, fs: 28, click: () => { s.seeThrough = !s.seeThrough; applySeeThrough(); } });
+    const secs = [['rules', 'What needs help'], ['branches', 'Style'], ['brim', 'Brim']];
+    ui.fillStyle = '#1b1d23'; rr(X, 330, FW, 84, 22); ui.fill();
+    secs.forEach(([k, l], i) => button(X + 6 + i * 315, 336, 310, 72, l, { on: UIS.supSec === k, fs: 28, click: () => { UIS.supSec = k; } }));
+    const sl = (y, label, key, lo, hi, unit, hint, dec = 0) =>
+      slider(X, y, FW, label, (s[key] - lo) / (hi - lo), `${s[key].toFixed(dec)}${unit}`, (u) => { s[key] = +(lo + u * (hi - lo)).toFixed(dec + 1); supSettingChanged(); }, hint);
+    if (UIS.supSec === 'rules') {
+      sl(450, 'Overhang angle', 'angle', 15, 75, '°', 'Slopes flatter than this need help');
+      sl(570, 'Overhang reach', 'bridge', 0, 15, ' mm', 'Overhangs this close to supported clay print fine', 1);
+      sl(690, 'Max bridge', 'maxBridge', 10, 100, ' mm', 'Flat spans clay-to-clay up to this long print fine');
+    } else if (UIS.supSec === 'branches') {
+      txt('Support style', X, 448, 28, '#9aa3b2', 'left', 700);
+      button(X, 474, 466, 84, 'Fused into the sculpture', { on: s.style !== 'removable', fs: 28, click: () => { s.style = 'fused'; supSettingChanged(); } });
+      button(X + 486, 474, 466, 84, 'Removable branches', { on: s.style === 'removable', fs: 28, click: () => { s.style = 'removable'; supSettingChanged(); } });
+      txt('Supports lean into', X, 598, 28, '#9aa3b2', 'left', 700);
+      button(X, 624, 466, 80, 'Sculpt or plate', { on: !s.plateOnly, fs: 30, click: () => { s.plateOnly = false; supSettingChanged(); } });
+      button(X + 486, 624, 466, 80, 'Plate only', { on: s.plateOnly, fs: 30, click: () => { s.plateOnly = true; supSettingChanged(); } });
+      if (s.style === 'removable') {
+        sl(744, 'Branch angle', 'branchAngle', 15, 60, '°');
+        sl(834, 'Trunk thickness', 'branchD', 3, 14, ' mm', null, 1);
+        sl(924, 'Tip thickness', 'tipD', 2.4, 8, ' mm', null, 1);
+        sl(1014, 'Contact spacing', 'spacing', 4, 16, ' mm', null, 1);
+      } else {
+        sl(744, 'Thinnest branch', 'branchD', 4, 14, ' mm', null, 1);
+        sl(834, 'Branch angle', 'branchAngle', 15, 50, '°');
+        txt('Branches gather into trunks under the weight they hold.', X, 940, 26, '#7f8896', 'left', 500);
+        txt('Trunks thicken with the share of the sculpture they carry.', X, 974, 26, '#7f8896', 'left', 500);
+      }
+    } else {
+      button(X, 446, FW, 84, `Brim: ${s.brim ? 'On' : 'Off'}`, { on: s.brim, fs: 32, click: () => { s.brim = !s.brim; supSettingChanged(); } });
+      sl(566, 'Brim width', 'brimW', 2, 15, ' mm', 'Flat skirt around support feet and thin bases', 1);
+      sl(686, 'Join gaps up to', 'brimJoin', 0, 40, ' mm', 'Feet and thin parts closer than this share one brim');
+      button(X, 786, FW, 84, `Flared feet: ${s.footFlare !== false ? 'On' : 'Off'}`, { on: s.footFlare !== false, fs: 32, click: () => { s.footFlare = s.footFlare === false; supSettingChanged(); } });
+      txt('Skinny parts standing on the plate widen at the base.', X, 904, 26, '#7f8896', 'left', 500);
+      txt('Only pieces under about 15 × 15 mm get a brim or flare.', X, 938, 26, '#7f8896', 'left', 500);
+    }
+    let st;
+    if (!s.auto) st = 'Auto supports are off';
+    else if (supStats.growing) st = 'Growing supports…';
+    else st = `${supStats.contacts} spot${supStats.contacts === 1 ? '' : 's'} needed help · ` + (supStats.dead ? `${supStats.dead} can't be reached (red dots)` : 'all supported');
+    txt(st, X, 1190, 28, supStats.dead ? '#ff8a8a' : '#cfd6e0', 'left', 700);
+  } else if (UIS.tab === 'slice') {
+    button(X, 230, 466, 96, `Plan cut: ${CUT.on ? 'On' : 'Off'}`, { on: CUT.on, fs: 34, click: () => setCut(!CUT.on) });
+    button(X + 486, 230, 466, 96, CUT.playing ? 'Pause' : 'Play bottom → top', { on: CUT.playing, fs: 32, click: () => {
+      if (!CUT.on) setCut(true);
+      if (CUT.playing) CUT.playing = false; else { if (CUT.h >= modelTop() - 0.5) CUT.h = 0; CUT.playing = true; }
+    } });
+    const top = Math.max(10, modelTop());
+    const layer = Math.max(1, Math.round(iy(CUT.h)));
+    slider(X, 372, FW, 'Cut height', clamp(CUT.h / top, 0, 1), `${CUT.h.toFixed(1)} mm · slice ${layer}`, (u) => { if (!CUT.on) setCut(true); CUT.playing = false; CUT.h = u * top; capDirty = true; }, 'Each slice is one 1.6 mm layer of clay');
+    const legend = [['#e9dccb', 'Sits on the slice below'], ['#ffd166', 'Short overhang or flat bridge (prints fine)'], ['#ff7a2f', 'Needs support'], ['#ff1a5c', 'Floating island (always supported, thicker)'], [supLayer ? PALETTE[supLayer.colorIdx] : PALETTE[3], 'Support clay']];
+    legend.forEach(([c, t], i) => { const y = 520 + i * 70; ui.fillStyle = c; rr(X, y - 24, 48, 48, 10); ui.fill(); txt(t, X + 72, y, 30, '#e9ecf1', 'left', 600); });
+    txt('Solid cells show your layer colors; tints mark', X, 900, 26, '#7f8896', 'left', 500);
+    txt('what the slicer would worry about.', X, 934, 26, '#7f8896', 'left', 500);
+  } else if (UIS.tab === 'together') {
+    drawTogether(X, FW);
+  } else {
+    txt('View', X, 252, 30, '#9aa3b2', 'left', 700);
+    button(X, 282, 466, 96, 'Stand on bed (1:10)', { click: () => resetView(0.01) });
+    button(X + 486, 282, 466, 96, 'Tabletop (1:1)', { click: () => resetView(0.001) });
+    txt('Saves', X, 430, 30, '#9aa3b2', 'left', 700);
+    txt(cloud.ok ? (cloud.local ? 'Saved in this browser · autosave on' : 'Saved to your account · autosave on') : (cloud.checking ? 'Connecting…' : 'Saving is not available here'), X + FW, 430, 24, '#7f8896', 'right', 500);
+    ['slot1', 'slot2', 'slot3'].forEach((slot, i) => {
+      const y = 462 + i * 112;
+      ui.fillStyle = '#20232a'; rr(X, y, FW, 100, 18); ui.fill();
+      txt(`Slot ${i + 1}`, X + 28, y + 36, 32, '#e9ecf1', 'left', 800);
+      txt(cloud.meta[slot] ? `Saved ${cloud.meta[slot]}` : 'Empty', X + 28, y + 72, 24, '#7f8896', 'left', 500);
+      confirmButton(X + 540, y + 14, 196, 72, 'save' + slot, 'Save', () => saveSlot(slot, true), { dim: !cloud.ok });
+      confirmButton(X + 746, y + 14, 196, 72, 'load' + slot, 'Load', () => loadSlot(slot), { dim: !cloud.ok || !cloud.meta[slot] });
+    });
+    button(X, 812, FW, 100, 'Export STL + 3MF (.zip)', { on: true, fs: 34, click: exportZip });
+    confirmButton(X, 932, 466, 90, 'new', 'New empty scene', newScene);
+    confirmButton(X + 486, 932, 466, 90, 'demo', 'Load demo mushroom', () => { newScene(); starter(activeLayer); afterEdit(); });
+    const lines = ['Right trigger sculpt · A add/carve · B undo', 'Right stick ↕ size · ↔ shape · click smooth', 'Grips grab world · both grips turn + scale', 'Left stick fly (click: VR ↔ MR) · X menu · Y see-through'];
+    lines.forEach((l, i) => txt(l, X, 1066 + i * 34, 25, '#7f8896', 'left', 500));
+  }
+  if (UIS.toast && performance.now() - UIS.toastT < 2200) {
+    ui.fillStyle = 'rgba(124,240,178,0.95)'; rr(X, UIH - 84, FW, 64, 18); ui.fill();
+    txt(UIS.toast, X + FW / 2, UIH - 52, 30, '#111317', 'center', 800);
+  }
+  uiTex.needsUpdate = true;
+}
+function drawTogether(X, FW) {
+  const peopleDots = (y) => {
+    const list = [{ col: SYNC.col, me: true }, ...[...SYNC.peers.values()].map(p => ({ col: p.col }))];
+    list.forEach((p, i) => { ui.beginPath(); ui.arc(X + 36 + i * 86, y, 28, 0, Math.PI * 2); ui.fillStyle = PEERC[p.col % PEERC.length]; ui.fill(); if (p.me) txt('you', X + 36 + i * 86, y + 58, 24, '#cfd6e0', 'center', 700); });
+    txt(list.length === 1 ? 'Just you so far' : `${list.length} people sculpting`, X + 36 + list.length * 86, y + 10, 30, '#e9ecf1', 'left', 700);
+  };
+  if (NET.on) {
+    txt(NET.host ? 'Your room code' : "You're in room", X, 252, 30, '#9aa3b2', 'left', 700);
+    txt(NET.code, X, 360, 120, ACC, 'left', 900);
+    txt(NET.host ? 'Friends open Overhang Garden, tap Together and type this.' : 'Everything you sculpt shows up on everyone’s bed.', X, 430, 28, '#cfd6e0', 'left', 500);
+    peopleDots(530);
+    ['Each person’s head and brush show in their color.', 'Supports grow by themselves on every headset.', 'Undo only takes back your own strokes.'].forEach((l, i) => txt(l, X, 660 + i * 40, 28, '#cfd6e0', 'left', 500));
+    confirmButton(X, 840, FW, 96, 'leave', NET.host ? 'Close the room' : 'Leave the room', netLeave, { fs: 32 });
+    if (!NET.host) txt('Leaving keeps the bed as it is now.', X, 980, 26, '#7f8896', 'left', 500);
+  } else {
+    button(X, 230, FW, 110, 'Start a room', { on: true, fs: 38, click: netHost });
+    txt('Or join one with its code', X, 400, 30, '#9aa3b2', 'left', 700);
+    const code = SYNC.entry;
+    for (let i = 0; i < 4; i++) { ui.fillStyle = '#20232a'; rr(X + i * 120, 428, 104, 120, 18); ui.fill(); txt(code[i] || '', X + i * 120 + 52, 510, 70, '#e9ecf1', 'center', 900); }
+    const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '⌫', '0', 'Join'];
+    keys.forEach((k, i) => {
+      const bx = X + 500 + (i % 3) * 152, by = 428 + Math.floor(i / 3) * 104;
+      button(bx, by, 140, 92, k, { on: k === 'Join' && code.length === 4, fs: k === 'Join' ? 30 : 40, click: () => {
+        if (k === '⌫') SYNC.entry = code.slice(0, -1); else if (k === 'Join') { if (code.length === 4) netJoin(code); } else if (code.length < 4) SYNC.entry = code + k;
+        UIS.dirty = true; } });
+    });
+    ['Joining swaps your bed for the room’s.', 'Save it first if you want to keep it.'].forEach((l, i) => txt(l, X, 620 + i * 40, 28, '#cfd6e0', 'left', 500));
+    if (window.claude) txt('Rooms work on the GitHub version: shawnchiki.github.io/xr', X, 880, 26, '#ffc93c', 'left', 600);
+  }
+  if (SYNC.status) txt(SYNC.status, X, 1060, 30, '#ffc93c', 'left', 700);
+}
+function hitWidget(px, py) {
+  for (let i = W.length - 1; i >= 0; i--) { const w = W[i]; if (px >= w.x && px <= w.x + w.w && py >= w.y && py <= w.y + w.h && (w.click || w.drag)) return i; }
+  return -1;
+}
+function uiDown(px, py) {
+  const i = hitWidget(px, py); if (i < 0) return;
+  const w = W[i];
+  if (w.drag) { UIS.drag = w; w.drag(px); } else if (w.click) w.click();
+  UIS.dirty = true;
+}
+function uiMove(px, py) {
+  if (UIS.drag) { UIS.drag.drag(px); UIS.dirty = true; return; }
+  const h = hitWidget(px, py); if (h !== UIS.hover) { UIS.hover = h; UIS.dirty = true; }
+}
+function uiUp() { UIS.drag = null; }
+
+// desktop panel
+const panelWrap = document.getElementById('panelWrap'); panelWrap.appendChild(uiCanvas);
+const toPanel = (e) => { const r = uiCanvas.getBoundingClientRect(); return [(e.clientX - r.left) * UIW / r.width, (e.clientY - r.top) * UIH / r.height]; };
+uiCanvas.addEventListener('pointerdown', (e) => { e.stopPropagation(); uiCanvas.setPointerCapture(e.pointerId); uiDown(...toPanel(e)); });
+uiCanvas.addEventListener('pointermove', (e) => uiMove(...toPanel(e)));
+uiCanvas.addEventListener('pointerup', () => uiUp());
+uiCanvas.addEventListener('pointerleave', () => { if (!UIS.drag) { UIS.hover = -1; UIS.dirty = true; } });
+
+// ───────────────────────── layer ops
+function clearLayer(L) {
+  if (L && L.bridge) {
+    if (!L.beams.length) return;
+    const rec = newRec(); snapBeams(rec, L); L.beams = []; L.rebuildBeams(); pushUndo(rec); toast(`Cleared ${L.name}`); return;
+  }
+  if (!L || !L.chunks.size) return;
+  const m = new Map(L.chunks), rec = { saves: new Map([[L, m]]), bsaves: new Map() };
+  for (const key of [...L.chunks.keys()]) { L.chunks.delete(key); markChunkDirty(L, key); }
+  pushUndo(rec); toast(`Cleared ${L.name}`);
+}
+function deleteLayer(L) {
+  if (!L || L.auto) return;
+  if (!L.bridge && clayLayers().length < 2) return toast('Keep at least one clay layer');
+  const i = layers.indexOf(L); layers.splice(i, 1); L.dispose();
+  for (const st of [undoStack, redoStack]) for (let k = st.length - 1; k >= 0; k--) { st[k].saves.delete(L); if (st[k].bsaves) st[k].bsaves.delete(L); if (!recSize(st[k])) st.splice(k, 1); }
+  const u = clayLayers(); activeLayer = u[clamp(i - 1, 0, u.length - 1)]; afterEdit(); toast(`Deleted ${L.name}`);
+}
+function mergeLayer(L) {
+  if (L && L.bridge) return toast('Bridges stay on their own layer');
+  const u = clayLayers(), i = u.indexOf(L), T = u[i - 1] || u[i + 1];
+  if (!L || !T) return toast('Add another clay layer to merge with');
+  for (const [key, ch] of L.chunks) {
+    const t = T.chunks.get(key);
+    if (!t) T.chunks.set(key, ch.slice()); else for (let q = 0; q < 4096; q++) if (ch[q] > t[q]) t[q] = ch[q];
+    markChunkDirty(T, key);
+  }
+  if (L.locked || T.locked) T.locked = false;
+  layers.splice(layers.indexOf(L), 1); L.dispose();
+  undoStack.length = 0; redoStack.length = 0;
+  activeLayer = T; afterEdit(); toast(`Merged ${L.name} into ${T.name}`);
+}
+function newScene() {
+  for (const L of layers) L.dispose();
+  layers.length = 0; undoStack.length = 0; redoStack.length = 0; layerSeq = 1; supLayer = null;
+  addLayer('Layer 1', 0); ensureSupLayer(); clearSupports(); afterEdit();
+}
+function starter(L) {
+  const shroom = (x, z, h, sr, cr) => {
+    stamp(L, x, h + cr * 0.2, z, IDM, 0, cr, 'add', null);
+    stamp(L, x, h - cr * 0.7, z, IDM, 0, cr * 0.9, 'carve', null);
+    for (let y = 3; y <= h + cr * 0.3; y += 2) stamp(L, x, y, z, IDM, 0, sr * (1.15 - 0.25 * Math.min(1, y / h)), 'add', null);
+  };
+  shroom(-6, -4, 58, 10, 32);
+  shroom(42, 22, 26, 6, 15);
+}
+
+// ───────────────────────── brush ghost
+const ghostGeos = (() => {
+  const cone = new THREE.ConeGeometry(1, 2, 28, 1); cone.rotateX(-Math.PI / 2);
+  const cyl = new THREE.CylinderGeometry(0.85, 0.85, 2, 28); cyl.rotateX(Math.PI / 2);
+  return [new THREE.SphereGeometry(1, 28, 18), new THREE.BoxGeometry(1.64, 1.64, 1.64), cone, cyl, new THREE.TorusGeometry(0.72, 0.28, 14, 36)];
+})();
+const ghostMat = new THREE.MeshStandardMaterial({ color: ACC, transparent: true, opacity: 0.32, depthWrite: false, roughness: 0.4 });
+const ghostWire = new THREE.MeshBasicMaterial({ color: ACC, wireframe: true, transparent: true, opacity: 0.25 });
+const ghost = new THREE.Mesh(ghostGeos[0], ghostMat); const ghostW = new THREE.Mesh(ghostGeos[0], ghostWire); ghost.add(ghostW);
+ghost.visible = false; modelRoot.add(ghost);
+const ghostMirror = ghost.clone(); ghostMirror.material = ghostMat; modelRoot.add(ghostMirror); ghostMirror.visible = false;
+function updateGhost() {
+  const col = { add: ACC, carve: CARVE, smooth: SMOOTH, flatten: FLATC, bridge: BRIDGEC, texture: TEXC }[ST.tool];
+  ghostMat.color.set(col); ghostWire.color.set(col);
+  const g = ghostGeos[ST.tool === 'bridge' || ST.tool === 'texture' || ST.tool === 'flatten' ? 0 : ST.shape];
+  ghost.geometry = ghostW.geometry = g;
+  ghostMirror.geometry = g; ghostMirror.children[0].geometry = g;
+  UIS.dirty = true;
+}
+const bridgeGhost = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({ color: ACC, transparent: true, opacity: 0.5, depthWrite: false, roughness: 0.5 }));
+bridgeGhost.visible = false; modelRoot.add(bridgeGhost);
+function showBridgeGhost(on) {
+  bridgeGhost.visible = on; if (!on) return;
+  const A = bridge.A, B = bridge.B, dx = B.x - A.x, dz = B.z - A.z, len = Math.hypot(dx, dz), r = bridge.r;
+  bridgeGhost.position.set((A.x + B.x) / 2, A.y, (A.z + B.z) / 2);
+  bridgeGhost.rotation.set(0, Math.atan2(-dz, dx), 0);
+  bridgeGhost.scale.set(Math.max(0.1, len + 2 * r), 2 * Math.max(VS * 1.1, r * 0.55), 2 * r);
+  bridgeGhost.material.color.set(bridge.ok ? ACC : '#ff5a6b');
+}
+const TEXPREV = [];
+function texPreview(i) {
+  if (TEXPREV[i]) return TEXPREV[i];
+  const c = document.createElement('canvas'); c.width = 60; c.height = 48; const g = c.getContext('2d'), im = g.createImageData(60, 48);
+  const s = ST.tex.scale;
+  for (let y = 0; y < 48; y++) for (let x = 0; x < 60; x++) {
+    const v = pattern(i, x * 0.6, (48 - y) * 0.6, 2.3, s) * 0.5 + 0.5, p = (y * 60 + x) * 4;
+    im.data[p] = 70 + v * 170; im.data[p + 1] = 60 + v * 120; im.data[p + 2] = 110 + v * 140; im.data[p + 3] = 255;
+  }
+  g.putImageData(im, 0, 0); TEXPREV[i] = c; return c;
+}
+let smoothDirtyAt = 0;
+function remeshAll() { for (const L of layers) for (const key of L.chunks.keys()) markChunkDirty(L, key); dimsDirty = true; }
+function placeGhost(c, q, r, show) {
+  ghost.visible = show; ghostMirror.visible = show && ST.mirror;
+  if (!show) return;
+  ghost.position.copy(c); ghost.quaternion.copy(q); ghost.scale.setScalar(r);
+  if (ST.mirror) {
+    ghostMirror.position.set(-c.x, c.y, c.z);
+    const e = new THREE.Matrix4().makeRotationFromQuaternion(q); const Sx = new THREE.Matrix4().makeScale(-1, 1, 1);
+    ghostMirror.quaternion.setFromRotationMatrix(Sx.clone().multiply(e).multiply(Sx)); ghostMirror.scale.setScalar(r);
+  }
+}
+
+const Q_CONE_DOWN = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+const Q_CONE_UP = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+const brushQ = (q) => ST.shape === 2 ? (ST.tool === 'carve' ? Q_CONE_UP : Q_CONE_DOWN) : q;
+
+// ───────────────────────── desktop sculpting
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const bedPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const desk = { down: false, depth: 2, lastEvt: null };
+function rayFromEvent(e) { ndc.set(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1); raycaster.setFromCamera(ndc, camera); }
+function sculptHits() {
+  const objs = []; for (const L of layers) if (L.visible) for (const m of L.meshes.values()) objs.push(m);
+  modelRoot.updateMatrixWorld(); for (const o of objs) o.updateMatrixWorld();
+  const h = raycaster.intersectObjects(objs, false);
+  if (h.length) return h[0].distance;
+  const wp = bedPlane.clone().applyMatrix4(modelRoot.matrixWorld); const pt = new THREE.Vector3();
+  if (raycaster.ray.intersectPlane(wp, pt)) {
+    const lp = modelRoot.worldToLocal(pt.clone());
+    if (Math.abs(lp.x) < HALF && Math.abs(lp.z) < HALF) return pt.distanceTo(raycaster.ray.origin);
+  }
+  // nothing under the cursor: draw at the depth of the middle of the build volume
+  const mid = modelRoot.localToWorld(new THREE.Vector3(0, 60, 0));
+  return Math.max(0.05, mid.clone().sub(raycaster.ray.origin).dot(raycaster.ray.direction));
+}
+const tmpV = new THREE.Vector3(), tmpQ = new THREE.Quaternion(), invRootQ = new THREE.Quaternion();
+const Mbuf = new Float32Array(9);
+function deskBrush() {
+  const wp = raycaster.ray.origin.clone().addScaledVector(raycaster.ray.direction, desk.depth);
+  const c = modelRoot.worldToLocal(wp);
+  invRootQ.copy(modelRoot.quaternion).invert();
+  tmpQ.copy(invRootQ).multiply(camera.quaternion);
+  return { c, q: brushQ(tmpQ.clone()) };
+}
+function bridgePointFromRay() {
+  const p = modelRoot.localToWorld(bridge.A.clone());
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(modelRoot.quaternion);
+  const hit = new THREE.Vector3();
+  if (!raycaster.ray.intersectPlane(new THREE.Plane().setFromNormalAndCoplanarPoint(up, p), hit)) return null;
+  return modelRoot.worldToLocal(hit);
+}
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (renderer.xr.isPresenting || e.button !== 0) return;
+  rayFromEvent(e); desk.depth = sculptHits();
+  if (ST.tool === 'bridge') {
+    if (!bridgeBegin(deskBrush().c, brushMM())) return;
+    desk.down = true; renderer.domElement.setPointerCapture(e.pointerId); ghost.visible = ghostMirror.visible = false; return;
+  }
+  if (!strokeBegin()) return;
+  desk.down = true; renderer.domElement.setPointerCapture(e.pointerId);
+  const { c, q } = deskBrush(); strokeApply(c, quatToInvM(q, Mbuf), brushMM());
+});
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (renderer.xr.isPresenting) return;
+  rayFromEvent(e); desk.lastEvt = e;
+  if (desk.down && bridge.active) { const p = bridgePointFromRay(); if (p) bridgeUpdate(p); return; }
+  if (desk.down) { const { c, q } = deskBrush(); strokeApply(c, quatToInvM(q, Mbuf), brushMM()); placeGhost(c, q, brushMM(), true); }
+  else { desk.depth = sculptHits(); const { c, q } = deskBrush(); placeGhost(c, q, brushMM(), true); }
+});
+renderer.domElement.addEventListener('pointerup', (e) => { if (!desk.down) return; desk.down = false; if (bridge.active) bridgeEnd(); else strokeEnd(); });
+renderer.domElement.addEventListener('pointerleave', () => { if (!desk.down) ghost.visible = ghostMirror.visible = false; });
+window.addEventListener('keydown', (e) => {
+  if (renderer.xr.isPresenting) return;
+  const k = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && k === 'z') { e.shiftKey ? redo() : undo(); return; }
+  if (k === 'z') undo(); else if (k === 'y') redo();
+  else if (k === 'a') { ST.tool = 'add'; updateGhost(); } else if (k === 'c') { ST.tool = 'carve'; updateGhost(); } else if (k === 's') { ST.tool = 'smooth'; updateGhost(); } else if (k === 'b') { ST.tool = 'bridge'; updateGhost(); } else if (k === 't') { ST.tool = 'texture'; updateGhost(); } else if (k === 'f') { ST.tool = 'flatten'; updateGhost(); }
+  else if (k >= '1' && k <= '5') { ST.shape = +k - 1; updateGhost(); }
+  else if (k === '[') { ST.brushVR = clamp(brushMM() / 1.15, 1, 80) * S(); UIS.dirty = true; }
+  else if (k === ']') { ST.brushVR = clamp(brushMM() * 1.15, 1, 80) * S(); UIS.dirty = true; }
+});
+
+// ───────────────────────── VR controllers
+const hands = { left: null, right: null };
+const panelMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.35 * UIW / UIH, 0.35), new THREE.MeshBasicMaterial({ map: uiTex, transparent: true, depthWrite: false }));
+panelMesh.renderOrder = 10;
+panelMesh.position.set(0, 0.07, -0.12); panelMesh.rotation.x = -0.35 - Math.PI / 2;
+const laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.8 }));
+laser.visible = false;
+const cursor = new THREE.Mesh(new THREE.SphereGeometry(0.004, 12, 8), new THREE.MeshBasicMaterial({ color: ACC })); cursor.visible = false; scene.add(cursor);
+function penModel() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.015, 0.1, 16), new THREE.MeshStandardMaterial({ color: 0x2a2d34, roughness: 0.5 }));
+  body.rotation.x = Math.PI / 2; body.position.z = 0.03; g.add(body);
+  const tip = new THREE.Mesh(new THREE.ConeGeometry(0.011, 0.025, 16), new THREE.MeshStandardMaterial({ color: 0x7cf0b2, roughness: 0.4 }));
+  tip.rotation.x = -Math.PI / 2; tip.position.z = -0.032; g.add(tip);
+  return g;
+}
+for (let i = 0; i < 2; i++) {
+  const ctrl = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
+  scene.add(ctrl); scene.add(grip);
+  const h = { ctrl, grip, src: null, hand: null, prev: [], vis: null };
+  ctrl.addEventListener('connected', (e) => {
+    h.src = e.data; h.hand = e.data.handedness;
+    if (h.vis) { h.vis.parent && h.vis.parent.remove(h.vis); }
+    if (h.hand === 'right') { h.vis = penModel(); ctrl.add(h.vis); ctrl.add(laser); }
+    else { h.vis = new THREE.Group(); h.vis.add(panelMesh); grip.add(h.vis); }
+    hands[h.hand] = h;
+  });
+  ctrl.addEventListener('disconnected', () => { if (hands[h.hand] === h) hands[h.hand] = null; h.src = null; });
+}
+const gp = (h) => h && h.src && h.src.gamepad;
+const btnP = (h, i) => { const g = gp(h); return !!(g && g.buttons[i] && g.buttons[i].pressed); };
+const btnV = (h, i) => { const g = gp(h); return g && g.buttons[i] ? g.buttons[i].value : 0; };
+const axis = (h, i) => { const g = gp(h); return g && g.axes[i] !== undefined ? g.axes[i] : 0; };
+function edge(h, i) { if (!h) return false; const now = btnP(h, i), was = !!h.prev[i]; h.prev[i] = now; return now && !was; }
+function pulse(h, a, ms) { try { const ha = gp(h)?.hapticActuators?.[0]; ha && ha.pulse(a, ms); } catch (e) { } }
+
+const nav = { mode: 0, startPos: new THREE.Vector3(), startQ: new THREE.Quaternion(), s0: 1, a0: new THREE.Vector3(), b0: new THREE.Vector3() };
+const gripPos = (h) => h.grip.getWorldPosition(new THREE.Vector3());
+function updateNav(dt) {
+  const L = hands.left, R = hands.right;
+  const gl = btnP(L, 1), gr = btnP(R, 1);
+  const mode = gl && gr ? 2 : (gl || gr) ? 1 : 0;
+  const pl = gl ? gripPos(L) : null, pr = gr ? gripPos(R) : null;
+  if (mode !== nav.mode) {
+    nav.mode = mode; nav.startPos.copy(modelRoot.position); nav.startQ.copy(modelRoot.quaternion); nav.s0 = S();
+    if (mode === 1) nav.a0.copy(pl || pr);
+    if (mode === 2) { nav.a0.copy(pl); nav.b0.copy(pr); }
+    return;
+  }
+  if (mode === 1) { modelRoot.position.copy(nav.startPos).add((pl || pr).clone().sub(nav.a0)); }
+  else if (mode === 2) {
+    const m0 = nav.a0.clone().add(nav.b0).multiplyScalar(0.5), m1 = pl.clone().add(pr).multiplyScalar(0.5);
+    const d0 = nav.b0.clone().sub(nav.a0), d1 = pr.clone().sub(pl);
+    let f = d1.length() / Math.max(1e-4, d0.length());
+    f = clamp(f, SCALE_MIN / nav.s0, SCALE_MAX / nav.s0);
+    const yaw = Math.atan2(d1.x, d1.z) - Math.atan2(d0.x, d0.z);
+    const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+    const rel = nav.startPos.clone().sub(m0).multiplyScalar(f).applyQuaternion(qy);
+    modelRoot.position.copy(m1).add(rel);
+    modelRoot.quaternion.copy(qy).multiply(nav.startQ);
+    modelRoot.scale.setScalar(nav.s0 * f);
+    UIS.dirty = true;
+  }
+  // fly with left stick
+  const ax = axis(L, 2), ay = axis(L, 3);
+  if (Math.abs(ax) > 0.15 || Math.abs(ay) > 0.15) {
+    const xc = renderer.xr.getCamera(); const fwd = new THREE.Vector3(); xc.getWorldDirection(fwd);
+    const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0)).normalize();
+    const mv = fwd.multiplyScalar(-ay).add(right.multiplyScalar(ax)).multiplyScalar(0.9 * dt);
+    modelRoot.position.sub(mv);
+  }
+}
+let shapeLatch = false, panelOn = true, uiHeld = false;
+const rayO = new THREE.Vector3(), rayD = new THREE.Vector3();
+function updateXR(dt) {
+  const L = hands.left, R = hands.right;
+  updateNav(dt);
+  // left buttons
+  if (edge(L, 4)) { panelOn = !panelOn; panelMesh.visible = panelOn; }
+  if (edge(L, 3)) setPassthrough(!XRS.passthrough);
+  if (edge(L, 5)) { ST.sup.seeThrough = !ST.sup.seeThrough; applySeeThrough(); UIS.dirty = true; toast(ST.sup.seeThrough ? 'Supports see-through' : 'Supports solid'); }
+  if (!R) { ghost.visible = ghostMirror.visible = false; return; }
+  if (edge(R, 4)) { ST.tool = ST.tool === 'add' ? 'carve' : 'add'; ST.lastTool = ST.tool; updateGhost(); pulse(R, 0.3, 30); }
+  if (edge(R, 5)) { undo(); pulse(R, 0.3, 30); }
+  if (edge(R, 3)) { ST.tool = ST.tool === 'smooth' ? ST.lastTool : 'smooth'; updateGhost(); }
+  const sx = axis(R, 2), sy = axis(R, 3);
+  if (!shapeLatch && Math.abs(sx) > 0.7) { ST.shape = (ST.shape + (sx > 0 ? 1 : SHAPES.length - 1)) % SHAPES.length; shapeLatch = true; updateGhost(); pulse(R, 0.2, 20); }
+  if (Math.abs(sx) < 0.3) shapeLatch = false;
+  if (Math.abs(sy) > 0.2 && Math.abs(sx) < 0.6) { ST.brushVR = clamp(ST.brushVR * Math.exp(-sy * dt * 1.6), 0.002, 0.4); UIS.dirty = true; }
+  // ray vs panel
+  R.ctrl.updateMatrixWorld();
+  rayO.setFromMatrixPosition(R.ctrl.matrixWorld);
+  rayD.set(0, 0, -1).transformDirection(R.ctrl.matrixWorld);
+  const trig = btnV(R, 0), trigDown = trig > 0.12;
+  let onPanel = false;
+  if (panelOn && L && !stroke.active && !bridge.active) {
+    raycaster.set(rayO, rayD);
+    panelMesh.updateWorldMatrix(true, false);
+    const hit = raycaster.intersectObject(panelMesh, false)[0];
+    if (hit && hit.uv) {
+      onPanel = true;
+      const px = hit.uv.x * UIW, py = (1 - hit.uv.y) * UIH;
+      laser.visible = true; laser.scale.z = hit.distance; cursor.visible = true; cursor.position.copy(hit.point);
+      if (trigDown && !uiHeld) { uiHeld = true; uiDown(px, py); pulse(R, 0.25, 15); }
+      else if (trigDown) uiMove(px, py);
+      else { if (uiHeld) uiUp(); uiHeld = false; uiMove(px, py); }
+    }
+  }
+  if (!onPanel) {
+    laser.visible = false; cursor.visible = false;
+    if (uiHeld && !trigDown) { uiHeld = false; uiUp(); }
+    if (UIS.hover !== -1 && !uiHeld) { UIS.hover = -1; UIS.dirty = true; }
+  }
+  // brush
+  const rVR = ST.brushVR * (ST.pressure && stroke.active ? 0.35 + 0.65 * trig : 1);
+  const center = rayO.clone().addScaledVector(rayD, 0.035 + ST.brushVR);
+  R.ctrl.getWorldQuaternion(tmpQ);
+  const qModel = brushQ(invRootQ.copy(modelRoot.quaternion).invert().multiply(tmpQ).clone());
+  const cModel = modelRoot.worldToLocal(center.clone());
+  const rmm = clamp(rVR / S(), 1.0, 80);
+  if (ST.tool === 'bridge' && !onPanel && !uiHeld) {
+    const r0 = clamp(ST.brushVR / S(), 1.0, 80);
+    placeGhost(cModel, qModel, r0, !bridge.active);
+    if (trigDown && !bridge.active) { if (bridgeBegin(cModel, r0)) pulse(R, 0.3, 20); else uiHeld = true; }
+    else if (trigDown && bridge.active) bridgeUpdate(cModel);
+    else if (!trigDown && bridge.active) { bridgeEnd(); pulse(R, bridge.ok ? 0.5 : 0.15, 40); }
+  } else if (!onPanel && !uiHeld) {
+    placeGhost(cModel, qModel, rmm, true);
+    if (trigDown && !stroke.active) { if (strokeBegin()) { stroke.hasLast = false; } else uiHeld = true; }
+    if (stroke.active) {
+      if (!trigDown) strokeEnd();
+      else if (strokeApply(cModel, quatToInvM(qModel, Mbuf), rmm)) { const t = performance.now(); if (t - stroke.lastHaptic > 60) { pulse(R, 0.12, 14); stroke.lastHaptic = t; } }
+    }
+  } else { placeGhost(cModel, qModel, rmm, false); if (stroke.active && !trigDown) strokeEnd(); }
+}
+
+// ───────────────────────── save / load (Claude account storage when available)
+const cloud = { ok: false, checking: true, db: null, uid: null, dl: null, meta: {}, saving: false };
+function b64(u8) { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
+function unb64(str) { const s = atob(str); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+async function zipStream(u8, Cls, fmt) { const st = new Blob([u8]).stream().pipeThrough(new Cls(fmt)); return new Uint8Array(await new Response(st).arrayBuffer()); }
+async function serialize() {
+  const metaLayers = []; let total = 0; const parts = [];
+  for (const L of userLayers()) {
+    if (L.bridge) { metaLayers.push({ uid: L.uid, name: L.name, colorIdx: L.colorIdx, visible: L.visible, locked: L.locked, chunks: 0, bridge: true, beams: L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh].map(v => +v.toFixed(2))) }); continue; }
+    let cnt = 0;
+    for (const [key, ch] of L.chunks) {
+      let any = false; for (let i = 0; i < 4096; i++) if (ch[i] > 0.004) { any = true; break; }
+      if (!any) continue;
+      const buf = new Uint8Array(4098); buf[0] = key & 255; buf[1] = key >> 8;
+      for (let i = 0; i < 4096; i++) buf[2 + i] = Math.round(clamp(ch[i], 0, 1) * 255);
+      parts.push(buf); cnt++; total += 4098;
+    }
+    metaLayers.push({ uid: L.uid, name: L.name, colorIdx: L.colorIdx, visible: L.visible, locked: L.locked, chunks: cnt });
+  }
+  const raw = new Uint8Array(total); let o = 0; for (const p of parts) { raw.set(p, o); o += p.length; }
+  let data = raw, z = false;
+  if (typeof CompressionStream !== 'undefined') { try { data = await zipStream(raw, CompressionStream, 'deflate'); z = true; } catch (e) { } }
+  return { meta: { v: 1, z, layers: metaLayers, active: userLayers().indexOf(activeLayer), sup: ST.sup, supColor: supLayer ? supLayer.colorIdx : 3, smooth: ST.autoSmooth }, data: b64(data) };
+}
+async function deserialize(meta, str) {
+  let data = unb64(str);
+  if (meta.z) data = await zipStream(data, DecompressionStream, 'deflate');
+  for (const L of layers) L.dispose();
+  layers.length = 0; undoStack.length = 0; redoStack.length = 0; layerSeq = 1; supLayer = null;
+  let o = 0;
+  for (const ml of meta.layers) {
+    if (ml.bridge) {
+      const B = addBridgeLayer(ml.name); if (ml.uid) B.uid = ml.uid; B.setColor(ml.colorIdx | 0); B.visible = ml.visible; B.locked = ml.locked; B.group.visible = B.visible;
+      B.beams = (ml.beams || []).map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6] })); B.rebuildBeams();
+      continue;
+    }
+    const L = addLayer(ml.name, ml.colorIdx); if (ml.uid) L.uid = ml.uid; L.visible = ml.visible; L.locked = ml.locked; L.group.visible = L.visible;
+    for (let c = 0; c < ml.chunks; c++) {
+      const key = data[o] | (data[o + 1] << 8); const ch = new Float32Array(4096);
+      for (let i = 0; i < 4096; i++) ch[i] = data[o + 2 + i] / 255;
+      o += 4098; L.chunks.set(key, ch); markChunkDirty(L, key);
+    }
+  }
+  if (!clayLayers().length) addLayer('Layer 1', 0);
+  activeLayer = layers[clamp(meta.active | 0, 0, layers.length - 1)];
+  if (!activeLayer || activeLayer.auto) activeLayer = clayLayers()[0];
+  clearSupports();
+  if (meta.sup) { for (const k of Object.keys(ST.sup)) if (meta.sup[k] !== undefined) ST.sup[k] = meta.sup[k]; overU.uShowOver.value = ST.sup.stripes ? 1 : 0; }
+  ensureSupLayer(); applySeeThrough(); if (meta.supColor !== undefined) supLayer.setColor(meta.supColor);
+  if (typeof meta.smooth === 'number') ST.autoSmooth = meta.smooth;
+  afterEdit(); autosaveDue = 0; UIS.dirty = true;
+}
+const docPath = (id) => `data/users/${cloud.uid}/${id}`;
+const PART = 200000;
+async function saveSlot(slot, loud) {
+  if (!cloud.ok) { if (loud) toast('Saving needs this page opened in Claude'); return; }
+  if (cloud.saving) return; cloud.saving = true;
+  try {
+    const { meta, data } = await serialize();
+    const n = Math.ceil(data.length / PART) || 1;
+    for (let i = 0; i < n; i++) await cloud.db.doc(docPath(`${slot}_p${i}`)).set({ d: data.slice(i * PART, (i + 1) * PART) });
+    const when = new Date().toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    await cloud.db.doc(docPath(slot)).set({ ...meta, parts: n, when });
+    cloud.meta[slot] = when; if (loud) toast(`Saved to ${slot.replace('slot', 'slot ')}`);
+  } catch (e) { if (loud) toast(e && e.code === 'quota_exceeded' ? 'Storage is full' : 'Save failed'); }
+  cloud.saving = false; UIS.dirty = true;
+}
+async function loadSlot(slot) {
+  if (!cloud.ok) return false;
+  try {
+    const m = await cloud.db.doc(docPath(slot)).get();
+    if (!m.exists) { if (slot !== 'auto') toast('That slot is empty'); return false; }
+    const meta = m.data(); let s = '';
+    for (let i = 0; i < meta.parts; i++) { const p = await cloud.db.doc(docPath(`${slot}_p${i}`)).get(); if (!p.exists) throw new Error('missing'); s += p.data().d; }
+    await deserialize(meta, s);
+    if (slot !== 'auto') toast(`Loaded ${slot.replace('slot', 'slot ')}`); else toast('Picked up where you left off');
+    return true;
+  } catch (e) { toast('Load failed'); return false; }
+}
+let autosaveDue = 0;
+function autosaveTick(now) { if (NET.on && !NET.host) return; if (cloud.ok && autosaveDue && now > autosaveDue && !stroke.active && !cloud.saving) { autosaveDue = 0; saveSlot('auto', false); } }
+(async () => {
+  try {
+    const c = window.claude;
+    if (c && c.use) {
+      const [db, user, dl] = await Promise.all([c.use('db'), c.use('user'), c.use('downloads')]);
+      cloud.dl = dl;
+      if (db && user) {
+        const uid = await user.id();
+        if (uid) {
+          cloud.db = db; cloud.uid = uid; cloud.ok = true;
+          for (const slot of ['slot1', 'slot2', 'slot3']) { try { const m = await db.doc(docPath(slot)).get(); if (m.exists) cloud.meta[slot] = m.data().when; } catch (e) { } }
+          if (editCount <= 1) await loadSlot('auto');
+        }
+      }
+    }
+  } catch (e) { }
+  if (!cloud.ok) {
+    // outside Claude (GitHub Pages): saves live in this browser
+    try {
+      const db = await localDocs();
+      cloud.db = db; cloud.uid = 'local'; cloud.ok = true; cloud.local = true;
+      for (const slot of ['slot1', 'slot2', 'slot3']) { try { const m = await db.doc(docPath(slot)).get(); if (m.exists) cloud.meta[slot] = m.data().when; } catch (e) { } }
+      if (editCount <= 1 && !NET.on) await loadSlot('auto');
+    } catch (e) { }
+  }
+  cloud.checking = false; UIS.dirty = true;
+})();
+// a tiny IndexedDB store with the same doc(path).get()/set() shape as Claude's database
+function localDocs() {
+  return new Promise((res, rej) => {
+    const rq = indexedDB.open('overhang-garden', 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('docs');
+    rq.onerror = () => rej(rq.error);
+    rq.onsuccess = () => {
+      const idb = rq.result;
+      const tx = (mode, fn) => new Promise((ok, no) => { const t = idb.transaction('docs', mode), st = t.objectStore('docs'), r = fn(st); t.oncomplete = () => ok(r && r.result); t.onerror = () => no(t.error); });
+      res({ doc: (path) => ({
+        get: async () => { const v = await tx('readonly', st => st.get(path)); return { exists: v !== undefined, data: () => v }; },
+        set: async (v) => { await tx('readwrite', st => st.put(v, path)); },
+      }) });
+    };
+  });
+}
+
+
+// ───────────────────────── sculpting together (PeerJS rooms with 4-digit codes, like Toy Box)
+// Whoever starts the room hosts it. Everyone sends the clay they changed (16-bit, packed and squeezed) to the host,
+// the host applies it and passes it on to everybody, so all beds end up identical and each headset grows the same
+// supports by itself. Layers, colors, bridges and support settings travel as one small list.
+// ?nettest swaps PeerJS for a BroadcastChannel so two tabs on one computer can try it without the internet.
+const NET_PREFIX = 'chiki-overhang-', MAX_GUESTS = 4;
+function Em() { this._h = {}; } Em.prototype.on = function (k, f) { (this._h[k] = this._h[k] || []).push(f); return this; }; Em.prototype.emit = function (k, ...a) { (this._h[k] || []).forEach(f => f(...a)); };
+function BCConn(o, r) { Em.call(this); this.o = o; this.peer = r; this.open = false; } BCConn.prototype = Object.create(Em.prototype);
+BCConn.prototype.ready = function () { if (this.open) return; this.open = true; setTimeout(() => this.emit('open'), 0); };
+BCConn.prototype.send = function (d) { this.o.bc.postMessage({ to: this.peer, from: this.o.id, k: 'data', d }); };
+BCConn.prototype.close = function () { this.o.bc.postMessage({ to: this.peer, from: this.o.id, k: 'close' }); };
+function BCPeer(id) { Em.call(this); this.id = id || 'g' + Math.random().toString(36).slice(2, 9); this.conns = {}; this.bc = new BroadcastChannel('overhang-net');
+  this.bc.onmessage = e => { const m = e.data; if (m.to !== this.id) return; const c = this.conns[m.from];
+    if (m.k === 'conn') { const n = new BCConn(this, m.from); this.conns[m.from] = n; this.emit('connection', n); n.ready(); this.bc.postMessage({ to: m.from, from: this.id, k: 'ok' }); }
+    else if (m.k === 'ok') c && c.ready(); else if (m.k === 'data') c && c.emit('data', m.d); else if (m.k === 'close') c && c.emit('close'); };
+  setTimeout(() => this.emit('open', this.id), 10); }
+BCPeer.prototype = Object.create(Em.prototype);
+BCPeer.prototype.connect = function (id) { const c = new BCConn(this, id); this.conns[id] = c; this.bc.postMessage({ to: id, from: this.id, k: 'conn' }); setTimeout(() => { if (!c.open) this.emit('error', { type: 'peer-unavailable' }); }, 1500); return c; };
+BCPeer.prototype.destroy = function () { try { this.bc.close(); } catch (e) {} };
+async function makeIce() {
+  const stun = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+  try { const user = Math.floor(Date.now() / 1000 + 24 * 3600) + ':overhang';
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('openrelayprojectsecret'), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+    const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(user))), H = 'staticauth.openrelay.metered.ca';
+    return stun.concat([{ urls: ['turn:' + H + ':80', 'turn:' + H + ':80?transport=tcp', 'turn:' + H + ':443', 'turns:' + H + ':443?transport=tcp'], username: user, credential: btoa(String.fromCharCode(...sig)) }]);
+  } catch (e) { return stun; } }
+async function loadPeer() { if (NET.test) return; if (!NET.ice) NET.ice = await makeIce(); if (window.Peer) return;
+  await new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'; sc.onload = res; sc.onerror = () => rej(new Error('load')); document.head.append(sc); }); }
+function makePeer(id) { if (NET.test) return new BCPeer(id); const o = { debug: 1, config: { iceServers: NET.ice } }; return id ? new window.Peer(id, o) : new window.Peer(o); }
+function errText(e) { return e.type === 'peer-unavailable' ? 'No room with that code. Check it and try again.' : (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error') ? "Can't reach the matchmaker. Check the internet and try again." : 'Something went wrong (' + e.type + '). Try again.'; }
+function netStatus(t) { SYNC.status = t; UIS.dirty = true; }
+function netReset() {
+  for (const id in NET.conns) try { NET.conns[id].close(); } catch (e) {}
+  try { NET.conn && NET.conn.close(); } catch (e) {} try { NET.peer && NET.peer.destroy(); } catch (e) {}
+  Object.assign(NET, { host: false, code: '', peer: null, conns: {}, conn: null, on: false });
+  SYNC.synced = false; SYNC.touched.clear(); SYNC.lsig.clear(); SYNC.stSig = ''; SYNC.deleted.clear();
+  for (const p of SYNC.peers.values()) dropMarker(p); SYNC.peers.clear(); UIS.dirty = true;
+}
+function sendTo(pid, m) { const c = NET.conns[pid]; if (c) try { c.send(m); } catch (e) {} }
+function sendAll(m, except) { for (const pid in NET.conns) if (pid !== except) sendTo(pid, m); }
+function sendHost(m) { if (NET.conn) try { NET.conn.send(m); } catch (e) {} }
+// host: everything you change goes to everybody; guests: it goes to the host, who passes it on
+function netSend(m) { m.from = SYNC.me; if (NET.host) sendAll(m); else sendHost(m); }
+async function netHost() {
+  netReset(); netStatus('Starting a room…');
+  try { await loadPeer(); } catch (e) { return netStatus("Couldn't load the together part. Check the internet."); }
+  const go = () => { const code = NET.test ? '1234' : String(1000 + Math.floor(Math.random() * 9000)), peer = makePeer(NET_PREFIX + code); NET.peer = peer;
+    peer.on('open', () => { Object.assign(NET, { host: true, on: true, code }); SYNC.me = 'host'; SYNC.col = 0; SYNC.synced = true; noteSentState(); netStatus(''); toast(`Room ${code} is open`); });
+    peer.on('connection', c => {
+      c.on('open', () => { if (Object.keys(NET.conns).length >= MAX_GUESTS) { try { c.send({ t: 'full' }); } catch (e) {} setTimeout(() => c.close(), 400); return; }
+        NET.conns[c.peer] = c; hostWelcome(c.peer); });
+      c.on('data', m => { m.from = c.peer; SYNC.rq = SYNC.rq.then(() => onNetData(m, c.peer)).catch(() => {}); });
+      const drop = () => { if (NET.conns[c.peer]) { delete NET.conns[c.peer]; const p = SYNC.peers.get(c.peer); if (p) { dropMarker(p); SYNC.peers.delete(c.peer); } sendAll({ t: 'bye', from: c.peer }); toast('Someone left the room'); UIS.dirty = true; } };
+      c.on('close', drop); c.on('error', drop);
+    });
+    peer.on('error', e => { if (e.type === 'unavailable-id') { try { peer.destroy(); } catch (_) {} go(); return; } if (!NET.on) netStatus(errText(e)); });
+    peer.on('disconnected', () => { try { peer.reconnect(); } catch (e) {} }); };
+  go();
+}
+async function netJoin(code) {
+  code = String(code || '').trim(); if (!/^\d{4}$/.test(code)) return netStatus('Type the 4-digit room code.');
+  netReset(); NET.code = code; netStatus('Joining ' + code + '…');
+  try { await loadPeer(); } catch (e) { return netStatus("Couldn't load the together part. Check the internet."); }
+  const peer = makePeer(); NET.peer = peer; let done = false;
+  peer.on('open', () => { const c = peer.connect(NET_PREFIX + code, { reliable: true }); NET.conn = c;
+    c.on('open', () => { done = true; NET.on = true; SYNC.me = peer.id; netStatus('Getting the bed…'); });
+    c.on('data', m => { SYNC.rq = SYNC.rq.then(() => onNetData(m, null)).catch(() => {}); });
+    const gone = () => { if (!NET.on) return; netReset(); toast('The room closed. Your bed stays as it is'); };
+    c.on('close', gone); c.on('error', gone); });
+  peer.on('error', e => { if (!done) netStatus(errText(e)); });
+  setTimeout(() => { if (!done && NET.code === code) netStatus("Couldn't connect. Check the code and the internet, then try again."); }, 20000);
+}
+function netLeave() { const was = NET.on; netReset(); netStatus(''); if (was) toast('Left the room. Your bed stays as it is'); }
+
+// ---- what travels: clay chunks as 16-bit values, packed + deflated
+function quant(ch) { if (!ch) return null; const q = new Uint16Array(4096); let any = false; for (let i = 0; i < 4096; i++) { const v = Math.round(clamp(ch[i], 0, 1) * 65535); q[i] = v; if (v > 200) any = true; } return any ? q : null; }
+function sameQ(a, b) { if (!a || !b) return a === b; for (let i = 0; i < 4096; i++) if (a[i] !== b[i]) return false; return true; }
+async function packChunks(uid, items) {
+  const n = items.length, buf = new Uint8Array(4 + n * 7 + items.filter(it => it[1]).length * 8192), dv = new DataView(buf.buffer);
+  dv.setUint32(0, n, true); let o = 4;
+  for (const [key, q, ver] of items) {
+    dv.setUint16(o, key, true); dv.setUint32(o + 2, ver >>> 0, true); buf[o + 6] = q ? 1 : 0; o += 7;
+    if (q) { buf.set(new Uint8Array(q.buffer, q.byteOffset, 8192), o); o += 8192; }
+  }
+  let data = buf, z = false;
+  if (typeof CompressionStream !== 'undefined') { try { data = await zipStream(buf, CompressionStream, 'deflate'); z = true; } catch (e) { } }
+  return { t: 'ch', u: uid, z, d: b64(data) };
+}
+async function unpackChunks(m) {
+  let buf = unb64(m.d); if (m.z) buf = await zipStream(buf, DecompressionStream, 'deflate');
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength), n = dv.getUint32(0, true), out = []; let o = 4;
+  for (let c = 0; c < n; c++) {
+    const key = dv.getUint16(o, true), ver = dv.getUint32(o + 2, true), has = buf[o + 6]; o += 7;
+    let q = null; if (has) { q = new Uint16Array(4096); new Uint8Array(q.buffer).set(buf.subarray(o, o + 8192)); o += 8192; }
+    out.push([key, q, ver]);
+  }
+  return out;
+}
+function netTouch(L, key) {
+  if (!NET.on || netApplying || !L || L.auto || L.bridge) return;
+  let set = SYNC.touched.get(L); if (!set) SYNC.touched.set(L, set = new Set()); set.add(key);
+  if (!L.netVer) L.netVer = new Map(); L.netVer.set(key, (L.netVer.get(key) || 0) + 1);
+}
+const layerDesc = (L) => ({ u: L.uid, n: L.name, c: L.colorIdx, vis: L.visible, lk: L.locked, b: L.bridge ? L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh]) : null });
+const settingsDesc = () => ({ sup: { ...ST.sup }, sm: ST.autoSmooth, sc: supLayer ? supLayer.colorIdx : 0 });
+function layersState() { return { list: userLayers().map(layerDesc), ...settingsDesc() }; }
+// remember what everyone already has, so only real changes go out
+function noteSentState() { SYNC.lsig.clear(); for (const L of userLayers()) SYNC.lsig.set(L.uid, JSON.stringify(layerDesc(L))); SYNC.stSig = JSON.stringify(settingsDesc()); }
+// changed clay since the last send (only chunks that really differ go out)
+function diffChunks(L, keys, all) {
+  const items = []; if (!L.netQ) L.netQ = new Map(); if (!L.netVer) L.netVer = new Map();
+  for (const key of keys) {
+    const ch = L.chunks.get(key), q = quant(ch), prev = L.netQ.get(key) || null;
+    if (!all && sameQ(q, prev)) continue;
+    if (q) { L.netQ.set(key, q); for (let i = 0; i < 4096; i++) ch[i] = q[i] / 65535; } else L.netQ.delete(key);
+    if (q || !all) items.push([key, q, L.netVer.get(key) || 0]);
+  }
+  return items;
+}
+async function sendChunks(L, items, to) {
+  for (let s = 0; s < items.length; s += 40) { const m = await packChunks(L.uid, items.slice(s, s + 40)); m.from = SYNC.me; if (to) sendTo(to, m); else netSend(m); }
+}
+function netTick(now) {
+  if (!NET.on || !SYNC.synced) return;
+  if (now - SYNC.lastMe > 100) { SYNC.lastMe = now; sendPresence(); }
+  fadeMarkers(now);
+  if (now - SYNC.lastTick < 150 || SYNC.busy) return;
+  SYNC.lastTick = now;
+  // settings, and each layer on its own (so two people changing different things never undo each other)
+  const st = settingsDesc(), ss = JSON.stringify(st);
+  if (ss !== SYNC.stSig) { SYNC.stSig = ss; SYNC.stVer++; netSend({ t: 'st', v: SYNC.stVer, ...st }); }
+  const seen = new Set();
+  userLayers().forEach((L, i) => {
+    const d = layerDesc(L), sg = JSON.stringify(d); seen.add(L.uid);
+    if (SYNC.lsig.get(L.uid) !== sg) { SYNC.lsig.set(L.uid, sg); L.netLv = (L.netLv || 0) + 1; netSend({ t: 'lp', v: L.netLv, i, ...d }); }
+  });
+  for (const u of [...SYNC.lsig.keys()]) if (!seen.has(u)) { SYNC.lsig.delete(u); SYNC.deleted.add(u); netSend({ t: 'ld', u }); }
+  if (!SYNC.touched.size) return;
+  const batches = [];
+  for (const [L, keys] of SYNC.touched) if (layers.includes(L)) { const items = diffChunks(L, keys, false); if (items.length) batches.push([L, items]); }
+  SYNC.touched.clear();
+  if (batches.length) { SYNC.busy = true; (async () => { try { for (const [L, items] of batches) await sendChunks(L, items); } catch (e) { } SYNC.busy = false; })(); }
+}
+// host → new guest: who they are, then the whole bed
+async function hostWelcome(pid) {
+  const used = new Set([0, ...[...SYNC.peers.values()].map(p => p.col)]); let col = 1; while (used.has(col) && col < PEERC.length - 1) col++;
+  SYNC.peers.set(pid, { id: pid, col, t: performance.now() });
+  sendTo(pid, { t: 'welcome', you: pid, col });
+  sendTo(pid, { t: 'ly', v: 0, from: 'host', ...layersState() });
+  for (const L of userLayers()) if (!L.bridge) { const items = diffChunks(L, [...L.chunks.keys()], true); if (items.length) await sendChunks(L, items, pid); }
+  sendTo(pid, { t: 'ready' });
+  toast('Someone joined your room'); UIS.dirty = true;
+}
+async function onNetData(m, fromPid) {
+  if (!m || !m.t) return;
+  if (NET.host && fromPid) {
+    // a guest's change: apply it here, then pass it on (back to them too, so everyone agrees on the order)
+    if (m.t === 'me') { notePresence(m); sendAll(m, fromPid); return; }
+    if (m.t === 'ch') { await applyChunks(m); sendAll(m); return; }
+    if (m.t === 'lp') { applyLayerProps(m); sendAll(m); return; }
+    if (m.t === 'ld') { applyLayerDelete(m); sendAll(m, fromPid); return; }
+    if (m.t === 'st') { applySettings(m); sendAll(m); return; }
+    return;
+  }
+  if (m.t === 'welcome') { SYNC.me = m.you; SYNC.col = m.col; return; }
+  if (m.t === 'full') { netReset(); netStatus('That room is full.'); return; }
+  if (m.t === 'ready') { netStatus(''); toast(`You're in room ${NET.code}`); return; }
+  if (m.t === 'bye') { const p = SYNC.peers.get(m.from); if (p) { dropMarker(p); SYNC.peers.delete(m.from); UIS.dirty = true; } return; }
+  if (m.t === 'me') { notePresence(m); return; }
+  if (m.t === 'ch') { await applyChunks(m); return; }
+  if (m.t === 'ly') { applyLayers(m); return; }
+  if (m.t === 'lp') { applyLayerProps(m); return; }
+  if (m.t === 'ld') { applyLayerDelete(m); return; }
+  if (m.t === 'st') { applySettings(m); return; }
+}
+async function applyChunks(m) {
+  const L = layers.find(l => l.uid === m.u && !l.auto); if (!L) return;
+  const items = await unpackChunks(m), own = m.from === SYNC.me;
+  if (!L.netQ) L.netQ = new Map(); if (!L.netVer) L.netVer = new Map();
+  netApplying = true; let any = false;
+  for (const [key, q, ver] of items) {
+    if (own && (L.netVer.get(key) || 0) !== ver) continue;            // newer strokes of yours are already on their way
+    if (sameQ(q, L.netQ.get(key) || null) && (!!q === L.chunks.has(key))) continue;
+    if (q) { let ch = L.chunks.get(key); if (!ch) { ch = new Float32Array(4096); L.chunks.set(key, ch); } for (let i = 0; i < 4096; i++) ch[i] = q[i] / 65535; L.netQ.set(key, q); }
+    else { L.chunks.delete(key); L.netQ.delete(key); }
+    markChunkDirty(L, key); any = true;
+  }
+  netApplying = false;
+  if (any) afterEdit();
+}
+function purgeUndo(L) { for (const st of [undoStack, redoStack]) for (let k = st.length - 1; k >= 0; k--) { st[k].saves.delete(L); if (st[k].bsaves) st[k].bsaves.delete(L); if (!recSize(st[k])) st.splice(k, 1); } }
+// the whole layer list at once: only used when you join a room, to swap your bed for the room's
+function applyLayers(m) {
+  netApplying = true;
+  const first = !SYNC.synced, keepActive = activeLayer;
+  if (first) { undoStack.length = 0; redoStack.length = 0; }
+  const byU = new Map(userLayers().map(l => [l.uid, l])), next = [];
+  for (const d of m.list) {
+    let L = byU.get(d.u);
+    if (!L) { L = d.b ? addBridgeLayer(d.n) : addLayer(d.n, d.c); L.uid = d.u; }
+    byU.delete(d.u);
+    L.name = d.n; if (L.colorIdx !== d.c) L.setColor(d.c);
+    L.visible = d.vis; L.group.visible = d.vis; L.locked = d.lk;
+    if (d.b) { const sg = JSON.stringify(d.b); if (sg !== L._beamSig) { L._beamSig = sg; L.beams = d.b.map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6] })); L.rebuildBeams(); } }
+    next.push(L);
+  }
+  for (const L of byU.values()) { purgeUndo(L); L.dispose(); }
+  layers.length = 0; layers.push(...next); if (supLayer) layers.push(supLayer);
+  activeLayer = keepActive && layers.includes(keepActive) && !keepActive.auto && !first ? keepActive : (clayLayers()[0] || next[0]);
+  setSettings(m);
+  noteSentState(); SYNC.synced = true;
+  netApplying = false; afterEdit(); dimsDirty = true; UIS.dirty = true;
+}
+function setSettings(m) {
+  let supChanged = false;
+  for (const k of Object.keys(m.sup || {})) if (ST.sup[k] !== m.sup[k]) { ST.sup[k] = m.sup[k]; supChanged = true; }
+  if (supChanged) { overU.uShowOver.value = ST.sup.stripes ? 1 : 0; applySeeThrough(); supSettingChanged(); }
+  if (typeof m.sm === 'number' && m.sm !== ST.autoSmooth) { ST.autoSmooth = m.sm; smoothDirtyAt = performance.now(); }
+  if (supLayer && typeof m.sc === 'number' && supLayer.colorIdx !== m.sc) supLayer.setColor(m.sc);
+}
+function applySettings(m) {
+  if (m.from === SYNC.me && m.v !== SYNC.stVer) return;                // a newer change of yours is on its way
+  setSettings(m); SYNC.stSig = JSON.stringify(settingsDesc()); UIS.dirty = true;
+}
+// one layer's name, color, shown/locked and bridges; makes the layer if it's new to you
+function applyLayerProps(m) {
+  if (SYNC.deleted.has(m.u)) return;
+  let L = userLayers().find(l => l.uid === m.u);
+  if (L && m.from === SYNC.me && (L.netLv || 0) !== m.v) return;
+  netApplying = true;
+  if (!L) {
+    const keep = activeLayer;
+    L = m.b ? addBridgeLayer(m.n) : addLayer(m.n, m.c); L.uid = m.u; activeLayer = keep || L;
+    const u = userLayers(); u.splice(u.indexOf(L), 1); u.splice(clamp(m.i | 0, 0, u.length), 0, L);
+    layers.length = 0; layers.push(...u); if (supLayer) layers.push(supLayer);
+  }
+  L.name = m.n; if (L.colorIdx !== m.c) L.setColor(m.c);
+  L.visible = m.vis; L.group.visible = m.vis; L.locked = m.lk;
+  if (m.b) { const sg = JSON.stringify(m.b); if (sg !== L._beamSig) { L._beamSig = sg; L.beams = m.b.map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6] })); L.rebuildBeams(); } }
+  SYNC.lsig.set(L.uid, JSON.stringify(layerDesc(L)));
+  netApplying = false; afterEdit(); dimsDirty = true; UIS.dirty = true;
+}
+function applyLayerDelete(m) {
+  SYNC.deleted.add(m.u); SYNC.lsig.delete(m.u);
+  const L = userLayers().find(l => l.uid === m.u); if (!L) return;
+  if (!L.bridge && clayLayers().length < 2) return;
+  purgeUndo(L); layers.splice(layers.indexOf(L), 1); L.dispose();
+  if (activeLayer === L) activeLayer = clayLayers()[0];
+  afterEdit(); dimsDirty = true; UIS.dirty = true;
+}
+// ---- where everyone is: a colored head and their brush, in the bed's own space so it lines up at any scale
+const _v1 = new THREE.Vector3(), _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion();
+function sendPresence() {
+  camera.getWorldPosition(_v1); modelRoot.worldToLocal(_v1);
+  camera.getWorldQuaternion(_q1); modelRoot.getWorldQuaternion(_q2); _q1.premultiply(_q2.invert());
+  const g = ghost.visible ? [+ghost.position.x.toFixed(1), +ghost.position.y.toFixed(1), +ghost.position.z.toFixed(1), +ghost.scale.x.toFixed(2)] : null;
+  netSend({ t: 'me', col: SYNC.col, s: S(), h: [+_v1.x.toFixed(1), +_v1.y.toFixed(1), +_v1.z.toFixed(1)], q: [_q1.x, _q1.y, _q1.z, _q1.w].map(v => +v.toFixed(3)), g });
+}
+const headGeo = new THREE.SphereGeometry(1, 20, 14), visorGeo = new THREE.BoxGeometry(1.5, 0.55, 0.5), brushGeo = new THREE.SphereGeometry(1, 18, 12);
+function notePresence(m) {
+  if (m.from === SYNC.me) return;
+  let p = SYNC.peers.get(m.from);
+  if (!p) { p = { id: m.from, col: m.col | 0 }; SYNC.peers.set(m.from, p); UIS.dirty = true; }
+  p.col = m.col | 0; p.t = performance.now();
+  if (!p.head) {
+    const c = PEERC[p.col % PEERC.length];
+    p.head = new THREE.Group();
+    p.head.add(new THREE.Mesh(headGeo, new THREE.MeshStandardMaterial({ color: c, roughness: 0.5 })));
+    const visor = new THREE.Mesh(visorGeo, new THREE.MeshStandardMaterial({ color: '#15171c', roughness: 0.3 })); visor.position.set(0, 0.1, -0.85); p.head.add(visor);
+    p.brush = new THREE.Mesh(brushGeo, new THREE.MeshBasicMaterial({ color: c, wireframe: true, transparent: true, opacity: 0.7 }));
+    modelRoot.add(p.head); modelRoot.add(p.brush);
+  }
+  const size = 0.09 / Math.max(1e-5, m.s || 0.01);        // a head is about 9 cm across for that person
+  p.head.position.set(m.h[0], m.h[1], m.h[2]); p.head.quaternion.set(m.q[0], m.q[1], m.q[2], m.q[3]); p.head.scale.setScalar(size);
+  p.head.visible = true;
+  if (m.g) { p.brush.visible = true; p.brush.position.set(m.g[0], m.g[1], m.g[2]); p.brush.scale.setScalar(m.g[3]); } else p.brush.visible = false;
+}
+function dropMarker(p) { for (const o of [p.head, p.brush]) if (o) { modelRoot.remove(o); o.traverse(c => { if (c.material) c.material.dispose(); }); } p.head = p.brush = null; }
+function fadeMarkers(now) { for (const p of SYNC.peers.values()) if (p.head && now - p.t > 3000) { p.head.visible = false; p.brush.visible = false; } }
+
+// ───────────────────────── export (STL + 3MF, zipped)
+// clean, welded triangles of every beam on a bridge layer
+function beamTris(L) {
+  const P = [], T = [];
+  for (const b of L.beams) {
+    let g = beamGeometry(b); g.deleteAttribute('normal'); g.deleteAttribute('uv');
+    g = mergeVertices(g, 1e-4);
+    const m = new THREE.Object3D(); placeBeam(m, b); g.applyMatrix4(m.matrix);
+    const base = P.length / 3, pos = g.attributes.position.array, idx = g.index.array;
+    for (let i = 0; i < pos.length; i++) P.push(pos[i]);
+    for (let i = 0; i < idx.length; i++) T.push(base + idx[i]);
+    g.dispose();
+  }
+  return { P, T };
+}
+function layerTris(L) {
+  const map = new Map(), P = [], T = [];
+  for (const m of L.meshes.values()) {
+    const pos = m.geometry.attributes.position.array, idx = m.geometry.index.array, local = new Int32Array(pos.length / 3);
+    for (let v = 0; v < local.length; v++) {
+      const x = pos[v * 3], y = pos[v * 3 + 1], z = pos[v * 3 + 2], k = x + ',' + y + ',' + z;
+      let id = map.get(k); if (id === undefined) { id = P.length / 3; P.push(x, y, z); map.set(k, id); } local[v] = id;
+    }
+    for (let t = 0; t < idx.length; t += 3) { const a = local[idx[t]], b = local[idx[t + 1]], c = local[idx[t + 2]]; if (a !== b && b !== c && a !== c) T.push(a, b, c); }
+  }
+  return { P, T };
+}
+const toPrint = (x, y, z) => [x + HALF, HALF - z, y];
+function stlBinary(meshes) {
+  let n = 0; for (const m of meshes) n += m.T.length / 3;
+  const buf = new ArrayBuffer(84 + n * 50), dv = new DataView(buf);
+  const head = 'Overhang Garden export'; for (let i = 0; i < head.length; i++) dv.setUint8(i, head.charCodeAt(i));
+  dv.setUint32(80, n, true); let o = 84;
+  for (const m of meshes) for (let t = 0; t < m.T.length; t += 3) {
+    const v = [m.T[t], m.T[t + 1], m.T[t + 2]].map(i => toPrint(m.P[i * 3], m.P[i * 3 + 1], m.P[i * 3 + 2]));
+    const ux = v[1][0] - v[0][0], uy = v[1][1] - v[0][1], uz = v[1][2] - v[0][2], wx = v[2][0] - v[0][0], wy = v[2][1] - v[0][1], wz = v[2][2] - v[0][2];
+    let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx; const l = Math.hypot(nx, ny, nz) || 1;
+    dv.setFloat32(o, nx / l, true); dv.setFloat32(o + 4, ny / l, true); dv.setFloat32(o + 8, nz / l, true); o += 12;
+    for (const p of v) { dv.setFloat32(o, p[0], true); dv.setFloat32(o + 4, p[1], true); dv.setFloat32(o + 8, p[2], true); o += 12; }
+    o += 2;
+  }
+  return new Uint8Array(buf);
+}
+function model3mf(objs) {
+  const out = ['<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n<resources>\n<basematerials id="1">'];
+  const esc = (s) => String(s).replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' })[c]);
+  objs.forEach(o => out.push(`<base name="${esc(o.name)}" displaycolor="${o.color.toUpperCase()}FF"/>`));
+  out.push('</basematerials>');
+  objs.forEach((o, i) => {
+    out.push(`<object id="${i + 2}" type="model" name="${esc(o.name)}" pid="1" pindex="${i}"><mesh><vertices>`);
+    const vs = []; for (let v = 0; v < o.P.length; v += 3) { const p = toPrint(o.P[v], o.P[v + 1], o.P[v + 2]); vs.push(`<vertex x="${p[0].toFixed(4)}" y="${p[1].toFixed(4)}" z="${p[2].toFixed(4)}"/>`); }
+    out.push(vs.join('')); out.push('</vertices><triangles>');
+    const ts = []; for (let t = 0; t < o.T.length; t += 3) ts.push(`<triangle v1="${o.T[t]}" v2="${o.T[t + 1]}" v3="${o.T[t + 2]}"/>`);
+    out.push(ts.join('')); out.push('</triangles></mesh></object>');
+  });
+  out.push('</resources>\n<build>'); objs.forEach((o, i) => out.push(`<item objectid="${i + 2}"/>`)); out.push('</build>\n</model>');
+  return out.join('\n');
+}
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(files) {
+  const enc = new TextEncoder(), chunks = [], central = []; let off = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), data = typeof f.data === 'string' ? enc.encode(f.data) : f.data, crc = crc32(data);
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+    h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, name.length, true);
+    chunks.push(new Uint8Array(h.buffer), name, data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true);
+    c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, name.length, true); c.setUint32(42, off, true);
+    central.push(new Uint8Array(c.buffer), name);
+    off += 30 + name.length + data.length;
+  }
+  let csize = 0; for (const c of central) csize += c.length;
+  const e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, csize, true); e.setUint32(16, off, true);
+  return new Blob([...chunks, ...central, new Uint8Array(e.buffer)], { type: 'application/zip' });
+}
+function unionTris(src) {
+  const U = new Map();
+  for (const L of src) for (const [k, ch] of L.chunks) { const u = U.get(k); if (!u) U.set(k, ch.slice()); else for (let i = 0; i < 4096; i++) if (ch[i] > u[i]) u[i] = ch[i]; }
+  const keys = new Set();
+  for (const k of U.keys()) {
+    const cx = k % NC, cy = ((k / NC) | 0) % NC, cz = (k / (NC * NC)) | 0;
+    for (let c = -1; c <= 1; c++) for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) {
+      const x = cx + a, y = cy + b, z = cz + c; if (x < 0 || y < 0 || z < 0 || x >= NC || y >= NC || z >= NC) continue; keys.add(x + NC * (y + NC * z));
+    }
+  }
+  const map = new Map(), P = [], T = [];
+  for (const k of keys) {
+    const r = surfaceNets(U, k); if (!r) continue;
+    const local = new Int32Array(r.nv);
+    for (let v = 0; v < r.nv; v++) {
+      const x = VP[v * 3], y = VP[v * 3 + 1], z = VP[v * 3 + 2], key = x + ',' + y + ',' + z;
+      let id = map.get(key); if (id === undefined) { id = P.length / 3; P.push(x, y, z); map.set(key, id); } local[v] = id;
+    }
+    for (let t = 0; t < r.ni; t += 3) { const p = local[IDX[t]], q = local[IDX[t + 1]], w = local[IDX[t + 2]]; if (p !== q && q !== w && p !== w) T.push(p, q, w); }
+  }
+  return { P, T };
+}
+async function exportZip() {
+  const vis = layers.filter(l => l.visible && (l.chunks.size || l.meshes.size || (l.bridge && l.beams.length)));
+  if (!vis.length) return toast('Nothing to export yet');
+  toast('Packing your files…'); drawUI();
+  await new Promise(r => setTimeout(r, 30));
+  try { while (supRunning) { if (supRunning.next().done) supRunning = null; } } catch (e) { supRunning = null; }
+  while (anyDirty()) processRemesh(1000);
+  const fused = unionTris(vis.filter(l => !l.bridge));
+  const beamSets = vis.filter(l => l.bridge).map(beamTris);
+  const objs = vis.filter(l => l.meshes.size).map(L => ({ name: L.name, color: PALETTE[L.colorIdx], ...layerTris(L) }))
+    .concat(vis.filter(l => l.bridge).map(L => ({ name: L.name, color: PALETTE[L.colorIdx], ...beamTris(L) })));
+  const files = [{ name: 'overhang-garden.stl', data: stlBinary([fused, ...beamSets]) }];
+  const m3 = makeZip([
+    { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>' },
+    { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>' },
+    { name: '3D/3dmodel.model', data: model3mf(objs) },
+  ]);
+  files.push({ name: 'overhang-garden-layers.3mf', data: new Uint8Array(await m3.arrayBuffer()) });
+  files.push({ name: 'README.txt', data: 'Overhang Garden export\n\noverhang-garden.stl - everything visible (your sculpt + its built-in supports) fused into one solid. Z up, origin at the front-left bed corner. Print this one.\noverhang-garden-layers.3mf - each layer as its own object, so you can give layers different filaments in Bambu Studio.\n\nThe supports are part of the piece, so turn slicer supports off.\n' });
+  const zip = makeZip(files);
+  window.__lastZip = zip;
+  if (cloud.dl) {
+    try { await cloud.dl.save({ filename: 'overhang-garden.zip', data: zip }); toast('Saved overhang-garden.zip'); }
+    catch (e) { toast(e && e.code === 'declined' ? 'Download cancelled' : 'Download not available here'); }
+  } else {
+    try { const a = document.createElement('a'); a.href = URL.createObjectURL(zip); a.download = 'overhang-garden.zip'; document.body.appendChild(a); a.click(); a.remove(); toast('Downloading overhang-garden.zip'); }
+    catch (e) { toast('Download not available here'); }
+  }
+}
+
+// ───────────────────────── boot
+addLayer('Layer 1', 0); ensureSupLayer();
+starter(activeLayer); afterEdit(); autosaveDue = 0; editCount = 1;
+resetView(0.01);
+updateGhost();
+
+const splash = document.getElementById('splash'), goVR = document.getElementById('go-vr'), goMR = document.getElementById('go-mr'), goDesk = document.getElementById('go-desk'), vrBtn = document.getElementById('vrBtn'), mrBtn = document.getElementById('mrBtn');
+let vrOK = false, mrOK = false;
+const BG = scene.background;
+function showDesktop() { splash.style.display = 'none'; panelWrap.style.display = 'block'; document.getElementById('hud').style.display = 'block'; vrBtn.style.display = vrOK ? 'block' : 'none'; mrBtn.style.display = mrOK ? 'block' : 'none'; }
+// one XR session; passthrough flips instantly by hiding an opaque sky (MR) or showing it (VR)
+const XRS = { inSession: false, passthrough: false, ar: false };
+const sky = new THREE.Mesh(new THREE.SphereGeometry(150, 32, 16), new THREE.MeshBasicMaterial({ color: 0x17181c, side: THREE.BackSide, depthWrite: false }));
+sky.renderOrder = -10; sky.visible = false; scene.add(sky);
+function setPassthrough(on) {
+  if (!XRS.ar) { toast('Passthrough needs MR (Quest browser)'); return; }
+  XRS.passthrough = on; sky.visible = !on; env.ground.visible = env.base.visible = !on;
+  UIS.dirty = true; toast(on ? 'Passthrough on (MR)' : 'Passthrough off (VR)');
+}
+async function enterXR(mode) {
+  try {
+    const useAR = mrOK;
+    const session = await navigator.xr.requestSession(useAR ? 'immersive-ar' : 'immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
+    XRS.ar = useAR; XRS.inSession = true;
+    XRS.passthrough = useAR && mode === 'mr'; sky.visible = useAR && !XRS.passthrough; env.ground.visible = env.base.visible = !XRS.passthrough;
+    await renderer.xr.setSession(session);
+    splash.style.display = 'none'; panelWrap.style.display = 'none'; vrBtn.style.display = mrBtn.style.display = 'none'; document.getElementById('hud').style.display = 'none';
+    resetView(0.01); panelOn = true; panelMesh.visible = true; UIS.dirty = true;
+    session.addEventListener('end', () => { XRS.inSession = false; sky.visible = false; ghost.visible = ghostMirror.visible = false; env.ground.visible = env.base.visible = true; UIS.dirty = true; showDesktop(); });
+  } catch (e) { toast(mode === 'mr' ? 'Could not start passthrough' : 'Could not start VR'); }
+}
+goDesk.onclick = showDesktop; goVR.onclick = () => enterXR('vr'); vrBtn.onclick = () => enterXR('vr'); goMR.onclick = () => enterXR('mr'); mrBtn.onclick = () => enterXR('mr');
+if (navigator.xr && navigator.xr.isSessionSupported) {
+  navigator.xr.isSessionSupported('immersive-vr').then(ok => { vrOK = ok; goVR.disabled = !ok; goVR.textContent = ok ? 'Enter VR' : 'Open on your Quest for VR'; }).catch(() => { goVR.textContent = 'Open on your Quest for VR'; });
+  navigator.xr.isSessionSupported('immersive-ar').then(ok => { mrOK = ok; goMR.style.display = ok ? 'block' : 'none'; }).catch(() => { });
+} else goVR.textContent = 'Open on your Quest for VR';
+
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+let lastT = performance.now(), lastDraw = 0;
+renderer.setAnimationLoop(() => {
+  const now = performance.now(), dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  const xr = renderer.xr.isPresenting;
+  if (xr) updateXR(dt); else controls.update();
+  if (smoothDirtyAt && now - smoothDirtyAt > 250) { smoothDirtyAt = 0; remeshAll(); }
+  processRemesh(xr ? 6 : 12);
+  supportTick(now);
+  cutTick(dt);
+  autosaveTick(now);
+  netTick(now);
+  if (UIS.confirm && now - UIS.confirmT > 2500) { UIS.confirm = null; UIS.dirty = true; }
+  if (UIS.toast && now - UIS.toastT > 2200) { UIS.toast = ''; UIS.dirty = true; }
+  if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
+  renderer.render(scene, camera);
+});
+window.__og = { netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+</script>
+<script src="../updated.js"></script>
+</body>
+</html>
