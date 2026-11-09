@@ -1,7 +1,8 @@
 // When did each app last change? Read from this repo's commit history on GitHub, so it is always right
 // without anyone having to remember to bump a date. All times are shown in Toronto time (ET),
 // whatever time zone the headset or computer is set to.
-// On an app page: a small "Updated …" tag in the bottom-right corner (also on window.chikiUpdated).
+// On an app page: a small "Updated …" tag in the bottom-right corner, or along the top on phones (also on window.chikiUpdated).
+// Tapping the tag hides it until the app changes again.
 // On the launcher (data-mode="list"): only the helpers; index.html draws its own labels.
 (() => {
   const REPO = 'ShawnChiki/xr', TTL = 3 * 60 * 1000;             // ask GitHub at most every 3 minutes per app
@@ -41,7 +42,7 @@
     const time = d.toLocaleTimeString('en-US', { timeZone: TZ, hour: 'numeric', minute: '2-digit' });
     return day + ' · ' + time + ' ET';
   }
-  const seenKey = path => 'chiki-seen:' + path;
+  const seenKey = path => 'chiki-seen:' + path, hideKey = path => 'chiki-hid:' + path;
   window.ChikiUpdated = { latest, pathOf, ago, when, seenKey, TZ };
   if (me.dataset.mode === 'list') return;
 
@@ -50,13 +51,20 @@
     const d = new Date(v.date);
     window.chikiUpdated = { date: d, message: v.msg, label: 'Updated ' + ago(d) };
     try { localStorage.setItem(seenKey(path), v.date); } catch (e) {}
-    const tag = document.createElement('div');
-    tag.textContent = 'Updated ' + when(d) + ' · ' + ago(d);
-    tag.title = v.msg;
-    tag.setAttribute('style', 'position:fixed;right:10px;bottom:10px;z-index:2147483000;pointer-events:none;' +
-      'font:700 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:#111;background:#ffd400;' +
-      'border:2px solid #111;box-shadow:3px 3px 0 #ff3e8a;border-radius:999px;padding:5px 11px;white-space:nowrap');
-    document.body.appendChild(tag);
+    let hid = null; try { hid = localStorage.getItem(hideKey(path)); } catch (e) {}
+    if (hid !== v.date) {                                          // hidden by a tap, until a newer update comes along
+      const phone = matchMedia('(pointer:coarse)').matches;
+      const tag = document.createElement('div');
+      tag.textContent = 'Updated ' + when(d) + ' · ' + ago(d) + '  \u2715';
+      tag.title = v.msg + ' (tap to hide)';
+      tag.setAttribute('style', 'position:fixed;z-index:2147483000;cursor:pointer;touch-action:manipulation;' +
+        (phone ? 'top:calc(8px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);max-width:calc(100vw - 24px);overflow:hidden;text-overflow:ellipsis;'
+               : 'right:10px;bottom:10px;') +
+        'font:700 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:#111;background:#ffd400;' +
+        'border:2px solid #111;box-shadow:3px 3px 0 #ff3e8a;border-radius:999px;padding:5px 11px;white-space:nowrap');
+      tag.addEventListener('click', e => { e.stopPropagation(); try { localStorage.setItem(hideKey(path), v.date); } catch (err) {} tag.remove(); });
+      document.body.appendChild(tag);
+    }
     dispatchEvent(new CustomEvent('chiki-updated', { detail: window.chikiUpdated }));
   }).catch(() => {});
 })();
