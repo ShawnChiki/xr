@@ -228,6 +228,7 @@ class Layer {
   rebuildBeams() {
     for (const m of this.beamMeshes) { this.group.remove(m); m.geometry.dispose(); }
     this.beamMeshes = this.beams.map(b => { const m = new THREE.Mesh(beamGeometry(b), this.material); placeBeam(m, b); this.group.add(m); return m; });
+    if (BE.on && BE.L === this && this.beamMeshes[BE.idx]) this.beamMeshes[BE.idx].visible = false;   // its draft is showing instead
     dimsDirty = true;
   }
   dispose() {
@@ -237,7 +238,9 @@ class Layer {
   }
 }
 // a bridge beam: A and B at the same height, half width hw, half height hh; it runs a little past both ends into the clay
-const beamLen = (b) => Math.hypot(b.bx - b.ax, b.bz - b.az) + 2 * b.hw;
+// v:2 beams end exactly at A and B; older beams ran hw past both ends
+const bext = (b) => b.v === 2 ? 0 : b.hw;
+const beamLen = (b) => Math.hypot(b.bx - b.ax, b.bz - b.az) + 2 * bext(b);
 const beamGeometry = (b) => new RoundedBoxGeometry(beamLen(b), 2 * b.hh, 2 * b.hw, 2, Math.min(b.hw, b.hh) * 0.3);
 function placeBeam(m, b) {
   m.position.set((b.ax + b.bx) / 2, b.ay, (b.az + b.bz) / 2);
@@ -246,7 +249,7 @@ function placeBeam(m, b) {
 function insideBeam(b, x, y, z, pad = 0) {
   let ux = b.bx - b.ax, uz = b.bz - b.az; const len = Math.hypot(ux, uz) || 1; ux /= len; uz /= len;
   const px = x - (b.ax + b.bx) / 2, pz = z - (b.az + b.bz) / 2;
-  return Math.abs(px * ux + pz * uz) <= len / 2 + b.hw + pad && Math.abs(y - b.ay) <= b.hh + pad && Math.abs(-px * uz + pz * ux) <= b.hw + pad;
+  return Math.abs(px * ux + pz * uz) <= len / 2 + bext(b) + pad && Math.abs(y - b.ay) <= b.hh + pad && Math.abs(-px * uz + pz * ux) <= b.hw + pad;
 }
 function addBridgeLayer(name) {
   const L = new Layer(name || 'Bridges', 0); L.bridge = true;
@@ -494,8 +497,8 @@ function applySwap(rec) {
   afterEdit();
 }
 function pushUndo(rec) { if (!recSize(rec)) return; undoStack.push(rec); if (undoStack.length > 40) undoStack.shift(); redoStack.length = 0; afterEdit(); }
-function undo() { const r = undoStack.pop(); if (!r) return toast('Nothing to undo'); applySwap(r); redoStack.push(r); toast('Undo'); }
-function redo() { const r = redoStack.pop(); if (!r) return toast('Nothing to redo'); applySwap(r); undoStack.push(r); toast('Redo'); }
+function undo() { if (BE.on) beExit(true); const r = undoStack.pop(); if (!r) return toast('Nothing to undo'); applySwap(r); redoStack.push(r); toast('Undo'); }
+function redo() { if (BE.on) beExit(true); const r = redoStack.pop(); if (!r) return toast('Nothing to redo'); applySwap(r); undoStack.push(r); toast('Redo'); }
 function afterEdit() { editCount++; supNeed = true; lastEditAt = performance.now(); autosaveDue = performance.now() + 12000; dimsDirty = true; }
 
 const stroke = { active: false, rec: null, targets: [], last: new THREE.Vector3(), hasLast: false, lastHaptic: 0 };
@@ -580,7 +583,6 @@ function bridgeUpdate(p) {
   bridge.B.set(p.x, bridge.A.y, p.z);
   const len = Math.hypot(bridge.B.x - bridge.A.x, bridge.B.z - bridge.A.z);
   if (len < bridge.r * 2) { bridge.ok = false; bridge.why = 'Drag farther'; }
-  else if (len > ST.sup.maxBridge) { bridge.ok = false; bridge.why = `Too long: max ${ST.sup.maxBridge} mm`; }
   else if (!clayNear(bridge.B, bridge.r + VS)) { bridge.ok = false; bridge.why = 'A bridge has to land on clay'; }
   else { bridge.ok = true; bridge.why = ''; }
   showBridgeGhost(true);
@@ -589,15 +591,182 @@ function bridgeEnd() {
   if (!bridge.active) return;
   bridge.active = false; showBridgeGhost(false);
   if (!bridge.ok) { toast(bridge.why || 'No bridge'); return; }
-  // bridges are clean beams on their own Bridges layer, never voxel clay
-  const L = activeLayer && activeLayer.bridge ? activeLayer : (layers.find(l => l.bridge && l.visible && !l.locked) || addBridgeLayer('Bridges'));
-  const rec = newRec(), hh = Math.max(VS * 1.1, bridge.r * 0.55), A = bridge.A, B = bridge.B;
-  snapBeams(rec, L);
-  L.beams = L.beams.concat([{ ax: A.x, ay: A.y, az: A.z, bx: B.x, by: A.y, bz: B.z, hw: bridge.r, hh }]);
-  if (ST.mirror) L.beams.push({ ax: -A.x, ay: A.y, az: A.z, bx: -B.x, by: A.y, bz: B.z, hw: bridge.r, hh });
-  L.rebuildBeams();
-  pushUndo(rec);
-  toast(`Bridge ${Math.round(Math.hypot(bridge.B.x - bridge.A.x, bridge.B.z - bridge.A.z))} mm`);
+  // the drawn beam becomes a draft with handles; it only gets set once both ends sit fully on clay
+  const A = bridge.A, B = bridge.B, hw = bridge.r, hh = Math.max(VS * 1.1, bridge.r * 0.55);
+  const len = Math.hypot(B.x - A.x, B.z - A.z), ux = (B.x - A.x) / len, uz = (B.z - A.z) / len;
+  const d = { ax: A.x - ux * hw, ay: A.y, az: A.z - uz * hw, bx: B.x + ux * hw, by: A.y, bz: B.z + uz * hw, hw, hh, v: 2 };
+  autoFitBeam(d);
+  beStart(null, -1, d, true);
+}
+
+// ───────────────────────── bridge editing: full-end check, handles, set only when supported
+// is this exact point inside clay? (blends the 8 voxels around it, a touch stricter than the surface itself)
+function clayAt(x, y, z) {
+  if (y < VS * 0.5) return true;                                     // the bed holds it up
+  const fx = ix(x), fy = iy(y), fz = iz(z), i = Math.floor(fx), j = Math.floor(fy), k = Math.floor(fz), tx = fx - i, ty = fy - j, tz = fz - k;
+  for (const L of layers) {
+    if (!L.visible || L.auto || L.bridge) continue;
+    let v = 0;
+    for (let c = 0; c < 8; c++) { const a = c & 1, b = (c >> 1) & 1, d = c >> 2; v += getD(L, i + a, j + b, k + d) * (a ? tx : 1 - tx) * (b ? ty : 1 - ty) * (d ? tz : 1 - tz); }
+    if (v > ISO + 0.05) return true;
+  }
+  return false;
+}
+// every point along both end faces has to sit on clay; the gap in between must fit the max bridge
+function beamCheck(b) {
+  const dx = b.bx - b.ax, dz = b.bz - b.az, len0 = Math.hypot(dx, dz) || 1e-6, ux = dx / len0, uz = dz / len0, e = bext(b);
+  const x0 = b.ax - ux * e, z0 = b.az - uz * e, Lb = len0 + 2 * e, yb = b.ay - b.hh;
+  const nu = Math.max(2, Math.ceil(Lb / (VS * 0.6))), nv = Math.max(2, Math.ceil(2 * b.hw / (VS * 0.6))), du = (Lb - 0.6) / nu;
+  let endA = true, endB = true, gap = 0;
+  for (let q = 0; q <= nv; q++) {
+    const v = -b.hw + 0.3 + (2 * b.hw - 0.6) * q / nv;
+    let first = -1, last = -1, run = 0;
+    for (let p = 0; p <= nu; p++) {
+      const u = 0.3 + du * p, x = x0 + ux * u - uz * v, z = z0 + uz * u + ux * v;
+      const sup = clayAt(x, yb + VS * 0.45, z) || clayAt(x, yb - VS * 0.55, z);
+      if (sup) { if (first >= 0) gap = Math.max(gap, run * du); run = 0; if (first < 0) first = p; last = p; } else run++;
+    }
+    if (first !== 0) endA = false; if (last !== nu) endB = false;
+  }
+  return { ok: endA && endB && gap <= ST.sup.maxBridge + 0.5, endA, endB, gap };
+}
+// pull in an end that hangs off the clay, if a slightly shorter beam sits fully on it
+function autoFitBeam(d) {
+  const tryEnd = (which) => {
+    for (let t = 0; t < 12; t++) {
+      const c = beamCheck(d); if (which === 'a' ? c.endA : c.endB) return;
+      const dx = d.bx - d.ax, dz = d.bz - d.az, len = Math.hypot(dx, dz); if (len < d.hw * 2 + VS) return;
+      const sx = dx / len * VS * 0.5, sz = dz / len * VS * 0.5;
+      if (which === 'a') { d.ax += sx; d.az += sz; } else { d.bx -= sx; d.bz -= sz; }
+    }
+  };
+  const keep = { ...d }; tryEnd('a'); tryEnd('b');
+  if (!beamCheck(d).ok) Object.assign(d, keep);                       // no luck: leave it as drawn, red, for the handles
+}
+const BE = { on: false, L: null, idx: -1, d: null, chk: null, isNew: false, drag: null, hover: null, commitAt: 0, mirrorDone: false };
+const beGroup = new THREE.Group(); beGroup.visible = false; modelRoot.add(beGroup);
+const beDraftMat = new THREE.MeshStandardMaterial({ color: '#7cf0b2', roughness: 0.45, transparent: true, opacity: 0.88 });
+let beDraftMesh = null;
+const HANDLES = (() => {
+  const mk = (geo, kind) => { const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: BRIDGEC, depthTest: false, transparent: true, opacity: 0.95 })); m.renderOrder = 10; m.userData.kind = kind; beGroup.add(m); return m; };
+  const up = new THREE.ConeGeometry(0.7, 1.6, 16); const side = new THREE.ConeGeometry(0.7, 1.6, 16); side.rotateZ(-Math.PI / 2);
+  const ring = new THREE.TorusGeometry(2.2, 0.28, 8, 40); ring.rotateX(Math.PI / 2);
+  return { a: mk(new THREE.SphereGeometry(1, 18, 12), 'a'), b: mk(new THREE.SphereGeometry(1, 18, 12), 'b'), move: mk(new THREE.BoxGeometry(1.4, 1.4, 1.4), 'move'),
+    turn: mk(ring, 'turn'), wide: mk(side, 'wide'), thick: mk(up, 'thick') };
+})();
+const handleSize = () => clamp(0.011 / S(), 1.2, 30);
+function beLayer() { return BE.L && layers.includes(BE.L) ? BE.L : (activeLayer && activeLayer.bridge && !activeLayer.locked ? activeLayer : (layers.find(l => l.bridge && l.visible && !l.locked) || addBridgeLayer('Bridges'))); }
+function beStart(L, idx, d, isNew) {
+  if (BE.on) beExit(true);
+  Object.assign(BE, { on: true, L, idx, d: { ...d, v: 2, by: d.ay }, isNew, drag: null, hover: null, commitAt: 0, mirrorDone: false });
+  if (L && idx >= 0 && L.beamMeshes[idx]) L.beamMeshes[idx].visible = false;
+  beRefresh();
+  if (BE.chk.ok) beCommit(); else toast(beWhy());
+  ST.tool = 'bridge'; UIS.dirty = true;
+}
+function beWhy() {
+  const c = BE.chk; if (!c) return '';
+  if (c.ok) return 'Both ends sit fully on clay. Set.';
+  if (!c.endA && !c.endB) return 'Both ends hang off the clay. Drag the handles.';
+  if (!c.endA || !c.endB) return 'One end hangs off the clay. Drag its handle.';
+  return `The gap is ${Math.round(c.gap)} mm; the max bridge is ${ST.sup.maxBridge} mm.`;
+}
+function beRefresh() {
+  const d = BE.d; BE.chk = beamCheck(d);
+  if (beDraftMesh) { beGroup.remove(beDraftMesh); beDraftMesh.geometry.dispose(); }
+  beDraftMesh = new THREE.Mesh(beamGeometry(d), beDraftMat); placeBeam(beDraftMesh, d); beGroup.add(beDraftMesh);
+  beDraftMat.color.set(BE.chk.ok ? '#7cf0b2' : '#ff5a6b');
+  const hs = handleSize(), cx = (d.ax + d.bx) / 2, cz = (d.az + d.bz) / 2, len = Math.hypot(d.bx - d.ax, d.bz - d.az) || 1;
+  const ux = (d.bx - d.ax) / len, uz = (d.bz - d.az) / len, nx = -uz, nz = ux, yaw = -Math.atan2(uz, ux);
+  const put = (h, x, y, z, sc) => { h.position.set(x, y, z); h.scale.setScalar(sc); h.material.color.set(BE.hover === h.userData.kind || (BE.drag && BE.drag.kind === h.userData.kind) ? '#ffffff' : BRIDGEC); };
+  put(HANDLES.a, d.ax, d.ay, d.az, hs); put(HANDLES.b, d.bx, d.ay, d.bz, hs);
+  put(HANDLES.move, cx, d.ay + d.hh + hs * 1.6, cz, hs); put(HANDLES.turn, cx, d.ay + d.hh + hs * 1.6, cz, hs);
+  put(HANDLES.wide, cx + nx * (d.hw + hs * 1.4), d.ay, cz + nz * (d.hw + hs * 1.4), hs); HANDLES.wide.rotation.set(0, yaw + Math.PI / 2, 0);
+  put(HANDLES.thick, d.ax + ux * len * 0.25, d.ay + d.hh + hs * 1.4, d.az + uz * len * 0.25, hs);
+  beGroup.visible = true; UIS.dirty = true;
+}
+function beCommit() {
+  if (!BE.on || !BE.chk || !BE.chk.ok) return false;
+  const L = beLayer(); BE.L = L;
+  const rec = newRec(); snapBeams(rec, L);
+  const arr = L.beams.slice(), nb = { ...BE.d };
+  if (BE.idx >= 0 && BE.idx < arr.length) arr[BE.idx] = nb; else { arr.push(nb); BE.idx = arr.length - 1; }
+  if (BE.isNew && ST.mirror && !BE.mirrorDone) {
+    const m = { ...nb, ax: -nb.ax, bx: -nb.bx }; if (Math.abs(m.ax - nb.ax) > 1 && beamCheck(m).ok) arr.push(m); BE.mirrorDone = true;
+  }
+  L.beams = arr; L.rebuildBeams(); if (L.beamMeshes[BE.idx]) L.beamMeshes[BE.idx].visible = false;
+  pushUndo(rec); BE.isNew = false;
+  return true;
+}
+function beExit(quiet) {
+  if (!BE.on) return;
+  if (BE.commitAt) { BE.commitAt = 0; beCommit(); }
+  if (BE.isNew && !quiet) toast('Bridge not set: an end hung off the clay');
+  const L = BE.L; BE.on = false; BE.drag = null; beGroup.visible = false;
+  if (L && layers.includes(L)) L.rebuildBeams();
+  UIS.dirty = true;
+}
+function beDelete() {
+  if (!BE.on) return;
+  const L = BE.L;
+  if (L && layers.includes(L) && BE.idx >= 0 && BE.idx < L.beams.length && !BE.isNew) {
+    const rec = newRec(); snapBeams(rec, L); L.beams = L.beams.filter((_, i) => i !== BE.idx); L.rebuildBeams(); pushUndo(rec);
+  }
+  BE.isNew = false; beExit(true); toast('Bridge deleted');
+}
+// pick an existing beam to edit (press on it with the bridge tool)
+function bePickAt(p) {
+  for (const L of layers) if (L.bridge && L.visible && !L.locked) for (let i = 0; i < L.beams.length; i++) if (insideBeam(L.beams[i], p.x, p.y, p.z, 0.8)) {
+    const b = L.beams[i], d = b.v === 2 ? { ...b } : (() => { const len = Math.hypot(b.bx - b.ax, b.bz - b.az) || 1, ux = (b.bx - b.ax) / len, uz = (b.bz - b.az) / len;
+      return { ...b, ax: b.ax - ux * b.hw, az: b.az - uz * b.hw, bx: b.bx + ux * b.hw, bz: b.bz + uz * b.hw, v: 2 }; })();
+    beStart(L, i, d, false); toast('Editing bridge: drag the handles'); return true;
+  }
+  return false;
+}
+// which handle is the brush (VR) or point (desktop) on
+function beHandleNear(p, extra) {
+  if (!BE.on) return null; const hs = handleSize(); let best = null, bd = Infinity;
+  for (const k of ['a', 'b', 'thick', 'wide', 'move']) { const h = HANDLES[k], d = h.position.distanceTo(p); if (d < hs * 2.2 + extra && d < bd) { bd = d; best = k; } }
+  if (!best) { const t = HANDLES.turn.position, r = Math.hypot(p.x - t.x, p.z - t.z); if (Math.abs(r - hs * 2.2) < hs + extra && Math.abs(p.y - t.y) < hs * 1.5 + extra) best = 'turn'; }
+  return best;
+}
+function beDragStart(kind, p) { BE.drag = { kind, p0: p.clone(), d0: { ...BE.d } }; beRefresh(); }
+function beDragTo(p, vertical) {
+  const g = BE.drag; if (!g) return; const d0 = g.d0, d = { ...d0 };
+  const cx = (d0.ax + d0.bx) / 2, cz = (d0.az + d0.bz) / 2, len0 = Math.hypot(d0.bx - d0.ax, d0.bz - d0.az) || 1;
+  const ux = (d0.bx - d0.ax) / len0, uz = (d0.bz - d0.az) / len0;
+  const dx = p.x - g.p0.x, dy = p.y - g.p0.y, dz = p.z - g.p0.z;
+  if (g.kind === 'a' || g.kind === 'b') {
+    const k = g.kind, ox = k === 'a' ? d0.bx : d0.ax, oz = k === 'a' ? d0.bz : d0.az;
+    let nx = (k === 'a' ? d0.ax : d0.bx) + dx, nz = (k === 'a' ? d0.az : d0.bz) + dz;
+    const l = Math.hypot(nx - ox, nz - oz), minL = d0.hw * 2 + VS;
+    if (l < minL) { nx = ox + (nx - ox) / (l || 1) * minL; nz = oz + (nz - oz) / (l || 1) * minL; }
+    if (k === 'a') { d.ax = nx; d.az = nz; } else { d.bx = nx; d.bz = nz; }
+  } else if (g.kind === 'move') {
+    const vy = vertical ? dy : (renderer.xr.isPresenting ? dy : 0), hx = vertical ? 0 : dx, hz = vertical ? 0 : dz;
+    d.ax += hx; d.bx += hx; d.az += hz; d.bz += hz; d.ay = Math.max(d0.hh, d0.ay + vy); d.by = d.ay;
+  } else if (g.kind === 'turn') {
+    const a0 = Math.atan2(g.p0.z - cz, g.p0.x - cx), a1 = Math.atan2(p.z - cz, p.x - cx), da = a1 - a0, c = Math.cos(da), s2 = Math.sin(da);
+    const rot = (x, z) => [cx + (x - cx) * c - (z - cz) * s2, cz + (x - cx) * s2 + (z - cz) * c];
+    [d.ax, d.az] = rot(d0.ax, d0.az); [d.bx, d.bz] = rot(d0.bx, d0.bz);
+  } else if (g.kind === 'wide') {
+    const lat = Math.abs(-(p.x - cx) * uz + (p.z - cz) * ux); d.hw = clamp(lat - handleSize() * 1.4, 1, 30);
+  } else if (g.kind === 'thick') {
+    const yb = d0.ay - d0.hh, top = Math.max(yb + VS * 1.2, p.y - handleSize() * 1.4); d.hh = clamp((top - yb) / 2, VS * 0.6, 20); d.ay = yb + d.hh; d.by = d.ay;
+  }
+  BE.d = d; beRefresh();
+}
+function beDragEnd() {
+  if (!BE.drag) return; BE.drag = null; beRefresh();
+  if (BE.chk.ok) beCommit(); else toast(beWhy());
+}
+// sliders change the draft right away and set it a moment after you stop, if it's supported
+function beSlide(fn) { if (!BE.on) return; fn(BE.d); beRefresh(); BE.commitAt = BE.chk.ok ? performance.now() + 450 : 0; }
+function beTick(now) {
+  if (!BE.on) return;
+  if (ST.tool !== 'bridge' || (BE.L && !layers.includes(BE.L))) { beExit(false); return; }
+  if (BE.commitAt && now > BE.commitAt && !BE.drag) { BE.commitAt = 0; beCommit(); }
+  const hs = handleSize(); if (Math.abs(HANDLES.a.scale.x - hs) > hs * 0.05) beRefresh();
 }
 
 // ───────────────────────── surface nets mesher
@@ -860,7 +1029,7 @@ function* occGen(vis, extra) {
   if (extra) yield* add(extra);
   if (firmUsed) { firmM.fill(0); firmUsed = false; }
   for (const L of vis) if (L.bridge) for (const b of L.beams) {
-    const anchored = clayNear({ x: b.ax, y: b.ay, z: b.az }, b.hw + VS) && clayNear({ x: b.bx, y: b.ay, z: b.bz }, b.hw + VS);
+    const anchored = beamCheck(b).ok;
     const cx = (b.ax + b.bx) / 2, cz = (b.az + b.bz) / 2, R = beamLen(b) / 2 + b.hw + VS;
     const [i0, i1, j0, j1, k0, k1] = voxBox(cx - R, cx + R, b.ay - b.hh - VS, b.ay + b.hh + VS, cz - R, cz + R);
     for (let k = k0; k <= k1; k++) for (let j = Math.max(1, j0); j <= j1; j++) for (let i = i0; i <= i1; i++) {
@@ -1729,9 +1898,15 @@ function drawUI() {
         ui.drawImage(texPreview(i), bx + 30, 444, 120, 96);
         txt(n, bx + 90, 564, 26, on ? '#111317' : '#cfd6e0', 'center', 700);
       });
+    } else if (tool === 'bridge' && BE.on) {
+      txt('Editing bridge', X, 404, 30, '#9aa3b2', 'left', 700);
+      txt(beWhy(), X, 446, 28, BE.chk && BE.chk.ok ? ACC : '#ff8a8a', 'left', 800);
+      ['Balls: ends · Ring: turn · Cube: move', 'Side arrow: width · Top arrow: thickness'].forEach((l, i) => txt(l, X, 490 + i * 34, 26, '#cfd6e0', 'left', 500));
+      button(X + 648, 482, 304, 76, BE.chk && BE.chk.ok ? 'Done' : 'Stop editing', { on: !!(BE.chk && BE.chk.ok), fs: 28, click: () => beExit(false) });
+      confirmButton(X + 648, 566, 304, 64, 'bedel', 'Delete bridge', beDelete, { fs: 26 });
     } else if (tool === 'bridge') {
       txt('Bridge', X, 404, 30, '#9aa3b2', 'left', 700);
-      ['Press on clay, drag across, let go on clay.', 'You get a clean beam on its own Bridges layer.', 'It prints with no supports while both ends sit', 'on clay. Carve an end away and that end gets one.'].forEach((l, i) => txt(l, X, 446 + i * 38, 28, '#cfd6e0', 'left', 500));
+      ['Press on clay, drag across, let go on clay.', 'It only sets once both ends sit fully on clay;', 'then drag its handles to change it. Press on', 'any bridge to edit it again.'].forEach((l, i) => txt(l, X, 446 + i * 38, 28, '#cfd6e0', 'left', 500));
     } else if (tool === 'flatten') {
       txt('Flatten', X, 404, 30, '#9aa3b2', 'left', 700);
       ['Where you start the stroke it finds the plane of', 'the surface, then shaves bumps down to it and fills', 'dips up to it. Start a new stroke for a new plane.'].forEach((l, i) => txt(l, X, 446 + i * 38, 28, '#cfd6e0', 'left', 500));
@@ -1746,11 +1921,15 @@ function drawUI() {
       txt('Cone points down when adding, up when carving.', X, 612, 24, '#7f8896', 'left', 500);
     }
     const rmm = brushMM();
-    slider(X, 652, FW, tool === 'bridge' ? 'Beam width' : 'Brush size', Math.log(rmm) / Math.log(80), `${(tool === 'bridge' ? rmm * 2 : rmm).toFixed(1)} mm`, (u) => { ST.brushVR = Math.pow(80, u) * S(); }, 'Stays with your hand when you scale the world');
+    if (tool === 'bridge' && BE.on) {
+      slider(X, 652, FW, 'Width', (BE.d.hw * 2 - 2) / 38, `${(BE.d.hw * 2).toFixed(1)} mm`, (u) => beSlide(d => { d.hw = (2 + u * 38) / 2; }));
+    } else slider(X, 652, FW, tool === 'bridge' ? 'Beam width' : 'Brush size', Math.log(rmm) / Math.log(80), `${(tool === 'bridge' ? rmm * 2 : rmm).toFixed(1)} mm`, (u) => { ST.brushVR = Math.pow(80, u) * S(); }, 'Stays with your hand when you scale the world');
     if (tool === 'texture') {
       const dep = ST.tex.depth;
       slider(X, 774, FW, 'Depth', Math.log(dep / 0.01) / Math.log(300), `${dep < 1 ? dep.toFixed(2) : dep.toFixed(1)} mm`, (u) => { ST.tex.depth = +(0.01 * Math.pow(300, u)).toFixed(u < 0.4 ? 3 : 2); });
       slider(X, 862, FW, 'Pattern size', (ST.tex.scale - 3) / 11, `${ST.tex.scale.toFixed(0)} mm`, (u) => { ST.tex.scale = Math.round(3 + u * 11); TEXPREV.length = 0; });
+    } else if (tool === 'bridge' && BE.on) {
+      slider(X, 782, FW, 'Thickness', (BE.d.hh * 2 - 2) / 28, `${(BE.d.hh * 2).toFixed(1)} mm`, (u) => beSlide(d => { const yb = d.ay - d.hh; d.hh = (2 + u * 28) / 2; d.ay = d.by = yb + d.hh; }), 'The bottom stays put; the top grows');
     } else if (tool === 'bridge') {
       slider(X, 782, FW, 'Max bridge', (ST.sup.maxBridge - 10) / 90, `${ST.sup.maxBridge} mm`, (u) => { ST.sup.maxBridge = Math.round(10 + u * 90); supSettingChanged(); }, 'Longer spans need supports');
     } else {
@@ -2077,6 +2256,20 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
   if (renderer.xr.isPresenting || e.button !== 0) return;
   rayFromEvent(e); desk.depth = sculptHits();
   if (ST.tool === 'bridge') {
+    if (BE.on) {
+      const hit = raycaster.intersectObjects(Object.values(HANDLES), false)[0];
+      if (hit) {
+        const kind = hit.object.userData.kind; beDragStart(kind, modelRoot.worldToLocal(hit.point.clone()));
+        desk.beVertical = kind === 'thick' || (kind === 'move' && e.shiftKey);
+        desk.down = true; renderer.domElement.setPointerCapture(e.pointerId); ghost.visible = ghostMirror.visible = false; return;
+      }
+    }
+    const bm = []; for (const L of layers) if (L.bridge && L.visible && !L.locked) bm.push(...L.beamMeshes.filter(m => m.visible));
+    if (BE.on && beDraftMesh) bm.push(beDraftMesh);
+    const bh = raycaster.intersectObjects(bm, false)[0];
+    if (bh && bh.object === beDraftMesh) return;
+    if (bh && bePickAt(modelRoot.worldToLocal(bh.point.clone()))) return;
+    if (BE.on) beExit(false);
     if (!bridgeBegin(deskBrush().c, brushMM())) return;
     desk.down = true; renderer.domElement.setPointerCapture(e.pointerId); ghost.visible = ghostMirror.visible = false; return;
   }
@@ -2087,17 +2280,28 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 renderer.domElement.addEventListener('pointermove', (e) => {
   if (renderer.xr.isPresenting) return;
   rayFromEvent(e); desk.lastEvt = e;
+  if (desk.down && BE.drag) { const p = deskPlanePoint(BE.drag.p0, desk.beVertical); if (p) beDragTo(p, desk.beVertical); return; }
   if (desk.down && bridge.active) { const p = bridgePointFromRay(); if (p) bridgeUpdate(p); return; }
+  if (BE.on && !desk.down) { const hit = raycaster.intersectObjects(Object.values(HANDLES), false)[0], k = hit ? hit.object.userData.kind : null; if (k !== BE.hover) { BE.hover = k; beRefresh(); } }
   if (desk.down) { const { c, q } = deskBrush(); strokeApply(c, quatToInvM(q, Mbuf), brushMM()); placeGhost(c, q, brushMM(), true); }
   else { desk.depth = sculptHits(); const { c, q } = deskBrush(); placeGhost(c, q, brushMM(), true); }
 });
-renderer.domElement.addEventListener('pointerup', (e) => { if (!desk.down) return; desk.down = false; if (bridge.active) bridgeEnd(); else strokeEnd(); });
+renderer.domElement.addEventListener('pointerup', (e) => { if (!desk.down) return; desk.down = false; if (BE.drag) beDragEnd(); else if (bridge.active) bridgeEnd(); else strokeEnd(); });
+// a point on a flat plane through p0 (in the bed's space): level, or upright facing you
+function deskPlanePoint(p0, vertical) {
+  const wp = modelRoot.localToWorld(p0.clone()), up = new THREE.Vector3(0, 1, 0).applyQuaternion(modelRoot.quaternion);
+  let n = up; if (vertical) { n = camera.getWorldDirection(new THREE.Vector3()); n.addScaledVector(up, -n.dot(up)).normalize(); }
+  const hit = new THREE.Vector3(); if (!raycaster.ray.intersectPlane(new THREE.Plane().setFromNormalAndCoplanarPoint(n, wp), hit)) return null;
+  return modelRoot.worldToLocal(hit);
+}
 renderer.domElement.addEventListener('pointerleave', () => { if (!desk.down) ghost.visible = ghostMirror.visible = false; });
 window.addEventListener('keydown', (e) => {
   if (renderer.xr.isPresenting) return;
   const k = e.key.toLowerCase();
   if ((e.ctrlKey || e.metaKey) && k === 'z') { e.shiftKey ? redo() : undo(); return; }
   if (k === 'z') undo(); else if (k === 'y') redo();
+  if (BE.on && (k === 'enter' || k === 'escape')) beExit(false);
+  if (BE.on && (k === 'delete' || k === 'backspace')) beDelete();
   else if (k === 'a') { ST.tool = 'add'; updateGhost(); } else if (k === 'c') { ST.tool = 'carve'; updateGhost(); } else if (k === 's') { ST.tool = 'smooth'; updateGhost(); } else if (k === 'b') { ST.tool = 'bridge'; updateGhost(); } else if (k === 't') { ST.tool = 'texture'; updateGhost(); } else if (k === 'f') { ST.tool = 'flatten'; updateGhost(); }
   else if (k >= '1' && k <= '5') { ST.shape = +k - 1; updateGhost(); }
   else if (k === '[') { ST.brushVR = clamp(brushMM() / 1.15, 1, 80) * S(); UIS.dirty = true; }
@@ -2226,10 +2430,21 @@ function updateXR(dt) {
   const rmm = clamp(rVR / S(), 1.0, 80);
   if (ST.tool === 'bridge' && !onPanel && !uiHeld) {
     const r0 = clamp(ST.brushVR / S(), 1.0, 80);
-    placeGhost(cModel, qModel, r0, !bridge.active);
-    if (trigDown && !bridge.active) { if (bridgeBegin(cModel, r0)) pulse(R, 0.3, 20); else uiHeld = true; }
-    else if (trigDown && bridge.active) bridgeUpdate(cModel);
-    else if (!trigDown && bridge.active) { bridgeEnd(); pulse(R, bridge.ok ? 0.5 : 0.15, 40); }
+    if (BE.on && BE.drag) {
+      placeGhost(cModel, qModel, r0, false);
+      if (trigDown) beDragTo(cModel, false); else { beDragEnd(); pulse(R, BE.chk && BE.chk.ok ? 0.5 : 0.15, 40); }
+    } else {
+      const hk = BE.on && !bridge.active ? beHandleNear(cModel, r0 * 0.5) : null;
+      if (hk !== BE.hover) { BE.hover = hk; if (BE.on) beRefresh(); }
+      placeGhost(cModel, qModel, r0, !bridge.active && !hk);
+      if (trigDown && !bridge.active) {
+        if (hk) { beDragStart(hk, cModel); pulse(R, 0.3, 20); }
+        else if (bePickAt(cModel)) { pulse(R, 0.3, 20); uiHeld = true; }
+        else { if (BE.on) beExit(false); if (bridgeBegin(cModel, r0)) pulse(R, 0.3, 20); else uiHeld = true; }
+      }
+      else if (trigDown && bridge.active) bridgeUpdate(cModel);
+      else if (!trigDown && bridge.active) { bridgeEnd(); pulse(R, BE.on && BE.chk && BE.chk.ok ? 0.5 : 0.15, 40); }
+    }
   } else if (!onPanel && !uiHeld) {
     placeGhost(cModel, qModel, rmm, true);
     if (trigDown && !stroke.active) { if (strokeBegin()) { stroke.hasLast = false; } else uiHeld = true; }
@@ -2248,7 +2463,7 @@ async function zipStream(u8, Cls, fmt) { const st = new Blob([u8]).stream().pipe
 async function serialize() {
   const metaLayers = []; let total = 0; const parts = [];
   for (const L of userLayers()) {
-    if (L.bridge) { metaLayers.push({ uid: L.uid, name: L.name, colorIdx: L.colorIdx, visible: L.visible, locked: L.locked, chunks: 0, bridge: true, beams: L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh].map(v => +v.toFixed(2))) }); continue; }
+    if (L.bridge) { metaLayers.push({ uid: L.uid, name: L.name, colorIdx: L.colorIdx, visible: L.visible, locked: L.locked, chunks: 0, bridge: true, beams: L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh].map(v => +v.toFixed(2)).concat([b.v || 1])) }); continue; }
     let cnt = 0;
     for (const [key, ch] of L.chunks) {
       let any = false; for (let i = 0; i < 4096; i++) if (ch[i] > 0.004) { any = true; break; }
@@ -2273,7 +2488,7 @@ async function deserialize(meta, str) {
   for (const ml of meta.layers) {
     if (ml.bridge) {
       const B = addBridgeLayer(ml.name); if (ml.uid) B.uid = ml.uid; B.setColor(ml.colorIdx | 0); B.visible = ml.visible; B.locked = ml.locked; B.group.visible = B.visible;
-      B.beams = (ml.beams || []).map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6] })); B.rebuildBeams();
+      B.beams = (ml.beams || []).map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6], v: a[7] || 1 })); B.rebuildBeams();
       continue;
     }
     const L = addLayer(ml.name, ml.colorIdx); if (ml.uid) L.uid = ml.uid; L.visible = ml.visible; L.locked = ml.locked; L.group.visible = L.visible;
@@ -2469,7 +2684,7 @@ function netTouch(L, key) {
   let set = SYNC.touched.get(L); if (!set) SYNC.touched.set(L, set = new Set()); set.add(key);
   if (!L.netVer) L.netVer = new Map(); L.netVer.set(key, (L.netVer.get(key) || 0) + 1);
 }
-const layerDesc = (L) => ({ u: L.uid, n: L.name, c: L.colorIdx, vis: L.visible, lk: L.locked, b: L.bridge ? L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh]) : null });
+const layerDesc = (L) => ({ u: L.uid, n: L.name, c: L.colorIdx, vis: L.visible, lk: L.locked, b: L.bridge ? L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh, b.v || 1]) : null });
 const settingsDesc = () => ({ sup: { ...ST.sup }, sm: ST.autoSmooth, sc: supLayer ? supLayer.colorIdx : 0 });
 function layersState() { return { list: userLayers().map(layerDesc), ...settingsDesc() }; }
 // remember what everyone already has, so only real changes go out
@@ -2569,7 +2784,7 @@ function applyLayers(m) {
     byU.delete(d.u);
     L.name = d.n; if (L.colorIdx !== d.c) L.setColor(d.c);
     L.visible = d.vis; L.group.visible = d.vis; L.locked = d.lk;
-    if (d.b) { const sg = JSON.stringify(d.b); if (sg !== L._beamSig) { L._beamSig = sg; L.beams = d.b.map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6] })); L.rebuildBeams(); } }
+    if (d.b) { const sg = JSON.stringify(d.b); if (sg !== L._beamSig) { L._beamSig = sg; L.beams = d.b.map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6], v: a[7] || 1 })); L.rebuildBeams(); } }
     next.push(L);
   }
   for (const L of byU.values()) { purgeUndo(L); L.dispose(); }
@@ -2604,7 +2819,7 @@ function applyLayerProps(m) {
   }
   L.name = m.n; if (L.colorIdx !== m.c) L.setColor(m.c);
   L.visible = m.vis; L.group.visible = m.vis; L.locked = m.lk;
-  if (m.b) { const sg = JSON.stringify(m.b); if (sg !== L._beamSig) { L._beamSig = sg; L.beams = m.b.map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6] })); L.rebuildBeams(); } }
+  if (m.b) { const sg = JSON.stringify(m.b); if (sg !== L._beamSig) { L._beamSig = sg; L.beams = m.b.map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6], v: a[7] || 1 })); L.rebuildBeams(); } }
   SYNC.lsig.set(L.uid, JSON.stringify(layerDesc(L)));
   netApplying = false; afterEdit(); dimsDirty = true; UIS.dirty = true;
 }
@@ -2827,12 +3042,13 @@ renderer.setAnimationLoop(() => {
   cutTick(dt);
   autosaveTick(now);
   netTick(now);
+  beTick(now);
   if (UIS.confirm && now - UIS.confirmT > 2500) { UIS.confirm = null; UIS.dirty = true; }
   if (UIS.toast && now - UIS.toastT > 2200) { UIS.toast = ''; UIS.dirty = true; }
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
