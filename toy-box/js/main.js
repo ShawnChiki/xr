@@ -61,7 +61,9 @@ APP.onLeave = pid => { delete APP.lobbyPlayers[pid]; drawPlayers(); lobbyInfo();
 APP.onHostData = (pid, m) => { if (m.t === 'in' && APP.S && APP.S.players[pid]) Object.assign(APP.S.players[pid].inp, m); };
 $('startBot').onclick = () => { sfx.init(); primeVoice(); startMatch('bot'); };
 $('startVR').onclick = async () => { sfx.init(); primeVoice();
-  try { const s = await navigator.xr.requestSession(xrMode, { requiredFeatures: ['local-floor'], optionalFeatures: ['hand-tracking', 'bounded-floor'] }); await renderer.xr.setSession(s); startDraw(); }
+  try { const s = await navigator.xr.requestSession(xrMode, { requiredFeatures: ['local-floor'], optionalFeatures: ['hand-tracking', 'bounded-floor'] }); await renderer.xr.setSession(s); XRF.base = renderer.xr.getReferenceSpace(); XRF.bounded = XRF.guardian = null;
+    s.requestReferenceSpace('bounded-floor').then(sp => { if (sp && sp.boundsGeometry && sp.boundsGeometry.length >= 3) XRF.bounded = sp; }).catch(() => {});
+    startDraw(); }
   catch (e) { $('hostNote').textContent = "Couldn't start the headset: " + (e && e.message || e); } };
 $('soloGo').onclick = () => { sfx.init(); primeVoice(); startMatch('solo'); };
 $('joinBtn').onclick = () => { sfx.init(); primeVoice(); if (CAN_FS && matchMedia('(pointer:coarse)').matches && !document.fullscreenElement) try { document.documentElement.requestFullscreen().catch(() => {}); } catch (e) {} netJoin($('joinCode').value, st => {
@@ -156,7 +158,7 @@ $('again').onclick = () => { sfx.init(); if (APP.kind === 'client') return; star
 $('toLobby').onclick = () => { if (APP.kind === 'client') { netReset(); toLobby('join'); $('joinWait').hidden = true; $('joinStatus').textContent = ''; } else toLobby(); };
 $('quit').onclick = () => $('toLobby').click();
 $('mute').onclick = () => { sfx.init(); sfx.mute(!sfx.muted); $('mute').textContent = sfx.muted ? '🔇' : '🔊'; };
-renderer.xr.addEventListener('sessionend', () => { if (APP.mode === 'draw' || (APP.mode === 'game' && APP.kind === 'xr')) toLobby('host'); });
+renderer.xr.addEventListener('sessionend', () => { XRF.base = XRF.bounded = XRF.guardian = null; if (APP.mode === 'draw' || (APP.mode === 'game' && APP.kind === 'xr')) toLobby('host'); });
 
 /* ---------- phone controls ---------- */
 const INP = { jx: 0, jy: 0, jc: 0, gc: 0, sc: 0, wc: 0, gh: false, jh: false };
@@ -203,8 +205,10 @@ function toyMove() {
 const HANDS = [{ side: 'right' }, { side: 'left' }].map(h => Object.assign(h, { grip: null, hand: null, src: null, prev: {}, gripping: false, J: Array.from({ length: 25 }, () => V()), Jg: Array.from({ length: 25 }, () => V()), tip: V(), realTip: V(), ok: false }));
 for (let i = 0; i < 2; i++) {
   const g = renderer.xr.getControllerGrip(i), c = renderer.xr.getController(i), hd = renderer.xr.getHand(i); rig.add(g, c, hd);
-  c.addEventListener('connected', e => { const side = e.data && e.data.handedness; const H = HANDS[side === 'left' ? 1 : 0]; H.grip = g; H.hand = hd; H.src = e.data; H.prev = {}; if (side === 'left' && !e.data.hand) g.add(WRIST.m); });
-  c.addEventListener('disconnected', e => { for (const H of HANDS) if (H.grip === g) { H.src = null; H.ok = false; } });
+  c.addEventListener('connected', e => { const side = e.data && e.data.handedness; const H = HANDS[side === 'left' ? 1 : 0]; H.grip = g; H.hand = hd; H.ray = c; H.src = e.data; H.prev = {}; H.sel = false; if (side === 'left' && !e.data.hand) g.add(WRIST.m); });
+  c.addEventListener('disconnected', e => { for (const H of HANDS) if (H.grip === g) { H.src = null; H.ok = false; H.sel = false; } });
+  c.addEventListener('selectstart', () => { for (const H of HANDS) if (H.ray === c) H.sel = true; });
+  c.addEventListener('selectend', () => { for (const H of HANDS) if (H.ray === c) H.sel = false; });
 }
 const WRIST = canvasPanel(0.13, 0.075, 2400); WRIST.m.position.set(0, 0.03, 0.09); WRIST.m.rotation.x = -1.0;
 const BANNER = canvasPanel(0.9, 0.34, 900); BANNER.m.position.set(0, 0.12, -0.85); camera.add(BANNER.m); BANNER.m.visible = false; BANNER.until = 0;
@@ -259,73 +263,134 @@ function readHands(frame) {
 }
 
 /* poke-able floating buttons, for setup and between rounds */
-const VRUI = { g: new THREE.Group(), btns: [], cool: 0,
-  show(title, body, buttons) { this.hide(); const g = this.g; scene.add(g);
-    const P = canvasPanel(0.62, 0.26, 1000), x = P.x, w = P.cv.width, h = P.cv.height; x.fillStyle = 'rgba(255,253,247,.96)'; x.strokeStyle = '#15121a'; x.lineWidth = 10; rr(x, 6, 6, w - 12, h - 12, 28); x.fill(); x.stroke();
-    x.fillStyle = '#15121a'; x.textAlign = 'center'; x.font = '400 54px Bungee, Rubik, sans-serif'; x.fillText(title, w / 2, 80); x.font = '700 30px Rubik, sans-serif'; String(body).split('\n').forEach((l, i) => x.fillText(l, w / 2, 130 + i * 38)); P.t.needsUpdate = true;
-    P.m.material.depthTest = true; g.add(P.m);
-    const n = buttons.length, bw = 0.62 / n - 0.015;
-    buttons.forEach((b, i) => { const B = canvasPanel(bw, 0.09, 1000), y = B.x; y.fillStyle = b.col || '#ffd400'; y.strokeStyle = '#15121a'; y.lineWidth = 10; rr(y, 6, 6, B.cv.width - 12, B.cv.height - 12, 20); y.fill(); y.stroke();
-      y.fillStyle = '#15121a'; y.textAlign = 'center'; y.font = '800 36px Rubik, sans-serif'; y.fillText(b.label, B.cv.width / 2, B.cv.height / 2 + 13); B.t.needsUpdate = true; B.m.material.depthTest = true;
-      B.m.position.set(-0.31 + bw / 2 + 0.0075 + i * (bw + 0.015), -0.2, 0.01); g.add(B.m); this.btns.push({ m: B.m, w: bw, h: 0.09, fn: b.fn, was: false }); });
+const VRUI = { g: new THREE.Group(), btns: [], cool: 0, panel: null,
+  show(title, body, buttons, keep) { const pos = this.g.position.clone(), q = this.g.quaternion.clone(), had = !!this.g.parent; this.hide(); const g = this.g; scene.add(g);
+    const PW = 0.74, lines = String(body).split('\n'), ph = Math.max(0.26, 0.15 + lines.length * 0.038);
+    const P = canvasPanel(PW, ph, 1000), x = P.x, w = P.cv.width, h = P.cv.height; x.fillStyle = 'rgba(255,253,247,.96)'; x.strokeStyle = '#15121a'; x.lineWidth = 10; rr(x, 6, 6, w - 12, h - 12, 28); x.fill(); x.stroke();
+    x.fillStyle = '#15121a'; x.textAlign = 'center'; const fit = (font, sz, min, txt) => { do { x.font = font.replace('#', sz); sz -= 2; } while (Math.max(...txt.map(t => x.measureText(t).width)) > w - 56 && sz > min); };
+    fit('400 #px Bungee, Rubik, sans-serif', 54, 30, [title]); x.fillText(title, w / 2, 80); fit('700 #px Rubik, sans-serif', 30, 18, lines); lines.forEach((l, i) => x.fillText(l, w / 2, 130 + i * 38)); P.t.needsUpdate = true;
+    P.m.material.depthTest = true; P.m.position.y = 0.13 - ph / 2; g.add(P.m); this.panel = { m: P.m, w: PW, h: ph };
+    const n = buttons.length, per = n > 4 ? 3 : n, bw = PW / per - 0.015, top = 0.13 - ph - 0.065;
+    buttons.forEach((b, i) => { const B = canvasPanel(bw, 0.09, 1000), y = B.x, row = Math.floor(i / per), inRow = Math.min(per, n - row * per), col = i % per;
+      y.fillStyle = b.col || '#ffd400'; y.strokeStyle = '#15121a'; y.lineWidth = 10; rr(y, 6, 6, B.cv.width - 12, B.cv.height - 12, 20); y.fill(); y.stroke();
+      y.fillStyle = '#15121a'; y.textAlign = 'center'; let fs = 36; do { y.font = `800 ${fs}px Rubik, sans-serif`; fs -= 2; } while (y.measureText(b.label).width > B.cv.width - 34 && fs > 16);
+      y.fillText(b.label, B.cv.width / 2, B.cv.height / 2 + 13); B.t.needsUpdate = true; B.m.material.depthTest = true;
+      B.m.position.set(-(inRow * (bw + 0.015)) / 2 + (bw + 0.015) / 2 + col * (bw + 0.015), top - row * 0.105, 0.01); g.add(B.m); this.btns.push({ m: B.m, w: bw, h: 0.09, fn: b.fn, was: false }); });
+    if (keep && had) { g.position.copy(pos); g.quaternion.copy(q); this.cool = 0.25; return; }
     // stand it up in front of you, a little below your eyes, facing you
     const hw = headL.clone(), f = V(0, 0, -1).applyQuaternion(headLQ); f.y = 0; if (f.lengthSq() < 1e-3) f.set(0, 0, -1); f.normalize();
-    g.position.copy(hw).addScaledVector(f, 0.5); g.position.y = Math.max(0.35, hw.y - 0.18); g.lookAt(hw.x, g.position.y, hw.z); this.cool = 0.5; },
-  hide() { this.g.clear(); scene.remove(this.g); this.btns = []; },
-  update(dt, tips) { this.cool -= dt; if (!this.btns.length) return; this.g.updateMatrixWorld(true);
-    for (const b of this.btns) { let inside = false; for (const t of tips) { const l = b.m.worldToLocal(t.clone()); if (Math.abs(l.x) < b.w / 2 && Math.abs(l.y) < b.h / 2 && l.z < 0.04 && l.z > -0.06) inside = true; }
-      b.m.position.z = inside ? -0.005 : 0.01; if (inside && !b.was && this.cool <= 0) { this.cool = 0.6; sfx.play('pop', 0.8); for (let i = 0; i < 2; i++) buzz(i, 0.4, 30); b.fn(); return; } b.was = inside; } },
+    g.position.copy(hw).addScaledVector(f, 0.55); g.position.y = Math.max(0.35, hw.y - 0.12); g.lookAt(hw.x, g.position.y, hw.z); this.cool = 0.5; },
+  hide() { this.g.clear(); scene.remove(this.g); this.btns = []; this.panel = null; },
+  // where a pointing ray hits the panel or a button (or null)
+  rayOn(m, w, h, o, d) { const l0 = m.worldToLocal(o.clone()), l1 = m.worldToLocal(o.clone().add(d)), dz = l1.z - l0.z; if (Math.abs(dz) < 1e-6) return null; const t = -l0.z / dz; if (t <= 0) return null;
+    const p = l0.addScaledVector(l1.sub(l0), t); return Math.abs(p.x) < w / 2 && Math.abs(p.y) < h / 2 ? m.localToWorld(p) : null; },
+  hits(o, d) { if (!this.g.parent) return null; this.g.updateMatrixWorld(true); for (const b of this.btns) { const p = this.rayOn(b.m, b.w, b.h, o, d); if (p) return p; } return this.panel ? this.rayOn(this.panel.m, this.panel.w, this.panel.h, o, d) : null; },
+  update(dt, tips, rays) { this.cool -= dt; if (!this.btns.length) return; this.g.updateMatrixWorld(true);
+    for (const b of this.btns) { let inside = false, aimed = false, click = false;
+      for (const t of tips) { const l = b.m.worldToLocal(t.clone()); if (Math.abs(l.x) < b.w / 2 && Math.abs(l.y) < b.h / 2 && l.z < 0.04 && l.z > -0.06) inside = true; }
+      for (const r of rays || []) if (this.rayOn(b.m, b.w, b.h, r.o, r.d)) { aimed = true; if (r.sel) click = true; }
+      b.m.position.z = inside ? -0.005 : 0.01; b.m.scale.setScalar(aimed ? 1.07 : 1);
+      if (((inside && !b.was) || click) && this.cool <= 0) { this.cool = 0.4; sfx.play('pop', 0.8); for (let i = 0; i < 2; i++) buzz(i, 0.4, 30); b.fn(); return; } b.was = inside; } },
 };
 
-/* ---------- mixed-reality setup: trace your clear floor space ---------- */
-const DRAW = { pts: [], closed: false, line: null, fill: null, dots: [], grid: null };
+/* ---------- mixed-reality setup, like the Quest's own boundary setup ----------
+   1. Set the floor. The grid is the game's floor: confirm it, nudge it, or pinch / pull the trigger to move it to your hand
+      (raise it to a table or chest height to play standing up). The whole game then sits on that floor.
+   2. Outline your space. Point at the floor and hold the trigger (or pinch) to paint round your clear space.
+      Nothing closes on its own: press Done. */
+const XRF = { base: null, bounded: null, guardian: null };   // the headset's own floor space, and its boundary if it shares one
+try { APP.floorH = +(localStorage.getItem('toybox-floor') || 0) || 0; } catch (e) { APP.floorH = 0; }
+function setFloor(h) {
+  APP.floorH = Math.round(clamp(h, -0.1, 1.7) * 100) / 100; try { localStorage.setItem('toybox-floor', APP.floorH); } catch (e) {}
+  if (XRF.base && typeof XRRigidTransform !== 'undefined') try { renderer.xr.setReferenceSpace(XRF.base.getOffsetReferenceSpace(new XRRigidTransform({ x: 0, y: APP.floorH, z: 0 }))); } catch (e) {}
+}
+// move the floor without the panel or your hands jumping (they're measured from the floor)
+function moveFloor(h) { const old = APP.floorH || 0; setFloor(h); const d = APP.floorH - old; VRUI.g.position.y -= d; headL.y -= d; for (const H of HANDS) { H.realTip.y -= d; H.tip.y -= d; } if (DRAW.grid) DRAW.grid.children[0].material.opacity = 0.9; }
+// pointing: each controller's (or tracked hand's) aim ray, and whether you just pulled the trigger / pinched
+function xrRays() {
+  const out = [];
+  for (const H of HANDS) { const c = H.ray; if (!H.src || !c || c.visible === false) { H.selPrev = false; continue; } c.updateMatrixWorld(true);
+    const o = V().setFromMatrixPosition(c.matrixWorld), d = V(0, 0, -1).transformDirection(c.matrixWorld), held = !!H.sel, edge = held && !H.selPrev; H.selPrev = held;
+    out.push({ H, o, d, held, sel: edge }); }
+  return out;
+}
+// the visible laser + floor dot for each hand
+const RAYS = [0, 1].map(() => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const line = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 })); line.frustumCulled = false; line.visible = false; scene.add(line);
+  const dot = new THREE.Mesh(new THREE.RingGeometry(0.025, 0.045, 24), new THREE.MeshBasicMaterial({ color: 0xff3e8a, side: THREE.DoubleSide })); dot.rotation.x = -Math.PI / 2; dot.visible = false; scene.add(dot); return { line, dot }; });
+function showRay(i, o, to, col, floorHit) { const R = RAYS[i], a = R.line.geometry.attributes.position; a.setXYZ(0, o.x, o.y, o.z); a.setXYZ(1, to.x, to.y, to.z); a.needsUpdate = true; R.line.material.color.set(col); R.line.visible = true;
+  R.dot.visible = !!floorHit; if (floorHit) { R.dot.position.set(floorHit.x, 0.008, floorHit.z); R.dot.material.color.set(col === '#ffd400' ? '#ffd400' : '#ff3e8a'); } }
+function hideRays() { for (const R of RAYS) R.line.visible = R.dot.visible = false; }
+const floorHit = (o, d) => { if (d.y > -0.03) return null; const t = -o.y / d.y; return t > 0 && t < 10 ? o.clone().addScaledVector(d, t) : null; };
+
+const DRAW = { step: 'floor', pts: [], strokes: [], line: null, close: null, fill: null, grid: null, end: null };
 function startDraw() {
-  APP.mode = 'draw'; APP.viewer = 'toddler'; DRAW.pts = []; DRAW.closed = false; DRAW.first = -1; DRAW.t0 = performance.now(); DRAW.warnT = undefined;
+  APP.mode = 'draw'; APP.viewer = 'toddler'; endDraw(); DRAW.pts = []; DRAW.strokes = []; DRAW.step = 'floor'; DRAW.msg = '';
   $('ui').style.display = 'none';
-  if (xrMode === 'immersive-ar') { scene.background = null; renderer.setClearColor(0x000000, 0); } else { scene.background = new THREE.Color('#2a2340'); DRAW.grid = new THREE.GridHelper(10, 20, 0x9b5cff, 0x55507a); scene.add(DRAW.grid); }
-  scene.fog = null;
+  if (xrMode === 'immersive-ar') { scene.background = null; renderer.setClearColor(0x000000, 0); } else scene.background = new THREE.Color('#2a2340');
+  scene.fog = null; setFloor(APP.floorH || 0);
+  // the floor grid, round where you stand
+  DRAW.grid = new THREE.Group(); const gh = new THREE.GridHelper(6, 24, 0xffd400, 0x00c2b3); gh.material.transparent = true; gh.material.opacity = 0.75; DRAW.grid.add(gh);
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(3, 48), new THREE.MeshBasicMaterial({ color: 0x00c2b3, transparent: true, opacity: 0.12, depthWrite: false, side: THREE.DoubleSide })); disc.rotation.x = -Math.PI / 2; DRAW.grid.add(disc);
+  DRAW.grid.position.set(headL.x, 0.002, headL.z); scene.add(DRAW.grid);
   const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3 * 3000), 3)); geo.setDrawRange(0, 0);
   DRAW.line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffd400 })); DRAW.line.frustumCulled = false; scene.add(DRAW.line);
-  for (let i = 0; i < 2; i++) { const d = new THREE.Mesh(new THREE.RingGeometry(0.02, 0.035, 24), new THREE.MeshBasicMaterial({ color: 0xff3e8a, side: THREE.DoubleSide })); d.rotation.x = -Math.PI / 2; d.visible = false; scene.add(d); DRAW.dots.push(d); }
-  // the end of the line: put a finger back here to keep drawing
+  const cg = new THREE.BufferGeometry(); cg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  DRAW.close = new THREE.Line(cg, new THREE.LineBasicMaterial({ color: 0xffd400, transparent: true, opacity: 0.35 })); DRAW.close.frustumCulled = false; DRAW.close.visible = false; scene.add(DRAW.close);
   DRAW.end = new THREE.Mesh(new THREE.RingGeometry(0.06, 0.09, 32), new THREE.MeshBasicMaterial({ color: 0xffd400, side: THREE.DoubleSide, transparent: true })); DRAW.end.rotation.x = -Math.PI / 2; DRAW.end.visible = false; scene.add(DRAW.end);
   if (NET.host) sendAll({ t: 'lobby', lv: APP.lv, mess: APP.mess, n: Object.keys(APP.lobbyPlayers).length, drawing: true });
-  setTimeout(drawPanel, 400);
+  setTimeout(drawPanel, 300);
 }
-function drawPanel() {
-  if (APP.mode !== 'draw') return;
-  if (!DRAW.closed) VRUI.show('Trace your play space', 'Touch the floor with a fingertip (or controller)\nand crawl around the edge of your clear space.\nThe line follows one hand (it glows yellow).\nCome back to where you started to close it.',
-    [{ label: '2×2 m square here', fn: () => useSquare(), col: '#00c2b3' }, { label: 'Clear', fn: () => { DRAW.pts = []; DRAW.closed = false; drawLine(); drawPanel(); }, col: '#fffdf7' }]);
-  else { const poly = simplifyArea(DRAW.pts), a = polyArea(poly); if (a < 1.2) { VRUI.show('A bit small', `That's ${a.toFixed(1)} m². Trace at least about 1.2 m across\nso there's room to crawl.`, [{ label: 'Redraw', fn: () => { DRAW.pts = []; DRAW.closed = false; drawLine(); drawPanel(); } }]); return; }
-    VRUI.show('Play here?', `${a.toFixed(1)} m² of floor. The living room's walls\nwill stand on your line. Stay inside it while you play.`,
-      [{ label: 'Play here!', fn: () => confirmArea(poly), col: '#ff3e8a' }, { label: 'Redraw', fn: () => { DRAW.pts = []; DRAW.closed = false; drawLine(); drawPanel(); }, col: '#fffdf7' }]); }
+function drawPanel(keep) {
+  if (APP.mode !== 'draw') return; const cm = Math.round((APP.floorH || 0) * 100);
+  if (DRAW.step === 'floor') VRUI.show('1 · Set the floor', `The grid is the game's floor: ${cm === 0 ? 'on your real floor' : cm + ' cm ' + (cm > 0 ? 'above' : 'below') + ' your real floor'}.\nPinch or pull the trigger to move it to your hand.\nRaise it to a table or chest height to play standing.`,
+    [{ label: '▲ Up', fn: () => { moveFloor(APP.floorH + 0.05); drawPanel(true); }, col: '#fffdf7' }, { label: '▼ Down', fn: () => { moveFloor(APP.floorH - 0.05); drawPanel(true); }, col: '#fffdf7' }, { label: 'Real floor', fn: () => { moveFloor(0); drawPanel(true); }, col: '#00c2b3' },
+     { label: 'Confirm ✓', fn: () => { DRAW.step = 'outline'; sfx.play('go', 0.6); drawPanel(); }, col: '#ff3e8a' }], keep);
+  else { const a = DRAW.pts.length > 2 ? polyArea(simplifyArea(DRAW.pts)) : 0;
+    VRUI.show('2 · Outline your space', (DRAW.msg ? '⚠ ' + DRAW.msg + '\n' : '') + `Point at the floor and hold the trigger (or pinch) to draw\nround your clear space. ${a ? 'That\'s ' + a.toFixed(1) + ' m² so far.' : 'Lines join up on their own.'}\nPress Done when you're happy. It won't close till you do.`,
+      [{ label: 'Done ✓', fn: doneOutline, col: '#ff3e8a' }, { label: 'Undo', fn: () => { if (DRAW.strokes.length) { DRAW.pts.length = DRAW.strokes.pop(); drawLine(); drawFill(); drawPanel(true); } }, col: '#fffdf7' },
+       { label: 'Clear', fn: () => { DRAW.pts = []; DRAW.strokes = []; drawLine(); drawFill(); drawPanel(true); }, col: '#fffdf7' },
+       { label: '2×2 m here', fn: useSquare, col: '#00c2b3' }].concat(XRF.guardian ? [{ label: 'Quest boundary', fn: () => confirmArea(simplifyArea(XRF.guardian.map(([x, z]) => ({ x, z })))), col: '#ffd400' }] : [],
+       [{ label: '← Floor', fn: () => { DRAW.step = 'floor'; drawPanel(); }, col: '#fffdf7' }]), keep); }
 }
-function drawLine() { const P = DRAW.pts, a = DRAW.line.geometry.attributes.position; for (let i = 0; i < P.length && i < 2999; i++) a.setXYZ(i, P[i].x, 0.006, P[i].z); let n = Math.min(P.length, 2999); if (DRAW.closed && n > 2) { a.setXYZ(n, P[0].x, 0.006, P[0].z); n++; } a.needsUpdate = true; DRAW.line.geometry.setDrawRange(0, n);
-  if (DRAW.fill) { scene.remove(DRAW.fill); DRAW.fill = null; }
-  if (DRAW.closed) { const poly = simplifyArea(P), sh = new THREE.Shape(poly.map(p => new THREE.Vector2(p[0], -p[1]))); DRAW.fill = new THREE.Mesh(new THREE.ShapeGeometry(sh), new THREE.MeshBasicMaterial({ color: 0xffd400, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false })); DRAW.fill.rotation.x = -Math.PI / 2; DRAW.fill.position.y = 0.004; scene.add(DRAW.fill); } }
+function doneOutline() {
+  if (DRAW.pts.length < 3) { DRAW.msg = 'Draw first: point at the floor and hold the trigger (or pinch).'; sfx.play('tick', 1); drawPanel(true); return; }
+  const poly = simplifyArea(DRAW.pts), a = polyArea(poly);
+  if (a < 1.0) { DRAW.msg = `A bit small (${a.toFixed(1)} m²): keep drawing round a bigger space, or use 2×2 m.`; sfx.play('tick', 1); drawPanel(true); return; }
+  sfx.play('win', 0.8); buzz(0, 0.6, 120); buzz(1, 0.6, 120); confirmArea(poly);
+}
+function drawLine() { const P = DRAW.pts, a = DRAW.line.geometry.attributes.position; let n = Math.min(P.length, 2999); for (let i = 0; i < n; i++) a.setXYZ(i, P[i].x, 0.006, P[i].z); a.needsUpdate = true; DRAW.line.geometry.setDrawRange(0, n);
+  DRAW.close.visible = P.length > 2; if (P.length > 2) { const c = DRAW.close.geometry.attributes.position, l = P[P.length - 1]; c.setXYZ(0, l.x, 0.006, l.z); c.setXYZ(1, P[0].x, 0.006, P[0].z); c.needsUpdate = true; } }
+function drawFill() { if (DRAW.fill) { scene.remove(DRAW.fill); DRAW.fill = null; } if (DRAW.pts.length < 3) return;
+  const poly = simplifyArea(DRAW.pts), sh = new THREE.Shape(poly.map(p => new THREE.Vector2(p[0], -p[1])));
+  DRAW.fill = new THREE.Mesh(new THREE.ShapeGeometry(sh), new THREE.MeshBasicMaterial({ color: 0xffd400, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false })); DRAW.fill.rotation.x = -Math.PI / 2; DRAW.fill.position.y = 0.004; scene.add(DRAW.fill); }
+// the headset's own boundary (if the browser shares it), turned into our floor's coordinates
+function guardianPoly(frame) { try { const pose = frame.getPose(XRF.bounded, XRF.base); if (!pose) return; const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
+  XRF.guardian = Array.from(XRF.bounded.boundsGeometry).map(p => { const v = V(p.x, 0, p.z).applyMatrix4(m); return [r3(v.x), r3(v.z)]; }); if (APP.mode === 'draw' && DRAW.step === 'outline') drawPanel(true); } catch (e) { XRF.bounded = null; } }
 function drawStep(dt, frame) {
-  const hands = readHands(frame), tips = [], P = DRAW.pts, last = P[P.length - 1];
-  // the line follows ONE fingertip: whichever touching hand is nearest the end of the line. (Crawling puts both hands on
-  // the floor; taking points from both made the line zigzag between them and snap shut in half a second.)
-  let pen = null, pd = 1e9;
-  for (let i = 0; i < 2; i++) { const H = HANDS[i], d = DRAW.dots[i]; if (!d) continue; d.visible = !!H.ok; if (!H.ok) continue; const t = H.realTip; tips.push(t.clone()); const on = t.y < 0.07; d.position.set(t.x, 0.008, t.z);
-    const dl = last ? Math.hypot(last.x - t.x, last.z - t.z) : (i === DRAW.first ? 0 : 1);
-    if (on && dl < pd) { pd = dl; pen = t; } d.material.color.set(on ? 0x00c2b3 : 0xff3e8a); }
-  if (pen && !DRAW.closed && !last) { DRAW.first = HANDS.findIndex(H => H.realTip === pen); DRAW.t0 = performance.now(); }
-  if (pen && !DRAW.closed && (!last || (pd > 0.04 && pd < 0.35))) { P.push({ x: pen.x, z: pen.z }); drawLine();
-    let len = 0, far = 0, sa = 0; for (let k = 1; k < P.length; k++) { len += Math.hypot(P[k].x - P[k - 1].x, P[k].z - P[k - 1].z); far = Math.max(far, Math.hypot(P[k].x - P[0].x, P[k].z - P[0].z)); sa += P[k - 1].x * P[k].z - P[k].x * P[k - 1].z; }
-    sa = Math.abs(sa + P[P.length - 1].x * P[0].z - P[0].x * P[P.length - 1].z) / 2;
-    // close only once it's a real loop: back near the start after going round something big enough to crawl in
-    if (P.length > 25 && len > 3 && far > 1 && sa > 1.0 && performance.now() - DRAW.t0 > 3000 && Math.hypot(P[0].x - pen.x, P[0].z - pen.z) < 0.3) { DRAW.closed = true; drawLine(); sfx.play('win', 0.8); buzz(0, 0.6, 120); buzz(1, 0.6, 120); drawPanel(); }
-    else if (P.length > 12 && len > 1.2 && sa < 1.0 && Math.hypot(P[0].x - pen.x, P[0].z - pen.z) < 0.3 && performance.now() - (DRAW.warnT || -1e9) > 4000) { DRAW.warnT = performance.now(); banner('Bigger!', 'Keep going round a bigger space (about 1 m across or more),\nor use the 2×2 m square button', 2.5); sfx.play('tick', 1); } }
-  for (let i = 0; i < 2; i++) if (DRAW.dots[i] && HANDS[i].ok && HANDS[i].realTip === pen && !DRAW.closed) DRAW.dots[i].material.color.set(0xffd400);   // the drawing hand glows yellow
-  const end = P[P.length - 1]; if (DRAW.end) { DRAW.end.visible = !!end && !DRAW.closed; if (end) { DRAW.end.position.set(end.x, 0.007, end.z); DRAW.end.material.opacity = 0.55 + Math.sin(performance.now() / 180) * 0.35; } }
-  VRUI.update(dt, tips);
+  readHands(frame); rig.updateMatrixWorld(true);
+  if (frame && XRF.bounded && !XRF.guardian) guardianPoly(frame);
+  if (DRAW.grid) { const k = Math.min(1, dt * 1.5); DRAW.grid.position.x += (headL.x - DRAW.grid.position.x) * k; DRAW.grid.position.z += (headL.z - DRAW.grid.position.z) * k; const m = DRAW.grid.children[0].material; m.opacity += (0.75 - m.opacity) * Math.min(1, dt * 2); }
+  const tips = HANDS.filter(H => H.ok).map(H => H.realTip.clone()), rays = xrRays(); let moved = false;
+  hideRays();
+  rays.forEach((r, i) => { const H = r.H, onUI = VRUI.hits(r.o, r.d), hit = floorHit(r.o, r.d);
+    showRay(i, r.o, onUI || hit || r.o.clone().addScaledVector(r.d, 2), r.held ? '#ffd400' : '#ffffff', onUI ? null : hit);
+    if (DRAW.step === 'floor') {   // pinch / trigger away from the panel: the floor comes to your hand
+      if (r.sel && !onUI) { const y = H.src.hand ? H.realTip.y : H.grip.position.y - 0.04; moveFloor(APP.floorH + y); sfx.play('pop', 0.8); buzz(HANDS.indexOf(H), 0.5, 60); drawPanel(true); }
+      return; }
+    // outline: paint while held (a press that starts on the panel is a button press, not paint)
+    if (r.sel) { H.painting = !onUI && !!hit; if (H.painting) { DRAW.strokes.push(DRAW.pts.length); DRAW.msg = ''; } }
+    if (r.held && H.painting && hit) { const last = DRAW.pts[DRAW.pts.length - 1]; if (DRAW.pts.length < 2999 && (!last || Math.hypot(last.x - hit.x, last.z - hit.z) > 0.05)) { DRAW.pts.push({ x: hit.x, z: hit.z }); moved = true; } }
+    if (!r.held && H.painting) { H.painting = false; drawFill(); drawPanel(true); } });
+  if (moved) drawLine();
+  const end = DRAW.pts[DRAW.pts.length - 1]; if (DRAW.end) { DRAW.end.visible = !!end && DRAW.step === 'outline'; if (end) { DRAW.end.position.set(end.x, 0.007, end.z); DRAW.end.material.opacity = 0.55 + Math.sin(performance.now() / 180) * 0.35; } }
+  if (DRAW.line) DRAW.line.visible = DRAW.close.visible = DRAW.step === 'outline' && DRAW.pts.length > 1; if (DRAW.fill) DRAW.fill.visible = DRAW.step === 'outline';
+  VRUI.update(dt, tips, rays);
 }
-function endDraw() { if (DRAW.end) scene.remove(DRAW.end); DRAW.end = null; if (DRAW.line) scene.remove(DRAW.line); if (DRAW.fill) scene.remove(DRAW.fill); if (DRAW.grid) scene.remove(DRAW.grid); for (const d of DRAW.dots) scene.remove(d); DRAW.line = DRAW.fill = DRAW.grid = null; DRAW.dots = []; }
+function endDraw() { for (const k of ['end', 'line', 'close', 'fill', 'grid']) { if (DRAW[k]) scene.remove(DRAW[k]); DRAW[k] = null; } hideRays(); for (const H of HANDS) H.painting = false; }
 function useSquare() { const f = V(0, 0, -1).applyQuaternion(headLQ); f.y = 0; f.normalize(); const r = V(-f.z, 0, f.x), c = headL.clone(); c.y = 0; const s = 1.1;
   const poly = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => { const p = c.clone().addScaledVector(r, a * s).addScaledVector(f, b * s); return [r3(p.x), r3(p.z)]; }); confirmArea(poly); }
-function confirmArea(poly) { VRUI.hide(); const area = { poly, start: [r3(headL.x), r3(headL.z)] }; startMatch('xr', area); }
+function confirmArea(poly) { VRUI.hide(); hideRays(); const area = { poly, start: [r3(headL.x), r3(headL.z)] }; startMatch('xr', area); }
 function polyArea(P) { let s = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a[0] * b[1] - b[0] * a[1]; } return Math.abs(s) / 2; }
 // tidy a traced loop into a few straight walls
 function simplifyArea(pts) {
@@ -354,10 +419,11 @@ function xrToddler(dt, frame) {
   const head = headL.clone(), hq = headLQ.clone();
   setToddlerPose(S, { head, hq, hands: hands.map(h => h.on ? h : { on: false, p: V(0, -1, 0), q: Q() }) });
   APP.me.joints = hands.map(h => h.on && h.tracked ? { j: h.j, q: h.q } : null);
-  const tips = HANDS.filter(H => H.ok).map(H => H.tip.clone());
-  VRUI.update(dt, tips);
-  // controllers: trigger/A/B also work between rounds
-  if (S.state === 'end' && APP.vrEnd) for (const H of HANDS) { const b = H.btn; if (!b || H.src && H.src.hand) continue; if (b.t) return vrAgain(); if (b.a && SHOWN.length > 1) return vrNext(); if (b.b) return toLobby('host'); }
+  const tips = HANDS.filter(H => H.ok).map(H => H.tip.clone()), rays = xrRays();
+  hideRays(); if (APP.vrEnd) rays.forEach((r, i) => { const on = VRUI.hits(r.o, r.d); showRay(i, r.o, on || r.o.clone().addScaledVector(r.d, 1.5), on ? '#ffd400' : '#ffffff', null); });
+  VRUI.update(dt, tips, rays); if (APP.mode !== 'game' || APP.S !== S) return;
+  // controllers: A = again, B = leave, between rounds (or point at a button and pull the trigger)
+  if (S.state === 'end' && APP.vrEnd) for (const H of HANDS) { const b = H.btn; if (!b || H.src && H.src.hand) continue; if (b.a) return vrAgain(); if (b.b) return toLobby('host'); }
 }
 function vrAgain() { startMatch('xr'); }
 function vrNext() { const i = SHOWN.findIndex(l => l.id === APP.lv); APP.lv = SHOWN[(i + 1) % SHOWN.length].id; hostLevels(); lobbyInfo(); startMatch('xr'); }
