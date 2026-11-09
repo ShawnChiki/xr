@@ -82,7 +82,7 @@ const SCALE_MIN = 0.0003, SCALE_MAX = 0.1;
 const ST = {
   tool: 'add', lastTool: 'add', shape: 0, brushVR: 0.06, mirror: false, pressure: true, carveAll: true, autoSmooth: 0.3,
   tex: { pattern: 0, depth: 1.2, scale: 6 },
-  sup: { auto: true, stripes: true, seeThrough: false, plateOnly: false, angle: 35, bridge: 5, maxBridge: 40, branchAngle: 40, branchD: 8, tipD: 3, spacing: 7, brim: true, brimW: 6, brimJoin: 14, style: 'fused', footFlare: true },
+  sup: { auto: true, stripes: true, seeThrough: false, plateOnly: false, angle: 35, bridge: 5, maxBridge: 40, branchAngle: 40, branchD: 4, tipD: 3, spacing: 7, brim: true, brimW: 6, brimJoin: 14, style: 'fused', footFlare: true },
 };
 
 // ───────────────────────── renderer / scene
@@ -287,8 +287,9 @@ function markDirtyRange(L, i0, i1, j0, j1, k0, k1) {
   const c0 = Math.max(0, Math.ceil((k0 - 17) / 16)), c1 = Math.min(NC - 1, Math.floor((k1 + 1) / 16));
   for (let c = c0; c <= c1; c++) for (let b = b0; b <= b1; b++) for (let a = a0; a <= a1; a++) L.dirty.add(a + NC * (b + NC * c));
 }
+function chunkTouched(L, key) { if (!L.cver) L.cver = new Map(); L.cver.set(key, (L.cver.get(key) || 0) + 1); }
 function markChunkDirty(L, key) {
-  netTouch(L, key);
+  chunkTouched(L, key); netTouch(L, key);
   const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
   markDirtyRange(L, cx * 16, cx * 16 + 15, cy * 16, cy * 16 + 15, cz * 16, cz * 16 + 15);
 }
@@ -353,7 +354,7 @@ function forVox(L, box, fn, rec, allocate) {
       if (!ch) { snap(rec, L, key, null); ch = new Float32Array(4096); L.chunks.set(key, ch); } else snap(rec, L, key, ch);
       ch[li] = nv; changed = true; wrote = true;
     }
-    if (wrote) netTouch(L, key);
+    if (wrote) { chunkTouched(L, key); netTouch(L, key); }
   }
   if (changed) markDirtyRange(L, i0, i1, j0, j1, k0, k1);
   return changed;
@@ -1005,6 +1006,7 @@ function findAnchor(x, y, z, tanA) {
 let supNeed = true, supRunning = null, lastEditAt = 0, lastSolveStart = 0;
 const supStats = { contacts: 0, dead: 0, islands: 0, growing: false };
 let solveTick = 0;
+const SOLVEPROF = { stage: '', t: {}, wall0: 0, wall: 0 };   // dev timing of each solver stage
 const solveMaybe = () => performance.now() - solveTick > 4;
 // occupancy of the sculpt (plus support clay when checking the finished result)
 function* occGen(vis, extra) {
@@ -1327,16 +1329,22 @@ function stampTube(fresh, a, b, ra, rb) {
 // with the share of the sculpture they carry. A trunk ends in the middle of the part (or plate) it stands on.
 function* treeGen(keep, sup, fresh, bb, clsArr) {
   if (!bb || !keep.length) return;
-  const { depth, middle } = yield* depthGen(bb);
+  SOLVEPROF.stage = 'depth'; const { depth, middle } = yield* depthGen(bb); SOLVEPROF.stage = 'trees';
   const { bi0, bi1, bj1, bk0, bk1 } = bb;
   const tanB = Math.tan(clamp(sup.branchAngle, 5, 60) * DEG);
   const reachV = 1 / Math.tan(clamp(sup.angle, 5, 85) * DEG);
   const tanMax = Math.min(tanB * 1.2, 1 / Math.tan(clamp(sup.angle + 8, 10, 85) * DEG));
-  const rMin = Math.max(2.0, sup.branchD / 2) / VS + 0.25;          // never thinner than 4 mm across, even after smoothing
-  const rCap = rMin * 2.6;
-  const sp = Math.max(sup.spacing, sup.branchD + 2 * sup.bridge) / VS;
+  // how thick a column has to be (diameter, mm): by its height, short stubs can be thin and it rises fast to the
+  // "tall columns" size (1 mm up to 2 mm tall, 3 mm at 10 mm tall, then levelling off at the tall size), very tall
+  // ones keep at least 1/25 of their height; and by the weight it carries (cross-section grows with the load)
+  const dShort = 1.0, dTall = Math.max(2, sup.branchD);
+  const dHeight = (h) => Math.max(h <= 2 ? dShort : dShort + (dTall - dShort) * (1 - Math.exp(-(h - 2) / 7.3)), h / 25);
+  const sp = Math.max(sup.spacing, sup.branchD * 1.6 + 2 * sup.bridge) / VS;
   const wRef = sp * sp * 4;                                          // about what one contact carries on a typical arm
-  const rOf = (w) => clamp(rMin * Math.sqrt(Math.max(1, w / wRef)), rMin, rCap);
+  const dLoad = (w) => 3.0 * Math.sqrt(Math.max(0, w) / wRef);
+  const dCap = Math.max(3 * dTall, 14);
+  // radius in voxels; never below what the 1.6 mm clay grid can hold through smoothing (about 3.4 mm across)
+  const rFor = (hmm, w) => Math.max(Math.min(Math.max(dHeight(hmm), dLoad(w)), dCap) / 2 / VS, 0.8) + 0.25;
   const C = [];
   for (const c of keep) {
     const ci = Math.round(ix(c.x)), ck = Math.round(iz(c.z)); let cj = Math.floor(iy(c.y)) + 1;
@@ -1358,7 +1366,7 @@ function* treeGen(keep, sup, fresh, bb, clsArr) {
   }
   const okLean = (P, B) => { const v = P.j - B.j; return v > 0.5 && Math.hypot(P.i - B.i, P.k - B.k) <= v * tanMax; };
   // nearest part below the spot (inside a printable cone) that is thick enough to bury a branch end of radius r in
-  const anchorFor = (ci, cy, ck, A, r) => {
+  const anchorFor = (ci, cy, ck, A, w) => {
     const R = Math.min(70 / VS, cy * tanB), ri = Math.ceil(R), cand = [];
     for (let dk = -ri; dk <= ri; dk += 2) for (let di = -ri; di <= ri; di += 2) {
       const i = Math.round(ci) + di, k = Math.round(ck) + dk; if (i <= bi0 || k <= bk0 || i >= bi1 || k >= bk1) continue;
@@ -1369,22 +1377,36 @@ function* treeGen(keep, sup, fresh, bb, clsArr) {
     }
     cand.sort((p, q) => p.d - q.d);
     for (let q = 0; q < Math.min(10, cand.length); q++) {
-      const h = cand[q], B = middle(h.i, h.j, h.k, r + 1.5);
-      if (B.d >= r - 0.4 && okLean(A, B)) return { B, d: h.d };
+      const h = cand[q], r = rFor(Math.hypot(A.i - h.i, A.j - h.j, A.k - h.k) * VS, w), B = middle(h.i, h.j, h.k, r + 1.5);
+      if (B.d >= r - 0.4 && okLean(A, B)) return { B, d: h.d, r };
     }
     return null;
   };
+  // a branch top widens into a little funnel (a capital) right under the part it holds, so a thin branch still holds
+  // up a wide patch; the funnel is only as steep as the branch's own lean leaves room for, so it always prints
+  const capR = Math.max(0, sp / 2 - sup.bridge * 0.8 / VS);
+  const branchTube = (A, B, rTop, rb) => {
+    const dx = B.i - A.i, dy = B.j - A.j, dz = B.k - A.k, len = Math.hypot(dx, dy, dz) || 1e-6, ux = dx / len, uy = dy / len, uz = dz / len;
+    let e = 0; while (e < len && occ[OI(Math.round(A.i + ux * e), Math.round(A.j + uy * e), Math.round(A.k + uz * e))]) e += 0.5;
+    const lean = Math.atan2(Math.hypot(dx, dz), Math.max(1e-6, -dy)), phi = 45 * DEG - lean, rc = Math.max(rb, Math.min(capR, rb + 4 / VS));
+    if (phi < 6 * DEG || rc < rb + 0.3 || e >= len - 1) { stampTube(fresh, A, B, rTop, rb); return; }
+    const capLen = Math.min(len - e - 0.5, (rc - rb) / Math.tan(phi)), at = (t) => ({ i: A.i + ux * t, j: A.j + uy * t, k: A.k + uz * t });
+    const E = at(e), E2 = at(e + capLen);
+    stampTube(fresh, A, E, Math.max(rTop, Math.min(rc, rTop + 1)), rc);
+    stampTube(fresh, E, E2, rc, rb);
+    stampTube(fresh, E2, B, rb, rb);
+  };
   const T = [];
   for (const c of C) {
-    const A = middle(c.ci, c.cj, c.ck, rMin + 1.5);
-    const w = (c.w + wRef * 0.25) * (c.isl ? 1.5 : 1), r = rOf(w);
-    T.push({ c, A, w, r, rTop: Math.max(1.2, Math.min(r, A.d - 0.2)) });
+    const w = (c.w + wRef * 0.25) * (c.isl ? 1.5 : 1);
+    const A = middle(c.ci, c.cj, c.ck, rFor(20, w) + 1.5);
+    T.push({ c, A, w });
   }
   // 1) a spot with sculpt close underneath leans straight into the middle of it
   const free = [];
   for (const t of T) {
-    const a = sup.plateOnly ? null : anchorFor(t.c.ci, t.c.cj - 1, t.c.ck, t.A, t.r);
-    if (a && a.d < 0.6 * t.c.cj) stampTube(fresh, t.A, a.B, t.rTop, t.r); else free.push(t);
+    const a = sup.plateOnly ? null : anchorFor(t.c.ci, t.c.cj - 1, t.c.ck, t.A, t.w);
+    if (a && a.d < 0.6 * t.c.cj) branchTube(t.A, a.B, Math.max(1.05, Math.min(a.r, t.A.d - 0.2)), a.r); else free.push(t);
   }
   if (solveMaybe()) { yield; solveTick = performance.now(); }
   // 2) the rest gather into trunks: group nearby spots while every one of them can still reach the group's
@@ -1408,23 +1430,28 @@ function* treeGen(keep, sup, fresh, bb, clsArr) {
   //    thickens every time a branch joins, then ends in the middle of the part below it or on the plate
   for (const g of G) {
     const joins = g.m.map(t => { const d = Math.hypot(t.A.i - g.ci, t.A.k - g.ck); return { t, y: d < 0.6 ? t.A.j : t.A.j - d / lean }; }).sort((p, q) => q.y - p.y);
-    const trunk = []; let W = 0;
-    for (const jn of joins) {
-      W += jn.t.w; const rT = rOf(W), M = { i: g.ci, j: jn.y, k: g.ck };
-      if (jn.y < jn.t.A.j - 0.5) stampTube(fresh, jn.t.A, M, jn.t.rTop, jn.t.r);
-      trunk.push({ ...M, r: trunk.length ? rT : Math.max(jn.t.rTop, Math.min(rT, jn.t.r)) });
-      if (trunk.length > 1) trunk[trunk.length - 1].r = rT;
-    }
-    const rT = rOf(W), low = trunk[trunk.length - 1].j, ci = Math.round(g.ci), ck = Math.round(g.ck);
-    let end = null;
+    const Wall = joins.reduce((a, jn) => a + jn.t.w, 0), top = joins[0].y, low = joins[joins.length - 1].y, ci = Math.round(g.ci), ck = Math.round(g.ck);
+    // where the trunk stands: the middle of a part under it, or the plate
+    let base = 0, end = null, rT = rFor(top * VS, Wall);
     if (!sup.plateOnly) for (let y = Math.floor(low) - 1; y >= 1 && !end; y--) {
       if (!occ[OI(ci, y, ck)] || occ[OI(ci, y + 1, ck)]) continue;            // the top of a part under the trunk
-      const B = middle(ci, y, ck, rT + 1.5);
-      if (B.d >= rT - 0.4 && okLean({ i: g.ci, j: y + 1, k: g.ck }, B)) end = [{ i: g.ci, j: y + 1, k: g.ck, r: rT }, { i: B.i, j: B.j, k: B.k, r: rT }];
+      const rr = rFor((top - y) * VS, Wall), B = middle(ci, y, ck, rr + 1.5);
+      if (B.d >= rr - 0.4 && okLean({ i: g.ci, j: y + 1, k: g.ck }, B)) { base = y; rT = rr; end = [{ i: g.ci, j: y + 1, k: g.ck, r: rT }, { i: B.i, j: B.j, k: B.k, r: rT }]; }
     }
+    const Htrunk = (top - base) * VS;
+    const trunk = []; let W = 0;
+    for (const jn of joins) {
+      W += jn.t.w; const M = { i: g.ci, j: jn.y, k: g.ck }, rHere = rFor(Htrunk, W);
+      if (jn.y < jn.t.A.j - 0.5) {
+        const rb = rFor(Math.hypot(jn.t.A.i - M.i, jn.t.A.j - M.j, jn.t.A.k - M.k) * VS, jn.t.w);
+        branchTube(jn.t.A, M, Math.max(1.05, Math.min(rb, jn.t.A.d - 0.2)), Math.min(rb, rHere));
+      } else branchTube(jn.t.A, { i: jn.t.A.i, j: Math.max(1, jn.t.A.j - 12), k: jn.t.A.k }, Math.max(1.05, Math.min(rHere, jn.t.A.d - 0.2)), rHere);
+      trunk.push({ ...M, r: rHere });
+    }
+    rT = Math.max(rT, trunk[trunk.length - 1].r);
     if (!end) {
       // standing on the plate: the trunk flares out toward its base like a tree
-      end = []; const H = Math.max(1, low), F = 2.4;
+      end = []; const H = Math.max(1, low), F = rT * VS > 6 ? 2.4 : 2.0;
       for (let q = 1; q <= 8; q++) end.push({ i: g.ci, j: q === 8 ? -rT * 0.4 : H * (1 - q / 8) + 0.6 * (q / 8), k: g.ck, r: rT * (1 + (F - 1) * Math.pow(q / 8, 1.8)) });
     }
     const P = trunk.concat(end.filter(p => p.j < low - 0.01));
@@ -1439,7 +1466,7 @@ function* fuseGen(sup, fresh, bb, clsArr) {
   if (!bb) return;
   const plateOnly = sup.plateOnly;
   const reachV = 1 / Math.tan(clamp(sup.angle, 5, 85) * DEG), reachT = reachV + 0.25;
-  const minR = Math.max(2.0, sup.branchD / 2) / VS + 0.25;          // stalks never thinner than 4 mm
+  const minR = Math.max(1.0, sup.branchD / 2) / VS + 0.25;          // free-standing stalks reach the plate, so they get the tall-column size
   const pad = 2, bi0 = Math.max(1, bb.bi0 - pad), bi1 = Math.min(N - 2, bb.bi1 + pad), bk0 = Math.max(1, bb.bk0 - pad), bk1 = Math.min(N - 2, bb.bk1 + pad);
   const W = bi1 - bi0 + 1, H = bk1 - bk0 + 1, WH = W * H, INF = 1e9, D2 = Math.SQRT2;
   const NB = []; for (let dk = -2; dk <= 2; dk++) for (let di = -2; di <= 2; di++) { const d = Math.hypot(di, dk); if (d > 0 && d <= reachV + 1e-6) NB.push([di, dk]); }
@@ -1560,40 +1587,50 @@ function* smoothSupport(map) {
   }
   map.clear(); for (const [k, ch] of out) map.set(k, ch);
 }
-function* solveGen() {
+// the support solver itself: reads clay layers, returns the support clay, the per-voxel classes and the spots left over.
+// It runs in a background thread (see below), or here on the main thread if that isn't available.
+function* solveCore(vis) {
   const sup = ST.sup;
-  const vis = layers.filter(l => l.visible && !l.auto);
   solveTick = performance.now();
-  const fresh = new Map();
-  let firstCount = 0, islands0 = 0, left = [];
+  const fresh = new Map(), passLog = [];
+  let firstCount = 0, islands0 = 0, left = [], cls0 = null;
   // pass 0 supports the sculpt; the next passes check sculpt + supports together and fix anything still hanging; the last only reports
   const passes = sup.style === 'removable' ? 3 : 5;
   for (let pass = 0; pass < passes; pass++) {
-    const bb = yield* occGen(vis, pass ? fresh : null);
+    SOLVEPROF.stage = 'occ'; const bb = yield* occGen(vis, pass ? fresh : null);
     const nextCls = pass === 0 ? new Uint8Array(N * N * N) : scratchCls();
-    const res = yield* classifyGen(bb, sup, nextCls);
-    if (pass === 0) { cls = nextCls; clsTex.image.data = cls; clsTex.needsUpdate = true; if (CUT.on) drawCap(); islands0 = res.islands; }
+    SOLVEPROF.stage = 'classify'; const res = yield* classifyGen(bb, sup, nextCls);
+    if (pass === 0) { cls0 = nextCls; islands0 = res.islands; }
     const keep = dedupeContacts(res.contacts, sup.spacing);
-    if (pass === 0) { firstCount = keep.length; supStats.passLog = []; }
-    supStats.passLog.push(keep.length);
+    if (pass === 0) firstCount = keep.length;
+    passLog.push(keep.length);
     left = keep;
     if (!keep.length || pass === passes - 1) break;
     if (sup.style === 'removable') { yield* strandGen(keep, sup, fresh); continue; }
-    const made = new Map();
-    if (pass <= 2) yield* treeGen(dedupeContacts(res.contacts, pass === 0 ? Math.max(sup.spacing, sup.branchD + 2 * sup.bridge) : sup.spacing), sup, made, bb, nextCls);
+    const made = new Map(); SOLVEPROF.stage = pass <= 2 ? 'trees' : 'fill';
+    if (pass <= 2) yield* treeGen(dedupeContacts(res.contacts, pass === 0 ? Math.max(sup.spacing, sup.branchD * 1.6 + 2 * sup.bridge) : sup.spacing), sup, made, bb, nextCls);
     else yield* fuseGen(sup, made, bb, nextCls);    // smooth out under anything that still hangs
-    yield* smoothSupport(made);
+    SOLVEPROF.stage = 'smooth'; yield* smoothSupport(made);
     for (const [key, ch] of made) { const f = fresh.get(key); if (!f) fresh.set(key, ch); else for (let q = 0; q < 4096; q++) if (ch[q] > f[q]) f[q] = ch[q]; }
   }
+  SOLVEPROF.stage = 'finish';
   if (sup.style !== 'removable' && sup.footFlare !== false) { addFootFlare(fresh); yield; }
   if (sup.brim) { addBrim(fresh, sup); yield; }
+  return { fresh, cls: cls0, left: left.map(c => ({ x: c.x, y: c.y, z: c.z, island: !!c.island })), firstCount, islands: islands0, passLog };
+}
+function* solveGen() {
+  const r = yield* solveCore(layers.filter(l => l.visible && !l.auto));
   supRunning = null;
+  applySolve(r.fresh, r.cls, r.left, r.firstCount, r.islands, r.passLog);
+}
+function applySolve(fresh, newCls, left, first, islands, passLog) {
+  if (newCls) { cls = newCls; clsTex.image.data = cls; clsTex.needsUpdate = true; if (CUT.on) drawCap(); }
   const L = ensureSupLayer();
   const keys = new Set([...L.chunks.keys(), ...fresh.keys()]);
   L.chunks = fresh;
   for (const k of keys) markChunkDirty(L, k);
   showDead(left);
-  supStats.contacts = firstCount; supStats.dead = left.length; supStats.islands = islands0; supStats.growing = false;
+  supStats.contacts = first; supStats.dead = left.length; supStats.islands = islands; supStats.passLog = passLog; supStats.growing = false;
   dimsDirty = true; capDirty = true; UIS.dirty = true;
 }
 let _scratch = null;
@@ -1688,6 +1725,7 @@ function showDead(pts) {
   deadMesh.instanceMatrix.needsUpdate = true;
 }
 function clearSupports() {
+  SOLVER.epoch++;
   supRunning = null;
   if (supLayer) { const keys = [...supLayer.chunks.keys()]; supLayer.chunks = new Map(); for (const k of keys) markChunkDirty(supLayer, k); }
   showDead([]); supStats.contacts = supStats.dead = supStats.islands = 0; supStats.growing = false; UIS.dirty = true;
@@ -1703,17 +1741,101 @@ function keepSupportsAsClay() {
 }
 function supportTick(now) {
   if (!ST.sup.auto) return;
+  if (SOLVER.w && !SOLVER.failed) {
+    // background thread: no need to wait for meshing or share frames, so supports can follow the sculpting closely
+    if (supNeed && !SOLVER.busy) {
+      const ready = stroke.active ? (now - lastSolveStart > 450) : (now - lastEditAt > 80);
+      if (ready) { supNeed = false; lastSolveStart = now; SOLVEPROF.wall0 = now; supStats.growing = true; UIS.dirty = true; postSolve(); }
+    }
+    if (stroke.active && now - lastSolveStart > 450) supNeed = true;
+    return;
+  }
   if (supNeed && !anyDirtyUser()) {
     const ready = stroke.active ? (now - lastSolveStart > 1600) : (now - lastEditAt > 120);
-    if (ready) { supNeed = stroke.active; supRunning = solveGen(); lastSolveStart = now; supStats.growing = true; UIS.dirty = true; }
+    if (ready) { supNeed = stroke.active; supRunning = solveGen(); lastSolveStart = now; SOLVEPROF.t = {}; SOLVEPROF.wall0 = now; supStats.growing = true; UIS.dirty = true; }
   }
   if (stroke.active && performance.now() - lastSolveStart > 1600) supNeed = true;
   if (supRunning) {
     const t0 = performance.now();
     try {
-      while (supRunning && performance.now() - t0 < (renderer.xr.isPresenting ? 4 : 9)) { const r = supRunning.next(); if (r.done) { supRunning = null; break; } }
+      while (supRunning && performance.now() - t0 < (renderer.xr.isPresenting ? 4 : 9)) {
+        const a = performance.now(), r = supRunning.next(), st = SOLVEPROF.stage; SOLVEPROF.t[st] = (SOLVEPROF.t[st] || 0) + performance.now() - a;
+        if (r.done) { supRunning = null; SOLVEPROF.wall = performance.now() - SOLVEPROF.wall0; break; } }
     } catch (e) { console.error(e); supRunning = null; supStats.growing = false; }
   }
+}
+
+// ───────────────────────── supports on a background thread
+// The exact same solver functions are copied into a Web Worker. Only clay chunks that changed since the last solve
+// are sent over; the worker keeps its own copy, grows the supports at full speed and sends back the result, so the
+// headset never shares its frames with the solver. If workers aren't allowed here, the solver runs on the main thread.
+const SOLVER = { w: null, busy: false, failed: false, id: 0, epoch: 0, sentEpoch: 0 };
+function solverSource() {
+  const fns = [getD, voxBox, smoothPass, gatherSmoothed, occAt, belowAt, ringBlocked, solidScore, massDir, burrow, fitRadius, buryEnd, findAnchor,
+    occGen, classifyGen, dedupeContacts, strandGen, depthGen, stampTube, treeGen, fuseGen, smoothSupport, addFootFlare, addBrim,
+    insideBeam, beamCheck, clayAt, solveCore];
+  const arrows = { clamp, vx, vy, vz, ix, iy, iz, OI, bext, beamLen, scratchCls };
+  return [
+    `const N = ${N}, VS = ${VS}, NC = ${NC}, HALF = ${HALF}, ISO = ${ISO}, DEG = Math.PI / 180, PB = ${PB}, PB2 = ${PB2}, TAPER = ${TAPER};`,
+    `const DIRS14 = ${JSON.stringify(DIRS14)};`,
+    'const occ = new Uint8Array(N * N * N), below = new Uint8Array(N * N * N), firmM = new Uint8Array(N * N * N); let firmUsed = false, _scratch = null;',
+    'const BIG = new Float32Array(PB * PB2), BLA = new Float32Array(PB * PB2), BLB = new Float32Array(PB * PB2);',
+    'let layers = []; const ST = { sup: {}, autoSmooth: 0.3 }; let solveTick = 0; const solveMaybe = () => false; const SOLVEPROF = { stage: "", t: {} };',
+    ...Object.entries(arrows).map(([k, f]) => `const ${k} = ${f.toString()};`),
+    ...fns.map(f => f.toString()),
+    `const mirror = new Map();
+self.onmessage = (e) => {
+  const m = e.data; if (m.t !== 'solve') return;
+  try {
+    ST.sup = m.sup; ST.autoSmooth = m.smooth;
+    const seen = new Set();
+    layers = m.layers.map(d => {
+      let L = mirror.get(d.u); if (!L || d.reset) { L = { chunks: new Map() }; mirror.set(d.u, L); }
+      seen.add(d.u);
+      for (const [k, a] of d.upd) L.chunks.set(k, a);
+      if (d.keys) { const ks = new Set(d.keys); for (const k of [...L.chunks.keys()]) if (!ks.has(k)) L.chunks.delete(k); }
+      L.bridge = d.bridge; L.beams = d.beams || []; L.visible = true; L.auto = false; return L;
+    });
+    for (const u of [...mirror.keys()]) if (!seen.has(u)) mirror.delete(u);
+    const t0 = performance.now(), g = solveCore(layers); let r; while (!(r = g.next()).done) {}
+    const out = r.value, fr = [...out.fresh], tr = fr.map(x => x[1].buffer); if (out.cls) tr.push(out.cls.buffer);
+    self.postMessage({ t: 'done', id: m.id, fresh: fr, cls: out.cls, left: out.left, first: out.firstCount, islands: out.islands, passLog: out.passLog, ms: performance.now() - t0 }, tr);
+  } catch (err) { self.postMessage({ t: 'error', id: m.id, msg: String(err && err.stack || err) }); }
+};`].join('\n');
+}
+function startSolver() {
+  if (/[?&]noworker/.test(location.search) || typeof Worker === 'undefined') return;
+  try {
+    const url = URL.createObjectURL(new Blob([solverSource()], { type: 'text/javascript' }));
+    SOLVER.w = new Worker(url);
+    SOLVER.w.onmessage = onSolverMsg;
+    SOLVER.w.onerror = (e) => { console.error('support worker', e.message); solverFail(); };
+  } catch (e) { SOLVER.w = null; }
+}
+function solverFail() { SOLVER.failed = true; SOLVER.busy = false; for (const L of layers) L.solverSent = null; supNeed = true; supStats.growing = false; }
+function postSolve() {
+  const vis = layers.filter(l => l.visible && !l.auto), out = [], transfer = [];
+  for (const L of layers) if (!vis.includes(L)) L.solverSent = null;
+  for (const L of vis) {
+    const d = { u: L.uid, bridge: L.bridge, beams: L.bridge ? L.beams.map(b => ({ ...b })) : null, upd: [], keys: null, reset: false };
+    if (!L.bridge) {
+      if (!L.solverSent) { L.solverSent = new Map(); d.reset = true; }
+      if (!L.cver) L.cver = new Map();
+      for (const [k, ch] of L.chunks) { const v = L.cver.get(k) || 0; if (L.solverSent.get(k) !== v) { const c = ch.slice(); d.upd.push([k, c]); transfer.push(c.buffer); L.solverSent.set(k, v); } }
+      for (const k of [...L.solverSent.keys()]) if (!L.chunks.has(k)) L.solverSent.delete(k);
+      d.keys = [...L.chunks.keys()];
+    }
+    out.push(d);
+  }
+  SOLVER.busy = true; SOLVER.id++; SOLVER.sentEpoch = SOLVER.epoch;
+  SOLVER.w.postMessage({ t: 'solve', id: SOLVER.id, layers: out, sup: { ...ST.sup }, smooth: ST.autoSmooth }, transfer);
+}
+function onSolverMsg(e) {
+  const m = e.data; SOLVER.busy = false;
+  if (m.t === 'error') { console.error('support worker', m.msg); solverFail(); return; }
+  if (SOLVER.sentEpoch !== SOLVER.epoch || !ST.sup.auto) { supStats.growing = false; supNeed = ST.sup.auto; return; }   // the bed changed under it
+  applySolve(new Map(m.fresh), m.cls, m.left, m.first, m.islands, m.passLog);
+  SOLVEPROF.wall = performance.now() - SOLVEPROF.wall0; SOLVEPROF.t = { worker: m.ms };
 }
 const anyDirtyUser = () => layers.some(l => !l.auto && l.dirty.size > 0);
 function supSettingChanged() { supNeed = true; lastEditAt = performance.now() - 1000; supRunning = null; UIS.dirty = true; }
@@ -1998,10 +2120,10 @@ function drawUI() {
         sl(924, 'Tip thickness', 'tipD', 2.4, 8, ' mm', null, 1);
         sl(1014, 'Contact spacing', 'spacing', 4, 16, ' mm', null, 1);
       } else {
-        sl(744, 'Thinnest branch', 'branchD', 4, 14, ' mm', null, 1);
+        sl(744, 'Tall columns at least', 'branchD', 2, 10, ' mm', null, 1);
         sl(834, 'Branch angle', 'branchAngle', 15, 50, '°');
-        txt('Branches gather into trunks under the weight they hold.', X, 940, 26, '#7f8896', 'left', 500);
-        txt('Trunks thicken with the share of the sculpture they carry.', X, 974, 26, '#7f8896', 'left', 500);
+        txt('Short stubs can be thinner; columns thicken as they get', X, 940, 26, '#7f8896', 'left', 500);
+        txt('taller and as they carry more of the sculpture.', X, 974, 26, '#7f8896', 'left', 500);
       }
     } else {
       button(X, 446, FW, 84, `Brim: ${s.brim ? 'On' : 'Off'}`, { on: s.brim, fs: 32, click: () => { s.brim = !s.brim; supSettingChanged(); } });
@@ -2695,7 +2817,7 @@ function diffChunks(L, keys, all) {
   for (const key of keys) {
     const ch = L.chunks.get(key), q = quant(ch), prev = L.netQ.get(key) || null;
     if (!all && sameQ(q, prev)) continue;
-    if (q) { L.netQ.set(key, q); for (let i = 0; i < 4096; i++) ch[i] = q[i] / 65535; } else L.netQ.delete(key);
+    if (q) { L.netQ.set(key, q); for (let i = 0; i < 4096; i++) ch[i] = q[i] / 65535; chunkTouched(L, key); } else L.netQ.delete(key);
     if (q || !all) items.push([key, q, L.netVer.get(key) || 0]);
   }
   return items;
@@ -3032,6 +3154,7 @@ if (navigator.xr && navigator.xr.isSessionSupported) {
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 
 let lastT = performance.now(), lastDraw = 0;
+startSolver();
 renderer.setAnimationLoop(() => {
   const now = performance.now(), dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
   const xr = renderer.xr.isPresenting;
@@ -3048,7 +3171,7 @@ renderer.setAnimationLoop(() => {
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
