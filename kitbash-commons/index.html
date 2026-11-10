@@ -1427,7 +1427,7 @@ function support(x,z,top,data,pipeCap=PIPE_R+0.14){
     for(const s of d.segs){ const hx=s[3]-s[0], hz=s[5]-s[2], l2=hx*hx+hz*hz; if(l2<1e-4) continue;
       const t=clamp(((x-s[0])*hx+(z-s[2])*hz)/l2,0,1), px=s[0]+hx*t, pz=s[2]+hz*t;
       if((x-px)**2+(z-pz)**2 < pipeCap*pipeCap){ const y=s[1]+(s[4]-s[1])*t+PIPE_R;
-        if(y<=top&&y>best){ best=y; const l=Math.sqrt(l2); Object.assign(SUP,{seg:true,px,pz,dx:hx/l,dz:hz/l,dy:(s[4]-s[1])/l}); } } }
+        if(y<=top&&y>best){ best=y; const l=Math.sqrt(l2); Object.assign(SUP,{seg:true,px,pz,dx:hx/l,dz:hz/l,dy:(s[4]-s[1])/l,t,s}); } } }
   }
   return best;
 }
@@ -1551,7 +1551,9 @@ function stepPlayer(dt){
   const hold=pogo?(rawHold&&pl.holdT>=0.22):rawHold;   // in Pogo a quick tap jumps, holding brakes
   pl.jig*=Math.exp(-dt*3); pl.hurtT-=dt; pl.stun-=dt;
   if(pogo){ // bounces on its own; hold to brake down to a stop, lean to steer in the air
-    if(pl.pogoRest&&hold){ const c0=pl.pcharge||0; pl.pcharge=Math.min(1,c0+dt/1.1); if(Math.floor(c0*6)!==Math.floor(pl.pcharge*6)) sfx('squeak',pl.pcharge); pl.jig=Math.max(pl.jig,pl.pcharge*0.6);
+    if(!hold&&pl.wasHold&&!pl.pogoRest&&(pl.pcharge||0)>0){ pl.pendC=pl.pcharge; pl.pcharge=0; }   // let go mid-bounce: the next landing springs higher
+    pl.wasHold=hold;
+    if(hold){ const c0=pl.pcharge||0; pl.pcharge=Math.min(1,c0+dt/1.1); if(Math.floor(c0*6)!==Math.floor(pl.pcharge*6)) sfx('squeak',pl.pcharge); pl.jig=Math.max(pl.jig,pl.pcharge*0.6);
       if(pl.pcharge>=1&&Math.random()<dt*12) burst(pl.pos.x,pl.pos.y+0.2,pl.pos.z,1,[0xffd23f,0xffffff,0xff5fb0],1.5,0.05,1.5); }
     pl.charge+=((hold?Math.max(0.4,pl.pcharge||0)*1.4:0)-pl.charge)*Math.min(1,dt*8);
     if(pl.pogoRest){
@@ -1618,15 +1620,29 @@ function stepPlayer(dt){
       if(!pogo && pl.onGround) pl.visOff += pl.pos.y-sup;   // stepping up/down: keep the body where it was, then ease it over
       const impact=-pl.vel.y; pl.pos.y=sup;
       if(pogo&&SUP.seg&&Math.abs(SUP.dy)<=0.5&&!pl.pogoRest&&(pl.pgr||impact<34)){   // a pipe: the pogo grinds along it on its own, picking up speed downhill
-        const vp=pl.vel.x*SUP.dx+pl.vel.z*SUP.dz, sg=vp>=0?1:-1, sp=clamp(Math.abs(vp)+(Math.abs(SUP.dy)>0.14?-Math.sign(SUP.dy)*sg*GRAV*0.5*Math.abs(SUP.dy)*h:0),5.5,13); if(!pl.pgr){ pl.pgr={t:0}; sfx('pipestep',0.9); } pl.pgr.t+=h;
-        pl.vel.set(SUP.dx*sg*sp,0,SUP.dz*sg*sp); const kk=Math.min(1,h*16); pl.pos.x+=(SUP.px-pl.pos.x)*kk; pl.pos.z+=(SUP.pz-pl.pos.z)*kk; pl.onGround=true; pl.onPipe=true; pl.pogoAirJ=false; pl.land=0;
+        if(!pl.pgr){ pl.pgr={t:0,sp:clamp(Math.hypot(pl.vel.x,pl.vel.z),5.5,13)}; sfx('pipestep',0.9); } const G=pl.pgr; G.t+=h;
+        if(SUP.s!==G.prev||!G.dir){   // (still touching the piece you just left at a bend: keep going the way you're heading)
+          if(G.seg&&SUP.s!==G.seg){ G.prev=G.seg; sfx('pipestep',0.6); } G.seg=SUP.s;
+          const along=G.dir?G.dir[0]*SUP.dx+G.dir[1]*SUP.dz:pl.vel.x*SUP.dx+pl.vel.z*SUP.dz, sg=Math.abs(along)>(G.dir?0.35:0.05)?Math.sign(along):(SUP.t<0.5?1:-1);
+          G.sp=clamp(G.sp+(Math.abs(SUP.dy)>0.14?-Math.sign(SUP.dy)*sg*GRAV*0.5*Math.abs(SUP.dy)*h:0),5.5,13); G.dir=[SUP.dx*sg,SUP.dz*sg];
+          const kk=Math.min(1,h*16); pl.pos.x+=(SUP.px-pl.pos.x)*kk; pl.pos.z+=(SUP.pz-pl.pos.z)*kk; }
+        let off=false;
+        if(SUP.s===G.seg&&(SUP.t>=0.999||SUP.t<=0.001)){ const s0=SUP.s, e1=SUP.t>=0.999, jx=e1?s0[3]:s0[0], jy=e1?s0[4]:s0[1], jz=e1?s0[5]:s0[2];
+          if((e1?1:-1)*(G.dir[0]*SUP.dx+G.dir[1]*SUP.dz)>0){   // reached the end of this piece: carry on round the bend onto the next, or sail off the end
+            let nx=null; for(const d of data) for(const q of d.segs){ if(q===s0) continue; for(const [e,o] of [[0,3],[3,0]]){ if(Math.abs(q[e]-jx)<0.12&&Math.abs(q[e+1]-jy)<0.12&&Math.abs(q[e+2]-jz)<0.12){ const hx=q[o]-q[e], hz=q[o+2]-q[e+2], L=Math.hypot(hx,hz); if(L>0.3&&Math.abs(q[o+1]-q[e+1])/L<=0.5) nx={q,dx:hx/L,dz:hz/L}; } } }
+            if(nx){ G.prev=s0; G.seg=nx.q; G.dir=[nx.dx,nx.dz]; pl.pos.x=jx+nx.dx*0.06; pl.pos.z=jz+nx.dz*0.06; sfx('pipestep',0.6); }
+            else { off=true; pl.pgr=null; pl.onGround=false; pl.vel.set(G.dir[0]*G.sp,PG.bounce*0.6,G.dir[1]*G.sp); } } }
+        if(!off){ pl.vel.set(G.dir[0]*G.sp,0,G.dir[1]*G.sp); pl.onGround=true; pl.onPipe=true; pl.pogoAirJ=false; pl.land=0; }
+        if(!off){ const mv=G.lx===undefined?1:Math.hypot(pl.pos.x-G.lx,pl.pos.z-G.lz); G.lx=pl.pos.x; G.lz=pl.pos.z; G.stall=mv<G.sp*h*0.3?(G.stall||0)+h:0;
+          if(G.stall>0.12){ pl.pgr=null; pl.onGround=false; pl.vel.y=PG.bounce*1.15; pl.land=1; sfx('boing',0.9); } }   // something across the pipe: hop it
         if(Math.random()<h*16) burst(pl.pos.x,pl.pos.y+0.05,pl.pos.z,1,[0xffd23f,0xffffff,0xff9f1c],1.5,0.05,1); }
       else if(pogo){ pl.pgr=null; pl.pogoAirJ=false;
         if(pl.pogoRest){ pl.vel.y=0; pl.onGround=true; }
         else if(hold){ // brake: each landing keeps a little less bounce and slide, with a wobbly settle
           let v=impact*PG.brake*0.6; pl.vel.x*=PG.grip; pl.vel.z*=PG.grip; pl.jig=Math.min(1,pl.jig+impact*0.07); pl.land=Math.min(1,impact/10);
           if(v<2.2){ v=0; pl.pogoRest=true; pl.onGround=true; sfx('thud',0.5); } else { pl.onGround=false; sfx('boing',v/PG.bounce*0.6); } pl.vel.y=v; }
-        else { pl.vel.y=PG.bounce; pl.vel.x+=wx*PG.push; pl.vel.z+=wz*PG.push; pl.land=1; pl.onGround=false; sfx('boing',clamp(impact/14,0.3,1.2)); } }
+        else { const pc=pl.pendC||0; pl.pendC=0; pl.vel.y=PG.bounce+pc*16; pl.vel.x+=wx*(PG.push+pc*4); pl.vel.z+=wz*(PG.push+pc*4); pl.land=1; pl.onGround=false; sfx('boing',clamp(impact/14,0.3,1.2)+pc*0.5);
+          if(pc>0.7&&!pl.flip){ pl.flip={t:0,dur:0.75,n:1}; sfx('flip'); } } }
       else { let impact2=impact; if(!pl.onGround && impact>26 && !pl.flip && Math.hypot(pl.vel.x,pl.vel.z)>2.5 && !pl.roll){ pl.roll={t:0,dur:0.42}; impact2*=0.4; sfx('hup'); }
         if(!pl.onGround && impact2>9) pl.land=Math.min(1,impact2/26); if(!pl.onGround){ pl.wr=null; pl.wrUsed=false; pl.kicks=0; pl.dashUsed=false; pl.dash=null; pl.cart=null; } if(!pl.onGround && impact>4) sfx('land',Math.min(1,impact/22)); pl.vel.y=0; pl.onGround=true; pl.jumps=0; pl.flip=null; pl.flipUsed=false;
         pl.onPipe=SUP.seg; pl.grind=SUP.seg&&Math.abs(SUP.dy)>0.14;
@@ -3029,7 +3045,7 @@ function setHint(){
 addEventListener('keydown',e=>{ if(e.target.tagName==='INPUT') return; keys[e.code]=true;
   if(e.code==='Space'){ e.preventDefault(); if(mode==='walk' && !e.repeat) jumpQueued=true; }
   if(e.code==='KeyE' && !e.repeat && mode!=='fly') setMode(mode==='pogo'?'walk':'pogo');
-  if(e.code==='KeyF' && !e.repeat && mode!=='fly'){ if(!(nearGarden&&sniffFlower())) talkToFace(); }
+  if(e.code==='KeyF' && !e.repeat && mode!=='fly'){ if(!((nearGarden||nearWild)&&sniffFlower())) talkToFace(); }
   if(e.code==='KeyR' && !e.repeat && mode!=='fly') pickOrPlant();
   if(DASH_ON && (e.code==='ShiftLeft'||e.code==='ShiftRight') && !e.repeat && mode==='walk') dashQueued=true;
   if(e.code==='KeyH' && !e.repeat && mode!=='fly') hugQueued=true;
@@ -3058,7 +3074,7 @@ canvas.addEventListener('pointerup',endPtr); canvas.addEventListener('pointercan
 canvas.addEventListener('wheel',e=>{ if(mode!=='fly'){ camDist=clamp(camDist*(1+e.deltaY*0.001),3,26); } },{passive:true});
 $('jump').addEventListener('pointerdown',e=>{ e.preventDefault(); jumpQueued=true; jumpBtnHeld=true; $('jump').setPointerCapture(e.pointerId); });
 for(const ev of ['pointerup','pointercancel']) $('jump').addEventListener(ev,()=>{ jumpBtnHeld=false; });
-$('talk').addEventListener('pointerdown',e=>{ e.preventDefault(); if(!(nearGarden&&sniffFlower())) talkToFace(); });
+$('talk').addEventListener('pointerdown',e=>{ e.preventDefault(); if(!((nearGarden||nearWild)&&sniffFlower())) talkToFace(); });
 $('pick').addEventListener('pointerdown',e=>{ e.preventDefault(); pickOrPlant(); });
 $('dash').addEventListener('pointerdown',e=>{ e.preventDefault(); if(mode==='walk') dashQueued=true; });
 $('hug').addEventListener('pointerdown',e=>{ e.preventDefault(); hugQueued=true; });
@@ -3416,7 +3432,7 @@ function vrInput(dt){
   jumpBtnHeld=jump; VR.prevJump=jump;
   if(menuB && !VR.prevMenu) menuToggle(); VR.prevMenu=menuB;
   if(pogoB && !VR.prevPogo){ setMode(mode==='pogo'?'walk':'pogo'); menuRefresh(); } VR.prevPogo=pogoB;
-  if(grip && !VR.prevGrip){ if(nearestFriend(1.8)) hugQueued=true; else if(nearGarden){ if(gripR) pickOrPlant(); else sniffFlower(); } else if(nearFace) talkToFace(); else if(NET.on) sendBeacon(); } VR.prevGrip=grip;
+  if(grip && !VR.prevGrip){ if(nearestFriend(1.8)) hugQueued=true; else if(nearGarden||nearWild||(onGrass&&gripR)){ if(gripR) pickOrPlant(); else sniffFlower(); } else if(nearFace) talkToFace(); else if(NET.on) sendBeacon(); } VR.prevGrip=grip;
   if(center && !VR.prevCenter) VR.needCenter=true; VR.prevCenter=center;
   if(VR.turn==='smooth'){ const t=dz(rx); if(Math.abs(rx)>Math.abs(ry)*0.7) VR.yaw-=t*dt*1.9; }
   else { const st=VR.turn==='snap45'?Math.PI/4:Math.PI/6;
