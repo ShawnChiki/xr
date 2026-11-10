@@ -169,6 +169,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { MarchingCubes } from 'three/addons/objects/MarchingCubes.js';
 
 //#GEN-START
+let KEEPOUT=null;   // while set, boxes are cut back in blocks wherever they'd get in a big slide's way
 /* ============================================================
    GENERATOR — every chunk is rebuilt from (chunkX, chunkZ, seed),
    so the field is endless and the same seed always gives the same city.
@@ -241,10 +242,20 @@ class Builder {
     if(x1<x0)[x0,x1]=[x1,x0]; if(y1<y0)[y0,y1]=[y1,y0]; if(z1<z0)[z0,z1]=[z1,z0];
     if(x1-x0<0.01||y1-y0<0.01||z1-z0<0.01) return;
     y0+=this.oy; y1+=this.oy;
-    if(collide) this.cols.push([x0,y0,z0,x1,y1,z1]);
     // every box is grown by its own tiny amount so touching faces never share a plane (no z-fighting)
     const e=ev!==null?ev:(String(col).startsWith('ter')?0:((this.n++*7)%11)*0.0015);
-    const c=this.rgb(col), lo=[x0-e,y0,z0-e], hi=[x1+e,y1+e,z1+e];
+    const c=this.rgb(col);
+    if(KEEPOUT&&!KEEPOUT.off&&y0>TB+0.01&&this.carve(x0,y0,z0,x1,y1,z1,c,e,col,collide)) return;
+    if(collide) this.cols.push([x0,y0,z0,x1,y1,z1]);
+    this.emit(x0,y0,z0,x1,y1,z1,c,e,col); }
+  carve(x0,y0,z0,x1,y1,z1,c,e,col,collide){ const near=keepNear(x0,y0,z0,x1,y1,z1); if(!near.length||!keepHit(near,x0,y0,z0,x1,y1,z1)) return false;
+    const S=0.75, nx=Math.max(1,Math.round((x1-x0)/S)), ny=Math.max(1,Math.round((y1-y0)/S)), nz=Math.max(1,Math.round((z1-z0)/S)); if(nx*ny*nz>30000) return false;
+    const gx=(x1-x0)/nx, gy=(y1-y0)/ny, gz=(z1-z0)/nz;
+    for(let j=0;j<ny;j++) for(let k=0;k<nz;k++){ const b2=y0+j*gy, c2=z0+k*gz; let i=0; while(i<nx){ if(keepHit(near,x0+i*gx,b2,c2,x0+(i+1)*gx,b2+gy,c2+gz)){ i++; continue; }
+        let m=i+1; while(m<nx&&!keepHit(near,x0+m*gx,b2,c2,x0+(m+1)*gx,b2+gy,c2+gz)) m++;
+        if(collide) this.cols.push([x0+i*gx,b2,c2,x0+m*gx,b2+gy,c2+gz]); this.emit(x0+i*gx,b2,c2,x0+m*gx,b2+gy,c2+gz,c,e,col); i=m; } }
+    return true; }
+  emit(x0,y0,z0,x1,y1,z1,c,e,col){ const lo=[x0-e,y0,z0-e], hi=[x1+e,y1+e,z1+e];
     const pv=this.piv?[this.piv[0],this.piv[1]+this.oy,this.piv[2]]:[(x0+x1)/2,(y0+y1)/2,(z0+z1)/2];
     for(const f of BOXT){ const base=this.pos.length/3;
       for(const k of f.cs){ this.pos.push(k[0]?hi[0]:lo[0], k[1]?hi[1]:lo[1], k[2]?hi[2]:lo[2]);
@@ -258,6 +269,8 @@ class Builder {
     const ix=t.index.array; for(let i=0;i<ix.length;i++) this.idx.push(base+ix[i]); }
   geo(g,col){ // append any three geometry
     if(this.oy) g.translate(0,this.oy,0);
+    if(KEEPOUT&&!KEEPOUT.off){ g.computeBoundingBox(); const q=g.boundingBox; if(Math.max(q.max.x-q.min.x,q.max.y-q.min.y,q.max.z-q.min.z)<3){ const near=keepNear(q.min.x,q.min.y,q.min.z,q.max.x,q.max.y,q.max.z);
+      if(near.length&&keepHit(near,q.min.x,q.min.y,q.min.z,q.max.x,q.max.y,q.max.z)){ this.rgb(col); g.dispose(); return; } } }   // little bits in the slide's way just go
     const p=g.attributes.position, n=g.attributes.normal, c=this.rgb(col), base=this.pos.length/3;
     let pv; if(this.piv) pv=[this.piv[0],this.piv[1]+this.oy,this.piv[2]]; else { g.computeBoundingBox(); const bc=g.boundingBox.getCenter(new THREE.Vector3()); pv=[bc.x,bc.y,bc.z]; }
     for(let i=0;i<p.count;i++){ this.pos.push(p.getX(i),p.getY(i),p.getZ(i)); this.nor.push(n.getX(i),n.getY(i),n.getZ(i)); this.col.push(c[0],c[1],c[2]); this.dnc.push(this.party&&col==='dark'?1:0,(this.win&&col==='dark')||col==='win'?1:0); this.pv.push(pv[0],pv[1],pv[2]); }
@@ -1129,36 +1142,45 @@ function poolLot(b,lot,pm,base,cr,seed){
   if((seed>>>9)%10<7&&Math.min(hx,hz)>=3) poolSlide(b,W,lx0,lz0,lx1,lz1,seed);
 }
 // the big waterslides: off the top of a tall building, spiralling all the way down to the street (straight through anything in the way)
-function bigSlide(b,cx,cz){ if(hashInts(cx,cz,P.seed+999)%3) return; const ox=cx*CHUNK, oz=cz*CHUNK;
+function bigSlide(b,cx,cz){ const ox=cx*CHUNK, oz=cz*CHUNK; let pts, plan, gy, PR, g0;
+  if(KEEPOUT&&KEEPOUT.spec) ({pts,plan,gy,PR,g0}=KEEPOUT.spec); else {   // the second pass reuses the path worked out the first time
+  if(hashInts(cx,cz,P.seed+999)%3) return;
   const tall=b.cols.filter(c=>c[1]>TB+0.5&&c[3]-c[0]>=3&&c[5]-c[2]>=3&&c[4]>=13&&c[4]<45).sort((p2,q)=>q[4]-p2[4])[0]; if(!tall) return;
   const tx=(tall[0]+tall[3])/2, tz=(tall[2]+tall[5])/2, vx=ox+CHUNK/2-tx, vz=oz+CHUNK/2-tz, alongX=Math.abs(vx)>=Math.abs(vz), dx=alongX?Math.sign(vx)||1:0, dz=alongX?0:Math.sign(vz)||1;
   const sx=alongX?(dx>0?tall[3]:tall[0]):tx, sz=alongX?tz:(dz>0?tall[5]:tall[2]), top=tall[4]+0.45, r=4.5;
-  const hcx=clamp(sx+dx*(r+0.4),ox+r+0.5,ox+CHUNK-r-0.5), hcz=clamp(sz+dz*(r+0.4),oz+r+0.5,oz+CHUNK-r-0.5), gy=terrainH(Math.floor(hcx/CELL),Math.floor(hcz/CELL))+0.5;
+  const hcx=clamp(sx+dx*(r+1.2),ox+r+0.5,ox+CHUNK-r-0.5), hcz=clamp(sz+dz*(r+1.2),oz+r+0.5,oz+CHUNK-r-0.5);
+  gy=terrainH(Math.floor(hcx/CELL),Math.floor(hcz/CELL))+0.5;
   if(top-gy<8) return; const turn=(hashInts(cx,cz,P.seed+31)%2)?1:-1, a0=Math.atan2(sz-hcz,sx-hcx);
   // it finishes in a splash pool: find clear ground near the bottom of the spiral, then end the spiral where a straight run points right at it
-  let plan=null;
+  plan=null;
   for(const PR of [2.6,2.2,1.8]){ const h=PR+0.45; let best=null;
     for(let gx=ox+h+0.25;gx<=ox+CHUNK-h-0.25;gx+=0.5) for(let gz=oz+h+0.25;gz<=oz+CHUNK-h-0.25;gz+=0.5){ const dd=Math.hypot(gx-hcx,gz-hcz); if(dd<r+h+0.6||dd>r+h+12||(best&&dd>=best.dd)) continue;
       const pg=slidePoolOK(b,gx,gz,h,ox,oz); if(pg&&top-(pg[1]+2.6)>=8) best={pcx:gx,pcz:gz,dd,lo:pg[0],g0:pg[1],PR}; }
     if(best){ plan=best; break; } }
-  const PR=plan?plan.PR:0, g0=plan?plan.g0:gy-0.5, pbase=g0+1.6; let sweep, L=0, yB=gy;
+  PR=plan?plan.PR:0; g0=plan?plan.g0:gy-0.5; const pbase=g0+1.6; let sweep, L=0, yB=gy;
   if(plan){ const phi=Math.atan2(plan.pcz-hcz,plan.pcx-hcx), aE=phi-turn*Math.acos(r/plan.dd); L=Math.sqrt(plan.dd*plan.dd-r*r); yB=pbase+0.55+L*0.06;
     const need=Math.max(TAU,(top-yB)/6*TAU), dl=(((aE-a0)*turn)%TAU+TAU)%TAU; sweep=dl+TAU*Math.max(0,Math.ceil((need-dl)/TAU)); }
   else sweep=Math.max(TAU,(top-gy)/6*TAU);
-  const pts=[]; pts.push(new THREE.Vector3(sx-dx*0.8,top,sz-dz*0.8),new THREE.Vector3(sx,top,sz));
+  pts=[]; pts.push(new THREE.Vector3(sx-dx*0.8,top,sz-dz*0.8),new THREE.Vector3(sx,top,sz));
   const n=Math.ceil(sweep/0.35); for(let i=1;i<=n;i++){ const t=i/n, a=a0+turn*sweep*t; pts.push(new THREE.Vector3(hcx+Math.cos(a)*r,lerp(top-0.3,yB,t),hcz+Math.sin(a)*r)); }
   const ae=a0+turn*sweep, tgx=-turn*Math.sin(ae), tgz=turn*Math.cos(ae), last=pts[pts.length-1];
   if(plan){ const e1=L-(PR-1.0); for(const e of [1.5,e1*0.5,e1]) pts.push(new THREE.Vector3(last.x+tgx*e,lerp(yB,pbase+0.3,e/e1),last.z+tgz*e)); }
-  else for(const e of [1.5,3,4.5]) pts.push(new THREE.Vector3(last.x+tgx*e,gy,last.z+tgz*e));
+  else for(const e of [1.5,3,4.5]) pts.push(new THREE.Vector3(last.x+tgx*e,gy,last.z+tgz*e)); }
+  if(KEEPOUT) KEEPOUT.off=true;
   const curve=new THREE.CatmullRomCurve3(pts,false,'centripetal'), N=Math.round(curve.getLength()*2.2); trough(b,curve,N,0.5,'teal');
   const kj=b.jr; b.jr=rnd3; const samp=[], inPool=(x,z)=>plan&&Math.abs(x-plan.pcx)<PR+0.8&&Math.abs(z-plan.pcz)<PR+0.8;
   for(let i=0;i<=160;i++){ const q=curve.getPointAt(i/160); samp.push([q.x,q.y,q.z]); if(i%9===4&&i<150&&q.y-gy>1&&!inPool(q.x,q.z)) b.box(q.x-0.06,gy-0.5,q.z-0.06,q.x+0.06,q.y-0.5,q.z+0.06,'cream',false); }
-  // wherever it passes through a building, it runs inside a tunnel with a ring round each mouth
-  const solid=b.cols.filter(c=>c[1]>TB+0.5&&c[3]-c[0]>=1&&c[5]-c[2]>=1&&c[4]-c[1]>=1.2), ins=samp.map(([x,y,z],i)=>i>3&&solid.some(c=>x>c[0]-0.4&&x<c[3]+0.4&&z>c[2]-0.4&&z<c[5]+0.4&&y+1.4>c[1]&&y-0.2<c[4]));
-  for(let i=0;i<ins.length;){ if(!ins[i]){ i++; continue; } let k=i; while(k<ins.length&&ins[k]) k++; slideTunnel(b,curve,Math.max(0,i-2)/160,Math.min(160,k+1)/160); i=k; }
-  if(plan) slidePool(b,plan.pcx,plan.pcz,PR,g0,plan.lo); b.jr=kj;
+  // if it runs into anything, the chunk gets built again with that space kept clear (buildings cut back in blocks)
+  if(!KEEPOUT&&b.cols.some(c=>c[1]>TB+0.01&&samp.some(([x,y,z],i)=>i>3&&x>c[0]-1.3&&x<c[3]+1.3&&z>c[2]-1.3&&z<c[5]+1.3&&y+2.2>c[1]&&y-0.5<c[4]))) b.recarve={pts:samp,spec:{pts,plan,gy,PR,g0}};
+  if(plan) slidePool(b,plan.pcx,plan.pcz,PR,g0,plan.lo); b.jr=kj; if(KEEPOUT) KEEPOUT.off=false;
   (b.slides||(b.slides=[])).push({pts:samp,len:curve.getLength()}); (b.streams||(b.streams=[])).push(samp.filter((q,i)=>i%2===0).map(q=>[q[0],q[1]-0.47,q[2]])); }
+// the space a big slide needs: a tube round its path, from just under the trough to well above a rider's head
+function keepNear(x0,y0,z0,x1,y1,z1){ const R=1.2, o=[]; for(let i=4;i<KEEPOUT.pts.length;i++){ const q=KEEPOUT.pts[i]; if(q[0]>x0-R&&q[0]<x1+R&&q[2]>z0-R&&q[2]<z1+R&&q[1]-0.55<y1&&q[1]+2.4>y0) o.push(q); } return o; }
+function keepHit(near,a,b2,c2,d,e2,f){ for(const q of near){ const dx=Math.max(a-q[0],0,q[0]-d), dz=Math.max(c2-q[2],0,q[2]-f); if(dx*dx+dz*dz<1.32&&e2>q[1]-0.55&&b2<q[1]+2.4) return true; } return false; }
 // where a splash pool can go: inside this chunk, clear of buildings, on ground that's roughly level; returns the ground height to build on
+function dishChunk(cx,cz){ const D=3, rx=Math.floor(cx/D), rz=Math.floor(cz/D); let best=null, bs=-1e9;
+  for(let i=0;i<D;i++) for(let j=0;j<D;j++){ const qx=rx*D+i, qz=rz*D+j, sc=hmaxAt(qx*CHUNK+CHUNK/2,qz*CHUNK+CHUNK/2)+(hashInts(qx,qz,P.seed+77)%100)*0.002; if(sc>bs){ bs=sc; best=[qx,qz]; } }
+  return best[0]===cx&&best[1]===cz; }
 function slidePoolOK(b,cx,cz,h,ox,oz){ if(cx-h<ox+0.2||cx+h>ox+CHUNK-0.2||cz-h<oz+0.2||cz+h>oz+CHUNK-0.2||laHits(cx-h,cz-h,cx+h,cz+h)) { SPDBG.edge++; return null; } let lo=99, hi=-99;
   for(const c of b.cols){ if(!(c[0]<cx+h+0.15&&c[3]>cx-h-0.15&&c[2]<cz+h+0.15&&c[5]>cz-h-0.15)) continue; if(c[1]<=TB+0.01) lo=Math.min(lo,c[4]); hi=Math.max(hi,c[4]); }
   if(hi<-90||hi-lo>2.6){ SPDBG.blk++; return null; } return [lo,hi]; }   // small stuff (steps, kerbs, low walls) disappears inside the block the pool sits on
@@ -1313,7 +1335,8 @@ function buildChunk(cx,cz){
       ['arch',L>=4?1:0],['house',L>=6?0.7:0],['ramp',L>=6?0.9:0],['frames',0.15+pfr*1.2]]);
     if(type!=='plaza' && type!=='frames' && rnd()<0.25 && !spiced) b.box(lot.x0-0.3,0,lot.z0-0.3,lot.x1+0.3,decalY(lot.x0,lot.z0),lot.z1+0.3,pick(TILE),false);
     // about one block in fourteen gets built a little off the grid (its own dice decide, so the city layout stays the same)
-    const turn=(type==='tower'||type==='zig'||type==='wall') && rnd3()<1/14 ? (rnd3()<0.5?-1:1)*(0.1+rnd3()*0.14) : 0;
+    let turn=(type==='tower'||type==='zig'||type==='wall') && rnd3()<1/14 ? (rnd3()<0.5?-1:1)*(0.1+rnd3()*0.14) : 0;
+    if(turn&&KEEPOUT&&keepNear(lot.x0-2,-99,lot.z0-2,lot.x1+2,999,lot.z1+2).length) turn=0;
     const B2=turn?Object.assign(new Builder(),{oy:b.oy,lotRects:b.lotRects,ox:b.ox,oz:b.oz,n:b.n}):b;
     switch(type){
       case 'plaza': plaza(b,lot,ctx,false); if(spiced){ const sh=hashInts(cx*17+li,cz*29+li*3,P.seed+5151); serraWall(b,lot,sh); if(sh%4!==0) gardenBeds(b,lot,hashInts(cx*23+li,cz*13+li,P.seed+7717)); } break;
@@ -1336,7 +1359,9 @@ function buildChunk(cx,cz){
   const nuke=nukeChunk(cx,cz);
   if(spiced&&!nuke){ roofBridges(b); deckRuns(b,ox,oz); }
   if(!nuke) pipes(b,ox,oz,hmaxAt);
+  if(KEEPOUT) b.cols=b.cols.filter(c=>c[1]<=TB+0.01||!keepHit(keepNear(c[0],c[1],c[2],c[3],c[4],c[5]),c[0],c[1],c[2],c[3],c[4],c[5]));   // invisible colliders left in the slide's way
   if(spiced){ serraBuild(b); solarRoofs(b); if(!nuke) bigSlide(b,cx,cz); }
+  if(b.recarve&&!KEEPOUT){ KEEPOUT=b.recarve; try{ return buildChunk(cx,cz); } finally{ KEEPOUT=null; } }
   // trampolines need open sky above them: drop any that ended up under or tangled in something built later
   if(b.tramps) b.tramps=b.tramps.filter(T=>{ const x0=T.x-T.a-0.1, x1=T.x+T.a+0.1, z0=T.z-T.b-0.1, z1=T.z+T.b+0.1, y0=T.y-0.5, y1=T.y+10, inB=(x,y,z)=>x>x0-0.2&&x<x1+0.2&&z>z0-0.2&&z<z1+0.2&&y>y0&&y<y1;
     const hit=b.cols.some(c=>c!==T.col&&c[4]>y0&&c[1]<y1&&c[0]<x1&&c[3]>x0&&c[2]<z1&&c[5]>z0&&!(c[1]<=TB+0.01&&c[4]<=T.y-0.55))
@@ -1886,7 +1911,7 @@ function danceFrame(i,b,t){ const P=Math.PI, s1=Math.sin(P*b), bi=Math.floor(b),
   switch(i){
     case 100: { const c=(t*0.13)%1, up=c<0.22;   // letting a load off: weight on one leg, one hand tucked away, a long slow drag, then admiring the cigarette
       if(up){ const k=Math.sin(Math.min(1,c/0.22)*Math.PI); set(DF.hR,0.42-0.28*k,0.18+0.36*k,0.42+0.18*k); } else set(DF.hR,0.42,0.18,0.42);
-      set(DF.hL,-0.42,-0.32,-0.2); set(DF.fL,-0.24,-0.93,0.0); set(DF.fR,0.02,-0.9,0.14); DF.px=-0.07; DF.py=-0.03; DF.lean=0; break; }
+      set(DF.hL,-0.42,-0.32,-0.2); set(DF.fL,-0.2,-0.93,0.0); set(DF.fR,0.06,-0.91,0.12); DF.px=-0.035; DF.py=-0.02; DF.lean=0; break; }
     case 101: { const s2=Math.sin(b);   // flapping like mad
       set(DF.hL,-1.0,0.15+0.55*s2,-0.05); set(DF.hR,1.0,0.15+0.55*s2,-0.05); set(DF.fL,-0.16,-0.95,-0.05); set(DF.fR,0.16,-0.95,-0.05); DF.py=0.03*s2; break; }
     case 104: { set(DF.fL,-0.22,-0.5,0.62); set(DF.fR,0.22,-0.5,0.62); set(DF.hL,-0.32,0.02,0.6); DF.py=-0.18;   // sat on the cushion, knees up, a teacup in hand
@@ -1900,7 +1925,7 @@ function danceFrame(i,b,t){ const P=Math.PI, s1=Math.sin(P*b), bi=Math.floor(b),
       set(DF.fR,0.26,-0.93+0.12*Math.max(0,Math.sin(2*P*b)),0.08); break; }
     case 1: { const sw=Math.sin(P*b), fb=Math.cos(P*b)>=0?1:-1;   // the floss: straight arms swing past the hips, front then back
       set(DF.hL,-0.12+0.5*sw,-0.62,0.26*fb); set(DF.hR,0.12+0.5*sw,-0.62,-0.26*fb); DF.px=-0.13*sw; DF.lean=-0.12*sw; DF.py=-0.03; break; }
-    case 2: { const q=Math.floor(b*2)%4, Pz=[[[-0.45,0.05,0.48],[0.45,0.4,0.06]],[[-0.45,0.4,0.06],[0.45,0.05,0.48]],[[-0.3,0.65,0.3],[0.3,-0.32,0.42]],[[-0.3,-0.32,0.42],[0.3,0.65,0.3]]][q];   // robot: snap between poses
+    case 2: { const q=Math.floor(b)%4, Pz=[[[-0.45,0.05,0.48],[0.45,0.4,0.06]],[[-0.45,0.4,0.06],[0.45,0.05,0.48]],[[-0.3,0.65,0.3],[0.3,-0.32,0.42]],[[-0.3,-0.32,0.42],[0.3,0.65,0.3]]][q];   // robot: snap between poses
       set(DF.hL,...Pz[0]); set(DF.hR,...Pz[1]); DF.hy=[0.55,-0.55,0.3,-0.3][q]; DF.py=-0.05*(q%2); DF.spin=[0.25,-0.25,0.12,-0.12][q]; break; }
     case 3: { const a=bi%2, lift=Math.sin(P*fr), back=0.18-0.36*fr;   // running man: knee up, slide back, swap
       if(a){ set(DF.fL,-0.2,-0.93+0.34*lift,0.28*lift); set(DF.fR,0.2,-0.93,back); } else { set(DF.fR,0.2,-0.93+0.34*lift,0.28*lift); set(DF.fL,-0.2,-0.93,back); }
@@ -1972,7 +1997,7 @@ function aimEyes(ch,target,maxDeg,blink,pup,heart=0){ camera.getWorldDirection(_
     if(ang>mx){ _ax.crossVectors(Z_AXIS,_d); if(_ax.lengthSq()<1e-8) _ax.set(1,0,0); _ax.normalize(); _d.copy(Z_AXIS).applyAxisAngle(_ax,mx); }
     e.pu.position.copy(_d).multiplyScalar(.29); e.pu.quaternion.setFromUnitVectors(Z_AXIS,_d); e.pu.scale.set(pup,pup,.45);
     e.hl.position.copy(_d).multiplyScalar(.41); e.hl.position.x+=.07; e.hl.position.y+=.08;
-    e.lid.visible=blink>.02&&heart<0.5; e.lid.rotation.x=lerp(-.2,1.72,clamp(blink,0,1)); if(blink>0.7&&heart<0.5) e.pu.visible=e.hl.visible=false;
+    e.lid.visible=blink>.02&&heart<0.5; e.lid.rotation.x=lerp(-.2,1.72,clamp(blink,0,1)); if(blink>0.7&&heart<0.5) e.pu.visible=e.hl.visible=false; if(blink>0.15) e.hl.visible=false;
     if(e.ht){ if(heart>0.02){ e.ht.visible=vis; e.ht.position.copy(_d).multiplyScalar(.3); e.ht.quaternion.setFromUnitVectors(Z_AXIS,_d); const hs=.2*heart*(1+.14*Math.sin(animT*10)); e.ht.scale.set(hs,hs,hs); e.pu.visible=e.hl.visible=false; } else e.ht.visible=false; } }
 }
 
@@ -2009,7 +2034,7 @@ function animAvatar(dt){
   else if(pl.ride){ ang=-0.45; _ta.set(pl.ride.dz,0,-pl.ride.dx); }
   else if(pl.dash){ ang=0.7; _ta.set(pl.dash.dz,0,-pl.dash.dx); }
   else if(pl.hug){ ang=0.18; _ta.set(pl.hug.z-pl.pos.z,0,-(pl.hug.x-pl.pos.x)); }
-  else if(pl.smoke){ ang=-0.13; _ta.set(Math.sin(facing)+Math.cos(facing)*0.5,0,Math.cos(facing)-Math.sin(facing)*0.5); }
+  else if(pl.smoke){ ang=-0.03; _ta.set(Math.sin(facing)+Math.cos(facing)*0.5,0,Math.cos(facing)-Math.sin(facing)*0.5); }
   else if(pl.swan){ const fall=clamp(-pl.vel.y/10,0,1); pl.swanFall=fall; ang=pl.vel.y>0?-0.4*Math.min(1,pl.vel.y/8)+0.1:0.1+2.7*fall*fall; if(Math.random()<dt*40) burst(pl.pos.x,pl.pos.y+0.8,pl.pos.z,1,[0xffffff,0xffe7a0,0xbff4ff],0.3,0.06,0.3); _ta.set(Math.cos(facing),0,-Math.sin(facing)); }
   else if(DD){ ang=DD.lean; _ta.set(Math.sin(facing),0,Math.cos(facing)); }
   if(_ta.lengthSq()<1e-6) _ta.set(1,0,0); _ta.normalize();
@@ -2051,7 +2076,7 @@ function animAvatar(dt){
   headYaw+=(want-headYaw)*(1-Math.exp(-dt*7)); headPitch+=(pitch-headPitch)*(1-Math.exp(-dt*6));
   ch.head.rotation.y=headYaw+(DD?DD.hy:0); ch.head.rotation.x=-headPitch*.6;
   eye.heart=pl.hug?0:Math.max(0,(eye.heart||0)-dt*0.5);   // eyes closed for the hug, hearts after
-  ch.root.updateMatrixWorld(true); aimEyes(ch,_tgt,80,pl.hug?1:eye.blink>0?1:pl.smoke?0.45:0,1,eye.heart);
+  ch.root.updateMatrixWorld(true); aimEyes(ch,_tgt,80,pl.hug?1:eye.blink>0?1:pl.smoke?0.2:0,1,eye.heart);
 }
 
 /* ============================================================
@@ -2847,7 +2872,11 @@ function trampTrick(tb,air){ const lvl=Math.min(TRICKS.length,2+tb*1.5), T=TRICK
   if(tb>=3){ toastMsg('🤸 '+T[0]+(tb>=4?' ×'+tb:'')); burst(pl.pos.x,pl.pos.y+0.6,pl.pos.z,6+tb,[0xff5fb0,0xffd23f,0x15c3b3,0xffffff],2.4,0.07,2.5); } }
 function trampAt(x,z,sup){ for(const d of nearData(x,z)) for(const T of d.tramps||[]){ if(Math.abs(sup-T.y)>0.08) continue; const dx=x-T.x, dz=z-T.z; if(T.round?Math.hypot(dx,dz)<T.a-0.05:Math.abs(dx)<T.a-0.05&&Math.abs(dz)<T.b-0.05) return T; } return null; }
 /* --- puddles after the rain: splash in them, run through and you slide --- */
-let WET=0; const PUD={ mat:new THREE.MeshStandardMaterial({color:0x9db3c9,roughness:0.04,metalness:0.45,transparent:true,opacity:0,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2}), meshes:new Set() }; PUD.mat.userData.keep=true;
+let WET=0; const PUD={ mat:new THREE.MeshStandardMaterial({color:0xdfe7f2,roughness:0.03,metalness:0.6,transparent:true,opacity:0,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2}), meshes:new Set() }; PUD.mat.userData.keep=true;
+PUD.mat.onBeforeCompile=sh=>{ sh.uniforms.uT=POOLU.t; sh.vertexShader='varying vec3 vPW;\n'+sh.vertexShader.replace('#include <begin_vertex>','#include <begin_vertex>\nvPW=(modelMatrix*vec4(transformed,1.0)).xyz;');
+  sh.fragmentShader='uniform float uT; varying vec3 vPW;\n'+NOISE_GLSL+sh.fragmentShader.replace('#include <emissivemap_fragment>',`#include <emissivemap_fragment>
+    { vec3 V=normalize(vViewPosition); float f=1.0-abs(dot(normalize(normal),V)); float h=fract(f*1.8+kfbm(vPW.xz*0.9+uT*0.03)*1.2+uT*0.04);
+      vec3 ir=clamp(abs(mod(h*6.0+vec3(0.0,4.0,2.0),6.0)-3.0)-1.0,0.0,1.0); totalEmissiveRadiance+=vec3(0.5,0.55,0.62)*0.45+ir*0.5; }`); };
 function makePuddles(d){ const out=[], rng=mulberry(hashInts(d.cx*7+3,d.cz*11+5,P.seed+515)), data=[d];
   for(let t=0;t<16&&out.length<7;t++){ const x=d.cx*CHUNK+1+rng()*(CHUNK-2), z=d.cz*CHUNK+1+rng()*(CHUNK-2), r=0.5+rng()*0.9, y=support(x,z,60,data);
     if(y<-50||SUP.seg||(d.pools||[]).some(W=>Math.abs(x-W.cx)<W.hx+1&&Math.abs(z-W.cz)<W.hz+1)) continue;
@@ -2866,7 +2895,7 @@ function coveredAt(x,y,z){ for(const d of nearData(x,z)) for(const c of d.cols) 
 const CIG={ paper:new THREE.MeshStandardMaterial({color:0xf4f1ea,roughness:0.7}), ember:new THREE.MeshBasicMaterial({color:0xff6a1f}), geo:new THREE.CylinderGeometry(0.012,0.012,0.11,6), eg:new THREE.SphereGeometry(0.016,6,5),
   ring:new THREE.TorusGeometry(0.08,0.018,6,18), rings:[] };
 function tagFx(ch,on){ if(!on){ if(ch.etag) ch.etag.visible=false; return; }
-  if(!ch.etag){ const g=new THREE.Mesh(new THREE.BoxGeometry(0.16,0.2,0.03),new THREE.MeshStandardMaterial({color:0xffd23f,roughness:0.4})); g.position.set(-0.78,0.25,0.1); g.rotation.set(0,-1.2,0.2); ch.head.add(g); ch.etag=g; } ch.etag.visible=true; }
+  if(!ch.etag){ const g=new THREE.Mesh(new THREE.BoxGeometry(0.16,0.2,0.03),new THREE.MeshStandardMaterial({color:0x7bff6a,roughness:0.3,emissive:0x39ff6a,emissiveIntensity:1.4})); g.position.set(-0.78,0.25,0.1); g.rotation.set(0,-1.2,0.2); ch.head.add(g); ch.etag=g; } ch.etag.visible=true; }
 function featherFx(ch,on){ if(!on){ if(ch.fcap) ch.fcap.visible=false; return; } if(!CROW.M) scene.remove(crowMesh().g);
   if(!ch.fcap){ const g=new THREE.Group(), v=new THREE.Mesh(fishBody,CROW.M.b); v.scale.set(0.09,0.02,0.34); v.position.z=-0.2; g.add(v); const q=new THREE.Mesh(FLW.stem,CROW.M.k); q.scale.set(0.5,0.25,0.5); q.rotation.x=Math.PI/2; q.position.z=0.05; g.add(q);
     g.position.set(0.32,0.62,-0.12); g.rotation.set(-0.9,0.35,0.25); ch.head.add(g); ch.fcap=g; } ch.fcap.visible=true; ch.fcap.rotation.z=0.25+0.05*Math.sin(animT*3); }
@@ -3018,6 +3047,10 @@ function updateBits(dt){
   for(let i=SPLU.length-1;i>=0;i--){ const S=SPLU[i]; S.t+=dt; const k=S.t/0.7; S.m.scale.set(0.14*(1+k),Math.max(0.01,3.8*Math.sin(Math.min(1,k)*Math.PI)),0.14*(1+k)); S.m.material.opacity=0.85*(1-k); if(k>=1){ scene.remove(S.m); S.m.material.dispose(); SPLU.splice(i,1); } } }
 const DISH={ m:new THREE.MeshStandardMaterial({color:0xe8ecf2,roughness:0.35,metalness:0.4,side:THREE.DoubleSide}), rim:new THREE.MeshStandardMaterial({color:0x2a3a2a,emissive:0x39ff6a,emissiveIntensity:0.6}), glow:new THREE.MeshBasicMaterial({color:0x6bff8a}), geo:null };
 for(const k of ['m','rim','glow']) DISH[k].userData.keep=true;
+// only the tallest dish in its neighbourhood shows (and works): checked against every loaded chunk within three chunks
+function updateDishes(){ for(const d of chunks.values()){ if(!d.dish||!d.dishG) continue; let on=true;
+    for(let a=-3;a<=3&&on;a++) for(let c=-3;c<=3&&on;c++){ if(!a&&!c) continue; const q=chunks.get((d.cx+a)+','+(d.cz+c)); if(q&&q.dish&&(q.dish[1]>d.dish[1]||(q.dish[1]===d.dish[1]&&(q.cx*7+q.cz)>(d.cx*7+d.cz)))) on=false; }
+    d.dishOn=on; d.dishG.visible=on; } }
 function makeDish(d){ if(!DISH.geo){ const pr=[]; for(let k=0;k<=12;k++){ const r=k/12*1.15; pr.push(new THREE.Vector2(r,r*r*0.32)); } DISH.geo=new THREE.LatheGeometry(pr,28); DISH.ring=new THREE.TorusGeometry(1.15,0.05,8,36); DISH.ring.rotateX(Math.PI/2); DISH.ring.translate(0,0.42,0); }
   const [x,y,z]=d.dish, g=new THREE.Group(); g.position.set(x,y,z);
   const post=new THREE.Mesh(CYL,DISH.m); post.scale.set(0.09,1.1,0.09); post.position.y=0.55; g.add(post);
@@ -3026,7 +3059,7 @@ function makeDish(d){ if(!DISH.geo){ const pr=[]; for(let k=0;k<=12;k++){ const 
   for(const a of [0,2.1,4.2]){ const arm=new THREE.Mesh(CYL,DISH.m); arm.scale.set(0.02,1.05,0.02); arm.position.set(Math.cos(a)*0.55,0.75,Math.sin(a)*0.55); arm.lookAt(0,1.3,0); arm.rotateX(Math.PI/2); head.add(arm); }
   const bulb=new THREE.Mesh(SPH,DISH.glow); bulb.scale.setScalar(0.14); bulb.position.y=1.25; head.add(bulb);
   const top=new THREE.Mesh(SPH,DISH.glow); top.scale.setScalar(0.16); top.position.y=2.05; g.add(top); const mast=new THREE.Mesh(CYL,DISH.m); mast.scale.set(0.025,0.95,0.025); mast.position.set(0,1.55,0); g.add(mast);
-  g.traverse(o=>{ if(o.isMesh) o.userData.keep=true; }); d.dyn.add(g); }
+  g.traverse(o=>{ if(o.isMesh) o.userData.keep=true; }); g.visible=false; d.dishG=g; d.dyn.add(g); }
 const UFO={ st:'', t:0, canCall:false, hintT:0, g:null, ant:null, beam:null, x:0,y:0,z:0, roofY:0, aliens:[] };
 function ufoBuild(){ if(UFO.g) return; const g=new THREE.Group(), hull=new THREE.MeshStandardMaterial({color:0xc9d0dc,roughness:0.25,metalness:0.8}), inner=new THREE.MeshStandardMaterial({color:0x5b3df0,roughness:0.5,emissive:0x2a1a70,side:THREE.BackSide}),
     glass=new THREE.MeshStandardMaterial({color:0x8fe8ff,roughness:0.05,transparent:true,opacity:0.35,side:THREE.DoubleSide}), floor=new THREE.MeshStandardMaterial({color:0x2b2238,roughness:0.6,emissive:0x15102a});
@@ -3043,27 +3076,31 @@ function ufoBuild(){ if(UFO.g) return; const g=new THREE.Group(), hull=new THREE
   const bm=new THREE.Mesh(new THREE.CylinderGeometry(1.4,3.2,1,24,1,true),new THREE.MeshBasicMaterial({color:0xbff4ff,transparent:true,opacity:0.28,depthWrite:false,side:THREE.DoubleSide})); bm.visible=false; scene.add(bm); UFO.beam=bm;
   const ant=new THREE.Group(); const pole=new THREE.Mesh(new THREE.CylinderGeometry(0.03,0.04,1,6),hull); pole.position.y=0.5; ant.add(pole); const tip=new THREE.Mesh(new THREE.SphereGeometry(0.08,8,6),new THREE.MeshBasicMaterial({color:0xff3b4a})); tip.position.y=1.02; ant.add(tip); ant.visible=false; scene.add(ant); UFO.ant=ant; UFO.tip=tip;
   g.visible=false; scene.add(g); UFO.g=g; }
-function ufoSpot(){ if(mode!=='walk'||!pl.onGround||UFO.st) return false; for(const d of nearData(pl.pos.x,pl.pos.z)) if(d.dish&&Math.hypot(pl.pos.x-d.dish[0],pl.pos.z-d.dish[2])<4&&Math.abs(pl.pos.y-d.dish[1])<0.6) return true; return false; }
-function ufoCall(){ if(!UFO.canCall) return false; ufoBuild(); UFO.st='antenna'; UFO.t=0; UFO.roofY=pl.pos.y; UFO.px=pl.pos.x; UFO.pz=pl.pos.z; UFO.ant.position.set(pl.pos.x+0.6,pl.pos.y,pl.pos.z); UFO.ant.visible=true; sfx('beep'); toastMsg('📡 You raise the antenna and send a signal up…'); return true; }
-function updateUFO(dt){
+function ufoSpot(){ if(mode!=='walk'||!pl.onGround||UFO.st) return false; for(const d of nearData(pl.pos.x,pl.pos.z)) if(d.dish&&d.dishOn&&Math.hypot(pl.pos.x-d.dish[0],pl.pos.z-d.dish[2])<4&&Math.abs(pl.pos.y-d.dish[1])<0.6) return true; return false; }
+function ufoCall(){ if(UFO.st==='inside'&&UFO.t>1.5){ UFO.landReq=true; return true; } if(!UFO.canCall) return false; ufoBuild(); UFO.st='antenna'; UFO.t=0; UFO.roofY=pl.pos.y; UFO.px=pl.pos.x; UFO.pz=pl.pos.z; UFO.ant.position.set(pl.pos.x+0.6,pl.pos.y,pl.pos.z); UFO.ant.visible=true; sfx('beep'); toastMsg('📡 You raise the antenna and send a signal up…'); return true; }
+function updateUFO(dt){ UFO.dishT=(UFO.dishT||0)-dt; if(UFO.dishT<=0){ UFO.dishT=0.5; updateDishes(); }
   if(!UFO.st){ const spot=ufoSpot(), dark=SKY.n>0.5; UFO.canCall=spot&&dark; if(spot&&UFO.hintT<performance.now()){ UFO.hintT=performance.now()+45000; toastMsg(dark?'📡 A satellite dish! Press F (TALK, or grip in VR) to send a signal up':'🌙 A satellite dish… come back up here at night. Someone might answer'); }
     if(UFO.canCall&&isTouch&&!renderer.xr.isPresenting){ talkEl.style.display='block'; talkEl.textContent='ANTENNA'; } return; }
   UFO.t+=dt; const T=animT, g=UFO.g, hoverY=UFO.roofY+14;
-  UFO.lights.forEach((l,i)=>l.visible=Math.floor(T*6+i)%3!==0); g.rotation.y+=dt*0.4; UFO.aliens.forEach((a,k)=>{ const an=T*0.5+k*2.1; a.position.set(Math.cos(an)*5,-0.55+0.15*Math.sin(T*2+k),Math.sin(an)*5); a.rotation.y=-an; });
+  UFO.lights.forEach((l,i)=>l.visible=Math.floor(T*6+i)%3!==0); g.rotation.y+=dt*0.4; UFO.aliens.forEach((a,k)=>{ const an=T*0.45+k*2.1, rr=2.3+0.5*Math.sin(T*0.7+k), fl=UFO.st==='inside'; a.position.set(Math.cos(an)*rr,-0.55+(fl?0.5+0.45*Math.sin(T*1.3+k*2):0.1*Math.sin(T*2+k)),Math.sin(an)*rr); a.rotation.y=Math.atan2(-Math.cos(an),-Math.sin(an)); a.rotation.z=fl?0.25*Math.sin(T*1.7+k):0; });
+  if(UFO.st==='inside'&&isTouch&&!renderer.xr.isPresenting){ talkEl.style.display='block'; talkEl.textContent='LAND'; } else if(talkEl.textContent==='LAND') talkEl.textContent='TALK';
   if(UFO.st==='antenna'){ const k=Math.min(1,UFO.t/1.5); UFO.ant.scale.y=0.1+2.9*k; UFO.tip.visible=Math.floor(T*4)%2===0; if(UFO.t>2){ UFO.st='arrive'; UFO.t=0; g.visible=true; sfx('ufo'); } }
   else if(UFO.st==='arrive'){ const k=Math.min(1,UFO.t/6), e=1-Math.pow(1-k,3); UFO.x=lerp(UFO.px+140,UFO.px,e); UFO.y=lerp(hoverY+40,hoverY,e)+0.4*Math.sin(T*1.5); UFO.z=lerp(UFO.pz-90,UFO.pz,e); g.position.set(UFO.x,UFO.y,UFO.z); if(k>=1){ UFO.st='beam'; UFO.t=0; UFO.beam.visible=true; sfx('beamhum'); } }
-  else if(UFO.st==='beam'||UFO.st==='down'){ g.position.y=hoverY+0.3*Math.sin(T*1.5); const top=hoverY-1.6, bot=UFO.roofY; UFO.beam.position.set(UFO.px,(top+bot)/2,UFO.pz); UFO.beam.scale.y=top-bot; UFO.beam.material.opacity=0.22+0.06*Math.sin(T*8);
+  else if(UFO.st==='beam'||UFO.st==='down'){ g.position.y+=(hoverY+0.3*Math.sin(T*1.5)-g.position.y)*Math.min(1,dt*(UFO.st==='down'?0.8:6)); const top=g.position.y-1.6, bot=UFO.roofY; UFO.beam.position.set(UFO.px,(top+bot)/2,UFO.pz); UFO.beam.scale.y=top-bot; UFO.beam.material.opacity=0.22+0.06*Math.sin(T*8);
     if(Math.random()<dt*20) burst(UFO.px+(Math.random()-0.5)*2,lerp(bot,top,Math.random()),UFO.pz+(Math.random()-0.5)*2,1,[0xbff4ff,0xffffff],0.3,0.05,0.3); }
   else if(UFO.st==='leave'){ const k=Math.min(1,UFO.t/5); g.position.set(UFO.px+k*k*200,hoverY+k*k*90,UFO.pz+k*k*60); UFO.ant.scale.y=Math.max(0.01,UFO.ant.scale.y-dt*2); if(k>=1){ g.visible=false; UFO.ant.visible=false; UFO.st=''; } } }
 // steering the abduction from stepPlayer: up the beam, floating about inside, and back down
 function ufoStep(dt,wx,wz,rawHold){ if(!UFO.st||['antenna','arrive','leave'].includes(UFO.st)) return false; const hoverY=UFO.roofY+14, floorY=hoverY-0.55;
   if(UFO.st==='beam'){ pl.pos.x+=(UFO.px-pl.pos.x)*Math.min(1,dt*2); pl.pos.z+=(UFO.pz-pl.pos.z)*Math.min(1,dt*2); pl.pos.y=Math.min(floorY,pl.pos.y+1.4*dt); pl.vel.set(0,0,0); pl.onGround=false; facing+=dt*1.2;
-    if(pl.pos.y>=floorY){ UFO.st='inside'; UFO.t=0; UFO.beam.visible=false; toastMsg('🛸 Inside the saucer! Float about. Hold JUMP to rise. The aliens are baking'); sfx('tada'); } return true; }
-  if(UFO.st==='inside'){ pl.vel.x+=(wx*4-pl.vel.x)*Math.min(1,dt*3); pl.vel.z+=(wz*4-pl.vel.z)*Math.min(1,dt*3); pl.vel.y+=((rawHold?2.2:-0.6)-pl.vel.y)*Math.min(1,dt*2);
-    pl.pos.addScaledVector(pl.vel,dt); const dx=pl.pos.x-UFO.g.position.x, dz=pl.pos.z-UFO.g.position.z, r=Math.hypot(dx,dz); if(r>7.6){ pl.pos.x=UFO.g.position.x+dx/r*7.6; pl.pos.z=UFO.g.position.z+dz/r*7.6; }
-    pl.pos.y=clamp(pl.pos.y,floorY,floorY+3.6); pl.onGround=pl.pos.y<=floorY+0.01; if(Math.hypot(wx,wz)>0.1) facing=Math.atan2(wx,wz);
-    if(UFO.t>22){ UFO.st='down'; UFO.t=0; UFO.beam.visible=true; pl.pos.set(UFO.px,floorY,UFO.pz); pl.croissants=2; pl.carry=6; pl.eartag=true; toastMsg('🥐 The aliens give you croissants (hug a friend to share) and clip a tag on your ear. Bye!'); sfx('coin'); } return true; }
-  if(UFO.st==='down'){ pl.pos.y=Math.max(UFO.roofY,pl.pos.y-1.8*dt); pl.vel.set(0,0,0); pl.onGround=false; facing-=dt*1.2; if(pl.pos.y<=UFO.roofY+0.001){ UFO.st='leave'; UFO.t=0; UFO.beam.visible=false; pl.onGround=true; sfx('ufo'); } return true; }
+    if(pl.pos.y>=floorY){ UFO.st='inside'; UFO.t=0; UFO.beam.visible=false; toastMsg('🛸 You\'re flying the saucer! Steer with the stick, hold JUMP to climb. Press F (LAND, or grip in VR) to be dropped off'); sfx('tada'); } return true; }
+  if(UFO.st==='inside'){ const g=UFO.g, T=animT;   // you fly the saucer: the stick steers, hold JUMP to climb, let go to sink to cruising height
+    UFO.vx=(UFO.vx||0)+(wx*16-(UFO.vx||0))*Math.min(1,dt*1.4); UFO.vz=(UFO.vz||0)+(wz*16-(UFO.vz||0))*Math.min(1,dt*1.4); UFO.vy=(UFO.vy||0)+((rawHold?7:-2.5)-(UFO.vy||0))*Math.min(1,dt*2);
+    g.position.x+=UFO.vx*dt; g.position.z+=UFO.vz*dt; const below=support(g.position.x,g.position.z,999,nearData(g.position.x,g.position.z)); g.position.y=clamp(g.position.y+UFO.vy*dt,Math.max(below,0)+13,140);
+    g.rotation.z=-UFO.vx*0.012; g.rotation.x=UFO.vz*0.012;
+    const fy=g.position.y-0.55; pl.pos.set(g.position.x+Math.sin(T*0.7)*0.35,fy+0.35+0.25*Math.sin(T*1.1),g.position.z+Math.cos(T*0.6)*0.35); pl.vel.set(0,0,0); pl.onGround=false; if(Math.hypot(wx,wz)>0.1) facing=Math.atan2(wx,wz);
+    if(UFO.t>60||UFO.landReq){ UFO.landReq=false; g.rotation.x=g.rotation.z=0; UFO.px=g.position.x; UFO.pz=g.position.z; UFO.roofY=Math.max(-20,support(UFO.px,UFO.pz,g.position.y-2,nearData(UFO.px,UFO.pz))); UFO.vx=UFO.vz=UFO.vy=0;
+      UFO.st='down'; UFO.t=0; UFO.beam.visible=true; pl.croissants=2; pl.carry=6; pl.eartag=true; toastMsg('🥐 The aliens give you croissants (hug a friend to share) and clip a glowing tag on your ear. Down you go!'); sfx('coin'); } return true; }
+  if(UFO.st==='down'){ pl.pos.x+=(UFO.px-pl.pos.x)*Math.min(1,dt*3); pl.pos.z+=(UFO.pz-pl.pos.z)*Math.min(1,dt*3); pl.pos.y=Math.max(UFO.roofY,pl.pos.y-2.6*dt); pl.vel.set(0,0,0); pl.onGround=false; facing-=dt*1.2; if(pl.pos.y<=UFO.roofY+0.001){ UFO.st='leave'; UFO.t=0; UFO.beam.visible=false; pl.onGround=true; sfx('ufo'); } return true; }
   return false; }
 const CRYPTM={ stone:new THREE.MeshStandardMaterial({color:0x6b6a7a,roughness:0.8}), worm:new THREE.MeshBasicMaterial({color:0xffffff}),
   queen:new THREE.MeshStandardMaterial({color:0xc39cff,roughness:0.3,emissive:0x4a2a90}), gold:new THREE.MeshStandardMaterial({color:0xffd23f,metalness:0.5,roughness:0.3,emissive:0x8a6400,side:THREE.DoubleSide}),
@@ -3181,7 +3218,15 @@ const FLW={ stem:new THREE.CylinderGeometry(0.018,0.022,1,5), sph:new THREE.Sphe
   mats:{} };
 const fMat=c=>FLW.mats[c]||(FLW.mats[c]=new THREE.MeshStandardMaterial({color:c,roughness:.5}));
 const CROI=new THREE.MeshStandardMaterial({color:0xe0a050,roughness:0.55}); CROI.userData.keep=true;
-function makeCroissant(){ const g=new THREE.Group(); for(let i=-2;i<=2;i++){ const m=new THREE.Mesh(SPH,CROI), a=i*0.42; m.position.set(Math.sin(a)*0.13,0.32,Math.cos(a)*0.06-0.03); m.scale.set(0.07-Math.abs(i)*0.012,0.05-Math.abs(i)*0.008,0.06); m.rotation.y=a; m.userData.keep=true; m.castShadow=true; g.add(m); } return g; }
+const CROI2=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.45}); CROI2.userData.keep=true;
+function croissantGeo(){ if(CROI2.geo) return CROI2.geo; const NA=40, NR=14, pos=[], col=[], idx=[], A=3.6, R0=0.12, c=new THREE.Color(), dark=new THREE.Color(0xb8692a), lite=new THREE.Color(0xf2b860);
+  for(let i=0;i<=NA;i++){ const t=i/NA, a=-A/2+A*t, cx=Math.sin(a)*R0, cz=Math.cos(a)*R0-R0*0.55, ridge=Math.abs(Math.sin(t*Math.PI*5)), r=(0.018+0.055*Math.pow(Math.sin(t*Math.PI),0.75))*(0.86+0.14*ridge);
+    const tx=Math.cos(a), tz=-Math.sin(a);   // along the arc
+    for(let k=0;k<=NR;k++){ const b2=k/NR*TAU, nx=-tz, nz=tx, ox=Math.cos(b2)*r, oy=Math.sin(b2)*r*0.78; pos.push(cx+nx*ox,Math.max(-r*0.5,oy),cz+nz*ox);
+      c.copy(dark).lerp(lite,0.25+0.75*ridge*(0.5+0.5*Math.sin(b2))); col.push(c.r,c.g,c.b); } }
+  for(let i=0;i<NA;i++) for(let k=0;k<NR;k++){ const a0=i*(NR+1)+k, b0=a0+NR+1; idx.push(a0,b0,a0+1, a0+1,b0,b0+1); }
+  const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3)); g.setAttribute('color',new THREE.Float32BufferAttribute(col,3)); g.setIndex(idx); g.computeVertexNormals(); CROI2.geo=g; return g; }
+function makeCroissant(){ const g=new THREE.Group(), m=new THREE.Mesh(croissantGeo(),CROI2); m.position.y=0.32; m.userData.keep=true; m.castShadow=true; g.add(m); return g; }
 function makeFlower(kind){ if(kind===6) return makeCroissant(); const g=new THREE.Group(), H=kind===2?0.75:kind===3?0.5:0.45+((kind*37)%10)/100, add=(geo,c,x,y,z,sx,sy,sz)=>{ const m=new THREE.Mesh(geo,fMat(c)); m.position.set(x,y,z); m.scale.set(sx,sy,sz); m.userData.keep=true; g.add(m); return m; };
   add(FLW.stem,0x3f9a3a,0,H/2,0,1,H,1); add(FLW.leaf,0x4fb247,0.05,H*0.35,0,0.07,0.025,0.035).rotation.z=0.5;
   if(kind===0){ add(FLW.cup,0xff3b4f,0,H+0.06,0,1,1,1); }
@@ -3372,7 +3417,7 @@ function updateFaces(dt,focus){
   const can=best && best.state==='closed';
   if(can && renderer.xr.isPresenting) faceSay(best,'…  say hi!  …');
   else if(best && best.shown==='…  say hi!  …' && !can) best.bubble.visible=false;
-  if(!renderer.xr.isPresenting){ promptEl.style.opacity=can&&!isTouch?1:0; talkEl.style.display=can&&isTouch?'block':'none'; if(can) promptEl.textContent='Press F to say hi'; }
+  if(!renderer.xr.isPresenting){ promptEl.style.opacity=can&&!isTouch?1:0; talkEl.style.display=(can||UFO.st==='inside')&&isTouch?'block':'none'; if(can) promptEl.textContent='Press F to say hi'; }
 }
 
 /* --- chunk extras: coins + faces live in a small dynamic group per chunk --- */
@@ -4242,7 +4287,7 @@ function frame(now){
     camFY+=gap*(1-Math.exp(-dt*rate));
     camFY=clamp(camFY, pl.pos.y-(pg?4.5:1.4), pl.pos.y+(pg?3.5:1.2));
     const tgt=_mv.set(pl.pos.x, camFY+1.1, pl.pos.z);
-    const cdist=camDist*(0.6+0.4*(pl.bigS||1))*(CRYPT.under?0.55:1), cp=_r.set(tgt.x+Math.sin(camYaw)*Math.cos(camPitch)*cdist, tgt.y+Math.sin(camPitch)*cdist, tgt.z+Math.cos(camYaw)*Math.cos(camPitch)*cdist);
+    const cdist=camDist*(0.6+0.4*(pl.bigS||1))*(CRYPT.under?0.55:1)*(UFO.st==='inside'?4:1), cp=_r.set(tgt.x+Math.sin(camYaw)*Math.cos(camPitch)*cdist, tgt.y+Math.sin(camPitch)*cdist, tgt.z+Math.cos(camYaw)*Math.cos(camPitch)*cdist);
     cp.y=Math.max(cp.y,support(cp.x,cp.z,cp.y+0.3,nearData(cp.x,cp.z))+0.35); if(CRYPT.under) cp.y=Math.min(cp.y,CRYPT.under.Y+CRYPT.under.H-0.25);
     camera.position.lerp(cp,1-Math.exp(-dt*12)); camera.lookAt(tgt);
     CUT.on.value=1; CUT.keep.value=0.1; CUT.a.value.copy(camera.position); CUT.b.value.set(pl.pos.x,pl.pos.y+0.75,pl.pos.z); CUT.feet.value=pl.pos.y+0.12;
