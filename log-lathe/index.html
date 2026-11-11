@@ -129,6 +129,16 @@ p.help b{color:var(--text)}
 .glass{background:color-mix(in srgb,var(--panel) 90%,transparent);backdrop-filter:blur(6px);color:var(--text)}
 .topbar{position:absolute;top:12px;right:12px;display:flex;gap:8px;z-index:3}
 .topbar .seg,.topbar .btn{background:color-mix(in srgb,var(--panel) 90%,transparent);backdrop-filter:blur(6px)}
+#drawPill{position:absolute;left:50%;transform:translateX(-50%);top:calc(46% + 10px);z-index:4;display:none;align-items:center;gap:8px;padding:6px 6px 6px 12px;border-radius:999px;font:500 13px Inter;white-space:nowrap}
+#drawPill.show{display:flex}
+#stage.v-flat #drawPill{top:64px}
+#drawPill span{color:var(--dim)}
+#drawPill button{border:0;border-radius:999px;padding:6px 12px;font:600 13px Inter;cursor:pointer;background:var(--card);color:var(--text)}
+#drawPill #dpDone{background:var(--accent);color:var(--accentInk)}
+.drawbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.drawbar .btn.on{background:var(--accent);color:var(--accentInk);border-color:transparent}
+.drawbar .btn:disabled{opacity:.45;cursor:default}
+#app.m-port #drawPill span,#app.m-land #drawPill span{display:none}
 #modeTag{position:absolute;top:14px;left:14px;z-index:3;font:600 12px Inter;padding:6px 10px;border-radius:9px;max-width:55%}
 #transport{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);z-index:3;display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:16px;padding:8px 12px;width:min(560px,calc(100% - 24px))}
 #transport button{border:0;background:var(--card);color:var(--text);width:38px;height:38px;border-radius:11px;display:grid;place-items:center;cursor:pointer;flex:none}
@@ -224,6 +234,7 @@ p.help b{color:var(--text)}
     <canvas id="gl"></canvas>
     <canvas id="flat"></canvas>
     <div id="modeTag" class="glass"></div>
+    <div id="drawPill" class="glass"><b>✏️ Drawing</b><span>drag on the sheet</span><button id="dpUndo" title="Undo last stroke">↶</button><button id="dpDone">Done</button></div>
     <div class="topbar">
       <div class="seg" id="viewSeg"><button data-v="3d">3D</button><button data-v="both" class="on">Both</button><button data-v="flat">Flat</button></div>
       <button class="btn" id="fitBtn" title="Frame the whole log">Fit</button>
@@ -1448,9 +1459,9 @@ function _dt1d(f, n, h, out, v, z) {
   k = 0;
   for (q = 0; q < n; q++) { xq = q * h; while (z[k + 1] < xq) k++; xv = v[k] * h; out[q] = (xq - xv) * (xq - xv) + f[v[k]]; }
 }
-function echoFill(tracks, L, G, pitch, maxRings) {
+function echoFill(tracks, L, G, pitch, maxRings, cells) {
   var C = G.C, R = G.R, INF = 1e20;
-  var h = Math.max(pitch / 9, Math.sqrt(C * L / 300000));
+  var h = Math.max(pitch / 9, Math.sqrt(C * L / (cells || 300000)));
   var nv = Math.max(8, Math.round(C / h)), hv = C / nv, nu = Math.max(4, Math.round(L / h) + 1), hu = L / (nu - 1);
   var W = nv * 3, f = new Float64Array(W * nu).fill(INF), i, j, k;
   var st = 0.4 * Math.min(hu, hv);
@@ -1531,6 +1542,9 @@ function echoFill(tracks, L, G, pitch, maxRings) {
         if (prev) v += C * Math.round((prev[1] - v) / C);   // keep continuous across the seam
         prev = [p[0], v]; pl.push(prev);
       });
+      // a ring that goes right round the log ends one full turn from where it
+      // started: keep that offset so it closes by carrying on, not by jumping back
+      var off = ch.closed ? pl[pl.length - 1][1] - pl[0][1] : 0;
       // Chaikin smoothing (2 passes) to take the stair-steps out
       for (var it = 0; it < 2 && pl.length > 3; it++) {
         var o = [], n2 = pl.length, last = ch.closed ? n2 - 1 : n2 - 1;
@@ -1539,7 +1553,7 @@ function echoFill(tracks, L, G, pitch, maxRings) {
           var A = pl[q], B = pl[q + 1];
           o.push([0.75 * A[0] + 0.25 * B[0], 0.75 * A[1] + 0.25 * B[1]], [0.25 * A[0] + 0.75 * B[0], 0.25 * A[1] + 0.75 * B[1]]);
         }
-        if (ch.closed) o.push(o[0]); else o.push(pl[n2 - 1]);
+        if (ch.closed) o.push([o[0][0], o[0][1] + off]); else o.push(pl[n2 - 1]);
         pl = o;
       }
       var len = 0; for (var q2 = 1; q2 < pl.length; q2++) len += Math.hypot(pl[q2][0] - pl[q2 - 1][0], pl[q2][1] - pl[q2 - 1][1]);
@@ -1558,6 +1572,217 @@ function g_knots(p, L, G) {
   }
   var seeds = ks.filter(function (k) { return k.h >= p.minH; });
   return bumpCore(p, L, G, seeds);
+}
+
+
+// ---------- Doodle: your own strokes, smoothed, then echoed ----------
+// strokes are kept zone-relative: [[u/L, v/C], ...] so they survive changes
+// to the log size or units. v can run past 0..1 (a stroke over the seam).
+function _demoStrokes(L, C) {
+  var out = [];
+  function twirl(cu, cv, rmax, turns, hand, ph, tail) {
+    var pts = [], n = 160;
+    for (var i = 0; i <= n; i++) { var f = i / n, r = rmax * Math.pow(f, 0.9), a = ph + hand * TWO_PI * turns * f; pts.push([cu + r * Math.cos(a), cv + r * Math.sin(a)]); }
+    var e = pts[n], a1 = ph + hand * TWO_PI * turns;
+    for (var j = 1; j <= 40; j++) { var g = j / 40; pts.push([e[0] + tail[0] * g + Math.sin(a1 + hand * Math.PI / 2) * rmax * 0.5 * g * (1 - g), e[1] + tail[1] * g + Math.cos(a1) * rmax * 0.5 * g * (1 - g)]); }
+    return pts;
+  }
+  var r = Math.min(L * 0.16, C * 0.2);
+  out.push(twirl(L * 0.24, C * 0.34, r, 2.2, 1, 0.3, [L * 0.18, C * 0.32]));
+  out.push(twirl(L * 0.7, C * 0.62, r * 0.85, 1.8, -1, 2.2, [-L * 0.1, -C * 0.36]));
+  var w = []; for (var k = 0; k <= 80; k++) { var f = k / 80; w.push([L * (0.08 + 0.86 * f), C * (0.86 + 0.07 * Math.sin(f * TWO_PI * 2.2))]); }
+  out.push(w);
+  return out.map(function (st) { return st.map(function (q) { return [q[0] / L, q[1] / C]; }); });
+}
+function _resample(pts, ds) {
+  var out = [pts[0]], carry = 0;
+  for (var i = 1; i < pts.length; i++) {
+    var a = pts[i - 1], b = pts[i], d = Math.hypot(b[0] - a[0], b[1] - a[1]); if (d < 1e-12) continue;
+    var s = ds - carry;
+    while (s <= d) { var f = s / d; out.push([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]); s += ds; }
+    carry = d - (s - ds);
+  }
+  var l = pts[pts.length - 1], o = out[out.length - 1];
+  if (Math.hypot(l[0] - o[0], l[1] - o[1]) > ds * 0.3) out.push(l);
+  return out;
+}
+function smoothStroke(raw, ds, win, closed) {
+  var pts = _resample(raw, ds), n = pts.length, m = Math.round(win / ds / 2);
+  if (n < 3 || m < 1) return pts;
+  for (var pass = 0; pass < 3; pass++) {
+    var o = new Array(n);
+    for (var i = 0; i < n; i++) {
+      var k = closed ? m : Math.min(m, i, n - 1 - i), su = 0, sv = 0, c = 0;
+      for (var j = -k; j <= k; j++) { var q = pts[closed ? ((i + j) % n + n) % n : i + j]; su += q[0]; sv += q[1]; c++; }
+      o[i] = [su / c, sv / c];
+    }
+    pts = o;
+  }
+  if (closed) pts.push(pts[0].slice());
+  return pts;
+}
+function _clipU(pts, L) {   // keep the bits that sit on the zone
+  var out = [], cur = [];
+  for (var i = 0; i < pts.length; i++) {
+    var q = pts[i], inside = q[0] >= 0 && q[0] <= L;
+    if (inside) {
+      if (!cur.length && i > 0) { var a = pts[i - 1], e = a[0] < 0 ? 0 : L, f = (e - a[0]) / (q[0] - a[0]); cur.push([e, a[1] + (q[1] - a[1]) * f]); }
+      cur.push(q);
+    } else if (cur.length) {
+      var b = pts[i - 1], e2 = q[0] < 0 ? 0 : L, f2 = (e2 - b[0]) / (q[0] - b[0]); cur.push([e2, b[1] + (q[1] - b[1]) * f2]);
+      if (cur.length > 1) out.push(cur); cur = [];
+    }
+  }
+  if (cur.length > 1) out.push(cur);
+  return out;
+}
+// weave: wherever two lines cross, one goes over (stays whole) and the other
+// dips under (its groove stops short on both sides), alternating along each line.
+function weaveLines(lines, G, spacing) {
+  var C = G.C, gw = G.gw, cs = Math.max(gw * 0.5, 0.05), nvC = Math.max(1, Math.floor(C / cs)), csv = C / nvC;
+  var hash = new Map(), segs = [];
+  lines.forEach(function (ln, li) {
+    var p = ln.pts, s = 0; ln.arc = [0];
+    for (var i = 1; i < p.length; i++) { s += Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]); ln.arc.push(s); }
+    ln.x = [];
+    for (var i2 = 0; i2 < p.length - 1; i2++) {
+      var a = p[i2], b = p[i2 + 1], av = _wrap(a[1], C), sh = av - a[1], bv = b[1] + sh, id = segs.length;
+      segs.push([li, i2, a[0], av, b[0], bv]);
+      var iu0 = Math.floor(Math.min(a[0], b[0]) / cs), iu1 = Math.floor(Math.max(a[0], b[0]) / cs);
+      var iv0 = Math.floor(Math.min(av, bv) / csv), iv1 = Math.floor(Math.max(av, bv) / csv);
+      for (var iu = iu0; iu <= iu1; iu++) for (var iv = iv0; iv <= iv1; iv++) {
+        var k = iu * nvC + ((iv % nvC) + nvC) % nvC, arr = hash.get(k); if (!arr) hash.set(k, arr = []); arr.push(id);
+      }
+    }
+  });
+  var seen = new Set(), xs = [];
+  hash.forEach(function (arr) {
+    for (var x = 0; x < arr.length; x++) for (var y = x + 1; y < arr.length; y++) {
+      var A = segs[arr[x]], B = segs[arr[y]], la = lines[A[0]], lb = lines[B[0]];
+      if (A[0] === B[0]) { if (!la.self || Math.abs(A[1] - B[1]) < 4) continue; }
+      else if (la.g === lb.g && !(la.src && lb.src)) continue;      // one stroke's echoes never cross each other
+      var key = arr[x] < arr[y] ? arr[x] + ',' + arr[y] : arr[y] + ',' + arr[x];
+      if (seen.has(key)) continue; seen.add(key);
+      var sh = C * Math.round((A[3] - B[3]) / C), b0u = B[2], b0v = B[3] + sh, b1u = B[4], b1v = B[5] + sh;
+      var du = A[4] - A[2], dv = A[5] - A[3], eu = b1u - b0u, ev = b1v - b0v, den = du * ev - dv * eu;
+      if (Math.abs(den) < 1e-14) continue;
+      var t = ((b0u - A[2]) * ev - (b0v - A[3]) * eu) / den, w = ((b0u - A[2]) * dv - (b0v - A[3]) * du) / den;
+      if (t < 0 || t >= 1 || w < 0 || w >= 1) continue;
+      var sn = Math.abs(den) / (Math.hypot(du, dv) * Math.hypot(eu, ev));
+      var X = { a: A[0], sa: la.arc[A[1]] + t * (la.arc[A[1] + 1] - la.arc[A[1]]), b: B[0], sb: lb.arc[B[1]] + w * (lb.arc[B[1] + 1] - lb.arc[B[1]]), sin: sn, over: -1 };
+      xs.push(X); la.x.push([X.sa, X, 'a']); lb.x.push([X.sb, X, 'b']);
+    }
+  });
+  // ribbons: a stroke and its echoes travel together, so where two ribbons
+  // cross, every line of one goes over every line of the other. Crossings of
+  // the same pair of strokes that sit close together form one crossing region.
+  var reach = Math.max(gw * 2, spacing * 2.6), par = xs.map(function (_, i) { return i; });
+  function find(i) { while (par[i] !== i) i = par[i] = par[par[i]]; return i; }
+  var byPair = new Map();
+  xs.forEach(function (X, i) {
+    var ga = lines[X.a].g, gb = lines[X.b].g; if (ga === gb) return;
+    var k = ga < gb ? ga + ',' + gb : gb + ',' + ga, arr = byPair.get(k); if (!arr) byPair.set(k, arr = []); arr.push(i);
+  });
+  function xyOf(X) { var ln = lines[X.a], A = ln.arc, j = 0; while (j < A.length - 2 && A[j + 1] < X.sa) j++; return ln.pts[j]; }
+  xs.forEach(function (X) { X.p = xyOf(X); });
+  byPair.forEach(function (arr) {
+    for (var i = 0; i < arr.length; i++) for (var j = i + 1; j < arr.length; j++) {
+      var P = xs[arr[i]].p, Q = xs[arr[j]].p, dv = Math.abs(P[1] - Q[1]) % C; if (dv > C / 2) dv = C - dv;
+      if (Math.abs(P[0] - Q[0]) < reach && dv < reach) { var ri = find(arr[i]), rj = find(arr[j]); if (ri !== rj) par[ri] = rj; }
+    }
+  });
+  var regions = new Map();
+  xs.forEach(function (X, i) {
+    if (lines[X.a].g === lines[X.b].g) return;
+    var r = find(i), R0 = regions.get(r); if (!R0) regions.set(r, R0 = { xs: [], ga: lines[X.a].g, gb: lines[X.b].g, over: null });
+    R0.xs.push(X); X.reg = R0;
+  });
+  // order each stroke's regions along the stroke itself, then alternate over/under
+  var srcOf = {}; lines.forEach(function (ln) { if (ln.src && !srcOf[ln.g]) srcOf[ln.g] = ln; });
+  function along(g, P) {
+    var ln = srcOf[g]; if (!ln) return 0;
+    var best = 1e30, bs = 0, step = Math.max(1, Math.floor(ln.pts.length / 400));
+    for (var i = 0; i < ln.pts.length; i += step) { var q = ln.pts[i], dv = Math.abs(q[1] - P[1]) % C; if (dv > C / 2) dv = C - dv; var d = (q[0] - P[0]) * (q[0] - P[0]) + dv * dv; if (d < best) { best = d; bs = ln.arc[i]; } }
+    return bs;
+  }
+  var gs = {}; regions.forEach(function (Rg) {
+    var cu = 0, cv = 0; Rg.xs.forEach(function (X) { cu += X.p[0]; cv += X.p[1]; }); var P = [cu / Rg.xs.length, cv / Rg.xs.length];
+    [Rg.ga, Rg.gb].forEach(function (g) { (gs[g] = gs[g] || []).push([along(g, P), Rg]); });
+  });
+  Object.keys(gs).sort(function (a, b) { return a - b; }).forEach(function (g) {
+    g = +g; var want = 1;
+    gs[g].sort(function (a, b) { return a[0] - b[0]; }).forEach(function (e) {
+      var Rg = e[1]; if (Rg.over === null) Rg.over = want ? g : (Rg.ga === g ? Rg.gb : Rg.ga);
+      want = Rg.over === g ? 0 : 1;
+    });
+  });
+  xs.forEach(function (X) { if (X.reg) X.over = lines[X.a].g === X.reg.over ? 'a' : 'b'; });
+  // a stroke crossing itself: alternate along that stroke
+  lines.forEach(function (ln, li) {
+    var want = 1;
+    ln.x.filter(function (e) { return !e[1].reg; }).sort(function (p, q) { return p[0] - q[0]; }).forEach(function (e) {
+      var X = e[1], me = e[2];
+      if (X.over === -1) X.over = want ? me : (me === 'a' ? 'b' : 'a');
+      want = X.over === me ? 0 : 1;
+    });
+  });
+  var out = [], land = gw * 0.45;
+  lines.forEach(function (ln, li) {
+    var gaps = [];
+    ln.x.forEach(function (e) {
+      var X = e[1]; if (X.over === e[2]) return;
+      var g = (gw * 0.5 + land) / Math.max(0.3, X.sin) + gw * 0.5;
+      gaps.push([e[0] - g, e[0] + g]);
+    });
+    var p = ln.pts, A = ln.arc, tot = A[A.length - 1];
+    if (!gaps.length) { out.push({ pts: p, closed: ln.closed, src: ln.src }); return; }
+    if (ln.closed) gaps.slice().forEach(function (gp) { if (gp[0] < 0) gaps.push([gp[0] + tot, tot + 1]); if (gp[1] > tot) gaps.push([-1, gp[1] - tot]); });
+    var inGap = function (s) { for (var k = 0; k < gaps.length; k++) if (s > gaps[k][0] && s < gaps[k][1]) return true; return false; };
+    var pieces = [], cur = [];
+    for (var i = 0; i < p.length; i++) {
+      if (inGap(A[i])) { if (cur.length > 1) pieces.push(cur); cur = []; }
+      else cur.push(p[i]);
+    }
+    if (cur.length > 1) pieces.push(cur);
+    if (ln.closed && pieces.length > 1 && !inGap(0) && !inGap(tot)) { var last = pieces.pop(), off = p[p.length - 1][1] - p[0][1]; pieces[0] = last.concat(pieces[0].slice(1).map(function (q) { return [q[0], q[1] + off]; })); }
+    pieces.forEach(function (pc) { var len = 0; for (var q = 1; q < pc.length; q++) len += Math.hypot(pc[q][0] - pc[q - 1][0], pc[q][1] - pc[q - 1][1]); if (len > gw * 0.6) out.push({ pts: pc, src: ln.src }); });
+  });
+  return { lines: out, crossings: xs.length };
+}
+function g_draw(p, L, G) {
+  var C = G.C, R = G.R, gw = G.gw, demo = !Array.isArray(p.strokes);
+  var strokes = demo ? _demoStrokes(L, C) : p.strokes;
+  var ds = Math.max(gw / 6, Math.min(L, C) / 2000), win = Math.max(0, +p.smooth || 0), spacing = Math.max(gw * 0.6, +p.spacing || gw * 1.6);
+  var nEcho = clampi(p.echoes, 0, 40), style = +p.style, srcs = [];
+  strokes.forEach(function (st, si) {
+    if (!st || st.length < 2) return;
+    var raw = st.map(function (q) { return [q[0] * L, q[1] * C]; }), len = 0;
+    for (var i = 1; i < raw.length; i++) len += Math.hypot(raw[i][0] - raw[i - 1][0], raw[i][1] - raw[i - 1][1]);
+    if (len < gw * 0.5) return;
+    var a = raw[0], b = raw[raw.length - 1], closed = len > gw * 8 && Math.hypot(a[0] - b[0], a[1] - b[1]) < Math.max(gw * 1.5, len * 0.06);
+    var sm = smoothStroke(raw, ds, win, closed);
+    var parts = _clipU(sm, L);
+    parts.forEach(function (pc) { srcs.push({ pts: pc, g: si, src: true, self: true, closed: closed && parts.length === 1 }); });
+  });
+  if (!srcs.length) return { tracks: [], note: 'Nothing drawn yet: turn on Draw and drag on the flat sheet.' };
+  var lines = p.cut ? srcs.slice() : [], toT = function (ln) { return ln.pts.map(function (q) { return [q[0], q[1] / R]; }); };
+  var asTr = function (pts) { return pts.map(function (q) { return [q[0], q[1] * R]; }); };
+  var cells = srcs.length > 6 ? 90000 : 160000, nx = 0, ex = 0;
+  if (nEcho > 0) {
+    if (style === 2) {              // meet: one distance field for everything, rings stop where they meet
+      var all = echoFill(srcs.map(function (s) { return { pts: toT(s) }; }), L, G, spacing, nEcho, 300000);
+      all.forEach(function (e) { lines.push({ pts: asTr(e.pts), g: -1, closed: e.closed }); }); ex = all.length;
+    } else {
+      var groups = {}; srcs.forEach(function (s) { (groups[s.g] = groups[s.g] || []).push({ pts: toT(s) }); });
+      Object.keys(groups).forEach(function (g) {
+        var ec = echoFill(groups[g], L, G, spacing, nEcho, cells);
+        ec.forEach(function (e) { lines.push({ pts: asTr(e.pts), g: +g, closed: e.closed }); }); ex += ec.length;
+      });
+    }
+  }
+  if (style === 1) { var wv = weaveLines(lines, G, spacing); lines = wv.lines; nx = wv.crossings; }
+  var tracks = lines.map(function (ln) { return { pts: ln.pts.map(function (q) { return [q[0], q[1] / R, G.depth]; }), closed: ln.closed, echo: !ln.src }; });
+  return { tracks: tracks, note: (demo ? 'Demo twirls: draw your own on the flat sheet. ' : '') + srcs.length + ' stroke' + (srcs.length === 1 ? '' : 's') + ' + ' + ex + ' echo lines' + (style === 1 ? ', ' + nx + ' crossings woven.' : '.') };
 }
 
 // ---------- the pattern list ----------
@@ -1675,6 +1900,12 @@ var MODES = [
       { k: 'echoMax', label: 'Echoes per spiral', kind: 'int', min: 1, max: 40, def: 40, hint: 'Lower = only a few ripples around each spiral, leaving plain wood further out.' },
       { k: 'place', label: 'Order', kind: 'choice', opts: [[0, 'Biggest gaps first'], [1, 'Random']], def: 0 },
       { k: 'spin', label: 'Spin', kind: 'choice', opts: [[0, 'Mixed'], [1, 'All one way'], [-1, 'All the other']], def: 0 }, P_SEED(3)] },
+  { key: 'draw', name: 'Doodle', blurb: 'Draw your own twirls on the flat sheet; they get smoothed and echoed, and the echoes weave, overlap or meet.', gen: g_draw,
+    params: [{ k: 'style', label: 'Where echoes cross', kind: 'choice', opts: [[1, 'Weave'], [0, 'Overlap'], [2, 'Meet & end']], def: 1 },
+      { k: 'echoes', label: 'Echoes', kind: 'int', min: 0, max: 30, def: 4, hint: 'How many rings ripple out from each stroke.' },
+      { k: 'spacing', label: 'Echo spacing', kind: 'len', min: 0.1, max: 3, def: function (G) { return r2(G.gw * 1.6); }, hint: 'Centre to centre. Keep it above the groove width or the rings merge.' },
+      { k: 'smooth', label: 'Smoothing', kind: 'len', min: 0, max: 4, def: function (G) { return r2(G.gw * 1.2); }, hint: 'Irons the wobble out of your hand. 0 = exactly as drawn.' },
+      { k: 'cut', label: 'Carve my lines too', kind: 'bool', def: true, hint: 'Off = only the echoes get carved.' }] },
   { key: 'knots', name: 'KnotSpirals', blurb: 'Reads the log: spirals grow around every knot, echoes flow between. Needs a Natural log or scan.', gen: g_knots,
     params: [{ k: 'minH', label: 'Knot height to use', kind: 'len', min: 0.02, max: 1, def: 0.1, hint: 'Bumps lower than this are ignored.' },
       { k: 'maxR', label: 'Spiral reach', kind: 'len', min: 0.2, max: 6, def: function (G) { return r2(G.diameter * 0.5); }, hint: 'How far the rings spread out from each knot.' },
@@ -1730,7 +1961,7 @@ function buildAll(S, touch, knots) {   // knots: [{t, th, r, h}] found on the re
       for (var i = 0; i < tr.pts.length; i++) tr.pts[i][0] += t0 + inA;
       tr.zone = zi; tracks.push(tr);
     });
-    notes.push(res.note); spans.push([t0, t0 + Lz, mi.key]);
+    notes.push(res.note); spans.push([t0, t0 + Lz, mi.key, zt0, zL]);
     t0 += Lz + gap;
   });
   if (S.ringGroove && n > 1) {
@@ -2199,6 +2430,7 @@ const DEFAULTS = {
   theme: { preset: 'playground', c: Object.assign({}, THEMES.playground.c) }
 };
 const S = JSON.parse(JSON.stringify(DEFAULTS));
+const DRAW = { on: false, cur: null, pid: null };   // Doodle: drawing on the flat sheet
 try {
   const saved = JSON.parse(localStorage.getItem('loglathe.v2') || 'null');
   if (saved && saved.v === 2) mergeSettings(saved);
@@ -2599,6 +2831,7 @@ function setView(v) {
   if (gridHelper) gridHelper.visible = v !== 'both';
   onResize(); flatDirty = true; flatFitKey = '';
   if (BUILD) { if (v === 'both') fitSide(); else if (v === '3d') fit3D(); }
+  if (typeof updDrawPill === 'function') updDrawPill();
 }
 // side view: the log runs left-to-right, seen straight from the front
 function fitSide() {
@@ -2762,6 +2995,10 @@ function drawFlat() {
     const o = (CV.cursor - 1) * 4, tx = R * CV.plan[o + 1], ty = CV.plan[o];
     fctx.fillStyle = S.theme.c.accent; fctx.beginPath(); fctx.arc(tx, ty, Math.max(gw / 2, 5 / s), 0, TWO_PI); fctx.fill();
   }
+  if (DRAW.cur && DRAW.cur.length > 1) {   // the stroke being drawn (sheet x = around, y = along)
+    fctx.strokeStyle = rgba(S.theme.c.accent, 0.85); fctx.lineWidth = Math.max(gw, 3 / s); fctx.lineCap = 'round'; fctx.lineJoin = 'round';
+    fctx.beginPath(); fctx.moveTo(DRAW.cur[0][1], DRAW.cur[0][0]); for (let i = 1; i < DRAW.cur.length; i++) fctx.lineTo(DRAW.cur[i][1], DRAW.cur[i][0]); fctx.stroke();
+  }
   fctx.restore();
   // labels
   fctx.fillStyle = rgba(th.sheet, 0.75); fctx.font = '500 12px Inter, sans-serif';
@@ -2788,10 +3025,61 @@ function drawFlat() {
 }
 // pan / zoom
 const ptrs = new Map(); let pinch0 = null;
-flatC.addEventListener('pointerdown', e => { flatC.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY }); flatC.style.cursor = 'grabbing'; });
+// ---- Doodle drawing on the sheet ----
+const drawZone = () => S.zones[S.zi] && modeInfo(S.zones[S.zi].mode).key === 'draw';
+const drawActive = () => DRAW.on && drawZone() && viewMode !== '3d';
+function setDraw(on) {
+  DRAW.on = !!on; DRAW.cur = null;
+  if (on && viewMode === '3d') setView('both');
+  if (on && phone) togglePanel(false);
+  updDrawPill(); if (S.tab === 'pattern') renderPanel(); flatDirty = true;
+}
+function updDrawPill() {
+  const a = drawActive();
+  $('#drawPill').classList.toggle('show', a);
+  flatC.style.cursor = a ? 'crosshair' : 'grab';
+  const u = $('#dpUndo'), z = S.zones[S.zi], st = z && z.params && z.params.draw && z.params.draw.strokes;
+  if (u) u.disabled = !(Array.isArray(st) && st.length);
+}
+function undoStroke() {
+  const z = S.zones[S.zi], p = z.params && z.params.draw;
+  if (!p || !Array.isArray(p.strokes) || !p.strokes.length) return;
+  p.strokes.pop(); if (S.tab === 'pattern') renderPanel(); updDrawPill(); schedule();
+}
+function sheetPt(x, y) {      // screen -> [t along the log, v around it]
+  const s = FV.s;
+  return flatHoriz() ? [(x - FV.ox) / s, (y - FV.oy) / s] : [(FV.oy - y) / s, (x - FV.ox) / s];
+}
+function commitStroke() {
+  const cur = DRAW.cur; DRAW.cur = null; DRAW.pid = null; flatDirty = true;
+  if (!cur || cur.length < 3 || !BUILD) return;
+  const sp = BUILD.spans[S.zi], zt0 = sp[3], zL = sp[4], C = BUILD.G.C;
+  const z = S.zones[S.zi], p = zoneParams(z, BUILD.G);
+  if (!Array.isArray(p.strokes)) p.strokes = [];
+  p.strokes.push(cur.map(q => [+((q[0] - zt0) / zL).toFixed(5), +(q[1] / C).toFixed(5)]));
+  if (S.tab === 'pattern') { const sc = panel.scrollTop; renderPanel(); panel.scrollTop = sc; }
+  updDrawPill(); schedule();
+}
+$('#dpDone').addEventListener('click', () => setDraw(false));
+$('#dpUndo').addEventListener('click', undoStroke);
+flatC.addEventListener('pointerdown', e => {
+  try { flatC.setPointerCapture(e.pointerId); } catch (_) { }
+  ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
+  if (drawActive()) {
+    if (ptrs.size === 1) { DRAW.cur = [sheetPt(e.offsetX, e.offsetY)]; DRAW.pid = e.pointerId; }
+    else { DRAW.cur = null; DRAW.pid = null; flatDirty = true; }     // second finger: pinch instead
+    return;
+  }
+  flatC.style.cursor = 'grabbing';
+});
 flatC.addEventListener('pointermove', e => {
   if (!ptrs.has(e.pointerId)) return;
   const p = ptrs.get(e.pointerId);
+  if (DRAW.cur && e.pointerId === DRAW.pid) {
+    if (Math.hypot(e.offsetX - p.x, e.offsetY - p.y) >= 2) { DRAW.cur.push(sheetPt(e.offsetX, e.offsetY)); p.x = e.offsetX; p.y = e.offsetY; flatDirty = true; }
+    return;
+  }
+  if (drawActive() && ptrs.size === 1) return;
   if (ptrs.size === 1) {
     if (viewMode === 'both') { const dx = (e.offsetX - p.x) / FV.s; sideCam.position.x -= dx; controls.target.x -= dx; FV.oy += e.offsetY - p.y; }
     else { FV.ox += e.offsetX - p.x; FV.oy += e.offsetY - p.y; }
@@ -2804,7 +3092,7 @@ flatC.addEventListener('pointermove', e => {
   }
   flatDirty = true;
 });
-const endPtr = e => { ptrs.delete(e.pointerId); pinch0 = null; flatC.style.cursor = 'grab'; };
+const endPtr = e => { if (DRAW.cur && e.pointerId === DRAW.pid) { if (e.type === 'pointerup') commitStroke(); else { DRAW.cur = null; flatDirty = true; } } ptrs.delete(e.pointerId); pinch0 = null; flatC.style.cursor = drawActive() ? 'crosshair' : 'grab'; };
 flatC.addEventListener('pointerup', endPtr); flatC.addEventListener('pointercancel', endPtr);
 flatC.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
 function zoomAt(x, y, f) {
@@ -2910,7 +3198,7 @@ function renderPanel() {
   }
   document.querySelectorAll('.rb').forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab && !panel.classList.contains('hidden')));
   ({ stock: panelStock, pattern: panelPattern, carve: panelCarve, paths: panelPaths, export: panelExport, style: panelStyle, help: panelHelp }[S.tab] || panelPattern)();
-  updateReadouts(); updateCheckCard(); syncSliders();
+  updateReadouts(); updateCheckCard(); syncSliders(); if (typeof updDrawPill === 'function') updDrawPill();
 }
 function panelStock() {
   const U = unitF(), st = S.stock, mode = stockMode();
@@ -3072,6 +3360,17 @@ function panelPattern() {
         thumbFor(m.key, pp, 82, 52), el('span', null, m.name)));
     });
     panel.append(grid);
+  }
+  if (mi.key === 'draw') {
+    const mine = Array.isArray(p.strokes);
+    panel.append(sec('Your drawing'),
+      el('div', { class: 'drawbar' },
+        el('button', { class: 'btn' + (DRAW.on ? ' on' : ''), onclick: () => setDraw(!DRAW.on) }, DRAW.on ? '✏️ Drawing (tap to stop)' : '✏️ Draw on the sheet'),
+        el('button', { class: 'btn', id: 'drawUndo', disabled: !mine || !p.strokes.length, onclick: undoStroke }, '↶ Undo'),
+        el('button', { class: 'btn', disabled: mine && !p.strokes.length, onclick: () => { p.strokes = []; renderPanel(); schedule(); } }, 'Clear'),
+        mine ? el('button', { class: 'btn', title: 'Bring back the demo twirls', onclick: () => { delete p.strokes; renderPanel(); schedule(); } }, 'Demo') : null),
+      el('div', { class: 'hint', style: 'margin-bottom:8px' }, mine ? (p.strokes.length + ' stroke' + (p.strokes.length === 1 ? '' : 's') + '. ') : 'Showing demo twirls; your first stroke replaces them. ',
+        'Drag on the flat sheet to draw. End a stroke where it started to close a loop. Strokes over the top or bottom edge wrap round the log.'));
   }
   // this pattern's own controls
   panel.append(sec('Settings'));
