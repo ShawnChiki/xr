@@ -3258,7 +3258,7 @@ function climberOnRay(ray) {
   });
   return best;
 }
-function grabClimber(i) { const c = CLM.list[i]; if (!c) return; c.state = 'held'; CLM.held = i; CLM.sel = i; UIS.dirty = true; }
+function grabClimber(i) { const c = CLM.list[i]; if (!c) return; c.state = 'held'; c.route = c.plan = c.dest = null; c.rest = 0; CLM.held = i; CLM.sel = i; UIS.dirty = true; }
 function moveHeld(p) { const c = CLM.list[CLM.held]; if (c) { c.p.copy(p); c.v.set(0, 0, 0); } }
 function dropHeld() { const c = CLM.list[CLM.held]; if (c) { c.state = 'fall'; c.v.set(0, 0, 0); c.air = 0; } CLM.held = -1; }
 // place a new one where you pointed: on the clay if it's there, otherwise it drops from that spot
@@ -3269,47 +3269,104 @@ function placeClimber(p) {
   CLM.sel = CLM.list.length - 1; UIS.dirty = true;
 }
 const limitOf = (c) => clamp(c.pref + 35, 30, 180);
-const _q = new THREE.Vector3(), _nq = new THREE.Vector3(), _t = new THREE.Vector3(), _h = new THREE.Vector3();
+// the mat is 256 mm square around the origin; nobody walks or drops off it
+const MAT = 128, matIn = (H) => MAT - Math.max(H * 0.5, 2);
+const onMat = (p, H) => Math.abs(p.x) <= matIn(H) && Math.abs(p.z) <= matIn(H);
+function keepOnMat(p, H) { const m = matIn(H); p.x = clamp(p.x, -m, m); p.z = clamp(p.z, -m, m); return p; }
+// where to go next: send out a few quick pretend walks from where it stands, using its own rules (slope limit, the mat),
+// and keep the best place any of them reached as a path of waypoints, so everything on the path is somewhere it can really walk.
+// One pretend walk per turn, a few turns per plan, so planning never stalls a frame.
+const PLAN_PROBES = 6;
+function planValue(c, P, q, n) {
+  const H = climberH(c); let crowd = 0;
+  for (const o of CLM.list) if (o !== c && o.dest && o.dest.distanceTo(q) < H * 2) crowd++;
+  return -Math.abs(slopeOf(n) - c.pref) / 20 * (P.summit ? 0.15 : 1) + (q.y / P.top) * (P.summit ? 6 : (c.pref / 90) * 2) + Math.min(q.distanceTo(P.start) / (H * 6), 1) * 0.8 - crowd * 1.2;
+}
+function planStart(c) {
+  const now = performance.now(); if (!CLM.box || now - CLM.boxT > 2000) { CLM.box = sculptureBox(); CLM.boxT = now; }
+  const P = { k: 0, best: null, start: c.p.clone(), n0: c.n.clone(), top: Math.max(10, CLM.box.y1), summit: c.pref >= 60 && Math.random() < 0.35 };   // now and then, climbers just go for the top
+  P.bv = planValue(c, P, c.p, c.n) + 0.3;
+  c.plan = P;
+}
+const _pv = Array.from({ length: 10 }, () => new THREE.Vector3()), _pq = new THREE.Quaternion();
+function planProbe(c) {
+  const P = c.plan, H = climberH(c), lim = limitOf(c), step = H * 0.8, sub = Math.max(1, Math.ceil(step / (VS * 1.8)));
+  const [p, n, d, t, q, nq, bq, bn, q2, qn] = _pv;
+  p.copy(P.start); n.copy(P.n0);
+  d.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5); d.addScaledVector(n, -n.dot(d));
+  const pts = [];
+  if (d.lengthSq() > 1e-6) { d.normalize();
+    for (let k = 0; k < 14; k++) {
+      let bs = -Infinity;
+      for (const off of [0, 0.75, -0.75]) {
+        // walk it in small steps, letting the surface carry the direction round corners, like a real climber would
+        t.copy(d).applyQuaternion(_pq.setFromAxisAngle(n, off + (Math.random() - 0.5) * 0.5));
+        q.copy(p); qn.copy(n); let ok = true;
+        for (let k2 = 0; k2 < sub; k2++) {
+          q2.copy(q).addScaledVector(t, step / sub).addScaledVector(qn, step * 0.02);
+          if (!toSurface(q2, nq) || !onMat(q2, H) || slopeOf(nq) > lim) { ok = false; break; }
+          t.applyQuaternion(_pq.setFromUnitVectors(qn, nq)); t.addScaledVector(nq, -nq.dot(t)); if (t.lengthSq() < 1e-8) { ok = false; break; } t.normalize();
+          q.copy(q2); qn.copy(nq);
+        }
+        if (!ok || q.distanceTo(p) < step * 0.3) continue;
+        const sc = -Math.abs(slopeOf(qn) - c.pref) / 25 * (P.summit ? 0.3 : 1) + (P.summit ? (q.y - p.y) / step * 1.5 : 0) + Math.cos(off) * 0.9 + Math.random() * 0.7;
+        if (sc > bs) { bs = sc; bq.copy(q); bn.copy(qn); }
+      }
+      if (bs === -Infinity) break;
+      d.subVectors(bq, p); p.copy(bq); n.copy(bn); d.addScaledVector(n, -n.dot(d)); if (d.lengthSq() < 1e-8) break; d.normalize();
+      pts.push(p.clone());
+      const v = planValue(c, P, p, n); if (v > P.bv) { P.bv = v; P.best = pts.slice(); }
+    }
+  }
+  if (++P.k < PLAN_PROBES) return;
+  c.plan = null; c.route = P.best; c.ri = 0; c.goalT = 0; c.dest = P.best ? P.best[P.best.length - 1] : null;
+  c.goalWait = P.best ? 0 : 1 + Math.random();
+  c.goalTop = !!P.best && P.summit && c.dest.y > P.top * 0.72;
+}
+function planRoute(c) { planStart(c); while (c.plan) planProbe(c); }   // all at once (tests)
+const _q = new THREE.Vector3(), _nq = new THREE.Vector3(), _t = new THREE.Vector3(), _h = new THREE.Vector3(), _qt2 = new THREE.Quaternion();
 function climberThink(c, H) {
   // look a step ahead in a few directions; pick the one closest to the slope it likes (climbers also like going up)
   const lim = limitOf(c) + (c.relax || 0), look = H * 0.9; let best = null, bs = -Infinity;
   const tan0 = _t.copy(c.head).addScaledVector(c.n, -c.n.dot(c.head)); if (tan0.lengthSq() < 1e-6) tan0.set(1, 0, 0).addScaledVector(c.n, -c.n.x); tan0.normalize();
   const side = new THREE.Vector3().crossVectors(c.n, tan0);
+  let gd = null;
   let hb = null;
-  if (c.p.y < 1 && c.pref >= 30) {
+  if (!gd && c.p.y < 1 && c.pref >= 30) {
     const now = performance.now(); if (!CLM.box || now - CLM.boxT > 2000) { CLM.box = sculptureBox(); CLM.boxT = now; }
     hb = new THREE.Vector3((CLM.box.x0 + CLM.box.x1) / 2 - c.p.x, 0, (CLM.box.z0 + CLM.box.z1) / 2 - c.p.z); if (hb.lengthSq() < 1) hb = null; else hb.normalize();
   }
   for (const off of [0, 0.5, -0.5, 1.1, -1.1, 1.8, -1.8, Math.PI]) {
     const dir = _h.copy(tan0).multiplyScalar(Math.cos(off)).addScaledVector(side, Math.sin(off));
     _q.copy(c.p).addScaledVector(dir, look).addScaledVector(c.n, H * 0.1);
-    const n = toSurface(_q, _nq); if (!n) continue;
+    const n = toSurface(_q, _nq); if (!n || !onMat(_q, H)) continue;
     if (_q.distanceTo(c.p) > look * 1.6 || _q.distanceTo(c.p) < look * 0.3) continue;
     const sl = slopeOf(n); if (sl > lim) continue;
     let crowd = 0; for (const o of CLM.list) if (o !== c && o.p.distanceTo(_q) < H * 1.1) crowd++;
-    const up = (_q.y - c.p.y) / look * (c.pref / 90) * 0.9;
+    const up = gd ? 0 : (_q.y - c.p.y) / look * (c.pref / 90) * 0.9;
     // on the bare bed, anyone who likes slopes heads back toward the sculpture
     const home = c.p.y < 1 && c.pref >= 30 && hb ? (dir.x * hb.x + dir.z * hb.z) * 0.9 : 0;
-    const score = -Math.abs(sl - c.pref) / 25 + Math.cos(off) * 0.7 + up + home + Math.random() * 0.6 - crowd * 1.5;
+    const toGoal = gd ? dir.dot(gd) * 1.1 : 0;
+    const score = -Math.abs(sl - c.pref) / 25 + Math.cos(off) * 0.7 + up + home + toGoal + Math.random() * (gd ? 0.25 : 0.6) - crowd * 1.5;
     if (score > bs) { bs = score; best = dir.clone(); }
   }
   if (best) { c.head.copy(best); c.stuck = 0; } else { c.head.multiplyScalar(-1); c.stuck += 1; }
   c.rethink = 0.5 + Math.random() * 1.1;
 }
 function climbersSim(dt) {
-  const g = 25 * CLM.size;
+  const g = 25 * CLM.size; CLM.planFree = 1; CLM.planUntil = performance.now() + 1.2;   // a little planning time per step, so it never causes a hitch
   for (const c of CLM.list) {
     const H = climberH(c);
     if (c.state === 'held') continue;
     if (c.state === 'fall') {
-      c.air += dt;
+      c.air += dt; keepOnMat(c.p, H);
       // buried (clay was added on top of them): work their way out, toward the nearest outside
       if (climbDens(c.p.x, c.p.y, c.p.z) > ISO + 0.1) {
         climbGrad(c.p, _g); if (_g.lengthSq() > 1e-4) c.p.addScaledVector(_g.normalize(), -H * 0.3); else c.p.y += H * 0.5;
         c.v.set(0, 0, 0); continue;
       }
       c.v.y = Math.max(c.v.y - g * dt, -H * 30);
-      const prev = c.p.clone(), cur = prev.clone().addScaledVector(c.v, dt);
+      const prev = c.p.clone(), cur = keepOnMat(prev.clone().addScaledVector(c.v, dt), H);
       // sweep the path so a fast fall can't skip through thin clay
       const len = prev.distanceTo(cur), nst = Math.max(1, Math.ceil(len / (VS * 0.8)));
       let hi = -1; for (let s = 1; s <= nst; s++) { _q.lerpVectors(prev, cur, s / nst); if (_q.y <= 0 || climbDens(_q.x, _q.y, _q.z) >= ISO) { hi = s / nst; break; } }
@@ -3323,7 +3380,7 @@ function climbersSim(dt) {
         if (n) c.n.copy(n);
         else { c.p.copy(sp); climbGrad(c.p, _g); if (_g.lengthSq() > 1e-6) c.n.copy(_g).negate().normalize(); else c.n.set(0, 1, 0); }
       }
-      if (slopeOf(c.n) <= limitOf(c) + (c.relax || 0) || c.p.y <= 0.01) { c.state = 'walk'; c.v.set(0, 0, 0); c.rethink = 0; c.slides = 0; c.stuck = 0; }
+      if (slopeOf(c.n) <= limitOf(c) + (c.relax || 0) || c.p.y <= 0.01) { c.state = 'walk'; c.v.set(0, 0, 0); c.rethink = 0; c.slides = 0; c.stuck = 0; c.route = c.plan = c.dest = null; }
       else {
         // too steep for them: slide down it (and off, if it's a roof)
         c.slides = (c.slides || 0) + 1;
@@ -3334,23 +3391,47 @@ function climbersSim(dt) {
       continue;
     }
     // walking / climbing along the surface
+    if (c.rest > 0 && climbDens(c.p.x - c.n.x * VS, c.p.y - c.n.y * VS, c.p.z - c.n.z * VS) < ISO) c.rest = 0;   // the clay under them got carved away
+    if (c.rest > 0) { c.rest -= dt; const st = Math.round((c.phase - Math.PI / 2) / Math.PI) * Math.PI + Math.PI / 2; c.phase += (st - c.phase) * Math.min(1, dt * 8); continue; }
+    if (!c.route) {
+      if (!c.plan) { c.goalWait = (c.goalWait || 0) - dt; if (c.goalWait <= 0) planStart(c); }
+      else if (CLM.planFree > 0 || performance.now() < CLM.planUntil) { CLM.planFree--; planProbe(c); }
+    }
+    if (c.route) {
+      let wp = c.route[c.ri];
+      while (c.ri + 1 < c.route.length && c.p.distanceTo(c.route[c.ri + 1]) < c.p.distanceTo(wp)) wp = c.route[++c.ri];   // cut corners
+      if (c.p.distanceTo(wp) < H * 0.6) {
+        c.ri++; c.goalT = 0;
+        if (c.ri >= c.route.length) {
+          // made it: catch their breath (and a little hop if they climbed to the top), then plan somewhere new
+          c.rest = 0.8 + Math.random() * 2; c.arrived = (c.arrived || 0) + 1; c.route = null;
+          if (c.goalTop) { c.state = 'fall'; c.v.set(0, H * 2.2, 0); c.air = 0; }
+          continue;
+        }
+        wp = c.route[c.ri];
+      }
+      if ((c.goalT += dt) > 5 || c.stuck > 2) { c.route = null; c.dest = null; c.stuck = 0; c.goalWait = 0.2; c.gaveUp = (c.gaveUp || 0) + 1; }   // lost the way: plan again
+      else { c.head.subVectors(wp, c.p); if (c.head.lengthSq() > 1e-8) c.head.normalize(); c.rethink = 1; }
+    }
     c.rethink -= dt; if (c.rethink <= 0) climberThink(c, H);
     if (c.relax) c.relax = Math.max(0, c.relax - dt * 15);
     if (c.stuck > 4) { c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H); c.stuck = 0; continue; }
     const sl = slopeOf(c.n), wall = clamp((sl - 35) / 45, 0, 1), speed = H * (1.25 - 0.9 * wall) * (c.pref < 20 ? 1.3 : 1);
-    const dir = _t.copy(c.head).addScaledVector(c.n, -c.n.dot(c.head)); if (dir.lengthSq() < 1e-6) { c.rethink = 0; continue; } dir.normalize();
+    const dir = c.route ? _t.subVectors(c.route[c.ri], c.p) : _t.copy(c.head).addScaledVector(c.n, -c.n.dot(c.head)); if (dir.lengthSq() < 1e-6) { c.rethink = 0; continue; } dir.normalize();
     const old = c.p.clone();
     c.p.addScaledVector(dir, speed * dt);
+    if (!onMat(c.p, H) && !onMat(old, H)) keepOnMat(c.p, H);   // already over the line (placed there): ease back in
+    else if (!onMat(c.p, H)) { c.p.copy(old); c.head.set(-c.p.x, 0, -c.p.z); if (c.head.lengthSq() > 1e-6) c.head.normalize(); else c.head.set(1, 0, 0); c.rethink = 0; continue; }
     const n = toSurface(c.p, _nq);
     if (!n || slopeOf(n) > limitOf(c) + 10 + (c.relax || 0)) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; if (!toSurface(c.p, _nq)) { c.state = 'fall'; c.v.set(0, 0, 0); } continue; }
-    c.n.lerp(n, 0.5).normalize(); c.head.copy(dir);
+    _h.copy(c.n); c.n.lerp(n, 0.5).normalize(); c.head.copy(dir).applyQuaternion(_qt2.setFromUnitVectors(_h, c.n));
     c.phase += old.distanceTo(c.p) / (H * 0.55) * Math.PI;
   }
   // personal space
   for (let a = 0; a < CLM.list.length; a++) for (let b = a + 1; b < CLM.list.length; b++) {
     const A = CLM.list[a], B = CLM.list[b]; if (A.state !== 'walk' || B.state !== 'walk') continue;
     const H = (climberH(A) + climberH(B)) / 2, d = A.p.distanceTo(B.p); if (d > H * 0.45 || d < 1e-4) continue;
-    const push = _q.copy(A.p).sub(B.p).multiplyScalar((H * 0.45 - d) / d * 0.25); A.p.add(push); B.p.sub(push);
+    const push = _q.copy(A.p).sub(B.p).multiplyScalar((H * 0.45 - d) / d * 0.25); keepOnMat(A.p.add(push), climberH(A)); keepOnMat(B.p.sub(push), climberH(B));
   }
 }
 // ---- drawing: spheres for joints and head, cylinders for limbs, all in two instanced meshes
@@ -3635,7 +3716,7 @@ renderer.setAnimationLoop(() => {
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
