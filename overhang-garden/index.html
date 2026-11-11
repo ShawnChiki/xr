@@ -54,7 +54,7 @@
 <button id="vrBtn">Enter VR</button>
 <button id="mrBtn">Enter MR</button>
 <div id="panelWrap"></div>
-<div id="hud">Left-drag sculpt · Right-drag orbit · Shift+right-drag pan · Wheel zoom<br>A add · C carve · S smooth · F flatten · B bridge · T texture · 1–5 shapes · [ ] size · Z undo · Y redo</div>
+<div id="hud">Left-drag sculpt · Right-drag orbit · Shift+right-drag pan · Wheel zoom<br>A add · C carve · S smooth · F flatten · B bridge · P paint · L climbers · 1–5 shapes · [ ] size · Z undo · Y redo</div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -73,14 +73,14 @@ const SHAPES = ['Sphere', 'Cube', 'Cone', 'Cylinder', 'Torus'];
 const BOUND = [1.0, 1.45, 1.45, 1.45, 1.05];
 // sculpting together: room state (filled in by the "Together" code further down)
 const NET = { host: false, code: '', peer: null, conns: {}, conn: null, on: false, test: /[?&]nettest/.test(location.search), ice: null };
-const SYNC = { synced: false, me: '', col: 0, touched: new Map(), lsig: new Map(), stSig: '', stVer: 0, deleted: new Set(), lyVer: 0, lastTick: 0, lastMe: 0, busy: false, rq: Promise.resolve(), peers: new Map(), status: '', entry: '' };
+const SYNC = { synced: false, me: '', col: 0, touched: new Map(), ptouched: new Map(), lsig: new Map(), stSig: '', stVer: 0, deleted: new Set(), lyVer: 0, lastTick: 0, lastMe: 0, busy: false, rq: Promise.resolve(), peers: new Map(), status: '', entry: '' };
 let netApplying = false;
 const PEERC = ['#ff6f5e', '#4fa3ff', '#ffc93c', '#9b6dff', '#5fd3a6'];
-const ACC = '#7cf0b2', CARVE = '#ff7a6b', SMOOTH = '#7ab8ff', BRIDGEC = '#ffd166', TEXC = '#c58cff', FLATC = '#5fd3d3';
+const ACC = '#7cf0b2', CARVE = '#ff7a6b', SMOOTH = '#7ab8ff', BRIDGEC = '#ffd166', TEXC = '#c58cff', FLATC = '#5fd3d3', PAINTC = '#ff8fcf', CLIMBC = '#ffb35c';
 const SCALE_MIN = 0.0003, SCALE_MAX = 0.1;
 
 const ST = {
-  tool: 'add', lastTool: 'add', shape: 0, brushVR: 0.06, mirror: false, pressure: true, carveAll: true, autoSmooth: 0.3,
+  tool: 'add', lastTool: 'add', shape: 0, brushVR: 0.06, mirror: false, pressure: true, carveAll: true, paintIdx: 5, autoSmooth: 0.3,
   tex: { pattern: 0, depth: 1.2, scale: 6 },
   sup: { auto: true, stripes: true, seeThrough: false, plateOnly: false, angle: 35, bridge: 5, maxBridge: 40, branchAngle: 40, branchD: 4, tipD: 3, spacing: 7, brim: true, brimW: 6, brimJoin: 14, style: 'fused', footFlare: true },
 };
@@ -223,8 +223,12 @@ class Layer {
     this.material = makeClayMaterial(PALETTE[colorIdx], !auto);
     this.bridge = false; this.beams = []; this.beamMeshes = [];   // bridge layers hold clean beams instead of clay
     this.uid = Math.random().toString(36).slice(2, 10);            // same on every headset in a shared room
+    this.paint = new Map();                                         // painted color per voxel (palette index + 1, 0 = layer color)
   }
-  setColor(ci) { this.colorIdx = ci; this.material.color.set(PALETTE[ci]); }
+  setColor(ci) {
+    this.colorIdx = ci;
+    if (this.painted) { for (const k of this.chunks.keys()) this.dirty.add(k); } else this.material.color.set(PALETTE[ci]);
+  }
   rebuildBeams() {
     for (const m of this.beamMeshes) { this.group.remove(m); m.geometry.dispose(); }
     this.beamMeshes = this.beams.map(b => { const m = new THREE.Mesh(beamGeometry(b), this.material); placeBeam(m, b); this.group.add(m); return m; });
@@ -434,6 +438,56 @@ function stampTexture(L, cx, cy, cz, r, rec) {
     return Math.abs(nv - cur) < 1e-4 ? undefined : nv;
   }, rec, true);
 }
+// ───────────────────────── paint: a color per voxel, blended onto the mesh as vertex colors
+function startPainting(L) {
+  if (L.painted) return;
+  L.painted = true; L.material.vertexColors = true; L.material.color.set('#ffffff'); L.material.needsUpdate = true;
+  const base = new THREE.Color(PALETTE[L.colorIdx]);
+  for (const mesh of L.meshes.values()) {                           // give existing meshes the plain layer color right away
+    const n = mesh.geometry.attributes.position.count, c = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) { c[i * 3] = base.r; c[i * 3 + 1] = base.g; c[i * 3 + 2] = base.b; }
+    mesh.geometry.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  }
+}
+function paintDirty(L, key) { startPainting(L); const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0; markDirtyRange(L, cx * 16, cx * 16 + 15, cy * 16, cy * 16 + 15, cz * 16, cz * 16 + 15); paintTouch(L, key); }
+function getP(L, i, j, k) {
+  if (i < 0 || j < 0 || k < 0 || i >= N || j >= N || k >= N) return 0;
+  const ch = L.paint.get((i >> 4) + NC * ((j >> 4) + NC * (k >> 4))); return ch ? ch[(i & 15) + 16 * ((j & 15) + 16 * (k & 15))] : 0;
+}
+// paint every visible clay layer the brush touches; idx is a palette index + 1, or 0 to take paint off
+function stampPaint(L, cx, cy, cz, r, idx, rec) {
+  const R = r + VS * 0.5, [i0, i1, j0, j1, k0, k1] = voxBox(cx - R, cx + R, cy - R, cy + R, cz - R, cz + R), touched = new Set();
+  for (let k = k0; k <= k1; k++) for (let j = Math.max(1, j0); j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    if (Math.hypot(vx(i) - cx, vy(j) - cy, vz(k) - cz) > r || getD(L, i, j, k) < 0.12) continue;
+    const key = (i >> 4) + NC * ((j >> 4) + NC * (k >> 4)), li = (i & 15) + 16 * ((j & 15) + 16 * (k & 15));
+    let pc = L.paint.get(key);
+    if (!pc) { if (!idx) continue; if (rec) { let m = rec.psaves.get(L); if (!m) rec.psaves.set(L, m = new Map()); if (!m.has(key)) m.set(key, null); } pc = new Uint8Array(4096); L.paint.set(key, pc); }
+    if (pc[li] === idx) continue;
+    if (rec) { let m = rec.psaves.get(L); if (!m) rec.psaves.set(L, m = new Map()); if (!m.has(key)) m.set(key, pc.slice()); }
+    pc[li] = idx; touched.add(key);
+  }
+  for (const key of touched) paintDirty(L, key);
+  return touched.size > 0;
+}
+const _pc = new THREE.Color();
+const PALC = PALETTE.map(h => new THREE.Color(h));
+// vertex colors for a painted layer's chunk: each vertex blends the paint of the solid voxels around it
+function paintColors(L, P, nv) {
+  const out = new Float32Array(nv * 3), base = PALC[L.colorIdx];
+  for (let v = 0; v < nv; v++) {
+    const fx = ix(P[v * 3]), fy = Math.max(1, iy(P[v * 3 + 1])), fz = iz(P[v * 3 + 2]);
+    const i = Math.floor(fx), j = Math.floor(fy), k = Math.floor(fz), tx = fx - i, ty = fy - j, tz = fz - k;
+    let r = 0, g = 0, b = 0, ws = 0;
+    for (let c = 0; c < 8; c++) {
+      const a = c & 1, bb = (c >> 1) & 1, d = c >> 2, ii = i + a, jj = j + bb, kk = k + d;
+      const w = (a ? tx : 1 - tx) * (bb ? ty : 1 - ty) * (d ? tz : 1 - tz) * (getD(L, ii, jj, kk) + 0.05);
+      const p = getP(L, ii, jj, kk), col = p ? PALC[p - 1] : base;
+      r += col.r * w; g += col.g * w; b += col.b * w; ws += w;
+    }
+    ws = ws || 1; out[v * 3] = r / ws; out[v * 3 + 1] = g / ws; out[v * 3 + 2] = b / ws;
+  }
+  return out;
+}
 // flatten: when a stroke starts it finds the plane of the surface under the brush, then shaves bumps down to
 // that plane and fills dips up to it (like ZBrush's flatten)
 function surfacePlane(L, cx, cy, cz, r) {
@@ -482,10 +536,14 @@ function clayNear(p, rad) {
 // ───────────────────────── undo / strokes
 const undoStack = [], redoStack = [];
 let editCount = 0;
-const newRec = () => ({ saves: new Map(), bsaves: new Map() });
-const recSize = (rec) => { let n = rec.bsaves ? rec.bsaves.size : 0; for (const m of rec.saves.values()) n += m.size; return n; };
+const newRec = () => ({ saves: new Map(), bsaves: new Map(), psaves: new Map() });
+const recSize = (rec) => { let n = rec.bsaves ? rec.bsaves.size : 0; for (const m of rec.saves.values()) n += m.size; if (rec.psaves) for (const m of rec.psaves.values()) n += m.size; return n; };
 function snapBeams(rec, L) { if (rec && !rec.bsaves.has(L)) rec.bsaves.set(L, L.beams.slice()); }
 function applySwap(rec) {
+  if (rec.psaves) for (const [L, m] of rec.psaves) {
+    if (!layers.includes(L)) continue;
+    for (const [key, arr] of m) { const cur = L.paint.get(key) || null; if (arr) L.paint.set(key, arr); else L.paint.delete(key); m.set(key, cur); paintDirty(L, key); }
+  }
   if (rec.bsaves) for (const [L, arr] of rec.bsaves) { if (!layers.includes(L)) continue; const cur = L.beams; L.beams = arr; rec.bsaves.set(L, cur); L.rebuildBeams(); }
   for (const [L, m] of rec.saves) {
     if (!layers.includes(L)) continue;
@@ -504,6 +562,11 @@ function afterEdit() { editCount++; supNeed = true; lastEditAt = performance.now
 
 const stroke = { active: false, rec: null, targets: [], last: new THREE.Vector3(), hasLast: false, lastHaptic: 0 };
 function strokeTargets() {
+  if (ST.tool === 'paint') {
+    const t = layers.filter(l => !l.auto && !l.bridge && l.visible && !l.locked);
+    if (!t.length) toast('Every layer is hidden or locked');
+    return t;
+  }
   if (ST.tool === 'carve' && ST.carveAll) {
     const t = layers.filter(l => !l.auto && !l.bridge && l.visible && !l.locked);
     if (!t.length) toast('Every layer is hidden or locked');
@@ -555,6 +618,9 @@ function strokeApply(c, m, rmm) {
       const pl = stroke.plane;
       changed = stampFlatten(L, p.x, p.y, p.z, rmm, pl, stroke.rec) || changed;
       if (mm) changed = stampFlatten(L, -p.x, p.y, p.z, rmm, { px: -pl.px, py: pl.py, pz: pl.pz, nx: -pl.nx, ny: pl.ny, nz: pl.nz }, stroke.rec) || changed;
+    } else if (tool === 'paint') {
+      changed = stampPaint(L, p.x, p.y, p.z, rmm, ST.paintIdx, stroke.rec) || changed;
+      if (mm) changed = stampPaint(L, -p.x, p.y, p.z, rmm, ST.paintIdx, stroke.rec) || changed;
     } else if (tool === 'texture') {
       changed = stampTexture(L, p.x, p.y, p.z, rmm, stroke.rec) || changed;
       if (mm) changed = stampTexture(L, -p.x, p.y, p.z, rmm, stroke.rec) || changed;
@@ -891,6 +957,7 @@ function meshChunk(L, key) {
   geo.setAttribute('position', new THREE.BufferAttribute(VP.slice(0, nv * 3), 3));
   geo.setAttribute('normal', new THREE.BufferAttribute(VN.slice(0, nv * 3), 3));
   geo.setIndex(new THREE.BufferAttribute(IDX.slice(0, ni), 1));
+  if (L.painted) geo.setAttribute('color', new THREE.BufferAttribute(paintColors(L, VP, nv), 3));
   geo.computeBoundingSphere(); geo.computeBoundingBox();
   let mesh = L.meshes.get(key);
   if (mesh) { mesh.geometry.dispose(); mesh.geometry = geo; }
@@ -2004,22 +2071,26 @@ function drawUI() {
   txt('OVERHANG GARDEN', X, 52, 30, ACC, 'left', 900);
   txt(scaleLabel(), UIW - 36, 40, 24, '#9aa3b2', 'right', 600);
   txt(dimsLabel(), UIW - 36, 72, 24, '#9aa3b2', 'right', 600);
-  const HEAD = { brush: ['Brush', 'Sculpt, carve, bridge and texture the clay'], layers: ['Layers', 'Pick a layer to sculpt on, recolor, hide or merge'], supports: ['Supports', 'What needs help, how branches grow, and the brim'], slice: ['Slice', 'Watch the print build up one layer at a time'], scene: ['Scene', 'View, saves and export'], together: ['Together', 'Sculpt the same bed live with friends in a room'] }[UIS.tab];
+  const HEAD = { brush: ['Brush', 'Sculpt, carve, bridge, paint, and place climbers'], layers: ['Layers', 'Pick a layer to sculpt on, recolor, hide or merge'], supports: ['Supports', 'What needs help, how branches grow, and the brim'], slice: ['Slice', 'Watch the print build up one layer at a time'], scene: ['Scene', 'View, saves and export'], together: ['Together', 'Sculpt the same bed live with friends in a room'] }[UIS.tab];
   txt(HEAD[0], X, 126, 46, '#e9ecf1', 'left', 900);
   txt(HEAD[1], X, 172, 26, '#7f8896', 'left', 500);
   if (UIS.tab === 'brush') {
     txt('Tool', X, 244, 30, '#9aa3b2', 'left', 700);
-    const tools = [['add', 'Add', ACC], ['carve', 'Carve', CARVE], ['smooth', 'Smooth', SMOOTH], ['flatten', 'Flatten', FLATC], ['bridge', 'Bridge', BRIDGEC], ['texture', 'Texture', TEXC]];
-    tools.forEach((t, i) => button(X + i * 161, 270, 150, 96, t[1], { on: ST.tool === t[0], accent: t[2], fs: 27, click: () => { ST.tool = t[0]; if (t[0] === 'add' || t[0] === 'carve') ST.lastTool = t[0]; updateGhost(); } }));
+    const tools = [['add', 'Add', ACC], ['carve', 'Carve', CARVE], ['smooth', 'Smooth', SMOOTH], ['flatten', 'Flatten', FLATC], ['bridge', 'Bridge', BRIDGEC], ['paint', 'Paint', PAINTC], ['climb', 'Climbers', CLIMBC]];
+    tools.forEach((t, i) => button(X + i * 138, 270, 128, 96, t[1], { on: ST.tool === t[0], accent: t[2], fs: 24, click: () => { ST.tool = t[0]; if (t[0] === 'add' || t[0] === 'carve') ST.lastTool = t[0]; updateGhost(); } }));
     const tool = ST.tool;
-    if (tool === 'texture') {
-      txt('Pattern', X, 404, 30, '#9aa3b2', 'left', 700);
-      TEXTURES.forEach((n, i) => {
-        const bx = X + i * 194, on = ST.tex.pattern === i;
-        button(bx, 430, 180, 156, '', { on, accent: TEXC, click: () => { ST.tex.pattern = i; } });
-        ui.drawImage(texPreview(i), bx + 30, 444, 120, 96);
-        txt(n, bx + 90, 564, 26, on ? '#111317' : '#cfd6e0', 'center', 700);
+    if (tool === 'climb') {
+      drawClimberPanel(X, FW);
+    } else if (tool === 'paint') {
+      txt('Paint color', X, 404, 30, '#9aa3b2', 'left', 700);
+      PALETTE.forEach((hex, i) => {
+        const bx = X + (i % 6) * 128, by = 432 + Math.floor(i / 6) * 84, on = ST.paintIdx === i + 1;
+        ui.fillStyle = hex; rr(bx, by, 112, 70, 16); ui.fill();
+        if (on) { ui.lineWidth = 6; ui.strokeStyle = '#ffffff'; rr(bx, by, 112, 70, 16); ui.stroke(); }
+        W.push({ x: bx, y: by, w: 112, h: 70, click: () => { ST.paintIdx = i + 1; updateGhost(); } });
       });
+      button(X + 776, 432, 176, 154, 'Rub off', { on: ST.paintIdx === 0, fs: 28, click: () => { ST.paintIdx = 0; updateGhost(); } });
+      txt('Paints whatever clay the brush touches, on every shown layer.', X, 612, 24, '#7f8896', 'left', 500);
     } else if (tool === 'bridge' && BE.on) {
       txt('Editing bridge', X, 404, 30, '#9aa3b2', 'left', 700);
       txt(beWhy(), X, 446, 28, BE.chk && BE.chk.ok ? ACC : '#ff8a8a', 'left', 800);
@@ -2045,11 +2116,9 @@ function drawUI() {
     const rmm = brushMM();
     if (tool === 'bridge' && BE.on) {
       slider(X, 652, FW, 'Width', (BE.d.hw * 2 - 2) / 38, `${(BE.d.hw * 2).toFixed(1)} mm`, (u) => beSlide(d => { d.hw = (2 + u * 38) / 2; }));
-    } else slider(X, 652, FW, tool === 'bridge' ? 'Beam width' : 'Brush size', Math.log(rmm) / Math.log(80), `${(tool === 'bridge' ? rmm * 2 : rmm).toFixed(1)} mm`, (u) => { ST.brushVR = Math.pow(80, u) * S(); }, 'Stays with your hand when you scale the world');
-    if (tool === 'texture') {
-      const dep = ST.tex.depth;
-      slider(X, 774, FW, 'Depth', Math.log(dep / 0.01) / Math.log(300), `${dep < 1 ? dep.toFixed(2) : dep.toFixed(1)} mm`, (u) => { ST.tex.depth = +(0.01 * Math.pow(300, u)).toFixed(u < 0.4 ? 3 : 2); });
-      slider(X, 862, FW, 'Pattern size', (ST.tex.scale - 3) / 11, `${ST.tex.scale.toFixed(0)} mm`, (u) => { ST.tex.scale = Math.round(3 + u * 11); TEXPREV.length = 0; });
+    } else if (tool !== 'climb') slider(X, 652, FW, tool === 'bridge' ? 'Beam width' : 'Brush size', Math.log(rmm) / Math.log(80), `${(tool === 'bridge' ? rmm * 2 : rmm).toFixed(1)} mm`, (u) => { ST.brushVR = Math.pow(80, u) * S(); }, 'Stays with your hand when you scale the world');
+    if (tool === 'climb') {
+      // the climber panel draws its own sliders
     } else if (tool === 'bridge' && BE.on) {
       slider(X, 782, FW, 'Thickness', (BE.d.hh * 2 - 2) / 28, `${(BE.d.hh * 2).toFixed(1)} mm`, (u) => beSlide(d => { const yb = d.ay - d.hh; d.hh = (2 + u * 28) / 2; d.ay = d.by = yb + d.hh; }), 'The bottom stays put; the top grows');
     } else if (tool === 'bridge') {
@@ -2241,7 +2310,7 @@ function clearLayer(L) {
     const rec = newRec(); snapBeams(rec, L); L.beams = []; L.rebuildBeams(); pushUndo(rec); toast(`Cleared ${L.name}`); return;
   }
   if (!L || !L.chunks.size) return;
-  const m = new Map(L.chunks), rec = { saves: new Map([[L, m]]), bsaves: new Map() };
+  const m = new Map(L.chunks), rec = { saves: new Map([[L, m]]), bsaves: new Map(), psaves: new Map() };
   for (const key of [...L.chunks.keys()]) { L.chunks.delete(key); markChunkDirty(L, key); }
   pushUndo(rec); toast(`Cleared ${L.name}`);
 }
@@ -2256,6 +2325,17 @@ function mergeLayer(L) {
   if (L && L.bridge) return toast('Bridges stay on their own layer');
   const u = clayLayers(), i = u.indexOf(L), T = u[i - 1] || u[i + 1];
   if (!L || !T) return toast('Add another clay layer to merge with');
+  if (L.paint.size || T.paint.size) {
+    // paint follows whichever layer's clay wins at each voxel
+    for (const [key, ch] of L.chunks) {
+      const t = T.chunks.get(key), lp = L.paint.get(key), tp = T.paint.get(key);
+      if (!lp && !tp) continue;
+      const out = tp ? tp.slice() : new Uint8Array(4096);
+      for (let q = 0; q < 4096; q++) if (ch[q] > (t ? t[q] : 0)) out[q] = lp ? lp[q] : 0;
+      T.paint.set(key, out);
+    }
+    startPainting(T);
+  }
   for (const [key, ch] of L.chunks) {
     const t = T.chunks.get(key);
     if (!t) T.chunks.set(key, ch.slice()); else for (let q = 0; q < 4096; q++) if (ch[q] > t[q]) t[q] = ch[q];
@@ -2293,9 +2373,9 @@ const ghost = new THREE.Mesh(ghostGeos[0], ghostMat); const ghostW = new THREE.M
 ghost.visible = false; modelRoot.add(ghost);
 const ghostMirror = ghost.clone(); ghostMirror.material = ghostMat; modelRoot.add(ghostMirror); ghostMirror.visible = false;
 function updateGhost() {
-  const col = { add: ACC, carve: CARVE, smooth: SMOOTH, flatten: FLATC, bridge: BRIDGEC, texture: TEXC }[ST.tool];
+  const col = { add: ACC, carve: CARVE, smooth: SMOOTH, flatten: FLATC, bridge: BRIDGEC, texture: TEXC, paint: ST.paintIdx ? PALETTE[ST.paintIdx - 1] : '#ffffff', climb: CLIMBC }[ST.tool];
   ghostMat.color.set(col); ghostWire.color.set(col);
-  const g = ghostGeos[ST.tool === 'bridge' || ST.tool === 'texture' || ST.tool === 'flatten' ? 0 : ST.shape];
+  const g = ghostGeos[ST.tool === 'bridge' || ST.tool === 'texture' || ST.tool === 'flatten' || ST.tool === 'paint' || ST.tool === 'climb' ? 0 : ST.shape];
   ghost.geometry = ghostW.geometry = g;
   ghostMirror.geometry = g; ghostMirror.children[0].geometry = g;
   UIS.dirty = true;
@@ -2377,6 +2457,14 @@ function bridgePointFromRay() {
 renderer.domElement.addEventListener('pointerdown', (e) => {
   if (renderer.xr.isPresenting || e.button !== 0) return;
   rayFromEvent(e); desk.depth = sculptHits();
+  if (ST.tool === 'climb') {
+    modelRoot.updateMatrixWorld();
+    const i = climberOnRay(raycaster.ray);
+    if (i >= 0) grabClimber(i);
+    else if (desk.depth < 1e8) placeClimber(deskBrush().c);
+    desk.down = i >= 0; if (desk.down) renderer.domElement.setPointerCapture(e.pointerId);
+    ghost.visible = ghostMirror.visible = false; return;
+  }
   if (ST.tool === 'bridge') {
     if (BE.on) {
       const hit = raycaster.intersectObjects(Object.values(HANDLES), false)[0];
@@ -2402,13 +2490,20 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 renderer.domElement.addEventListener('pointermove', (e) => {
   if (renderer.xr.isPresenting) return;
   rayFromEvent(e); desk.lastEvt = e;
+  if (desk.down && CLM.held >= 0) {
+    // carry it just above whatever clay is under the pointer, or at the same depth in the air
+    const c = CLM.list[CLM.held], d = sculptHits(), H = climberH(c);
+    if (d < 1e8) { desk.depth = d; const p = deskBrush().c; p.y += H * 0.7; moveHeld(p); } else moveHeld(deskBrush().c);
+    return;
+  }
+  if (ST.tool === 'climb' && !desk.down) { ghost.visible = ghostMirror.visible = false; return; }
   if (desk.down && BE.drag) { const p = deskPlanePoint(BE.drag.p0, desk.beVertical); if (p) beDragTo(p, desk.beVertical); return; }
   if (desk.down && bridge.active) { const p = bridgePointFromRay(); if (p) bridgeUpdate(p); return; }
   if (BE.on && !desk.down) { const hit = raycaster.intersectObjects(Object.values(HANDLES), false)[0], k = hit ? hit.object.userData.kind : null; if (k !== BE.hover) { BE.hover = k; beRefresh(); } }
   if (desk.down) { const { c, q } = deskBrush(); strokeApply(c, quatToInvM(q, Mbuf), brushMM()); placeGhost(c, q, brushMM(), true); }
   else { desk.depth = sculptHits(); const { c, q } = deskBrush(); placeGhost(c, q, brushMM(), true); }
 });
-renderer.domElement.addEventListener('pointerup', (e) => { if (!desk.down) return; desk.down = false; if (BE.drag) beDragEnd(); else if (bridge.active) bridgeEnd(); else strokeEnd(); });
+renderer.domElement.addEventListener('pointerup', (e) => { if (!desk.down) return; desk.down = false; if (CLM.held >= 0) { dropHeld(); return; } if (BE.drag) beDragEnd(); else if (bridge.active) bridgeEnd(); else strokeEnd(); });
 // a point on a flat plane through p0 (in the bed's space): level, or upright facing you
 function deskPlanePoint(p0, vertical) {
   const wp = modelRoot.localToWorld(p0.clone()), up = new THREE.Vector3(0, 1, 0).applyQuaternion(modelRoot.quaternion);
@@ -2424,7 +2519,7 @@ window.addEventListener('keydown', (e) => {
   if (k === 'z') undo(); else if (k === 'y') redo();
   if (BE.on && (k === 'enter' || k === 'escape')) beExit(false);
   if (BE.on && (k === 'delete' || k === 'backspace')) beDelete();
-  else if (k === 'a') { ST.tool = 'add'; updateGhost(); } else if (k === 'c') { ST.tool = 'carve'; updateGhost(); } else if (k === 's') { ST.tool = 'smooth'; updateGhost(); } else if (k === 'b') { ST.tool = 'bridge'; updateGhost(); } else if (k === 't') { ST.tool = 'texture'; updateGhost(); } else if (k === 'f') { ST.tool = 'flatten'; updateGhost(); }
+  else if (k === 'a') { ST.tool = 'add'; updateGhost(); } else if (k === 'c') { ST.tool = 'carve'; updateGhost(); } else if (k === 's') { ST.tool = 'smooth'; updateGhost(); } else if (k === 'b') { ST.tool = 'bridge'; updateGhost(); } else if (k === 'p') { ST.tool = 'paint'; updateGhost(); } else if (k === 'l') { ST.tool = 'climb'; updateGhost(); } else if (k === 'f') { ST.tool = 'flatten'; updateGhost(); }
   else if (k >= '1' && k <= '5') { ST.shape = +k - 1; updateGhost(); }
   else if (k === '[') { ST.brushVR = clamp(brushMM() / 1.15, 1, 80) * S(); UIS.dirty = true; }
   else if (k === ']') { ST.brushVR = clamp(brushMM() * 1.15, 1, 80) * S(); UIS.dirty = true; }
@@ -2550,7 +2645,21 @@ function updateXR(dt) {
   const qModel = brushQ(invRootQ.copy(modelRoot.quaternion).invert().multiply(tmpQ).clone());
   const cModel = modelRoot.worldToLocal(center.clone());
   const rmm = clamp(rVR / S(), 1.0, 80);
-  if (ST.tool === 'bridge' && !onPanel && !uiHeld) {
+  if (ST.tool === 'climb' && !onPanel && !uiHeld) {
+    const r0 = clamp(ST.brushVR / S(), 1.0, 80);
+    if (CLM.held >= 0) {
+      if (trigDown) moveHeld(cModel); else { dropHeld(); pulse(R, 0.25, 30); }
+      placeGhost(cModel, qModel, r0, false);
+    } else {
+      const near = climberNear(cModel, r0 * 0.5);
+      placeGhost(cModel, qModel, Math.min(r0, CLM.size * 0.3), near < 0);
+      if (trigDown) {
+        if (near >= 0) { grabClimber(near); pulse(R, 0.4, 30); }
+        else { placeClimber(cModel); pulse(R, 0.2, 20); }
+        uiHeld = near < 0;
+      }
+    }
+  } else if (ST.tool === 'bridge' && !onPanel && !uiHeld) {
     const r0 = clamp(ST.brushVR / S(), 1.0, 80);
     if (BE.on && BE.drag) {
       placeGhost(cModel, qModel, r0, false);
@@ -2596,18 +2705,26 @@ async function serialize() {
     }
     metaLayers.push({ uid: L.uid, name: L.name, colorIdx: L.colorIdx, visible: L.visible, locked: L.locked, chunks: cnt });
   }
+  for (let li = 0; li < metaLayers.length; li++) {
+    const L = userLayers().find(l => l.uid === metaLayers[li].uid); if (!L || L.bridge || !L.paint.size) continue;
+    let cnt = 0;
+    for (const [key, pc] of L.paint) { let any = false; for (let i = 0; i < 4096; i++) if (pc[i]) { any = true; break; } if (!any) continue;
+      const buf = new Uint8Array(4098); buf[0] = key & 255; buf[1] = key >> 8; buf.set(pc, 2); parts.push(buf); cnt++; total += 4098; }
+    metaLayers[li].paint = cnt;
+  }
   const raw = new Uint8Array(total); let o = 0; for (const p of parts) { raw.set(p, o); o += p.length; }
   let data = raw, z = false;
   if (typeof CompressionStream !== 'undefined') { try { data = await zipStream(raw, CompressionStream, 'deflate'); z = true; } catch (e) { } }
-  return { meta: { v: 1, z, layers: metaLayers, active: userLayers().indexOf(activeLayer), sup: ST.sup, supColor: supLayer ? supLayer.colorIdx : 3, smooth: ST.autoSmooth }, data: b64(data) };
+  return { meta: { v: 1, z, climbers: climbersState(), layers: metaLayers, active: userLayers().indexOf(activeLayer), sup: ST.sup, supColor: supLayer ? supLayer.colorIdx : 3, smooth: ST.autoSmooth }, data: b64(data) };
 }
 async function deserialize(meta, str) {
   let data = unb64(str);
   if (meta.z) data = await zipStream(data, DecompressionStream, 'deflate');
   for (const L of layers) L.dispose();
   layers.length = 0; undoStack.length = 0; redoStack.length = 0; layerSeq = 1; supLayer = null;
-  let o = 0;
+  let o = 0; const made = [];
   for (const ml of meta.layers) {
+    made.push(null);
     if (ml.bridge) {
       const B = addBridgeLayer(ml.name); if (ml.uid) B.uid = ml.uid; B.setColor(ml.colorIdx | 0); B.visible = ml.visible; B.locked = ml.locked; B.group.visible = B.visible;
       B.beams = (ml.beams || []).map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6], v: a[7] || 1 })); B.rebuildBeams();
@@ -2619,7 +2736,13 @@ async function deserialize(meta, str) {
       for (let i = 0; i < 4096; i++) ch[i] = data[o + 2 + i] / 255;
       o += 4098; L.chunks.set(key, ch); markChunkDirty(L, key);
     }
+    made[made.length - 1] = L;
   }
+  meta.layers.forEach((ml, li) => {
+    const L = made[li]; if (!L || !ml.paint) return;
+    for (let c = 0; c < ml.paint; c++) { const key = data[o] | (data[o + 1] << 8); L.paint.set(key, data.slice(o + 2, o + 4098)); o += 4098; }
+    startPainting(L); for (const k of L.chunks.keys()) L.dirty.add(k);
+  });
   if (!clayLayers().length) addLayer('Layer 1', 0);
   activeLayer = layers[clamp(meta.active | 0, 0, layers.length - 1)];
   if (!activeLayer || activeLayer.auto) activeLayer = clayLayers()[0];
@@ -2627,6 +2750,7 @@ async function deserialize(meta, str) {
   if (meta.sup) { for (const k of Object.keys(ST.sup)) if (meta.sup[k] !== undefined) ST.sup[k] = meta.sup[k]; overU.uShowOver.value = ST.sup.stripes ? 1 : 0; }
   ensureSupLayer(); applySeeThrough(); if (meta.supColor !== undefined) supLayer.setColor(meta.supColor);
   if (typeof meta.smooth === 'number') ST.autoSmooth = meta.smooth;
+  if (meta.climbers) loadClimbers(meta.climbers);
   afterEdit(); autosaveDue = 0; UIS.dirty = true;
 }
 const docPath = (id) => `data/users/${cloud.uid}/${id}`;
@@ -2738,7 +2862,7 @@ function netReset() {
   for (const id in NET.conns) try { NET.conns[id].close(); } catch (e) {}
   try { NET.conn && NET.conn.close(); } catch (e) {} try { NET.peer && NET.peer.destroy(); } catch (e) {}
   Object.assign(NET, { host: false, code: '', peer: null, conns: {}, conn: null, on: false });
-  SYNC.synced = false; SYNC.touched.clear(); SYNC.lsig.clear(); SYNC.stSig = ''; SYNC.deleted.clear();
+  SYNC.synced = false; SYNC.touched.clear(); SYNC.ptouched.clear(); SYNC.lsig.clear(); SYNC.stSig = ''; SYNC.deleted.clear();
   for (const p of SYNC.peers.values()) dropMarker(p); SYNC.peers.clear(); UIS.dirty = true;
 }
 function sendTo(pid, m) { const c = NET.conns[pid]; if (c) try { c.send(m); } catch (e) {} }
@@ -2801,6 +2925,26 @@ async function unpackChunks(m) {
   }
   return out;
 }
+function paintTouch(L, key) {
+  if (!NET.on || netApplying || !L || L.auto) return;
+  let set = SYNC.ptouched.get(L); if (!set) SYNC.ptouched.set(L, set = new Set()); set.add(key);
+}
+async function packPaint(uid, keys, L) {
+  const buf = new Uint8Array(4 + keys.length * 4099), dv = new DataView(buf.buffer); dv.setUint32(0, keys.length, true); let o = 4;
+  for (const key of keys) { const pc = L.paint.get(key); dv.setUint16(o, key, true); buf[o + 2] = pc ? 1 : 0; if (pc) buf.set(pc, o + 3); o += 4099; }
+  let data = buf, z = false;
+  if (typeof CompressionStream !== 'undefined') { try { data = await zipStream(buf, CompressionStream, 'deflate'); z = true; } catch (e) { } }
+  return { t: 'pc', u: uid, z, d: b64(data) };
+}
+async function applyPaint(m) {
+  if (m.from === SYNC.me) return;
+  const L = layers.find(l => l.uid === m.u && !l.auto); if (!L) return;
+  let buf = unb64(m.d); if (m.z) buf = await zipStream(buf, DecompressionStream, 'deflate');
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength), n = dv.getUint32(0, true); let o = 4;
+  netApplying = true;
+  for (let c = 0; c < n; c++) { const key = dv.getUint16(o, true); if (buf[o + 2]) L.paint.set(key, buf.slice(o + 3, o + 4099)); else L.paint.delete(key); o += 4099; paintDirty(L, key); }
+  netApplying = false;
+}
 function netTouch(L, key) {
   if (!NET.on || netApplying || !L || L.auto || L.bridge) return;
   let set = SYNC.touched.get(L); if (!set) SYNC.touched.set(L, set = new Set()); set.add(key);
@@ -2840,6 +2984,11 @@ function netTick(now) {
     if (SYNC.lsig.get(L.uid) !== sg) { SYNC.lsig.set(L.uid, sg); L.netLv = (L.netLv || 0) + 1; netSend({ t: 'lp', v: L.netLv, i, ...d }); }
   });
   for (const u of [...SYNC.lsig.keys()]) if (!seen.has(u)) { SYNC.lsig.delete(u); SYNC.deleted.add(u); netSend({ t: 'ld', u }); }
+  if (SYNC.ptouched.size) {
+    const pb = []; for (const [L, keys] of SYNC.ptouched) if (layers.includes(L)) pb.push([L, [...keys]]);
+    SYNC.ptouched.clear();
+    (async () => { for (const [L, keys] of pb) for (let s = 0; s < keys.length; s += 40) netSend(await packPaint(L.uid, keys.slice(s, s + 40), L)); })();
+  }
   if (!SYNC.touched.size) return;
   const batches = [];
   for (const [L, keys] of SYNC.touched) if (layers.includes(L)) { const items = diffChunks(L, keys, false); if (items.length) batches.push([L, items]); }
@@ -2853,6 +3002,7 @@ async function hostWelcome(pid) {
   sendTo(pid, { t: 'welcome', you: pid, col });
   sendTo(pid, { t: 'ly', v: 0, from: 'host', ...layersState() });
   for (const L of userLayers()) if (!L.bridge) { const items = diffChunks(L, [...L.chunks.keys()], true); if (items.length) await sendChunks(L, items, pid); }
+  for (const L of userLayers()) if (!L.bridge && L.paint.size) { const keys = [...L.paint.keys()]; for (let s = 0; s < keys.length; s += 40) { const m = await packPaint(L.uid, keys.slice(s, s + 40), L); m.from = 'host'; sendTo(pid, m); } }
   sendTo(pid, { t: 'ready' });
   toast('Someone joined your room'); UIS.dirty = true;
 }
@@ -2862,6 +3012,7 @@ async function onNetData(m, fromPid) {
     // a guest's change: apply it here, then pass it on (back to them too, so everyone agrees on the order)
     if (m.t === 'me') { notePresence(m); sendAll(m, fromPid); return; }
     if (m.t === 'ch') { await applyChunks(m); sendAll(m); return; }
+    if (m.t === 'pc') { await applyPaint(m); sendAll(m, fromPid); return; }
     if (m.t === 'lp') { applyLayerProps(m); sendAll(m); return; }
     if (m.t === 'ld') { applyLayerDelete(m); sendAll(m, fromPid); return; }
     if (m.t === 'st') { applySettings(m); sendAll(m); return; }
@@ -2873,6 +3024,7 @@ async function onNetData(m, fromPid) {
   if (m.t === 'bye') { const p = SYNC.peers.get(m.from); if (p) { dropMarker(p); SYNC.peers.delete(m.from); UIS.dirty = true; } return; }
   if (m.t === 'me') { notePresence(m); return; }
   if (m.t === 'ch') { await applyChunks(m); return; }
+  if (m.t === 'pc') { await applyPaint(m); return; }
   if (m.t === 'ly') { applyLayers(m); return; }
   if (m.t === 'lp') { applyLayerProps(m); return; }
   if (m.t === 'ld') { applyLayerDelete(m); return; }
@@ -2982,6 +3134,302 @@ function notePresence(m) {
 }
 function dropMarker(p) { for (const o of [p.head, p.brush]) if (o) { modelRoot.remove(o); o.traverse(c => { if (c.material) c.material.dispose(); }); } p.head = p.brush = null; }
 function fadeMarkers(now) { for (const p of SYNC.peers.values()) if (p.head && now - p.t > 3000) { p.head.visible = false; p.brush.visible = false; } }
+
+
+// ───────────────────────── climbers: little jointed people who run, scramble and climb over the clay
+// They move across the clay's own surface (all shown layers, supports and bridges, plus the bed). Each one has a
+// slope it likes: 0° runs on flat tops, ~45° scrambles, ~90° climbs walls, more hangs under roofs. Steeper than its
+// limit and it turns back, or falls if it gets dropped there. Grab them with the Climbers tool.
+const CLM = { list: [], size: 14, paused: false, sel: -1, held: -1, max: 40, holdOff: null };
+const CL_SPH = 15, CL_CYL = 9;
+const clMat = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0 });
+const clSph = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 12, 8), clMat, CLM.max * CL_SPH);
+const clCyl = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 10, 1, true), clMat, CLM.max * CL_CYL);
+for (const m of [clSph, clCyl]) { m.count = 0; m.frustumCulled = false; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); modelRoot.add(m); }
+const clRing = new THREE.Mesh(new THREE.TorusGeometry(1, 0.08, 8, 40), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9, depthTest: false }));
+clRing.renderOrder = 9; clRing.visible = false; modelRoot.add(clRing);
+const UPV = new THREE.Vector3(0, 1, 0);
+// how solid the world is at a point (0 air … 1 clay): every shown layer incl. supports, bridges as boxes, the bed below 0
+function climbDens(x, y, z) {
+  // the bed is a smooth half-space with its surface at y = 0, so walking off clay onto the bed has no seam
+  let best = clamp(0.5 - y / (2 * VS), 0, 1);
+  if (best >= 1) return 1;
+  const fx = ix(x), fy = iy(y), fz = iz(z), i = Math.floor(fx), j = Math.floor(fy), k = Math.floor(fz), tx = fx - i, ty = fy - j, tz = fz - k;
+  for (const L of layers) {
+    if (!L.visible) continue;
+    if (L.bridge) {
+      for (const b of L.beams) {
+        let ux = b.bx - b.ax, uz = b.bz - b.az; const len = Math.hypot(ux, uz) || 1; ux /= len; uz /= len;
+        const px = x - (b.ax + b.bx) / 2, pz = z - (b.az + b.bz) / 2;
+        const dx = Math.abs(px * ux + pz * uz) - (len / 2 + bext(b)), dy = Math.abs(y - b.ay) - b.hh, dz = Math.abs(-px * uz + pz * ux) - b.hw;
+        const sd = Math.max(dx, dy, dz) < 0 ? Math.max(dx, dy, dz) : Math.hypot(Math.max(dx, 0), Math.max(dy, 0), Math.max(dz, 0));
+        const v = clamp(0.5 - sd / (2 * VS), 0, 1); if (v > best) best = v;
+      }
+      continue;
+    }
+    if (!L.chunks.size) continue;
+    let v = 0;
+    for (let c = 0; c < 8; c++) { const a = c & 1, bb = (c >> 1) & 1, d = c >> 2; v += getD(L, i + a, Math.max(1, j + bb), k + d) * (a ? tx : 1 - tx) * (bb ? ty : 1 - ty) * (d ? tz : 1 - tz); }
+    if (v > best) best = v;
+  }
+  return best;
+}
+const _g = new THREE.Vector3();
+function climbGrad(p, out) {
+  const h = VS * 0.6;
+  return out.set(climbDens(p.x + h, p.y, p.z) - climbDens(p.x - h, p.y, p.z), climbDens(p.x, p.y + h, p.z) - climbDens(p.x, p.y - h, p.z), climbDens(p.x, p.y, p.z + h) - climbDens(p.x, p.y, p.z - h)).multiplyScalar(1 / (2 * h));
+}
+// pull a point onto the clay's surface; returns the outward normal, or null if there's no surface nearby
+function toSurface(p, nOut) {
+  for (let it = 0; it < 5; it++) {
+    if (p.y < 0.4 && climbDens(p.x, 0.5, p.z) < ISO) { p.y = 0; return nOut.set(0, 1, 0); }
+    const d = climbDens(p.x, p.y, p.z) - ISO; climbGrad(p, _g); const gl2 = _g.lengthSq();
+    if (gl2 < 1e-5) return null;
+    const step = d / gl2; if (Math.abs(step) > VS * 3) p.addScaledVector(_g, -Math.sign(step) * VS * 3 / Math.sqrt(gl2)); else p.addScaledVector(_g, -step);
+    if (Math.abs(d) < 0.02) break;
+  }
+  if (Math.abs(climbDens(p.x, p.y, p.z) - ISO) > 0.15) return null;
+  climbGrad(p, _g); if (_g.lengthSq() < 1e-5) return null;
+  return nOut.copy(_g).multiplyScalar(-1).normalize();
+}
+const slopeOf = (n) => Math.acos(clamp(n.y, -1, 1)) / DEG;   // 0 flat top · 90 wall · 180 roof
+function makeClimber(p, o = {}) {
+  if (CLM.list.length >= CLM.max) { toast(`That's the most climbers (${CLM.max})`); return null; }
+  const prefs = [8, 8, 30, 45, 60, 85, 85, 95, 120];
+  const c = { p: p.clone(), n: new THREE.Vector3(0, 1, 0), head: new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).normalize(), v: new THREE.Vector3(),
+    state: 'fall', pref: o.pref ?? prefs[(Math.random() * prefs.length) | 0], hue: o.hue ?? Math.random(), s: o.s ?? (0.86 + Math.random() * 0.28), girth: o.girth ?? (0.8 + Math.random() * 0.5),
+    phase: Math.random() * 6, rethink: 0, stuck: 0, air: 0 };
+  c.col = new THREE.Color().setHSL(c.hue, 1, 0.5); c.colHead = new THREE.Color().setHSL(c.hue, 1, 0.78);
+  CLM.list.push(c); return c;
+}
+function sculptureBox() {
+  let x0 = Infinity, x1 = -Infinity, y1 = 0, z0 = Infinity, z1 = -Infinity;
+  for (const L of layers) if (L.visible && !L.bridge) for (const key of L.chunks.keys()) {
+    const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+    x0 = Math.min(x0, vx(cx * 16)); x1 = Math.max(x1, vx(cx * 16 + 15)); z0 = Math.min(z0, vz(cz * 16)); z1 = Math.max(z1, vz(cz * 16 + 15)); y1 = Math.max(y1, vy(cy * 16 + 15));
+  }
+  if (!isFinite(x0)) return { x0: -60, x1: 60, z0: -60, z1: 60, y1: 40 };
+  return { x0, x1, z0, z1, y1 };
+}
+// drop a few in from above, over the sculpture
+function addClimbers(n) {
+  const b = sculptureBox();
+  for (let q = 0; q < n; q++) {
+    // drop them over clay where possible (the box is loose), else anywhere over it
+    let x = 0, z = 0;
+    for (let t = 0; t < 14; t++) {
+      x = b.x0 + Math.random() * (b.x1 - b.x0); z = b.z0 + Math.random() * (b.z1 - b.z0);
+      let hit = false; for (let y = b.y1; y > 3; y -= VS * 2) if (climbDens(x, y, z) >= ISO) { hit = true; break; }
+      if (hit) break;
+    }
+    const c = makeClimber(new THREE.Vector3(x, b.y1 + 10 + Math.random() * 20, z));
+    if (!c) break;
+  }
+  UIS.dirty = true;
+}
+function removeClimber(i) { if (i < 0 || i >= CLM.list.length) return; CLM.list.splice(i, 1); if (CLM.sel === i) CLM.sel = -1; else if (CLM.sel > i) CLM.sel--; if (CLM.held === i) CLM.held = -1; else if (CLM.held > i) CLM.held--; UIS.dirty = true; }
+const climberH = (c) => CLM.size * c.s;
+// the climber nearest to a point (within reach), or -1
+function climberNear(p, extra) {
+  let best = -1, bd = Infinity;
+  CLM.list.forEach((c, i) => { const H = climberH(c), cen = c.cen || c.p, d = cen.distanceTo(p); if (d < H * 0.55 + extra && d < bd) { bd = d; best = i; } });
+  return best;
+}
+function climberOnRay(ray) {
+  let best = -1, bd = Infinity; const tmp = new THREE.Vector3();
+  CLM.list.forEach((c, i) => {
+    const w = modelRoot.localToWorld((c.cen || c.p).clone()), t = tmp.copy(w).sub(ray.origin).dot(ray.direction); if (t < 0) return;
+    const d = ray.distanceToPoint(w), r = climberH(c) * 0.5 * modelRoot.scale.x;
+    if (d < r && t < bd) { bd = t; best = i; }
+  });
+  return best;
+}
+function grabClimber(i) { const c = CLM.list[i]; if (!c) return; c.state = 'held'; CLM.held = i; CLM.sel = i; UIS.dirty = true; }
+function moveHeld(p) { const c = CLM.list[CLM.held]; if (c) { c.p.copy(p); c.v.set(0, 0, 0); } }
+function dropHeld() { const c = CLM.list[CLM.held]; if (c) { c.state = 'fall'; c.v.set(0, 0, 0); c.air = 0; } CLM.held = -1; }
+// place a new one where you pointed: on the clay if it's there, otherwise it drops from that spot
+function placeClimber(p) {
+  const q = p.clone(), n = new THREE.Vector3(), c = makeClimber(q); if (!c) return;
+  const hit = toSurface(q, n);
+  if (hit && q.distanceTo(p) < climberH(c)) { c.p.copy(q); c.n.copy(n); c.state = slopeOf(n) <= limitOf(c) ? 'walk' : 'fall'; }
+  CLM.sel = CLM.list.length - 1; UIS.dirty = true;
+}
+const limitOf = (c) => clamp(c.pref + 35, 30, 180);
+const _q = new THREE.Vector3(), _nq = new THREE.Vector3(), _t = new THREE.Vector3(), _h = new THREE.Vector3();
+function climberThink(c, H) {
+  // look a step ahead in a few directions; pick the one closest to the slope it likes (climbers also like going up)
+  const lim = limitOf(c) + (c.relax || 0), look = H * 0.9; let best = null, bs = -Infinity;
+  const tan0 = _t.copy(c.head).addScaledVector(c.n, -c.n.dot(c.head)); if (tan0.lengthSq() < 1e-6) tan0.set(1, 0, 0).addScaledVector(c.n, -c.n.x); tan0.normalize();
+  const side = new THREE.Vector3().crossVectors(c.n, tan0);
+  let hb = null;
+  if (c.p.y < 1 && c.pref >= 30) {
+    const now = performance.now(); if (!CLM.box || now - CLM.boxT > 2000) { CLM.box = sculptureBox(); CLM.boxT = now; }
+    hb = new THREE.Vector3((CLM.box.x0 + CLM.box.x1) / 2 - c.p.x, 0, (CLM.box.z0 + CLM.box.z1) / 2 - c.p.z); if (hb.lengthSq() < 1) hb = null; else hb.normalize();
+  }
+  for (const off of [0, 0.5, -0.5, 1.1, -1.1, 1.8, -1.8, Math.PI]) {
+    const dir = _h.copy(tan0).multiplyScalar(Math.cos(off)).addScaledVector(side, Math.sin(off));
+    _q.copy(c.p).addScaledVector(dir, look).addScaledVector(c.n, H * 0.1);
+    const n = toSurface(_q, _nq); if (!n) continue;
+    if (_q.distanceTo(c.p) > look * 1.6 || _q.distanceTo(c.p) < look * 0.3) continue;
+    const sl = slopeOf(n); if (sl > lim) continue;
+    let crowd = 0; for (const o of CLM.list) if (o !== c && o.p.distanceTo(_q) < H * 1.1) crowd++;
+    const up = (_q.y - c.p.y) / look * (c.pref / 90) * 0.9;
+    // on the bare bed, anyone who likes slopes heads back toward the sculpture
+    const home = c.p.y < 1 && c.pref >= 30 && hb ? (dir.x * hb.x + dir.z * hb.z) * 0.9 : 0;
+    const score = -Math.abs(sl - c.pref) / 25 + Math.cos(off) * 0.7 + up + home + Math.random() * 0.6 - crowd * 1.5;
+    if (score > bs) { bs = score; best = dir.clone(); }
+  }
+  if (best) { c.head.copy(best); c.stuck = 0; } else { c.head.multiplyScalar(-1); c.stuck += 1; }
+  c.rethink = 0.5 + Math.random() * 1.1;
+}
+function climbersSim(dt) {
+  const g = 25 * CLM.size;
+  for (const c of CLM.list) {
+    const H = climberH(c);
+    if (c.state === 'held') continue;
+    if (c.state === 'fall') {
+      c.air += dt;
+      // buried (clay was added on top of them): work their way out, toward the nearest outside
+      if (climbDens(c.p.x, c.p.y, c.p.z) > ISO + 0.1) {
+        climbGrad(c.p, _g); if (_g.lengthSq() > 1e-4) c.p.addScaledVector(_g.normalize(), -H * 0.3); else c.p.y += H * 0.5;
+        c.v.set(0, 0, 0); continue;
+      }
+      c.v.y = Math.max(c.v.y - g * dt, -H * 30);
+      const prev = c.p.clone(), cur = prev.clone().addScaledVector(c.v, dt);
+      // sweep the path so a fast fall can't skip through thin clay
+      const len = prev.distanceTo(cur), nst = Math.max(1, Math.ceil(len / (VS * 0.8)));
+      let hi = -1; for (let s = 1; s <= nst; s++) { _q.lerpVectors(prev, cur, s / nst); if (_q.y <= 0 || climbDens(_q.x, _q.y, _q.z) >= ISO) { hi = s / nst; break; } }
+      if (hi < 0) { c.p.copy(cur); continue; }
+      let lo = hi - 1 / nst;
+      for (let it = 0; it < 7; it++) { const m = (lo + hi) / 2; _q.lerpVectors(prev, cur, m); if (_q.y <= 0 || climbDens(_q.x, _q.y, _q.z) >= ISO) hi = m; else lo = m; }
+      c.p.lerpVectors(prev, cur, lo);
+      if (c.p.y < 0.6 && climbDens(c.p.x, 0.5, c.p.z) < ISO) { c.p.y = 0; c.n.set(0, 1, 0); }   // the bare bed
+      else {
+        const sp = c.p.clone(), n = toSurface(c.p, _nq);
+        if (n) c.n.copy(n);
+        else { c.p.copy(sp); climbGrad(c.p, _g); if (_g.lengthSq() > 1e-6) c.n.copy(_g).negate().normalize(); else c.n.set(0, 1, 0); }
+      }
+      if (slopeOf(c.n) <= limitOf(c) + (c.relax || 0) || c.p.y <= 0.01) { c.state = 'walk'; c.v.set(0, 0, 0); c.rethink = 0; c.slides = 0; c.stuck = 0; }
+      else {
+        // too steep for them: slide down it (and off, if it's a roof)
+        c.slides = (c.slides || 0) + 1;
+        if (c.slides > 40) { c.relax = 60; c.slides = 0; }   // wedged somewhere steep: hang on for a bit anyway
+        const down = _t.set(0, -1, 0).addScaledVector(c.n, c.n.y); c.p.addScaledVector(c.n, H * 0.08);
+        c.v.copy(down).multiplyScalar(H * 2).addScaledVector(c.n, H * 0.3);
+      }
+      continue;
+    }
+    // walking / climbing along the surface
+    c.rethink -= dt; if (c.rethink <= 0) climberThink(c, H);
+    if (c.relax) c.relax = Math.max(0, c.relax - dt * 15);
+    if (c.stuck > 4) { c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H); c.stuck = 0; continue; }
+    const sl = slopeOf(c.n), wall = clamp((sl - 35) / 45, 0, 1), speed = H * (1.25 - 0.9 * wall) * (c.pref < 20 ? 1.3 : 1);
+    const dir = _t.copy(c.head).addScaledVector(c.n, -c.n.dot(c.head)); if (dir.lengthSq() < 1e-6) { c.rethink = 0; continue; } dir.normalize();
+    const old = c.p.clone();
+    c.p.addScaledVector(dir, speed * dt);
+    const n = toSurface(c.p, _nq);
+    if (!n || slopeOf(n) > limitOf(c) + 10 + (c.relax || 0)) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; if (!toSurface(c.p, _nq)) { c.state = 'fall'; c.v.set(0, 0, 0); } continue; }
+    c.n.lerp(n, 0.5).normalize(); c.head.copy(dir);
+    c.phase += old.distanceTo(c.p) / (H * 0.55) * Math.PI;
+  }
+  // personal space
+  for (let a = 0; a < CLM.list.length; a++) for (let b = a + 1; b < CLM.list.length; b++) {
+    const A = CLM.list[a], B = CLM.list[b]; if (A.state !== 'walk' || B.state !== 'walk') continue;
+    const H = (climberH(A) + climberH(B)) / 2, d = A.p.distanceTo(B.p); if (d > H * 0.45 || d < 1e-4) continue;
+    const push = _q.copy(A.p).sub(B.p).multiplyScalar((H * 0.45 - d) / d * 0.25); A.p.add(push); B.p.sub(push);
+  }
+}
+// ---- drawing: spheres for joints and head, cylinders for limbs, all in two instanced meshes
+const _m4 = new THREE.Matrix4(), _qt = new THREE.Quaternion(), _sc = new THREE.Vector3(), _mid = new THREE.Vector3(), _dir = new THREE.Vector3();
+let nS = 0, nC = 0;
+function putS(p, r, col) { _sc.set(r, r, r); _m4.compose(p, _qt.identity(), _sc); clSph.setMatrixAt(nS, _m4); clSph.setColorAt(nS, col); nS++; }
+function putC(a, b, r, col) {
+  _dir.subVectors(b, a); const len = _dir.length(); if (len < 1e-5) return;
+  _mid.addVectors(a, b).multiplyScalar(0.5); _qt.setFromUnitVectors(UPV, _dir.multiplyScalar(1 / len)); _sc.set(r, len, r);
+  _m4.compose(_mid, _qt, _sc); clCyl.setMatrixAt(nC, _m4); clCyl.setColorAt(nC, col); nC++;
+}
+// two-bone reach: where the elbow/knee goes so the hand/foot gets to the target
+function ik(root, target, a, b, pole, outMid, outEnd) {
+  const d0 = _dir.subVectors(target, root), d = Math.min(d0.length(), (a + b) * 0.999), dirn = d0.normalize();
+  outEnd.copy(root).addScaledVector(dirn, d);
+  const x = (a * a - b * b + d * d) / (2 * d), h = Math.sqrt(Math.max(0, a * a - x * x));
+  const perp = pole.clone().addScaledVector(dirn, -pole.dot(dirn)); if (perp.lengthSq() < 1e-6) perp.set(0, 0, 1); perp.normalize();
+  outMid.copy(root).addScaledVector(dirn, x).addScaledVector(perp, h);
+}
+function climberPose(c) {
+  const H = climberH(c), held = c.state === 'held', falling = c.state === 'fall';
+  const n = held || falling ? UPV : c.n, sl = slopeOf(n), w = held || falling ? 0 : clamp((sl - 35) / 45, 0, 1);
+  const uh = new THREE.Vector3().copy(UPV).addScaledVector(n, -n.y); if (uh.lengthSq() < 0.02) uh.copy(c.head); uh.normalize();
+  const U = new THREE.Vector3().copy(UPV).lerp(uh, w).normalize();
+  const hf = new THREE.Vector3(c.head.x, 0, c.head.z); if (hf.lengthSq() < 1e-4) hf.set(0, 0, 1); hf.normalize();
+  const F = hf.clone().lerp(n.clone().negate(), w); F.addScaledVector(U, -F.dot(U)); if (F.lengthSq() < 1e-6) F.set(0, 0, 1); F.normalize();
+  const R = new THREE.Vector3().crossVectors(F, U).normalize();
+  const leg = 0.47 * H, torso = 0.3 * H, gi = c.girth, ph = c.phase;
+  const hip = c.p.clone().addScaledVector(n, held ? 0 : (falling ? 0 : 0.5 * H * (1 - w) + 0.12 * H * w));
+  if (held) hip.addScaledVector(UPV, -0.35 * H);
+  const chest = hip.clone().addScaledVector(U, torso), head = chest.clone().addScaledVector(U, 0.15 * H);
+  c.cen = hip.clone().addScaledVector(U, torso * 0.4);
+  putC(hip, chest, 0.085 * H * gi, c.col); putS(hip, 0.09 * H * gi, c.col); putS(chest, 0.095 * H * gi, c.col); putS(head, 0.075 * H, c.colHead);
+  const onPlane = (q) => q.addScaledVector(n, -n.dot(_mid.subVectors(q, c.p)) + 0.03 * H);
+  for (const side of [-1, 1]) {
+    const sh = chest.clone().addScaledVector(R, side * 0.11 * H * (0.9 + gi * 0.1)).addScaledVector(U, -0.02 * H);
+    const hp = hip.clone().addScaledVector(R, side * 0.065 * H * gi);
+    const swing = Math.sin(ph + (side > 0 ? 0 : Math.PI)), lift = Math.max(0, Math.cos(ph + (side > 0 ? 0 : Math.PI)));
+    // feet: under the hips on flat ground, on the wall below on steep ground
+    const fFlat = hp.clone().addScaledVector(U, -leg).addScaledVector(F, swing * 0.16 * H).addScaledVector(n, lift * 0.08 * H);
+    const fWall = onPlane(hp.clone().addScaledVector(U, -0.3 * H + swing * 0.07 * H).addScaledVector(R, side * 0.07 * H));
+    let fT = fFlat.lerp(fWall, w);
+    // hands: swing when running, reach up the wall when climbing
+    const hFlat = sh.clone().addScaledVector(U, -0.3 * H).addScaledVector(F, -swing * 0.12 * H).addScaledVector(R, side * 0.03 * H);
+    const hWall = onPlane(sh.clone().addScaledVector(U, 0.2 * H - swing * 0.07 * H).addScaledVector(R, side * 0.05 * H));
+    let hT = hFlat.lerp(hWall, w);
+    if (held) { hT = sh.clone().addScaledVector(U, 0.25 * H).addScaledVector(R, side * 0.08 * H); fT = hp.clone().addScaledVector(U, -leg * 0.95).addScaledVector(F, swing * 0.05 * H); }
+    if (falling) { hT = sh.clone().addScaledVector(U, 0.22 * H).addScaledVector(R, side * 0.14 * H); fT = hp.clone().addScaledVector(U, -leg * 0.8).addScaledVector(R, side * 0.1 * H); }
+    const elbow = new THREE.Vector3(), hand = new THREE.Vector3(), knee = new THREE.Vector3(), foot = new THREE.Vector3();
+    ik(sh, hT, 0.16 * H, 0.15 * H, R.clone().multiplyScalar(side).addScaledVector(F, -0.6).addScaledVector(n, w * 0.8), elbow, hand);
+    ik(hp, fT, 0.24 * H, 0.23 * H, F.clone().addScaledVector(R, side * 0.3 * w).addScaledVector(n, w), knee, foot);
+    putS(sh, 0.045 * H * gi, c.col); putC(sh, elbow, 0.035 * H * gi, c.col); putS(elbow, 0.035 * H * gi, c.col); putC(elbow, hand, 0.03 * H * gi, c.col); putS(hand, 0.034 * H, c.colHead);
+    putS(hp, 0.05 * H * gi, c.col); putC(hp, knee, 0.048 * H * gi, c.col); putS(knee, 0.044 * H * gi, c.col); putC(knee, foot, 0.04 * H * gi, c.col); putS(foot, 0.042 * H, c.col);
+  }
+}
+function climbersTick(dt) {
+  if (!CLM.list.length) { if (clSph.count) { clSph.count = clCyl.count = 0; } clRing.visible = false; return; }
+  if (!CLM.paused) {
+    const steps = Math.min(4, Math.ceil(dt / 0.034)); for (let q = 0; q < steps; q++) climbersSim(Math.min(dt, 0.1) / steps);
+  }
+  nS = 0; nC = 0;
+  for (const c of CLM.list) climberPose(c);
+  clSph.count = nS; clCyl.count = nC;
+  clSph.instanceMatrix.needsUpdate = clCyl.instanceMatrix.needsUpdate = true;
+  if (clSph.instanceColor) clSph.instanceColor.needsUpdate = true; if (clCyl.instanceColor) clCyl.instanceColor.needsUpdate = true;
+  const sc = CLM.list[CLM.sel];
+  clRing.visible = !!sc && ST.tool === 'climb';
+  if (sc) { const H = climberH(sc); clRing.position.copy(sc.p).addScaledVector(sc.state === 'walk' ? sc.n : UPV, 0.02 * H); clRing.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), sc.state === 'walk' ? sc.n : UPV); clRing.scale.setScalar(H * 0.32); }
+}
+function drawClimberPanel(X, FW) {
+  txt('Climbers', X, 404, 30, '#9aa3b2', 'left', 700);
+  button(X, 430, 228, 84, 'Add 5', { fs: 30, click: () => addClimbers(5) });
+  button(X + 242, 430, 228, 84, CLM.paused ? 'Paused' : 'Moving', { on: !CLM.paused, accent: CLIMBC, fs: 30, click: () => { CLM.paused = !CLM.paused; } });
+  confirmButton(X + 484, 430, 228, 84, 'clrall', 'Remove all', () => { CLM.list.length = 0; CLM.sel = CLM.held = -1; }, { fs: 28 });
+  txt(`${CLM.list.length} on the bed`, X + 952, 482, 26, '#7f8896', 'right', 500);
+  txt('Click clay to place one. Grab one to carry it; let go to drop it.', X, 548, 24, '#7f8896', 'left', 500);
+  slider(X, 604, FW, 'Climber size', (Math.log(CLM.size) - Math.log(4)) / (Math.log(60) - Math.log(4)), `${CLM.size.toFixed(CLM.size < 10 ? 1 : 0)} mm tall`, (u) => { CLM.size = +(Math.exp(Math.log(4) + u * (Math.log(60) - Math.log(4)))).toFixed(1); }, 'Everyone together; each varies a little');
+  const c = CLM.list[CLM.sel];
+  if (c) {
+    ui.fillStyle = '#' + c.col.getHexString(); ui.beginPath(); ui.arc(X + 26, 742, 24, 0, Math.PI * 2); ui.fill();
+    const kind = c.pref < 20 ? 'a runner' : c.pref < 60 ? 'a scrambler' : c.pref < 105 ? 'a climber' : 'a roof hanger';
+    txt(`This one is ${kind}`, X + 66, 752, 30, '#e9ecf1', 'left', 700);
+    confirmButton(X + 712, 712, 240, 60, 'clrone', 'Remove it', () => removeClimber(CLM.sel), { fs: 26 });
+    slider(X, 818, FW, 'Slope it likes', c.pref / 150, `${Math.round(c.pref)}°`, (u) => { c.pref = Math.round(u * 150); c.rethink = 0; }, '0° runs on flat tops · 45° scrambles · 90° climbs walls · 130° hangs under roofs');
+  } else txt('Grab or click a climber to set the slope it likes.', X, 760, 26, '#7f8896', 'left', 500);
+}
+const climbersState = () => ({ size: CLM.size, list: CLM.list.map(c => [+c.p.x.toFixed(1), +c.p.y.toFixed(1), +c.p.z.toFixed(1), c.pref, +c.hue.toFixed(3), +c.s.toFixed(2), +c.girth.toFixed(2)]) });
+function loadClimbers(st) {
+  CLM.list.length = 0; CLM.sel = CLM.held = -1;
+  if (!st) return;
+  if (st.size) CLM.size = st.size;
+  for (const a of st.list || []) makeClimber(new THREE.Vector3(a[0], a[1] + 1, a[2]), { pref: a[3], hue: a[4], s: a[5], girth: a[6] });
+}
 
 // ───────────────────────── export (STL + 3MF, zipped)
 // clean, welded triangles of every beam on a bridge layer
@@ -3166,12 +3614,13 @@ renderer.setAnimationLoop(() => {
   autosaveTick(now);
   netTick(now);
   beTick(now);
+  climbersTick(dt);
   if (UIS.confirm && now - UIS.confirmT > 2500) { UIS.confirm = null; UIS.dirty = true; }
   if (UIS.toast && now - UIS.toastT > 2200) { UIS.toast = ''; UIS.dirty = true; }
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
