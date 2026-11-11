@@ -658,6 +658,10 @@ function tubeTool(def){
       if(C.P.length === 1){ C.P.push(C.P[0].clone().add(fwdOf(C.Q[0]).multiplyScalar(S.tool.base*S.size*0.7))); C.PR.push(C.PR[0]); C.Q.push(C.Q[0].clone()); }
       for(const pt of def.build(S, C, true)) if(pt.g) C.tier.mbuf(pt.mat).append(pt.g);
       const r = S.tool.base*S.size; for(let i=0;i<C.P.length;i+=2) addHit(_a.copy(C.P[i]).add(C.tier.origin), r);
+      if(S.tool.grow){ const segs = growTree(S, C);
+        for(const sg of segs) addHit(sg.leaf ? sg.p : sg.b, (sg.r||r)*1.5); // claim the space now, so live play and replays match
+        if(S.replay) for(const sg of segs) emitTreeSeg(S, C, sg);
+        else growers.push({S, C, segs, i:0, t:0}); }
     }
   });
 }
@@ -976,6 +980,80 @@ T({id:'kaboom', name:'KABOOM!', cat:'chaos', base:0.03, spacing:0.5, weight:0.4,
   variant(){ return {col:CL('#ff2a1a'), tag:'no undo!'}; },
   begin(S,C){ C.maxPr = 0; }, add(S,C,p,q,pr){ C.last = p.clone(); C.maxPr = Math.max(C.maxPr, pr); },
   end(S,C){ if(C.last) explode(C.last, S.tool.base*S.size*(3+7*C.maxPr), S.replay); }});
+
+// ---- LASER + TREE ----
+// Pew Pew Laser: every shot is a dead-straight red beam out of your hand, long enough to run past the horizon.
+T({id:'laser', name:'Pew Pew Laser', cat:'tube', base:0.03, spacing:1e9, sample:'time', interval:170, sfx:'pew',
+  variant(r){ const c = CL(pk(r, ['#ff1a1a','#ff2a2a','#ff0a3c'])); return {col:c, halo:c.clone().multiplyScalar(0.6)}; },
+  add(S,C,p,q,pr){ const b = S.tool.base*S.size, dir = fwdOf(q), seg = 10*S.size, N = 50, rc = b*(0.05+0.05*pr);
+    put(C, 'sph:glow', p, QI, b*0.35, b*0.35, b*0.35, S.V.col);
+    const a = p.clone(), e = new V3();
+    for(let i=0;i<N;i++){ e.copy(p).addScaledVector(dir, seg*(i+1)); thread(C, a, e, rc, S.V.col, 'cyl:glow'); thread(C, a, e, rc*5, S.V.halo, 'cyl:halo'); a.copy(e); } }});
+
+// Branching Tree: draw the trunk; when you let go it keeps branching for 30 seconds, steering around what's already there.
+// The whole growth is worked out the moment you let go (so saves replay it exactly), then revealed over 30 s.
+const growers = [];
+const TREE_SECS = 30, TREE_GENS = 60, TREE_MAX = 700;
+function growTree(S, C){
+  const b = S.tool.base*S.size, o = C.tier.origin, rng = S.rng, up = S.g.clone().negate().normalize();
+  const P = C.P.map(v => v.clone().add(o)); const n = P.length; if(n < 2) return [];
+  const L = b*1.5, reach = L*TREE_GENS*0.9 + P[0].distanceTo(P[n-1]);
+  // nearby obstacles (everything already in the world), filtered once
+  const ctr = P[n-1], cs = L*2.5, grid = new Map(), gk = (x,y,z) => Math.floor(x/cs) + ',' + Math.floor(y/cs) + ',' + Math.floor(z/cs);
+  const addG = (x, y, z, r, gen) => { const k = gk(x,y,z); let a = grid.get(k); if(!a) grid.set(k, a = []); a.push(x, y, z, r, gen); };
+  let bigR = b*0.5; // obstacles bigger than a cell are rare; remember the biggest so lookups reach far enough
+  for(let i=0;i<hitN;i++){ const k=i*4, r = hitArr[k+3]; if(r < 0) continue; const dx=hitArr[k]-ctr.x, dy=hitArr[k+1]-ctr.y, dz=hitArr[k+2]-ctr.z; if(dx*dx+dy*dy+dz*dz < (reach+r)*(reach+r)){ addG(hitArr[k], hitArr[k+1], hitArr[k+2], r, -1e9); if(r > bigR) bigR = Math.min(r, cs*2); } }
+  const leaf = (p, r, g) => ({leaf:true, p, r, g, s:b*(0.55 + 0.6*rng()), q:randQ(rng), c:pickC(S, S.V.leaves)});
+  const segs = [], tips = [];
+  const r0 = b*0.42, rt = b*0.26;
+  const tEnd = new V3().subVectors(P[n-1], P[Math.max(0,n-3)]).normalize();
+  tips.push({p:P[n-1].clone(), d:tEnd, r:rt, g:0});
+  const sideN = Math.min(3, Math.floor(n/6));
+  for(let k=0;k<sideN;k++){ const i = 2 + ((rng()*(n-4))|0), t = new V3().subVectors(P[i+1], P[i-1]).normalize(); const d = randDir(rng); d.addScaledVector(t, -d.dot(t)).normalize().lerp(t, 0.35).normalize();
+    tips.push({p:P[i].clone(), d, r:r0 + (rt-r0)*i/(n-1)*0.9, g:2+((rng()*6)|0)}); }
+  for(let i=0;i<n;i+=2) addG(P[i].x, P[i].y, P[i].z, b*0.4, -99);
+  // Only things a branch is moving TOWARD count, so a tip never gets stuck on the spot it grows from.
+  const clear = (q, rad, gen, f) => { const push = new V3(); let blocked = false;
+    const test = (x, y, z, r, pad) => { const dx=q.x-x, dy=q.y-y, dz=q.z-z, d2=dx*dx+dy*dy+dz*dz, lim = r+rad+L*1.3; if(d2 >= lim*lim) return;
+      const fx=f.x-x, fy=f.y-y, fz=f.z-z; if(d2 >= fx*fx+fy*fy+fz*fz) return;
+      const d = Math.sqrt(d2)||1e-9, w = (lim-d)/lim; if(d < r+rad+pad) blocked = true; push.x += dx/d*w; push.y += dy/d*w; push.z += dz/d*w; };
+    const reachC = Math.ceil((bigR + rad + L*1.3)/cs), ix = Math.floor(q.x/cs), iy = Math.floor(q.y/cs), iz = Math.floor(q.z/cs);
+    for(let x=ix-reachC;x<=ix+reachC;x++) for(let y=iy-reachC;y<=iy+reachC;y++) for(let z=iz-reachC;z<=iz+reachC;z++){ const a = grid.get(x+','+y+','+z); if(!a) continue;
+      for(let i=0;i<a.length;i+=5){ const g = a[i+4]; if(g === -1e9) test(a[i], a[i+1], a[i+2], a[i+3], L*0.3); else if(g <= gen-3) test(a[i], a[i+1], a[i+2], a[i+3], L*0.15); } }
+    return {push, blocked}; };
+  let active = tips;
+  for(let gen=0; gen<TREE_GENS && active.length && segs.length < TREE_MAX; gen++){
+    const next = [];
+    for(const tp of active){ if(tp.g > gen){ next.push(tp); continue; } if(segs.length >= TREE_MAX) break;
+      const d = tp.d.clone().addScaledVector(randDir(rng), 0.3).addScaledVector(up, 0.12);
+      let q = tp.p.clone().addScaledVector(d.normalize(), L), c = clear(q, tp.r, gen, tp.p);
+      if(c.push.lengthSq() > 0){ d.addScaledVector(c.push, 1.4).normalize(); q = tp.p.clone().addScaledVector(d, L); c = clear(q, tp.r, gen, tp.p); }
+      if(c.blocked){ // try a couple of other ways out before giving up
+        let ok = false; for(let t=0;t<3 && !ok;t++){ const d2 = d.clone().addScaledVector(randDir(rng), 1.1).normalize(); const q2 = tp.p.clone().addScaledVector(d2, L); if(!clear(q2, tp.r, gen, tp.p).blocked){ d.copy(d2); q = q2; ok = true; } }
+        if(!ok){ segs.push(leaf(tp.p.clone(), tp.r, gen)); continue; } }
+      segs.push({a:tp.p.clone(), b:q.clone(), r:tp.r, g:gen}); addG(q.x, q.y, q.z, tp.r, gen);
+      const r2 = tp.r*0.955;
+      if(r2 < b*0.05){ segs.push(leaf(q.clone(), tp.r, gen+1)); continue; }
+      next.push({p:q, d:d.clone(), r:r2, g:gen+1});
+      if(rng() < 0.2 && next.length < 48){ const sd = randDir(rng); sd.addScaledVector(d, -sd.dot(d)).normalize(); const nd = d.clone().lerp(sd, 0.55 + rng()*0.3).normalize();
+        next.push({p:q.clone(), d:nd, r:tp.r*0.72, g:gen+1}); }
+    }
+    active = next;
+  }
+  for(const tp of active) segs.push(leaf(tp.p.clone(), tp.r, TREE_GENS));
+  return segs;
+}
+function emitTreeSeg(S, C, sg){
+  if(sg.dead) return;
+  const pool = key => C.tier.pool(key);
+  if(sg.leaf){ _lp.copy(sg.p).sub(C.tier.origin); pool(S.V.leafKey).add(_lp, sg.q, sg.s, sg.s, sg.s, sg.c); return; }
+  thread(C, sg.a, sg.b, sg.r, S.V.col, 'cyl:std'); _lp.copy(sg.b).sub(C.tier.origin); pool('sph:std').add(_lp, QI, sg.r*2, sg.r*2, sg.r*2, S.V.col);
+}
+TOOLS.push(Object.assign(tubeTool({id:'tree', name:'Branching Tree', cat:'tube', base:0.03, spacing:0.4,
+  variant(r){ const v = pk(r, [['#8a4b22',['#4dff3a','#9ff2b4','#f7f20a']], ['#0b0b12',['#ff4fb0','#ffffff']], ['#ffffff',['#f7f20a','#ff6a00']], ['#5a2cff',['#00ffd0','#4dff3a']], ['#ff2a1a',['#ffffff','#ffd84a']]]);
+    return {col:CL(v[0]), leaves:v[1].map(CL), leafKey:pk(r, ['sph:gloss','octa:gloss','star:gloss'])}; },
+  build(S,C,fin){ const P = smooth(C.P, 2), b = S.tool.base*S.size, n = P.length, r = roundEnds(P, P.map((_, i) => b*(0.42 + (0.26-0.42)*i/Math.max(1,n-1)))); return [{mat:'m-std', g:tubeGeo(r.P, r.R, () => S.V.col, 9)}]; }}),
+  {grow:true}));
 const TOOL_BY_ID = Object.fromEntries(TOOLS.map(t => [t.id, t]));
 
 /* ---------------- kaboom ---------------- */
@@ -995,6 +1073,7 @@ function explode(cw, r, replay){
       if(hit){ mb.full = true; dirtyPools.add(mb); } }
     for(const rope of t.ropes) rope.blast(c, r); }
   for(const l of lights) if(!l.dead && l.p.distanceTo(cw) < r) l.dead = true;
+  for(const G of growers) for(let i=G.i;i<G.segs.length;i++){ const sg = G.segs[i], q = sg.leaf ? sg.p : sg.b; if(q.distanceTo(cw) < r) sg.dead = true; }
   for(let i=0;i<hitN;i++){ const o=i*4; if(hitArr[o+3] < 0) continue; const dx=hitArr[o]-cw.x, dy=hitArr[o+1]-cw.y, dz=hitArr[o+2]-cw.z; if(dx*dx+dy*dy+dz*dz < r2) hitArr[o+3] = -1; }
   if(!replay) burst(cw, r);
 }
@@ -1006,6 +1085,12 @@ function burst(cw, r){
   const flash = new THREE.Mesh(GEO.sph, new THREE.MeshBasicMaterial({color:'#fff6a0', transparent:true, blending:THREE.AdditiveBlending, depthWrite:false})); g.add(flash);
   bursts.push({g, m, vel, flash, t:0, r});
   SFX.boom();
+}
+function updateGrowers(dt){
+  for(let k=growers.length-1;k>=0;k--){ const G = growers[k]; G.t += dt; const gNow = G.t/TREE_SECS*TREE_GENS;
+    let n = 0; while(G.i < G.segs.length && G.segs[G.i].g <= gNow){ emitTreeSeg(G.S, G.C, G.segs[G.i++]); n++; }
+    if(n && SFX.thr('tree', 260)) SFX.tone(260 + Math.random()*180, 0.09, 'sine', 0.03, 330 + Math.random()*120);
+    if(G.i >= G.segs.length) growers.splice(k, 1); }
 }
 function updateBursts(dt){
   for(let k=bursts.length-1;k>=0;k--){ const b = bursts[k]; b.t += dt; const t = b.t;
@@ -1232,6 +1317,7 @@ const SFX = {
       case 'clay': this.tone(140+r*60, 0.11, 'sine', 0.09, 95+r*30); this.noise(0.05, 0.08, 700+r*400, 2); break; } },
   end(cat){ if(cat === 'rope'){ this.tone(420, 0.35, 'sine', 0.16, 120); this.tone(630, 0.25, 'triangle', 0.05, 200, 0.02); } else if(cat === 'light'){ this.tone(1568, 0.5, 'sine', 0.1); this.tone(2093, 0.4, 'sine', 0.05, null, 0.03); } },
   boom(){ this.noise(0.9, 0.7, 500, 0.7, 'lowpass'); this.tone(95, 0.6, 'sine', 0.4, 32); },
+  pew(){ if(!this.ok()) return; const r = Math.random(); this.tone(1700+r*500, 0.13, 'square', 0.05, 240); this.tone(900+r*200, 0.1, 'sawtooth', 0.02, 150); },
   bloop(){ this.tone(640, 0.32, 'sine', 0.09, 300); },
   settle(){ [784,988,1175,1568].forEach((f,i) => this.tone(f, 0.3, 'triangle', 0.07, null, i*0.09)); }
 };
@@ -1370,12 +1456,12 @@ function pushPoint(h, S, tipP, tipQ, pr){
   S.raw.push(dx, dy, dz, qx, qy, qz, qw, prf);
   const p = new V3(S.o.x + dx, S.o.y + dy, S.o.z + dz), q = new THREE.Quaternion(qx, qy, qz, qw);
   strokePoint(S, p, q, prf); S.lastP = p; S.lastT = performance.now();
-  SFX.place(S.cat, h.i); if(S.cat === 'voxel' || S.cat === 'stamp' || S.cat === 'dust' || S.cat === 'clay') buzz(h, 0.12, 8);
+  if(S.tool.sfx) SFX[S.tool.sfx](); else SFX.place(S.cat, h.i); if(S.cat === 'voxel' || S.cat === 'stamp' || S.cat === 'dust' || S.cat === 'clay') buzz(h, 0.12, 8);
 }
 function sampleStroke(h, tipP, tipQ, pr){
   const S = h.stroke; if(S.raw.length >= 2400*8){ endStroke(h); return; } toLocal(tipP, _lpt);
   const sp = S.tool.spacing*S.tool.base*S.size, d = _lpt.distanceTo(S.lastP), now = performance.now();
-  if(d >= sp || (S.tool.sample === 'time' && now - S.lastT > 55)) pushPoint(h, S, tipP, tipQ, pr);
+  if(d >= sp || (S.tool.sample === 'time' && now - S.lastT > (S.tool.interval || 55))) pushPoint(h, S, tipP, tipQ, pr);
 }
 function endStroke(h){
   const S = h.stroke; h.stroke = null; if(!S) return;
@@ -1893,7 +1979,7 @@ let mode = 'menu', lastFrame = performance.now(), autosaveT = 0;
 function resetWorld(){
   const shared = new Set(Object.values(GEO));
   for(const t of tiers){ t.group.traverse(o => { if(o.isInstancedMesh) o.dispose(); if(o.geometry && !shared.has(o.geometry)) o.geometry.dispose(); }); if(t.pupil) t.pupil.dispose(); t.group.removeFromParent(); }
-  tiers = []; lights = []; hitN = 0; dirtyPools.clear(); for(const b of bursts) b.g.removeFromParent(); bursts.length = 0;
+  tiers = []; lights = []; hitN = 0; dirtyPools.clear(); for(const b of bursts) b.g.removeFromParent(); bursts.length = 0; growers.length = 0;
   world.position.set(0,0,0); world.quaternion.identity(); world.scale.set(1,1,1); shrinkT = 0; settledShown = false; lastHalf = 0;
 }
 function startSession(m){
@@ -1931,7 +2017,7 @@ function tick(time){
   if(renderer.xr.isPresenting) renderer.xr.updateCamera(camera);
   if(mode === 'vr') updateXRInput(dt); else if(mode === 'desk') updateDeskInput(dt);
   if(mode === 'menu') return;
-  updateShrink(dt); updateRopes(dt); updateLights(); updateBursts(dt); updateEyes(); checkLimits(dt);
+  updateShrink(dt); updateRopes(dt); updateLights(); updateBursts(dt); updateGrowers(dt); updateEyes(); checkLimits(dt);
   sky.position.copy(camera.position); sky.quaternion.copy(world.quaternion);
   if(toastT > 0){ toastT -= dt; toastP.m.visible = mode === 'vr'; if(toastT <= 0) toastP.m.visible = false; else { const tgt = _a; const f = fwdOf(camera.quaternion, _b); f.y *= 0.4; f.normalize(); tgt.copy(camera.position).addScaledVector(f, 0.75); tgt.y -= 0.12; toastP.m.position.lerp(tgt, Math.min(1, dt*4)); toastP.m.lookAt(camera.position); } }
   flushAll();
@@ -2079,7 +2165,7 @@ document.fonts && document.fonts.load('40px Bungee').catch(() => {});
 Store.init().then(() => GHS.init()).then(renderSlots);
 
 // tiny hook for automated tests
-window.DD = { IS_HEADSET, setTouchMode, get IS_TOUCH(){ return IS_TOUCH; }, GHS, pushToGitHub, chunkEvents, VM, openMenu, closeMenu, drawMenu, exportGLB, buildExportScene, makeZip, lockTool, countTris, get limitHit(){ return limitHit; }, set shrinkT(v){ shrinkT = v; }, forcePick(h, id){ const t = TOOL_BY_ID[id], seed = 12345; h.pick = {tool:t, seed, sym:null, V:t.variant(mulberry32(seed ^ 0x5bd1e995))}; }, hands, updateXRInput, updateShrink, targetSize, get mode(){ return mode; }, TOOLS:TOOL_BY_ID, startSession, newWorld, exitSession, get tiers(){ return tiers; }, get hitN(){ return hitN; }, Log, settings, world, camera,
+window.DD = { growers, updateGrowers, IS_HEADSET, setTouchMode, get IS_TOUCH(){ return IS_TOUCH; }, GHS, pushToGitHub, chunkEvents, VM, openMenu, closeMenu, drawMenu, exportGLB, buildExportScene, makeZip, lockTool, countTris, get limitHit(){ return limitHit; }, set shrinkT(v){ shrinkT = v; }, forcePick(h, id){ const t = TOOL_BY_ID[id], seed = 12345; h.pick = {tool:t, seed, sym:null, V:t.variant(mulberry32(seed ^ 0x5bd1e995))}; }, hands, updateXRInput, updateShrink, targetSize, get mode(){ return mode; }, TOOLS:TOOL_BY_ID, startSession, newWorld, exitSession, get tiers(){ return tiers; }, get hitN(){ return hitN; }, Log, settings, world, camera,
   testStroke(id, pts, sym){ const t = TOOL_BY_ID[id]; deskHand.pick = {tool:t, seed:(Math.random()*1e9)>>>0, sym:sym||null, V:t.variant(mulberry32(1))}; deskHand.pick.V = t.variant(mulberry32(deskHand.pick.seed ^ 0x5bd1e995));
     const q = new THREE.Quaternion(); startStroke(deskHand, pts[0], q, 0.7); for(let i=1;i<pts.length;i++){ deskHand.stroke.lastT = 0; pushPoint(deskHand, deskHand.stroke, pts[i], q, 0.7); } endStroke(deskHand); },
   replay: replayEvent, encode: encodeStroke, resetWorld, flushAll, Store, saveNow, openWorld, renderer, scene };
