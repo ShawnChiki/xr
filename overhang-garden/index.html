@@ -2616,16 +2616,19 @@ let shapeLatch = false, panelOn = true, uiHeld = false;
 const rayO = new THREE.Vector3(), rayD = new THREE.Vector3();
 function updateXR(dt) {
   const L = hands.left, R = hands.right;
-  updateNav(dt);
+  if (!PL.on) updateNav(dt);
   // left buttons
   if (edge(L, 4)) { panelOn = !panelOn; panelMesh.visible = panelOn; }
   if (edge(L, 3)) setPassthrough(!XRS.passthrough);
   if (edge(L, 5)) { ST.sup.seeThrough = !ST.sup.seeThrough; applySeeThrough(); UIS.dirty = true; toast(ST.sup.seeThrough ? 'Supports see-through' : 'Supports solid'); }
   if (!R) { ghost.visible = ghostMirror.visible = false; return; }
+  if (PL.on) { if (edge(R, 4)) PL.jumpReq = true; if (edge(R, 5)) { climbEnd(); pulse(R, 0.3, 30); } edge(R, 3); }
+  else {
   if (edge(R, 4)) { ST.tool = ST.tool === 'add' ? 'carve' : 'add'; ST.lastTool = ST.tool; updateGhost(); pulse(R, 0.3, 30); }
   if (edge(R, 5)) { undo(); pulse(R, 0.3, 30); }
   if (edge(R, 3)) { ST.tool = ST.tool === 'smooth' ? ST.lastTool : 'smooth'; updateGhost(); }
-  const sx = axis(R, 2), sy = axis(R, 3);
+  }
+  const sx = PL.on ? 0 : axis(R, 2), sy = PL.on ? 0 : axis(R, 3);
   if (!shapeLatch && Math.abs(sx) > 0.7) { ST.shape = (ST.shape + (sx > 0 ? 1 : SHAPES.length - 1)) % SHAPES.length; shapeLatch = true; updateGhost(); pulse(R, 0.2, 20); }
   if (Math.abs(sx) < 0.3) shapeLatch = false;
   if (Math.abs(sy) > 0.2 && Math.abs(sx) < 0.6) { ST.brushVR = clamp(ST.brushVR * Math.exp(-sy * dt * 1.6), 0.002, 0.4); UIS.dirty = true; }
@@ -2653,6 +2656,7 @@ function updateXR(dt) {
     if (uiHeld && !trigDown) { uiHeld = false; uiUp(); }
     if (UIS.hover !== -1 && !uiHeld) { UIS.hover = -1; UIS.dirty = true; }
   }
+  if (PL.on) { ghost.visible = ghostMirror.visible = false; if (stroke.active) strokeEnd(); climbXR(dt, onPanel); return; }
   // brush
   const rVR = ST.brushVR * (ST.pressure && stroke.active ? 0.35 + 0.65 * trig : 1);
   const center = rayO.clone().addScaledVector(rayD, 0.035 + ST.brushVR);
@@ -2660,6 +2664,14 @@ function updateXR(dt) {
   const qModel = brushQ(invRootQ.copy(modelRoot.quaternion).invert().multiply(tmpQ).clone());
   const cModel = modelRoot.worldToLocal(center.clone());
   const rmm = clamp(rVR / S(), 1.0, 80);
+  // a little player within pinching reach: the trigger picks them up instead of sculpting
+  if (PH.pid) {
+    if (trigDown && SYNC.peers.has(PH.pid)) pinchMove(cModel, dt); else { pinchEnd(); pulse(R, 0.3, 30); }
+    placeGhost(cModel, qModel, rmm, false); return;
+  }
+  const lp = !onPanel && !uiHeld && !stroke.active && !bridge.active && CLM.held < 0 ? littleNear(cModel, rmm) : null;
+  if (lp !== PH.hover) { PH.hover = lp; if (lp) pulse(R, 0.15, 15); }
+  if (lp && trigDown) { pinchStart(lp, cModel); pulse(R, 0.5, 40); placeGhost(cModel, qModel, rmm, false); return; }
   if (ST.tool === 'climb' && !onPanel && !uiHeld) {
     const r0 = clamp(ST.brushVR / S(), 1.0, 80);
     if (CLM.held >= 0) {
@@ -3026,6 +3038,7 @@ async function onNetData(m, fromPid) {
   if (NET.host && fromPid) {
     // a guest's change: apply it here, then pass it on (back to them too, so everyone agrees on the order)
     if (m.t === 'me') { notePresence(m); sendAll(m, fromPid); return; }
+    if (m.t === 'pk') { onPick(m); sendAll(m, fromPid); return; }
     if (m.t === 'ch') { await applyChunks(m); sendAll(m); return; }
     if (m.t === 'pc') { await applyPaint(m); sendAll(m, fromPid); return; }
     if (m.t === 'lp') { applyLayerProps(m); sendAll(m); return; }
@@ -3038,6 +3051,7 @@ async function onNetData(m, fromPid) {
   if (m.t === 'ready') { netStatus(''); toast(`You're in room ${NET.code}`); return; }
   if (m.t === 'bye') { const p = SYNC.peers.get(m.from); if (p) { dropMarker(p); SYNC.peers.delete(m.from); UIS.dirty = true; } return; }
   if (m.t === 'me') { notePresence(m); return; }
+  if (m.t === 'pk') { onPick(m); return; }
   if (m.t === 'ch') { await applyChunks(m); return; }
   if (m.t === 'pc') { await applyPaint(m); return; }
   if (m.t === 'ly') { applyLayers(m); return; }
@@ -3126,7 +3140,15 @@ function sendPresence() {
   camera.getWorldPosition(_v1); modelRoot.worldToLocal(_v1);
   camera.getWorldQuaternion(_q1); modelRoot.getWorldQuaternion(_q2); _q1.premultiply(_q2.invert());
   const g = ghost.visible ? [+ghost.position.x.toFixed(1), +ghost.position.y.toFixed(1), +ghost.position.z.toFixed(1), +ghost.scale.x.toFixed(2)] : null;
-  netSend({ t: 'me', col: SYNC.col, s: S(), h: [+_v1.x.toFixed(1), +_v1.y.toFixed(1), +_v1.z.toFixed(1)], q: [_q1.x, _q1.y, _q1.z, _q1.w].map(v => +v.toFixed(3)), g });
+  const m = { t: 'me', col: SYNC.col, s: S(), h: [+_v1.x.toFixed(1), +_v1.y.toFixed(1), +_v1.z.toFixed(1)], q: [_q1.x, _q1.y, _q1.z, _q1.w].map(v => +v.toFixed(3)), g: PL.on ? null : g };
+  const r2 = (v) => [v.x, v.y, v.z].map(x => +x.toFixed(2));
+  if (renderer.xr.isPresenting || PL.test) for (const side of ['left', 'right']) { const h = hands[side]; if (h && h.grip) m[side === 'left' ? 'hl' : 'hr'] = r2(modelRoot.worldToLocal(h.grip.getWorldPosition(new THREE.Vector3()))); }
+  if (PL.on) {
+    const fw = new THREE.Vector3(); (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldDirection(fw); fw.applyQuaternion(_q2.copy(modelRoot.quaternion).invert());
+    Object.assign(m, { cl: 1, H: PL.H, f: r2(PL.pos), st: PL.state, yaw: +Math.atan2(fw.x, fw.z).toFixed(2) });
+    if (PL.state === 'k' && PL.wallP) { m.wp = r2(PL.wallP); m.wn = r2(PL.wallN); }
+  }
+  netSend(m);
 }
 const headGeo = new THREE.SphereGeometry(1, 20, 14), visorGeo = new THREE.BoxGeometry(1.5, 0.55, 0.5), brushGeo = new THREE.SphereGeometry(1, 18, 12);
 function notePresence(m) {
@@ -3144,11 +3166,19 @@ function notePresence(m) {
   }
   const size = 0.09 / Math.max(1e-5, m.s || 0.01);        // a head is about 9 cm across for that person
   p.head.position.set(m.h[0], m.h[1], m.h[2]); p.head.quaternion.set(m.q[0], m.q[1], m.q[2], m.q[3]); p.head.scale.setScalar(size);
-  p.head.visible = true;
+  p.head.visible = !m.cl;
+  p.little = m.cl ? { H: m.H, f: new THREE.Vector3().fromArray(m.f), st: m.st, yaw: m.yaw || 0, wp: m.wp ? new THREE.Vector3().fromArray(m.wp) : null, wn: m.wn ? new THREE.Vector3().fromArray(m.wn) : null } : null;
+  if (!p.little) p.fig = null;
+  // their hands (giant ones, if they're full size and you're little)
+  for (const k of ['hl', 'hr']) {
+    if (!m[k]) { if (p[k]) p[k].visible = false; continue; }
+    if (!p[k]) { p[k] = new THREE.Mesh(brushGeo, new THREE.MeshStandardMaterial({ color: PEERC[p.col % PEERC.length], roughness: 0.6 })); modelRoot.add(p[k]); }
+    p[k].visible = !m.cl; p[k].position.fromArray(m[k]); p[k].scale.setScalar(0.04 / Math.max(1e-5, m.s || 0.01));
+  }
   if (m.g) { p.brush.visible = true; p.brush.position.set(m.g[0], m.g[1], m.g[2]); p.brush.scale.setScalar(m.g[3]); } else p.brush.visible = false;
 }
-function dropMarker(p) { for (const o of [p.head, p.brush]) if (o) { modelRoot.remove(o); o.traverse(c => { if (c.material) c.material.dispose(); }); } p.head = p.brush = null; }
-function fadeMarkers(now) { for (const p of SYNC.peers.values()) if (p.head && now - p.t > 3000) { p.head.visible = false; p.brush.visible = false; } }
+function dropMarker(p) { p.little = null; p.fig = null; for (const o of [p.head, p.brush, p.hl, p.hr]) if (o) { modelRoot.remove(o); o.traverse(c => { if (c.material) c.material.dispose(); }); } p.head = p.brush = p.hl = p.hr = null; }
+function fadeMarkers(now) { for (const p of SYNC.peers.values()) if (p.head && now - p.t > 3000) { p.head.visible = false; p.brush.visible = false; for (const k of ['hl', 'hr']) if (p[k]) p[k].visible = false; } }
 
 
 // ───────────────────────── climbers: little jointed people who run, scramble and climb over the clay
@@ -3158,8 +3188,8 @@ function fadeMarkers(now) { for (const p of SYNC.peers.values()) if (p.head && n
 const CLM = { list: [], size: 14, paused: false, sel: -1, held: -1, max: 40, holdOff: null, time: 0, brushP: new THREE.Vector3(), brushR: 0, brushT: -9 };
 const CL_SPH = 17, CL_CYL = 9;
 const clMat = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0 });
-const clSph = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 12, 8), clMat, CLM.max * CL_SPH);
-const clCyl = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 10, 1, true), clMat, CLM.max * CL_CYL);
+const clSph = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 12, 8), clMat, (CLM.max + 8) * CL_SPH);
+const clCyl = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 10, 1, true), clMat, (CLM.max + 8) * CL_CYL);
 for (const m of [clSph, clCyl]) { m.count = 0; m.frustumCulled = false; m.instanceMatrix.setUsage(THREE.DynamicDrawUsage); modelRoot.add(m); }
 const clRing = new THREE.Mesh(new THREE.TorusGeometry(1, 0.08, 8, 40), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9, depthTest: false }));
 clRing.renderOrder = 9; clRing.visible = false; modelRoot.add(clRing);
@@ -3679,13 +3709,15 @@ function climberPose(c, dt) {
 }
 function poseAll(dt) { nS = 0; nC = 0; for (const c of CLM.list) climberPose(c, dt); }   // (tests)
 function climbersTick(dt) {
-  if (!CLM.list.length) { if (clSph.count) { clSph.count = clCyl.count = 0; } clRing.visible = false; return; }
+  const figs = NET.on ? peerFigures(Math.min(dt, 0.1)) : [];
+  if (!CLM.list.length && !figs.length) { if (clSph.count) { clSph.count = clCyl.count = 0; } clRing.visible = false; return; }
   if (!CLM.paused) {
     const steps = Math.min(4, Math.ceil(dt / 0.034)); for (let q = 0; q < steps; q++) climbersSim(Math.min(dt, 0.1) / steps);
   }
   nS = 0; nC = 0;
   const pdt = CLM.paused ? 0 : Math.min(dt, 0.1);
   for (const c of CLM.list) climberPose(c, pdt);
+  for (const f of figs) climberPose(f, Math.min(dt, 0.1));
   clSph.count = nS; clCyl.count = nC;
   clSph.instanceMatrix.needsUpdate = clCyl.instanceMatrix.needsUpdate = true;
   if (clSph.instanceColor) clSph.instanceColor.needsUpdate = true; if (clCyl.instanceColor) clCyl.instanceColor.needsUpdate = true;
@@ -3694,6 +3726,220 @@ function climbersTick(dt) {
   clRing.visible = !!sc && ST.tool === 'climb';
   if (sc) { const H = climberH(sc); clRing.position.copy(sc.p).addScaledVector(sc.state === 'walk' ? sc.n : UPV, 0.02 * H); clRing.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), sc.state === 'walk' ? sc.n : UPV); clRing.scale.setScalar(H * 0.32); }
 }
+// ───────────────────────── climb it yourself (headset): you shrink to climber size and climb the sculpture
+// Grip (or trigger) with a hand touching clay holds on; pull to move, let go mid-swing to fling yourself. On anything
+// 45° or flatter you stand, and the left stick walks; steeper and you slide. A jumps, right stick turns, B comes back.
+// In a room, someone bigger can pinch you with their trigger and carry you; let go and you drop.
+const PL = { on: false, pos: new THREE.Vector3(), vel: new THREE.Vector3(), grounded: true, grip: { left: null, right: null }, prev: null, H: 14,
+  carry: null, turnLatch: false, jumpReq: false, wasGrip: false, state: 'g', wallP: null, wallN: null, gloves: null, test: false };
+const _cw1 = new THREE.Vector3(), _cw2 = new THREE.Vector3(), _cv1 = new THREE.Vector3(), _cv2 = new THREE.Vector3(), _cv3 = new THREE.Vector3(), _cq = new THREE.Quaternion();
+const headW = (out) => (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldPosition(out);
+const bodyBlocked = (p, H) => climbDens(p.x, p.y + 0.3 * H, p.z) >= ISO || climbDens(p.x, p.y + 0.6 * H, p.z) >= ISO || climbDens(p.x, p.y + 0.9 * H, p.z) >= ISO;
+function resolveBody(p, H) {
+  for (let it = 0; it < 8; it++) {
+    let moved = false;
+    for (const k of [0.15, 0.45, 0.85]) {
+      _cv3.set(p.x, p.y + k * H, p.z); if (climbDens(_cv3.x, _cv3.y, _cv3.z) < ISO - 0.05) continue;
+      climbGrad(_cv3, _g); if (_g.lengthSq() > 1e-6) p.addScaledVector(_g.normalize(), -VS * 0.6); else p.y += VS;
+      moved = true;
+    }
+    if (!moved) break;
+  }
+  if (p.y < 0) p.y = 0;
+}
+// the ground under a spot: 'ok' (flat enough to stand, ≤45°), 'steep', 'wall' (blocked at body height) or 'none' (a drop)
+function groundAt(p, H) {
+  if (bodyBlocked(_cv3.set(p.x, p.y + 0.12 * H, p.z), H * 0.85)) return { st: 'wall' };
+  for (let y = p.y + 0.35 * H; y > p.y - 0.3 * H; y -= VS * 0.5) {
+    if (y > 0 && climbDens(p.x, y, p.z) < ISO) continue;
+    let lo = y, hi = y + VS * 0.5; for (let i = 0; i < 5; i++) { const m = (lo + hi) / 2; if (m <= 0 || climbDens(p.x, m, p.z) >= ISO) lo = m; else hi = m; }
+    const gy = Math.max(0, hi), n = new THREE.Vector3(0, 1, 0);
+    if (!(gy <= 0.01 && climbDens(p.x, 0.5, p.z) < ISO)) { climbGrad(_cv3.set(p.x, gy, p.z), _g); if (_g.lengthSq() > 1e-6) n.copy(_g).negate().normalize(); }
+    return { st: n.y >= 0.707 ? 'ok' : 'steep', y: gy, n };
+  }
+  return { st: 'none' };
+}
+function canGrab(hm, H) {
+  if (climbDens(hm.x, hm.y, hm.z) >= 0.3) return true;
+  const r = H * 0.07; for (const [a, b, c] of [[r, 0, 0], [-r, 0, 0], [0, r, 0], [0, -r, 0], [0, 0, r], [0, 0, -r]]) if (climbDens(hm.x + a, hm.y + b, hm.z + c) >= ISO) return true;
+  return hm.y < H * 0.05;   // the bed counts
+}
+// put the model so your feet (PL.pos) are on the floor under your head
+function plPlace() {
+  const w = modelRoot.localToWorld(_cv1.copy(PL.pos)); headW(_cw1);
+  modelRoot.position.x += _cw1.x - w.x; modelRoot.position.z += _cw1.z - w.z; modelRoot.position.y -= w.y;
+}
+function plGloves(on) {
+  if (!PL.gloves) PL.gloves = ['left', 'right'].map(() => new THREE.Mesh(new THREE.SphereGeometry(0.032, 16, 12), new THREE.MeshStandardMaterial({ color: '#f4f1ea', roughness: 0.6 })));
+  ['left', 'right'].forEach((side, i) => { const h = hands[side], g = PL.gloves[i]; if (g.parent) g.parent.remove(g); if (on && h) h.grip.add(g); });
+  const R = hands.right; if (R && R.vis) R.vis.visible = !on;
+}
+function climbStart() {
+  if (PL.on) return;
+  PL.prev = { p: modelRoot.position.clone(), q: modelRoot.quaternion.clone(), s: S(), panel: panelOn };
+  headW(_cw1); const eye = _cw1.y > 0.9 ? _cw1.y : 1.6;
+  PL.H = CLM.size; const sc = eye / (PL.H * 0.93);
+  // start on the mat in front of the sculpture, or beside the climber you picked if it's on flat ground
+  const b = sculptureBox(), cx = (b.x0 + b.x1) / 2, cz = (b.z0 + b.z1) / 2, sel = CLM.list[CLM.sel];
+  const sp = sel && sel.state === 'walk' && slopeOf(sel.n) < 40 ? sel.p.clone().add(new THREE.Vector3(PL.H * 0.8, 0, 0)) : new THREE.Vector3(cx, 0, b.z1 + PL.H * 2.5);
+  keepOnMat(sp, PL.H);
+  for (let t = 0; t < 40 && bodyBlocked(sp, PL.H); t++) { sp.z += PL.H * 0.5; keepOnMat(sp, PL.H); if (sp.z >= matIn(PL.H)) sp.x += PL.H * 0.5; }
+  const g = groundAt(sp, PL.H); sp.y = g.st === 'ok' ? g.y : 0;
+  modelRoot.scale.setScalar(sc);
+  // turn the model so the sculpture is in front of you
+  const fw = new THREE.Vector3(); (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldDirection(fw);
+  const yaw = Math.atan2(fw.x, fw.z) - Math.atan2(cx - sp.x, cz - sp.z);
+  modelRoot.quaternion.setFromAxisAngle(UPV, Number.isFinite(yaw) ? yaw : 0);
+  PL.pos.copy(sp); PL.vel.set(0, 0, 0); PL.grounded = true; PL.grip.left = PL.grip.right = null; PL.carry = null; PL.state = 'g'; PL.on = true;
+  plPlace();
+  panelOn = false; panelMesh.visible = false; ghost.visible = ghostMirror.visible = false; laser.visible = cursor.visible = false;
+  plGloves(true); UIS.dirty = true;
+  toast("You're climber-sized: grip clay to climb · left stick walks · A jumps · B comes back");
+}
+function climbEnd() {
+  if (!PL.on) return;
+  PL.on = false; PL.carry = null; PL.grip.left = PL.grip.right = null;
+  const P = PL.prev; if (P) { modelRoot.position.copy(P.p); modelRoot.quaternion.copy(P.q); modelRoot.scale.setScalar(P.s); panelOn = P.panel; }
+  panelMesh.visible = panelOn; plGloves(false); UIS.dirty = true;
+}
+function plSnapTurn(a) {
+  headW(_cw1); _cq.setFromAxisAngle(UPV, a);
+  modelRoot.position.sub(_cw2.set(_cw1.x, 0, _cw1.z)).applyQuaternion(_cq).add(_cw2); modelRoot.quaternion.premultiply(_cq);
+}
+function climbXR(dt, onPanel) {
+  const Lh = hands.left, Rh = hands.right, H = PL.H, g = 5.8 * H;   // real gravity, at your size
+  // walking around your room moves you over the model, but not through clay
+  headW(_cw1); const here = modelRoot.worldToLocal(_cw2.set(_cw1.x, 0, _cw1.z));
+  if ((here.x - PL.pos.x) ** 2 + (here.z - PL.pos.z) ** 2 > 1e-8) { const tp = _cv2.set(here.x, PL.pos.y, here.z); if (!bodyBlocked(tp, H)) PL.pos.copy(tp); }
+  const sx = axis(Rh, 2);
+  if (!PL.turnLatch && Math.abs(sx) > 0.7) { plSnapTurn(sx > 0 ? -Math.PI / 6 : Math.PI / 6); PL.turnLatch = true; }
+  if (Math.abs(sx) < 0.3) PL.turnLatch = false;
+  for (const [i, side] of [[0, 'left'], [1, 'right']]) if (PL.gloves) PL.gloves[i].material.color.set(PL.grip[side] ? CLIMBC : '#f4f1ea');
+  // carried by someone bigger: go where their pinch goes
+  if (PL.carry && performance.now() - PL.carry.t < 600) {
+    const prev = _cv1.copy(PL.pos), tgt = _cv2.copy(PL.carry.p).addScaledVector(UPV, -0.5 * H); tgt.y = Math.max(0, tgt.y);
+    PL.pos.lerp(tgt, 1 - Math.exp(-dt * 14)); PL.vel.subVectors(PL.pos, prev).multiplyScalar(1 / Math.max(dt, 1e-3));
+    PL.grounded = false; PL.grip.left = PL.grip.right = null; PL.wasGrip = false; PL.state = 'c';
+    plPlace(); return;
+  }
+  if (PL.carry) PL.carry = null;   // they let go (or the signal dropped): fall from here
+  // holding on to clay: your hand stays where it grabbed, so pulling moves you
+  const pull = _cv2.set(0, 0, 0); let nGrip = 0;
+  for (const h of [Lh, Rh]) {
+    if (!h || !h.hand) continue;
+    const want = btnP(h, 1) || (btnV(h, 0) > 0.5 && !(h === Rh && onPanel));
+    const hm = modelRoot.worldToLocal(gripPos(h));
+    if (!want) PL.grip[h.hand] = null;
+    else if (!PL.grip[h.hand] && canGrab(hm, H)) { PL.grip[h.hand] = hm.clone(); pulse(h, 0.5, 30); }
+    if (PL.grip[h.hand]) { pull.add(_cv3.subVectors(PL.grip[h.hand], hm)); nGrip++; }
+  }
+  if (nGrip) {
+    const tgt = PL.pos.clone().addScaledVector(pull, 1 / nGrip); resolveBody(tgt, H); keepOnMat(tgt, H);
+    PL.vel.lerp(_cv3.subVectors(tgt, PL.pos).multiplyScalar(1 / Math.max(dt, 1e-3)), 0.35);
+    PL.pos.copy(tgt); PL.grounded = false; PL.wasGrip = true; PL.state = 'k';
+    const a = PL.grip.left || PL.grip.right; PL.wallP = a.clone(); PL.wallN = toSurface(PL.wallP, new THREE.Vector3()) || UPV.clone();
+    plPlace(); return;
+  }
+  if (PL.wasGrip) {   // let go: keep the swing as a fling (gentle ones just drop)
+    PL.wasGrip = false; const sp = PL.vel.length(), mx = H * 5;
+    if (sp > mx) PL.vel.multiplyScalar(mx / sp); else if (sp < H * 0.3) PL.vel.set(0, 0, 0);
+    const gr = groundAt(PL.pos, H); if (gr.st === 'ok' && PL.vel.y <= H * 0.3 && PL.pos.y - gr.y < H * 0.1) { PL.grounded = true; PL.pos.y = gr.y; }
+  }
+  if (PL.grounded) {
+    // left stick walks wherever it's 45° or flatter; walk off an edge and you drop
+    const ax = axis(Lh, 2), ay = axis(Lh, 3), mv = _cv1.set(0, 0, 0);
+    if (Math.abs(ax) > 0.15 || Math.abs(ay) > 0.15) {
+      const fw = new THREE.Vector3(); (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldDirection(fw); fw.y = 0;
+      if (fw.lengthSq() > 1e-6) {
+        fw.normalize().applyQuaternion(_cq.copy(modelRoot.quaternion).invert());
+        const rt = new THREE.Vector3().crossVectors(fw, UPV).normalize();
+        mv.copy(fw).multiplyScalar(-ay).addScaledVector(rt, ax).multiplyScalar(H * 1.1 * dt);
+        let moved = false;
+        for (const m of [mv, new THREE.Vector3(mv.x, 0, 0), new THREE.Vector3(0, 0, mv.z)]) {
+          if (m.lengthSq() < 1e-10) continue;
+          const p2 = PL.pos.clone().add(m), gr = groundAt(p2, H);
+          if (gr.st === 'ok') { PL.pos.set(p2.x, gr.y, p2.z); moved = true; break; }
+          if (gr.st === 'none') { PL.pos.copy(p2); PL.grounded = false; PL.vel.copy(m).multiplyScalar(1 / Math.max(dt, 1e-3)); moved = true; break; }
+        }
+        if (!moved) mv.set(0, 0, 0);
+      }
+    }
+    if (PL.grounded) {
+      const gr = groundAt(PL.pos, H);
+      if (gr.st === 'ok') PL.pos.y = gr.y; else { PL.grounded = false; PL.vel.set(0, 0, 0); }
+    }
+    if (PL.jumpReq && PL.grounded) { PL.vel.copy(mv).multiplyScalar(1 / Math.max(dt, 1e-3)); PL.vel.y = Math.sqrt(2 * g * 0.35 * H); PL.grounded = false; }
+    PL.state = 'g';
+  }
+  PL.jumpReq = false;
+  if (!PL.grounded) {
+    // flying or falling: land on anything 45° or flatter, slide off anything steeper
+    PL.state = 'a'; PL.vel.y = Math.max(PL.vel.y - g * dt, -H * 12);
+    const from = PL.pos.clone(), to = from.clone().addScaledVector(PL.vel, dt), len = from.distanceTo(to), nst = Math.max(1, Math.ceil(len / (VS * 0.8)));
+    let hit = -1, hitK = 0;
+    const solid = (q, k) => (k === 0 && q.y <= 0) || climbDens(q.x, q.y + k * H, q.z) >= ISO;
+    for (let s2 = 1; s2 <= nst && hit < 0; s2++) { _cv3.lerpVectors(from, to, s2 / nst); for (const k of [0, 0.5, 0.9]) if (solid(_cv3, k)) { hit = s2 / nst; hitK = k; break; } }
+    if (hit < 0) PL.pos.copy(to);
+    else {
+      let lo = hit - 1 / nst, hi = hit; for (let i = 0; i < 6; i++) { const m = (lo + hi) / 2; _cv3.lerpVectors(from, to, m); if (solid(_cv3, hitK)) hi = m; else lo = m; }
+      PL.pos.lerpVectors(from, to, lo);
+      const cp = _cv3.copy(PL.pos).addScaledVector(UPV, hitK * H), n = new THREE.Vector3(0, 1, 0);
+      if (!(hitK === 0 && cp.y <= 0.05 && climbDens(cp.x, 0.5, cp.z) < ISO)) { climbGrad(cp, _g); if (_g.lengthSq() > 1e-6) n.copy(_g).negate().normalize(); }
+      if (hitK === 0 && n.y >= 0.707) { PL.grounded = true; PL.vel.set(0, 0, 0); const gr = groundAt(PL.pos, H); if (gr.st === 'ok') PL.pos.y = gr.y; pulse(Lh, 0.2, 20); pulse(Rh, 0.2, 20); }
+      else { const vn = PL.vel.dot(n); if (vn < 0) PL.vel.addScaledVector(n, -vn); PL.vel.multiplyScalar(0.96); PL.pos.addScaledVector(n, VS * 0.3); }
+    }
+    resolveBody(PL.pos, H);
+  }
+  keepOnMat(PL.pos, H); if (PL.pos.y < 0) PL.pos.y = 0;
+  plPlace();
+}
+// ---- someone bigger pinching a little player (the big side)
+const PH = { pid: null, off: new THREE.Vector3(), prev: new THREE.Vector3(), vel: new THREE.Vector3(), lastSend: 0, hover: null };
+function littleNear(cm, r) {
+  if (!NET.on || PL.on) return null;
+  headW(_cw1); const mine = _cw1.y / S(); let best = null, bd = Infinity;
+  for (const p of SYNC.peers.values()) {
+    if (!p.little || performance.now() - p.t > 1500 || mine < p.little.H * 2.5) continue;
+    const c = _cv3.copy(p.little.f).addScaledVector(UPV, 0.5 * p.little.H), d = c.distanceTo(cm);
+    if (d < Math.max(0.6 * p.little.H, r * 0.8) && d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+function pinchStart(p, cm) { PH.pid = p.id; PH.off.copy(p.little.f).addScaledVector(UPV, 0.5 * p.little.H).sub(cm); PH.prev.copy(cm).add(PH.off); PH.vel.set(0, 0, 0); PH.lastSend = 0; }
+function pinchMove(cm, dt) {
+  const P = cm.clone().add(PH.off); PH.vel.lerp(_cv3.subVectors(P, PH.prev).multiplyScalar(1 / Math.max(dt, 1e-3)), 0.4); PH.prev.copy(P);
+  const p = SYNC.peers.get(PH.pid); if (p) p.holdP = P.clone();
+  const now = performance.now(); if (now - PH.lastSend > 33) { PH.lastSend = now; netSend({ t: 'pk', to: PH.pid, on: 1, p: [P.x, P.y, P.z].map(v => +v.toFixed(2)) }); }
+}
+function pinchEnd() {
+  const p = SYNC.peers.get(PH.pid), H = p && p.little ? p.little.H : CLM.size, mx = H * 6, v = PH.vel.clone(); if (v.length() > mx) v.setLength(mx);
+  netSend({ t: 'pk', to: PH.pid, on: 0, v: [v.x, v.y, v.z].map(x => +x.toFixed(1)) }); if (p) p.holdP = null; PH.pid = null;
+}
+// ---- the little side
+function onPick(m) {
+  if (m.to !== SYNC.me || !PL.on) return;
+  if (m.on) { if (!PL.carry) PL.carry = { p: new THREE.Vector3(), t: 0 }; PL.carry.p.fromArray(m.p); PL.carry.t = performance.now(); }
+  else { PL.carry = null; if (m.v) PL.vel.fromArray(m.v); PL.grounded = false; PL.wasGrip = false; }
+}
+// ---- little players as climber figures for everyone else
+function peerFigures(dt) {
+  const out = [];
+  for (const p of SYNC.peers.values()) {
+    if (!p.little || performance.now() - p.t > 3000) continue;
+    const L = p.little, held = !!p.holdP || L.st === 'c';
+    if (!p.fig) p.fig = { p: L.f.clone(), n: UPV.clone(), head: new THREE.Vector3(0, 0, 1), state: 'walk', s: 1, girth: 1, hue: p.col * 0.13, limbs: [], look: new THREE.Vector3(0, 0, 1), speed: 0, rest: 0, col: new THREE.Color(PEERC[p.col % PEERC.length]), colHead: new THREE.Color(PEERC[p.col % PEERC.length]).lerp(new THREE.Color('#ffffff'), 0.35) };
+    const f = p.fig; f.s = L.H / CLM.size;
+    const tgt = held ? (p.holdP || L.f.clone().addScaledVector(UPV, 0.8 * L.H)) : (L.st === 'k' && L.wp ? L.wp : L.f);
+    const prev = f.p.clone(); f.p.lerp(tgt, held && p.holdP ? 1 : 1 - Math.exp(-dt * 12));
+    f.state = held ? 'held' : L.st === 'a' ? 'fall' : 'walk';
+    f.n.copy(L.st === 'k' && L.wn ? L.wn : UPV);
+    f.speed = dt > 0 ? f.speed * 0.8 + 0.2 * prev.distanceTo(f.p) / dt : 0;
+    f.head.set(Math.sin(L.yaw), 0, Math.cos(L.yaw));
+    out.push(f);
+  }
+  return out;
+}
+
 // the one trait that stands out most, as a word
 function climberTrait(c) {
   const t = [[(c.pace - 1.025) / 0.225, 'speedy', 'slow'], [(c.grit - 1.05) / 0.45, 'tireless', 'sleepy'], [(c.curious - 0.9) / 0.6, 'curious', 'cozy'],
@@ -3728,6 +3974,12 @@ function drawClimberPanel(X, FW) {
     confirmButton(X + 712, 582, 240, 60, 'clrone', 'Remove it', () => removeClimber(CLM.sel), { fs: 26 });
     slider(X, 716, FW, 'Slope it likes', c.pref / 150, `${Math.round(c.pref)}°`, (u) => { c.pref = Math.round(u * 150); c.rethink = 0; }, '0° runs on flat tops · 45° scrambles · 90° climbs walls · 130° hangs under roofs');
   } else txt('Grab or click a climber to set the slope it likes.', X, 622, 26, '#7f8896', 'left', 500);
+  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 846, FW, 3);
+  if (XRS.inSession) {
+    button(X, 878, FW, 96, PL.on ? 'Back to full size' : 'Climb it yourself', { on: !PL.on, accent: CLIMBC, fs: 32, click: () => { if (PL.on) climbEnd(); else climbStart(); } });
+    txt(PL.on ? 'B also brings you back · X shows or hides this panel' : 'Become climber-sized. Grip clay to pull yourself up, let go mid-swing to fling;', X, 1012, 24, '#7f8896', 'left', 500);
+    if (!PL.on) txt('left stick walks up to 45°, A jumps, right stick turns, B comes back.', X, 1044, 24, '#7f8896', 'left', 500);
+  } else txt('Climb it yourself: in the headset, become climber-sized and climb your sculpture.', X, 900, 24, '#7f8896', 'left', 500);
 }
 const climbersState = () => ({ size: CLM.size, list: CLM.list.map(c => [+c.p.x.toFixed(1), +c.p.y.toFixed(1), +c.p.z.toFixed(1), c.pref, +c.hue.toFixed(3), +c.s.toFixed(2), +c.girth.toFixed(2), +c.pace.toFixed(2), +c.grit.toFixed(2), +c.curious.toFixed(2), +c.social.toFixed(2), +c.bold.toFixed(2)]) });
 function loadClimbers(st) {
@@ -3912,6 +4164,7 @@ startSolver();
 renderer.setAnimationLoop(() => {
   const now = performance.now(), dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
   const xr = renderer.xr.isPresenting;
+  if (PL.on && !xr && !PL.test) climbEnd();
   if (xr) updateXR(dt); else controls.update();
   if (smoothDirtyAt && now - smoothDirtyAt > 250) { smoothDirtyAt = 0; remeshAll(); }
   processRemesh(xr ? 6 : 12);
@@ -3927,7 +4180,7 @@ renderer.setAnimationLoop(() => {
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
