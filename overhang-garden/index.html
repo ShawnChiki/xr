@@ -185,8 +185,73 @@ const SKIES = [
   ['Paper', '#ffffff', '#efece4', '#d6d0c2'], ['Studio', '#17181c', '#17181c', '#17181c']];
 const LOOK = { bg: 'Pool', ao: true, rim: true, lines: 0 };
 try { Object.assign(LOOK, JSON.parse(localStorage.getItem('og-look') || '{}')); } catch (e) {}
+LOOK.sndClimb = LOOK.sndClimb ?? true; LOOK.sndSculpt = LOOK.sndSculpt ?? true;
 const saveLook = () => { try { localStorage.setItem('og-look', JSON.stringify(LOOK)); } catch (e) {} };
-const lookU = { uAO: { value: LOOK.ao ? 1 : 0 }, uRim: { value: LOOK.rim ? 1 : 0 }, uRimCol: { value: new THREE.Color('#ffffff') }, uLines: { value: LOOK.lines } };
+const lookU = { uAO: { value: LOOK.ao ? 1 : 0 }, uRim: { value: LOOK.rim ? 1 : 0 }, uRimCol: { value: new THREE.Color('#ffffff') }, uLines: { value: LOOK.lines }, uHold: { value: 2.4 } };
+
+// ───────────────────────── sound effects (made on the fly, nothing to download)
+const SND = { ctx: null, out: null, noise: null, budget: 0, lastT: 0, mv: 0, r: 1, voice: null, cool: {} };
+function sndInit() {
+  if (SND.ctx) { if (SND.ctx.state === 'suspended') SND.ctx.resume(); return; }
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)(); SND.ctx = ctx;
+    SND.out = ctx.createGain(); SND.out.gain.value = 0.7; SND.out.connect(ctx.destination);
+    const b = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate), d = b.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; SND.noise = b;
+  } catch (e) { SND.ctx = null; }
+}
+addEventListener('pointerdown', sndInit); addEventListener('keydown', sndInit);
+const _sw = new THREE.Vector3(), _sr = new THREE.Vector3();
+function sndPlace(p) {   // loudness and left/right from where the sound is relative to your head
+  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+  const w = modelRoot.localToWorld(_sw.copy(p)), hp = cam.getWorldPosition(new THREE.Vector3()), d = w.distanceTo(hp);
+  _sr.set(1, 0, 0).applyQuaternion(cam.getWorldQuaternion(new THREE.Quaternion()));
+  return { g: clamp(0.5 / Math.max(d, 0.25), 0, 1), pan: clamp(w.sub(hp).normalize().dot(_sr), -1, 1) * 0.8 };
+}
+function sndChain(g0, pan) { const ctx = SND.ctx, g = ctx.createGain(), pn = ctx.createStereoPanner ? ctx.createStereoPanner() : null; g.gain.value = 0; if (pn) { pn.pan.value = pan; g.connect(pn); pn.connect(SND.out); } else g.connect(SND.out); return g; }
+function sndTone(type, f0, f1, dur, vol, pan, delay = 0) {
+  const ctx = SND.ctx, t = ctx.currentTime + delay, o = ctx.createOscillator(), g = sndChain(0, pan);
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(vol, t + 0.008); g.gain.exponentialRampToValueAtTime(0.0005, t + dur);
+  o.connect(g); o.start(t); o.stop(t + dur + 0.02);
+}
+function sndNoise(ftype, freq, q, dur, vol, pan) {
+  const ctx = SND.ctx, t = ctx.currentTime, src = ctx.createBufferSource(), f = ctx.createBiquadFilter(), g = sndChain(0, pan);
+  src.buffer = SND.noise; src.playbackRate.value = 0.8 + Math.random() * 0.4; f.type = ftype; f.frequency.value = freq; f.Q.value = q;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0005, t + dur);
+  src.connect(f); f.connect(g); src.start(t, Math.random() * 0.5); src.stop(t + dur + 0.02);
+}
+// climbers: tiny footsteps, a boing when they hop, a thump when they land, a slide whistle, an eep when picked up, a yay at the top
+function sndClimber(kind, c) {
+  if (!LOOK.sndClimb || !SND.ctx || SND.ctx.state !== 'running' || CLM.paused) return;
+  const now = performance.now(); SND.budget = Math.min(14, SND.budget + (now - SND.lastT) * 0.014); SND.lastT = now;
+  const cost = kind === 'step' ? 1 : 0.5; if (SND.budget < cost) return; SND.budget -= cost;
+  const { g, pan } = sndPlace(c.cen || c.p), pitch = 1.25 - (c.s || 1) * 0.25; if (g < 0.02) return;
+  if (kind === 'step') sndNoise('highpass', 2600 * pitch, 0.7, 0.03, 0.05 * g, pan);
+  else if (kind === 'hop') sndTone('sine', 320 * pitch, 760 * pitch, 0.14, 0.12 * g, pan);
+  else if (kind === 'land') { sndTone('sine', 150 * pitch, 70, 0.09, 0.14 * g, pan); sndNoise('lowpass', 900, 0.7, 0.05, 0.05 * g, pan); }
+  else if (kind === 'slide') sndTone('triangle', 1250 * pitch, 520 * pitch, 0.9, 0.08 * g, pan);
+  else if (kind === 'eep') sndTone('square', 900 * pitch, 1500 * pitch, 0.09, 0.05 * g, pan);
+  else if (kind === 'fall') sndTone('sine', 1100 * pitch, 260 * pitch, 0.6, 0.09 * g, pan);
+  else if (kind === 'yay') { sndTone('triangle', 880 * pitch, 900 * pitch, 0.1, 0.08 * g, pan); sndTone('triangle', 1320 * pitch, 1360 * pitch, 0.14, 0.08 * g, pan, 0.09); }
+  else if (kind === 'pop') { sndNoise('bandpass', 900, 1.5, 0.08, 0.2 * g, pan); sndTone('sine', 600, 1400, 0.06, 0.08 * g, pan); }
+}
+// sculpting: a squishy low rumble while adding, a gritty scrape while carving, softer for smooth and flatten; louder the faster you move
+function sndSculptTick(dt) {
+  const on = LOOK.sndSculpt && SND.ctx && SND.ctx.state === 'running' && stroke.active && ['add', 'carve', 'smooth', 'flatten'].includes(ST.tool);
+  const speed = dt > 0 ? SND.mv / dt / Math.max(SND.r, 1) : 0; SND.mv = 0;
+  if (!on) { if (SND.voice) { const v = SND.voice; v.g.gain.setTargetAtTime(0, SND.ctx.currentTime, 0.05); v.src.stop(SND.ctx.currentTime + 0.3); SND.voice = null; } return; }
+  if (!SND.voice || SND.voice.tool !== ST.tool) {
+    if (SND.voice) { SND.voice.g.gain.setTargetAtTime(0, SND.ctx.currentTime, 0.03); SND.voice.src.stop(SND.ctx.currentTime + 0.2); }
+    const ctx = SND.ctx, src = ctx.createBufferSource(), f = ctx.createBiquadFilter(), g = ctx.createGain();
+    src.buffer = SND.noise; src.loop = true; g.gain.value = 0; src.connect(f); f.connect(g); g.connect(SND.out); src.start();
+    const t = ST.tool; f.type = t === 'carve' ? 'bandpass' : 'lowpass'; f.frequency.value = { add: 380, carve: 2300, smooth: 900, flatten: 1300 }[t]; f.Q.value = t === 'carve' ? 0.9 : 1.6;
+    SND.voice = { src, f, g, tool: t };
+    if (t === 'add') sndTone('sine', 130, 70, 0.12, 0.12, 0); else if (t === 'carve') sndNoise('bandpass', 3200, 1.2, 0.06, 0.08, 0);
+  }
+  const v = SND.voice, now = SND.ctx.currentTime, lvl = clamp(speed / 6, 0, 1) * ({ add: 0.22, carve: 0.12, smooth: 0.07, flatten: 0.08 }[v.tool]);
+  v.g.gain.setTargetAtTime(lvl, now, 0.06);
+  if (v.tool === 'add') v.f.frequency.setTargetAtTime(300 + 200 * Math.sin(now * 9) * clamp(speed / 6, 0, 1), now, 0.05);
+}
 
 // ───────────────────────── clay material w/ overhang stripes
 const overU = { uShowOver: { value: 1 } };
@@ -197,8 +262,25 @@ function makeClayMaterial(hex, stripes = true) {
   const m = new THREE.MeshStandardMaterial({ color: hex, roughness: 0.56, metalness: 0 });
   m.onBeforeCompile = (sh) => {
     sh.uniforms.uCls = clsU; sh.uniforms.uShowOver = stripes ? overU.uShowOver : noStripeU; Object.assign(sh.uniforms, lookU);
-    sh.vertexShader = 'attribute float ao;\nvarying float vAO;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjN = normal; vObjP = position; vAO = ao;');
-    sh.fragmentShader = 'uniform highp sampler3D uCls;\nuniform float uShowOver, uAO, uRim, uLines;\nuniform vec3 uRimCol;\nvarying float vAO;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.fragmentShader
+    sh.vertexShader = 'attribute float ao;\nattribute vec2 usew;\nvarying float vAO;\nvarying vec2 vUse;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjN = normal; vObjP = position; vAO = ao; vUse = usew;');
+    sh.fragmentShader = 'uniform highp sampler3D uCls;\nuniform float uShowOver, uAO, uRim, uLines, uHold;\nuniform vec3 uRimCol;\nvarying float vAO;\nvarying vec2 vUse;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.fragmentShader
+      // climbing walls: a grey board with bright speckled holds; slides: glossy yellow plastic with lanes down the fall line
+      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+      if (vUse.x > 0.02) {
+        vec3 cell = floor(vObjP / uHold);
+        vec3 h = fract(sin(vec3(dot(cell, vec3(127.1, 311.7, 74.7)), dot(cell, vec3(269.5, 183.3, 246.1)), dot(cell, vec3(113.5, 271.9, 124.6)))) * 43758.5453);
+        float d = length(vObjP - (cell + 0.25 + 0.5 * h) * uHold) / uHold;
+        float hold = step(h.x, 0.62) * (1.0 - smoothstep(0.17 + 0.12 * h.y, 0.21 + 0.12 * h.y, d));
+        float ci = floor(h.z * 6.0);
+        vec3 hc = ci < 1.0 ? vec3(1.0, 0.06, 0.08) : ci < 2.0 ? vec3(1.0, 0.75, 0.0) : ci < 3.0 ? vec3(0.04, 0.2, 1.0) : ci < 4.0 ? vec3(0.0, 0.62, 0.18) : ci < 5.0 ? vec3(1.0, 0.3, 0.0) : vec3(0.45, 0.05, 0.85);
+        diffuseColor.rgb = mix(diffuseColor.rgb, mix(mix(diffuseColor.rgb, vec3(0.32, 0.36, 0.42), 0.75), hc, hold), vUse.x);
+        roughnessFactor = mix(roughnessFactor, 0.8, vUse.x);
+      }
+      if (vUse.y > 0.02) {
+        float lip = smoothstep(0.2, 0.45, vUse.y) * (1.0 - smoothstep(0.55, 0.8, vUse.y));   // a darker lip around the edge
+        diffuseColor.rgb = mix(diffuseColor.rgb, mix(vec3(1.0, 0.62, 0.0), vec3(1.0, 0.22, 0.0), lip), vUse.y);
+        roughnessFactor = mix(roughnessFactor, 0.16, vUse.y);
+      }`)
       // printed layer lines: little rounded ridges every 0.1 or 0.2 mm up the sides, fading out when they're too fine to see
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
       if (uLines > 0.0) {
@@ -234,7 +316,8 @@ function makeClayMaterial(hex, stripes = true) {
         }
       }`).replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += ovHot * 0.4;');
   };
-  m.customProgramCacheKey = () => 'clay2' + (stripes ? 1 : 0);
+  m.customProgramCacheKey = () => 'clay3' + (stripes ? 1 : 0);
+  m.defaultAttributeValues = { ...m.defaultAttributeValues, ao: [1], usew: [0, 0] };
   if (typeof CUT !== 'undefined' && CUT.on) m.clippingPlanes = [cutPlane];
   return m;
 }
@@ -492,12 +575,44 @@ function stampPaint(L, cx, cy, cz, r, idx, rec) {
     const key = (i >> 4) + NC * ((j >> 4) + NC * (k >> 4)), li = (i & 15) + 16 * ((j & 15) + 16 * (k & 15));
     let pc = L.paint.get(key);
     if (!pc) { if (!idx) continue; if (rec) { let m = rec.psaves.get(L); if (!m) rec.psaves.set(L, m = new Map()); if (!m.has(key)) m.set(key, null); } pc = new Uint8Array(4096); L.paint.set(key, pc); }
-    if (pc[li] === idx) continue;
+    if ((pc[li] & 15) === idx) continue;
     if (rec) { let m = rec.psaves.get(L); if (!m) rec.psaves.set(L, m = new Map()); if (!m.has(key)) m.set(key, pc.slice()); }
-    pc[li] = idx; touched.add(key);
+    pc[li] = (pc[li] & 0xF0) | idx; touched.add(key);
   }
   for (const key of touched) paintDirty(L, key);
   return touched.size > 0;
+}
+// what a surface is for (painted from the Climbers tab): 1 climbing wall, 2 slide, 0 nothing special. Kept in the same
+// bytes as color paint (the high bits), so undo, saves and rooms carry it too.
+function stampUse(L, cx, cy, cz, r, kind, rec) {
+  const R = r + VS * 0.5, [i0, i1, j0, j1, k0, k1] = voxBox(cx - R, cx + R, cy - R, cy + R, cz - R, cz + R), touched = new Set();
+  for (let k = k0; k <= k1; k++) for (let j = Math.max(1, j0); j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    if (Math.hypot(vx(i) - cx, vy(j) - cy, vz(k) - cz) > r || getD(L, i, j, k) < 0.12) continue;
+    const key = (i >> 4) + NC * ((j >> 4) + NC * (k >> 4)), li = (i & 15) + 16 * ((j & 15) + 16 * (k & 15));
+    let pc = L.paint.get(key);
+    if (!pc) { if (!kind) continue; if (rec) { let m = rec.psaves.get(L); if (!m) rec.psaves.set(L, m = new Map()); if (!m.has(key)) m.set(key, null); } pc = new Uint8Array(4096); L.paint.set(key, pc); }
+    if ((pc[li] >> 4) === kind) continue;
+    if (rec) { let m = rec.psaves.get(L); if (!m) rec.psaves.set(L, m = new Map()); if (!m.has(key)) m.set(key, pc.slice()); }
+    pc[li] = (pc[li] & 15) | (kind << 4); touched.add(key);
+  }
+  for (const key of touched) paintDirty(L, key);
+  return touched.size > 0;
+}
+// per vertex: how much climbing wall and how much slide is around it (blended like color paint)
+function useWeights(L, P, nv) {
+  const out = new Float32Array(nv * 2);
+  for (let v = 0; v < nv; v++) {
+    const fx = ix(P[v * 3]), fy = Math.max(1, iy(P[v * 3 + 1])), fz = iz(P[v * 3 + 2]);
+    const i = Math.floor(fx), j = Math.floor(fy), k = Math.floor(fz), tx = fx - i, ty = fy - j, tz = fz - k;
+    let a = 0, b = 0, ws = 0;
+    for (let c = 0; c < 8; c++) {
+      const aa = c & 1, bb = (c >> 1) & 1, d = c >> 2, ii = i + aa, jj = j + bb, kk = k + d;
+      const w = (aa ? tx : 1 - tx) * (bb ? ty : 1 - ty) * (d ? tz : 1 - tz) * (getD(L, ii, jj, kk) + 0.05), u = getP(L, ii, jj, kk) >> 4;
+      if (u === 1) a += w; else if (u === 2) b += w; ws += w;
+    }
+    ws = ws || 1; out[v * 2] = a / ws; out[v * 2 + 1] = b / ws;
+  }
+  return out;
 }
 const _pc = new THREE.Color();
 const PALC = PALETTE.map(h => new THREE.Color(h));
@@ -511,7 +626,7 @@ function paintColors(L, P, nv) {
     for (let c = 0; c < 8; c++) {
       const a = c & 1, bb = (c >> 1) & 1, d = c >> 2, ii = i + a, jj = j + bb, kk = k + d;
       const w = (a ? tx : 1 - tx) * (bb ? ty : 1 - ty) * (d ? tz : 1 - tz) * (getD(L, ii, jj, kk) + 0.05);
-      const p = getP(L, ii, jj, kk), col = p ? PALC[p - 1] : base;
+      const p = getP(L, ii, jj, kk) & 15, col = p ? PALC[p - 1] : base;
       r += col.r * w; g += col.g * w; b += col.b * w; ws += w;
     }
     ws = ws || 1; out[v * 3] = r / ws; out[v * 3 + 1] = g / ws; out[v * 3 + 2] = b / ws;
@@ -592,7 +707,7 @@ function afterEdit() { editCount++; supNeed = true; lastEditAt = performance.now
 
 const stroke = { active: false, rec: null, targets: [], last: new THREE.Vector3(), hasLast: false, lastHaptic: 0 };
 function strokeTargets() {
-  if (ST.tool === 'paint') {
+  if (ST.tool === 'paint' || ST.tool === 'use') {
     const t = layers.filter(l => !l.auto && !l.bridge && l.visible && !l.locked);
     if (!t.length) toast('Every layer is hidden or locked');
     return t;
@@ -619,7 +734,8 @@ function strokeBegin() {
 }
 function strokeApply(c, m, rmm) {
   if (!stroke.active) return false;
-  CLM.brushP.copy(c); CLM.brushR = rmm; CLM.brushT = CLM.time;   // climbers nearby get out of the way
+  if (ST.tool !== 'use') { CLM.brushP.copy(c); CLM.brushR = rmm; CLM.brushT = CLM.time; }   // climbers nearby get out of the way
+  if (stroke.hasLast) SND.mv += c.distanceTo(stroke.last); SND.r = rmm;
   const tool = ST.tool, shape = ST.shape;
   const pts = [];
   const again = tool === 'smooth' || tool === 'texture';
@@ -649,6 +765,9 @@ function strokeApply(c, m, rmm) {
       const pl = stroke.plane;
       changed = stampFlatten(L, p.x, p.y, p.z, rmm, pl, stroke.rec) || changed;
       if (mm) changed = stampFlatten(L, -p.x, p.y, p.z, rmm, { px: -pl.px, py: pl.py, pz: pl.pz, nx: -pl.nx, ny: pl.ny, nz: pl.nz }, stroke.rec) || changed;
+    } else if (tool === 'use') {
+      changed = stampUse(L, p.x, p.y, p.z, rmm, ST.useKind, stroke.rec) || changed;
+      if (mm) changed = stampUse(L, -p.x, p.y, p.z, rmm, ST.useKind, stroke.rec) || changed;
     } else if (tool === 'paint') {
       changed = stampPaint(L, p.x, p.y, p.z, rmm, ST.paintIdx, stroke.rec) || changed;
       if (mm) changed = stampPaint(L, -p.x, p.y, p.z, rmm, ST.paintIdx, stroke.rec) || changed;
@@ -988,7 +1107,7 @@ function meshChunk(L, key) {
   geo.setAttribute('position', new THREE.BufferAttribute(VP.slice(0, nv * 3), 3));
   geo.setAttribute('normal', new THREE.BufferAttribute(VN.slice(0, nv * 3), 3));
   geo.setIndex(new THREE.BufferAttribute(IDX.slice(0, ni), 1));
-  if (L.painted) geo.setAttribute('color', new THREE.BufferAttribute(paintColors(L, VP, nv), 3));
+  if (L.painted) { geo.setAttribute('color', new THREE.BufferAttribute(paintColors(L, VP, nv), 3)); geo.setAttribute('usew', new THREE.BufferAttribute(useWeights(L, VP, nv), 2)); }
   geo.setAttribute('ao', new THREE.BufferAttribute(new Float32Array(nv).fill(1), 1));
   geo.computeBoundingSphere(); geo.computeBoundingBox();
   let mesh = L.meshes.get(key);
@@ -1892,6 +2011,14 @@ function keepSupportsAsClay() {
   for (const key of L.chunks.keys()) netTouch(L, key);
   supSettingChanged(); toast(`Supports are now clay on ${L.name}`);
 }
+// supports become clay and merge straight into the clay layer above them in the list
+function bakeSupportsInto() {
+  if (!supLayer || !supLayer.chunks.size) return toast('No supports to bake yet');
+  const L = supLayer; keepSupportsAsClay();
+  const u = clayLayers(), i = u.indexOf(L), T = u[i - 1];
+  if (!T) return;
+  mergeLayer(L); toast(`Supports baked into ${T.name}`);
+}
 function supportTick(now) {
   if (!ST.sup.auto) return;
   if (SOLVER.w && !SOLVER.failed) {
@@ -2153,8 +2280,8 @@ function railButton(y, name, label, on, click, accent) {
 // the Climbers tab is also the climber hand: opening it picks climbers up, leaving it gives back the tool you had
 function setTab(k) {
   if (k === UIS.tab) return;
-  if (k === 'climbers') { if (ST.tool !== 'climb') { CLM.prevTool = ST.tool; ST.tool = 'climb'; } }
-  else if (UIS.tab === 'climbers' && ST.tool === 'climb') { if (CLM.held >= 0) dropHeld(); ST.tool = CLM.prevTool || 'add'; }
+  if (k === 'climbers') { if (ST.tool !== 'climb' && ST.tool !== 'use') { CLM.prevTool = ST.tool; setClimbMode(CLM.mode || 'grab'); } }
+  else if (UIS.tab === 'climbers' && (ST.tool === 'climb' || ST.tool === 'use')) { if (CLM.held >= 0) dropHeld(); if (stroke.active) strokeEnd(); ST.tool = CLM.prevTool || 'add'; }
   UIS.tab = k; UIS.dirty = true; updateGhost();
 }
 function drawUI() {
@@ -2239,7 +2366,7 @@ function drawUI() {
       W.push({ x: X + 12, y: y + 4, w: 88, h: 84, click: () => { UIS.picker = UIS.picker === L.id ? null : L.id; } });
       txt(L.name + (L.auto ? ' (grows itself)' : L.bridge ? (act ? '  ← new bridges' : '  (bridges)') : act ? '  ← sculpting' : ''), X + 112, y + 46, 30, L.visible ? '#e9ecf1' : '#7f8896', 'left', 700);
       button(X + 560, y + 12, 186, 68, L.visible ? 'Shown' : 'Hidden', { on: L.visible, fs: 28, click: () => { L.visible = !L.visible; L.group.visible = L.visible; dimsDirty = true; if (!L.auto) afterEdit(); } });
-      if (L.auto) button(X + 756, y + 12, 186, 68, 'Keep clay', { fs: 28, click: keepSupportsAsClay });
+      if (L.auto) { const above = clayLayers().filter(l => l !== L).slice(-1)[0]; confirmButton(X + 756, y + 12, 186, 68, 'bake', above ? 'Bake in ↑' : 'Keep clay', () => bakeSupportsInto(), { fs: 26 }); }
       else button(X + 756, y + 12, 186, 68, L.locked ? 'Locked' : 'Lock', { on: L.locked, accent: '#ffc93c', fs: 28, click: () => { L.locked = !L.locked; } });
       y += 102;
       if (UIS.picker === L.id) {
@@ -2337,24 +2464,25 @@ function drawUI() {
     });
     button(X, 548, 466, 80, 'Ambient occlusion', { on: LOOK.ao, fs: 28, click: () => { LOOK.ao = !LOOK.ao; lookU.uAO.value = LOOK.ao ? 1 : 0; if (LOOK.ao) aoMarkAll(); saveLook(); } });
     button(X + 486, 548, 466, 80, 'Rim light', { on: LOOK.rim, fs: 28, click: () => { LOOK.rim = !LOOK.rim; lookU.uRim.value = LOOK.rim ? 1 : 0; saveLook(); } });
-    txt('Layer lines', X, 688, 28, '#e9ecf1', 'left', 700);
+    txt('Layer lines', X, 676, 28, '#e9ecf1', 'left', 700); txt('show up close', X, 706, 20, '#7f8896', 'left', 500);
     [[0, 'Off'], [0.1, '0.1 mm'], [0.2, '0.2 mm']].forEach(([v, lab], i) => button(X + 262 + i * 234, 646, 222, 72, lab, { on: LOOK.lines === v, fs: 26, click: () => { LOOK.lines = v; lookU.uLines.value = v; saveLook(); } }));
-    txt('Layer lines show up close (stand on the bed, or climb it).', X, 750, 22, '#7f8896', 'left', 500);
-    txt('Saves', X, 800, 30, '#9aa3b2', 'left', 700);
-    txt(cloud.ok ? (cloud.local ? 'Saved in this browser · autosave on' : 'Saved to your account · autosave on') : (cloud.checking ? 'Connecting…' : 'Saving is not available here'), X + FW, 800, 22, '#7f8896', 'right', 500);
+    button(X, 734, 466, 72, `Climber sounds: ${LOOK.sndClimb ? 'On' : 'Off'}`, { on: LOOK.sndClimb, accent: CLIMBC, fs: 26, click: () => { LOOK.sndClimb = !LOOK.sndClimb; sndInit(); saveLook(); } });
+    button(X + 486, 734, 466, 72, `Sculpt sounds: ${LOOK.sndSculpt ? 'On' : 'Off'}`, { on: LOOK.sndSculpt, fs: 26, click: () => { LOOK.sndSculpt = !LOOK.sndSculpt; sndInit(); saveLook(); } });
+    txt('Saves', X, 846, 30, '#9aa3b2', 'left', 700);
+    txt(cloud.ok ? (cloud.local ? 'Saved in this browser · autosave on' : 'Saved to your account · autosave on') : (cloud.checking ? 'Connecting…' : 'Saving is not available here'), X + FW, 846, 22, '#7f8896', 'right', 500);
     ['slot1', 'slot2', 'slot3'].forEach((slot, i) => {
-      const cw = (FW - 32) / 3, x = X + i * (cw + 16), y = 818;
+      const cw = (FW - 32) / 3, x = X + i * (cw + 16), y = 862;
       ui.fillStyle = '#20232a'; rr(x, y, cw, 140, 18); ui.fill();
       txt(`Slot ${i + 1}`, x + 20, y + 38, 28, '#e9ecf1', 'left', 800);
       txt(cloud.meta[slot] ? `${cloud.meta[slot]}` : 'Empty', x + 20, y + 68, 20, '#7f8896', 'left', 500);
       confirmButton(x + 14, y + 84, (cw - 40) / 2, 44, 'save' + slot, 'Save', () => saveSlot(slot, true), { dim: !cloud.ok, fs: 22 });
       confirmButton(x + 26 + (cw - 40) / 2, y + 84, (cw - 40) / 2, 44, 'load' + slot, 'Load', () => loadSlot(slot), { dim: !cloud.ok || !cloud.meta[slot], fs: 22 });
     });
-    button(X, 976, FW, 78, 'Export STL + 3MF (.zip)', { on: true, fs: 32, click: exportZip });
-    confirmButton(X, 1068, 466, 68, 'new', 'New empty scene', newScene, { fs: 26 });
-    confirmButton(X + 486, 1068, 466, 68, 'demo', 'Load demo mushroom', () => { newScene(); starter(activeLayer); afterEdit(); }, { fs: 26 });
-    txt('Trigger sculpt · A add/carve · B undo · right stick size, shape (click: smooth)', X, 1170, 21, '#7f8896', 'left', 500);
-    txt('Grips move world (both: turn, scale) · left stick fly (click: MR) · X menu · Y see-through', X, 1200, 21, '#7f8896', 'left', 500);
+    button(X, 1016, FW, 74, 'Export STL + 3MF (.zip)', { on: true, fs: 32, click: exportZip });
+    confirmButton(X, 1102, 466, 64, 'new', 'New empty scene', newScene, { fs: 26 });
+    confirmButton(X + 486, 1102, 466, 64, 'demo', 'Load demo mushroom', () => { newScene(); starter(activeLayer); afterEdit(); }, { fs: 26 });
+    txt('Trigger sculpt · A add/carve · B undo · right stick size, shape (click: smooth)', X, 1206, 20, '#7f8896', 'left', 500);
+    txt('Grips move world (both: turn, scale) · left stick fly (click: MR) · X menu · Y see-through', X, 1234, 20, '#7f8896', 'left', 500);
   }
   if (UIS.toast && performance.now() - UIS.toastT < 2200) {
     ui.fillStyle = 'rgba(124,240,178,0.95)'; rr(X, UIH - 84, FW, 64, 18); ui.fill();
@@ -2487,9 +2615,9 @@ const ghost = new THREE.Mesh(ghostGeos[0], ghostMat); const ghostW = new THREE.M
 ghost.visible = false; modelRoot.add(ghost);
 const ghostMirror = ghost.clone(); ghostMirror.material = ghostMat; modelRoot.add(ghostMirror); ghostMirror.visible = false;
 function updateGhost() {
-  const col = { add: ACC, carve: CARVE, smooth: SMOOTH, flatten: FLATC, bridge: BRIDGEC, texture: TEXC, paint: ST.paintIdx ? PALETTE[ST.paintIdx - 1] : '#ffffff', climb: CLIMBC }[ST.tool];
+  const col = { add: ACC, carve: CARVE, smooth: SMOOTH, flatten: FLATC, bridge: BRIDGEC, texture: TEXC, paint: ST.paintIdx ? PALETTE[ST.paintIdx - 1] : '#ffffff', climb: CLIMBC, use: ['#ffffff', '#3f6bff', '#ffc400'][ST.useKind || 0] }[ST.tool];
   ghostMat.color.set(col); ghostWire.color.set(col);
-  const g = ghostGeos[ST.tool === 'bridge' || ST.tool === 'texture' || ST.tool === 'flatten' || ST.tool === 'paint' || ST.tool === 'climb' ? 0 : ST.shape];
+  const g = ghostGeos[ST.tool === 'bridge' || ST.tool === 'texture' || ST.tool === 'flatten' || ST.tool === 'paint' || ST.tool === 'use' || ST.tool === 'climb' ? 0 : ST.shape];
   ghost.geometry = ghostW.geometry = g;
   ghostMirror.geometry = g; ghostMirror.children[0].geometry = g;
   UIS.dirty = true;
@@ -2571,6 +2699,10 @@ function bridgePointFromRay() {
 renderer.domElement.addEventListener('pointerdown', (e) => {
   if (renderer.xr.isPresenting || e.button !== 0) return;
   rayFromEvent(e); desk.depth = sculptHits();
+  if (ST.tool === 'climb' && CLM.mode === 'erase') {
+    modelRoot.updateMatrixWorld(); const i = climberOnRay(raycaster.ray); if (i >= 0) eraseClimber(i);
+    desk.down = true; desk.erase = true; renderer.domElement.setPointerCapture(e.pointerId); ghost.visible = ghostMirror.visible = false; return;
+  }
   if (ST.tool === 'climb') {
     modelRoot.updateMatrixWorld();
     const i = climberOnRay(raycaster.ray);
@@ -2604,6 +2736,7 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 renderer.domElement.addEventListener('pointermove', (e) => {
   if (renderer.xr.isPresenting) return;
   rayFromEvent(e); desk.lastEvt = e;
+  if (desk.down && desk.erase) { modelRoot.updateMatrixWorld(); const i = climberOnRay(raycaster.ray); if (i >= 0) eraseClimber(i); return; }
   if (desk.down && CLM.held >= 0) {
     // carry it just above whatever clay is under the pointer, or at the same depth in the air
     const c = CLM.list[CLM.held], d = sculptHits(), H = climberH(c);
@@ -2617,7 +2750,7 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   if (desk.down) { const { c, q } = deskBrush(); strokeApply(c, quatToInvM(q, Mbuf), brushMM()); placeGhost(c, q, brushMM(), true); }
   else { desk.depth = sculptHits(); const { c, q } = deskBrush(); placeGhost(c, q, brushMM(), true); }
 });
-renderer.domElement.addEventListener('pointerup', (e) => { if (!desk.down) return; desk.down = false; if (CLM.held >= 0) { dropHeld(); return; } if (BE.drag) beDragEnd(); else if (bridge.active) bridgeEnd(); else strokeEnd(); });
+renderer.domElement.addEventListener('pointerup', (e) => { if (!desk.down) return; desk.down = false; if (desk.erase) { desk.erase = false; return; } if (CLM.held >= 0) { dropHeld(); return; } if (BE.drag) beDragEnd(); else if (bridge.active) bridgeEnd(); else strokeEnd(); });
 // a point on a flat plane through p0 (in the bed's space): level, or upright facing you
 function deskPlanePoint(p0, vertical) {
   const wp = modelRoot.localToWorld(p0.clone()), up = new THREE.Vector3(0, 1, 0).applyQuaternion(modelRoot.quaternion);
@@ -2771,7 +2904,10 @@ function updateXR(dt) {
   const lp = !onPanel && !uiHeld && !stroke.active && !bridge.active && CLM.held < 0 ? littleNear(cModel, rmm) : null;
   if (lp !== PH.hover) { PH.hover = lp; if (lp) pulse(R, 0.15, 15); }
   if (lp && trigDown) { pinchStart(lp, cModel); pulse(R, 0.5, 40); placeGhost(cModel, qModel, rmm, false); return; }
-  if (ST.tool === 'climb' && !onPanel && !uiHeld) {
+  if (ST.tool === 'climb' && CLM.mode === 'erase' && !onPanel && !uiHeld) {
+    const r0 = clamp(ST.brushVR / S(), 1.0, 80) * 0.6; placeGhost(cModel, qModel, r0, false);
+    if (trigDown) for (let i = CLM.list.length - 1; i >= 0; i--) { const c = CLM.list[i]; if (c.cen && c.cen.distanceTo(cModel) < r0 + climberH(c) * 0.3) { eraseClimber(i); pulse(R, 0.3, 20); } }
+  } else if (ST.tool === 'climb' && !onPanel && !uiHeld) {
     const r0 = clamp(ST.brushVR / S(), 1.0, 80);
     if (CLM.held >= 0) {
       if (trigDown) moveHeld(cModel); else { dropHeld(); pulse(R, 0.25, 30); }
@@ -3374,6 +3510,7 @@ function addClimbers(n) {
   }
   UIS.dirty = true;
 }
+function eraseClimber(i) { const c = CLM.list[i]; if (c) sndClimber('pop', c); removeClimber(i); }
 function removeClimber(i) { if (i < 0 || i >= CLM.list.length) return; CLM.list.splice(i, 1); if (CLM.sel === i) CLM.sel = -1; else if (CLM.sel > i) CLM.sel--; if (CLM.held === i) CLM.held = -1; else if (CLM.held > i) CLM.held--; UIS.dirty = true; }
 const climberH = (c) => CLM.size * c.s;
 // the climber nearest to a point (within reach), or -1
@@ -3391,7 +3528,7 @@ function climberOnRay(ray) {
   });
   return best;
 }
-function grabClimber(i) { const c = CLM.list[i]; if (!c) return; c.state = 'held'; c.route = c.plan = c.dest = null; c.rest = 0; CLM.held = i; CLM.sel = i; UIS.dirty = true; }
+function grabClimber(i) { const c = CLM.list[i]; if (!c) return; sndClimber('eep', c); c.state = 'held'; c.route = c.plan = c.dest = null; c.rest = 0; CLM.held = i; CLM.sel = i; UIS.dirty = true; }
 function moveHeld(p) { const c = CLM.list[CLM.held]; if (c) { c.p.copy(p); c.v.set(0, 0, 0); } }
 function dropHeld() { const c = CLM.list[CLM.held]; if (c) { c.state = 'fall'; c.v.set(0, 0, 0); c.air = 0; } CLM.held = -1; }
 // place a new one where you pointed: on the clay if it's there, otherwise it drops from that spot
@@ -3402,6 +3539,15 @@ function placeClimber(p) {
   CLM.sel = CLM.list.length - 1; UIS.dirty = true;
 }
 const limitOf = (c) => clamp(c.pref + 35, 30, 180);
+// what the clay just under a spot is for (0 nothing, 1 climbing wall, 2 slide)
+let USE_ON = false;
+function useAt(p, n) {
+  if (!USE_ON || p.y < 0.3) return 0;
+  const i = Math.round(ix(p.x - n.x * VS * 0.8)), j = Math.round(iy(p.y - n.y * VS * 0.8)), k = Math.round(iz(p.z - n.z * VS * 0.8));
+  for (const L of layers) if (L.visible && L.paint.size) { const u = getP(L, i, j, k) >> 4; if (u) return u; }
+  return 0;
+}
+const WALL_LIM = 125;   // anyone can climb a painted climbing wall up to this steep
 // the mat is 256 mm square around the origin; nobody walks or drops off it
 const MAT = 128, matIn = (H) => MAT - Math.max(H * 0.5, 2);
 const onMat = (p, H) => Math.abs(p.x) <= matIn(H) && Math.abs(p.z) <= matIn(H);
@@ -3461,32 +3607,39 @@ function planProbe(c) {
   p.copy(P.start); n.copy(P.n0);
   d.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5); d.addScaledVector(n, -n.dot(d));
   if (P.flee) { d.subVectors(p, P.flee).addScaledVector(n, -n.dot(_jv.subVectors(p, P.flee))); d.x += (Math.random() - 0.5) * 0.5; d.z += (Math.random() - 0.5) * 0.5; }
-  const pts = []; let jumps = 0;
+  const pts = []; let jumps = 0, funAcc = 0;
   if (d.lengthSq() > 1e-6) { d.normalize();
     for (let k = 0; k < 14; k++) {
-      let bs = -Infinity, jumped = false;
+      let bs = -Infinity, jumped = false, bf = 0;
       for (const off of [0, 0.75, -0.75]) {
         // walk it in small steps, letting the surface carry the direction round corners, like a real climber would
         t.copy(d).applyQuaternion(_pq.setFromAxisAngle(n, off + (Math.random() - 0.5) * 0.5));
         q.copy(p); qn.copy(n); let ok = true;
         for (let k2 = 0; k2 < sub; k2++) {
           q2.copy(q).addScaledVector(t, step / sub).addScaledVector(qn, step * 0.02);
-          if (!toSurface(q2, nq) || !onMat(q2, H) || slopeOf(nq) > lim) { ok = false; break; }
+          if (!toSurface(q2, nq) || !onMat(q2, H) || (slopeOf(nq) > lim && !(slopeOf(nq) <= WALL_LIM && useAt(q2, nq) === 1))) { ok = false; break; }
           t.applyQuaternion(_pq.setFromUnitVectors(qn, nq)); t.addScaledVector(nq, -nq.dot(t)); if (t.lengthSq() < 1e-8) { ok = false; break; } t.normalize();
           q.copy(q2); qn.copy(nq);
         }
         if (!ok || q.distanceTo(p) < step * 0.3) continue;
+        // slides only go one way; going down one (or up a climbing wall) is fun
+        let fun = 0;
+        if (USE_ON) {
+          const u1 = useAt(q, qn), u0 = useAt(p, n);
+          if ((u1 === 2 || u0 === 2) && q.y > p.y - step * 0.05) continue;
+          if (!P.tired) { if (u1 === 2) fun += 0.55; if (u1 === 1 && q.y > p.y + step * 0.2) fun += 0.2 + 0.3 * Math.min(c.pref, 90) / 90; }
+        }
         const sc = -Math.abs(slopeOf(qn) - wantSl) / 25 * (P.summit ? 0.3 : 1) + (P.summit ? (q.y - p.y) / step * 1.5 : 0)
-          + (P.flee ? (q.distanceTo(P.flee) - p.distanceTo(P.flee)) / step * 1.5 : 0) + Math.cos(off) * 0.9 + Math.random() * 0.7;
-        if (sc > bs) { bs = sc; bq.copy(q); bn.copy(qn); }
+          + (P.flee ? (q.distanceTo(P.flee) - p.distanceTo(P.flee)) / step * 1.5 : 0) + Math.cos(off) * 0.9 + Math.random() * 0.7 + fun * 2;
+        if (sc > bs) { bs = sc; bq.copy(q); bn.copy(qn); bf = fun; }
       }
       if (bs === -Infinity) {   // dead end: maybe hop across or down
         if (jumps >= 1 || P.tired || !findJump(c, p, n, d, H, lim, bq, bn)) break;
         jumps++; jumped = true;
       }
       d.subVectors(bq, p); p.copy(bq); n.copy(bn); d.addScaledVector(n, -n.dot(d)); if (d.lengthSq() < 1e-8) break; d.normalize();
-      const w = p.clone(); if (jumped) w.jump = true; pts.push(w);
-      const v = planValue(c, P, p, n); if (v > P.bv) { P.bv = v; P.best = pts.slice(); }
+      const w = p.clone(); if (jumped) w.jump = true; pts.push(w); funAcc += bf;
+      const v = planValue(c, P, p, n) + funAcc; if (v > P.bv) { P.bv = v; P.best = pts.slice(); }
     }
   }
   if (++P.k < P.probes) return;
@@ -3498,7 +3651,7 @@ function planProbe(c) {
 }
 function planRoute(c) { planStart(c); while (c.plan) planProbe(c); }   // all at once (tests)
 function startJump(c, to, H) {
-  c.state = 'jump'; c.speed = 0;
+  c.state = 'jump'; c.speed = 0; sndClimber('hop', c);
   c.j = { from: c.p.clone(), to: to.clone(), t: -0.16, h: arcH(c.p.y, to.y, H), dur: 0.3 + c.p.distanceTo(to) / (H * 6) };
   c.head.set(to.x - c.p.x, 0, to.z - c.p.z); if (c.head.lengthSq() < 1e-6) c.head.set(1, 0, 0); c.head.normalize();
 }
@@ -3519,7 +3672,8 @@ function climberThink(c, H) {
     _q.copy(c.p).addScaledVector(dir, look).addScaledVector(c.n, H * 0.1);
     const n = toSurface(_q, _nq); if (!n || !onMat(_q, H)) continue;
     if (_q.distanceTo(c.p) > look * 1.6 || _q.distanceTo(c.p) < look * 0.3) continue;
-    const sl = slopeOf(n); if (sl > lim) continue;
+    const sl = slopeOf(n), u = useAt(_q, n); if (sl > lim && !(u === 1 && sl <= WALL_LIM)) continue;
+    if (u === 2 && _q.y > c.p.y - look * 0.05) continue;   // never up a slide
     let crowd = 0; for (const o of CLM.list) if (o !== c && o.p.distanceTo(_q) < H * 1.1) crowd++;
     const up = gd ? 0 : (_q.y - c.p.y) / look * (c.pref / 90) * 0.9;
     // on the bare bed, anyone who likes slopes heads back toward the sculpture
@@ -3560,7 +3714,7 @@ function climbersSim(dt) {
         if (n) c.n.copy(n);
         else { c.p.copy(sp); climbGrad(c.p, _g); if (_g.lengthSq() > 1e-6) c.n.copy(_g).negate().normalize(); else c.n.set(0, 1, 0); }
       }
-      if (slopeOf(c.n) <= limitOf(c) + (c.relax || 0) || c.p.y <= 0.01) { c.state = 'walk'; c.v.set(0, 0, 0); c.rethink = 0; c.slides = 0; c.stuck = 0; c.route = c.plan = c.dest = null; }
+      if (slopeOf(c.n) <= limitOf(c) + (c.relax || 0) || c.p.y <= 0.01 || (slopeOf(c.n) <= WALL_LIM && useAt(c.p, c.n) === 1)) { c.state = 'walk'; sndClimber('land', c); c.v.set(0, 0, 0); c.rethink = 0; c.slides = 0; c.stuck = 0; c.route = c.plan = c.dest = null; }
       else {
         // too steep for them: slide down it (and off, if it's a roof)
         c.slides = (c.slides || 0) + 1;
@@ -3579,7 +3733,7 @@ function climbersSim(dt) {
       c.p.set(x, y, z);
       if (u >= 1) {
         const n = toSurface(c.p, _nq); if (!n) { c.state = 'fall'; c.v.set(0, 0, 0); continue; }
-        c.n.copy(n); c.state = 'walk'; c.squash = 0.2; c.goalT = 0; c.jumps = (c.jumps || 0) + 1;
+        c.n.copy(n); c.state = 'walk'; c.squash = 0.2; c.goalT = 0; c.jumps = (c.jumps || 0) + 1; sndClimber('land', c);
         if (c.route && ++c.ri >= c.route.length) { c.route = null; c.rest = 0.6 + Math.random(); c.arrived = (c.arrived || 0) + 1; }
       }
       continue;
@@ -3602,7 +3756,7 @@ function climbersSim(dt) {
     }
     if (c.rest > 0 && climbDens(c.p.x - c.n.x * VS * 1.5, c.p.y - c.n.y * VS * 1.5, c.p.z - c.n.z * VS * 1.5) < ISO * 0.8) c.rest = 0;   // the clay under them got carved away
     // completely spent halfway up a wall: it lets go
-    if (c.energy < 0.01 && wall > 0.6 && !(c.rest > 0)) { c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H * 0.6); c.air = 0; c.route = c.plan = c.dest = null; c.letGo = (c.letGo || 0) + 1; continue; }
+    if (c.energy < 0.01 && wall > 0.6 && !(c.rest > 0)) { sndClimber('fall', c); c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H * 0.6); c.air = 0; c.route = c.plan = c.dest = null; c.letGo = (c.letGo || 0) + 1; continue; }
     if (c.rest > 0) {
       c.rest -= dt; c.speed = Math.max(0, c.speed - H * 6 * dt);
       if (c.tired && c.energy > 0.92) { c.tired = false; c.rest = Math.min(c.rest, 0.5); }
@@ -3624,7 +3778,7 @@ function climbersSim(dt) {
           // made it: rest (sit down if worn out; a little hop if it climbed to the top), then plan somewhere new
           c.route = null; c.arrived = (c.arrived || 0) + 1;
           if (c.tired) { c.rest = 99; c.sit = sl < 40; }
-          else { c.rest = 0.6 + Math.random() * 2.2 / c.pace; if (c.goalTop) { c.state = 'fall'; c.v.set(0, H * 2.2, 0); c.air = 0; } }
+          else { c.rest = 0.6 + Math.random() * 2.2 / c.pace; if (c.goalTop) { c.state = 'fall'; c.v.set(0, H * 2.2, 0); c.air = 0; sndClimber('yay', c); } }
           continue;
         }
         wp = c.route[c.ri];
@@ -3645,21 +3799,28 @@ function climbersSim(dt) {
     if (c.stuck > 4) { c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H); c.stuck = 0; continue; }
     // steering: turn toward where it wants to go at a limited rate, speed up and slow down smoothly
     let align = 1;
+    if (want && c.sliding) align = 1;   // (sliders don't slow for turns)
     if (want) {
       const ang = c.head.angleTo(want), maxA = (6 - 3 * wall) * dt;
       if (ang > 1e-4) { _qt2.setFromUnitVectors(c.head, want); _qt3.identity().slerp(_qt2, Math.min(1, maxA / ang)); c.head.applyQuaternion(_qt3).normalize(); }
       align = Math.max(0, c.head.dot(want));
     }
-    let target = H * (1.25 - 0.8 * wall) * (c.pref < 20 ? 1.3 : 1) * c.pace * (0.5 + 0.5 * Math.min(1, c.energy * 1.6)) * (c.flee > 0 ? 1.7 : 1) * (0.3 + 0.7 * align * align);
+    const onSlide = USE_ON && useAt(c.p, c.n) === 2 && c.head.y < 0.05;
+    if (onSlide && !c.sliding) sndClimber('slide', c);
+    c.sliding = onSlide;
+    if (onSlide) c.energy = Math.min(1, c.energy + dt * 0.03);
+    let target = onSlide ? H * 3.2 : H * (1.25 - 0.8 * wall) * (USE_ON && wall > 0.3 && useAt(c.p, c.n) === 1 ? 1.3 : 1) * (c.pref < 20 ? 1.3 : 1) * c.pace * (0.5 + 0.5 * Math.min(1, c.energy * 1.6)) * (c.flee > 0 ? 1.7 : 1) * (0.3 + 0.7 * align * align);
     if (last) target *= clamp(wpDist / (H * 1.5), 0.3, 1);
-    if (!c.route && c.plan && !(c.flee > 0)) target *= 0.5;   // slows while working out where to go
+    if (!c.route && c.plan && !(c.flee > 0) && !c.sliding) target *= 0.5;   // slows while working out where to go
     c.speed += clamp(target - c.speed, -H * 6 * dt, H * 3.5 * dt);
     const old = c.p.clone();
     c.p.addScaledVector(c.head, c.speed * dt);
     if (!onMat(c.p, H) && !onMat(old, H)) keepOnMat(c.p, H);   // already over the line (placed there): ease back in
     else if (!onMat(c.p, H)) { c.p.copy(old); c.want = (c.want || new THREE.Vector3()).set(-c.p.x, 0, -c.p.z); if (c.want.lengthSq() > 1e-6) c.want.normalize(); else c.want.set(1, 0, 0); c.route = null; c.speed *= 0.5; continue; }
     const n = toSurface(c.p, _nq);
-    if (!n || slopeOf(n) > limitOf(c) + 10 + (c.relax || 0)) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; if (!toSurface(c.p, _nq)) { c.state = 'fall'; c.v.set(0, 0, 0); } continue; }
+    const uHere = useAt(c.p, n || c.n);
+    if (n && uHere === 2 && c.p.y > old.y + 1e-4) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; c.route = null; continue; }   // no climbing up slides
+    if (!n || (slopeOf(n) > limitOf(c) + 10 + (c.relax || 0) && !(uHere === 1 && slopeOf(n) <= WALL_LIM + 10))) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; if (!toSurface(c.p, _nq)) { c.state = 'fall'; c.v.set(0, 0, 0); } continue; }
     _h.copy(c.n); c.n.lerp(n, 0.5).normalize(); c.head.applyQuaternion(_qt2.setFromUnitVectors(_h, c.n));
   }
   // personal space
@@ -3698,7 +3859,7 @@ function limbStep(c, i, ideal, nrm, dt, H, can, thr, dur, lead, root, reach) {
     if ((can || must) && dt > 0 && (L.p.distanceTo(ideal) > thr || must)) {
       L.from.copy(L.p); L.to.copy(ideal).add(lead);
       if (toSurface(L.to, _nq)) L.n.copy(_nq); else { L.to.copy(ideal); L.n.copy(nrm); }
-      L.t = 0; L.dur = dur;
+      L.t = 0; L.dur = dur; if (i < 2) sndClimber('step', c);
     }
     return L.p;
   }
@@ -3714,7 +3875,8 @@ function climberPose(c, dt) {
   const n = air ? UPV : c.n, sl = slopeOf(n);
   const w = air ? 0 : clamp((sl - 35) / 45, 0, 1);         // 0 standing … 1 on a wall
   const hang = air ? 0 : clamp((sl - 105) / 25, 0, 1);     // under a roof, hanging from its hands
-  const sit = !air && c.sit && c.rest > 0 ? 1 : 0;
+  const slide = !air && c.sliding ? 1 : 0;
+  const sit = !air && ((c.sit && c.rest > 0) || slide) ? 1 : 0;
   const crouch = jump && c.j.t < 0 ? 1 : 0, squash = c.squash > 0 ? c.squash / 0.2 : 0;
   if (c.squash > 0) c.squash -= dt;
   // which way the body points: up on flat ground, up along the wall when climbing, straight up when hanging
@@ -3729,14 +3891,22 @@ function climberPose(c, dt) {
   const hip = c.p.clone();
   if (held) hip.addScaledVector(UPV, -0.35 * H);
   else if (!air || jump) {
-    const up = jump && c.j.t >= 0 ? 0.4 * H : (0.43 * H * (1 - w) + 0.12 * H * w) * (1 - 0.35 * crouch - 0.3 * squash);   // knees a touch bent
+    // standing tall: the hips ride about a straight leg above the planted foot, so they rise and dip a little with each step
+    let stand = 0.45 * H;
+    if (!sit && w < 0.6) {
+      let best = 0, any = false;
+      for (const i of [0, 1]) { const L = c.limbs[i]; if (!L || !L.on || L.t >= 0) continue; any = true;
+        const dx = L.p.x - c.p.x, dy = L.p.y - c.p.y, dz = L.p.z - c.p.z, along = dx * n.x + dy * n.y + dz * n.z;
+        const flat2 = Math.max(0, dx * dx + dy * dy + dz * dz - along * along), hh = Math.sqrt(Math.max((0.455 * H) ** 2 - flat2, (0.3 * H) ** 2)) + along; if (hh > best) best = hh; }
+      if (any) stand = clamp(best, 0.36 * H, 0.46 * H);
+    }
+    c.hipH = c.hipH === undefined ? stand : c.hipH + (stand - c.hipH) * Math.min(1, dt * 14);
+    const up = jump && c.j.t >= 0 ? 0.4 * H : (c.hipH * (1 - w) + 0.12 * H * w) * (1 - 0.35 * crouch - 0.3 * squash);
     hip.addScaledVector(n, up * (1 - sit) + 0.15 * H * sit);
     if (hang > 0) hip.lerp(c.p.clone().addScaledVector(UPV, -0.62 * H), hang);
   }
   // footfalls bob the hips a touch
-  let bob = 0; for (const i of [0, 1]) if (stepping(c, i)) bob += Math.sin(Math.PI * c.limbs[i].t);
-  hip.addScaledVector(U, -0.025 * H * bob * (1 - w));
-  const lean = run * 0.07 * (1 - w) - 0.08 * sit + 0.1 * crouch;
+  const lean = run * 0.06 * (1 - w) + 0.02 * Math.min(run, 1) - 0.08 * sit + 0.1 * crouch - 0.04 * slide;
   const chest = hip.clone().addScaledVector(U, torso).addScaledVector(F, lean * H);
   const spine = chest.clone().sub(hip).normalize(), head = chest.clone().addScaledVector(spine, 0.15 * H);
   c.cen = hip.clone().addScaledVector(spine, torso * 0.4);
@@ -3758,7 +3928,7 @@ function climberPose(c, dt) {
   const onPlane = (q) => q.addScaledVector(n, -n.dot(_mid.subVectors(q, c.p)) + 0.02 * H);
   const lead = ht.clone().multiplyScalar((c.speed || 0) * 0.13);
   const fThr = H * (0.13 + 0.05 * run), fDur = clamp(0.25 - 0.06 * run, 0.12, 0.28);
-  const feetDown = !air && hang < 0.5, handsDown = !air && !sit && (w > 0.55 || hang >= 0.5);
+  const feetDown = !air && hang < 0.5 && !slide, handsDown = !air && !sit && (w > 0.55 || hang >= 0.5);
   const P = [];
   for (const side of [-1, 1]) {
     const fi = side < 0 ? 0 : 1, hi = fi + 2, of = 1 - fi, oh = of + 2;
@@ -3775,6 +3945,7 @@ function climberPose(c, dt) {
       if (held) fT = hp.clone().addScaledVector(U, -leg * 0.92).addScaledVector(F, Math.sin(T * 11 + side) * 0.07 * H);
       else if (jump) fT = c.j.t < 0 ? hp.clone().addScaledVector(U, -leg * 0.7).addScaledVector(F, 0.04 * H) : hp.clone().addScaledVector(U, -leg * 0.62).addScaledVector(F, 0.14 * H);
       else if (st === 'fall') fT = hp.clone().addScaledVector(U, -leg * 0.8).addScaledVector(R, side * 0.1 * H);
+      else if (slide) fT = c.p.clone().addScaledVector(F, 0.38 * H).addScaledVector(R, side * 0.08 * H).addScaledVector(n, 0.04 * H);   // legs out front down the slide
       else fT = hp.clone().addScaledVector(UPV, -leg * 0.95).addScaledVector(hf, Math.sin(T * 2.6 + side * 0.8 + c.hue * 9) * 0.07 * H);   // dangling
     }
     if (handsDown) {
@@ -3787,12 +3958,16 @@ function climberPose(c, dt) {
       if (held) hT = sh.clone().addScaledVector(U, 0.25 * H).addScaledVector(R, side * 0.08 * H).addScaledVector(F, Math.sin(T * 9 + side * 2) * 0.05 * H);
       else if (jump) hT = c.j.t < 0 ? sh.clone().addScaledVector(U, -0.22 * H).addScaledVector(F, -0.12 * H) : sh.clone().addScaledVector(U, 0.24 * H).addScaledVector(F, 0.1 * H).addScaledVector(R, side * 0.07 * H);
       else if (st === 'fall') hT = sh.clone().addScaledVector(U, 0.22 * H).addScaledVector(R, side * 0.14 * H);
+      else if (slide) hT = sh.clone().addScaledVector(U, 0.24 * H).addScaledVector(R, side * 0.1 * H).addScaledVector(F, 0.04 * H);   // hands up, wheee
       else if (sit) hT = hp.clone().addScaledVector(F, 0.15 * H).addScaledVector(U, 0.2 * H).addScaledVector(R, side * 0.02 * H);   // hands on its knees
       else if (w > 0.25) hT = sh.clone().addScaledVector(U, -0.2 * H).addScaledVector(F, 0.13 * H).addScaledVector(R, side * 0.06 * H);   // scrambling: arms out front for balance
       else {
         // arms swing against the opposite foot
-        const ofp = c.limbs[of] && c.limbs[of].on ? c.limbs[of].p : null, swing = ofp ? clamp(_mid.subVectors(ofp, hp).dot(F) / (0.2 * H), -1, 1) : 0;
-        hT = sh.clone().addScaledVector(U, -0.29 * H + run * 0.04 * H).addScaledVector(F, swing * (0.1 + 0.05 * run) * H).addScaledVector(R, side * 0.03 * H);
+        // arms hang and swing like pendulums against the legs (opposite arm with each foot); bigger swings and bent elbows when running
+        const ofp = c.limbs[of] && c.limbs[of].on ? c.limbs[of].p : null, sw = ofp ? clamp(_mid.subVectors(ofp, c.p).dot(F) / (0.18 * H), -1, 1) : 0;
+        c.swing = c.swing || [0, 0]; c.swing[fi] += (sw - c.swing[fi]) * Math.min(1, dt * 10);
+        const th = c.swing[fi] * (0.22 + 0.4 * clamp(run, 0, 1.5)), reach = 0.31 * H * (1 - 0.28 * clamp(run - 0.9, 0, 1));
+        hT = sh.clone().addScaledVector(U, -Math.cos(th) * reach).addScaledVector(F, Math.sin(th) * reach).addScaledVector(R, side * (0.035 + 0.015 * run) * H);
       }
     }
     P.push([side, sh, hp, hT, fT]);
@@ -4105,30 +4280,41 @@ function climberDoing(c) {
   if (c.route) return c.goalTop ? 'Going for the top' : c.routeNew ? 'Exploring somewhere new' : 'Heading somewhere it likes';
   return 'Working out where to go';
 }
+function setClimbMode(m) {
+  CLM.mode = m;
+  if (m === 'wall' || m === 'slide' || m === 'wipe') { ST.tool = 'use'; ST.useKind = m === 'wall' ? 1 : m === 'slide' ? 2 : 0; }
+  else { if (CLM.held >= 0 && m !== 'grab') dropHeld(); ST.tool = 'climb'; }
+  updateGhost();
+}
 function drawClimberPanel(X, FW) {
   button(X, 230, 228, 84, 'Add 5', { fs: 30, click: () => addClimbers(5) });
   button(X + 242, 230, 228, 84, CLM.paused ? 'Paused' : 'Moving', { on: !CLM.paused, accent: CLIMBC, fs: 30, click: () => { CLM.paused = !CLM.paused; } });
   confirmButton(X + 484, 230, 228, 84, 'clrall', 'Remove all', () => { CLM.list.length = 0; CLM.sel = CLM.held = -1; SEEN.clear(); }, { fs: 28 });
   txt(`${CLM.list.length} on the bed`, X + 952, 282, 26, '#7f8896', 'right', 500);
-  txt('Click clay to place one. Grab one to carry it; let go to drop it.', X, 352, 24, '#7f8896', 'left', 500);
-  slider(X, 410, FW, 'Climber size', (Math.log(CLM.size) - Math.log(4)) / (Math.log(60) - Math.log(4)), `${CLM.size.toFixed(CLM.size < 10 ? 1 : 0)} mm tall`, (u) => { CLM.size = +(Math.exp(Math.log(4) + u * (Math.log(60) - Math.log(4)))).toFixed(1); }, 'Everyone together; each varies a little');
-  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 548, FW, 3);
+  const MODES = [['grab', 'Grab', CLIMBC], ['erase', 'Erase', CARVE], ['wall', 'Climb wall', '#3f6bff'], ['slide', 'Slide', '#ffc400'], ['wipe', 'Wipe', '#9aa3b2']], mode = CLM.mode || 'grab';
+  MODES.forEach(([k, l, col], i) => button(X + i * 193, 334, 180, 76, l, { on: mode === k, accent: col, fs: 26, click: () => setClimbMode(k) }));
+  txt({ grab: 'Click clay to place one. Grab one to carry it; let go to drop it.', erase: 'Touch climbers to take them away (drag to sweep).',
+    wall: 'Climbing walls: speckled holds anyone can climb.', slide: 'Slides: down only; they climb up another way.',
+    wipe: 'Rub off climbing walls and slides.' }[mode], X, 444, 22, '#7f8896', 'left', 500);
+  if (mode === 'wall' || mode === 'slide' || mode === 'wipe') txt('[ ] or right stick: brush size', X + FW, 444, 22, '#7f8896', 'right', 500);
+  slider(X, 494, FW, 'Climber size', (Math.log(CLM.size) - Math.log(4)) / (Math.log(60) - Math.log(4)), `${CLM.size.toFixed(CLM.size < 10 ? 1 : 0)} mm tall`, (u) => { CLM.size = +(Math.exp(Math.log(4) + u * (Math.log(60) - Math.log(4)))).toFixed(1); lookU.uHold.value = Math.max(1.6, CLM.size * 0.17); }, 'Everyone together; each varies a little');
+  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 624, FW, 3);
   const c = CLM.list[CLM.sel];
   if (c) {
-    ui.fillStyle = '#' + c.col.getHexString(); ui.beginPath(); ui.arc(X + 26, 612, 24, 0, Math.PI * 2); ui.fill();
+    ui.fillStyle = '#' + c.col.getHexString(); ui.beginPath(); ui.arc(X + 26, 670, 24, 0, Math.PI * 2); ui.fill();
     const kind = c.pref < 20 ? 'runner' : c.pref < 60 ? 'scrambler' : c.pref < 105 ? 'climber' : 'roof hanger', adj = climberTrait(c);
-    txt(`This one is ${/^[aeiou]/.test(adj) ? 'an' : 'a'} ${adj} ${kind}`, X + 66, 622, 30, '#e9ecf1', 'left', 700);
-    txt(climberDoing(c), X + 66, 660, 24, '#7f8896', 'left', 500);
-    confirmButton(X + 712, 582, 240, 60, 'clrone', 'Remove it', () => removeClimber(CLM.sel), { fs: 26 });
-    slider(X, 716, FW, 'Slope it likes', c.pref / 150, `${Math.round(c.pref)}°`, (u) => { c.pref = Math.round(u * 150); c.rethink = 0; }, '0° runs on flat tops · 45° scrambles · 90° climbs walls · 130° hangs under roofs');
-  } else txt('Grab or click a climber to set the slope it likes.', X, 622, 26, '#7f8896', 'left', 500);
-  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 846, FW, 3);
+    txt(`This one is ${/^[aeiou]/.test(adj) ? 'an' : 'a'} ${adj} ${kind}`, X + 66, 680, 30, '#e9ecf1', 'left', 700);
+    txt(climberDoing(c), X + 66, 716, 24, '#7f8896', 'left', 500);
+    confirmButton(X + 712, 640, 240, 60, 'clrone', 'Remove it', () => removeClimber(CLM.sel), { fs: 26 });
+    slider(X, 756, FW, 'Slope it likes', c.pref / 150, `${Math.round(c.pref)}°`, (u) => { c.pref = Math.round(u * 150); c.rethink = 0; }, '0° runs on flat tops · 45° scrambles · 90° climbs walls · 130° hangs under roofs');
+  } else txt('Grab or click a climber to set the slope it likes.', X, 680, 26, '#7f8896', 'left', 500);
+  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 886, FW, 3);
   if (XRS.inSession) {
-    button(X, 878, PL.on ? FW - 300 : FW, 96, PL.on ? 'Back to full size' : 'Climb it yourself', { on: !PL.on, accent: CLIMBC, fs: 32, click: () => { if (PL.on) climbEnd(); else climbStart(); } });
-    if (PL.on) button(X + FW - 284, 878, 284, 96, PL.tunnel ? 'Tunnel vision' : 'No tunnel', { on: PL.tunnel, accent: CLIMBC, fs: 28, click: () => { PL.tunnel = !PL.tunnel; } });
-    txt(PL.on ? 'B also brings you back · X shows or hides this panel · tunnel vision dims the edges while you move' : 'Become climber-sized. Grip clay to pull yourself up, let go mid-swing to fling;', X, 1012, 24, '#7f8896', 'left', 500);
-    if (!PL.on) txt('left stick walks up to 45°, A jumps, right stick turns, B comes back.', X, 1044, 24, '#7f8896', 'left', 500);
-  } else txt('Climb it yourself: in the headset, become climber-sized and climb your sculpture.', X, 900, 24, '#7f8896', 'left', 500);
+    button(X, 908, PL.on ? FW - 300 : FW, 96, PL.on ? 'Back to full size' : 'Climb it yourself', { on: !PL.on, accent: CLIMBC, fs: 32, click: () => { if (PL.on) climbEnd(); else climbStart(); } });
+    if (PL.on) button(X + FW - 284, 908, 284, 96, PL.tunnel ? 'Tunnel vision' : 'No tunnel', { on: PL.tunnel, accent: CLIMBC, fs: 28, click: () => { PL.tunnel = !PL.tunnel; } });
+    txt(PL.on ? 'B also brings you back · X shows or hides this panel · tunnel vision dims the edges while you move' : 'Become climber-sized. Grip clay to pull yourself up, let go mid-swing to fling;', X, 1040, 24, '#7f8896', 'left', 500);
+    if (!PL.on) txt('left stick walks up to 45°, A jumps, right stick turns, B comes back.', X, 1072, 24, '#7f8896', 'left', 500);
+  } else txt('Climb it yourself: in the headset, become climber-sized and climb your sculpture.', X, 930, 24, '#7f8896', 'left', 500);
 }
 const climbersState = () => ({ size: CLM.size, list: CLM.list.map(c => [+c.p.x.toFixed(1), +c.p.y.toFixed(1), +c.p.z.toFixed(1), c.pref, +c.hue.toFixed(3), +c.s.toFixed(2), +c.girth.toFixed(2), +c.pace.toFixed(2), +c.grit.toFixed(2), +c.curious.toFixed(2), +c.social.toFixed(2), +c.bold.toFixed(2)]) });
 function loadClimbers(st) {
@@ -4303,6 +4489,7 @@ function setPassthrough(on) {
   UIS.dirty = true; toast(on ? 'Passthrough on (MR)' : 'Passthrough off (VR)');
 }
 async function enterXR(mode) {
+  sndInit();
   try {
     const useAR = mrOK;
     const session = await navigator.xr.requestSession(useAR ? 'immersive-ar' : 'immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
@@ -4336,15 +4523,17 @@ renderer.setAnimationLoop(() => {
   autosaveTick(now);
   netTick(now);
   beTick(now);
-  if (UIS.tab === 'climbers' && ST.tool !== 'climb') { if (CLM.held >= 0) dropHeld(); UIS.tab = 'brush'; UIS.dirty = true; }
+  if (UIS.tab === 'climbers' && ST.tool !== 'climb' && ST.tool !== 'use') { if (CLM.held >= 0) dropHeld(); UIS.tab = 'brush'; UIS.dirty = true; }
+  USE_ON = layers.some(L => L.paint.size);
   processAO(stroke.active ? 2 : 5);
+  sndSculptTick(dt);
   climbersTick(dt);
   if (UIS.confirm && now - UIS.confirmT > 2500) { UIS.confirm = null; UIS.dirty = true; }
   if (UIS.toast && now - UIS.toastT > 2200) { UIS.toast = ''; UIS.dirty = true; }
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { LOOK, lookU, applySky, aoMarkAll, processAO, aoQ, sky, onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { setClimbMode, bakeSupportsInto, stampUse, useAt, SND, sndClimber, eraseClimber, clayLayers, LOOK, lookU, applySky, aoMarkAll, processAO, aoQ, sky, onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
