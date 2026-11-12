@@ -2641,76 +2641,133 @@ if(!load()){
 setTimeout(()=>pushUndo(JSON.stringify(serModel())),0);
 
 /* ---------------- VR / XR ----------------
-   Trigger on a face: push or pull it (box faces resize, cut planes slide, cut-out faces resize). Grip: grab and move a box, cut or cut-out.
-   The wrist menu on the left controller adds and deletes things, undoes, and switches views. */
+   Set up like Overhang Garden: the left controller holds the menu and the right one points at it and clicks with the trigger.
+   Every session starts by setting the floor (Toy Box style). Then: trigger on a face pushes or pulls it, grip on a box, cut or
+   cut-out moves it, grip on empty space moves the whole model and both grips turn and scale it, the left stick flies,
+   A undoes, B redoes, X hides the menu, Y sets the floor again. */
 const xray=new THREE.Raycaster();
-const ctrls=[0,1].map(i=>{const c=renderer.xr.getController(i);
-  const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V(),new V(0,0,-1)]),new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:.75}));
-  line.scale.z=4;c.add(line);
-  c.addEventListener('connected',e=>{c.userData.hand=e.data?.handedness;placeMenu()});
+const XR={step:null,base:null,floorH:0,hover:-1,W:[],navN:0,nav:null};
+try{XR.floorH=+(localStorage.getItem('pgFloor')||0)||0}catch(e){}
+function ctrlModel(col){const g=new THREE.Group(),m=new THREE.MeshStandardMaterial({color:col,roughness:.45}),dk=new THREE.MeshStandardMaterial({color:0x15181D,roughness:.6});
+  const body=new THREE.Mesh(new THREE.CapsuleGeometry(.019,.075,6,14),m);body.rotation.x=Math.PI/2+.45;body.position.set(0,-.018,.05);g.add(body);
+  const ring=new THREE.Mesh(new THREE.TorusGeometry(.036,.0075,8,32),m);ring.position.set(0,.006,-.01);ring.rotation.x=.6;g.add(ring);
+  const face=new THREE.Mesh(new THREE.CylinderGeometry(.02,.02,.006,20),dk);face.position.set(0,.012,.012);face.rotation.x=.5;g.add(face);
+  const trig=new THREE.Mesh(new THREE.BoxGeometry(.013,.022,.016),dk);trig.position.set(0,-.032,-.002);trig.rotation.x=.4;g.add(trig);return g}
+const rayGeo=new THREE.BufferGeometry().setFromPoints([new V(),new V(0,0,-1)]);
+const ctrls=[0,1].map(i=>{const c=renderer.xr.getController(i),g=renderer.xr.getControllerGrip(i);
+  const line=new THREE.Line(rayGeo,new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:.8}));line.scale.z=4;c.add(line);
+  const dot=new THREE.Mesh(new THREE.SphereGeometry(.007,12,8),new THREE.MeshBasicMaterial({color:0xF2A01F,depthTest:false}));dot.renderOrder=20;dot.visible=false;scene.add(dot);
+  Object.assign(c.userData,{line,dot,grip:g,prev:[]});
+  c.addEventListener('connected',e=>{c.userData.hand=e.data?.handedness;c.userData.src=e.data;const col=c.userData.hand==='left'?0x2E5BFF:0xE5392B;
+    if(c.userData.model)g.remove(c.userData.model);if(!e.data?.hand){c.userData.model=ctrlModel(col);g.add(c.userData.model)}placeMenu()});
+  c.addEventListener('disconnected',()=>{c.userData.src=null});
   c.addEventListener('selectstart',()=>xrTrigger(c));c.addEventListener('selectend',()=>xrTriggerEnd(c));
   c.addEventListener('squeezestart',()=>grab(c));c.addEventListener('squeezeend',()=>release(c));
-  scene.add(c);return c});
+  scene.add(c);scene.add(g);return c});
+const gpad=c=>c.userData.src?.gamepad,btn=(c,i)=>!!gpad(c)?.buttons?.[i]?.pressed,axis=(c,i)=>gpad(c)?.axes?.[i]||0;
+const edgeB=(c,i)=>{const now=btn(c,i),was=!!c.userData.prev[i];c.userData.prev[i]=now;return now&&!was};
+const buzz=(c,a=.3,ms=25)=>{try{gpad(c)?.hapticActuators?.[0]?.pulse(a,ms)}catch(e){}};
+const gripPos=c=>c.userData.grip.getWorldPosition(new V());
+const leftC=()=>ctrls.find(c=>c.userData.hand==='left')||ctrls[0],rightC=()=>ctrls.find(c=>c.userData.hand==='right')||ctrls.find(c=>c!==leftC());
 const ctrlRay=c=>{const rot=new THREE.Matrix4().extractRotation(c.matrixWorld);xray.ray.origin.setFromMatrixPosition(c.matrixWorld);xray.ray.direction.set(0,0,-1).applyMatrix4(rot);return xray};
 function xrParam(c,P0,n){ctrlRay(c);const inv=new THREE.Matrix4().copy(world.matrixWorld).invert(),o=xray.ray.origin.clone().applyMatrix4(inv),d=xray.ray.direction.clone().transformDirection(inv);
   const w=P0.clone().sub(o),b_=n.dot(d),den=1-b_*b_;if(den<1e-4)return null;return (b_*w.dot(d)-w.dot(n))/den}
 function xrFace(c){if(view!=='mass')return null;ctrlRay(c);const hit=xray.intersectObjects(blocks.map(b=>b.mesh),false)[0];if(!hit)return null;
-  const b=hit.object.userData.pick,id=b.triIds?.[hit.faceIndex],f=b.faces?.find(x=>x.pl.id===id);if(!f)return null;const P=hit.point.clone();world.worldToLocal(P);return {b,f,id,P}}
-/* wrist menu */
-const MENU=[['Add box','box'],['Add cut','cut'],['Add cut-out','carve'],['Delete','del'],['Undo','undo'],['Redo','redo'],['Panels','view'],['Snap','snap']];
-const menuCv=document.createElement('canvas');menuCv.width=512;menuCv.height=384;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;
-const menu=new THREE.Mesh(new THREE.PlaneGeometry(.17,.1275),new THREE.MeshBasicMaterial({map:menuTex,transparent:true}));menu.visible=false;
-let menuHover=-1,menuMsg='Trigger a face to push or pull it. Grip to move.';
-function drawMenu(){const x=menuCv.getContext('2d');x.clearRect(0,0,512,384);x.fillStyle='#15181D';x.beginPath();x.roundRect(0,0,512,384,28);x.fill();
-  const cols=['#2E5BFF','#E5392B','#F2A01F','#15181D','#2FBF5B','#2FBF5B','#B03BE0','#19B5A1'];
-  MENU.forEach(([l,k],i)=>{const cx=16+(i%2)*248,cy=16+Math.floor(i/2)*72;x.fillStyle=i===menuHover?'#FFFFFF':cols[i];x.beginPath();x.roundRect(cx,cy,232,60,14);x.fill();
-    x.fillStyle=i===menuHover?'#15181D':'#FFFFFF';x.font='bold 30px system-ui,sans-serif';x.textAlign='center';x.textBaseline='middle';
-    const lab=k==='view'?(view==='mass'?'Panels':'Massing'):k==='snap'?(snap?'Snap on':'Snap off'):l;x.fillText(lab,cx+116,cy+31)});
-  x.fillStyle='#FFFFFF';x.font='22px system-ui,sans-serif';x.textAlign='left';x.textBaseline='middle';x.fillText(menuMsg.slice(0,46),20,318);x.fillText(menuMsg.slice(46,92),20,350);menuTex.needsUpdate=true}
-function placeMenu(){const left=ctrls.find(c=>c.userData.hand==='left')||ctrls[0];if(menu.parent!==left){menu.parent?.remove(menu);left.add(menu)}
-  menu.position.set(0,.06,.02);menu.rotation.set(-Math.PI/3,0,0);drawMenu()}
-function menuHit(c){if(!menu.visible||menu.parent===c)return -1;ctrlRay(c);const h=xray.intersectObject(menu,false)[0];if(!h)return -1;
-  const u=h.uv.x*512,v=(1-h.uv.y)*384,col=u<256?0:1,row=Math.floor((v-16)/72);if(row<0||row>3)return -1;return row*2+col}
-function menuDo(i){const k=MENU[i][1];
+  const b=hit.object.userData.pick,id=b.triIds?.[hit.faceIndex],f=b.faces?.find(x=>x.pl.id===id);if(!f)return null;const P=hit.point.clone(),W=P.clone();world.worldToLocal(P);return {b,f,id,P,W,dist:hit.distance}}
+/* the floor grid shown while setting the floor */
+const floorGrid=new THREE.GridHelper(3,12,0xF2A01F,0xF2A01F);floorGrid.material.transparent=true;floorGrid.material.opacity=.85;floorGrid.visible=false;scene.add(floorGrid);
+function setFloor(h){XR.floorH=Math.round(Math.max(-.3,Math.min(1.8,h))*100)/100;try{localStorage.setItem('pgFloor',XR.floorH)}catch(e){}
+  if(XR.base&&typeof XRRigidTransform!=='undefined')try{renderer.xr.setReferenceSpace(XR.base.getOffsetReferenceSpace(new XRRigidTransform({x:0,y:XR.floorH,z:0})))}catch(e){}drawMenu()}
+function floorStep(on){XR.step=on?'floor':null;floorGrid.visible=on;menu.visible=true;
+  if(!on)menuMsg=view==='mass'?'Trigger a face to push or pull it. Grip a box to move it.':'Panels view: grip a part to look closer.';drawMenu()}
+/* the menu: one canvas on the left controller */
+const MW=1024,MH=980;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
+const menu=new THREE.Mesh(new THREE.PlaneGeometry(.27*MW/MH,.27),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
+let menuMsg='Trigger a face to push or pull it. Grip a box to move it.';
+const MX=menuCv.getContext('2d');
+function mText(s,x,y,size=34,col='#E9ECF1',al='left',wt=600){MX.fillStyle=col;MX.font=`${wt} ${size}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;MX.textAlign=al;MX.textBaseline='middle';MX.fillText(s,x,y)}
+function mWrap(s,x,y,w,size=30,col='#C9CED8',lh=40,max=4){MX.font=`500 ${size}px system-ui,sans-serif`;const words=String(s).split(' ');let line='',n=0;
+  for(const wd of words){const t=line?line+' '+wd:wd;if(MX.measureText(t).width>w&&line){mText(line,x,y+n*lh,size,col,'left',500);n++;line=wd;if(n>=max)return y+n*lh}else line=t}if(line){mText(line,x,y+n*lh,size,col,'left',500);n++}return y+n*lh}
+function mBtn(x,y,w,h,label,o={}){const id=XR.W.length,hov=XR.hover===id;MX.fillStyle=o.on?(o.col||'#2E5BFF'):hov?'#3B3F49':(o.col&&o.solid?o.col:'#2A2D34');MX.beginPath();MX.roundRect(x,y,w,h,20);MX.fill();
+  if(hov){MX.strokeStyle='#FFFFFF';MX.lineWidth=5;MX.stroke()}mText(label,x+w/2,y+h/2+2,o.fs||36,o.on||o.solid?'#FFFFFF':'#E9ECF1','center',700);XR.W.push({x,y,w,h,click:o.click})}
+function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.beginPath();MX.roundRect(0,0,MW,MH,36);MX.fill();
+  mText('Ply Grammar',48,64,52,'#FFFFFF','left',800);const sb=sel?sel.name+(selCut?(selCut.userData.isCarve?' · cut-out':' · cut'):''):'nothing selected';mText(sb,MW-48,64,30,'#F2A01F','right',700);
+  const B=(x,y,w,label,o)=>mBtn(x,y,w,104,label,o),c3=[48,356,664],w3=296,c2=[48,510],w2=450;
+  if(XR.step==='floor'){const cm=Math.round(XR.floorH*100);
+    mText('Set the floor',48,160,46,'#FFFFFF','left',800);
+    let y=mWrap(`The orange grid is the floor: ${cm===0?'right on your real floor':Math.abs(cm)+' cm '+(cm>0?'above':'below')+' your real floor'}. Pull the right trigger to put the floor where your controller is, or nudge it. Raise it to a table to model standing up.`,48,226,MW-96,32,'#C9CED8',44,5);
+    y+=30;B(c3[0],y,w3,'\u25B2  Up 2 cm',{click:()=>setFloor(XR.floorH+.02)});B(c3[1],y,w3,'\u25BC  Down 2 cm',{click:()=>setFloor(XR.floorH-.02)});B(c3[2],y,w3,'Real floor',{click:()=>setFloor(0)});
+    y+=140;B(48,y,MW-96,'Done',{solid:true,col:'#2FBF5B',fs:44,click:()=>floorStep(false)});
+  }else{let y=120;
+    B(c2[0],y,w2,'Massing',{on:view==='mass',click:()=>{setView('mass');drawMenu()}});B(c2[1],y,w2,'Panels',{on:view==='panels',click:()=>{setView('panels');drawMenu()}});y+=124;
+    B(c3[0],y,w3,'Add box',{click:()=>menuDo('box')});B(c3[1],y,w3,'Add cut',{click:()=>menuDo('cut')});B(c3[2],y,w3,'Add cut-out',{click:()=>menuDo('carve')});y+=124;
+    B(c3[0],y,w3,'Delete',{click:()=>menuDo('del')});B(c3[1],y,w3,'Undo  (A)',{click:()=>menuDo('undo')});B(c3[2],y,w3,'Redo  (B)',{click:()=>menuDo('redo')});y+=124;
+    B(c2[0],y,w2,'Tabletop 1:12',{on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}});B(c2[1],y,w2,'Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}});y+=124;
+    B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor  (Y)',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=150;
+    MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,2)+18;
+    mWrap('Trigger a face: push or pull it. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly. X: hide this menu.',48,y,MW-96,26,'#8B93A1',36,4)}
+  menuTex.needsUpdate=true}
+function placeMenu(){const g=leftC().userData.grip;if(menu.parent!==g){menu.parent?.remove(menu);g.add(menu)}menu.position.set(0,.08,-.13);menu.rotation.set(-.35-Math.PI/2,0,0);drawMenu()}
+function menuHit(c){if(!menu.visible||menu.parent===c.userData.grip)return null;ctrlRay(c);menu.updateWorldMatrix(true,false);const h=xray.intersectObject(menu,false)[0];if(!h)return null;
+  const px=h.uv.x*MW,py=(1-h.uv.y)*MH,i=XR.W.findIndex(w=>px>=w.x&&px<=w.x+w.w&&py>=w.y&&py<=w.y+w.h);return {i,point:h.point,dist:h.distance}}
+function menuDo(k){if(typeof k==='number')k=['box','cut','carve','del','undo','redo','view','snap'][k];
   if(k==='box'){const cam=renderer.xr.getCamera(),p=new V().setFromMatrixPosition(cam.matrixWorld),f=new V(0,0,-1).transformDirection(cam.matrixWorld);f.y=0;f.normalize();
-    const at=world.worldToLocal(p.addScaledVector(f,S.xrScale==='table'?.4:1.2)),bx=makeBlock({p:[Math.round(at.x),12,Math.round(at.z)],s:[24,24,24]});select(bx);schedule();menuMsg='Box '+bx.name+' added in front of you.'}
+    const at=world.worldToLocal(p.addScaledVector(f,S.xrScale==='table'?.4:1.2)),bx=makeBlock({p:[Math.round(at.x),12,Math.round(at.z)],s:[24,24,24]});select(bx);schedule();save();menuMsg='Box '+bx.name+' added in front of you.'}
   else if(k==='cut'||k==='carve'){if(!sel&&blocks.length)select(blocks[blocks.length-1]);if(!sel)return;(k==='cut'?$('#addCut'):$('#addCarve')).onclick();menuMsg=k==='cut'?'Cut added. Grip it to tilt or move it.':'Cut-out added. Trigger its faces to size it.'}
-  else if(k==='del'){if(selCut?.userData.isCarve)delCarve(selCut);else if(selCut)delCut(selCut);else if(sel){removeBlock(sel);select(null);schedule()}menuMsg='Deleted.'}
-  else if(k==='undo')undo();else if(k==='redo')redo();
-  else if(k==='view')setView(view==='mass'?'panels':'mass');else if(k==='snap'){snap=!snap;applySnap()}
+  else if(k==='del'){if(selCut?.userData.isCarve)delCarve(selCut);else if(selCut)delCut(selCut);else if(sel){removeBlock(sel);select(null);schedule();save()}menuMsg='Deleted.'}
+  else if(k==='undo'){undo();menuMsg='Undone.'}else if(k==='redo'){redo();menuMsg='Redone.'}
+  else if(k==='view')setView(view==='mass'?'panels':'mass');else if(k==='snap'){snap=!snap;applySnap();menuMsg=snap?'Snap on: 1 inch and 15°.':'Snap off.'}
   drawMenu()}
-function xrTrigger(c){const mi=menuHit(c);if(mi>=0){menuDo(mi);return}
-  const h=xrFace(c);if(h){const d=startPush(h,xrParam(c,h.P,h.f.pl.n));if(d){c.userData.push=d;if(sel!==h.b)select(h.b);return}}
+function xrTrigger(c){const mh=menuHit(c);if(mh){if(mh.i>=0){buzz(c,.25,15);XR.W[mh.i].click?.()}return}
+  if(XR.step==='floor'){setFloor(XR.floorH+gripPos(c).y-.02);buzz(c,.5,60);return}
+  const h=xrFace(c);if(h){const d=startPush(h,xrParam(c,h.P,h.f.pl.n));if(d){c.userData.push=d;if(sel!==h.b)select(h.b);buzz(c,.2,15);return}}
   grab(c)}
 function xrTriggerEnd(c){const d=c.userData.push;if(d){c.userData.push=null;showFace(null);if(d.moved){renderModelPanel();schedule();save()}return}release(c)}
-function xrTick(){let hov=-1;
-  for(const c of ctrls){const d=c.userData.push;
-    if(d){const t=xrParam(c,d.P,d.n);if(t!=null&&d.t0!=null){const m=pushTo(d,t-d.t0);if(m&&m!==menuMsg){menuMsg=m;drawMenu()}}continue}
-    const mi=menuHit(c);if(mi>=0)hov=mi;}
-  if(!ctrls.some(c=>c.userData.push)){const c=ctrls.find(x=>x!==menu.parent)||ctrls[0],h=hov<0?xrFace(c):null;showFace(h&&h.f)}
-  if(hov!==menuHover){menuHover=hov;drawMenu()}}
-function grab(c){
-  const rot=new THREE.Matrix4().extractRotation(c.matrixWorld);
-  xray.ray.origin.setFromMatrixPosition(c.matrixWorld);xray.ray.direction.set(0,0,-1).applyMatrix4(rot);
+function grab(c){if(XR.step==='floor')return;ctrlRay(c);
   const targets=[];blocks.forEach(b=>{b.cuts.forEach(cu=>{if(cu.visible)targets.push(cu.userData.vis)});b.carves.forEach(cv=>{if(cv.visible)targets.push(cv.userData.vis)})});
   (view==='mass'?massGroup:panelGroup).traverse(o=>{if(o.isMesh&&!o.userData.isStencil)targets.push(o)});
-  const hit=xray.intersectObjects(targets,false)[0];if(!hit)return;
-  const pk=hit.object.userData.pick;let obj,b;
+  const hit=xray.intersectObjects(targets,false)[0],pk=hit?.object.userData.pick;let obj,b;
   if(pk?.isObject3D&&pk.userData.isCut){obj=pk;b=pk.userData.block}else{b=pk;obj=b?.pivot}
-  if(!b)return;select(b,obj===b.pivot?null:obj);
-  c.userData.grab={obj,parent:obj.parent,b};c.attach(obj);
-}
-function release(c){const g=c.userData.grab;if(!g)return;g.parent.attach(g.obj);c.userData.grab=null;updateMass(g.b);schedule();save()}
-function placeWorld(){setTimeout(updateSection,0);if(S.xrScale==='table'){world.scale.setScalar(.0254/12);world.position.set(0,.8,-.6)}else{world.scale.setScalar(.0254);world.position.set(0,0,-1.6)}}
+  if(!b){c.userData.nav=true;buzz(c,.15,15);return}
+  select(b,obj===b.pivot?null:obj);c.userData.grab={obj,parent:obj.parent,b};c.attach(obj);buzz(c,.3,20);drawMenu()}
+function release(c){if(c.userData.nav){c.userData.nav=false;return}const g=c.userData.grab;if(!g)return;g.parent.attach(g.obj);c.userData.grab=null;updateMass(g.b);schedule();save()}
+/* moving the whole model: one grip drags it, both grips turn and scale it about the middle of your hands */
+function navTick(dt){const ns=ctrls.filter(c=>c.userData.nav),n=Math.min(2,ns.length);
+  if(n!==XR.navN){XR.navN=n;XR.nav={pos:world.position.clone(),q:world.quaternion.clone(),s:world.scale.x,a:ns[0]&&gripPos(ns[0]),b:ns[1]&&gripPos(ns[1])};}
+  else if(n===1)world.position.copy(XR.nav.pos).add(gripPos(ns[0]).sub(XR.nav.a));
+  else if(n===2){const N=XR.nav,pa=gripPos(ns[0]),pb=gripPos(ns[1]),m0=N.a.clone().add(N.b).multiplyScalar(.5),m1=pa.clone().add(pb).multiplyScalar(.5),d0=N.b.clone().sub(N.a),d1=pb.clone().sub(pa);
+    const base=S.xrScale==='table'?.0254/12:.0254,f=Math.max(base*.25/N.s,Math.min(base*4/N.s,d1.length()/Math.max(1e-4,d0.length())));
+    const qy=new THREE.Quaternion().setFromAxisAngle(new V(0,1,0),Math.atan2(d1.x,d1.z)-Math.atan2(d0.x,d0.z));
+    world.position.copy(m1).add(N.pos.clone().sub(m0).multiplyScalar(f).applyQuaternion(qy));world.quaternion.copy(qy).multiply(N.q);world.scale.setScalar(N.s*f)}
+  /* fly with the left stick */
+  const L=leftC(),ax=axis(L,2),ay=axis(L,3);if(Math.abs(ax)>.15||Math.abs(ay)>.15){const cam=renderer.xr.getCamera(),fw=new V();cam.getWorldDirection(fw);fw.y=0;fw.normalize();
+    const rt=new V().crossVectors(fw,new V(0,1,0)).normalize();world.position.sub(fw.multiplyScalar(-ay*dt*1.2).add(rt.multiplyScalar(ax*dt*1.2)))}}
+let xrT0=0;
+function xrTick(){const now=performance.now(),dt=Math.min(.05,(now-(xrT0||now))/1000);xrT0=now;
+  const L=leftC(),R=rightC();
+  if(edgeB(L,4)){menu.visible=!menu.visible;buzz(L,.2,15)}if(edgeB(L,5))floorStep(true);
+  if(R&&R!==L){if(edgeB(R,4)){menuDo('undo');buzz(R,.3,20)}if(edgeB(R,5)){menuDo('redo');buzz(R,.3,20)}}
+  navTick(dt);let hov=-1;
+  for(const c of ctrls){const U=c.userData;U.line.visible=!(menu.visible&&menu.parent===U.grip);U.dot.visible=false;U.line.scale.z=4;
+    if(U.grab){updateMass(U.grab.b);schedule();continue}
+    const d=U.push;if(d){const t=xrParam(c,d.P,d.n);if(t!=null&&d.t0!=null){const m=pushTo(d,t-d.t0);if(m&&m!==menuMsg){menuMsg=m;drawMenu()}}continue}
+    if(!U.line.visible)continue;
+    const mh=menuHit(c);if(mh){hov=mh.i;U.line.scale.z=mh.dist;U.dot.position.copy(mh.point);U.dot.visible=true;continue}
+    if(XR.step==='floor')continue;
+    const h=xrFace(c);if(h){U.line.scale.z=h.dist;U.dot.position.copy(h.W);U.dot.visible=true}}
+  if(!ctrls.some(c=>c.userData.push)){const c=R||ctrls[0],h=hov<0&&!XR.step?xrFace(c):null;showFace(h&&h.f)}
+  if(hov!==XR.hover){XR.hover=hov;drawMenu()}}
+function placeWorld(){setTimeout(updateSection,0);world.quaternion.identity();if(S.xrScale==='table'){world.scale.setScalar(.0254/12);world.position.set(0,.8,-.6)}else{world.scale.setScalar(.0254);world.position.set(0,0,-1.6)}}
 async function enterXR(kind){
   try{const sess=await navigator.xr.requestSession(kind==='ar'?'immersive-ar':'immersive-vr',{optionalFeatures:['local-floor','bounded-floor','hand-tracking']});
     xrMode=kind;tc.detach();if(view!=='mass'&&view!=='panels')setView('mass');placeWorld();applyTheme();menu.visible=true;placeMenu();
-    sess.addEventListener('end',()=>{ctrls.forEach(c=>{release(c);c.userData.push=null});menu.visible=false;showFace(null);xrMode=null;world.scale.setScalar(1);world.position.set(0,0,0);applyTheme();updateSection();attachGizmo();resize()});
-    await renderer.xr.setSession(sess);
+    sess.addEventListener('end',()=>{ctrls.forEach(c=>{release(c);c.userData.nav=false;c.userData.push=null;c.userData.dot.visible=false});XR.base=null;XR.step=null;floorGrid.visible=false;menu.visible=false;showFace(null);xrMode=null;
+      world.scale.setScalar(1);world.position.set(0,0,0);world.quaternion.identity();applyTheme();updateSection();attachGizmo();resize()});
+    await renderer.xr.setSession(sess);XR.base=renderer.xr.getReferenceSpace();setFloor(XR.floorH);floorStep(true);
   }catch(e){xrMode=null;toast('The headset session could not start')}}
 $('#vrBtn').onclick=()=>enterXR('vr');$('#arBtn').onclick=()=>enterXR('ar');
 const scaleLabel=()=>$('#xrScaleBtn').textContent=S.xrScale==='table'?'Tabletop 1:12':'Life size';
-$('#xrScaleBtn').onclick=()=>{S.xrScale=S.xrScale==='table'?'life':'table';scaleLabel();if(xrMode)placeWorld();save()};
+$('#xrScaleBtn').onclick=()=>{S.xrScale=S.xrScale==='table'?'life':'table';scaleLabel();if(xrMode){placeWorld();drawMenu()}save()};
 if(navigator.xr){Promise.all(['immersive-vr','immersive-ar'].map(m=>navigator.xr.isSessionSupported(m).catch(()=>false))).then(([v,a])=>{
   if(!v&&!a)return;$('#xrSeg').hidden=false;$('#vrBtn').hidden=!v;$('#arBtn').hidden=!a})}
 
@@ -2726,7 +2783,6 @@ renderer.setAnimationLoop(()=>{
   if(T.anim)testTick(performance.now());
   if(view==='build')asmTick(performance.now());
   if(xrMode)xrTick();
-  else ctrls.forEach(c=>{if(c.userData.grab){updateMass(c.userData.grab.b);schedule()}});
   renderer.render(scene,camera)});
 </script>
 
