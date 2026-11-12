@@ -3731,7 +3731,8 @@ function climbersTick(dt) {
 // 45° or flatter you stand, and the left stick walks; steeper and you slide. A jumps, right stick turns, B comes back.
 // In a room, someone bigger can pinch you with their trigger and carry you; let go and you drop.
 const PL = { on: false, pos: new THREE.Vector3(), vel: new THREE.Vector3(), grounded: true, grip: { left: null, right: null }, prev: null, H: 14,
-  carry: null, turnLatch: false, jumpReq: false, wasGrip: false, state: 'g', wallP: null, wallN: null, gloves: null, test: false };
+  carry: null, turnLatch: false, jumpReq: false, wasGrip: false, state: 'g', wallP: null, wallN: null, gloves: null, test: false,
+  clock: 0, tunnel: true, vig: null, vigS: 0, blink: 0, walking: false, last: new THREE.Vector3() };
 const _cw1 = new THREE.Vector3(), _cw2 = new THREE.Vector3(), _cv1 = new THREE.Vector3(), _cv2 = new THREE.Vector3(), _cv3 = new THREE.Vector3(), _cq = new THREE.Quaternion();
 const headW = (out) => (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldPosition(out);
 const bodyBlocked = (p, H) => climbDens(p.x, p.y + 0.3 * H, p.z) >= ISO || climbDens(p.x, p.y + 0.6 * H, p.z) >= ISO || climbDens(p.x, p.y + 0.9 * H, p.z) >= ISO;
@@ -3769,6 +3770,40 @@ function plPlace() {
   const w = modelRoot.localToWorld(_cv1.copy(PL.pos)); headW(_cw1);
   modelRoot.position.x += _cw1.x - w.x; modelRoot.position.z += _cw1.z - w.z; modelRoot.position.y -= w.y;
 }
+// tunnel vision: a dark ring around your view that closes in while you're being moved (carried, flung, falling, walking)
+function plVignette() {
+  if (PL.vig) return PL.vig;
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.25, 40, 20), new THREE.ShaderMaterial({
+    uniforms: { strength: { value: 0 } }, transparent: true, depthTest: false, depthWrite: false, side: THREE.BackSide,
+    vertexShader: 'varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'uniform float strength; varying vec3 vP; void main(){ vec3 d = normalize(vP); float a = acos(clamp(-d.z, -1.0, 1.0));' +
+      ' float inner = mix(1.25, 0.36, strength); float k = smoothstep(inner, inner + 0.38, a) * min(1.0, strength * 1.8); gl_FragColor = vec4(0.0, 0.0, 0.0, k); }'
+  }));
+  m.renderOrder = 999; m.frustumCulled = false; m.visible = false;
+  if (!camera.parent) scene.add(camera);
+  camera.add(m); PL.vig = m; return m;
+}
+function plComfort(dt) {
+  const H = PL.H, sp = dt > 0 ? PL.pos.distanceTo(PL.last) / dt : 0; PL.last.copy(PL.pos);
+  let want = 0;
+  if (PL.state === 'c') want = 0.75 + 0.25 * clamp(sp / (4 * H), 0, 1);
+  else if (PL.state === 'a') want = clamp((sp - H) / (4 * H), 0, 1) * 0.9;
+  else if (PL.state === 'g' && PL.walking) want = 0.45;
+  if (PL.blink > 0) { PL.blink -= dt; want = Math.max(want, 0.85); }
+  if (!PL.tunnel) want = 0;
+  PL.vigS += (want - PL.vigS) * (1 - Math.exp(-dt * (want > PL.vigS ? 12 : 4)));   // closes quickly, opens gently
+  const v = plVignette(); v.material.uniforms.strength.value = PL.vigS; v.visible = PL.on && PL.vigS > 0.01;
+}
+// critically damped follow (no overshoot, no sudden jumps in speed)
+function smoothDamp(cur, tgt, vel, st, dt, maxSpeed) {
+  const om = 2 / st, x = om * dt, e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+  const ch = _cv3.subVectors(cur, tgt), ml = maxSpeed * st; if (ch.length() > ml) ch.setLength(ml);
+  const t2 = cur.clone().sub(ch), tmp = vel.clone().addScaledVector(ch, om).multiplyScalar(dt);
+  vel.addScaledVector(tmp, -om).multiplyScalar(e);
+  const out = t2.clone().add(ch.clone().add(tmp).multiplyScalar(e));
+  if (_cv1.subVectors(tgt, cur).dot(_cv2.subVectors(out, tgt)) > 0) { out.copy(tgt); vel.set(0, 0, 0); }
+  cur.copy(out);
+}
 function plGloves(on) {
   if (!PL.gloves) PL.gloves = ['left', 'right'].map(() => new THREE.Mesh(new THREE.SphereGeometry(0.032, 16, 12), new THREE.MeshStandardMaterial({ color: '#f4f1ea', roughness: 0.6 })));
   ['left', 'right'].forEach((side, i) => { const h = hands[side], g = PL.gloves[i]; if (g.parent) g.parent.remove(g); if (on && h) h.grip.add(g); });
@@ -3800,25 +3835,36 @@ function climbEnd() {
   if (!PL.on) return;
   PL.on = false; PL.carry = null; PL.grip.left = PL.grip.right = null;
   const P = PL.prev; if (P) { modelRoot.position.copy(P.p); modelRoot.quaternion.copy(P.q); modelRoot.scale.setScalar(P.s); panelOn = P.panel; }
-  panelMesh.visible = panelOn; plGloves(false); UIS.dirty = true;
+  panelMesh.visible = panelOn; plGloves(false); if (PL.vig) { PL.vig.visible = false; PL.vigS = 0; } UIS.dirty = true;
 }
 function plSnapTurn(a) {
   headW(_cw1); _cq.setFromAxisAngle(UPV, a);
   modelRoot.position.sub(_cw2.set(_cw1.x, 0, _cw1.z)).applyQuaternion(_cq).add(_cw2); modelRoot.quaternion.premultiply(_cq);
 }
-function climbXR(dt, onPanel) {
+function climbXR(dt, onPanel) { PL.clock += dt; PL.walking = false; climbStep(dt, onPanel); plComfort(dt); }
+function climbStep(dt, onPanel) {
   const Lh = hands.left, Rh = hands.right, H = PL.H, g = 5.8 * H;   // real gravity, at your size
   // walking around your room moves you over the model, but not through clay
   headW(_cw1); const here = modelRoot.worldToLocal(_cw2.set(_cw1.x, 0, _cw1.z));
   if ((here.x - PL.pos.x) ** 2 + (here.z - PL.pos.z) ** 2 > 1e-8) { const tp = _cv2.set(here.x, PL.pos.y, here.z); if (!bodyBlocked(tp, H)) PL.pos.copy(tp); }
   const sx = axis(Rh, 2);
-  if (!PL.turnLatch && Math.abs(sx) > 0.7) { plSnapTurn(sx > 0 ? -Math.PI / 6 : Math.PI / 6); PL.turnLatch = true; }
+  if (!PL.turnLatch && Math.abs(sx) > 0.7) { plSnapTurn(sx > 0 ? -Math.PI / 6 : Math.PI / 6); PL.turnLatch = true; PL.blink = 0.12; PL.vigS = Math.max(PL.vigS, PL.tunnel ? 0.9 : 0); }
   if (Math.abs(sx) < 0.3) PL.turnLatch = false;
   for (const [i, side] of [[0, 'left'], [1, 'right']]) if (PL.gloves) PL.gloves[i].material.color.set(PL.grip[side] ? CLIMBC : '#f4f1ea');
   // carried by someone bigger: go where their pinch goes
-  if (PL.carry && performance.now() - PL.carry.t < 600) {
-    const prev = _cv1.copy(PL.pos), tgt = _cv2.copy(PL.carry.p).addScaledVector(UPV, -0.5 * H); tgt.y = Math.max(0, tgt.y);
-    PL.pos.lerp(tgt, 1 - Math.exp(-dt * 14)); PL.vel.subVectors(PL.pos, prev).multiplyScalar(1 / Math.max(dt, 1e-3));
+  const C = PL.carry;
+  if (C && PL.clock - C.samples[C.samples.length - 1].t < 0.6) {
+    // play their hand back a touch late, so we're always between two real updates (no stutter from the network),
+    // then follow that smoothly so a shaky or quick hand never jolts your view
+    const S2 = C.samples, rt = PL.clock - 0.11, tgt = new THREE.Vector3();
+    while (S2.length > 2 && S2[1].t <= rt) S2.shift();
+    if (S2.length === 1 || rt <= S2[0].t) tgt.copy(S2[0].p);
+    else if (rt >= S2[S2.length - 1].t) {
+      const a = S2[S2.length - 2], b = S2[S2.length - 1], span = Math.max(b.t - a.t, 1e-3);
+      tgt.copy(b.p).addScaledVector(_cv1.subVectors(b.p, a.p), Math.min(rt - b.t, 0.08) / span);
+    } else { const a = S2[0], b = S2[1]; tgt.lerpVectors(a.p, b.p, (rt - a.t) / Math.max(b.t - a.t, 1e-3)); }
+    tgt.addScaledVector(UPV, -0.5 * H); tgt.y = Math.max(0, tgt.y);
+    smoothDamp(PL.pos, tgt, C.dv, 0.2, dt, H * 10); PL.vel.copy(C.dv);
     PL.grounded = false; PL.grip.left = PL.grip.right = null; PL.wasGrip = false; PL.state = 'c';
     plPlace(); return;
   }
@@ -3861,7 +3907,7 @@ function climbXR(dt, onPanel) {
           if (gr.st === 'ok') { PL.pos.set(p2.x, gr.y, p2.z); moved = true; break; }
           if (gr.st === 'none') { PL.pos.copy(p2); PL.grounded = false; PL.vel.copy(m).multiplyScalar(1 / Math.max(dt, 1e-3)); moved = true; break; }
         }
-        if (!moved) mv.set(0, 0, 0);
+        if (!moved) mv.set(0, 0, 0); else PL.walking = true;
       }
     }
     if (PL.grounded) {
@@ -3918,7 +3964,10 @@ function pinchEnd() {
 // ---- the little side
 function onPick(m) {
   if (m.to !== SYNC.me || !PL.on) return;
-  if (m.on) { if (!PL.carry) PL.carry = { p: new THREE.Vector3(), t: 0 }; PL.carry.p.fromArray(m.p); PL.carry.t = performance.now(); }
+  if (m.on) {
+    if (!PL.carry) PL.carry = { samples: [], dv: PL.vel.clone() };
+    const S2 = PL.carry.samples; S2.push({ t: PL.clock, p: new THREE.Vector3().fromArray(m.p) }); if (S2.length > 12) S2.shift();
+  }
   else { PL.carry = null; if (m.v) PL.vel.fromArray(m.v); PL.grounded = false; PL.wasGrip = false; }
 }
 // ---- little players as climber figures for everyone else
@@ -3976,8 +4025,9 @@ function drawClimberPanel(X, FW) {
   } else txt('Grab or click a climber to set the slope it likes.', X, 622, 26, '#7f8896', 'left', 500);
   ui.fillStyle = '#2b2e36'; ui.fillRect(X, 846, FW, 3);
   if (XRS.inSession) {
-    button(X, 878, FW, 96, PL.on ? 'Back to full size' : 'Climb it yourself', { on: !PL.on, accent: CLIMBC, fs: 32, click: () => { if (PL.on) climbEnd(); else climbStart(); } });
-    txt(PL.on ? 'B also brings you back · X shows or hides this panel' : 'Become climber-sized. Grip clay to pull yourself up, let go mid-swing to fling;', X, 1012, 24, '#7f8896', 'left', 500);
+    button(X, 878, PL.on ? FW - 300 : FW, 96, PL.on ? 'Back to full size' : 'Climb it yourself', { on: !PL.on, accent: CLIMBC, fs: 32, click: () => { if (PL.on) climbEnd(); else climbStart(); } });
+    if (PL.on) button(X + FW - 284, 878, 284, 96, PL.tunnel ? 'Tunnel vision' : 'No tunnel', { on: PL.tunnel, accent: CLIMBC, fs: 28, click: () => { PL.tunnel = !PL.tunnel; } });
+    txt(PL.on ? 'B also brings you back · X shows or hides this panel · tunnel vision dims the edges while you move' : 'Become climber-sized. Grip clay to pull yourself up, let go mid-swing to fling;', X, 1012, 24, '#7f8896', 'left', 500);
     if (!PL.on) txt('left stick walks up to 45°, A jumps, right stick turns, B comes back.', X, 1044, 24, '#7f8896', 'left', 500);
   } else txt('Climb it yourself: in the headset, become climber-sized and climb your sculpture.', X, 900, 24, '#7f8896', 'left', 500);
 }
@@ -4180,7 +4230,7 @@ renderer.setAnimationLoop(() => {
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
