@@ -178,6 +178,16 @@ const env = {};
   for (let mm = 50; mm <= 250; mm += 50) { const s = labelSprite(mm + ' mm'); s.position.set(-128 - 14, mm, -128); modelRoot.add(s); }
 })();
 
+// ───────────────────────── how things look: background, ambient occlusion, rim light, layer lines (yours only, kept in this browser)
+const SKIES = [
+  ['Pool', '#0a3dff', '#19c3ff', '#0b2a8a'], ['Sunset', '#5a1bd6', '#ff3d7f', '#ff9a1f'], ['Grape', '#3a0ca3', '#c21aa8', '#ff2e88'],
+  ['Tomato', '#e0150f', '#ff7a00', '#ffd23f'], ['Jungle', '#00563a', '#00c46a', '#d4f000'], ['Night', '#03061f', '#1b2a8f', '#6a1b9a'],
+  ['Paper', '#ffffff', '#efece4', '#d6d0c2'], ['Studio', '#17181c', '#17181c', '#17181c']];
+const LOOK = { bg: 'Pool', ao: true, rim: true, lines: 0 };
+try { Object.assign(LOOK, JSON.parse(localStorage.getItem('og-look') || '{}')); } catch (e) {}
+const saveLook = () => { try { localStorage.setItem('og-look', JSON.stringify(LOOK)); } catch (e) {} };
+const lookU = { uAO: { value: LOOK.ao ? 1 : 0 }, uRim: { value: LOOK.rim ? 1 : 0 }, uRimCol: { value: new THREE.Color('#ffffff') }, uLines: { value: LOOK.lines } };
+
 // ───────────────────────── clay material w/ overhang stripes
 const overU = { uShowOver: { value: 1 } };
 const clsU = { value: null };
@@ -186,9 +196,29 @@ const cutPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e6);
 function makeClayMaterial(hex, stripes = true) {
   const m = new THREE.MeshStandardMaterial({ color: hex, roughness: 0.56, metalness: 0 });
   m.onBeforeCompile = (sh) => {
-    sh.uniforms.uCls = clsU; sh.uniforms.uShowOver = stripes ? overU.uShowOver : noStripeU;
-    sh.vertexShader = 'varying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjN = normal; vObjP = position;');
-    sh.fragmentShader = 'uniform highp sampler3D uCls;\nuniform float uShowOver;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.fragmentShader.replace('#include <color_fragment>', `#include <color_fragment>
+    sh.uniforms.uCls = clsU; sh.uniforms.uShowOver = stripes ? overU.uShowOver : noStripeU; Object.assign(sh.uniforms, lookU);
+    sh.vertexShader = 'attribute float ao;\nvarying float vAO;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjN = normal; vObjP = position; vAO = ao;');
+    sh.fragmentShader = 'uniform highp sampler3D uCls;\nuniform float uShowOver, uAO, uRim, uLines;\nuniform vec3 uRimCol;\nvarying float vAO;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.fragmentShader
+      // printed layer lines: little rounded ridges every 0.1 or 0.2 mm up the sides, fading out when they're too fine to see
+      .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+      if (uLines > 0.0) {
+        float ly = vObjP.y / uLines, fw = fwidth(ly);
+        float fade = (1.0 - smoothstep(0.1, 0.28, fw)) * (1.0 - smoothstep(0.8, 0.97, abs(normalize(vObjN).y)));
+        float ph = fract(ly) * 2.0 - 1.0, bead = sqrt(max(1.0 - ph * ph, 0.0));
+        // a soft wave from a distance (no shimmer), rounded beads with crisp grooves up close
+        float sharp = 1.0 - smoothstep(0.02, 0.07, fw);
+        float tilt = mix(sin(3.14159265 * ph) * 0.9, clamp(ph / max(bead, 0.3), -2.5, 2.5), sharp) * 0.3 * fade;
+        vec3 upV = normalize((viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz), tg = upV - normal * dot(normal, upV);
+        if (dot(tg, tg) > 1e-4 && fade > 0.0) normal = normalize(normal + normalize(tg) * tilt);
+        diffuseColor.rgb *= mix(1.0, mix(0.9 + 0.1 * cos(3.14159265 * ph), 0.84 + 0.16 * bead, sharp), fade);
+      }`)
+      // soft shadow in creases and where the sculpture meets the bed
+      .replace('#include <aomap_fragment>', `#include <aomap_fragment>
+      if (uAO > 0.0) { float a = mix(1.0, vAO, uAO); reflectedLight.indirectDiffuse *= a; reflectedLight.directDiffuse *= mix(1.0, a, 0.55); reflectedLight.indirectSpecular *= a; }`)
+      // rim light: edges facing away from you glow with the sky's color
+      .replace('#include <opaque_fragment>', `if (uRim > 0.0) { float fr = pow(1.0 - clamp(dot(normal, normalize(vViewPosition)), 0.0, 1.0), 3.0); outgoingLight += uRimCol * fr * 0.5 * uRim; }
+      #include <opaque_fragment>`)
+      .replace('#include <color_fragment>', `#include <color_fragment>
       vec3 ovHot = vec3(0.0);
       if (uShowOver > 0.5) {
         vec3 nn = normalize(vObjN);
@@ -204,7 +234,7 @@ function makeClayMaterial(hex, stripes = true) {
         }
       }`).replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += ovHot * 0.4;');
   };
-  m.customProgramCacheKey = () => 'clay' + (stripes ? 1 : 0);
+  m.customProgramCacheKey = () => 'clay2' + (stripes ? 1 : 0);
   if (typeof CUT !== 'undefined' && CUT.on) m.clippingPlanes = [cutPlane];
   return m;
 }
@@ -959,11 +989,66 @@ function meshChunk(L, key) {
   geo.setAttribute('normal', new THREE.BufferAttribute(VN.slice(0, nv * 3), 3));
   geo.setIndex(new THREE.BufferAttribute(IDX.slice(0, ni), 1));
   if (L.painted) geo.setAttribute('color', new THREE.BufferAttribute(paintColors(L, VP, nv), 3));
+  geo.setAttribute('ao', new THREE.BufferAttribute(new Float32Array(nv).fill(1), 1));
   geo.computeBoundingSphere(); geo.computeBoundingBox();
   let mesh = L.meshes.get(key);
-  if (mesh) { mesh.geometry.dispose(); mesh.geometry = geo; }
+  if (mesh) {
+    // keep the old shading until the new one is worked out, so creases don't flash bright while you sculpt
+    const oa = mesh.geometry.attributes.ao; if (oa && LOOK.ao) aoCarry(mesh.geometry, geo);
+    mesh.geometry.dispose(); mesh.geometry = geo;
+  }
   else { mesh = new THREE.Mesh(geo, L.material); mesh.matrixAutoUpdate = false; L.group.add(mesh); L.meshes.set(key, mesh); }
+  if (LOOK.ao) aoMark(L, key, true);
   dimsDirty = true;
+}
+// ── ambient occlusion: per vertex, how much clay (or bed) is around it in the open directions. Worked out a few chunks
+// per frame in the background, so sculpting stays smooth; neighbors get refreshed too since a change shades them.
+const AO_DIRS = (() => { const t = (1 + Math.sqrt(5)) / 2, v = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]];
+  return v.map(a => { const l = Math.hypot(...a); return [a[0] / l, a[1] / l, a[2] / l]; }); })();
+const aoQ = new Map();   // "layerId:chunkKey" -> [layer, key]
+function aoMark(L, key, nbrs) {
+  aoQ.set(L.id + ':' + key, [L, key]);
+  if (!nbrs) return;
+  const ci = key % NC, cj = Math.floor(key / NC) % NC, ck = Math.floor(key / (NC * NC));
+  for (const Lx of layers) for (const [a, b, c] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1], [0, 0, 0]]) {
+    const ni = ci + a, nj = cj + b, nk = ck + c; if (ni < 0 || nj < 0 || nk < 0 || ni >= NC || nj >= NC || nk >= NC) continue;
+    const k2 = ni + NC * (nj + NC * nk); if (Lx.meshes.has(k2) && !(Lx === L && k2 === key)) aoQ.set(Lx.id + ':' + k2, [Lx, k2]);
+  }
+}
+function aoMarkAll() { for (const L of layers) for (const key of L.meshes.keys()) aoQ.set(L.id + ':' + key, [L, key]); }
+function aoCarry(og, ng) {   // nearest old value for each new vertex (cheap, same chunk)
+  const op = og.attributes.position.array, oa = og.attributes.ao.array, np = ng.attributes.position.array, na = ng.attributes.ao.array;
+  const grid = new Map(); for (let i = 0; i < oa.length; i++) grid.set(Math.round(op[i * 3] / VS) + ',' + Math.round(op[i * 3 + 1] / VS) + ',' + Math.round(op[i * 3 + 2] / VS), oa[i]);
+  for (let i = 0; i < na.length; i++) { const v = grid.get(Math.round(np[i * 3] / VS) + ',' + Math.round(np[i * 3 + 1] / VS) + ',' + Math.round(np[i * 3 + 2] / VS)); if (v !== undefined) na[i] = v; }
+}
+function aoChunk(L, key, solidLs) {
+  const mesh = L.meshes.get(key); if (!mesh) return;
+  const g = mesh.geometry, P = g.attributes.position.array, Nn = g.attributes.normal.array, A = g.attributes.ao.array;
+  const solid = (x, y, z) => {
+    if (y <= 0) return 1;
+    const i = Math.round(ix(x)), j = Math.round(iy(y)), k = Math.round(iz(z));
+    if (i < 0 || k < 0 || i >= N || j >= N || k >= N) return 0;
+    for (const Ls of solidLs) if (getD(Ls, i, j, k) >= 0.5) return 1;
+    return 0;
+  };
+  for (let v = 0; v < A.length; v++) {
+    const x = P[v * 3], y = P[v * 3 + 1], z = P[v * 3 + 2], nx = Nn[v * 3], ny = Nn[v * 3 + 1], nz = Nn[v * 3 + 2];
+    let occl = 0, cnt = 0;
+    for (const d of AO_DIRS) {
+      let sx = nx + d[0] * 0.85, sy = ny + d[1] * 0.85, sz = nz + d[2] * 0.85; const l = Math.hypot(sx, sy, sz) || 1; sx /= l; sy /= l; sz /= l;
+      for (const r of [2.2, 4.6]) { occl += solid(x + nx * VS * 0.9 + sx * r * VS, y + ny * VS * 0.9 + sy * r * VS, z + nz * VS * 0.9 + sz * r * VS) * (r < 3 ? 1.2 : 0.8); cnt++; }
+    }
+    A[v] = clamp(1 - (occl / cnt) * 1.35, 0.22, 1);
+  }
+  g.attributes.ao.needsUpdate = true;
+}
+function processAO(budgetMs) {
+  if (!LOOK.ao || !aoQ.size) return;
+  const t0 = performance.now(), solidLs = layers.filter(l => l.visible && !l.bridge && l.chunks.size);
+  for (const [id, [L, key]] of aoQ) {
+    aoQ.delete(id); aoChunk(L, key, solidLs);
+    if (performance.now() - t0 > budgetMs) return;
+  }
 }
 function processRemesh(budgetMs) {
   const t0 = performance.now();
@@ -2079,7 +2164,7 @@ function drawUI() {
   ui.strokeStyle = '#3a3f4a'; ui.lineWidth = 4; ui.stroke();
   // icon rail
   ui.fillStyle = '#111217'; ui.beginPath(); ui.roundRect(0, 0, RAIL, UIH, [44, 0, 0, 44]); ui.fill();
-  const TABS = [['brush', 'Brush'], ['layers', 'Layers'], ['supports', 'Supports'], ['slice', 'Slice'], ['climbers', 'Climbers'], ['scene', 'Scene'], ['together', NET.on ? 'Room ' + NET.code : 'Together']];
+  const TABS = [['scene', 'Scene'], ['brush', 'Brush'], ['layers', 'Layers'], ['supports', 'Supports'], ['slice', 'Slice'], ['climbers', 'Climbers'], ['together', NET.on ? 'Room ' + NET.code : 'Together']];
   TABS.forEach(([k, label], i) => railButton(24 + i * 120, k, label, UIS.tab === k, () => setTab(k), k === 'climbers' ? CLIMBC : undefined));
   railButton(UIH - 376, 'undo', 'Undo', false, undo);
   railButton(UIH - 256, 'redo', 'Redo', false, redo);
@@ -2088,7 +2173,7 @@ function drawUI() {
   txt('OVERHANG GARDEN', X, 52, 30, ACC, 'left', 900);
   txt(scaleLabel(), UIW - 36, 40, 24, '#9aa3b2', 'right', 600);
   txt(dimsLabel(), UIW - 36, 72, 24, '#9aa3b2', 'right', 600);
-  const HEAD = { brush: ['Brush', 'Sculpt, carve, smooth, flatten, bridge and paint'], climbers: ['Climbers', 'Little climbers that run, scramble and climb over your sculpture'], layers: ['Layers', 'Pick a layer to sculpt on, recolor, hide or merge'], supports: ['Supports', 'What needs help, how branches grow, and the brim'], slice: ['Slice', 'Watch the print build up one layer at a time'], scene: ['Scene', 'View, saves and export'], together: ['Together', 'Sculpt the same bed live with friends in a room'] }[UIS.tab];
+  const HEAD = { brush: ['Brush', 'Sculpt, carve, smooth, flatten, bridge and paint'], climbers: ['Climbers', 'Little climbers that run, scramble and climb over your sculpture'], layers: ['Layers', 'Pick a layer to sculpt on, recolor, hide or merge'], supports: ['Supports', 'What needs help, how branches grow, and the brim'], slice: ['Slice', 'Watch the print build up one layer at a time'], scene: ['Scene', 'View, look, saves and export'], together: ['Together', 'Sculpt the same bed live with friends in a room'] }[UIS.tab];
   txt(HEAD[0], X, 126, 46, '#e9ecf1', 'left', 900);
   txt(HEAD[1], X, 172, 26, '#7f8896', 'left', 500);
   if (UIS.tab === 'brush') {
@@ -2239,23 +2324,37 @@ function drawUI() {
     drawTogether(X, FW);
   } else {
     txt('View', X, 252, 30, '#9aa3b2', 'left', 700);
-    button(X, 282, 466, 96, 'Stand on bed (1:10)', { click: () => resetView(0.01) });
-    button(X + 486, 282, 466, 96, 'Tabletop (1:1)', { click: () => resetView(0.001) });
-    txt('Saves', X, 430, 30, '#9aa3b2', 'left', 700);
-    txt(cloud.ok ? (cloud.local ? 'Saved in this browser · autosave on' : 'Saved to your account · autosave on') : (cloud.checking ? 'Connecting…' : 'Saving is not available here'), X + FW, 430, 24, '#7f8896', 'right', 500);
-    ['slot1', 'slot2', 'slot3'].forEach((slot, i) => {
-      const y = 462 + i * 112;
-      ui.fillStyle = '#20232a'; rr(X, y, FW, 100, 18); ui.fill();
-      txt(`Slot ${i + 1}`, X + 28, y + 36, 32, '#e9ecf1', 'left', 800);
-      txt(cloud.meta[slot] ? `Saved ${cloud.meta[slot]}` : 'Empty', X + 28, y + 72, 24, '#7f8896', 'left', 500);
-      confirmButton(X + 540, y + 14, 196, 72, 'save' + slot, 'Save', () => saveSlot(slot, true), { dim: !cloud.ok });
-      confirmButton(X + 746, y + 14, 196, 72, 'load' + slot, 'Load', () => loadSlot(slot), { dim: !cloud.ok || !cloud.meta[slot] });
+    button(X, 270, 466, 88, 'Stand on bed (1:10)', { click: () => resetView(0.01) });
+    button(X + 486, 270, 466, 88, 'Tabletop (1:1)', { click: () => resetView(0.001) });
+    txt('Look', X, 404, 30, '#9aa3b2', 'left', 700);
+    SKIES.forEach((sk, i) => {
+      const w = 110, x = X + i * ((FW - w) / 7), y = 422, on = LOOK.bg === sk[0];
+      const gr = ui.createLinearGradient(0, y, 0, y + 78); gr.addColorStop(0, sk[1]); gr.addColorStop(0.55, sk[2]); gr.addColorStop(1, sk[3]);
+      ui.fillStyle = gr; rr(x, y, w, 78, 16); ui.fill();
+      if (on) { ui.lineWidth = 5; ui.strokeStyle = '#ffffff'; rr(x - 1, y - 1, w + 2, 80, 17); ui.stroke(); }
+      txt(sk[0], x + w / 2, y + 106, 21, on ? '#e9ecf1' : '#7f8896', 'center', on ? 800 : 500);
+      W.push({ x, y, w, h: 110, click: () => { LOOK.bg = sk[0]; applySky(); saveLook(); } });
     });
-    button(X, 812, FW, 100, 'Export STL + 3MF (.zip)', { on: true, fs: 34, click: exportZip });
-    confirmButton(X, 932, 466, 90, 'new', 'New empty scene', newScene);
-    confirmButton(X + 486, 932, 466, 90, 'demo', 'Load demo mushroom', () => { newScene(); starter(activeLayer); afterEdit(); });
-    const lines = ['Right trigger sculpt · A add/carve · B undo', 'Right stick ↕ size · ↔ shape · click smooth', 'Grips grab world · both grips turn + scale', 'Left stick fly (click: VR ↔ MR) · X menu · Y see-through'];
-    lines.forEach((l, i) => txt(l, X, 1066 + i * 34, 25, '#7f8896', 'left', 500));
+    button(X, 548, 466, 80, 'Ambient occlusion', { on: LOOK.ao, fs: 28, click: () => { LOOK.ao = !LOOK.ao; lookU.uAO.value = LOOK.ao ? 1 : 0; if (LOOK.ao) aoMarkAll(); saveLook(); } });
+    button(X + 486, 548, 466, 80, 'Rim light', { on: LOOK.rim, fs: 28, click: () => { LOOK.rim = !LOOK.rim; lookU.uRim.value = LOOK.rim ? 1 : 0; saveLook(); } });
+    txt('Layer lines', X, 688, 28, '#e9ecf1', 'left', 700);
+    [[0, 'Off'], [0.1, '0.1 mm'], [0.2, '0.2 mm']].forEach(([v, lab], i) => button(X + 262 + i * 234, 646, 222, 72, lab, { on: LOOK.lines === v, fs: 26, click: () => { LOOK.lines = v; lookU.uLines.value = v; saveLook(); } }));
+    txt('Layer lines show up close (stand on the bed, or climb it).', X, 750, 22, '#7f8896', 'left', 500);
+    txt('Saves', X, 800, 30, '#9aa3b2', 'left', 700);
+    txt(cloud.ok ? (cloud.local ? 'Saved in this browser · autosave on' : 'Saved to your account · autosave on') : (cloud.checking ? 'Connecting…' : 'Saving is not available here'), X + FW, 800, 22, '#7f8896', 'right', 500);
+    ['slot1', 'slot2', 'slot3'].forEach((slot, i) => {
+      const cw = (FW - 32) / 3, x = X + i * (cw + 16), y = 818;
+      ui.fillStyle = '#20232a'; rr(x, y, cw, 140, 18); ui.fill();
+      txt(`Slot ${i + 1}`, x + 20, y + 38, 28, '#e9ecf1', 'left', 800);
+      txt(cloud.meta[slot] ? `${cloud.meta[slot]}` : 'Empty', x + 20, y + 68, 20, '#7f8896', 'left', 500);
+      confirmButton(x + 14, y + 84, (cw - 40) / 2, 44, 'save' + slot, 'Save', () => saveSlot(slot, true), { dim: !cloud.ok, fs: 22 });
+      confirmButton(x + 26 + (cw - 40) / 2, y + 84, (cw - 40) / 2, 44, 'load' + slot, 'Load', () => loadSlot(slot), { dim: !cloud.ok || !cloud.meta[slot], fs: 22 });
+    });
+    button(X, 976, FW, 78, 'Export STL + 3MF (.zip)', { on: true, fs: 32, click: exportZip });
+    confirmButton(X, 1068, 466, 68, 'new', 'New empty scene', newScene, { fs: 26 });
+    confirmButton(X + 486, 1068, 466, 68, 'demo', 'Load demo mushroom', () => { newScene(); starter(activeLayer); afterEdit(); }, { fs: 26 });
+    txt('Trigger sculpt · A add/carve · B undo · right stick size, shape (click: smooth)', X, 1170, 21, '#7f8896', 'left', 500);
+    txt('Grips move world (both: turn, scale) · left stick fly (click: MR) · X menu · Y see-through', X, 1200, 21, '#7f8896', 'left', 500);
   }
   if (UIS.toast && performance.now() - UIS.toastT < 2200) {
     ui.fillStyle = 'rgba(124,240,178,0.95)'; rr(X, UIH - 84, FW, 64, 18); ui.fill();
@@ -4182,8 +4281,22 @@ const BG = scene.background;
 function showDesktop() { splash.style.display = 'none'; panelWrap.style.display = 'block'; document.getElementById('hud').style.display = 'block'; vrBtn.style.display = vrOK ? 'block' : 'none'; mrBtn.style.display = mrOK ? 'block' : 'none'; }
 // one XR session; passthrough flips instantly by hiding an opaque sky (MR) or showing it (VR)
 const XRS = { inSession: false, passthrough: false, ar: false };
-const sky = new THREE.Mesh(new THREE.SphereGeometry(150, 32, 16), new THREE.MeshBasicMaterial({ color: 0x17181c, side: THREE.BackSide, depthWrite: false }));
-sky.renderOrder = -10; sky.visible = false; scene.add(sky);
+const sky = new THREE.Mesh(new THREE.SphereGeometry(150, 48, 24), new THREE.ShaderMaterial({
+  uniforms: { top: { value: new THREE.Color() }, mid: { value: new THREE.Color() }, bot: { value: new THREE.Color() } }, side: THREE.BackSide, depthWrite: false,
+  vertexShader: 'varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
+  fragmentShader: 'uniform vec3 top, mid, bot; varying vec3 vW; void main(){ float y = normalize(vW - cameraPosition).y;' +
+    ' vec3 c = y < 0.0 ? mix(mid, bot, smoothstep(0.0, -0.35, y)) : mix(mid, top, smoothstep(0.0, 0.75, y)); gl_FragColor = vec4(c, 1.0);\n#include <colorspace_fragment>\n}'
+}));
+sky.renderOrder = -10; sky.frustumCulled = false; scene.add(sky);
+function applySky() {
+  const sk = SKIES.find(x => x[0] === LOOK.bg) || SKIES[0], u = sky.material.uniforms;
+  u.top.value.set(sk[1]); u.mid.value.set(sk[2]); u.bot.value.set(sk[3]);
+  scene.background = new THREE.Color(sk[2]);
+  // the floor around the printer picks up the sky, a lot darker; rim light takes the horizon color
+  env.ground.material.color.set(sk[0] === 'Studio' ? '#202227' : sk[0] === 'Paper' ? '#c9c3b5' : new THREE.Color(sk[3]).lerp(new THREE.Color('#000000'), 0.55));
+  lookU.uRimCol.value.set(sk[0] === 'Studio' ? '#9fb4d6' : sk[2]).lerp(new THREE.Color('#ffffff'), 0.35);
+}
+applySky();
 function setPassthrough(on) {
   if (!XRS.ar) { toast('Passthrough needs MR (Quest browser)'); return; }
   XRS.passthrough = on; sky.visible = !on; env.ground.visible = env.base.visible = !on;
@@ -4194,11 +4307,11 @@ async function enterXR(mode) {
     const useAR = mrOK;
     const session = await navigator.xr.requestSession(useAR ? 'immersive-ar' : 'immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
     XRS.ar = useAR; XRS.inSession = true;
-    XRS.passthrough = useAR && mode === 'mr'; sky.visible = useAR && !XRS.passthrough; env.ground.visible = env.base.visible = !XRS.passthrough;
+    XRS.passthrough = useAR && mode === 'mr'; sky.visible = !XRS.passthrough; env.ground.visible = env.base.visible = !XRS.passthrough;
     await renderer.xr.setSession(session);
     splash.style.display = 'none'; panelWrap.style.display = 'none'; vrBtn.style.display = mrBtn.style.display = 'none'; document.getElementById('hud').style.display = 'none';
     resetView(0.01); panelOn = true; panelMesh.visible = true; UIS.dirty = true;
-    session.addEventListener('end', () => { XRS.inSession = false; sky.visible = false; ghost.visible = ghostMirror.visible = false; env.ground.visible = env.base.visible = true; UIS.dirty = true; showDesktop(); });
+    session.addEventListener('end', () => { XRS.inSession = false; sky.visible = true; ghost.visible = ghostMirror.visible = false; env.ground.visible = env.base.visible = true; UIS.dirty = true; showDesktop(); });
   } catch (e) { toast(mode === 'mr' ? 'Could not start passthrough' : 'Could not start VR'); }
 }
 goDesk.onclick = showDesktop; goVR.onclick = () => enterXR('vr'); vrBtn.onclick = () => enterXR('vr'); goMR.onclick = () => enterXR('mr'); mrBtn.onclick = () => enterXR('mr');
@@ -4224,13 +4337,14 @@ renderer.setAnimationLoop(() => {
   netTick(now);
   beTick(now);
   if (UIS.tab === 'climbers' && ST.tool !== 'climb') { if (CLM.held >= 0) dropHeld(); UIS.tab = 'brush'; UIS.dirty = true; }
+  processAO(stroke.active ? 2 : 5);
   climbersTick(dt);
   if (UIS.confirm && now - UIS.confirmT > 2500) { UIS.confirm = null; UIS.dirty = true; }
   if (UIS.toast && now - UIS.toastT > 2200) { UIS.toast = ''; UIS.dirty = true; }
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { LOOK, lookU, applySky, aoMarkAll, processAO, aoQ, sky, onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
