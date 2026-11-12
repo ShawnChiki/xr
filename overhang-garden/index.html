@@ -61,6 +61,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // ───────────────────────── constants
 const N = 160, VS = 1.6, NC = 10, HALF = 128, ISO = 0.5;
@@ -185,7 +186,7 @@ const SKIES = [
   ['Paper', '#ffffff', '#efece4', '#d6d0c2'], ['Studio', '#17181c', '#17181c', '#17181c']];
 const LOOK = { bg: 'Pool', ao: true, rim: true, lines: 0 };
 try { Object.assign(LOOK, JSON.parse(localStorage.getItem('og-look') || '{}')); } catch (e) {}
-LOOK.sndClimb = LOOK.sndClimb ?? true; LOOK.sndSculpt = LOOK.sndSculpt ?? true;
+LOOK.sndClimb = LOOK.sndClimb ?? true; LOOK.sndSculpt = LOOK.sndSculpt ?? true; LOOK.splitUse = LOOK.splitUse ?? true;
 const saveLook = () => { try { localStorage.setItem('og-look', JSON.stringify(LOOK)); } catch (e) {} };
 const lookU = { uAO: { value: LOOK.ao ? 1 : 0 }, uRim: { value: LOOK.rim ? 1 : 0 }, uRimCol: { value: new THREE.Color('#ffffff') }, uLines: { value: LOOK.lines }, uHold: { value: 2.4 } };
 
@@ -205,7 +206,7 @@ function sndPlace(p) {   // loudness and left/right from where the sound is rela
   const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
   const w = modelRoot.localToWorld(_sw.copy(p)), hp = cam.getWorldPosition(new THREE.Vector3()), d = w.distanceTo(hp);
   _sr.set(1, 0, 0).applyQuaternion(cam.getWorldQuaternion(new THREE.Quaternion()));
-  return { g: clamp(0.5 / Math.max(d, 0.25), 0, 1), pan: clamp(w.sub(hp).normalize().dot(_sr), -1, 1) * 0.8 };
+  return { d, g: clamp(0.5 / Math.max(d, 0.25), 0, 1), pan: clamp(w.sub(hp).normalize().dot(_sr), -1, 1) * 0.8 };
 }
 function sndChain(g0, pan) { const ctx = SND.ctx, g = ctx.createGain(), pn = ctx.createStereoPanner ? ctx.createStereoPanner() : null; g.gain.value = 0; if (pn) { pn.pan.value = pan; g.connect(pn); pn.connect(SND.out); } else g.connect(SND.out); return g; }
 function sndTone(type, f0, f1, dur, vol, pan, delay = 0) {
@@ -224,12 +225,18 @@ function sndNoise(ftype, freq, q, dur, vol, pan) {
 function sndClimber(kind, c) {
   if (!LOOK.sndClimb || !SND.ctx || SND.ctx.state !== 'running' || CLM.paused) return;
   const now = performance.now(); SND.budget = Math.min(14, SND.budget + (now - SND.lastT) * 0.014); SND.lastT = now;
+  // how far each kind carries (metres from your head): footsteps only when you're right up close
+  const reach = { step: 0.4, hop: 0.9, land: 0.9, thud: 2, slide: 1.2, eep: 3, fall: 2, yay: 1.5, pop: 3 }[kind] || 1;
+  const pl = sndPlace(c.cen || c.p); if (pl.d > reach) return;
+  const cool = { hop: 0.5, land: 0.4, thud: 0.5, slide: 6, fall: 3, yay: 4, eep: 0.3 }[kind] || 0;
+  c.sndT = c.sndT || {}; if (cool && CLM.time - (c.sndT[kind] ?? -99) < cool) return; c.sndT[kind] = CLM.time;
   const cost = kind === 'step' ? 1 : 0.5; if (SND.budget < cost) return; SND.budget -= cost;
-  const { g, pan } = sndPlace(c.cen || c.p), pitch = 1.25 - (c.s || 1) * 0.25; if (g < 0.02) return;
+  const g = Math.pow(1 - pl.d / reach, 1.3), pan = pl.pan, pitch = 1.25 - (c.s || 1) * 0.25; if (g < 0.02) return;
   if (kind === 'step') sndNoise('highpass', 2600 * pitch, 0.7, 0.03, 0.05 * g, pan);
   else if (kind === 'hop') sndTone('sine', 320 * pitch, 760 * pitch, 0.14, 0.12 * g, pan);
-  else if (kind === 'land') { sndTone('sine', 150 * pitch, 70, 0.09, 0.14 * g, pan); sndNoise('lowpass', 900, 0.7, 0.05, 0.05 * g, pan); }
-  else if (kind === 'slide') sndTone('triangle', 1250 * pitch, 520 * pitch, 0.9, 0.08 * g, pan);
+  else if (kind === 'land') { sndTone('sine', 150 * pitch, 70, 0.09, 0.1 * g, pan); sndNoise('lowpass', 900, 0.7, 0.05, 0.04 * g, pan); }
+  else if (kind === 'thud') { sndTone('sine', 120 * pitch, 50, 0.16, 0.18 * g, pan); sndNoise('lowpass', 600, 0.7, 0.1, 0.08 * g, pan); }
+  else if (kind === 'slide') sndNoise('bandpass', 1800 * pitch, 2.5, 0.45, 0.05 * g, pan);   // a soft whoosh
   else if (kind === 'eep') sndTone('square', 900 * pitch, 1500 * pitch, 0.09, 0.05 * g, pan);
   else if (kind === 'fall') sndTone('sine', 1100 * pitch, 260 * pitch, 0.6, 0.09 * g, pan);
   else if (kind === 'yay') { sndTone('triangle', 880 * pitch, 900 * pitch, 0.1, 0.08 * g, pan); sndTone('triangle', 1320 * pitch, 1360 * pitch, 0.14, 0.08 * g, pan, 0.09); }
@@ -262,8 +269,8 @@ function makeClayMaterial(hex, stripes = true) {
   const m = new THREE.MeshStandardMaterial({ color: hex, roughness: 0.56, metalness: 0 });
   m.onBeforeCompile = (sh) => {
     sh.uniforms.uCls = clsU; sh.uniforms.uShowOver = stripes ? overU.uShowOver : noStripeU; Object.assign(sh.uniforms, lookU);
-    sh.vertexShader = 'attribute float ao;\nattribute vec2 usew;\nvarying float vAO;\nvarying vec2 vUse;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjN = normal; vObjP = position; vAO = ao; vUse = usew;');
-    sh.fragmentShader = 'uniform highp sampler3D uCls;\nuniform float uShowOver, uAO, uRim, uLines, uHold;\nuniform vec3 uRimCol;\nvarying float vAO;\nvarying vec2 vUse;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.fragmentShader
+    sh.vertexShader = 'attribute float ao;\nattribute vec3 usew;\nvarying float vAO;\nvarying vec3 vUse;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjN = normal; vObjP = position; vAO = ao; vUse = usew;');
+    sh.fragmentShader = 'uniform highp sampler3D uCls;\nuniform float uShowOver, uAO, uRim, uLines, uHold;\nuniform vec3 uRimCol;\nvarying float vAO;\nvarying vec3 vUse;\nvarying vec3 vObjN;\nvarying vec3 vObjP;\n' + sh.fragmentShader
       // climbing walls: a grey board with bright speckled holds; slides: glossy yellow plastic with lanes down the fall line
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
       if (vUse.x > 0.02) {
@@ -280,7 +287,8 @@ function makeClayMaterial(hex, stripes = true) {
         float lip = smoothstep(0.2, 0.45, vUse.y) * (1.0 - smoothstep(0.55, 0.8, vUse.y));   // a darker lip around the edge
         diffuseColor.rgb = mix(diffuseColor.rgb, mix(vec3(1.0, 0.62, 0.0), vec3(1.0, 0.22, 0.0), lip), vUse.y);
         roughnessFactor = mix(roughnessFactor, 0.16, vUse.y);
-      }`)
+      }
+      if (vUse.z > 0.02) { float hz = step(0.82, fract((vObjP.x + vObjP.y - vObjP.z) / 2.2)); diffuseColor.rgb *= 1.0 - 0.16 * hz * vUse.z; }   // keep off: faint hatching`)
       // printed layer lines: little rounded ridges every 0.1 or 0.2 mm up the sides, fading out when they're too fine to see
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
       if (uLines > 0.0) {
@@ -317,7 +325,7 @@ function makeClayMaterial(hex, stripes = true) {
       }`).replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += ovHot * 0.4;');
   };
   m.customProgramCacheKey = () => 'clay3' + (stripes ? 1 : 0);
-  m.defaultAttributeValues = { ...m.defaultAttributeValues, ao: [1], usew: [0, 0] };
+  m.defaultAttributeValues = { ...m.defaultAttributeValues, ao: [1], usew: [0, 0, 0] };
   if (typeof CUT !== 'undefined' && CUT.on) m.clippingPlanes = [cutPlane];
   return m;
 }
@@ -600,17 +608,17 @@ function stampUse(L, cx, cy, cz, r, kind, rec) {
 }
 // per vertex: how much climbing wall and how much slide is around it (blended like color paint)
 function useWeights(L, P, nv) {
-  const out = new Float32Array(nv * 2);
+  const out = new Float32Array(nv * 3);
   for (let v = 0; v < nv; v++) {
     const fx = ix(P[v * 3]), fy = Math.max(1, iy(P[v * 3 + 1])), fz = iz(P[v * 3 + 2]);
     const i = Math.floor(fx), j = Math.floor(fy), k = Math.floor(fz), tx = fx - i, ty = fy - j, tz = fz - k;
-    let a = 0, b = 0, ws = 0;
+    let a = 0, b = 0, e = 0, ws = 0;
     for (let c = 0; c < 8; c++) {
       const aa = c & 1, bb = (c >> 1) & 1, d = c >> 2, ii = i + aa, jj = j + bb, kk = k + d;
       const w = (aa ? tx : 1 - tx) * (bb ? ty : 1 - ty) * (d ? tz : 1 - tz) * (getD(L, ii, jj, kk) + 0.05), u = getP(L, ii, jj, kk) >> 4;
-      if (u === 1) a += w; else if (u === 2) b += w; ws += w;
+      const uu = u || L.useAll; if (uu === 1) a += w; else if (uu === 2) b += w; else if (uu === 3) e += w; ws += w;
     }
-    ws = ws || 1; out[v * 2] = a / ws; out[v * 2 + 1] = b / ws;
+    ws = ws || 1; out[v * 3] = a / ws; out[v * 3 + 1] = b / ws; out[v * 3 + 2] = e / ws;
   }
   return out;
 }
@@ -766,6 +774,7 @@ function strokeApply(c, m, rmm) {
       changed = stampFlatten(L, p.x, p.y, p.z, rmm, pl, stroke.rec) || changed;
       if (mm) changed = stampFlatten(L, -p.x, p.y, p.z, rmm, { px: -pl.px, py: pl.py, pz: pl.pz, nx: -pl.nx, ny: pl.ny, nz: pl.nz }, stroke.rec) || changed;
     } else if (tool === 'use') {
+      if (ST.useKind === 2) changed = stamp(L, p.x, p.y, p.z, m, 0, rmm * 0.9, 'smooth', stroke.rec) || changed;   // slides come out smooth enough to ride
       changed = stampUse(L, p.x, p.y, p.z, rmm, ST.useKind, stroke.rec) || changed;
       if (mm) changed = stampUse(L, -p.x, p.y, p.z, rmm, ST.useKind, stroke.rec) || changed;
     } else if (tool === 'paint') {
@@ -786,6 +795,7 @@ function strokeApply(c, m, rmm) {
 function strokeEnd() {
   if (!stroke.active) return;
   stroke.active = false;
+  if (ST.tool === 'use') supSettingChanged();   // supports steer clear of slides
   pushUndo(stroke.rec);
   stroke.rec = null;
 }
@@ -1107,7 +1117,8 @@ function meshChunk(L, key) {
   geo.setAttribute('position', new THREE.BufferAttribute(VP.slice(0, nv * 3), 3));
   geo.setAttribute('normal', new THREE.BufferAttribute(VN.slice(0, nv * 3), 3));
   geo.setIndex(new THREE.BufferAttribute(IDX.slice(0, ni), 1));
-  if (L.painted) { geo.setAttribute('color', new THREE.BufferAttribute(paintColors(L, VP, nv), 3)); geo.setAttribute('usew', new THREE.BufferAttribute(useWeights(L, VP, nv), 2)); }
+  if (L.painted) geo.setAttribute('color', new THREE.BufferAttribute(paintColors(L, VP, nv), 3));
+  if (L.painted || L.useAll) geo.setAttribute('usew', new THREE.BufferAttribute(useWeights(L, VP, nv), 3));
   geo.setAttribute('ao', new THREE.BufferAttribute(new Float32Array(nv).fill(1), 1));
   geo.computeBoundingSphere(); geo.computeBoundingBox();
   let mesh = L.meshes.get(key);
@@ -1645,6 +1656,7 @@ function* treeGen(keep, sup, fresh, bb, clsArr) {
       const rr = Math.hypot(i - ci, k - ck); if (rr > R) continue;
       const jc = Math.floor(cy - Math.max(1, rr / tanB)); if (jc < 1) continue;
       const o = OI(i, jc, k), jb = occ[o] ? jc : below[o]; if (!jb) continue;
+      if (noLandOn && noLand[OI(i, jb, k)]) continue;   // not on a slide
       cand.push({ i, j: jb, k, d: Math.hypot(rr, cy - jb) });
     }
     cand.sort((p, q) => p.d - q.d);
@@ -1700,6 +1712,34 @@ function* treeGen(keep, sup, fresh, bb, clsArr) {
   }
   // 3) each group: branches run from their spots to the trunk, the trunk stands under the weighted middle and
   //    thickens every time a branch joins, then ends in the middle of the part below it or on the plate
+  // a trunk that would come down on a slide moves over (as far as its branches can still reach) to land somewhere else;
+  // a group that can't move together splits up and each branch finds its own way down
+  const landsOnSlide = (ci, ck, low) => {
+    for (const [di, dk] of [[0, 0], [3, 0], [-3, 0], [0, 3], [0, -3]]) {
+      let air = false;   // skip down out of the part the branches hang from, then the first top below is where the trunk lands
+      for (let y = Math.floor(low) - 1; y >= 1; y--) { const o = OI(Math.round(ci + di), y, Math.round(ck + dk));
+        if (!occ[o]) { air = true; continue; } if (air) { if (noLand[o]) return true; break; } }
+    }
+    return false;
+  };
+  const moveOff = (g) => {
+    const low = Math.min(...g.m.map(t => t.A.j));
+    if (!landsOnSlide(g.ci, g.ck, low)) return true;
+    for (let r = 2; r <= 24; r += 1.5) for (let a = 0; a < 16; a++) {
+      const ci = g.ci + Math.cos(a * Math.PI / 8) * r, ck = g.ck + Math.sin(a * Math.PI / 8) * r;
+      if (ci <= bi0 || ck <= bk0 || ci >= bi1 || ck >= bk1) continue;
+      if (fits(g.m, ci, ck) && !landsOnSlide(ci, ck, low)) { g.ci = ci; g.ck = ck; return true; }
+    }
+    return false;
+  };
+  if (noLandOn) {
+    const out = [];
+    for (const g of G) {
+      if (moveOff(g) || g.m.length === 1) { out.push(g); continue; }
+      for (const t of g.m) { const s1 = { m: [t], w: t.w, ci: t.A.i, ck: t.A.k }; moveOff(s1); out.push(s1); }
+    }
+    G = out;
+  }
   for (const g of G) {
     const joins = g.m.map(t => { const d = Math.hypot(t.A.i - g.ci, t.A.k - g.ck); return { t, y: d < 0.6 ? t.A.j : t.A.j - d / lean }; }).sort((p, q) => q.y - p.y);
     const Wall = joins.reduce((a, jn) => a + jn.t.w, 0), top = joins[0].y, low = joins[joins.length - 1].y, ci = Math.round(g.ci), ck = Math.round(g.ck);
@@ -1772,7 +1812,7 @@ function* fuseGen(sup, fresh, bb, clsArr) {
     let anyFirm = false;
     for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
       const o = i + W * k, g = G(i, j, k);
-      const firm = occ[g] && clsArr[g] === 1; sig[o] = firm ? 0 : INF; if (firm) anyFirm = true;
+      const firm = occ[g] && clsArr[g] === 1 && !(noLandOn && noLand[g]); sig[o] = firm ? 0 : INF; if (firm) anyFirm = true;
     }
     if (anyFirm && !plateOnly) chamfer(sig, null); else if (anyFirm) chamfer(sig, null);
     for (let k = 0; k < H; k++) for (let i = 0; i < W; i++) {
@@ -1863,6 +1903,7 @@ function* smoothSupport(map) {
 // It runs in a background thread (see below), or here on the main thread if that isn't available.
 function* solveCore(vis) {
   const sup = ST.sup;
+  if (typeof window !== 'undefined') buildNoLand();
   solveTick = performance.now();
   const fresh = new Map(), passLog = [];
   let firstCount = 0, islands0 = 0, left = [], cls0 = null;
@@ -2050,6 +2091,21 @@ function supportTick(now) {
 // are sent over; the worker keeps its own copy, grows the supports at full speed and sends back the result, so the
 // headset never shares its frames with the solver. If workers aren't allowed here, the solver runs on the main thread.
 const SOLVER = { w: null, busy: false, failed: false, id: 0, epoch: 0, sentEpoch: 0 };
+// slide surfaces (and a couple of voxels around them) where supports shouldn't land
+const noLand = new Uint8Array(N * N * N); let noLandOn = false;
+function buildNoLand() {
+  noLand.fill(0); const list = [];
+  const mark = (i, j, k) => { for (let c = -2; c <= 2; c++) for (let b = -2; b <= 2; b++) for (let a = -2; a <= 2; a++) { const x = i + a, y = j + b, z = k + c; if (x < 0 || y < 1 || z < 0 || x >= N || y >= N || z >= N) continue; const g = OI(x, y, z); if (!noLand[g]) { noLand[g] = 1; list.push(g); } } };
+  for (const L of layers) {
+    if (!L.visible || L.auto || L.bridge) continue;
+    if (L.useAll === 2) { for (const [key, ch] of L.chunks) { const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+      for (let li = 0; li < 4096; li++) if (ch[li] >= 0.5) { const i = cx * 16 + (li & 15), j = cy * 16 + ((li >> 4) & 15), k = cz * 16 + (li >> 8); if (!noLand[OI(i, j, k)]) { noLand[OI(i, j, k)] = 1; list.push(OI(i, j, k)); } } } }
+    for (const [key, pc] of L.paint) { const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+      for (let li = 0; li < 4096; li++) if ((pc[li] >> 4) === 2) mark(cx * 16 + (li & 15), cy * 16 + ((li >> 4) & 15), cz * 16 + (li >> 8)); }
+  }
+  noLandOn = list.length > 0;
+  return Int32Array.from(list);
+}
 function solverSource() {
   const fns = [getD, voxBox, smoothPass, gatherSmoothed, occAt, belowAt, ringBlocked, solidScore, massDir, burrow, fitRadius, buryEnd, findAnchor,
     occGen, classifyGen, dedupeContacts, strandGen, depthGen, stampTube, treeGen, fuseGen, smoothSupport, addFootFlare, addBrim,
@@ -2058,7 +2114,7 @@ function solverSource() {
   return [
     `const N = ${N}, VS = ${VS}, NC = ${NC}, HALF = ${HALF}, ISO = ${ISO}, DEG = Math.PI / 180, PB = ${PB}, PB2 = ${PB2}, TAPER = ${TAPER};`,
     `const DIRS14 = ${JSON.stringify(DIRS14)};`,
-    'const occ = new Uint8Array(N * N * N), below = new Uint8Array(N * N * N), firmM = new Uint8Array(N * N * N); let firmUsed = false, _scratch = null;',
+    'const occ = new Uint8Array(N * N * N), below = new Uint8Array(N * N * N), firmM = new Uint8Array(N * N * N), noLand = new Uint8Array(N * N * N); let firmUsed = false, _scratch = null, noLandOn = false;',
     'const BIG = new Float32Array(PB * PB2), BLA = new Float32Array(PB * PB2), BLB = new Float32Array(PB * PB2);',
     'let layers = []; const ST = { sup: {}, autoSmooth: 0.3 }; let solveTick = 0; const solveMaybe = () => false; const SOLVEPROF = { stage: "", t: {} };',
     ...Object.entries(arrows).map(([k, f]) => `const ${k} = ${f.toString()};`),
@@ -2068,6 +2124,7 @@ self.onmessage = (e) => {
   const m = e.data; if (m.t !== 'solve') return;
   try {
     ST.sup = m.sup; ST.autoSmooth = m.smooth;
+    noLand.fill(0); noLandOn = !!(m.noLand && m.noLand.length); if (noLandOn) for (const g of m.noLand) noLand[g] = 1;
     const seen = new Set();
     layers = m.layers.map(d => {
       let L = mirror.get(d.u); if (!L || d.reset) { L = { chunks: new Map() }; mirror.set(d.u, L); }
@@ -2108,7 +2165,8 @@ function postSolve() {
     out.push(d);
   }
   SOLVER.busy = true; SOLVER.id++; SOLVER.sentEpoch = SOLVER.epoch;
-  SOLVER.w.postMessage({ t: 'solve', id: SOLVER.id, layers: out, sup: { ...ST.sup }, smooth: ST.autoSmooth }, transfer);
+  const nl = buildNoLand(); transfer.push(nl.buffer);
+  SOLVER.w.postMessage({ t: 'solve', id: SOLVER.id, layers: out, sup: { ...ST.sup }, smooth: ST.autoSmooth, noLand: nl }, transfer);
 }
 function onSolverMsg(e) {
   const m = e.data; SOLVER.busy = false;
@@ -2364,8 +2422,9 @@ function drawUI() {
       ui.beginPath(); ui.arc(X + 56, y + 46, 30, 0, Math.PI * 2); ui.fillStyle = PALETTE[L.colorIdx]; ui.fill();
       ui.strokeStyle = UIS.picker === L.id ? ACC : '#111317'; ui.lineWidth = UIS.picker === L.id ? 6 : 3; ui.stroke();
       W.push({ x: X + 12, y: y + 4, w: 88, h: 84, click: () => { UIS.picker = UIS.picker === L.id ? null : L.id; } });
-      txt(L.name + (L.auto ? ' (grows itself)' : L.bridge ? (act ? '  ← new bridges' : '  (bridges)') : act ? '  ← sculpting' : ''), X + 112, y + 46, 30, L.visible ? '#e9ecf1' : '#7f8896', 'left', 700);
+      txt(L.name + (L.auto ? ' (grows itself)' : L.bridge ? (act ? '  ← new bridges' : '  (bridges)') : act ? '  ← sculpting' : ''), X + 112, y + 46, 27, L.visible ? '#e9ecf1' : '#7f8896', 'left', 700);
       button(X + 560, y + 12, 186, 68, L.visible ? 'Shown' : 'Hidden', { on: L.visible, fs: 28, click: () => { L.visible = !L.visible; L.group.visible = L.visible; dimsDirty = true; if (!L.auto) afterEdit(); } });
+      if (!L.auto && !L.bridge) { const u = L.useAll | 0; button(X + 424, y + 18, 124, 56, USE_NAMES[u], { on: u > 0, accent: USE_COLS[u], fs: 20, click: () => setLayerUse(L, (u + 1) % 4) }); }
       if (L.auto) { const above = clayLayers().filter(l => l !== L).slice(-1)[0]; confirmButton(X + 756, y + 12, 186, 68, 'bake', above ? 'Bake in ↑' : 'Keep clay', () => bakeSupportsInto(), { fs: 26 }); }
       else button(X + 756, y + 12, 186, 68, L.locked ? 'Locked' : 'Lock', { on: L.locked, accent: '#ffc93c', fs: 28, click: () => { L.locked = !L.locked; } });
       y += 102;
@@ -2478,7 +2537,8 @@ function drawUI() {
       confirmButton(x + 14, y + 84, (cw - 40) / 2, 44, 'save' + slot, 'Save', () => saveSlot(slot, true), { dim: !cloud.ok, fs: 22 });
       confirmButton(x + 26 + (cw - 40) / 2, y + 84, (cw - 40) / 2, 44, 'load' + slot, 'Load', () => loadSlot(slot), { dim: !cloud.ok || !cloud.meta[slot], fs: 22 });
     });
-    button(X, 1016, FW, 74, 'Export STL + 3MF (.zip)', { on: true, fs: 32, click: exportZip });
+    button(X, 1016, FW - 300, 74, 'Export STL + 3MF (.zip)', { on: true, fs: 30, click: exportZip });
+    button(X + FW - 284, 1016, 284, 74, LOOK.splitUse ? 'Split by use: On' : 'Split by use: Off', { on: LOOK.splitUse, accent: '#ffc400', fs: 22, click: () => { LOOK.splitUse = !LOOK.splitUse; saveLook(); } });
     confirmButton(X, 1102, 466, 64, 'new', 'New empty scene', newScene, { fs: 26 });
     confirmButton(X + 486, 1102, 466, 64, 'demo', 'Load demo mushroom', () => { newScene(); starter(activeLayer); afterEdit(); }, { fs: 26 });
     txt('Trigger sculpt · A add/carve · B undo · right stick size, shape (click: smooth)', X, 1206, 20, '#7f8896', 'left', 500);
@@ -2780,17 +2840,18 @@ panelMesh.position.set(0, 0.07, -0.12); panelMesh.rotation.x = -0.35 - Math.PI /
 const laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.8 }));
 laser.visible = false;
 const cursor = new THREE.Mesh(new THREE.SphereGeometry(0.004, 12, 8), new THREE.MeshBasicMaterial({ color: ACC })); cursor.visible = false; scene.add(cursor);
+// the right hand keeps a little pointer tip ahead of the controller, to show where the brush is aimed
 function penModel() {
   const g = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.015, 0.1, 16), new THREE.MeshStandardMaterial({ color: 0x2a2d34, roughness: 0.5 }));
-  body.rotation.x = Math.PI / 2; body.position.z = 0.03; g.add(body);
-  const tip = new THREE.Mesh(new THREE.ConeGeometry(0.011, 0.025, 16), new THREE.MeshStandardMaterial({ color: 0x7cf0b2, roughness: 0.4 }));
-  tip.rotation.x = -Math.PI / 2; tip.position.z = -0.032; g.add(tip);
+  const tip = new THREE.Mesh(new THREE.ConeGeometry(0.007, 0.02, 16), new THREE.MeshStandardMaterial({ color: 0x7cf0b2, roughness: 0.4 }));
+  tip.rotation.x = -Math.PI / 2; tip.position.z = -0.03; g.add(tip);
   return g;
 }
+const ctrlModels = new XRControllerModelFactory();   // your actual controllers (fetched for whichever headset you have)
 for (let i = 0; i < 2; i++) {
   const ctrl = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
   scene.add(ctrl); scene.add(grip);
+  try { grip.add(ctrlModels.createControllerModel(grip)); } catch (e) {}
   const h = { ctrl, grip, src: null, hand: null, prev: [], vis: null };
   ctrl.addEventListener('connected', (e) => {
     h.src = e.data; h.hand = e.data.handedness;
@@ -2965,7 +3026,7 @@ async function serialize() {
       for (let i = 0; i < 4096; i++) buf[2 + i] = Math.round(clamp(ch[i], 0, 1) * 255);
       parts.push(buf); cnt++; total += 4098;
     }
-    metaLayers.push({ uid: L.uid, name: L.name, colorIdx: L.colorIdx, visible: L.visible, locked: L.locked, chunks: cnt });
+    metaLayers.push({ uid: L.uid, name: L.name, colorIdx: L.colorIdx, visible: L.visible, locked: L.locked, chunks: cnt, useAll: L.useAll | 0 });
   }
   for (let li = 0; li < metaLayers.length; li++) {
     const L = userLayers().find(l => l.uid === metaLayers[li].uid); if (!L || L.bridge || !L.paint.size) continue;
@@ -2992,7 +3053,7 @@ async function deserialize(meta, str) {
       B.beams = (ml.beams || []).map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6], v: a[7] || 1 })); B.rebuildBeams();
       continue;
     }
-    const L = addLayer(ml.name, ml.colorIdx); if (ml.uid) L.uid = ml.uid; L.visible = ml.visible; L.locked = ml.locked; L.group.visible = L.visible;
+    const L = addLayer(ml.name, ml.colorIdx); if (ml.uid) L.uid = ml.uid; L.visible = ml.visible; L.locked = ml.locked; L.group.visible = L.visible; L.useAll = ml.useAll | 0;
     for (let c = 0; c < ml.chunks; c++) {
       const key = data[o] | (data[o + 1] << 8); const ch = new Float32Array(4096);
       for (let i = 0; i < 4096; i++) ch[i] = data[o + 2 + i] / 255;
@@ -3212,7 +3273,7 @@ function netTouch(L, key) {
   let set = SYNC.touched.get(L); if (!set) SYNC.touched.set(L, set = new Set()); set.add(key);
   if (!L.netVer) L.netVer = new Map(); L.netVer.set(key, (L.netVer.get(key) || 0) + 1);
 }
-const layerDesc = (L) => ({ u: L.uid, n: L.name, c: L.colorIdx, vis: L.visible, lk: L.locked, b: L.bridge ? L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh, b.v || 1]) : null });
+const layerDesc = (L) => ({ u: L.uid, n: L.name, c: L.colorIdx, vis: L.visible, lk: L.locked, ua: L.useAll | 0, b: L.bridge ? L.beams.map(b => [b.ax, b.ay, b.az, b.bx, b.bz, b.hw, b.hh, b.v || 1]) : null });
 const settingsDesc = () => ({ sup: { ...ST.sup }, sm: ST.autoSmooth, sc: supLayer ? supLayer.colorIdx : 0 });
 function layersState() { return { list: userLayers().map(layerDesc), ...settingsDesc() }; }
 // remember what everyone already has, so only real changes go out
@@ -3356,7 +3417,7 @@ function applyLayerProps(m) {
     layers.length = 0; layers.push(...u); if (supLayer) layers.push(supLayer);
   }
   L.name = m.n; if (L.colorIdx !== m.c) L.setColor(m.c);
-  L.visible = m.vis; L.group.visible = m.vis; L.locked = m.lk;
+  L.visible = m.vis; L.group.visible = m.vis; L.locked = m.lk; if (!m.b) setLayerUse(L, m.ua | 0);
   if (m.b) { const sg = JSON.stringify(m.b); if (sg !== L._beamSig) { L._beamSig = sg; L.beams = m.b.map(a => ({ ax: a[0], ay: a[1], az: a[2], bx: a[3], by: a[1], bz: a[4], hw: a[5], hh: a[6], v: a[7] || 1 })); L.rebuildBeams(); } }
   SYNC.lsig.set(L.uid, JSON.stringify(layerDesc(L)));
   netApplying = false; afterEdit(); dimsDirty = true; UIS.dirty = true;
@@ -3539,13 +3600,17 @@ function placeClimber(p) {
   CLM.sel = CLM.list.length - 1; UIS.dirty = true;
 }
 const limitOf = (c) => clamp(c.pref + 35, 30, 180);
-// what the clay just under a spot is for (0 nothing, 1 climbing wall, 2 slide)
+// what the clay just under a spot is for (0 nothing, 1 climbing wall, 2 slide, 3 keep off): painted on, or the layer's own use
 let USE_ON = false;
 function useAt(p, n) {
   if (!USE_ON || p.y < 0.3) return 0;
   const i = Math.round(ix(p.x - n.x * VS * 0.8)), j = Math.round(iy(p.y - n.y * VS * 0.8)), k = Math.round(iz(p.z - n.z * VS * 0.8));
-  for (const L of layers) if (L.visible && L.paint.size) { const u = getP(L, i, j, k) >> 4; if (u) return u; }
-  return 0;
+  let best = 0, bd = 0.25;
+  for (const L of layers) if (L.visible && !L.bridge && (L.paint.size || L.useAll)) {
+    const u = getP(L, i, j, k) >> 4; if (u) return u;
+    if (L.useAll) { const d = getD(L, i, j, k); if (d > bd) { bd = d; best = L.useAll; } }
+  }
+  return best;
 }
 const WALL_LIM = 125;   // anyone can climb a painted climbing wall up to this steep
 // the mat is 256 mm square around the origin; nobody walks or drops off it
@@ -3617,7 +3682,10 @@ function planProbe(c) {
         q.copy(p); qn.copy(n); let ok = true;
         for (let k2 = 0; k2 < sub; k2++) {
           q2.copy(q).addScaledVector(t, step / sub).addScaledVector(qn, step * 0.02);
-          if (!toSurface(q2, nq) || !onMat(q2, H) || (slopeOf(nq) > lim && !(slopeOf(nq) <= WALL_LIM && useAt(q2, nq) === 1))) { ok = false; break; }
+          if (!toSurface(q2, nq) || !onMat(q2, H)) { ok = false; break; }
+          if (USE_ON) { const uq = useAt(q2, nq), sq = slopeOf(nq);
+            if (uq === 3 || (sq > lim && !(uq === 1 && sq <= WALL_LIM) && !(uq === 2 && sq <= 85 && q2.y < q.y))) { ok = false; break; } }
+          else if (slopeOf(nq) > lim) { ok = false; break; }
           t.applyQuaternion(_pq.setFromUnitVectors(qn, nq)); t.addScaledVector(nq, -nq.dot(t)); if (t.lengthSq() < 1e-8) { ok = false; break; } t.normalize();
           q.copy(q2); qn.copy(nq);
         }
@@ -3672,7 +3740,7 @@ function climberThink(c, H) {
     _q.copy(c.p).addScaledVector(dir, look).addScaledVector(c.n, H * 0.1);
     const n = toSurface(_q, _nq); if (!n || !onMat(_q, H)) continue;
     if (_q.distanceTo(c.p) > look * 1.6 || _q.distanceTo(c.p) < look * 0.3) continue;
-    const sl = slopeOf(n), u = useAt(_q, n); if (sl > lim && !(u === 1 && sl <= WALL_LIM)) continue;
+    const sl = slopeOf(n), u = useAt(_q, n); if (u === 3 || (sl > lim && !(u === 1 && sl <= WALL_LIM) && !(u === 2 && sl <= 85 && _q.y < c.p.y))) continue;
     if (u === 2 && _q.y > c.p.y - look * 0.05) continue;   // never up a slide
     let crowd = 0; for (const o of CLM.list) if (o !== c && o.p.distanceTo(_q) < H * 1.1) crowd++;
     const up = gd ? 0 : (_q.y - c.p.y) / look * (c.pref / 90) * 0.9;
@@ -3693,7 +3761,9 @@ function climbersSim(dt) {
     const H = climberH(c);
     if (c.state === 'held') continue;
     if (c.state === 'fall') {
+      if (!c.air) { c.fallTop = c.p.y; c.whistled = false; }
       c.air += dt; keepOnMat(c.p, H);
+      if (!c.whistled && !c.hop && c.air > 0.3 && c.fallTop - c.p.y > H * 2) { c.whistled = true; sndClimber('fall', c); }
       // buried (clay was added on top of them): work their way out, toward the nearest outside
       if (climbDens(c.p.x, c.p.y, c.p.z) > ISO + 0.1) {
         climbGrad(c.p, _g); if (_g.lengthSq() > 1e-4) c.p.addScaledVector(_g.normalize(), -H * 0.3); else c.p.y += H * 0.5;
@@ -3714,7 +3784,8 @@ function climbersSim(dt) {
         if (n) c.n.copy(n);
         else { c.p.copy(sp); climbGrad(c.p, _g); if (_g.lengthSq() > 1e-6) c.n.copy(_g).negate().normalize(); else c.n.set(0, 1, 0); }
       }
-      if (slopeOf(c.n) <= limitOf(c) + (c.relax || 0) || c.p.y <= 0.01 || (slopeOf(c.n) <= WALL_LIM && useAt(c.p, c.n) === 1)) { c.state = 'walk'; sndClimber('land', c); c.v.set(0, 0, 0); c.rethink = 0; c.slides = 0; c.stuck = 0; c.route = c.plan = c.dest = null; }
+      const uL = useAt(c.p, c.n);
+      if (uL !== 3 && (slopeOf(c.n) <= limitOf(c) + (c.relax || 0) || c.p.y <= 0.01 || (slopeOf(c.n) <= WALL_LIM && uL === 1))) { c.state = 'walk'; if ((c.fallTop || 0) - c.p.y > H * 2.5) sndClimber('thud', c); else if (!c.hop) sndClimber('land', c); c.hop = false; c.v.set(0, 0, 0); c.rethink = 0; c.slides = 0; c.stuck = 0; c.route = c.plan = c.dest = null; }
       else {
         // too steep for them: slide down it (and off, if it's a roof)
         c.slides = (c.slides || 0) + 1;
@@ -3756,7 +3827,7 @@ function climbersSim(dt) {
     }
     if (c.rest > 0 && climbDens(c.p.x - c.n.x * VS * 1.5, c.p.y - c.n.y * VS * 1.5, c.p.z - c.n.z * VS * 1.5) < ISO * 0.8) c.rest = 0;   // the clay under them got carved away
     // completely spent halfway up a wall: it lets go
-    if (c.energy < 0.01 && wall > 0.6 && !(c.rest > 0)) { sndClimber('fall', c); c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H * 0.6); c.air = 0; c.route = c.plan = c.dest = null; c.letGo = (c.letGo || 0) + 1; continue; }
+    if (c.energy < 0.01 && wall > 0.6 && !(c.rest > 0)) { c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H * 0.6); c.air = 0; c.route = c.plan = c.dest = null; c.letGo = (c.letGo || 0) + 1; continue; }
     if (c.rest > 0) {
       c.rest -= dt; c.speed = Math.max(0, c.speed - H * 6 * dt);
       if (c.tired && c.energy > 0.92) { c.tired = false; c.rest = Math.min(c.rest, 0.5); }
@@ -3778,7 +3849,7 @@ function climbersSim(dt) {
           // made it: rest (sit down if worn out; a little hop if it climbed to the top), then plan somewhere new
           c.route = null; c.arrived = (c.arrived || 0) + 1;
           if (c.tired) { c.rest = 99; c.sit = sl < 40; }
-          else { c.rest = 0.6 + Math.random() * 2.2 / c.pace; if (c.goalTop) { c.state = 'fall'; c.v.set(0, H * 2.2, 0); c.air = 0; sndClimber('yay', c); } }
+          else { c.rest = 0.6 + Math.random() * 2.2 / c.pace; if (c.goalTop) { c.state = 'fall'; c.v.set(0, H * 2.2, 0); c.air = 0; c.hop = true; sndClimber('yay', c); } }
           continue;
         }
         wp = c.route[c.ri];
@@ -3796,14 +3867,18 @@ function climbersSim(dt) {
       if (c.flee > 0) { want = _w.subVectors(c.p, CLM.brushP); want.addScaledVector(c.n, -c.n.dot(want)); if (want.lengthSq() < 1e-6) want = null; else want.normalize(); }
     }
     if (c.relax) c.relax = Math.max(0, c.relax - dt * 15);
+    if (c.sliding) c.stuck = 0;
     if (c.stuck > 4) { c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H); c.stuck = 0; continue; }
     // steering: turn toward where it wants to go at a limited rate, speed up and slow down smoothly
     let align = 1;
-    if (want && c.sliding) align = 1;   // (sliders don't slow for turns)
+    if (c.sliding) {   // riding a slide: mostly go where it goes (straight down the fall line)
+      const fall = _t.set(0, -1, 0).addScaledVector(c.n, c.n.y);
+      if (fall.lengthSq() > 1e-4) { fall.normalize(); want = want ? _w.copy(want).multiplyScalar(0.35).addScaledVector(fall, 0.65).normalize() : _w.copy(fall); }
+    }
     if (want) {
       const ang = c.head.angleTo(want), maxA = (6 - 3 * wall) * dt;
       if (ang > 1e-4) { _qt2.setFromUnitVectors(c.head, want); _qt3.identity().slerp(_qt2, Math.min(1, maxA / ang)); c.head.applyQuaternion(_qt3).normalize(); }
-      align = Math.max(0, c.head.dot(want));
+      align = c.sliding ? 1 : Math.max(0, c.head.dot(want));
     }
     const onSlide = USE_ON && useAt(c.p, c.n) === 2 && c.head.y < 0.05;
     if (onSlide && !c.sliding) sndClimber('slide', c);
@@ -3819,8 +3894,8 @@ function climbersSim(dt) {
     else if (!onMat(c.p, H)) { c.p.copy(old); c.want = (c.want || new THREE.Vector3()).set(-c.p.x, 0, -c.p.z); if (c.want.lengthSq() > 1e-6) c.want.normalize(); else c.want.set(1, 0, 0); c.route = null; c.speed *= 0.5; continue; }
     const n = toSurface(c.p, _nq);
     const uHere = useAt(c.p, n || c.n);
-    if (n && uHere === 2 && c.p.y > old.y + 1e-4) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; c.route = null; continue; }   // no climbing up slides
-    if (!n || (slopeOf(n) > limitOf(c) + 10 + (c.relax || 0) && !(uHere === 1 && slopeOf(n) <= WALL_LIM + 10))) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; if (!toSurface(c.p, _nq)) { c.state = 'fall'; c.v.set(0, 0, 0); } continue; }
+    if (n && ((uHere === 2 && c.p.y > old.y + 1e-4) || uHere === 3)) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; c.route = null; continue; }   // no climbing up slides, no walking on keep-off
+    if (!n || (slopeOf(n) > limitOf(c) + 10 + (c.relax || 0) && !(uHere === 1 && slopeOf(n) <= WALL_LIM + 10) && !(uHere === 2 && slopeOf(n) <= 88))) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; if (!toSurface(c.p, _nq)) { c.state = 'fall'; c.v.set(0, 0, 0); } continue; }
     _h.copy(c.n); c.n.lerp(n, 0.5).normalize(); c.head.applyQuaternion(_qt2.setFromUnitVectors(_h, c.n));
   }
   // personal space
@@ -4079,6 +4154,7 @@ function smoothDamp(cur, tgt, vel, st, dt, maxSpeed) {
   cur.copy(out);
 }
 function plGloves(on) {
+  const R0 = hands.right; if (R0 && R0.vis) R0.vis.visible = !on; return;
   if (!PL.gloves) PL.gloves = ['left', 'right'].map(() => new THREE.Mesh(new THREE.SphereGeometry(0.032, 16, 12), new THREE.MeshStandardMaterial({ color: '#f4f1ea', roughness: 0.6 })));
   ['left', 'right'].forEach((side, i) => { const h = hands[side], g = PL.gloves[i]; if (g.parent) g.parent.remove(g); if (on && h) h.grip.add(g); });
   const R = hands.right; if (R && R.vis) R.vis.visible = !on;
@@ -4124,7 +4200,7 @@ function climbStep(dt, onPanel) {
   const sx = axis(Rh, 2);
   if (!PL.turnLatch && Math.abs(sx) > 0.7) { plSnapTurn(sx > 0 ? -Math.PI / 6 : Math.PI / 6); PL.turnLatch = true; PL.blink = 0.12; PL.vigS = Math.max(PL.vigS, PL.tunnel ? 0.9 : 0); }
   if (Math.abs(sx) < 0.3) PL.turnLatch = false;
-  for (const [i, side] of [[0, 'left'], [1, 'right']]) if (PL.gloves) PL.gloves[i].material.color.set(PL.grip[side] ? CLIMBC : '#f4f1ea');
+
   // carried by someone bigger: go where their pinch goes
   const C = PL.carry;
   if (C && PL.clock - C.samples[C.samples.length - 1].t < 0.6) {
@@ -4280,9 +4356,15 @@ function climberDoing(c) {
   if (c.route) return c.goalTop ? 'Going for the top' : c.routeNew ? 'Exploring somewhere new' : 'Heading somewhere it likes';
   return 'Working out where to go';
 }
+const USE_NAMES = ['—', 'Climb', 'Slide', 'Keep off'], USE_COLS = ['#9aa3b2', '#3f6bff', '#ffc400', '#c7ccd6'];
+function setLayerUse(L, u) {
+  if ((L.useAll | 0) === u) return;
+  L.useAll = u; for (const k of L.chunks.keys()) L.dirty.add(k); supSettingChanged(); UIS.dirty = true;
+}
+const allWall = () => clayLayers().length > 0 && clayLayers().every(L => L.useAll === 1);
 function setClimbMode(m) {
   CLM.mode = m;
-  if (m === 'wall' || m === 'slide' || m === 'wipe') { ST.tool = 'use'; ST.useKind = m === 'wall' ? 1 : m === 'slide' ? 2 : 0; }
+  if (m === 'wall' || m === 'slide' || m === 'wipe' || m === 'keep') { ST.tool = 'use'; ST.useKind = { wall: 1, slide: 2, keep: 3, wipe: 0 }[m]; }
   else { if (CLM.held >= 0 && m !== 'grab') dropHeld(); ST.tool = 'climb'; }
   updateGhost();
 }
@@ -4291,30 +4373,34 @@ function drawClimberPanel(X, FW) {
   button(X + 242, 230, 228, 84, CLM.paused ? 'Paused' : 'Moving', { on: !CLM.paused, accent: CLIMBC, fs: 30, click: () => { CLM.paused = !CLM.paused; } });
   confirmButton(X + 484, 230, 228, 84, 'clrall', 'Remove all', () => { CLM.list.length = 0; CLM.sel = CLM.held = -1; SEEN.clear(); }, { fs: 28 });
   txt(`${CLM.list.length} on the bed`, X + 952, 282, 26, '#7f8896', 'right', 500);
-  const MODES = [['grab', 'Grab', CLIMBC], ['erase', 'Erase', CARVE], ['wall', 'Climb wall', '#3f6bff'], ['slide', 'Slide', '#ffc400'], ['wipe', 'Wipe', '#9aa3b2']], mode = CLM.mode || 'grab';
-  MODES.forEach(([k, l, col], i) => button(X + i * 193, 334, 180, 76, l, { on: mode === k, accent: col, fs: 26, click: () => setClimbMode(k) }));
+  const MODES = [['grab', 'Grab', CLIMBC], ['erase', 'Erase', CARVE], ['wall', 'Climb wall', '#3f6bff'], ['slide', 'Slide', '#ffc400'], ['keep', 'Keep off', '#c7ccd6'], ['wipe', 'Wipe', '#9aa3b2']], mode = CLM.mode || 'grab';
+  MODES.forEach(([k, l, col], i) => button(X + i * 161, 334, 150, 76, l, { on: mode === k, accent: col, fs: 23, click: () => setClimbMode(k) }));
+  const aw = allWall();
+  button(X, 424, 466, 64, aw ? 'Everything is climbing wall' : 'Make everything climbing wall', { on: aw, accent: '#3f6bff', fs: 24, click: () => { const v = aw ? 0 : 1; for (const L of clayLayers()) if (!L.useAll || L.useAll === 1) setLayerUse(L, v); } });
+  txt('Painted slides and keep-off stay as they are.', X + 486, 448, 20, '#7f8896', 'left', 500);
+  txt('Whole layers: the use button on the Layers tab.', X + 486, 474, 20, '#7f8896', 'left', 500);
   txt({ grab: 'Click clay to place one. Grab one to carry it; let go to drop it.', erase: 'Touch climbers to take them away (drag to sweep).',
-    wall: 'Climbing walls: speckled holds anyone can climb.', slide: 'Slides: down only; they climb up another way.',
-    wipe: 'Rub off climbing walls and slides.' }[mode], X, 444, 22, '#7f8896', 'left', 500);
-  if (mode === 'wall' || mode === 'slide' || mode === 'wipe') txt('[ ] or right stick: brush size', X + FW, 444, 22, '#7f8896', 'right', 500);
-  slider(X, 494, FW, 'Climber size', (Math.log(CLM.size) - Math.log(4)) / (Math.log(60) - Math.log(4)), `${CLM.size.toFixed(CLM.size < 10 ? 1 : 0)} mm tall`, (u) => { CLM.size = +(Math.exp(Math.log(4) + u * (Math.log(60) - Math.log(4)))).toFixed(1); lookU.uHold.value = Math.max(1.6, CLM.size * 0.17); }, 'Everyone together; each varies a little');
-  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 624, FW, 3);
+    wall: 'Climbing walls: speckled holds anyone can climb.', slide: 'Slides: down only, and painting one smooths it.', keep: 'Keep off: decoration nobody climbs on.',
+    wipe: 'Rub off painted walls, slides and keep-off.' }[mode], X, 524, 22, '#7f8896', 'left', 500);
+  if (ST.tool === 'use') txt('[ ] or right stick: brush size', X + FW, 524, 22, '#7f8896', 'right', 500);
+  slider(X, 562, FW, 'Climber size', (Math.log(CLM.size) - Math.log(4)) / (Math.log(60) - Math.log(4)), `${CLM.size.toFixed(CLM.size < 10 ? 1 : 0)} mm tall`, (u) => { CLM.size = +(Math.exp(Math.log(4) + u * (Math.log(60) - Math.log(4)))).toFixed(1); lookU.uHold.value = Math.max(1.6, CLM.size * 0.17); }, 'Everyone together; each varies a little');
+  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 690, FW, 3);
   const c = CLM.list[CLM.sel];
   if (c) {
-    ui.fillStyle = '#' + c.col.getHexString(); ui.beginPath(); ui.arc(X + 26, 670, 24, 0, Math.PI * 2); ui.fill();
+    ui.fillStyle = '#' + c.col.getHexString(); ui.beginPath(); ui.arc(X + 26, 730, 24, 0, Math.PI * 2); ui.fill();
     const kind = c.pref < 20 ? 'runner' : c.pref < 60 ? 'scrambler' : c.pref < 105 ? 'climber' : 'roof hanger', adj = climberTrait(c);
-    txt(`This one is ${/^[aeiou]/.test(adj) ? 'an' : 'a'} ${adj} ${kind}`, X + 66, 680, 30, '#e9ecf1', 'left', 700);
-    txt(climberDoing(c), X + 66, 716, 24, '#7f8896', 'left', 500);
-    confirmButton(X + 712, 640, 240, 60, 'clrone', 'Remove it', () => removeClimber(CLM.sel), { fs: 26 });
-    slider(X, 756, FW, 'Slope it likes', c.pref / 150, `${Math.round(c.pref)}°`, (u) => { c.pref = Math.round(u * 150); c.rethink = 0; }, '0° runs on flat tops · 45° scrambles · 90° climbs walls · 130° hangs under roofs');
-  } else txt('Grab or click a climber to set the slope it likes.', X, 680, 26, '#7f8896', 'left', 500);
-  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 886, FW, 3);
+    txt(`This one is ${/^[aeiou]/.test(adj) ? 'an' : 'a'} ${adj} ${kind}`, X + 66, 740, 30, '#e9ecf1', 'left', 700);
+    txt(climberDoing(c), X + 66, 774, 24, '#7f8896', 'left', 500);
+    confirmButton(X + 712, 700, 240, 60, 'clrone', 'Remove it', () => removeClimber(CLM.sel), { fs: 26 });
+    slider(X, 810, FW, 'Slope it likes', c.pref / 150, `${Math.round(c.pref)}°`, (u) => { c.pref = Math.round(u * 150); c.rethink = 0; }, '0° runs on flat tops · 45° scrambles · 90° climbs walls · 130° hangs under roofs');
+  } else txt('Grab or click a climber to set the slope it likes.', X, 740, 26, '#7f8896', 'left', 500);
+  ui.fillStyle = '#2b2e36'; ui.fillRect(X, 936, FW, 3);
   if (XRS.inSession) {
-    button(X, 908, PL.on ? FW - 300 : FW, 96, PL.on ? 'Back to full size' : 'Climb it yourself', { on: !PL.on, accent: CLIMBC, fs: 32, click: () => { if (PL.on) climbEnd(); else climbStart(); } });
-    if (PL.on) button(X + FW - 284, 908, 284, 96, PL.tunnel ? 'Tunnel vision' : 'No tunnel', { on: PL.tunnel, accent: CLIMBC, fs: 28, click: () => { PL.tunnel = !PL.tunnel; } });
-    txt(PL.on ? 'B also brings you back · X shows or hides this panel · tunnel vision dims the edges while you move' : 'Become climber-sized. Grip clay to pull yourself up, let go mid-swing to fling;', X, 1040, 24, '#7f8896', 'left', 500);
-    if (!PL.on) txt('left stick walks up to 45°, A jumps, right stick turns, B comes back.', X, 1072, 24, '#7f8896', 'left', 500);
-  } else txt('Climb it yourself: in the headset, become climber-sized and climb your sculpture.', X, 930, 24, '#7f8896', 'left', 500);
+    button(X, 956, PL.on ? FW - 300 : FW, 90, PL.on ? 'Back to full size' : 'Climb it yourself', { on: !PL.on, accent: CLIMBC, fs: 32, click: () => { if (PL.on) climbEnd(); else climbStart(); } });
+    if (PL.on) button(X + FW - 284, 956, 284, 90, PL.tunnel ? 'Tunnel vision' : 'No tunnel', { on: PL.tunnel, accent: CLIMBC, fs: 28, click: () => { PL.tunnel = !PL.tunnel; } });
+    txt(PL.on ? 'B also brings you back · X shows or hides this panel · tunnel vision dims the edges while you move' : 'Become climber-sized. Grip clay to pull yourself up, let go mid-swing to fling;', X, 1080, 24, '#7f8896', 'left', 500);
+    if (!PL.on) txt('left stick walks up to 45°, A jumps, right stick turns, B comes back.', X, 1110, 24, '#7f8896', 'left', 500);
+  } else txt('Climb it yourself: in the headset, become climber-sized and climb your sculpture.', X, 980, 24, '#7f8896', 'left', 500);
 }
 const climbersState = () => ({ size: CLM.size, list: CLM.list.map(c => [+c.p.x.toFixed(1), +c.p.y.toFixed(1), +c.p.z.toFixed(1), c.pref, +c.hue.toFixed(3), +c.s.toFixed(2), +c.girth.toFixed(2), +c.pace.toFixed(2), +c.grit.toFixed(2), +c.curious.toFixed(2), +c.social.toFixed(2), +c.bold.toFixed(2)]) });
 function loadClimbers(st) {
@@ -4367,7 +4453,7 @@ function stlBinary(meshes) {
   }
   return new Uint8Array(buf);
 }
-function model3mf(objs) {
+function model3mf(objs, asParts) {
   const out = ['<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n<resources>\n<basematerials id="1">'];
   const esc = (s) => String(s).replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' })[c]);
   objs.forEach(o => out.push(`<base name="${esc(o.name)}" displaycolor="${o.color.toUpperCase()}FF"/>`));
@@ -4379,6 +4465,11 @@ function model3mf(objs) {
     const ts = []; for (let t = 0; t < o.T.length; t += 3) ts.push(`<triangle v1="${o.T[t]}" v2="${o.T[t + 1]}" v3="${o.T[t + 2]}"/>`);
     out.push(ts.join('')); out.push('</triangles></mesh></object>');
   });
+  if (asParts) {   // one object built from all the parts, so a slicer loads it as a single piece with several parts
+    const id = objs.length + 2; out.push(`<object id="${id}" type="model" name="overhang-garden"><components>${objs.map((o, i) => `<component objectid="${i + 2}"/>`).join('')}</components></object>`);
+    out.push('</resources>\n<build>'); out.push(`<item objectid="${id}"/>`); out.push('</build>\n</model>');
+    return out.join('\n');
+  }
   out.push('</resources>\n<build>'); objs.forEach((o, i) => out.push(`<item objectid="${i + 2}"/>`)); out.push('</build>\n</model>');
   return out.join('\n');
 }
@@ -4406,6 +4497,21 @@ function makeZip(files) {
 function unionTris(src) {
   const U = new Map();
   for (const L of src) for (const [k, ch] of L.chunks) { const u = U.get(k); if (!u) U.set(k, ch.slice()); else for (let i = 0; i < 4096; i++) if (ch[i] > u[i]) u[i] = ch[i]; }
+  return trisFromU(U);
+}
+// each bit of clay goes to what it's for (painted use, else its layer's use), and each use is meshed as its own closed solid
+function useSplit(src) {
+  const parts = [new Map(), new Map(), new Map(), new Map()], keys = new Set();
+  for (const L of src) for (const k of L.chunks.keys()) keys.add(k);
+  for (const k of keys) {
+    const owner = new Float32Array(4096), cls = new Uint8Array(4096);
+    for (const L of src) { const ch = L.chunks.get(k); if (!ch) continue; const pc = L.paint.get(k);
+      for (let i = 0; i < 4096; i++) if (ch[i] > owner[i]) { owner[i] = ch[i]; cls[i] = (pc ? pc[i] >> 4 : 0) || (L.useAll | 0); } }
+    for (let i = 0; i < 4096; i++) if (owner[i] > 0) { const c = cls[i] & 3; let a = parts[c].get(k); if (!a) parts[c].set(k, a = new Float32Array(4096)); a[i] = owner[i]; }
+  }
+  return parts.map(U => trisFromU(U));
+}
+function trisFromU(U) {
   const keys = new Set();
   for (const k of U.keys()) {
     const cx = k % NC, cy = ((k / NC) | 0) % NC, cz = (k / (NC * NC)) | 0;
@@ -4437,13 +4543,27 @@ async function exportZip() {
   const objs = vis.filter(l => l.meshes.size).map(L => ({ name: L.name, color: PALETTE[L.colorIdx], ...layerTris(L) }))
     .concat(vis.filter(l => l.bridge).map(L => ({ name: L.name, color: PALETTE[L.colorIdx], ...beamTris(L) })));
   const files = [{ name: 'overhang-garden.stl', data: stlBinary([fused, ...beamSets]) }];
+  const useSrc = vis.filter(l => !l.bridge), hasUses = useSrc.some(L => L.useAll || [...L.paint.values()].some(pc => pc.some(v => v >> 4)));
+  let usesNote = '';
+  if (LOOK.splitUse && hasUses) {
+    const NAMES = ['everything-else', 'climbing-wall', 'slide', 'keep-off'], COLS = ['#f2efe8', '#6b7a8f', '#ffc400', '#c7ccd6'];
+    const parts = useSplit(useSrc).map((t, i) => ({ name: NAMES[i], color: COLS[i], ...t })).filter(o => o.T.length);
+    for (const o of parts) files.push({ name: `overhang-garden-${o.name}.stl`, data: stlBinary([o]) });
+    const mu = makeZip([
+      { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>' },
+      { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>' },
+      { name: '3D/3dmodel.model', data: model3mf(parts.concat(beamSets.map((b, i) => ({ name: 'bridge-' + (i + 1), color: '#ffffff', ...b }))), true) },
+    ]);
+    files.push({ name: 'overhang-garden-uses.3mf', data: new Uint8Array(await mu.arrayBuffer()) });
+    usesNote = '\noverhang-garden-uses.3mf - one object made of parts that fit together: slide, climbing wall, keep-off and everything else, each its own solid, so you can give slides and climbing walls their own filament.\noverhang-garden-<use>.stl - the same parts as separate STLs (load them together as one object with several parts).\n';
+  }
   const m3 = makeZip([
     { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>' },
     { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>' },
     { name: '3D/3dmodel.model', data: model3mf(objs) },
   ]);
   files.push({ name: 'overhang-garden-layers.3mf', data: new Uint8Array(await m3.arrayBuffer()) });
-  files.push({ name: 'README.txt', data: 'Overhang Garden export\n\noverhang-garden.stl - everything visible (your sculpt + its built-in supports) fused into one solid. Z up, origin at the front-left bed corner. Print this one.\noverhang-garden-layers.3mf - each layer as its own object, so you can give layers different filaments in Bambu Studio.\n\nThe supports are part of the piece, so turn slicer supports off.\n' });
+  files.push({ name: 'README.txt', data: 'Overhang Garden export\n\noverhang-garden.stl - everything visible (your sculpt + its built-in supports) fused into one solid. Z up, origin at the front-left bed corner. Print this one.\noverhang-garden-layers.3mf - each layer as its own object, so you can give layers different filaments in Bambu Studio.\n' + usesNote + '\nThe supports are part of the piece, so turn slicer supports off.\n' });
   const zip = makeZip(files);
   window.__lastZip = zip;
   if (cloud.dl) {
@@ -4524,7 +4644,7 @@ renderer.setAnimationLoop(() => {
   netTick(now);
   beTick(now);
   if (UIS.tab === 'climbers' && ST.tool !== 'climb' && ST.tool !== 'use') { if (CLM.held >= 0) dropHeld(); UIS.tab = 'brush'; UIS.dirty = true; }
-  USE_ON = layers.some(L => L.paint.size);
+  USE_ON = layers.some(L => L.paint.size || L.useAll);
   processAO(stroke.active ? 2 : 5);
   sndSculptTick(dt);
   climbersTick(dt);
@@ -4533,7 +4653,7 @@ renderer.setAnimationLoop(() => {
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { setClimbMode, bakeSupportsInto, stampUse, useAt, SND, sndClimber, eraseClimber, clayLayers, LOOK, lookU, applySky, aoMarkAll, processAO, aoQ, sky, onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { setLayerUse, useSplit, buildNoLand, noLand, allWall, setClimbMode, bakeSupportsInto, stampUse, useAt, SND, sndClimber, eraseClimber, clayLayers, LOOK, lookU, applySky, aoMarkAll, processAO, aoQ, sky, onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
