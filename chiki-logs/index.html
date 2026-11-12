@@ -1324,7 +1324,7 @@ function init3D(){
   new ResizeObserver(resize3D).observe(stage);resize3D();
   applyTheme3D();
   renderer.xr.enabled=true;
-  renderer.setAnimationLoop(function(t){if(renderer.xr.isPresenting){if(window.ChikiXR) ChikiXR.frame(t);try{renderer.render(scene,camera)}catch(e){if(window.ChikiXR) ChikiXR.err(e)}return}if(!['design','make','edit','structure','assembly','climb','cost'].includes(current)) return;asmTick(performance.now());climbTick(performance.now());wiggleTick(performance.now());orbit.update();fogFollow();renderer.render(scene,camera);updateLabels()});
+  renderer.setAnimationLoop(function(t){if(renderer.xr.isPresenting){if(window.ChikiXR){ChikiXR.frame(t);ChikiXR.cam()}else renderer.xr.updateCamera(camera);try{renderer.render(scene,camera)}catch(e){if(window.ChikiXR) ChikiXR.err(e)}return}if(!['design','make','edit','structure','assembly','climb','cost'].includes(current)) return;asmTick(performance.now());climbTick(performance.now());wiggleTick(performance.now());orbit.update();fogFollow();renderer.render(scene,camera);updateLabels()});
 }
 function resize3D(){if(!renderer) return;const s=$('#stage');stageW=s.clientWidth||1;stageH=s.clientHeight||1;
   renderer.setSize(stageW,stageH);camera.aspect=stageW/stageH;camera.updateProjectionMatrix()}
@@ -3005,7 +3005,7 @@ function say(t){note.textContent=t;note.hidden=!t}
 function err(e){const m=(e&&e.message)||String(e),w=((e&&e.stack)||'').split('\n').find(l=>/index\.html|three/.test(l))||'';
   const t=m+(w?' @ '+w.trim().replace(/^at /,'').replace(/https?:\/\/[^ )]*\//,'').slice(0,60):'');
   if(X.err!==t){X.err=t;console.error('[headset]',e);X.panelKey=''}}
-window.ChikiXR={frame(t){try{xrFrame(t)}catch(e){err(e)}},err,state:X,press:id=>press(id),probes:()=>PR,isAR:()=>!!X.session&&X.kind==='immersive-ar',reEnv:()=>reEnv()};
+window.ChikiXR={frame(t){try{xrFrame(t)}catch(e){err(e)}},err,cam:()=>camUpdate(),state:X,press:id=>press(id),probes:()=>PR,isAR:()=>!!X.session&&X.kind==='immersive-ar',reEnv:()=>reEnv()};
 window.addEventListener('error',e=>{if(X.session) err(e.error||e.message)});
 
 const rig=new THREE.Group();rig.name='xr-rig';scene.add(rig);
@@ -3279,7 +3279,7 @@ async function begin(s,kind){
   captureEnv();if(kind==='immersive-ar'){scene.background=null;scene.fog=null;renderer.setClearColor(0x000000,0);if(envGroup) envGroup.visible=false;ground.visible=false;if(polar) polar.visible=false}
   if(X.full) placeFull();else placeModel();X.full=!X.full;syncScale();
   renderer.xr.setReferenceSpaceType('local-floor');
-  await renderer.xr.setSession(s);
+  renderer.xr.cameraAutoUpdate=false;await renderer.xr.setSession(s);
   try{if(s.renderState.baseLayer&&'fixedFoveation' in s.renderState.baseLayer) s.renderState.baseLayer.fixedFoveation=1}catch(e){}
   panel.position.set(0,1.25,-0.45);X.panelKey='';X.helpKey='';drawPanel()}
 function onEnd(){
@@ -3560,6 +3560,34 @@ function dockPanel(lc){const host=lc&&!lc.isHand&&lc.grip?lc.grip:rig;if(panel.p
   if(host!==rig){panel.rotation.set(MENU_TILT,0,0);panel.position.set(0,0.03+MENU_H/2*Math.cos(MENU_TILT),-0.02+MENU_H/2*Math.sin(MENU_TILT))}
   else{panel.rotation.set(0,0,0);if(!lc) panel.position.set(0,1.25,-0.45)}}
 
+/* three r147 works out the headset's culling frustum with the eye distance in world units while the
+   rig is scaled, which culls everything near your eyes (controllers, the hand menu) and more as you zoom out.
+   We update the headset camera ourselves and redo that step with the eye distance in view units. */
+const _pL=new THREE.Vector3(),_pR=new THREE.Vector3(),_sc=new THREE.Vector3();
+function fixUnion(){const cv=renderer.xr.getCamera(),cs=cv.cameras;if(!cs||cs.length!==2) return;const L=cs[0],R=cs[1];
+  _pL.setFromMatrixPosition(L.matrixWorld);_pR.setFromMatrixPosition(R.matrixWorld);const k=_sc.setFromMatrixScale(L.matrixWorld).x||1;
+  const ipd=_pL.distanceTo(_pR)/k,pl=L.projectionMatrix.elements,pr=R.projectionMatrix.elements;
+  const near=pl[14]/(pl[10]-1),far=pl[14]/(pl[10]+1),topFov=(pl[9]+1)/pl[5],bottomFov=(pl[9]-1)/pl[5],leftFov=(pl[8]-1)/pl[0],rightFov=(pr[8]+1)/pr[0];
+  const left=near*leftFov,right=near*rightFov,zOffset=ipd/(-leftFov+rightFov),xOffset=zOffset*-leftFov;
+  L.matrixWorld.decompose(cv.position,cv.quaternion,cv.scale);cv.translateX(xOffset*k);cv.translateZ(zOffset*k);
+  cv.matrixWorld.compose(cv.position,cv.quaternion,cv.scale);cv.matrixWorldInverse.copy(cv.matrixWorld).invert();
+  const near2=near+zOffset,far2=far+zOffset;
+  cv.projectionMatrix.makePerspective(left-xOffset,right+(ipd-xOffset),topFov*far/far2*near2,bottomFov*far/far2*near2,near2,far2);
+  if(cv.projectionMatrixInverse) cv.projectionMatrixInverse.copy(cv.projectionMatrix).invert()}
+function camUpdate(){try{renderer.xr.updateCamera(camera);fixUnion()}catch(e){err(e)}}
+
+/* the scale, shown between your hands while you resize (both grips, or the left stick) */
+const RW=320,RH=120,rdC=document.createElement('canvas');rdC.width=RW;rdC.height=RH;const rdTex=new THREE.CanvasTexture(rdC);
+const scaleRead=new THREE.Mesh(new THREE.PlaneGeometry(0.11,0.11*RH/RW),new THREE.MeshBasicMaterial({map:rdTex,transparent:true,depthTest:false}));
+scaleRead.renderOrder=45;scaleRead.visible=false;rig.add(scaleRead);let rdKey='';
+function updateScaleRead(){const on=X.scaleT&&performance.now()-X.scaleT<1200;scaleRead.visible=!!on;if(!on) return;
+  const k=X.full?'1:1':'1:'+ratio();if(k!==rdKey){rdKey=k;const g=rdC.getContext('2d');g.clearRect(0,0,RW,RH);rr(g,4,4,RW-8,RH-8,52);g.fillStyle=X.full?C.btn:C.yellow;g.fill();
+    g.textAlign='center';g.textBaseline='middle';g.fillStyle=X.full?C.ink:C.dark;g.font=`64px ${FD}`;g.fillText(k,RW/2,RH/2+3);rdTex.needsUpdate=true}
+  const a=ctrls[0].src?ctrls[0].grip.position:null,b=ctrls[1].src?ctrls[1].grip.position:null;
+  if(a&&b) scaleRead.position.copy(a).add(b).multiplyScalar(0.5).add(tmpV.set(0,0.05,0));
+  else scaleRead.position.copy(camera.position).add(tmpV.set(0,-0.25,-0.45).applyQuaternion(camera.quaternion));
+  scaleRead.lookAt(camera.getWorldPosition(tmpV2))}
+
 /* ---- every headset frame ---- */
 function xrFrame(t){
   const dt=Math.min(0.05,X.lt?(t-X.lt)/1000:0.016);X.lt=t;X.frames++;
@@ -3622,7 +3650,7 @@ function xrFrame(t){
     // sticks
     if(isLeft(st)){
       if(X.full&&!grabbing){if(ay<-0.6){st.aim=true;aimArc(st)}else if(st.aim&&ay>-0.3){st.aim=false;endAim();if(arcHit) teleport(arcHit)}}
-      else if(!X.full&&!grabbing&&(ax||ay)){let f=Math.exp(ay*dt*1.6);const sn=rig.scale.x*f;if(sn<IN*0.25||(f>1&&sn>zoomMax())) f=1;about(modelPivot(),f,ax*dt*1.8);syncScale();X.panelKey=''}
+      else if(!X.full&&!grabbing&&(ax||ay)){let f=Math.exp(ay*dt*1.6);const sn=rig.scale.x*f;if(sn<IN*0.25||(f>1&&sn>zoomMax())) f=1;about(modelPivot(),f,ax*dt*1.8);syncScale();X.panelKey='';if(ay) X.scaleT=performance.now()}
     }else if(!grabbing){
       if(Math.abs(ax)>0.7&&!st.turned){st.turned=true;const h=camera.position;about(new THREE.Vector3(h.x,0,h.z),1,-Math.sign(ax)*Math.PI/6)}
       else if(Math.abs(ax)<0.3) st.turned=false}
@@ -3631,7 +3659,7 @@ function xrFrame(t){
   if(X.grab) moveGrab(dt);
   moveProbe();testProbes();
   if(X.frames%15===0) updateFog();
-  updateScaleTag();
+  updateScaleTag();updateScaleRead();
   previews(lc);
   ctrls.forEach(st=>{st.body.visible=!st.isHand&&!hasModel(st);st.chips.update();pointHint(st);handTip(st,dt)});faceAll();
   if(hud.visible) drawHud(ctrls.some(st=>st.btnHover==='ground'));
@@ -3655,7 +3683,7 @@ function worldDrag(gs){
     const m0=q1.clone().add(q2).multiplyScalar(0.5),m=p1.clone().add(p2).multiplyScalar(0.5);
     const v0=q2.clone().sub(q1),v=p2.clone().sub(p1),a0=Math.atan2(v0.x,v0.z),a=Math.atan2(v.x,v.z);
     let f=v0.length()/Math.max(1e-3,v.length());
-    const sNew=M0.getMaxScaleOnAxis()*f;if(sNew<IN*0.25||(f>1&&sNew>zoomMax())) f=1;
+    const sNew=M0.getMaxScaleOnAxis()*f;if(sNew<IN*0.25||(f>1&&sNew>zoomMax())) f=1;X.scaleT=performance.now();
     const K=T(m0.x,m0.y,m0.z).multiply(new THREE.Matrix4().makeRotationY(a0-a)).multiply(new THREE.Matrix4().makeScale(f,f,f)).multiply(T(-m.x,-m.y,-m.z));
     setRig(M0.clone().multiply(K));X.panelKey=''}
   syncScale()}
