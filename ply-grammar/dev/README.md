@@ -15,6 +15,7 @@
 ## Tests (Node, need `npm i three@0.160.0 clipper-lib@6.4.2` beside them)
 
     python3 mkh.py fz.js && node h.mjs 400     # torture test: 400 random obstacles through panelizing, overlap, build-order and fit checks
+    python3 mkh.py fzs.js && FORCE=1 node h.mjs 150   # same test with the two biggest parts of every shape split in two keyed pieces
     python3 mkh.py test9.js && node h.mjs      # the original boxes
     python3 mkh.py cv.js && node h.mjs         # cut-outs: step, tunnel, sloped corner, 110" box
     python3 mkh.py dn.js && node h.mjs         # holes through the middle
