@@ -15,6 +15,22 @@ function gen(seed){const R=rng(seed*7919+13),ri=(a,b)=>Math.round(a+R()*(b-a)),p
     const cp=[0,1,2].map(k=>k===thru?0:Math.round((R()-.5)*(s[k]-cs[k]*.2)));const o=carve(b,cp,cs);
     if(process.env.ROT){const R2=rng(seed*104729+i*31+7),m=R2();if(EV)o.rotation.set(m<.3?(R2()-.5)*.3:0,(R2()-.5)*1.2,0);else o.rotation.set(m<.35?(R2()-.5)*.5:0,(R2()-.5)*1.6,m>.8?(R2()-.5)*.4:0);o.updateMatrixWorld(true)}}
   b.name='A';return {b,desc:`box ${s.join('x')} cuts ${cuts.map(c=>c.n.map(x=>x.toFixed(2)).join(',')+'@'+c.p.map(x=>x.toFixed(0)).join(',')).join(' | ')} carves ${b.carves.map(c=>c.userData.sizer.scale.toArray().join('x')+'@'+c.position.toArray().join(',')).join(' | ')}`}}
+/* surface coverage: walk a grid over every outside face, half a ply under the surface; each point must be inside some part.
+   Returns the bare spots per face, largest first. */
+function coverage(b,r,step=.5,depth=.06){const t=thkModel(),ps=r.panels.filter(p=>p.part?.length),parts=ps.map((p,i)=>asmPart(p,i)),out=[];
+  const faces=b.brep?b.brep.faces.filter(f=>!f.skip).map(f=>({name:'A'+f.num,n:f.n,O:f.O,u:f.u,v:f.v,cts:f.cts})):solidFaces(blockPlanes(b)).map((f,i)=>{const n=f.pl.n,O=f.poly[0],u=f.poly[1].clone().sub(O).normalize(),v=new V().crossVectors(n,u);return {name:'f'+i+':'+f.pl.id,n,O,u,v,cts:[f.poly.map(p=>{const q=p.clone().sub(O);return [q.dot(u),q.dot(v)]})]}});
+  for(const f of faces){let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;f.cts[0].forEach(([x,y])=>{x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x);y1=Math.max(y1,y)});const bare=[];
+    for(let x=x0+.2;x<x1;x+=step)for(let y=y0+.2;y<y1;y+=step){if(!pip2(f.cts,x,y))continue;const X0=f.O.clone().addScaledVector(f.u,x).addScaledVector(f.v,y);
+      /* a see-through hole: no wood anywhere through the skin at this spot */
+      if([.06,.25,.45,.68].every(h=>{const X=X0.clone().addScaledVector(f.n,-h*t/.75);return !parts.some(P=>inPart(P,X.x,X.y,X.z))}))bare.push([x,y])}
+    /* group touching bare points */
+    const seen=new Set(),key=(x,y)=>Math.round(x/step)+','+Math.round(y/step),S_=new Map(bare.map(p=>[key(...p),p]));
+    for(const p of bare){const k0=key(...p);if(seen.has(k0))continue;const q=[p],grp=[];seen.add(k0);while(q.length){const c=q.pop();grp.push(c);for(const [dx,dy] of [[step,0],[-step,0],[0,step],[0,-step]]){const k=key(c[0]+dx,c[1]+dy);if(S_.has(k)&&!seen.has(k)){seen.add(k);q.push(S_.get(k))}}}
+      let a=1e9,b_=1e9,c=-1e9,d=-1e9;grp.forEach(([x,y])=>{a=Math.min(a,x);b_=Math.min(b_,y);c=Math.max(c,x);d=Math.max(d,y)});
+      const sq=grp.some(([x,y])=>S_.has(key(x+step,y))&&S_.has(key(x,y+step))&&S_.has(key(x+step,y+step)));
+      out.push({face:f.name,sq,area:grp.length*step*step,w:c-a+step,h:d-b_+step,at:[+((a+c)/2).toFixed(1),+((b_+d)/2).toFixed(1)],ext:[+(x1-x0).toFixed(1),+(y1-y0).toFixed(1)]})}}
+  return out.sort((p,q)=>q.area-p.area)}
+
 function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,desc}=gen(seed),out={seed,desc,issues:[]},I=(k,m)=>out.issues.push([k,m]),name0='A';
   if(process.env.FORCE){try{const r0=panelizeBlock(b),ar=p=>p.part.reduce((x,c)=>x+areaF(c),0),big=r0.panels.filter(p=>p.part?.length&&p.kind!=='cleat'&&!p.splice).sort((x,y)=>ar(y)-ar(x)).slice(0,2);b.forceSplit={};big.forEach(p=>b.forceSplit[p.label]=2);out.forced=big.map(p=>p.label)}catch(e){}}
   let r;try{r=panelizeBlock(b)}catch(e){I('crash',e.message+' @ '+(e.stack.split('\n')[1]||'').trim().slice(0,90));return out}
@@ -30,6 +46,8 @@ function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,
         for(const [x,y] of out2){const X=x*cs+y*sn,Y=-x*sn+y*cs;x0=Math.min(x0,X);x1=Math.max(x1,X);y0=Math.min(y0,Y);y1=Math.max(y1,Y)}const w=x1-x0,h=y1-y0;if((w<=Wu&&h<=Hu)||(w<=Hu&&h<=Wu))ok=true}
       if(!ok)I('oversize',p.label)}}
   if(b.brep&&b.freeEdges)I('open-shell',b.freeEdges+' free edges');
+  /* no see-through hole an inch square or more anywhere on the outside */
+  {const hs=coverage(b,r).filter(x=>x.sq);if(hs.length)I('hole',hs.length+' biggest '+hs[0].face+' '+hs[0].area.toFixed(1)+'sq in')}
   /* every outside corner filled: walk each shell edge half a ply under both faces; that stick of wood must belong to some part.
      And no two neighbors may lie in one plane: that is one plate wrongly cut in two. */
   if(b.brep){const t=thkModel(),parts=ps.map((p,i)=>asmPart(p,i)),F=b.brep.faces.slice().sort((x,y)=>x.i-y.i);

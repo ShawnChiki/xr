@@ -20,7 +20,8 @@
     ROT=1 node h.mjs 400                       # wild: several turned and tipped cut-outs at once
 
 The torture test also checks that every outside corner is filled (no socket without its finger) and that no plate is cut in two along a flat face.
-With those checks: plain boxes and boxes with cuts 100% clean, straight cut-outs 95%, everyday turned cut-outs 72% (linings that cannot slide past ribs, and thin sharp triangle faces, are the open problems).
+It also walks a grid over every outside face and reports any see-through hole an inch square or more.
+With those checks: plain boxes 100% clean, boxes with cuts 99%, straight cut-outs 95%, everyday turned cut-outs 76% (linings that cannot slide past ribs, and thin sharp triangle faces, are the open problems).
     python3 mkh.py test9.js && node h.mjs      # the original boxes
     python3 mkh.py cv.js && node h.mjs         # cut-outs: step, tunnel, sloped corner, 110" box
     python3 mkh.py dn.js && node h.mjs         # holes through the middle
