@@ -32,6 +32,7 @@ function coverage(b,r,step=.5,depth=.06){const t=thkModel(),ps=r.panels.filter(p
   return out.sort((p,q)=>q.area-p.area)}
 
 function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,desc}=gen(seed),out={seed,desc,issues:[]},I=(k,m)=>out.issues.push([k,m]),name0='A';
+  if(process.env.KEY)S.keyShape=process.env.KEY;
   if(process.env.FORCE){try{const r0=panelizeBlock(b),ar=p=>p.part.reduce((x,c)=>x+areaF(c),0),big=r0.panels.filter(p=>p.part?.length&&p.kind!=='cleat'&&!p.splice).sort((x,y)=>ar(y)-ar(x)).slice(0,2);b.forceSplit={};big.forEach(p=>b.forceSplit[p.label]=2);out.forced=big.map(p=>p.label)}catch(e){}}
   let r;try{r=panelizeBlock(b)}catch(e){I('crash',e.message+' @ '+(e.stack.split('\n')[1]||'').trim().slice(0,90));return out}
   const ps=r.panels.filter(p=>p.part?.length);
