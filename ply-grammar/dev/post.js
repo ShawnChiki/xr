@@ -1496,11 +1496,49 @@ function pushTo(d,dl){if(snap)dl=Math.round(dl);if(Math.abs(dl)>0)d.moved=true;
   updateMass(b);syncSizeInputs();
   const f=b.faces.find(x=>x.pl.id===d.id)||b.faces.find(x=>x.pl.src&&x.pl.src.type===d.f.pl.src.type&&x.pl.src.i===d.f.pl.src.i&&(x.pl.src.carve||x.pl.src.cut)===(d.cv||d.cut));showFace(f);
   return msg}
-renderer.domElement.addEventListener('pointerdown',e=>{if(e.button!==0||mode!=='push')return;const h=faceUnder(e);if(!h)return;
+/* ---------------- grab what you point at: a face, an edge or a corner ----------------
+   No mode to pick. Near the middle of a face you push or pull that face. Near one of its edges you move the edge, which
+   moves both faces that meet there. Near a corner you move the corner and every face that meets at it. Each face simply
+   follows the drag by however far the drag goes along that face's own direction. Used by the mouse in Push and by the headset. */
+const hDot=new THREE.Mesh(new THREE.SphereGeometry(1,14,10),new THREE.MeshBasicMaterial({color:0xFFD23F,depthTest:false,transparent:true,opacity:.95}));hDot.renderOrder=12;hDot.visible=false;world.add(hDot);
+const hEdge=new THREE.Mesh(new THREE.CylinderGeometry(1,1,1,10),new THREE.MeshBasicMaterial({color:0xFFD23F,depthTest:false,transparent:true,opacity:.95}));hEdge.renderOrder=12;hEdge.visible=false;world.add(hEdge);
+function pickHandle(h){if(!h)return null;const {b,f,P}=h,loops=f.cts3||[f.poly];let area=0;for(const tr of f.tris||[])area+=tr[1].clone().sub(tr[0]).cross(tr[2].clone().sub(tr[0])).length()/2;
+  const thr=Math.max(1.25,Math.min(4,.14*Math.sqrt(area||100)));let bv=null,be=null;
+  for(const lp of loops)for(let i=0;i<lp.length;i++){const A=lp[i],B=lp[(i+1)%lp.length],dv=A.distanceTo(P);if(!bv||dv<bv.d)bv={d:dv,V:A};
+    const AB=B.clone().sub(A),L2=AB.lengthSq();if(L2<1e-6)continue;const tt=Math.max(0,Math.min(1,P.clone().sub(A).dot(AB)/L2)),de=A.clone().addScaledVector(AB,tt).distanceTo(P);if(!be||de<be.d)be={d:de,A,B}}
+  const ok=g=>g.pl.src&&!g.pl.src.split,on=(g,X)=>Math.abs(g.pl.n.dot(X)-g.pl.d)<.03;
+  const touches=(g,X)=>(g.cts3||[g.poly]).some(lp=>lp.some((A,i)=>{const B=lp[(i+1)%lp.length],AB=B.clone().sub(A),L2=AB.lengthSq();if(L2<1e-6)return false;const tt=Math.max(0,Math.min(1,X.clone().sub(A).dot(AB)/L2));return A.clone().addScaledVector(AB,tt).distanceTo(X)<.06}));
+  if(!ok(f))return null;
+  if(bv&&bv.d<thr*.9){const fs=b.faces.filter(g=>ok(g)&&on(g,bv.V)&&touches(g,bv.V));if(fs.length>=3)return {b,type:'corner',faces:fs,P:bv.V.clone(),V:bv.V}}
+  if(be&&be.d<thr*.7){const M=be.A.clone().add(be.B).multiplyScalar(.5),g=b.faces.find(g=>g!==f&&ok(g)&&on(g,be.A)&&on(g,be.B)&&touches(g,M));if(g)return {b,type:'edge',faces:[f,g],P:P.clone(),A:be.A,B:be.B}}
+  return {b,type:'face',faces:[f],P:P.clone(),hit:h}}
+function showHandle(hd){hDot.visible=hEdge.visible=false;if(!hd){showFace(null);return}showFaces(hd.faces);const r=Math.max(.35,.012/Math.max(1e-6,world.scale.x)*(xrMode?1:0)||.5);
+  if(hd.type==='corner'){hDot.position.copy(hd.V);hDot.scale.setScalar(r*1.6);hDot.visible=true}
+  else if(hd.type==='edge'){const d=hd.B.clone().sub(hd.A),L=d.length();hEdge.position.copy(hd.A).addScaledVector(d,.5);hEdge.quaternion.setFromUnitVectors(new V(0,1,0),d.normalize());hEdge.scale.set(r*.7,L,r*.7);hEdge.visible=true}}
+function showFaces(fs){if(!fs||!fs.length){pushHi.visible=false;return}const pos=[];for(const f of fs){const o=f.pl.n.clone().multiplyScalar(.05);for(const tr of f.tris||[])for(const q of tr)pos.push(...q.clone().add(o).toArray())}
+  pushHi.geometry.dispose();pushHi.geometry=new THREE.BufferGeometry();pushHi.geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));pushHi.visible=true}
+const snapBlock=b=>({s:b.sizer.scale.clone(),p:b.pivot.position.clone(),cuts:b.cuts.map(c=>[c.position.clone(),c.quaternion.clone()]),carves:b.carves.map(c=>[c.position.clone(),c.quaternion.clone(),c.userData.sizer.scale.clone()])});
+function restoreBlock(b,z){b.sizer.scale.copy(z.s);b.pivot.position.copy(z.p);b.cuts.forEach((c,i)=>{if(z.cuts[i]){c.position.copy(z.cuts[i][0]);c.quaternion.copy(z.cuts[i][1])}});
+  b.carves.forEach((c,i)=>{if(z.carves[i]){c.position.copy(z.carves[i][0]);c.quaternion.copy(z.carves[i][1]);c.userData.sizer.scale.copy(z.carves[i][2])}})}
+const sameFace=(b,f)=>b.faces.find(x=>x.pl.id===f.pl.id)||b.faces.find(x=>x.pl.src&&f.pl.src&&x.pl.src.type===f.pl.src.type&&x.pl.src.i===f.pl.src.i&&(x.pl.src.carve||x.pl.src.cut)===(f.pl.src.carve||f.pl.src.cut));
+function startHandle(hd){if(!hd)return null;const b=hd.b;if(sel!==b)select(b);return {hd,b,snap:snapBlock(b),faces:hd.faces.slice(),moved:false}}
+/* delta: how far the grabbed point has been dragged, in the model's own inches */
+function dragHandle(g,delta){restoreBlock(g.b,g.snap);const msgs=[];
+  for(const f of g.faces){const d=startPush({b:g.b,f,id:f.pl.id,P:g.hd.P},0);if(!d)continue;const m=pushTo(d,delta.dot(f.pl.n));if(d.moved)g.moved=true;if(m)msgs.push(m)}
+  showFaces(g.faces.map(f=>sameFace(g.b,f)).filter(Boolean));hDot.visible=hEdge.visible=false;return msgs.join(' · ')}
+function endHandle(g){if(!g)return;showHandle(null);if(g.moved){renderModelPanel();schedule();save()}}
+/* mouse: drag in the plane that faces the camera through the grabbed point */
+function mouseDelta(e,P0){const r=renderer.domElement.getBoundingClientRect();mouse.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(mouse,camera);
+  const inv=new THREE.Matrix4().copy(world.matrixWorld).invert(),o=ray.ray.origin.clone().applyMatrix4(inv),d=ray.ray.direction.clone().transformDirection(inv),n=camera.getWorldDirection(new V()).transformDirection(inv);
+  const den=d.dot(n);if(Math.abs(den)<1e-6)return null;return o.addScaledVector(d,P0.clone().sub(o).dot(n)/den).sub(P0)}
+let hDrag=null;
+renderer.domElement.addEventListener('pointerdown',e=>{if(e.button!==0||mode!=='push')return;const h=faceUnder(e);if(!h)return;const hd=pickHandle(h);
+  if(hd&&hd.type!=='face'){const g=startHandle(hd);if(!g)return;orbit.enabled=false;hDrag=g;renderer.domElement.setPointerCapture(e.pointerId);return}
   const d=startPush(h,rayParam(e,h.P,h.f.pl.n));if(!d)return;orbit.enabled=false;pushDrag=d;
   if(sel!==h.b)select(h.b);renderer.domElement.setPointerCapture(e.pointerId)},{capture:true});
 renderer.domElement.addEventListener('pointermove',e=>{
-  if(!pushDrag){if(tc.dragging)return;const h=faceUnder(e);showFace(h&&h.f);renderer.domElement.style.cursor=h?(mode==='tilt'?'pointer':'grab'):'';return}
+  if(hDrag){const dl=mouseDelta(e,hDrag.hd.P);if(dl)$('#hint').textContent=dragHandle(hDrag,dl)||HINTS[view];renderer.domElement.style.cursor='grabbing';return}
+  if(!pushDrag){if(tc.dragging)return;const h=faceUnder(e);if(mode==='push')showHandle(pickHandle(h));else{hDot.visible=hEdge.visible=false;showFace(h&&h.f)}renderer.domElement.style.cursor=h?(mode==='tilt'?'pointer':'grab'):'';return}
   const d=pushDrag,t=rayParam(e,d.P,d.n);if(t==null||d.t0==null)return;
   $('#hint').textContent=pushTo(d,t-d.t0);renderer.domElement.style.cursor='grabbing'});
 /* tilt: click a face, then turn the rings to swing its plane about the face's middle.
@@ -1516,10 +1554,11 @@ function applyTilt(){const T_=tilt.target;if(!T_)return;const b=T_.b,{p:pp,q:pq}
   else if(T_.src.type==='carve'){const cv=T_.src.carve,dq=tiltH.quaternion.clone().multiply(T_.q0.clone().invert()),{p,q}=T_.cv0;
     const P=T_.c.clone().add(p.clone().sub(T_.c).applyQuaternion(dq));cv.position.copy(toLocal(P));cv.quaternion.copy(pqi.clone().multiply(dq.multiply(q)))}
   updateMass(b);schedule()}
-const endPush=e=>{if(!pushDrag)return;const d=pushDrag;pushDrag=null;orbit.enabled=true;renderer.domElement.style.cursor='';$('#hint').textContent=HINTS[view];
+const endPush=e=>{if(hDrag){const g=hDrag;hDrag=null;orbit.enabled=true;renderer.domElement.style.cursor='';$('#hint').textContent=HINTS[view];endHandle(g);if(g.moved)down=null;return}
+  if(!pushDrag)return;const d=pushDrag;pushDrag=null;orbit.enabled=true;renderer.domElement.style.cursor='';$('#hint').textContent=HINTS[view];
   if(d.moved){renderModelPanel();schedule();down=null}};
 renderer.domElement.addEventListener('pointerup',endPush,{capture:true});renderer.domElement.addEventListener('pointercancel',endPush);
-renderer.domElement.addEventListener('pointerleave',()=>{if(!pushDrag)showFace(null)});
+renderer.domElement.addEventListener('pointerleave',()=>{if(!pushDrag&&!hDrag)showHandle(null)});
 
 /* ---------------- model panel ---------------- */
 function renderModelPanel(){
@@ -2097,7 +2136,7 @@ $$('.tab').forEach(t=>t.onclick=()=>{const on=t.getAttribute('aria-selected')===
   $$('.sec').forEach(s=>s.hidden=s.dataset.sec!==t.dataset.tab);
   const tb=t.dataset.tab;if(tb==='sheets'){freshen();if(sheetsStale)updateSheetsPanel(true)}
   if(tb==='test')setView('test');else if(tb==='build')setView('build');else if(tb==='sheets'||tb==='machine')setView('sheets');else if((tb==='joints'||tb==='marks')&&view!=='panels')setView('panels');else if(tb==='model'&&(view==='sheets'||view==='test'||view==='build'))setView('mass');resize()});
-const HINTS={mass:'Push (P): drag a face to push or pull it. Tilt (T): click a face, then turn the rings to swing its plane. Planes (V) hides the cut planes. Move (W), Rotate (E), Size (R) use the gumball.',panels:'Click a part to hide or isolate it (H, I). Labels are cut in with the engraving bit. Screw rings: red clashes, orange moved to clear one, grey taken out.',sheets:'Drag to pan, scroll or pinch to zoom. Dashed orange is the bit path, green crosses are drill points.',build:'Back and Next step through the build. Click any part to jump to its step. Drag to orbit.',test:'Click the ground ring to pick where the hit comes from, then Hit. Click the top to land on it. Red tips, orange slides, green holds.'};
+const HINTS={mass:'Push (P): drag a face to push or pull it, an edge to move both its faces, a corner to move all three. Tilt (T): click a face, then turn the rings to swing its plane. Planes (V) hides the cut planes. Move (W), Rotate (E), Size (R) use the gumball.',panels:'Click a part to hide or isolate it (H, I). Labels are cut in with the engraving bit. Screw rings: red clashes, orange moved to clear one, grey taken out.',sheets:'Drag to pan, scroll or pinch to zoom. Dashed orange is the bit path, green crosses are drill points.',build:'Back and Next step through the build. Click any part to jump to its step. Drag to orbit.',test:'Click the ground ring to pick where the hit comes from, then Hit. Click the top to land on it. Red tips, orange slides, green holds.'};
 /* cut planes and cut-out boxes are editing handles: they show only in Massing, on the selected box, while Planes is on */
 function showPlanes(){const on=view==='mass'&&S.showPlanes!==false;blocks.forEach(x=>{x.cuts.forEach(c=>c.visible=on&&x===sel);x.carves.forEach(c=>c.visible=on&&x===sel)});
   const pb=$('#planesBtn');if(pb){pb.hidden=view!=='mass';pb.setAttribute('aria-pressed',S.showPlanes!==false)}}
@@ -2192,11 +2231,11 @@ const floorGrid=new THREE.GridHelper(3,12,0xF2A01F,0xF2A01F);floorGrid.material.
 function setFloor(h){XR.floorH=Math.round(Math.max(-.3,Math.min(1.8,h))*100)/100;try{localStorage.setItem('pgFloor',XR.floorH)}catch(e){}
   if(XR.base&&typeof XRRigidTransform!=='undefined')try{renderer.xr.setReferenceSpace(XR.base.getOffsetReferenceSpace(new XRRigidTransform({x:0,y:XR.floorH,z:0})))}catch(e){}drawMenu()}
 function floorStep(on){XR.step=on?'floor':null;floorGrid.visible=on;menu.visible=true;
-  if(!on)menuMsg=view==='mass'?'Trigger a face to push or pull it. Grip a box to move it.':'Panels view: grip a part to look closer.';drawMenu()}
+  if(!on)menuMsg=view==='mass'?'Point at a face, an edge or a corner and pull the trigger to drag it.':'Panels view: grip a part to look closer.';drawMenu()}
 /* the menu: one canvas on the left controller */
 const MW=1024,MH=1100;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
 const menu=new THREE.Mesh(new THREE.PlaneGeometry(.30*MW/MH,.30),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
-let menuMsg='Trigger a face to push or pull it. Grip a box to move it.';
+let menuMsg='Point at a face, an edge or a corner and pull the trigger to drag it.';
 const MX=menuCv.getContext('2d');
 function mText(s,x,y,size=34,col='#E9ECF1',al='left',wt=600){MX.fillStyle=col;MX.font=`${wt} ${size}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;MX.textAlign=al;MX.textBaseline='middle';MX.fillText(s,x,y)}
 function mWrap(s,x,y,w,size=30,col='#C9CED8',lh=40,max=4){MX.font=`500 ${size}px system-ui,sans-serif`;const words=String(s).split(' ');let line='',n=0;
@@ -2219,7 +2258,7 @@ function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.be
     B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor  (Y)',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=150;
     {const c=XR.price;B(48,y-26,MW-96,c?`≈ ${money(c.cost)}  ·  ${c.sheets} sheet${c.sheets===1?'':'s'}  ·  ${hours(c.mins)} cutting`:'Price: tap to work it out',{solid:!!c,col:'#15181D',fs:c?38:34,click:()=>{menuMsg='Working out the price…';drawMenu();setTimeout(()=>{freshen();updateSheetsPanel(true);menuMsg='Price updated.';drawMenu()},50)}});y+=124}
     MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,2)+18;
-    mWrap('Trigger a face: push or pull it. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly. X: hide this menu.',48,y,MW-96,26,'#8B93A1',36,4)}
+    mWrap('Trigger the middle of a face: push or pull it. Near an edge or a corner: drag that edge or corner. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly. X: hide this menu.',48,y,MW-96,26,'#8B93A1',36,4)}
   menuTex.needsUpdate=true}
 function placeMenu(){const g=leftC().userData.grip;if(menu.parent!==g){menu.parent?.remove(menu);g.add(menu)}menu.position.set(0,.08,-.13);menu.rotation.set(-.35-Math.PI/2,0,0);drawMenu()}
 function menuHit(c){if(!menu.visible||menu.parent===c.userData.grip)return null;ctrlRay(c);menu.updateWorldMatrix(true,false);const h=xray.intersectObject(menu,false)[0];if(!h)return null;
@@ -2234,9 +2273,13 @@ function menuDo(k){if(typeof k==='number')k=['box','cut','carve','del','undo','r
   drawMenu()}
 function xrTrigger(c){const mh=menuHit(c);if(mh){if(mh.i>=0){buzz(c,.25,15);XR.W[mh.i].click?.()}return}
   if(XR.step==='floor'){setFloor(XR.floorH+gripPos(c).y-.02);buzz(c,.5,60);return}
-  const h=xrFace(c);if(h){const d=startPush(h,xrParam(c,h.P,h.f.pl.n));if(d){c.userData.push=d;if(sel!==h.b)select(h.b);buzz(c,.2,15);return}}
+  /* what you point at decides what you grab: the middle of a face, an edge, or a corner */
+  const h=xrFace(c),hd=pickHandle(h);
+  if(hd&&hd.type!=='face'){const g=startHandle(hd);if(g){c.userData.hd={g,D0:h.dist,P0:h.P.clone()};buzz(c,.3,20);menuMsg=hd.type==='edge'?'Moving an edge: both faces follow.':'Moving a corner: all its faces follow.';drawMenu();return}}
+  if(h){const d=startPush(h,xrParam(c,h.P,h.f.pl.n));if(d){c.userData.push=d;if(sel!==h.b)select(h.b);buzz(c,.2,15);return}}
   grab(c)}
-function xrTriggerEnd(c){const d=c.userData.push;if(d){c.userData.push=null;showFace(null);if(d.moved){renderModelPanel();schedule();save()}return}release(c)}
+function xrTriggerEnd(c){if(c.userData.hd){const g=c.userData.hd.g;c.userData.hd=null;endHandle(g);drawMenu();return}
+  const d=c.userData.push;if(d){c.userData.push=null;showFace(null);if(d.moved){renderModelPanel();schedule();save()}return}release(c)}
 function grab(c){if(XR.step==='floor')return;ctrlRay(c);
   const targets=[];blocks.forEach(b=>{b.cuts.forEach(cu=>{if(cu.visible)targets.push(cu.userData.vis)});b.carves.forEach(cv=>{if(cv.visible)targets.push(cv.userData.vis)})});
   (view==='mass'?massGroup:panelGroup).traverse(o=>{if(o.isMesh&&!o.userData.isStencil)targets.push(o)});
@@ -2264,18 +2307,19 @@ function xrTick(){const now=performance.now(),dt=Math.min(.05,(now-(xrT0||now))/
   navTick(dt);let hov=-1;
   for(const c of ctrls){const U=c.userData;U.line.visible=!(menu.visible&&menu.parent===U.grip);U.dot.visible=false;U.line.scale.z=4;
     if(U.grab){updateMass(U.grab.b);schedule();continue}
+    if(U.hd){ctrlRay(c);const Q=world.worldToLocal(xray.ray.origin.clone().addScaledVector(xray.ray.direction,U.hd.D0)),m=dragHandle(U.hd.g,Q.sub(U.hd.P0));if(m&&m!==menuMsg){menuMsg=m;drawMenu()}continue}
     const d=U.push;if(d){const t=xrParam(c,d.P,d.n);if(t!=null&&d.t0!=null){const m=pushTo(d,t-d.t0);if(m&&m!==menuMsg){menuMsg=m;drawMenu()}}continue}
     if(!U.line.visible)continue;
     const mh=menuHit(c);if(mh){hov=mh.i;U.line.scale.z=mh.dist;U.dot.position.copy(mh.point);U.dot.visible=true;continue}
     if(XR.step==='floor')continue;
     const h=xrFace(c);if(h){U.line.scale.z=h.dist;U.dot.position.copy(h.W);U.dot.visible=true}}
-  if(!ctrls.some(c=>c.userData.push)){const c=R||ctrls[0],h=hov<0&&!XR.step?xrFace(c):null;showFace(h&&h.f)}
+  if(!ctrls.some(c=>c.userData.push||c.userData.hd)){const c=R||ctrls[0],h=hov<0&&!XR.step?xrFace(c):null;showHandle(pickHandle(h))}
   if(hov!==XR.hover){XR.hover=hov;drawMenu()}}
 function placeWorld(){setTimeout(updateSection,0);world.quaternion.identity();if(S.xrScale==='table'){world.scale.setScalar(.0254/12);world.position.set(0,.8,-.6)}else{world.scale.setScalar(.0254);world.position.set(0,0,-1.6)}}
 async function enterXR(kind){
   try{const sess=await navigator.xr.requestSession(kind==='ar'?'immersive-ar':'immersive-vr',{optionalFeatures:['local-floor','bounded-floor','hand-tracking']});
     xrMode=kind;tc.detach();if(view!=='mass'&&view!=='panels')setView('mass');placeWorld();applyTheme();menu.visible=true;placeMenu();
-    sess.addEventListener('end',()=>{ctrls.forEach(c=>{release(c);c.userData.nav=false;c.userData.push=null;c.userData.dot.visible=false});XR.base=null;XR.step=null;floorGrid.visible=false;menu.visible=false;showFace(null);xrMode=null;
+    sess.addEventListener('end',()=>{ctrls.forEach(c=>{release(c);c.userData.nav=false;c.userData.push=null;c.userData.hd=null;c.userData.dot.visible=false});XR.base=null;XR.step=null;floorGrid.visible=false;menu.visible=false;showFace(null);xrMode=null;
       world.scale.setScalar(1);world.position.set(0,0,0);world.quaternion.identity();applyTheme();updateSection();attachGizmo();resize()});
     await renderer.xr.setSession(sess);try{renderer.xr.setFoveation?.(1)}catch(e){}XR.base=renderer.xr.getReferenceSpace();setFloor(XR.floorH);floorStep(true);
   }catch(e){xrMode=null;toast('The headset session could not start')}}
