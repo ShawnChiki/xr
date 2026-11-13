@@ -15,7 +15,12 @@
 ## Tests (Node, need `npm i three@0.160.0 clipper-lib@6.4.2` beside them)
 
     python3 mkh.py fz.js && node h.mjs 400     # torture test: 400 random obstacles through panelizing, overlap, build-order and fit checks
-    python3 mkh.py fzs.js && FORCE=1 node h.mjs 150   # same test with the two biggest parts of every shape split in two keyed pieces
+    FORCE=1 node h.mjs 150                     # same shapes with the two biggest parts of each split in two keyed pieces
+    ROT=2 node h.mjs 200                       # everyday turned cut-outs: one cut-out, turned and sometimes tipped, on a simple box
+    ROT=1 node h.mjs 400                       # wild: several turned and tipped cut-outs at once
+
+The torture test also checks that every outside corner is filled (no socket without its finger) and that no plate is cut in two along a flat face.
+With those checks: plain boxes and boxes with cuts 100% clean, straight cut-outs 95%, everyday turned cut-outs 72% (linings that cannot slide past ribs, and thin sharp triangle faces, are the open problems).
     python3 mkh.py test9.js && node h.mjs      # the original boxes
     python3 mkh.py cv.js && node h.mjs         # cut-outs: step, tunnel, sloped corner, 110" box
     python3 mkh.py dn.js && node h.mjs         # holes through the middle

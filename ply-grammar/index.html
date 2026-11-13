@@ -746,6 +746,13 @@ function clipRun(subj,clip,type,fillS=ClipperLib.PolyFillType.pftNonZero,fillC=C
   if(subj.length)c.AddPaths(subj,ClipperLib.PolyType.ptSubject,true);if(clip.length)c.AddPaths(clip,ClipperLib.PolyType.ptClip,true);
   const tree=new ClipperLib.PolyTree();c.Execute(type,tree,fillS,fillC);return treeData(tree)}
 const posC=c=>areaF(c)<0?c.slice().reverse():c, negC=c=>areaF(c)>0?c.slice().reverse():c;
+function closeC(paths,e=.002){const run=(P,d)=>{const co=new ClipperLib.ClipperOffset(20,CS*.0005),out=new ClipperLib.Paths();co.AddPaths(P,ClipperLib.JoinType.jtMiter,ClipperLib.EndType.etClosedPolygon);co.Execute(out,d*CS);return out};
+  return run(run(paths,e),-e)}
+function weldPolys(polys,tol=.004){const reps=[],snap=p=>{for(const r of reps)if(Math.abs(r[0]-p[0])<tol&&Math.abs(r[1]-p[1])<tol)return r;const r=[Math.round(p[0]*CS)/CS,Math.round(p[1]*CS)/CS];reps.push(r);return r};
+  const S_=polys.map(p=>p.map(snap));
+  return S_.map(p=>{const out=[];for(let i=0;i<p.length;i++){const a=p[i],c=p[(i+1)%p.length];if(a===c)continue;out.push(a);const dx=c[0]-a[0],dy=c[1]-a[1],L2=dx*dx+dy*dy;if(L2<1e-10)continue;const mid=[];
+      for(const r of reps){if(r===a||r===c)continue;const tt=((r[0]-a[0])*dx+(r[1]-a[1])*dy)/L2;if(tt<=0||tt>=1)continue;const ex=a[0]+dx*tt-r[0],ey=a[1]+dy*tt-r[1];if(ex*ex+ey*ey<tol*tol)mid.push([tt,r])}
+      mid.sort((x,y)=>x[0]-y[0]).forEach(m=>out.push(m[1]))}return out}).map(p=>p.length>2?p:[])}
 function brepOf(b){
   const PC=piecesOf(b);if(PC.length<2)return null;const groups=new Map();
   for(const P of PC)for(const f of solidFaces(P)){const k=PKEY(f.pl.n,f.pl.d);let g=groups.get(k);
@@ -755,8 +762,14 @@ function brepOf(b){
     const p0=g.polys[0];let kk=0,best=-1;for(let j=0;j<p0.length;j++){const L=p0[j].distanceTo(p0[(j+1)%p0.length]);if(L>best){best=L;kk=j}}
     const O=p0[kk].clone(),u=p0[(kk+1)%p0.length].clone().sub(O).normalize(),v=new V().crossVectors(n,u);
     const to2=P=>{const q=P.clone().sub(O);return [q.dot(u),q.dot(v)]};
-    const plus=g.polys.map(p=>c2path(posC(p.map(to2)))),minus=opp?opp.polys.map(p=>c2path(posC(p.map(to2)))):[];
-    const res=clipRun(plus,minus,ClipperLib.ClipType.ctDifference);
+    /* pieces that meet along a line each worked that line out on their own; give both the very same corners (and a corner wherever the
+       other one has one part-way along) so the union comes back as one face instead of two with a hairline between them */
+    const W=weldPolys([...g.polys.map(p=>p.map(to2)),...(opp?opp.polys.map(p=>p.map(to2)):[])]),nP=g.polys.length;
+    const plus=W.slice(0,nP).map(p=>c2path(posC(p))),minus=W.slice(nP).map(p=>c2path(posC(p)));
+    let res=clipRun(plus,minus,ClipperLib.ClipType.ctDifference);
+    /* the polygon library sometimes leaves two pieces that share a whole edge as two shapes; closing the hairline (out and back in
+       by two thousandths) joins them. Kept only when it really gives fewer shapes, so everything else stays exactly as it was. */
+    if(res.shapes.length>1){const big=r=>r.shapes.filter(sh=>Math.abs(areaF(sh.outer))>=.5).length,r2=clipRun(closeC(plus),minus,ClipperLib.ClipType.ctDifference);if(big(r2)<big(res))res=r2}
     const cln=c=>fromC(ClipperLib.Clipper.CleanPolygon(c2path(c),CS*.002));
     res.shapes.forEach((sh,si)=>{if(Math.abs(areaF(sh.outer))<.5)return;
       const cts=[posC(cln(sh.outer)),...sh.holes.map(cln).filter(h=>h.length>2&&Math.abs(areaF(h))>.05).map(negC)];
@@ -779,7 +792,9 @@ function brepOf(b){
   faces.forEach((f,fi)=>{f.E=[];f.cts.forEach((ct,ci)=>{const base=f.E.length;for(let i=0;i<ct.length;i++){const a=ct[i],c=ct[(i+1)%ct.length],L=Math.hypot(c[0]-a[0],c[1]-a[1]);
       const d=L>1e-9?[(c[0]-a[0])/L,(c[1]-a[1])/L]:[1,0];const e={fi,ci,q:f.E.length,P:a,P2:c,D:d,M:[-d[1],d[0]],L,A:P3(f,a),B:P3(f,c),prev:base+(i-1+ct.length)%ct.length,next:base+(i+1)%ct.length,nb:-1,nbq:-1};
       f.E.push(e);if(L>1e-6)byKey.set(rk(e.A)+'>'+rk(e.B),e)}})});
-  faces.forEach(f=>f.E.forEach(e=>{if(e.L<1e-6)return;const m=byKey.get(rk(e.B)+'>'+rk(e.A));if(m&&m.fi!==e.fi){e.nb=m.fi;e.nbq=m.q}}))};
+  faces.forEach(f=>f.E.forEach(e=>{if(e.L<1e-6)return;const m=byKey.get(rk(e.B)+'>'+rk(e.A));if(m&&m.fi!==e.fi){e.nb=m.fi;e.nbq=m.q}}));
+  /* a neighbor only counts when it points straight back; anything else is left as a free edge instead of half a joint */
+  faces.forEach(f=>f.E.forEach(e=>{if(e.nb<0)return;const m=faces[e.nb].E[e.nbq];if(!m||m.nb!==e.fi||m.nbq!==e.q){e.nb=-1;e.nbq=-1}}))};
   build();
   /* then join straight runs that meet the same neighbor back into one edge, and drop zero-length ones */
   faces.forEach(f=>{f.cts=f.cts.map((ct,ci)=>{const E=f.E.filter(e=>e.ci===ci);return ct.filter((p,i)=>{const ein=E[(i-1+E.length)%E.length],eout=E[i];
@@ -805,7 +820,9 @@ function panelizeShell(b,name,B){
   b.freeEdges=F.reduce((n,f)=>n+f.E.filter(e=>e.L>.02&&e.nb<0).length,0);
   b.openStrips=[];F.forEach(f=>{const ct=f.cts[0];let w=Infinity;for(let i=0;i<ct.length;i++){const a=ct[i],c=ct[(i+1)%ct.length],L=Math.hypot(c[0]-a[0],c[1]-a[1]);if(L<1e-6)continue;
       const m=[-(c[1]-a[1])/L,(c[0]-a[0])/L];let hi=0;for(const p of ct)hi=Math.max(hi,Math.abs((p[0]-a[0])*m[0]+(p[1]-a[1])*m[1]));w=Math.min(w,hi)}
-    if(w<2.5*t||Math.abs(areaF(ct))<8*t*t){f.skip=true;b.openStrips.push({w})}});
+    let eaten=false;if(w<8*t){let q2=posC(ct.slice());for(const e of f.E){if(e.ci!==0||e.nb<0||e.L<1e-6||!e.convex||q2.length<3)continue;const g=F[e.nb],cp=-f.n.dot(g.n),sp=Math.max(.25,Math.sqrt(Math.max(0,1-cp*cp)));q2=clip2(q2,e.P,e.M,cp>0?t*(1+cp)/sp:t/sp)}
+      eaten=q2.length<3||Math.abs(areaF(q2))<4*t*t}
+    if(w<2.5*t||Math.abs(areaF(ct))<8*t*t||eaten){f.skip=true;b.openStrips.push({w})}});
   F.forEach(f=>f.E.forEach(e=>{if(e.nb>=0&&(f.skip||F[e.nb].skip))e.nb=-1}));
   /* a cut-out that comes closer to another face than two sheets of ply leaves a wall too thin to build: the two panels' wood would overlap */
   b.thin=[];for(const f of F)for(const g of F){if(f===g||f.n.dot(g.n)>-.2||f.E.some(e=>e.nb===g.i)||(f.pl.src?.type!=='carve'&&g.pl.src?.type!=='carve'))continue;
@@ -1016,7 +1033,7 @@ function panelizeShell(b,name,B){
         /* corners: run on past a neighbor edge only where that edge is an outside corner this panel owns; inside corners and inside-corner fingers stop short */
         const offP=(e.convex&&kp.convex&&ownsEnd(kp))?-kp.ext:kp.s,offN=(e.convex&&kn.convex&&ownsStart(kn))?-kn.ext:kn.s;
         /* at an inside outline corner the neighbor's line says nothing about where wood is, so only outward corners clip */
-        if(qd.length>2&&(cvS||!st))qd=clip2(qd,kp.P,kp.M,offP);if(qd.length>2&&(cvE||!en))qd=clip2(qd,kn.P,kn.M,offN);
+        if(qd.length>2&&cvS)qd=clip2(qd,kp.P,kp.M,offP);if(qd.length>2&&cvE)qd=clip2(qd,kn.P,kn.M,offN);
         if(qd.length>2)fingers.push(c2path(posC(qd)));
         if(S.screws&&e.convex&&e.eo&&e.eo.screws&&Math.abs(e.cos)<=sOK){if(oc++%S.screwEvery!==0)continue;
           const lo_=Math.max(0,sg.a),hi_=Math.min(Lk,sg.b),cm=(lo_+hi_)/2,sp2=S.fingerScrewGap,cs=S.fingerScrews===2&&hi_-lo_>=sp2+2*t?[cm-sp2/2,cm+sp2/2]:[cm];
@@ -1186,6 +1203,8 @@ function splicePanel(p,Wu,Hu,t,mc,k,force=0){
     const res=cellSub[c].length?clipRun(withK.contours.map(c2path),cellSub[c],ClipperLib.ClipType.ctDifference):withK;
     for(const shp of res.shapes)if(areaF(shp.outer)>4*t*t)pieces.push([shp.outer,...shp.holes].map(q=>q.map(UN)))}
   if(pieces.length<2)return null;
+  /* a split made only to nest tighter has to give two real halves, never a half and a scrap */
+  if(force&&fits(w,h)&&(pieces.length!==2||pieces.some(pc=>Math.abs(areaF(pc[0]))<36)))return null;
   return pieces.map((pc,qi)=>{const has=([x,y])=>pipC(pc,x,y);
     const drills=(p.drills||[]).filter(d=>has(d.c)),fin=finishRegion(pc.map(c2path),[],drills,mc),name=p.label+'-'+(qi+1);
     const engr=keepE.filter(st=>st.length&&has(st[Math.floor(st.length/2)])),marks=(p.marks||[]).filter(has),flagHoles=(p.flagHoles||[]).filter(c=>c.length&&has(c[0]));
@@ -1206,7 +1225,13 @@ function mergeSplices(ps){const out=[],by={};
 function polyWidth(poly,n){let w=Infinity;for(let i=0;i<poly.length;i++){const a=poly[i],e=poly[(i+1)%poly.length].clone().sub(a);if(e.lengthSq()<1e-9)continue;
     const m=new V().crossVectors(n,e).normalize();let hi=0;for(const p of poly)hi=Math.max(hi,Math.abs(p.clone().sub(a).dot(m)));w=Math.min(w,hi)}return w}
 function buildablePlanes(b){let P=blockPlanes(b).slice();b.softened=[];b.strips=[];const t=thkModel(),minW=2.5*t,keep=new Set();
-  for(let it=0;it<8;it++){let worst=null;for(const f of solidFaces(P)){if(keep.has(f.pl))continue;const w=polyWidth(f.poly,f.pl.n);if(w<minW&&(!worst||w<worst.w))worst={f,w}}
+  /* what is left of a face once each edge steps back for its joint (a shallow fold steps back a long way) */
+  const core=(f,FS)=>{const n=f.pl.n,p0=f.poly[0],u=f.poly[1].clone().sub(p0).normalize(),v=new V().crossVectors(n,u),to=X=>{const q=X.clone().sub(p0);return [q.dot(u),q.dot(v)]};let q2=f.poly.map(to);if(areaF(q2)<0)q2.reverse();
+    const src=q2.slice();for(let i=0;i<src.length&&q2.length>2;i++){const a=src[i],c=src[(i+1)%src.length],L=Math.hypot(c[0]-a[0],c[1]-a[1]);if(L<1e-6)continue;const A3=p0.clone().addScaledVector(u,a[0]).addScaledVector(v,a[1]),C3=p0.clone().addScaledVector(u,c[0]).addScaledVector(v,c[1]);
+      const g=FS.find(h=>h!==f&&Math.abs(h.pl.n.dot(A3)-h.pl.d)<1e-3&&Math.abs(h.pl.n.dot(C3)-h.pl.d)<1e-3);if(!g)continue;const cp=-n.dot(g.pl.n),sp=Math.max(.25,Math.sqrt(Math.max(0,1-cp*cp))),sb=cp>0?t*(1+cp)/sp:t/sp;
+      q2=clip2(q2,a,[-(c[1]-a[1])/L,(c[0]-a[0])/L],sb)}
+    if(q2.length<3)return 0;const P3=q2.map(([x,y])=>p0.clone().addScaledVector(u,x).addScaledVector(v,y));return Math.abs(areaF(q2))<4*t*t?0:polyWidth(P3,n)};
+  for(let it=0;it<8;it++){let worst=null;const FS=solidFaces(P);for(const f of FS){if(keep.has(f.pl))continue;let w=polyWidth(f.poly,f.pl.n);if(w>=minW&&w<8*t&&core(f,FS)<t)w=Math.min(w,minW*.999);if(w<minW&&(!worst||w<worst.w))worst={f,w:polyWidth(f.poly,f.pl.n)}}
     if(!worst)break;const pl=worst.f.pl,P2=P.filter(p=>p!==pl),F2=P2.length>=4?solidFaces(P2):[];
     let ok=F2.length>=4,grow=0;for(const f of F2)for(const v of f.poly){grow=Math.max(grow,pl.n.dot(v)-pl.d);if(v.length()>600)ok=false}
     if(ok&&grow<=Math.max(2.5*worst.w,1.5*t)){P=P2;b.softened.push({w:worst.w,grow})}else{keep.add(pl);b.strips.push({w:worst.w,need:minW})}}
