@@ -748,6 +748,30 @@ function clipRun(subj,clip,type,fillS=ClipperLib.PolyFillType.pftNonZero,fillC=C
 const posC=c=>areaF(c)<0?c.slice().reverse():c, negC=c=>areaF(c)>0?c.slice().reverse():c;
 function closeC(paths,e=.002){const run=(P,d)=>{const co=new ClipperLib.ClipperOffset(20,CS*.0005),out=new ClipperLib.Paths();co.AddPaths(P,ClipperLib.JoinType.jtMiter,ClipperLib.EndType.etClosedPolygon);co.Execute(out,d*CS);return out};
   return run(run(paths,e),-e)}
+/* Where the ribs sit. They start evenly spaced along the box; then each family slides as a group (up to 30% of its spacing) and
+   spreads or closes up a little, to make the longest unsupported stretch of any face as short as it can be. On a face that leans
+   across both families their ribs land side by side, and without this two of them can meet in the middle and leave the rest bare.
+   Returns the planned position of every rib, family by family. */
+function ribSpots(faces,fams,t){const at=(fm,k)=>{const o=[];for(let r=1;r<=fm.nR;r++)o.push(fm.mn+fm.step*(fm.nR+1)/2+(r-(fm.nR+1)/2)*fm.step*k.sc+k.sh*.06*fm.step);return o};
+  let k=fams.map(()=>({sh:0,sc:1}));if(!fams.some(f=>f.nR>0))return fams.map((fm,i)=>at(fm,k[i]));
+  let chord=0;const pre=faces.map(f=>({P:f.poly,fam:fams.map(fm=>{const dir=new V().crossVectors(f.n,fm.axis),l=dir.length();if(l<.2)return null;dir.multiplyScalar(1/l);
+    const m=new V().crossVectors(f.n,dir).normalize(),cs=f.poly.map(p=>p.dot(m));return {dir,m,c0:Math.min(...cs),c1:Math.max(...cs)}})}));
+  const land=(P,axis,d,m)=>{let a=null,b=null;for(let j=0;j<P.length;j++){const A=P[j],B=P[(j+1)%P.length],da=axis.dot(A)-d,db=axis.dot(B)-d;if((da<=0&&db>0)||(da>0&&db<=0)){const X=A.clone().lerp(B,da/(da-db));if(!a)a=X;else if(!b)b=X}}
+    if(!b)return null;const ch=a.distanceTo(b);if(ch<3*t)return null;chord+=ch;return a.dot(m)};
+  const gapsOf=(I,cs)=>{const a=[I.c0,...cs.filter(c=>c>I.c0&&c<I.c1).sort((x,y)=>x-y),I.c1],g=[];for(let i=0;i+1<a.length;i++)g.push(a[i+1]-a[i]);return g};
+  const lands=(F,i,pos,m)=>{const cs=[];for(const d of pos[i]){const c=land(F.P,fams[i].axis,d,m);if(c!=null)cs.push(c)}return cs};
+  const cost=kk=>{const pos=fams.map((fm,i)=>at(fm,kk[i]));let mx=0,sum=0;chord=0;for(const F of pre){const on=fams.map((_,i)=>i).filter(i=>F.fam[i]);if(!on.length)continue;let g;
+      if(on.length===2&&Math.abs(F.fam[on[0]].dir.dot(F.fam[on[1]].dir))>.94){const I=F.fam[on[0]];g=gapsOf(I,[...lands(F,on[0],pos,I.m),...lands(F,on[1],pos,I.m)])}
+      else g=on.map(i=>gapsOf(F.fam[i],lands(F,i,pos,F.fam[i].m))).reduce((a,c)=>Math.max(...c)<Math.max(...a)?c:a);
+      for(const x of g){mx=Math.max(mx,x);sum+=x*x*x*x}}
+    const pen=1+.002*kk.reduce((a,x)=>a+Math.abs(x.sh)+Math.abs(x.sc-1)*20,0);return [Math.round(mx*2)/2,sum*pen,chord]};
+  /* shortest worst stretch first; then the most even overall; and between equals, the longer ribs (they cross and lock as a waffle) */
+  const better=(c,b)=>c[0]<b[0]-1e-9||(Math.abs(c[0]-b[0])<1e-9&&(c[1]<b[1]*.995||(c[1]<b[1]*1.005&&c[2]>b[2]+.5)));
+  let best=cost(k);const SH=[0,1,-1,2,-2,3,-3,4,-4,5,-5];
+  /* slide the families together first (they trade off against each other on a leaning face), then let each one spread or close up */
+  const go=(i,kk)=>{if(i===fams.length){const c=cost(kk);if(better(c,best)){best=c;k=kk}return}for(const sh of fams[i].nR?SH:[0])go(i+1,[...kk,{sh,sc:1}])};go(0,[]);
+  fams.forEach((fm,i)=>{if(fm.nR<2)return;for(const sc of [.9,1.1,.8,1.2,1.3])for(const sh of SH){const kk=k.map((x,j)=>j===i?{sh,sc}:x),c=cost(kk);if(better(c,best)){best=c;k=kk}}});
+  return fams.map((fm,i)=>at(fm,k[i]))}
 function weldPolys(polys,tol=.004){const reps=[],snap=p=>{for(const r of reps)if(Math.abs(r[0]-p[0])<tol&&Math.abs(r[1]-p[1])<tol)return r;const r=[Math.round(p[0]*CS)/CS,Math.round(p[1]*CS)/CS];reps.push(r);return r};
   const S_=polys.map(p=>p.map(snap));
   return S_.map(p=>{const out=[];for(let i=0;i<p.length;i++){const a=p[i],c=p[(i+1)%p.length];if(a===c)continue;out.push(a);const dx=c[0]-a[0],dy=c[1]-a[1],L2=dx*dx+dy*dy;if(L2<1e-10)continue;const mid=[];
@@ -910,10 +934,11 @@ function panelizeShell(b,name,B){
     /* two ribs that meet in more than one stretch (around a hole) can't be half-lapped: neither can drop past the other */
     const multiX=(A,Bq)=>{const L_=crossLine(A,Bq);if(!L_)return false;const IA=intervals(A,L_.X,L_.dir),IB=intervals(Bq,L_.X,L_.dir);if(IA.length<2&&IB.length<2)return false;
       return IA.some(([a0,a1])=>IB.some(([b0,b1])=>Math.min(a1,b1)-Math.max(a0,b0)>=2*t))};
-    fams.forEach((la,fi)=>{const axis=la.clone().applyQuaternion(q).normalize(),vp=vpAll.map(p=>p.dot(axis)),mn=Math.min(...vp),mx=Math.max(...vp),L=mx-mn;
-      const nR=Math.max(0,Math.ceil(L/(b.ribMax||S.ribMax)-1e-6)-1),step=L/(nR+1);
+    const famI=fams.map(la=>{const axis=la.clone().applyQuaternion(q).normalize(),vp=vpAll.map(p=>p.dot(axis)),mn=Math.min(...vp),mx=Math.max(...vp),L=mx-mn,nR=Math.max(0,Math.ceil(L/(b.ribMax||S.ribMax)-1e-6)-1);return {axis,vp,mn,nR,step:L/(nR+1)}});
+    const ribAt=ribSpots(F.filter(f=>!f.skip&&f.pl.src?.type!=='carve').map(f=>({n:f.n,poly:f.E.filter(e=>e.ci===0).map(e=>e.A)})).filter(f=>f.poly.length>2),famI,t);
+    famI.forEach(({axis,vp,mn,nR,step},fi)=>{
       for(let r=1;r<=nR;r++){let best=null;
-        for(const z of [0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,7,-7]){const d=mn+step*r+z*step*.06,sec=section(axis,d);if(!sec)continue;
+        for(const z of [0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,7,-7]){const d=ribAt[fi][r-1]+z*step*.06,sec=section(axis,d);if(!sec)continue;
           /* keep every rib one piece: skip spots where a cut-out would split it, or where it would cross a rib of the other way around a hole.
              If no spot works, that rib is left out; the cut-out's own lining panels brace that stretch. */
           if(sec.shapes.length>1)continue;if(fi===1&&ribs.some(A=>A.fam===0&&multiX(A,{axis,d,sec,sh:sec.shapes[0]})))continue;
@@ -1237,7 +1262,8 @@ function buildablePlanes(b){let P=blockPlanes(b).slice();b.softened=[];b.strips=
     if(ok&&grow<=Math.max(2.5*worst.w,1.5*t)){P=P2;b.softened.push({w:worst.w,grow})}else{keep.add(pl);b.strips.push({w:worst.w,need:minW})}}
   return P}
 function panelizeBlock(b){b.planes=null;b.planes=buildablePlanes(b);try{const B=brepOf(b);b.brep=B;let r;
-    if(B)r=panelizeShell(b,b.name,B);else if(b.carves?.length&&!piecesOf(b).length)return {panels:[],screws:[],sd:.1,sLen:1,joints:[],planes:[]};else r=panelize(b,b.name);
+    if(B){r=panelizeShell(b,b.name,B);const real=new Set(B.faces.map(f=>PKEY(f.pl.n,f.pl.d)));
+      r.planeSets=piecesOf(b).map(P=>P.map(pl=>({n:pl.n,d:pl.d,inner:!real.has(PKEY(pl.n,pl.d))})))}else if(b.carves?.length&&!piecesOf(b).length)return {panels:[],screws:[],sd:.1,sLen:1,joints:[],planes:[]};else r=panelize(b,b.name);
     r.panels=spliceAll(deOverlap(r.panels),b);return r}finally{b.planes=null}}
 /* Install order for a waffle: the longest rib goes down first with its slots facing up, the longest rib the other way
    drops onto it with its own remaining slots facing up, and so on, swapping direction each time, so the half-built
@@ -1312,16 +1338,18 @@ function panelize(b,name){
     const first=S.ribAxis==='vertical'?new V(0,1,0):((s.x>=s.z)===(S.ribAxis!=='short')?new V(1,0,0):new V(0,0,1));
     const fams=[first];if(S.waffle&&S.ribAxis!=='vertical')fams.push(first.x?new V(0,0,1):new V(1,0,0));
     const ribs=[];
-    fams.forEach((la,fi)=>{const axis=la.clone().applyQuaternion(q).normalize(),vp=vpAll.map(p=>p.dot(axis)),mn=Math.min(...vp),mx=Math.max(...vp),L=mx-mn;
+    const famI=fams.map(la=>{const axis=la.clone().applyQuaternion(q).normalize(),vp=vpAll.map(p=>p.dot(axis)),mn=Math.min(...vp),mx=Math.max(...vp),L=mx-mn,nR=Math.max(0,Math.ceil(L/(b.ribMax||S.ribMax)-1e-6)-1);return {axis,vp,mn,nR,step:L/(nR+1)}});
+    const ribAt=ribSpots(F.map(f=>({n:f.n,poly:f.poly})),famI,t);
+    famI.forEach(({axis,vp,mn,nR,step},fi)=>{
       /* the rib is a slab, not a sheet: where a face leans across the rib, pull the outline in so neither of the rib's faces pokes into it */
       const innerR=inner.map(pl=>({...pl,d:pl.d-t/2*Math.abs(pl.n.dot(axis)),lean:t/2*Math.abs(pl.n.dot(axis))}));
-      const nR=Math.max(0,Math.ceil(L/(b.ribMax||S.ribMax)-1e-6)-1),step=L/(nR+1);
       for(let r=1;r<=nR;r++){let best=null;
-        for(let z=-6;z<=6;z++){const d=mn+step*r+z*step*.06,poly=polygonOnPlane({n:axis,d},innerR,1000);
+        /* the planned spot is kept unless it makes a tiny edge or sits on a corner; only then is the rib nudged, as little as it takes */
+        for(const z of [0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6]){const d=ribAt[fi][r-1]+z*step*.06,poly=polygonOnPlane({n:axis,d},innerR,1000);
           if(!poly||area3(poly,axis)<9*t*t)continue;
           let me=Infinity;for(let j=0;j<poly.length;j++)me=Math.min(me,poly[j].distanceTo(poly[(j+1)%poly.length]));
           const vc=Math.min(...vp.map(x=>Math.abs(x-d))),score=Math.min(me,vc*3)-Math.abs(z)*step*.01;
-          if(!best||score>best.score)best={score,d,poly}}
+          if(!best||score>best.score)best={score,d,poly};if(me>t*2&&vc>t*3)break}
         if(best){ribs.push({fam:fi,axis,d:best.d,poly:best.poly,notches:[],excl:[],innerR});ribPlanes.push({axis,d:best.d})}}});
     /* half-laps: at each crossing the rib that goes in first is notched from the top down to the middle, the later one from the bottom up */
     ribOrder(ribs,rb=>ribLen(rb.axis,rb.poly));
@@ -1335,7 +1363,8 @@ function panelize(b,name){
       if(s1-s0<2*t)continue;const P=x=>sa[0].clone().addScaledVector(dir,x-pr(sa[0])),mid=(s0+s1)/2;
       const top=sg=>Math.max(pr(sg[0]),pr(sg[1])),bot=sg=>Math.min(pr(sg[0]),pr(sg[1]));
       const [E_,L_]=A.rank<=B.rank?[A,B]:[B,A],eTop=top(E_===A?sa:sb),lBot=bot(L_===A?sa:sb);
-      for(const [R,from,to] of [[E_,mid-stol,eTop+t],[L_,lBot-t,mid+stol]]){const side=new V().crossVectors(R.axis,dir).normalize();
+      /* run each slot well past the rib's own edge: where that edge is steep, one side of the slot is higher than the middle */
+      for(const [R,from,to] of [[E_,mid-stol,eTop+t+W*4],[L_,lBot-t-W*4,mid+stol]]){const side=new V().crossVectors(R.axis,dir).normalize();
         R.notches.push([P(from).addScaledVector(side,-W/2),P(to).addScaledVector(side,-W/2),P(to).addScaledVector(side,W/2),P(from).addScaledVector(side,W/2)]);
         R.excl.push(P(s0),P(s1));
         /* the lane the other rib travels along when it drops in: this rib keeps its own tabs out of it, however the edge above is sloped */
@@ -1677,7 +1706,7 @@ function sandedPolys(p,mtx,K,topShapes){
         const pr=[{n:nn.clone(),d:nn.dot(P3(A.x,A.y,z1))},{n:nn.clone().negate(),d:-nn.dot(P3(A.x,A.y,z0))}];
         for(const [Pi,Pj] of [[A,B],[B,C],[C,A]]){const p0=P3(Pi.x,Pi.y,z0),on=new V().subVectors(P3(Pj.x,Pj.y,z0),p0).cross(nn).normalize();pr.push({n:on,d:on.dot(p0)})}
         const all=[...pr,...crossing];
-        for(const k of crossing){const poly=polygonOnPlane(k,all,1000);if(poly&&area3(poly,k.n)>1e-7){walls.push(poly);(cutsBy.get(k)||cutsBy.set(k,[]).get(k)).push(poly)}}}
+        for(const k of crossing){if(k.inner)continue;const poly=polygonOnPlane(k,all,1000);if(poly&&area3(poly,k.n)>1e-7){walls.push(poly);(cutsBy.get(k)||cutsBy.set(k,[]).get(k)).push(poly)}}}
     }}
   const capsBot=caps.slice(),capsFull=caps.slice();
   const topCaps=(shs,arr)=>{for(const sh of shs){const {pts,faces}=triShape(sh);for(const [a,b,c] of faces){const A=pts[a],B=pts[b],C=pts[c];push(arr,clipK([P3(A.x,A.y,z1),P3(B.x,B.y,z1),P3(C.x,C.y,z1)]))}}};
@@ -1725,7 +1754,9 @@ function panelObject(p,b){
   }
   const z0=p.z0,z1=p.z1;
   if(S.sanded&&p.K){const inv=new THREE.Matrix4().copy(mtx).invert(),tv=new V();
-    const {caps,walls,capsFull}=sandedPolys(p,mtx,p.K,topShapes),cuv=q=>{tv.copy(q).applyMatrix4(inv);return [tv.x,tv.y]};
+    /* a box with cut-outs is trimmed piece by piece: each convex piece of the solid keeps the wood that lies inside it */
+    let caps,walls,capsFull;if(p.KS?.length){caps=[];walls=[];capsFull=topShapes!==p.shapes?[]:null;for(const K of p.KS){const r=sandedPolys(p,mtx,K,topShapes);caps.push(...r.caps);walls.push(...r.walls);if(capsFull&&r.capsFull)capsFull.push(...r.capsFull)}}
+    else ({caps,walls,capsFull}=sandedPolys(p,mtx,p.K,topShapes));const cuv=q=>{tv.copy(q).applyMatrix4(inv);return [tv.x,tv.y]};
     const capG=polysGeo(caps,cuv);
     const wallG=polysGeo(walls,(q,fn)=>{tv.copy(q).applyMatrix4(inv);let d=new V().crossVectors(fn,n);if(d.lengthSq()<1e-6)d.copy(u);d.normalize();return [q.dot(d)/2,(tv.z-z0)/(z1-z0)]});
     for(const [g,m] of [[capG,LK.face],[wallG,LK.wall]]){const me=new THREE.Mesh(g,m);me.userData.pick=b;me.userData.panel=p.label;grp.add(me);
@@ -1761,7 +1792,7 @@ function rebuild(){const _t0=performance.now();let _tp=0;dirty=false;
   lastPanels=[];allScrews=[];allFixes=[];const cfg=cfgSig();
   blocks.forEach(b=>{const sig=JSON.stringify({...serBlock(b),useAs:undefined})+cfg;
     if(b._sig!==sig||!b._res){let res={panels:[],screws:[],sd:.1,sLen:1,joints:[],planes:[]};const _a=performance.now();try{res=panelizeBlock(b)}catch(e){console.error(e)}_tp+=performance.now()-_a;
-      res.panels.forEach(p=>{p.K=res.planes;p.block=b});b._res=res;b._sig=sig;dropGroup(b)}
+      res.panels.forEach(p=>{p.K=res.planes;p.KS=res.planeSets||null;p.block=b});b._res=res;b._sig=sig;dropGroup(b)}
     const res=b._res;b.joints=res.joints||[];b.tModel=thkModel();res.panels.forEach(p=>lastPanels.push(p));
     res.screws.forEach(s=>{if(s.fix)allFixes.push({...s,block:b});if(!s.dropped)allScrews.push({...s,block:b})})});
   const _t1=performance.now();meshDirty=true;if(view==='panels')buildMeshes();
