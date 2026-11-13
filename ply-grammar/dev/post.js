@@ -1082,11 +1082,12 @@ function panelObject(p,b){
 /* ---------------- rebuild ---------------- */
 let lastPanels=[],allScrews=[],allFixes=[];
 const PERF={};
+const XR={step:null,base:null,floorH:0,hover:-1,W:[],navN:0,nav:null,price:null};   /* headset state (the code is in the VR / XR section) */
 /* ---------------- keeping things up to date, cheaply ----------------
    Each box remembers its panelized result until the box or a build setting really changes, so an edit only reworks the box you touched.
    Panel meshes are only made for the Panels view, sheets are only nested when a price or the Sheets view needs them, and in the
    headset nothing at all is computed while you model in Massing: the parts catch up when you ask to see them. */
-const DISPLAY_KEYS=new Set(['explode','showPaths','xrScale','sanded','look','glue','jumperLb','landG','pushX','mu','plyPcf','secOn','secAx','secPos','secFlip','showPlanes','feed','sheetCost','screwCost','shopRate','priceOn','priceOpen']);
+const DISPLAY_KEYS=new Set(['rateSet','explode','showPaths','xrScale','sanded','look','glue','jumperLb','landG','pushX','mu','plyPcf','secOn','secAx','secPos','secFlip','showPlanes','feed','sheetCost','screwCost','shopRate','priceOn','priceOpen']);
 const cfgSig=()=>JSON.stringify(Object.keys(S).filter(k=>!DISPLAY_KEYS.has(k)).sort().map(k=>[k,S[k]]));
 let dirty=true,meshDirty=true;
 function dropGroup(b){const g=b._grp;if(!g)return;panelGroup.remove(g);g.traverse(x=>{x.geometry?.dispose();x.userData.stencilGeo?.dispose();x.material?.dispose?.()});b._grp=null}
@@ -1206,7 +1207,7 @@ addEventListener('keydown',e=>{if(!S.secOn||e.target.closest('input,select,texta
   else if(e.key.toLowerCase()==='f'){S.secFlip=!S.secFlip;updateSection();save()}});
 $('#secPos').addEventListener('input',e=>{S.secPos=+e.target.value;updateSection()});
 let timer=0;
-function schedule(){dirty=true;clearTimeout(timer);
+function schedule(){dirty=true;clearTimeout(timer);$('#price')?.classList.add('stale');XR.price=null;
   if(xrMode&&view==='mass'){save();return}          /* headset modeling: no part work until you open Panels */
   timer=setTimeout(()=>{rebuild();save()},view==='panels'?60:view==='mass'?450:180)}
 
@@ -1241,21 +1242,28 @@ function layout(){
       return {m,test,offs,stamp:dilate(m,1+gk),data:()=>({part:tt(tr(p.part)),view:tt(tr(p.view)),path:tt(tr(p.path)),engr:tt(tr(p.engr)),fh:tt(tr(p.flagHoles||[])),drills:(p.drills||[]).map(d=>({c:RT(d.c),r:d.r*k})),marks:(p.marks||[]).map(RT)})}});
     return {p,rots,area:rots[0].m.g.reduce((a,b)=>a+b,0)}});
   parts.sort((a,b)=>b.area-a.area);
-  const SW=Math.round(W/cell),SH=Math.round(H/cell),mg=Math.max(1,gk);sheets=[];
-  const newSheet=()=>{const occ=new Uint8Array(SW*SH);for(let y=0;y<SH;y++)for(let x=0;x<SW;x++)if(x<mg||y<mg||x>=SW-mg||y>=SH-mg)occ[y*SW+x]=1;const s={occ,items:[]};sheets.push(s);return s};
-  const fit=(sh,rot)=>{const T=rot.test;for(let y=0;y+T.H<=SH;y++)xl:for(let x=0;x+T.W<=SW;x++){const base=y*SW+x;for(const [ox,oy] of rot.offs)if(sh.occ[base+oy*SW+ox])continue xl;return {x,y}}return null};
-  for(const pt of parts){
-    let placed=false;
-    for(const sh of sheets){if(sh.over)continue;let best=null;
-      for(const rot of pt.rots){const f=fit(sh,rot);if(f&&(!best||f.y<best.f.y||(f.y===best.f.y&&f.x<best.f.x)))best={f,rot}}
-      if(best){place(sh,pt,best.rot,best.f);placed=true;break}}
-    if(placed)continue;
-    const sh=newSheet();let best=null;for(const rot of pt.rots){const f=fit(sh,rot);if(f&&(!best||f.y<best.f.y||(f.y===best.f.y&&f.x<best.f.x)))best={f,rot}}
-    if(best)place(sh,pt,best.rot,best.f);else{sh.over=true;sh.items.push({p:pt.p,...pt.rots[0].data(),x:gap,y:gap})}
-  }
-  function place(sh,pt,rot,f){const St=rot.stamp,o=gk;
-    for(let y=0;y<St.H;y++)for(let x=0;x<St.W;x++)if(St.g[y*St.W+x]){const X=f.x-o+x,Y=f.y-o+y;if(X>=0&&Y>=0&&X<SW&&Y<SH)sh.occ[Y*SW+X]=1}
-    sh.items.push({p:pt.p,...rot.data(),x:(f.x+1)*cell,y:(f.y+1)*cell})}
+  const SW=Math.round(W/cell),SH=Math.round(H/cell),mg=Math.max(1,gk);
+  /* Parts go on biggest first. Two ways of choosing each spot are tried and the one that needs fewer sheets wins:
+     lowest-then-leftmost (rows), and furthest-left-edge-first with the part turned whichever way reaches least far along
+     the sheet (columns), which is what gets three 31 x 41 panels across a sheet instead of two. */
+  const fitRow=(sh,rot)=>{const T=rot.test;for(let y=0;y+T.H<=SH;y++)xl:for(let x=0;x+T.W<=SW;x++){const base=y*SW+x;for(const [ox,oy] of rot.offs)if(sh.occ[base+oy*SW+ox])continue xl;return {x,y}}return null};
+  const fitCol=(sh,rot)=>{const T=rot.test;for(let x=0;x+T.W<=SW;x++)yl:for(let y=0;y+T.H<=SH;y++){const base=y*SW+x;for(const [ox,oy] of rot.offs)if(sh.occ[base+oy*SW+ox])continue yl;return {x,y}}return null};
+  const run=(mode,order)=>{const out=[],parts=order,fit=mode?fitCol:fitRow,key=(f,rot)=>mode?[f.x+rot.test.W,f.y]:[f.y,f.x],less=(a,b)=>a[0]<b[0]||(a[0]===b[0]&&a[1]<b[1]);
+    const newSheet=()=>{const occ=new Uint8Array(SW*SH);for(let y=0;y<SH;y++)for(let x=0;x<SW;x++)if(x<mg||y<mg||x>=SW-mg||y>=SH-mg)occ[y*SW+x]=1;const s={occ,items:[],cells:0};out.push(s);return s};
+    const place=(sh,pt,rot,f)=>{const St=rot.stamp,o=gk;
+      for(let y=0;y<St.H;y++)for(let x=0;x<St.W;x++)if(St.g[y*St.W+x]){const X=f.x-o+x,Y=f.y-o+y;if(X>=0&&Y>=0&&X<SW&&Y<SH)sh.occ[Y*SW+X]=1}
+      sh.cells+=pt.area;sh.items.push({p:pt.p,pt,rot,x:(f.x+1)*cell,y:(f.y+1)*cell})};
+    const bestIn=(sh,pt)=>{let best=null;for(const rot of pt.rots){const f=fit(sh,rot);if(f&&(!best||less(key(f,rot),best.k)))best={f,rot,k:key(f,rot)}}return best};
+    for(const pt of parts){let placed=false;
+      for(const sh of out){if(sh.over)continue;const b_=bestIn(sh,pt);if(b_){place(sh,pt,b_.rot,b_.f);placed=true;break}}
+      if(placed)continue;const sh=newSheet(),b_=bestIn(sh,pt);
+      if(b_)place(sh,pt,b_.rot,b_.f);else{sh.over=true;sh.items.push({p:pt.p,pt,rot:pt.rots[0],x:gap,y:gap})}}
+    return out};
+  const byLong=parts.slice().sort((a,b)=>Math.max(b.rots[0].test.W,b.rots[0].test.H)-Math.max(a.rots[0].test.W,a.rots[0].test.H)||b.area-a.area);
+  const tries=[run(1,parts)];if(tries[0].length>1){tries.push(run(0,parts));if(Math.min(...tries.map(o=>o.length))>1)tries.push(run(1,byLong),run(0,byLong))}
+  const score=o=>o.length*1e9+(o.length?o[o.length-1].cells:0);
+  const win=tries.reduce((m,o)=>score(o)<score(m)?o:m);
+  sheets=win.map(sh=>({over:sh.over,occ:sh.occ,items:sh.items.map(it=>({p:it.p,...it.rot.data(),x:it.x,y:it.y}))}));
 }
 
 /* ---------------- sheets canvas ---------------- */
@@ -1573,11 +1581,12 @@ function syncInputs(){$$('[data-k]').forEach(el=>{const v=S[el.dataset.k];if(el.
 $$('[data-k]').forEach(el=>el.addEventListener('change',()=>{const k=el.dataset.k,old=S[k];
   if(el.type==='checkbox')S[k]=el.checked;else if(el.tagName==='SELECT')S[k]=isNaN(+el.value)?el.value:+el.value;
   else S[k]=Math.max(+el.min||0,+el.value||0);
-  if(k==='scaleDen'&&(old===1)!==(S[k]===1)){Object.assign(S,S[k]===1?FULL_DEF:MODEL_DEF);syncInputs()}
+  if(k==='scaleDen'&&(old===1)!==(S[k]===1)){Object.assign(S,S[k]===1?FULL_DEF:MODEL_DEF);S.rateSet=true;syncInputs()}
   updateMachinePanel();
   if(TEST_KEYS.has(k)){save();if(view==='test')buildTest(true);return}
-  if(['sheetCost','screwCost','feed','shopRate'].includes(k)){save();updateCost();return}
   if(k==='showPaths'){save();if(view==='sheets')drawFlat();return}
+  if(k==='priceOn'){$('#price').hidden=!S.priceOn;if(S.priceOn)updateSheetsPanel(true);save();return}
+  if(k==='sheetCost'||k==='screwCost'||k==='feed'||k==='shopRate'){S.rateSet=true;updateCost();save();return}
   if((k==='sheetW'||k==='sheetH'||k==='gap')&&!S.splice){updateSheetsPanel();if(view==='sheets'){fitFlat();drawFlat()}save();return}
   schedule()}));
 /* diagrams: a field and its dimension light up together */
@@ -2034,10 +2043,26 @@ async function save3D(){if(!await needUnlock())return;freshen();if(meshDirty)bui
 /* cost: sheets, screws and machine time */
 function costInfo(){freshen();layout();const cnc=S.machine==='cnc',k=scl(),thk=thkModel()*k,passes=cnc?Math.max(1,Math.ceil((thk+S.overcut)/Math.max(.01,S.stepdown))):1;
   let L=0;for(const p of lastPanels)for(const pl of p.path||[])for(let i=0;i<pl.length;i++){const a=pl[i],b=pl[(i+1)%pl.length];L+=Math.hypot(b[0]-a[0],b[1]-a[1])}
-  const nS=allScrews.filter(s=>!s.flag).length,mins=L*passes/Math.max(1,S.feed)+nS*(S.screwMark==='poke'?.05:.08)+lastPanels.length*.3;
-  const cost=sheets.length*S.sheetCost+nS*S.screwCost+mins/60*S.shopRate;return {sheets:sheets.length,nS,mins,cost}}
+  const nS=allScrews.filter(s=>!s.flag).length,mins=L*k*passes/Math.max(1,S.feed)+nS*(S.screwMark==='poke'?.05:.08)+lastPanels.filter(p=>p.part?.length).length*.3;
+  const wood=sheets.length*S.sheetCost,scr=nS*S.screwCost,cut=mins/60*S.shopRate;
+  /* how full each sheet is, by the wood actually on it */
+  const use=sheets.map(sh=>sh.items.reduce((a,it)=>a+it.p.part.reduce((x,c)=>x+areaF(c),0)*k*k,0)/(S.sheetW*S.sheetH));
+  return {sheets:sheets.length,nS,mins,cost:wood+scr+cut,wood,scr,cut,use}}
+const money=x=>'$'+Math.round(x).toLocaleString(),hours=m=>m<90?Math.round(m)+' min':(m/60).toFixed(1)+' h';
 function updateCost(){const el=$('#costLine');if(!el)return;const c=costInfo();
-  el.innerHTML=`<b>${c.sheets} sheet${c.sheets===1?'':'s'}</b> · ${c.nS} screws · about ${c.mins<90?Math.round(c.mins)+' min':(c.mins/60).toFixed(1)+' h'} of cutting · <b>≈ $${Math.round(c.cost).toLocaleString()}</b>`}
+  el.innerHTML=`<b>${c.sheets} sheet${c.sheets===1?'':'s'}</b> · ${c.nS} screws · about ${hours(c.mins)} of cutting · <b>≈ ${money(c.cost)}</b>`;
+  const P=$('#price');if(!P)return;P.hidden=S.priceOn===false||!blocks.length;P.classList.remove('stale');
+  $('#priceTot').textContent='≈ '+money(c.cost);$('#priceSub').textContent=c.sheets+(c.sheets===1?' sheet':' sheets');
+  $('#pWood').textContent=`${c.sheets} × ${money(S.sheetCost)} = ${money(c.wood)}`;$('#pCut').textContent=S.shopRate?`${hours(c.mins)} × ${money(S.shopRate)}/h = ${money(c.cut)}`:`${hours(c.mins)}, no shop rate set`;
+  $('#pScr').textContent=c.nS?`${c.nS} × ${S.screwCost?'$'+S.screwCost.toFixed(2):'$0'} = ${money(c.scr)}`:'none';$('#pTot').textContent=money(c.cost);
+  /* one hint at most, only when it would really change the price */
+  let hint='';const lo=c.use.length>1?c.use.reduce((m,u,i)=>u<m.u?{u,i}:m,{u:1,i:-1}):null;
+  if(lo&&lo.u<.3)hint=`Sheet ${lo.i+1} is only ${Math.round(lo.u*100)}% full. A slightly smaller obstacle would save that sheet (${money(S.sheetCost)}).`;
+  else if(S.shopRate&&c.cut>c.wood*1.5)hint='Most of this is machine time. Fewer ribs or corner blocks cut it down.';
+  $('#pHint').hidden=!hint;$('#pHint').textContent=hint;XR.price=c;if(xrMode)drawMenu()}
+$('#priceChip').onclick=()=>{const c=$('#priceCard'),open=c.hidden;c.hidden=!open;$('#priceChip').setAttribute('aria-expanded',open);if(open&&(dirty||sheetsStale)){freshen();updateSheetsPanel(true)}};
+$('#priceHide').onclick=()=>{S.priceOn=false;$('#price').hidden=true;$('#priceCard').hidden=true;syncInputs();save();toast('Price tag hidden. Bring it back in Sheets › Cost.')};
+$('#priceRates').onclick=()=>{$('#priceCard').hidden=true;if($('.tab[data-tab=sheets]').getAttribute('aria-selected')!=='true'||$('#app').classList.contains('collapsed'))$('.tab[data-tab=sheets]').click();setTimeout(()=>$('#sheetCost')?.scrollIntoView({block:'center'}),60)};
 /* booklet: one picture per build step, rendered from the Build view */
 async function saveBooklet(){if(!await needUnlock())return;freshen();if(!dl){toast('Saving isn’t available here');return}
   toast('Drawing the build steps…');await new Promise(r=>setTimeout(r,30));
@@ -2122,7 +2147,7 @@ function undo(){if(undoS.length<2)return;redoS.push(undoS.pop());restoreModel(un
 function redo(){if(!redoS.length)return;const j=redoS.pop();undoS.push(j);restoreModel(j);updUndo();toast('Redone')}
 function save(){clearTimeout(saveT);saveT=setTimeout(()=>{const j=JSON.stringify(serModel());try{localStorage.setItem(KEY,j)}catch(e){}pushUndo(j)},300)}
 function load(){try{let d=JSON.parse(localStorage.getItem(KEY));
-    if(d&&d.blocks){Object.assign(S,d.S||{});d.blocks.forEach(makeBlock);return true}
+    if(d&&d.blocks){Object.assign(S,d.S||{});if(!S.rateSet&&S.scaleDen===1&&!S.shopRate)S.shopRate=FULL_DEF.shopRate;d.blocks.forEach(makeBlock);return true}
     d=JSON.parse(localStorage.getItem('plyGrammar.v1'));               // earlier version: keep the model, reset names to letters
     if(d&&d.blocks){d.blocks.forEach(x=>makeBlock({...x,name:null}));return true}}catch(e){}return false}
 /* a fresh start is one obstacle: the app is about getting a single piece right */
@@ -2135,7 +2160,6 @@ setTimeout(()=>pushUndo(JSON.stringify(serModel())),0);
    cut-out moves it, grip on empty space moves the whole model and both grips turn and scale it, the left stick flies,
    A undoes, B redoes, X hides the menu, Y sets the floor again. */
 const xray=new THREE.Raycaster();
-const XR={step:null,base:null,floorH:0,hover:-1,W:[],navN:0,nav:null};
 try{XR.floorH=+(localStorage.getItem('pgFloor')||0)||0}catch(e){}
 function ctrlModel(col){const g=new THREE.Group(),m=new THREE.MeshStandardMaterial({color:col,roughness:.45}),dk=new THREE.MeshStandardMaterial({color:0x15181D,roughness:.6});
   const body=new THREE.Mesh(new THREE.CapsuleGeometry(.019,.075,6,14),m);body.rotation.x=Math.PI/2+.45;body.position.set(0,-.018,.05);g.add(body);
@@ -2170,8 +2194,8 @@ function setFloor(h){XR.floorH=Math.round(Math.max(-.3,Math.min(1.8,h))*100)/100
 function floorStep(on){XR.step=on?'floor':null;floorGrid.visible=on;menu.visible=true;
   if(!on)menuMsg=view==='mass'?'Trigger a face to push or pull it. Grip a box to move it.':'Panels view: grip a part to look closer.';drawMenu()}
 /* the menu: one canvas on the left controller */
-const MW=1024,MH=980;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
-const menu=new THREE.Mesh(new THREE.PlaneGeometry(.27*MW/MH,.27),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
+const MW=1024,MH=1100;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
+const menu=new THREE.Mesh(new THREE.PlaneGeometry(.30*MW/MH,.30),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
 let menuMsg='Trigger a face to push or pull it. Grip a box to move it.';
 const MX=menuCv.getContext('2d');
 function mText(s,x,y,size=34,col='#E9ECF1',al='left',wt=600){MX.fillStyle=col;MX.font=`${wt} ${size}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;MX.textAlign=al;MX.textBaseline='middle';MX.fillText(s,x,y)}
@@ -2193,6 +2217,7 @@ function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.be
     B(c3[0],y,w3,'Delete',{click:()=>menuDo('del')});B(c3[1],y,w3,'Undo  (A)',{click:()=>menuDo('undo')});B(c3[2],y,w3,'Redo  (B)',{click:()=>menuDo('redo')});y+=124;
     B(c2[0],y,w2,'Tabletop 1:12',{on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}});B(c2[1],y,w2,'Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}});y+=124;
     B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor  (Y)',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=150;
+    {const c=XR.price;B(48,y-26,MW-96,c?`≈ ${money(c.cost)}  ·  ${c.sheets} sheet${c.sheets===1?'':'s'}  ·  ${hours(c.mins)} cutting`:'Price: tap to work it out',{solid:!!c,col:'#15181D',fs:c?38:34,click:()=>{menuMsg='Working out the price…';drawMenu();setTimeout(()=>{freshen();updateSheetsPanel(true);menuMsg='Price updated.';drawMenu()},50)}});y+=124}
     MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,2)+18;
     mWrap('Trigger a face: push or pull it. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly. X: hide this menu.',48,y,MW-96,26,'#8B93A1',36,4)}
   menuTex.needsUpdate=true}
