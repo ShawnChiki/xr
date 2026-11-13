@@ -92,8 +92,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p4.2"></script>
-<script src="solver.js?v=p4.2"></script>
+<script src="demo.js?v=p4.3"></script>
+<script src="solver.js?v=p4.3"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -107,7 +107,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '4.2';
+const VERSION = '4.3';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -3744,9 +3744,21 @@ class BCPeer {
   destroy(){ try { this.bc.close(); } catch (e) {} }
 }
 const NET = (() => {
-  const st = { on: false, host: false, guest: false, ui: 'idle', code: '', entry: '', status: '', peer: null, conns: new Map(), conn: null, slot: 0, roster: [], lastArr: null, lastDabs: null, lastRuns: '', lastSet: '', applying: false, poseT: 0, checkT: 0, synced: false, queue: [] };
+  const st = { log: [], lastDrop: '', on: false, host: false, guest: false, ui: 'idle', code: '', entry: '', status: '', peer: null, conns: new Map(), conn: null, slot: 0, roster: [], lastArr: null, lastDabs: null, lastRuns: '', lastSet: '', applying: false, poseT: 0, checkT: 0, synced: false, queue: [] };
   const loadPeer = () => NET_TEST || window.Peer ? Promise.resolve() : new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'; s.onload = res; s.onerror = () => rej(new Error('load')); document.head.append(s); });
-  const makePeer = id => NET_TEST ? new BCPeer(id) : (id ? new window.Peer(id, { debug: 1 }) : new window.Peer({ debug: 1 }));
+  const ICE = { iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }, { urls: 'stun:global.stun.twilio.com:3478' },
+    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' }], sdpSemantics: 'unified-plan' };
+  const makePeer = id => NET_TEST ? new BCPeer(id) : (id ? new window.Peer(id, { debug: 1, config: ICE }) : new window.Peer({ debug: 1, config: ICE }));
+  // ---- keeping the link alive, and noting why it dropped (shown in Files, so a drop can be tracked down)
+  const now = () => performance.now();
+  function note(what){ st.log.push(Math.round((now() - (st.t0 || now())) / 1000) + 's ' + what); if (st.log.length > 8) st.log.shift(); menuDirty = true; }
+  function watch(c, who){ c.lastHeard = now();
+    const pc = c.peerConnection; if (pc && pc.addEventListener){ pc.addEventListener('iceconnectionstatechange', () => note(who + ' network: ' + pc.iceConnectionState)); pc.addEventListener('connectionstatechange', () => { if (pc.connectionState === 'failed') note(who + ' link failed'); }); } }
+  function dropped(why){ st.lastDrop = why + ' after ' + Math.round((now() - (st.t0 || now())) / 1000) + 's'; note('dropped: ' + why); }
+  // a heartbeat on a timer (it keeps going when a headset isn't drawing frames); 20 s of silence counts as gone
+  setInterval(() => { if (!st.on) return; send({ t: 'hb' }); const t = now();
+    if (st.guest && st.conn && t - (st.conn.lastHeard || t) > 20000){ dropped('no word from the host for 20 s'); try { st.conn.close(); } catch (e){} st.conn.emit ? st.conn.emit('close') : 0; }
+    if (st.host) for (const [pid, c] of st.conns) if (t - (c.lastHeard || t) > 20000){ note('no word from a guest for 20 s'); try { c.close(); } catch (e){} if (c.emit) c.emit('close'); } }, 2000);
   const status = s => { st.status = s; menuDirty = true; };
   const r4 = v => Math.round(v * 1e4) / 1e4;
 
@@ -3810,7 +3822,7 @@ const NET = (() => {
     // your lines keep ids under the guests' ranges
     if (strokes.some(s => s.id >= ID_SPAN)){ strokes = strokes.map((s, i) => Object.assign({}, s, { id: i + 1 })); nextId = strokes.length + 1; undoS = []; redoS = []; changed(); rebuildHandles(); }
     const tryCode = left => { const code = String(1000 + Math.floor(Math.random() * 9000)), peer = makePeer(NET_PREFIX + code); st.peer = peer;
-      peer.on('open', id => { Object.assign(st, { code, on: true, host: true, guest: false, ui: 'live', slot: 0 }); st.roster = [{ slot: 0, pid: id }]; remember(); st.synced = true; status('Room ' + code + ' is open. Tell your friends the code.'); voice.ready = voiceStart(); });
+      peer.on('open', id => { Object.assign(st, { code, on: true, host: true, guest: false, ui: 'live', slot: 0 }); st.roster = [{ slot: 0, pid: id }]; remember(); st.synced = true; st.t0 = now(); note('room open'); status('Room ' + code + ' is open. Tell your friends the code.'); voice.ready = voiceStart(); });
       peer.on('connection', c => attachGuest(c)); peer.on('disconnected', () => { setTimeout(() => { try { if (st.peer === peer && !peer.destroyed) peer.reconnect(); } catch (e){} }, 1000); });
       peer.on('call', c => (voice.ready || Promise.resolve()).then(() => { c.answer(voice.local || silentStream()); voiceAttach(c); }));
       peer.on('error', e => { if (e.type === 'unavailable-id' && left > 0){ peer.destroy(); tryCode(left - 1); return; }
@@ -3825,10 +3837,10 @@ const NET = (() => {
       sendConn(c, { t: 'welcome', slot, state: full(), others: st.roster.filter(p => p.pid !== c.peer).map(p => ({ slot: p.slot, pid: p.pid })) });
       send(rosterMsg()); flash('Player ' + (slot + 1) + ' joined'); menuDirty = true; chime(true);
     });
-    c.on('data', m => onData(m, c.peer));
+    c.on('data', m => { c.lastHeard = now(); onData(m, c.peer); }); c.on('open', () => watch(c, 'guest'));
     const gone = () => { if (!st.conns.has(c.peer)) return; st.conns.delete(c.peer); const p = st.roster.find(q => q.pid === c.peer); st.roster = st.roster.filter(q => q.pid !== c.peer);
       if (p){ const a = avatars.get(p.slot); if (a){ dropAvatar(a); avatars.delete(p.slot); } flash('Player ' + (p.slot + 1) + ' left'); } send(rosterMsg()); menuDirty = true; chime(false); };
-    c.on('close', gone); c.on('error', gone);
+    c.on('close', () => { note('a guest closed'); gone(); }); c.on('error', e => { note('a guest errored: ' + (e && (e.type || e.message))); gone(); });
   }
   // a guest who loses the host tries again a few times (keeping their copy of the park meanwhile)
   function retry(code, n){ if (st.cancel) return; if (n > 6){ st.ui = 'join'; status('Lost room ' + code + '. Your copy of the park is still here. Join again when the host is back.'); flash('Couldn\'t get back into the room', 4); return; }
@@ -3838,24 +3850,26 @@ const NET = (() => {
     try { await loadPeer(); } catch (e){ st.ui = 'join'; return status('Couldn\'t load the multiplayer library. Check the internet and try again.'); }
     const peer = makePeer(); st.peer = peer;
     peer.on('open', () => { const c = peer.connect(NET_PREFIX + code, { reliable: true, serialization: 'json' }); st.conn = c;
-      c.on('open', () => { Object.assign(st, { on: true, guest: true, host: false, ui: 'live' }); status('Connected to room ' + code); });
-      c.on('data', m => onData(m, 'host'));
-      const lost = () => { if (!st.on) return; reset(); flash('Lost the connection to the host: reconnecting', 3); chime(false); retry(code, 1); };
-      c.on('close', lost); c.on('error', lost); });
+      c.on('open', () => { Object.assign(st, { on: true, guest: true, host: false, ui: 'live' }); st.t0 = now(); watch(c, 'host'); note('joined'); status('Connected to room ' + code); });
+      c.on('data', m => { c.lastHeard = now(); onData(m, 'host'); });
+      const lost = (e) => { if (!st.on) return; if (!st.lastDrop || !/after/.test(st.lastDrop) || st.lastDropAt !== st.t0) dropped(e && (e.type || e.message) ? 'error ' + (e.type || e.message) : 'the host link closed'); st.lastDropAt = st.t0; st.wasIn = true; reset(); flash('Lost the connection to the host: reconnecting', 3); chime(false); retry(code, 1); };
+      c.on('close', () => lost()); c.on('error', e => lost(e)); });
     peer.on('disconnected', () => { setTimeout(() => { try { if (st.peer === peer && !peer.destroyed) peer.reconnect(); } catch (e){} }, 1000); });
     peer.on('call', c => (voice.ready || Promise.resolve()).then(() => { c.answer(voice.local || silentStream()); voiceAttach(c); }));
     peer.on('error', e => { if (st.on) return; if (attempt){ retry(code, attempt + 1); return; } st.ui = 'join';
       status(e.type === 'peer-unavailable' ? 'No room with code ' + code + '. Check the number.' : e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' ? 'Can\'t reach the matchmaker. Check the internet and try again.' : 'Something went wrong (' + e.type + '). Try again.'); });
     setTimeout(() => { if (!st.on && st.ui === 'busy' && st.peer === peer){ if (attempt){ retry(code, attempt + 1); return; } st.ui = 'join'; status('Couldn\'t connect. Try again, or both use home WiFi.'); } }, 15000);
   }
-  function leave(){ st.cancel = true; if (st.on){ send({ t: 'bye' }); flash('Left the room'); } reset(); status(''); }
+  function leave(){ st.cancel = true; st.wasIn = false; if (st.on){ send({ t: 'bye' }); flash('Left the room'); } reset(); status(''); }
   function onData(m, from){
-    if (!m || !m.t) return;
+    if (!m || !m.t || m.t === 'hb') return;
     if (m.t === 'ck'){ const key = from + '|' + m.id; let b = ckBuf.get(key); if (!b) ckBuf.set(key, b = { n: m.n, got: 0, parts: [] });
       if (b.parts[m.i] == null){ b.parts[m.i] = m.d; b.got++; } if (b.got === b.n){ ckBuf.delete(key); let whole; try { whole = JSON.parse(b.parts.join('')); } catch (e){ return; } onData(whole, from); } return; }
     if (st.host && from !== 'host' && from !== 'queued' && ['ops', 'runs', 'set', 'pose', 'layers', 'mi'].includes(m.t)) send(m, from);   // pass it on to everyone else
     if ((m.t === 'ops' || m.t === 'full' || m.t === 'runs') && editOpen){ st.queue.push(m); return; }   // after your own edit is done
-    if (m.t === 'welcome'){ st.slot = m.slot; st.synced = true; nextId = Math.max(nextId % ID_SPAN, 1) + m.slot * ID_SPAN; applyFull(m.state, true); st.roster = [{ slot: m.slot, pid: st.peer.id }, ...m.others];
+    if (m.t === 'welcome'){ const mine = st.wasIn && st.lastIds ? diff() : null; st.slot = m.slot; st.synced = true; nextId = Math.max(nextId % ID_SPAN, 1) + m.slot * ID_SPAN; applyFull(m.state, !st.wasIn);
+      // back after a drop: what you drew or changed while you were out goes back in (and on to everyone)
+      if (mine && (mine.add.length || mine.del.length)){ strokes = applyTo(strokes, mine, mine.add.map(unpackOne)); changed(); rebuildHandles(); flash('Back in the room, with what you did while you were out', 4); } st.roster = [{ slot: m.slot, pid: st.peer.id }, ...m.others];
       flash('Joined room ' + st.code + ' as player ' + (m.slot + 1), 4); chime(true); voice.ready = voiceStart().then(() => { for (const p of m.others) if (!NET_TEST && voice.local !== undefined) voiceAttach(st.peer.call(p.pid, voice.local || silentStream())); }); }
     else if (m.t === 'roster'){ st.roster = m.list; for (const [slot, a] of avatars) if (!m.list.some(p => p.slot === slot)){ dropAvatar(a); avatars.delete(slot); } menuDirty = true; }
     else if (m.t === 'ops') applyOps(m);
@@ -4601,6 +4615,7 @@ function setStep(st, quiet){
     act: () => { if (k === '⌫') nst.entry = nst.entry.slice(0, -1); else if (k === 'Join'){ if (nst.entry.length === 4) NET.join(nst.entry); else flash('The code is 4 digits'); } else if (nst.entry.length < 4) nst.entry += k; menuDirty = true; } })), { vis: netJoining, gap: 10 });
   row('files', 60, [{ id: 'net-cancel', label: () => 'Cancel', act: () => NET.leave() }], { vis: netJoining });
   note('files', () => (nst.host ? 'You\'re the host: you are P1. ' : 'You are P' + (nst.slot + 1) + '. ') + 'Lines, paint, runs and build settings are shared; each of you has your own step, size and view, so one can skate while another sketches. Your undo only takes back your own changes. ' + (nst.host ? 'Opening a sketch sends it to everyone.' : 'Only the host can open, clear or load a sketch.') + ' SubD shaping and Fab aren\'t shared yet.', { vis: netLive });
+  note('files', () => 'Last drop: ' + nst.lastDrop + '. What happened: ' + nst.log.slice(-5).join(' · '), { vis: () => !!nst.lastDrop });
   row('files', 72, [
     { id: 'net-mic', label: () => !NET.hasMic ? 'No mic' : NET.muted ? 'Mic off' : 'Mic on', on: () => NET.hasMic && !NET.muted, act: () => NET.mute(!NET.muted) },
     { id: 'net-leave', label: () => nst.host ? 'Close room' : 'Leave', style: 'danger', act: () => NET.leave() }], { vis: netLive });
