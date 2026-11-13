@@ -57,6 +57,8 @@ function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,
       if(best>=4){const th=b.thin||[],ex=th.some(x=>[x.A,x.B].includes(name0+f.num)||[x.A,x.B].includes(name0+g.num));I(ex?'empty-socket-thin(explained)':'empty-socket',name0+f.num+'|'+name0+g.num+' '+(best*.25).toFixed(1)+'in')}}))}
   const mp=mergeSplices(ps),faces=mp.filter(p=>p.kind==='face');if(!faces.length){I('nofaces','');return out}
   const base=basePanel(faces).label,plan=planAssembly(mp,base),P=plan.parts,thin=b.thin||[];
+  /* a corner block must have something to hold it when it goes in */
+  {const at=new Map();plan.steps.forEach((s,k)=>{at.set(s.i,k);s.with.forEach(j=>at.set(j,k))});const fl=plan.parts.filter(P=>P.kind==='cleat'&&![...plan.touch[P.idx]].some(j=>at.get(j)<=at.get(P.idx)));if(fl.length)I('floating-block',fl.map(P=>P.label).join(' '))}
   for(const [i,j] of plan.clash){const ex=thin.some(x=>[x.A,x.B].includes(P[i].label)||[x.A,x.B].includes(P[j].label))||b.strips?.length>0;I(ex?'overlap-thin(explained)':'overlap',P[i].label+'x'+P[j].label)}
   for(const s of plan.steps)if(s.stuck)I('stuck',P[s.i].label+'['+s.stuck.join('/')+']');
   P.forEach((p,i)=>{if(i!==P.findIndex(q=>q.label===base)&&!plan.touch[i].size)I('floating',p.label)});

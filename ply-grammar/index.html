@@ -514,7 +514,7 @@ kbd{font:11px var(--f-mono);border:1px solid var(--line);border-bottom-width:2px
         </div>
         <div class="seg"><button id="undoBtn" title="Undo (Ctrl+Z)" aria-label="Undo" disabled>↶</button><button id="redoBtn" title="Redo (Ctrl+Shift+Z)" aria-label="Redo" disabled>↷</button></div>
         <div class="seg"><button id="secBtn" aria-pressed="false" title="Cut a section to see inside">Section</button><button id="planesBtn" aria-pressed="true" title="Show or hide the cut planes and cut-out boxes (V)">Planes <kbd>V</kbd></button></div>
-        <div class="seg" id="explodeSeg" hidden><button id="explodeBtn" aria-pressed="false">Explode</button><button id="sandBtn" aria-pressed="false" title="Trim proud fingers and tabs flush">Sanded</button><button id="screwBtn" aria-pressed="false" title="Show every screw where it goes in">Screws</button><button id="birchBtn" aria-pressed="false" title="Show every part as Baltic birch">Birch</button></div>
+        <div class="seg" id="explodeSeg" hidden><button id="explodeBtn" aria-pressed="false">Explode</button><button id="sandBtn" aria-pressed="false" title="Trim proud fingers and tabs flush">Sanded</button><button id="screwBtn" aria-pressed="false" title="Show every screw where it goes in">Screws</button><button id="gapBtn" aria-pressed="false" title="Mark every spot on the outside with no wood under it">Gaps</button><button id="birchBtn" aria-pressed="false" title="Show every part as Baltic birch">Birch</button></div>
         <div class="seg" id="panelBar" hidden><button id="selPanelName" disabled style="opacity:1;color:var(--ink);font-family:var(--f-display);font-weight:600"></button><button id="hideBtn">Hide <kbd>H</kbd></button><button id="isoBtn">Isolate <kbd>I</kbd></button><button id="showAllBtn">Show all</button></div>
       </div>
     </div>
@@ -708,6 +708,8 @@ function segDist(p1,q1,p2,q2){const d1=q1.clone().sub(p1),d2=q2.clone().sub(p2),
 /* ---------------- blocks ---------------- */
 /* a joint sharper than square by more than this is 'sharp': a screw driven through one plate there would break out of the other */
 const SHARP=Math.sin(4*Math.PI/180);
+/* a rib tab may pass through a face that leans across the rib by up to this much; it then stands proud enough to sand flush all the way across */
+const LEAN_MAX=Math.sin(15.5*Math.PI/180);
 const blocks=[];let uid=0;
 const _wi=new THREE.Matrix4();
 function poseIn(obj){world.updateMatrixWorld(true);obj.updateWorldMatrix(true,false);_wi.copy(world.matrixWorld).invert();
@@ -769,6 +771,33 @@ const cleatSpots=(L,leg,t)=>{const margin=Math.max(leg*.6,t*3),avail=L-2*margin;
 /* a screw either side of every tab pulls the plate down tight right where the tab locates it; with no tabs, evenly along the edge */
 const ribScrewSpots=(tcs,tabW,t,Le,tabM,use,nt)=>{if(!tcs.length)return Array.from({length:nt+1},(_,z)=>tabM+use*z/nt);const sg=t*1.6,out=[];
   for(const c of tcs)for(const x of [c-tabW/2-sg,c+tabW/2+sg]){if(x<t*1.2||x>Le-t*1.2||out.some(y=>Math.abs(y-x)<t*2))continue;out.push(x)}return out};
+/* Rib blocks. Where a face leans more than 15 degrees across a rib, a tab would need a slot much wider than itself, so the rib is
+   tied to that face with small blocks instead: a plate standing square to both, in the corner between the rib's side and the face's
+   inside surface, on the side where that corner is open. One leg lies on the face and one on the rib, and each is held by two screws
+   driven square through the plate it sits on, so nothing shows but screw heads. Returns how many were placed along this rib edge. */
+function ribBlockRun(o){const {f,n,dIn,a3,dir3,Le,axis,t,near,hit,ribPlanes,rmarks,to2R,to2f,panels,name,mc,screwInto,xScr,cnt,ribLabel,lh,k}=o;
+  const leg=Math.min(S.cleatLeg,Math.max(3,Le*.6)),margin=Math.max(leg*.5,t*2.5),use=Le-2*margin;if(Le<Math.max(leg,5))return 0;
+  const nb=use>0?Math.max(1,Math.round(use/Math.max(S.cleatSpacing*2,10))+1):1,spots=nb===1?[Le/2]:Array.from({length:nb},(_,z)=>margin+use*z/(nb-1)),clr=Math.max(t*.5,.04);let made=0;
+  for(const c of spots){const P0=a3.clone().addScaledVector(dir3,c),sg=n.dot(axis)<0?1:-1,X0=P0.clone().addScaledVector(axis,sg*t/2),r_=n.clone().addScaledVector(axis,-n.dot(axis)).normalize(),den=n.dot(r_);if(Math.abs(den)<.2)continue;
+    const C=X0.clone().addScaledVector(r_,(dIn-n.dot(X0))/den),dR=r_.clone().negate(),dF=axis.clone().multiplyScalar(sg).addScaledVector(n,-sg*axis.dot(n)).normalize();
+    const phi=Math.acos(Math.max(-1,Math.min(1,dF.dot(dR)))),sp=Math.sin(phi);if(sp<.3)continue;const ch=t*.3;
+    let poly=[C.clone().addScaledVector(dF,ch)];for(let z=0;z<=12;z++){const tt=z/12,w1=Math.sin((1-tt)*phi)/sp,w2=Math.sin(tt*phi)/sp;poly.push(C.clone().addScaledVector(dF,leg*w1).addScaledVector(dR,leg*w2))}poly.push(C.clone().addScaledVector(dR,ch));
+    const a0=area3(poly,dir3);for(const h of near(C,leg)){const tp=clipPoly(poly,h);if(tp.length<3){poly=[];break}poly=tp}
+    if(poly.length<3||area3(poly,dir3)<a0*.45)continue;
+    /* keep off any rib that crosses here, and out of every plate */
+    if(ribPlanes.some(rp=>Math.abs(rp.axis.dot(axis))<.9&&Math.abs(rp.axis.dot(C)-rp.d)<t/2+clr+t*.5))continue;
+    const cen=poly.reduce((a,P)=>a.add(P),new V()).multiplyScalar(1/poly.length);if(poly.some(P=>hit(P.clone().lerp(cen,.06))))continue;
+    let lgF=0,lgR=0;poly.forEach(P=>{const d=P.clone().sub(C);if(Math.abs(n.dot(P)-dIn)<1e-3)lgF=Math.max(lgF,d.dot(dF));if(Math.abs(axis.dot(d))<1e-3&&Math.abs(d.dot(dF)-d.dot(dR)*dF.dot(dR))<1e-3)lgR=Math.max(lgR,d.dot(dR))});
+    if(lgF<t*2.5||lgR<t*2.5)continue;
+    const fp=[[0,-1],[lgF,-1],[lgF,1],[0,1]].map(([s_,w])=>to2f(C.clone().addScaledVector(dF,s_).addScaledVector(dir3,w*(t/2+clr))));if(f.keep.some(K=>overlap(fp,K)))continue;
+    made++;const id=++cnt.n,label=name+'K'+id,v=new V().crossVectors(dir3,dF),fr={O:C,u:dF.clone(),v,n:dir3.clone()};let p2=poly.map(P=>{const d=P.clone().sub(C);return [d.dot(dF),d.dot(v)]});if(areaF(p2)<0)p2.reverse();
+    f.keep.push(fp);
+    if(S.screws){for(const s_ of [lgF*.38,lgF*.78])screwInto(f,C.clone().addScaledVector(dF,s_).addScaledVector(n,t),'JK'+id);
+      for(const s_ of [lgR*.38,lgR*.78]){const Y=C.clone().addScaledVector(dR,s_);rmarks.push(to2R(Y));xScr.push({f:{pl:{id:'__rib'}},p3:Y.clone().addScaledVector(axis,-sg*t),n:axis.clone().multiplyScalar(-sg),name:ribLabel,edge:'JK'+id,flag:''})}}
+    const fin=finish([p2],[],[],mc),engr=[];
+    if(S.labels){const txt=ribLabel.slice(name.length)+'>'+f.num,bh=Math.min(lh*.4,S.edgeLabelH/k*.8),Lb=placeLabel(txt,p2,[],bh,()=>gridCands(p2),[[1,0],[0,1]]);if(Lb)engr.push(...strokes(txt,Lb.c,Lb.sz,Lb.ax))}
+    panels.push({kind:'cleat',sub:'rib',joint:ribLabel+'>'+name+f.num,label,frame:fr,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#E7C48E'})}
+  return made}
 /* Where the ribs sit. They start evenly spaced along the box; then each family slides as a group (up to 30% of its spacing) and
    spreads or closes up a little, to make the longest unsupported stretch of any face as short as it can be. On a face that leans
    across both families their ribs land side by side, and without this two of them can meet in the middle and leave the rest bare.
@@ -901,6 +930,7 @@ function panelizeShell(b,name,B){
     return {key:x.ekey,a:x.A,b:x.B,label:f.num+letter(qf)+'>'+g.num+letter(qg),ang:Math.round(Math.acos(Math.max(-1,Math.min(1,x.cp)))*180/Math.PI)+(x.convex?0:180),
       o:x.o,blk:x.blk,ends:x.ends,joint:x.joint,faces:[{id:f.pl.id,num:f.num},{id:g.pl.id,num:g.num}],offSq:x.offSq,inside:!x.convex,uIn:{[f.pl.id]:ef.inF.clone(),[g.pl.id]:eg.inF.clone()}}});
   const panels=[],ribPlanes=[];
+  const xScr=[],kCnt={n:0};
   const slotOn=(f,e0,e1,out3,h,thick,extra=0,commit=true)=>{const pts=[];
     for(const e of [e0,e1,e0.clone().addScaledVector(out3,h),e1.clone().addScaledVector(out3,h)])for(const sg of [-1,1])pts.push(to2(f,e.clone().addScaledVector(thick,sg*t/2)));
     const dir3=e1.clone().sub(e0).normalize();let ax=[dir3.dot(f.u),dir3.dot(f.v)];const al=Math.hypot(...ax)||1;ax=mul(ax,1/al);const pp=[-ax[1],ax[0]];
@@ -994,7 +1024,7 @@ function panelizeShell(b,name,B){
     const opensOut=f=>{if(openMemo.has(f))return openMemo.get(f);const pts=f.E.filter(e=>e.ci===0&&e.L>1e-6).map(e=>e.A),c=pts.reduce((a,p)=>a.add(p),new V()).multiplyScalar(1/pts.length);
       const ok=[c,...pts.map(p=>p.clone().lerp(c,.2))].every(P0=>{for(let d=t*1.5;d<far;d+=1)if(inSolid(P0.clone().addScaledVector(f.n,d)))return false;return true});openMemo.set(f,ok);return ok};
     ribs.forEach((rb,ri)=>{const {axis}=rb,r=ri+1,{O,u,v}=rb.sec,R={O,u,v,n:axis.clone()},to2R=P=>{const d=P.clone().sub(O);return [d.dot(u),d.dot(v)]};
-      const cts=[posC(rb.sh.outer),...rb.sh.holes.map(negC)],tabs=[],notch2=rb.notches.map(nq=>nq.map(to2R));
+      const cts=[posC(rb.sh.outer),...rb.sh.holes.map(negC)],tabs=[],rmarks=[],notch2=rb.notches.map(nq=>nq.map(to2R));
       for(const ct of cts)for(let j=0;j<ct.length;j++){const a=ct[j],bb=ct[(j+1)%ct.length],Le=Math.hypot(bb[0]-a[0],bb[1]-a[1]);if(Le<1e-6)continue;
         const a3=R3(rb,a),b3=R3(rb,bb),mid3=a3.clone().add(b3).multiplyScalar(.5);
         /* which face's inside surface does this edge sit on? */
@@ -1009,23 +1039,27 @@ function panelizeShell(b,name,B){
            and so does a face that has been turned or tilted off the box's own directions: its finger joints with the plates around it
            are off square, and it could not lift straight off both those and the tabs. */
         const noTab=f.pl.src?.type==='carve'&&(!opensOut(f)||!squareOn(f));
-        if(cosA>=.3){const h=t/cosA,use=Le-2*tabM;
+        if(cosA>=.3){const h=t/cosA,use=Le-2*tabM,lnA=Math.abs(f.n.dot(axis));
+          /* a panel with an inside corner gets flush tabs, so the panel that drops in beside it can slide past. Through a leaning face
+             the tab is cut long enough that sanding brings it flush right across the rib's thickness (up to a 15 degree lean); steeper
+             than that it stops at the face's near side, as before. */
+          const tX=f.E.some(e=>e.nb>=0&&!e.convex)?0:lean>t*.02?(lnA<=LEAN_MAX?tabX+t*lnA/cosA:0):tabX,hS=h+(lean>t*.02?tX:0);
+          const steep=lnA>LEAN_MAX&&S.cleats&&!noTab&&ribBlockRun({f,n:f.n,dIn:f.d-t,a3,dir3,Le,axis,t,ribPlanes,rmarks,to2R,to2f:P=>to2(f,P),panels,name,mc,screwInto,xScr,cnt:kCnt,ribLabel:name+'R'+r,lh,k,
+            near:(C,lg)=>F.filter(h=>h!==f&&!h.skip&&Math.abs(h.n.dot(C)-h.d)<lg+t*2).map(h=>({n:h.n,d:h.d-t})),hit:P=>{const h=inPlate(B,P,t);return h&&h!==f}})>0;
           if(use>=tabW){const nt=Math.max(1,Math.round(use/tabGap)),clrR=Math.max(t,stol*4),midE=Le/2;
-            const tcs=[];for(let z=0;z<nt&&!noTab;z++){const c0=tabM+use*(z+.5)/nt,w=tabW/2,toMid=Math.sign(midE-c0)||1;let c=null;
+            const tcs=[];for(let z=0;z<nt&&!noTab&&!steep;z++){const c0=tabM+use*(z+.5)/nt,w=tabW/2,toMid=Math.sign(midE-c0)||1;let c=null;
               for(const kk of [0,1,2,3,4,-1,-2]){const cc=c0+toMid*kk*tabW*.3;if(cc-w<t||cc+w>Le-t)continue;if(ex.some(x=>Math.abs(x-cc)<w+t*1.5))continue;
                 if(rb.corr){const Hh=h+t,q0=add(a,mul(d,cc-w)),q1=add(a,mul(d,cc+w)),tq=[q0,q1,add(q1,mul(m,-Hh)),add(q0,mul(m,-Hh))];if(rb.corr.some(K=>overlap(tq,K.map(to2R))))continue}
-                const test=slotOn(f,a3.clone().addScaledVector(dir3,cc-w),a3.clone().addScaledVector(dir3,cc+w),out3,h,axis,clrR,false);
+                const test=slotOn(f,a3.clone().addScaledVector(dir3,cc-w),a3.clone().addScaledVector(dir3,cc+w),out3,hS,axis,clrR,false);
                 if(!edgeOK(f,test,minE)||f.keep.some(K=>overlap(test,K)))continue;c=cc;break}
               if(c==null)continue;tcs.push(c);const A0=add(a,mul(d,c-w)),A1=add(a,mul(d,c+w));
-              /* a panel with an inside corner gets flush tabs, so the panel that drops in beside it can slide past */
-              const tX=f.E.some(e=>e.nb>=0&&!e.convex)||lean>t*.02?0:tabX;
               tabs.push([add(A0,mul(m,.02)),add(A1,mul(m,.02)),add(A1,mul(m,-h-tX)),add(A0,mul(m,-h-tX))]);
-              slotOn(f,a3.clone().addScaledVector(dir3,c-w),a3.clone().addScaledVector(dir3,c+w),out3,h,axis)}
+              slotOn(f,a3.clone().addScaledVector(dir3,c-w),a3.clone().addScaledVector(dir3,c+w),out3,hS,axis)}
             if(S.screws&&S.ribScrews&&Math.abs(f.n.dot(axis))<=sOK)for(const c of ribScrewSpots(tcs,tabW,t,Le,tabM,use,nt)){if(ex.some(x=>Math.abs(x-c)<t*2))continue;screwInto(f,a3.clone().addScaledVector(dir3,c).addScaledVector(f.n,t),'R'+r)}}}
         f.keep.push(foot)}
       const label=name+'R'+r,region=[...cts.map(c2path),...tabs.map(q=>c2path(posC(q)))],fin=finishRegion(region,notch2,[],mc),engr=[];
       if(S.labels){const Lb=placeLabel(label,cts[0],[...notch2,...cts.slice(1)],lh,()=>gridCands(cts[0]),[[1,0],[0,1]]);if(Lb){const i0=engr.length;engr.push(...strokes(label,Lb.c,Lb.sz,Lb.ax));engr.lab=[i0,engr.length]}}
-      panels.push({kind:'rib',order:rb.rank,label,frame:R,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#D7B98A'})})}
+      panels.push({kind:'rib',order:rb.rank,label,frame:R,z0:-t/2,z1:t/2,...fin,engr,marks:rmarks,flagHoles:[],color:'#D7B98A'})})}
   /* ---- corner blocks on outside corners that are off square ---- */
   {let jn=0;const clr=Math.max(t*.5,stol*4);
     for(const x of edges.values()){if(!x.blk||!x.convex)continue;const f=F[x.i],g=F[x.j],q=x.fq[f.i],qg=x.fq[g.i],ef=f.E[q];
@@ -1039,7 +1073,7 @@ function panelizeShell(b,name,B){
         poly.push(C3.clone().addScaledVector(dQ,ch));
         /* trim by nearby faces that face into the block, then make sure no plate's wood is inside it */
         for(const h of F){if(h===f||h===g)continue;if(Math.abs(h.n.dot(C3)-h.d)>leg+t*2)continue;const tp=clipPoly(poly,{n:h.n,d:h.d-t});if(tp.length>=3&&area3(tp,e3)>area3(poly,e3)*.25)poly=tp}
-        let blocked=false;for(const rp of ribPlanes){if(poly.length<3)break;const dC=rp.axis.dot(C3)-rp.d,need=t/2+clr;if(Math.abs(dC)<need+t){blocked=true;break}const sg=dC>0?1:-1;poly=clipPoly(poly,{n:rp.axis.clone().multiplyScalar(-sg),d:-sg*rp.d-need})}
+        let blocked=false;for(const rp of ribPlanes){if(poly.length<3)break;const dC=rp.axis.dot(C3)-rp.d,need=t/2+Math.max(clr,t+tabX+.15)/* room to back the block off its tab with the rib already in */;if(Math.abs(dC)<need+t){blocked=true;break}const sg=dC>0?1:-1;poly=clipPoly(poly,{n:rp.axis.clone().multiplyScalar(-sg),d:-sg*rp.d-need})}
         if(blocked||poly.length<3||area3(poly,e3)<leg*leg*.08)continue;
         const samples=[];poly.forEach((P,i)=>{const N=poly[(i+1)%poly.length];for(const tt of [0,.5])for(const z of [-.4,0,.4])samples.push(P.clone().lerp(N,tt).addScaledVector(e3,z*t))});
         const cen=poly.reduce((s_,P)=>s_.add(P),new V()).multiplyScalar(1/poly.length);if(samples.some(P=>{const hit=inPlate(B,P.clone().lerp(cen,.04),t);return hit&&hit!==f&&hit!==g}))continue;
@@ -1049,8 +1083,12 @@ function panelizeShell(b,name,B){
         if(sides.some(sd_=>sd_.lg<t*2||hitsKeep(sd_.F_,sd_.qq,sd_.fp)))continue;
         const vv=new V().crossVectors(e3,dP),fr={O:C3,u:dP.clone(),v:vv,n:e3.clone()};let p2=poly.map(P=>{const d=P.clone().sub(C3);return [d.dot(dP),d.dot(vv)]});if(areaF(p2)<0)p2.reverse();
         const tabs=[],bScr=[];jn++;
-        for(const {F_,d_,qq,lg,fp} of sides){const wT=Math.min(S.tabW,lg*.3);let tabAt=null;
-          if(lg>wT*2.2)for(const fr2 of [.5,.42,.58,.34,.66,.26,.74]){const c=lg*fr2;if(c-wT/2<t||c+wT/2>lg-t*.5)continue;
+        /* the same tab spot on both legs wherever both walls allow it, so the block is the same either way round */
+        let cTab=null;const lgm=Math.min(sides[0].lg,sides[1].lg),wTm=Math.min(S.tabW,lgm*.3);
+        if(lgm>wTm*2.2)for(const fr2 of [.5,.42,.58,.34,.66,.26,.74]){const c=lgm*fr2;if(c-wTm/2<t||c+wTm/2>lgm-t*.5)continue;
+          if(sides.every(({F_,d_,qq})=>{const test=slotOn(F_,C3.clone().addScaledVector(d_,c-wTm/2),C3.clone().addScaledVector(d_,c+wTm/2),F_.n,t,e3,clr,false);return !hitsKeep(F_,qq,test)&&edgeOK(F_,test,minE)})){cTab=c;break}}
+        for(const {F_,d_,qq,lg,fp} of sides){const wT=cTab!=null?wTm:Math.min(S.tabW,lg*.3);let tabAt=null;
+          if(lg>wT*2.2)for(const fr2 of (cTab!=null?[cTab/lg]:[.5,.42,.58,.34,.66,.26,.74])){const c=lg*fr2;if(c-wT/2<t||c+wT/2>lg-t*.5)continue;
             const e0=C3.clone().addScaledVector(d_,c-wT/2),e1=C3.clone().addScaledVector(d_,c+wT/2),test=slotOn(F_,e0,e1,F_.n,t,e3,clr,false);
             if(hitsKeep(F_,qq,test)||!edgeOK(F_,test,minE))continue;
             tabs.push([e0.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,t+tabX),e0.clone().addScaledVector(F_.n,t+tabX)].map(P=>{const d=P.clone().sub(C3);return [d.dot(dP),d.dot(vv)]}));
@@ -1063,10 +1101,10 @@ function panelizeShell(b,name,B){
               const sI=tabAt!=null&&sd2>tabAt?1:0;if(tabAt!=null&&S.cleatScrews>1&&sideUsed[sI])continue;
               const X=C3.clone().addScaledVector(d_,sd2).addScaledVector(F_.n,t),T_=X.clone().addScaledVector(F_.n,-sLen);
               if(!clear(X)||T_.distanceTo(C3)>lg-t*.4||sides.some(o=>o.F_!==F_&&-o.F_.n.dot(T_.clone().sub(C3))<t*.35))continue;screwInto(F_,X,'J'+jn);bScr.push([X,F_.n]);n2++;sideUsed[sI]=1}}}
-        const label=name+'J'+jn,fin=finish([p2,...tabs],[],[],mc),engr=[];
-        if(S.labels){const bh=Math.min(lh*.4,S.edgeLabelH/k*.7),Lb=placeLabel(label,p2,[],bh,()=>gridCands(p2),[[1,0],[0,1]]);
-          if(Lb){engr.push(...strokes(label,Lb.c,Lb.sz,Lb.ax));const jt=f.num+letter(q)+'>'+g.num+letter(qg),L2=placeLabel(jt,p2,[Lb.R],bh*.75,()=>gridCands(p2),[[1,0],[0,1]]);if(L2)engr.push(...strokes(jt,L2.c,L2.sz,L2.ax))}}
-        panels.push({kind:'cleat',label,frame:fr,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#E7C48E'});placed.push(sP);doneG.add(sG)}}}
+        const label=name+'J'+jn,fin=finish([p2,...tabs],[],[],mc),engr=[],jt=f.num+letter(q)+'>'+g.num+letter(qg);
+        /* a block is marked with its joint and nothing else: every block on that joint is the same part */
+        if(S.labels){const bh=Math.min(lh*.45,S.edgeLabelH/k*.9),Lb=placeLabel(jt,p2,[],bh,()=>gridCands(p2),[[1,0],[0,1]]);if(Lb)engr.push(...strokes(jt,Lb.c,Lb.sz,Lb.ax))}
+        panels.push({kind:'cleat',joint:jt,label,frame:fr,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#E7C48E'});placed.push(sP);doneG.add(sG)}}}
   /* ---- face panels: setback bands come off, owned fingers go on ---- */
   const FD=F.map(f=>{const E=f.E,screws=[];
     const region=f.cts.map(c2path),bands=[];for(const e of E){if(e.L<1e-9||e.s<=0)continue;bands.push(c2path(posC([e.P,e.P2,add(e.P2,mul(e.M,e.s)),add(e.P,mul(e.M,e.s))])));
@@ -1112,7 +1150,7 @@ function panelizeShell(b,name,B){
         if(Ed){engr.push(...strokes(tx,Ed.c,Ed.sz,Ed.ax));keep.push(Ed.R)}}}
     if(!f.skip&&fin.part.reduce((a,c)=>a+areaF(c),0)<8*t*t){f.skip=true;b.openStrips.push({w:t})}   /* what is left after the joints is too small to be a part */
     panels.push({kind:'face',label,planeId:f.pl.id,face:f.cts,frame:{O:f.O,u:f.u,v:f.v,n:f.n},z0:-t,z1:0,...(f.skip?{part:[],path:[],shapes:[],view:[],drills:[]}:fin),engr,marks,flagHoles,color:PAL[f.i%PAL.length]})}
-  return {panels,screws:all.filter(s=>!s.f.skip),sd,sLen,planes:[],joints}}
+  return {panels,screws:[...all.filter(s=>!s.f.skip),...xScr],sd,sLen,planes:[],joints}}
 /* like finish(), but the region keeps its own holes (paths already oriented: outsides counter-clockwise, holes clockwise) */
 function finishRegion(regionPaths,holes,drills,mc){
   const c=new ClipperLib.Clipper();c.AddPaths(regionPaths,ClipperLib.PolyType.ptSubject,true);const h=holes.filter(p=>p.length>2);if(h.length)c.AddPaths(h.map(toC),ClipperLib.PolyType.ptClip,true);
@@ -1369,6 +1407,7 @@ function panelize(b,name){
 
   const panels=[],ribPlanes=[];
   /* slot in face f for a tab that runs e0->e1 along f's inner face, sticks out along out3 by h, in a piece whose plane normal is thick */
+  const xScr=[],kCnt={n:0};
   const slotOn=(f,e0,e1,out3,h,thick,extra=0,commit=true)=>{const pts=[];
     for(const e of [e0,e1,e0.clone().addScaledVector(out3,h),e1.clone().addScaledVector(out3,h)])for(const sg of [-1,1])pts.push(to2(f,e.clone().addScaledVector(thick,sg*t/2)));
     const dir3=e1.clone().sub(e0).normalize();let ax=[dir3.dot(f.u),dir3.dot(f.v)];const al=Math.hypot(...ax)||1;ax=mul(ax,1/al);const pp=[-ax[1],ax[0]];
@@ -1423,7 +1462,7 @@ function panelize(b,name){
       let k0=0,bl=-1;for(let j=0;j<poly.length;j++){const d=poly[j].distanceTo(poly[(j+1)%poly.length]);if(d>bl){bl=d;k0=j}}
       const O=poly[k0].clone(),u=poly[(k0+1)%poly.length].clone().sub(O).normalize(),v=new V().crossVectors(axis,u);
       const R={O,u,v,n:axis.clone()},to2R=P=>{const d=P.clone().sub(O);return [d.dot(u),d.dot(v)]},p2=poly.map(to2R);
-      const tabs=[],notch2=rb.notches.map(nq=>nq.map(to2R));
+      const tabs=[],rmarks=[],notch2=rb.notches.map(nq=>nq.map(to2R));
       for(let j=0;j<poly.length;j++){
         const a3=poly[j],b3=poly[(j+1)%poly.length],Le=a3.distanceTo(b3);
         const fi=rb.innerR.find(pl=>Math.abs(pl.n.dot(a3)-pl.d)<2e-3&&Math.abs(pl.n.dot(b3)-pl.d)<2e-3);if(!fi)continue;
@@ -1432,20 +1471,24 @@ function panelize(b,name){
         const ex=rb.excl.filter(X=>{const w=X.clone().sub(a3),c=w.dot(dir3);return c>-t&&c<Le+t&&w.clone().addScaledVector(dir3,-c).length()<t*1.5}).map(X=>X.clone().sub(a3).dot(dir3));
         const a=p2[j],bb=p2[(j+1)%p2.length],d=mul(sub(bb,a),1/Le),m=[-d[1],d[0]];
         const out3=u.clone().multiplyScalar(-m[0]).addScaledVector(v,-m[1]),cosA=out3.dot(f.n);
-        if(cosA>=.3){/* through a leaning face the tab stops flush with the face on its near side: any part of it standing proud would hook the face as it is pressed on */
-          const cf=f.pl.src?.type==='carve',lean_=fi.lean>t*.02,tX=cf||lean_?0:tabX,h=t/cosA,use=Le-2*tabM;
+        if(cosA>=.3){/* through a face that leans across the rib by up to 15 degrees, the tab is cut long enough that sanding brings it flush right
+             across the rib's thickness; the slot is as wide as the whole tab seen along the face's own direction, so the face still presses on.
+             Steeper than that, the tab stops flush with the face on its near side. */
+          const cf=f.pl.src?.type==='carve',lean_=fi.lean>t*.02,lnA=Math.abs(f.n.dot(axis)),h=t/cosA,tX=cf?0:lean_?(lnA<=LEAN_MAX?tabX+t*lnA/cosA:0):tabX,hS=h+(lean_?tX:0),use=Le-2*tabM;
+          const steep=lnA>LEAN_MAX&&S.cleats&&!cf&&ribBlockRun({f,n:f.n,dIn:f.pl.d-t,a3,dir3,Le,axis,t,ribPlanes,rmarks,to2R,to2f:P=>to2(f,P),panels,name,mc,screwInto,xScr,cnt:kCnt,ribLabel:name+'R'+r,lh,k,
+            near:()=>inner.filter(pl=>pl.f!==f),hit:()=>false})>0;
           if(use>=tabW){const nt=Math.max(1,Math.round(use/tabGap)),clrR=Math.max(t,stol*4),mid=Le/2;
-            const tcs=[];for(let z=0;z<nt;z++){const c0=tabM+use*(z+.5)/nt,w=tabW/2,toMid=Math.sign(mid-c0)||1;let c=null;
+            const tcs=[];for(let z=0;z<nt&&!steep;z++){const c0=tabM+use*(z+.5)/nt,w=tabW/2,toMid=Math.sign(mid-c0)||1;let c=null;
               /* nudge toward the middle until the slot keeps enough wood to every edge and clears other slots and crossings */
               for(const kk of [0,1,2,3,4,-1,-2]){const cc=c0+toMid*kk*tabW*.3;if(cc-w<t||cc+w>Le-t)continue;
                 if(ex.some(x=>Math.abs(x-cc)<w+t*1.5))continue;
                 if(rb.corr){const Hh=h+t,q0=add(a,mul(d,cc-w)),q1=add(a,mul(d,cc+w)),tq=[q0,q1,add(q1,mul(m,-Hh)),add(q0,mul(m,-Hh))];if(rb.corr.some(K=>overlap(tq,K.map(to2R))))continue}
-                const test=slotOn(f,a3.clone().addScaledVector(dir3,cc-w),a3.clone().addScaledVector(dir3,cc+w),out3,h,axis,clrR,false);
+                const test=slotOn(f,a3.clone().addScaledVector(dir3,cc-w),a3.clone().addScaledVector(dir3,cc+w),out3,hS,axis,clrR,false);
                 if(!edgeOK(f,test,minE)||f.keep.some(K=>overlap(test,K)))continue;c=cc;break}
               if(c==null)continue;tcs.push(c);
               const A0=add(a,mul(d,c-w)),A1=add(a,mul(d,c+w));
               tabs.push([add(A0,mul(m,.02)),add(A1,mul(m,.02)),add(A1,mul(m,-h-tX)),add(A0,mul(m,-h-tX))]);
-              slotOn(f,a3.clone().addScaledVector(dir3,c-w),a3.clone().addScaledVector(dir3,c+w),out3,h,axis);}
+              slotOn(f,a3.clone().addScaledVector(dir3,c-w),a3.clone().addScaledVector(dir3,c+w),out3,hS,axis);}
             /* screws through the face into the rib's edge, between tabs, when the face is square to the rib */
             if(S.screws&&S.ribScrews&&Math.abs(f.n.dot(axis))<=sOK)
               for(const c of ribScrewSpots(tcs,tabW,t,Le,tabM,use,nt)){if(ex.some(x=>Math.abs(x-c)<t*2))continue;screwInto(f,a3.clone().addScaledVector(dir3,c).addScaledVector(f.n,t),'R'+r)}}}
@@ -1453,7 +1496,7 @@ function panelize(b,name){
       }
       const label=name+'R'+r,fin=finish([p2,...tabs],notch2,[],mc),engr=[];
       if(S.labels){const Lb=placeLabel(label,p2,notch2,lh,()=>gridCands(p2),[[1,0],[0,1]]);if(Lb){const i0=engr.length;engr.push(...strokes(label,Lb.c,Lb.sz,Lb.ax));engr.lab=[i0,engr.length]}}
-      panels.push({kind:'rib',order:rb.rank,label,frame:R,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#D7B98A'});
+      panels.push({kind:'rib',order:rb.rank,label,frame:R,z0:-t/2,z1:t/2,...fin,engr,marks:rmarks,flagHoles:[],color:'#D7B98A'});
     });
   }
   /* corner blocks: on joints too far off square for screws, a small angled piece tabs into both walls
@@ -1474,7 +1517,7 @@ function panelize(b,name){
         for(const h of F){if(h===f||h===g)continue;poly=clipPoly(poly,{n:h.n,d:h.pl.d-t});if(poly.length<3)break}
         /* stay on this side of every rib, with clearance; skip if a rib runs right through the corner */
         let blocked=false;
-        for(const rp of ribPlanes){if(poly.length<3)break;const dC=rp.axis.dot(C3)-rp.d,need=t/2+clr;if(Math.abs(dC)<need+t){blocked=true;break}
+        for(const rp of ribPlanes){if(poly.length<3)break;const dC=rp.axis.dot(C3)-rp.d,need=t/2+Math.max(clr,t+tabX+.15)/* room to back the block off its tab with the rib already in */;if(Math.abs(dC)<need+t){blocked=true;break}
           const sg=dC>0?1:-1;poly=clipPoly(poly,{n:rp.axis.clone().multiplyScalar(-sg),d:-sg*rp.d-need})}
         if(blocked||poly.length<3||area3(poly,e3)<leg*leg*.08)continue;
         /* leg footprints on both walls must stay clear of slots, ribs, other blocks and other edges' finger zones */
@@ -1485,9 +1528,13 @@ function panelize(b,name){
         const v=new V().crossVectors(e3,dP),fr={O:C3,u:dP.clone(),v,n:e3.clone()};
         let p2=poly.map(P=>{const d=P.clone().sub(C3);return [d.dot(dP),d.dot(v)]});if(areaF(p2)<0)p2.reverse();
         const tabs=[],bScr=[];jn++;
+        /* the same tab spot on both legs wherever both walls allow it, so the block is the same either way round */
+        let cTab=null;const lgm=Math.min(sides[0].lg,sides[1].lg),wTm=Math.min(S.tabW,lgm*.3);
+        if(lgm>wTm*2.2)for(const fr2 of [.5,.42,.58,.34,.66,.26,.74]){const c=lgm*fr2;if(c-wTm/2<t||c+wTm/2>lgm-t*.5)continue;
+          if(sides.every(({F_,d_,qq})=>{const test=slotOn(F_,C3.clone().addScaledVector(d_,c-wTm/2),C3.clone().addScaledVector(d_,c+wTm/2),F_.n,t,e3,clr,false);return !hitsKeep(F_,qq,test)&&edgeOK(F_,test,minE)})){cTab=c;break}}
         for(const {F_,d_,qq,lg,fp} of sides){
-          const wT=Math.min(S.tabW,lg*.3);let tabAt=null;
-          if(lg>wT*2.2)for(const fr2 of [.5,.42,.58,.34,.66,.26,.74]){const c=lg*fr2;if(c-wT/2<t||c+wT/2>lg-t*.5)continue;
+          const wT=cTab!=null?wTm:Math.min(S.tabW,lg*.3);let tabAt=null;
+          if(lg>wT*2.2)for(const fr2 of (cTab!=null?[cTab/lg]:[.5,.42,.58,.34,.66,.26,.74])){const c=lg*fr2;if(c-wT/2<t||c+wT/2>lg-t*.5)continue;
             const e0=C3.clone().addScaledVector(d_,c-wT/2),e1=C3.clone().addScaledVector(d_,c+wT/2),test=slotOn(F_,e0,e1,F_.n,t,e3,clr,false);
             if(hitsKeep(F_,qq,test)||!edgeOK(F_,test,minE))continue;
             tabs.push([e0.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,t+(F_.pl.src?.type==='carve'?0:tabX)),e0.clone().addScaledVector(F_.n,t+(F_.pl.src?.type==='carve'?0:tabX))].map(P=>{const d=P.clone().sub(C3);return [d.dot(dP),d.dot(v)]}));
@@ -1506,11 +1553,9 @@ function panelize(b,name){
               if(!clear(X)||T.distanceTo(C3)>lg-t*.4||sides.some(o=>o.F_!==F_&&-o.F_.n.dot(T.clone().sub(C3))<t*.35))continue;
               screwInto(F_,X,'J'+jn);bScr.push([X,F_.n]);n2++;sideUsed[sI]=1}}
         }
-        const label=name+'J'+jn,fin=finish([p2,...tabs],[],[],mc),engr=[];
-        if(S.labels){const bh=Math.min(lh*.4,S.edgeLabelH/k*.7),Lb=placeLabel(label,p2,[],bh,()=>gridCands(p2),[[1,0],[0,1]]);
-          if(Lb){engr.push(...strokes(label,Lb.c,Lb.sz,Lb.ax));const jt=f.num+letter(q)+'>'+g.num+letter(qg);
-            const L2=placeLabel(jt,p2,[Lb.R],bh*.75,()=>gridCands(p2),[[1,0],[0,1]]);if(L2)engr.push(...strokes(jt,L2.c,L2.sz,L2.ax))}}
-        panels.push({kind:'cleat',label,frame:fr,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#E7C48E'});placed.push(sP);doneG.add(sG);
+        const label=name+'J'+jn,fin=finish([p2,...tabs],[],[],mc),engr=[],jt=f.num+letter(q)+'>'+g.num+letter(qg);
+        if(S.labels){const bh=Math.min(lh*.45,S.edgeLabelH/k*.9),Lb=placeLabel(jt,p2,[],bh,()=>gridCands(p2),[[1,0],[0,1]]);if(Lb)engr.push(...strokes(jt,Lb.c,Lb.sz,Lb.ax))}
+        panels.push({kind:'cleat',joint:jt,label,frame:fr,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#E7C48E'});placed.push(sP);doneG.add(sG);
       }}}
   /* face panels, pass 1: inset base + owned fingers + pilot holes */
   const FD=F.map(f=>{
@@ -1565,7 +1610,7 @@ function panelize(b,name){
     }
     panels.push({kind:'face',label,planeId:f.pl.id,face:[f.p2],frame:{O:f.O,u:f.u,v:f.v,n:f.n},z0:-t,z1:0,...fin,engr,marks,flagHoles,color:PAL[f.i%PAL.length]});
   }
-  return {panels,screws:all,sd,sLen,planes:F.map(f=>f.pl),joints};
+  return {panels,screws:[...all,...xScr],sd,sLen,planes:F.map(f=>f.pl),joints};
 }
 
 /* ---------------- assembly planning ----------------
@@ -1601,10 +1646,10 @@ function asmHit(A,B,ox,oy,oz){if(!bbHit(A,B,ox,oy,oz))return false;
     if(x<A.mn[0]-.1||x>A.mx[0]+.1||y<A.mn[1]-.1||y>A.mx[1]+.1||z<A.mn[2]-.1||z>A.mx[2]+.1)continue;if(inPart(A,x,y,z))return true}
   return false}
 /* slide A out along d until it clears everything in `others`; returns the part it hits first, if any */
-function asmSweep(A,others,d){if(!others.length)return {ok:true,D:10};
+function asmSweep(A,others,d,maxD){if(!others.length)return {ok:true,D:10};
   const mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];for(const B of others)for(let k=0;k<3;k++){mn[k]=Math.min(mn[k],B.mn[k]);mx[k]=Math.max(mx[k],B.mx[k])}
   const dv=[d.x,d.y,d.z];let D=Infinity;for(let k=0;k<3;k++){if(dv[k]>1e-6)D=Math.min(D,(mx[k]-A.mn[k])/dv[k]);else if(dv[k]<-1e-6)D=Math.min(D,(A.mx[k]-mn[k])/-dv[k])}
-  D=Math.max(0,D)+.2;
+  D=Math.max(0,D)+.2;if(maxD)D=Math.min(D,maxD);
   for(let s=ASM_STEP*.5;s<=D;s+=ASM_STEP){const ox=d.x*s,oy=d.y*s,oz=d.z*s;for(const B of others)if(asmHit(A,B,ox,oy,oz))return {ok:false,by:B,s}}
   return {ok:true,D}}
 function asmDirs(A,others){const out=[],add=v=>{if(v.lengthSq()<1e-6)return;v=v.clone().normalize();if(!out.some(w=>w.dot(v)>.995))out.push(v)};
@@ -1630,23 +1675,31 @@ function planAssembly(panels,baseLabel){
   const prio=A=>A.idx===base?-1e9:A.kind==='face'?2000+A.c.y:A.kind==='cleat'?1900+A.c.y:1000+(A.p.order??0)*10+A.c.y*.01;
   const left=new Set(parts.map((_,i)=>i)),out=[],touch=parts.map(()=>new Set());
   /* corner blocks only hold on through their tabs in the walls, so a block brushing a rib or another block doesn't count */
-  const joins=(A,B)=>!(A.kind==='cleat'&&B.kind!=='face')&&!(B.kind==='cleat'&&A.kind!=='face');
+  /* a rib block is the other way round: it is screwed to its rib first (those screws are out of reach once the face is on), so the rib is what holds it */
+  const holds=(C,B)=>C.p.sub==='rib'?B.kind==='rib':B.kind==='face',joins=(A,B)=>!(A.kind==='cleat'&&!holds(A,B))&&!(B.kind==='cleat'&&!holds(B,A));
   for(let i=0;i<parts.length;i++)for(let j=i+1;j<parts.length;j++)if(joins(parts[i],parts[j])&&asmTouch(parts[i],parts[j])){touch[i].add(j);touch[j].add(i)}
   /* the parts that would be left touching nothing if i came out */
   const orphansOf=i=>[...left].filter(j=>j!==i&&j!==base&&touch[j].has(i)&&[...touch[j]].filter(k=>left.has(k)).length===1);
   /* slide a group as one rigid piece */
-  const sweepG=(G,others,d)=>{let D=0;for(const A of G){const r=asmSweep(A,others,d);if(!r.ok)return r;D=Math.max(D,r.D)}return {ok:true,D}};
+  const sweepG=(G,others,d,maxD)=>{let D=0;for(const A of G){const r=asmSweep(A,others,d,maxD);if(!r.ok)return r;D=Math.max(D,r.D)}return {ok:true,D}};
+  /* a block on its own is put in by hand: it only has to back off its tab, a couple of plies, without touching anything.
+     It does not have to travel out of the obstacle in one straight line the way a plate does. */
+  const tP=parts.find(p=>p.kind==='face'),handD=tP?Math.max(1.5,(tP.z1-tP.z0)*2.2):1.6;
   while(left.size){let pick=null;const order=[...left].sort((a,c)=>prio(parts[c])-prio(parts[a])),miss={};
     for(const pass of [0,1]){for(const i of order){if(i===base&&left.size>1)continue;
       let grp=[i];const orph=orphansOf(i);
       if(orph.length&&!pass){/* corner blocks that only hang on this panel come out with it, screwed on as a sub-assembly */
-        if(parts[i].kind==='face'&&orph.every(j=>parts[j].kind==='cleat'))grp=[i,...orph];else continue}
+        if((parts[i].kind==='face'||parts[i].kind==='rib')&&orph.every(j=>parts[j].kind==='cleat'))grp=[i,...orph];else continue}
       const G=grp.map(j=>parts[j]),others=[...left].filter(j=>!grp.includes(j)&&grp.every(g=>ok(g,j))).map(j=>parts[j]);
-      const hits=new Set();for(const d of asmDirs(parts[i],others)){const r=sweepG(G,others,d);if(r.ok){pick={i,d,D:r.D,with:grp.slice(1)};break}hits.add(r.by.label)}
+      const hits=new Set();for(const d of asmDirs(parts[i],others)){const r=sweepG(G,others,d,parts[i].kind==='cleat'&&grp.length===1?handD:0);if(r.ok){pick={i,d,D:r.D,with:grp.slice(1)};break}hits.add(r.by.label)}
       if(pick)break;miss[i]=[...hits]}if(pick)break}
     if(!pick){const i=order.find(i=>i!==base)??order[0];pick={i,d:parts[i].n.clone(),D:6,stuck:miss[i]||[],with:[]}}
     out.push(pick);left.delete(pick.i);pick.with.forEach(j=>left.delete(j))}
-  out.reverse();return {parts,steps:out,clash,touch}}
+  out.reverse();
+  /* blocks that go on one after another the same way read as one step ("these four blocks onto that wall") */
+  const steps=[];for(const s of out){const p=steps[steps.length-1],isB=x=>parts[x.i].kind==='cleat'&&!x.stuck&&!x.lone;
+    if(p&&isB(s)&&isB(p)&&!s.with.length&&p.d.dot(s.d)>.99&&parts[p.i].p.sub===parts[s.i].p.sub)p.with.push(s.i);else steps.push(s)}
+  return {parts,steps,clash,touch}}
 
 /* ---------------- three.js scene ---------------- */
 const host=$('#three');
@@ -1837,7 +1890,7 @@ const DISPLAY_KEYS=new Set(['showScrews','tipOpen','sandSet','cncDef2','rateSet'
 const cfgSig=()=>JSON.stringify(Object.keys(S).filter(k=>!DISPLAY_KEYS.has(k)).sort().map(k=>[k,S[k]]));
 let dirty=true,meshDirty=true;
 function dropGroup(b){const g=b._grp;if(!g)return;panelGroup.remove(g);g.traverse(x=>{x.geometry?.dispose();x.userData.stencilGeo?.dispose();x.material?.dispose?.()});b._grp=null}
-function rebuild(){const _t0=performance.now();let _tp=0;dirty=false;
+function rebuild(){if(gapMesh)clearGaps();const _t0=performance.now();let _tp=0;dirty=false;
   lastPanels=[];allScrews=[];allFixes=[];const cfg=cfgSig();
   blocks.forEach(b=>{const sig=JSON.stringify({...serBlock(b),useAs:undefined})+cfg;
     if(b._sig!==sig||!b._res){let res={panels:[],screws:[],sd:.1,sLen:1,joints:[],planes:[]};const _a=performance.now();try{res=panelizeBlock(b)}catch(e){console.error(e)}_tp+=performance.now()-_a;
@@ -1881,6 +1934,36 @@ function buildMeshes(){meshDirty=false;
 /* red rings (a clash you need to settle) always show; the orange and grey ones only report what was already fixed for you, so they wait until Screws & labels is open */
 function syncRings(){const on=$('.tab[data-tab=marks]')?.getAttribute('aria-selected')==='true'&&!$('#app')?.classList.contains('collapsed');panelGroup.traverse(o=>{if(o.userData.info)o.visible=on})}
 document.addEventListener('click',e=>{if(e.target.closest?.('.tab,.rail,#railToggle,[data-tab]'))setTimeout(syncRings,0)});
+/* ---------------- gap finder ----------------
+   Walks a fine grid over every outside face, just under the surface, and marks every spot where no part has wood there: orange where
+   there is wood further in (a dent, a groove beside a finger, a pocket at a corner), red where you can see right through. Hairlines
+   from the fit gap are ignored. These are the places a builder would reach for filler, so it is better to see them before cutting. */
+let gapMesh=null;
+function clearGaps(){if(gapMesh){world.remove(gapMesh);gapMesh.geometry.dispose();gapMesh=null}$('#gapBtn')?.setAttribute('aria-pressed','false')}
+function findGaps(){clearGaps();freshen();const t=thkModel(),step=Math.max(.2,t*.27),pos=[],col=[],spots=[];let dent=0,hole=0;
+  for(const b of blocks){const res=b._res;if(!res)continue;const ps=res.panels.filter(p=>p.part?.length),parts=ps.map((p,i)=>asmPart(p,i)),seen=new Set();
+    for(const p of ps){if(p.kind!=='face'||!p.face?.length||seen.has(p.planeId))continue;seen.add(p.planeId);const {O,u,v,n}=p.frame;
+      let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;p.face[0].forEach(([x,y])=>{x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x);y1=Math.max(y1,y)});
+      /* this face's own pieces first (they cover almost everything), then whatever else comes near its skin */
+      const own=parts.filter(P=>P.p.planeId===p.planeId),rest=parts.filter(P=>P.p.planeId!==p.planeId),near=[...own,...rest];
+      const at=(x,y,h)=>{const X=O.x+u.x*x+v.x*y-n.x*h,Y=O.y+u.y*x+v.y*y-n.y*h,Z=O.z+u.z*x+v.z*y-n.z*h;for(const P of near)if(inPart(P,X,Y,Z))return true;return false};
+      const cells=new Map(),key=(i,j)=>i+','+j,nx=Math.ceil((x1-x0)/step),ny=Math.ceil((y1-y0)/step),j_=step*.33;
+      for(let i=0;i<nx;i++)for(let j=0;j<ny;j++){const x=x0+(i+.5)*step,y=y0+(j+.5)*step;if(!pip2(p.face,x,y))continue;const h0=t*.06;
+        if(at(x,y,h0)||at(x+j_,y,h0)||at(x-j_,y,h0)||at(x,y+j_,h0)||at(x,y-j_,h0))continue;
+        const thru=!at(x,y,t*.35)&&!at(x,y,t*.65)&&!at(x,y,t*.92);cells.set(key(i,j),{i,j,x,y,thru})}
+      /* group touching cells into spots; a single stray cell is noise */
+      const done=new Set();for(const c of cells.values()){const k0=key(c.i,c.j);if(done.has(k0))continue;const q=[c],grp=[];done.add(k0);
+        while(q.length){const a=q.pop();grp.push(a);for(const [di,dj] of [[1,0],[-1,0],[0,1],[0,-1]]){const kk=key(a.i+di,a.j+dj);if(cells.has(kk)&&!done.has(kk)){done.add(kk);q.push(cells.get(kk))}}}
+        if(grp.length<2)continue;const thru=grp.filter(g=>g.thru).length>=Math.max(2,grp.length*.3);thru?hole++:dent++;
+        let a=1e9,b_=1e9,c2=-1e9,d=-1e9;grp.forEach(g=>{a=Math.min(a,g.x);b_=Math.min(b_,g.y);c2=Math.max(c2,g.x);d=Math.max(d,g.y)});spots.push({w:c2-a+step,h:d-b_+step,thru,label:p.label.replace(/-\d+$/,'')});
+        const rgb=thru?[.9,.16,.13]:[1,.55,.05],h=step/2,up=.04;
+        for(const g of grp){const P=(dx,dy)=>[O.x+u.x*(g.x+dx)+v.x*(g.y+dy)+n.x*up,O.y+u.y*(g.x+dx)+v.y*(g.y+dy)+n.y*up,O.z+u.z*(g.x+dx)+v.z*(g.y+dy)+n.z*up];
+          for(const [dx,dy] of [[-h,-h],[h,-h],[h,h],[-h,-h],[h,h],[-h,h]]){pos.push(...P(dx,dy));col.push(...rgb)}}}}}
+  const n=dent+hole;if(!n){toast('No gaps found: every outside surface has wood under it.');return}
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));g.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
+  gapMesh=new THREE.Mesh(g,new THREE.MeshBasicMaterial({vertexColors:true,side:THREE.DoubleSide,depthTest:false,transparent:true,opacity:.9}));gapMesh.renderOrder=11;gapMesh.raycast=()=>{};gapMesh.visible=view==='panels';world.add(gapMesh);
+  $('#gapBtn').setAttribute('aria-pressed','true');const big=spots.reduce((a,c)=>c.w*c.h>a.w*a.h?c:a,spots[0]),f1=x=>(Math.round(x*10)/10).toString();
+  toast(`${n} gap${n>1?'s':''}: ${dent} dent${dent===1?'':'s'} (orange)${hole?', '+hole+' right through (red)':''}. Biggest is ${f1(Math.max(big.w,big.h))} × ${f1(Math.min(big.w,big.h))} in on ${big.label}.`)}
 /* bring the parts up to date right now if something changed (opening a view that shows them) */
 function freshen(){if(dirty){clearTimeout(timer);rebuild()}else if(meshDirty&&view==='panels'){buildMeshes()}}
 function applyClipping(){}
@@ -2399,6 +2482,7 @@ $$('[data-k]').forEach(el=>{const k=el.dataset.k,w=el.closest('.f')||el.closest(
   el.addEventListener('focus',()=>lite(k,true));el.addEventListener('blur',()=>{$$(`.dg [data-d="${k}"]`).forEach(g=>g.classList.remove('on'));w.classList.remove('lit')})});
 $('#explodeBtn').onclick=()=>{S.explode=!S.explode;syncInputs();rebuild();save()};
 $('#sandBtn').onclick=()=>{S.sanded=!S.sanded;S.sandSet=true;syncInputs();rebuild();save()};
+$('#gapBtn').onclick=()=>{if(gapMesh){clearGaps();return}if(S.explode){toast('Turn Explode off to look for gaps.');return}toast('Looking for gaps…');setTimeout(findGaps,30)};
 $('#screwBtn').onclick=()=>{S.showScrews=!S.showScrews;syncInputs();meshDirty=true;if(view==='panels')buildMeshes();save()};
 $('#birchBtn').onclick=()=>{S.look=S.look==='birch'?'color':'birch';syncInputs();rebuild();save()};
 
@@ -2774,11 +2858,14 @@ function buildAsm(keep){
 function stepText(k){const P=AS.plan.parts,s=AS.plan.steps[k],A=P[s.i],L=A.label,d=s.d,w=kindWord(A.kind);
   const pre=A.p.pieces?`${L} comes in ${A.p.pieces.length} pieces (${A.p.pieces.join(', ')}). Lay them flat, glue the keys and mallet them together into one ${w} first. `:'';
   if(k===0)return pre+`Lay ${L} down flat, outside face on the floor. Everything builds up from it.`;
+  if(A.kind==='cleat'){const n=s.with.length+1,nm=A.p.joint||L,held=[...AS.plan.touch[s.i]].filter(j=>AS.idx[j]<k).map(j=>P[j]);
+    if(A.p.sub==='rib'){const rib=[...AS.plan.touch[s.i]].map(j=>P[j]).find(p=>p.kind==='rib');return `Hold ${n>1?'the '+n+' rib blocks':'the rib block'} marked ${nm.replace(/^.*?R/,'R')} against rib ${rib?rib.label:''} at the screw marks and drive two screws through the rib into ${n>1?'each':'it'}. The face that leans over this rib screws down into ${n>1?'them':'it'} later.`}
+    const wall=held.find(p=>p.kind==='face');return `Push ${n>1?'the '+n+' corner blocks':'the corner block'} marked ${nm} onto ${wall?wall.label:'the wall'}, tab into slot, and screw through the wall into ${n>1?'each one':'it'}. ${n>1?'They are':'It is'} the same either way round.`}
   let side='';const H=hullOf(AS.b);const best=H.reduce((m,F)=>{const v=F.n.dot(d);return v>m.v?{v,F}:m},{v:-2});
   const move=d.y>.9?(A.kind==='rib'?`Drop ${w} ${L} straight down into its slots.`:`Lower ${w} ${L} straight down onto it.`)
     :d.y<-.9?`Push ${w} ${L} up into place from underneath.`:d.y>.45?`Lower ${w} ${L} on at an angle, along the arrow.`
     :best.v>.8?(best.F.id===A.p.planeId?`Slide ${w} ${L} straight in from outside.`:`Slide ${w} ${L} in from the ${faceName(AS.b,best.F.id)} side, along the arrow.`):`Slide ${w} ${L} in along the arrow, at the angle shown.`;
-  let txt=s.with.length?`Off the box, fit corner block${s.with.length>1?'s':''} ${s.with.map(j=>P[j].label).join(', ')} into ${L} and screw ${s.with.length>1?'them':'it'} on. Then ${move[0].toLowerCase()+move.slice(1)}`:move;
+  let txt=s.with.length?`Off the box, fit the ${s.with.length>1?s.with.length+' ':''}${A.kind==='rib'?'rib':'corner'} block${s.with.length>1?'s':''} marked ${[...new Set(s.with.map(j=>P[j].p.joint||P[j].label))].join(', ')} onto ${L} and screw ${s.with.length>1?'them':'it'} on. Then ${move[0].toLowerCase()+move.slice(1)}`:move;
   const jn=[...AS.plan.touch[s.i]].filter(j=>AS.idx[j]<k),jl=jn.filter(j=>P[j].kind!=='cleat').map(j=>P[j].label),jb=jn.length-jl.length;
   if(jn.length)txt+=` It locks into ${jl.join(', ')}${jb?(jl.length?' and ':'')+jb+' corner block'+(jb>1?'s':''):''}.`;
   return pre+txt}
@@ -2792,7 +2879,7 @@ function renderAsmPanel(){const plan=AS.plan,P=plan.parts,n=plan.steps.length;
   stuck.forEach(s=>rows.push(['tip',`<b>${P[s.i].label} can't go in.</b> Whatever way it slides, it runs into ${s.stuck.join(', ')||'other parts'}.`]));
   $('#aSum').innerHTML=rows.map(([c,h])=>`<div class="tr"><span class="dot ${c}"></span><div>${h}</div></div>`).join('');
   $('#aSlider').max=n;$('#aStepCard').hidden=false;
-  $('#aList').innerHTML=plan.steps.map((s,k)=>`<div class="item${k===AS.step?' on':''}" data-as="${k}"><span class="dot ${s.stuck?'tip':'hold'}"></span><span class="nm">${k+1}. ${P[s.i].label}${s.with.length?' + '+s.with.length+' block'+(s.with.length>1?'s':''):''}</span><span class="meta">${kindWord(P[s.i].kind)}</span></div>`).join('');
+  $('#aList').innerHTML=plan.steps.map((s,k)=>`<div class="item${k===AS.step?' on':''}" data-as="${k}"><span class="dot ${s.stuck?'tip':'hold'}"></span><span class="nm">${k+1}. ${P[s.i].kind==='cleat'?(s.with.length?(s.with.length+1)+' blocks ':'Block ')+(P[s.i].p.joint||P[s.i].label):P[s.i].label+(s.with.length?' + '+s.with.length+' block'+(s.with.length>1?'s':''):'')}</span><span class="meta">${kindWord(P[s.i].kind)}</span></div>`).join('');
   $$('#aList [data-as]').forEach(e=>e.onclick=()=>{AS.playing=false;showStep(+e.dataset.as)})}
 function showStep(k){const plan=AS.plan;if(!plan)return;const n=plan.steps.length;k=Math.max(0,Math.min(n-1,k));AS.step=k;AS.t0=performance.now();
   const s=plan.steps[k],cur=new Set([s.i,...s.with]),blk=new Set(s.stuck?plan.parts.filter(p=>s.stuck.includes(p.label)).map(p=>p.idx):[]);
@@ -2956,7 +3043,7 @@ function showPlanes(){const on=view==='mass'&&S.showPlanes!==false;blocks.forEac
   const pb=$('#planesBtn');if(pb){pb.hidden=view!=='mass';pb.setAttribute('aria-pressed',S.showPlanes!==false)}}
 function togglePlanes(){S.showPlanes=S.showPlanes===false;if(S.showPlanes===false&&selCut){selCut=null}showPlanes();attachGizmo();renderModelPanel();save()}
 function setView(v){view=v;if(v!=='mass')freshen();showPlanes();$$('#viewSeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.view===v));
-  massGroup.visible=v==='mass';panelGroup.visible=v==='panels';testGroup.visible=v==='test';asmGroup.visible=v==='build';if(v==='test'){T.anim=null;buildTest()}if(v==='build')buildAsm(true);$('#explodeSeg').hidden=v!=='panels';updatePanelBar();updateSection();showEdge();
+  massGroup.visible=v==='mass';panelGroup.visible=v==='panels';if(gapMesh)gapMesh.visible=v==='panels';testGroup.visible=v==='test';asmGroup.visible=v==='build';if(v==='test'){T.anim=null;buildTest()}if(v==='build')buildAsm(true);$('#explodeSeg').hidden=v!=='panels';updatePanelBar();updateSection();showEdge();
   $('#flat').hidden=v!=='sheets';host.style.visibility=v==='sheets'?'hidden':'visible';$('#gizmoSeg').style.visibility=v==='sheets'||v==='test'||v==='build'?'hidden':'visible';
   if(v==='build'&&$('.tab[data-tab=build]').getAttribute('aria-selected')!=='true')$('.tab[data-tab=build]').click();
   if(v==='test'&&$('.tab[data-tab=test]').getAttribute('aria-selected')!=='true')$('.tab[data-tab=test]').click();
