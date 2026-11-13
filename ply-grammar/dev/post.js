@@ -947,7 +947,7 @@ function makeBlock(d){
   b.mesh.userData.pick=b;b.lines=new THREE.LineSegments(new THREE.BufferGeometry(),new THREE.LineBasicMaterial({color:0x15181d,transparent:true,opacity:.55}));
   massGroup.add(b.mesh,b.lines);blocks.push(b);
   b.edgeOpts=d.edgeOpts?JSON.parse(JSON.stringify(d.edgeOpts)):{};
-  if(d.ribMax)b.ribMax=d.ribMax;if(d.glueRibs)b.glueRibs=true;(d.carves||[]).forEach(c=>makeCarve(b,c));
+  if(d.ribMax)b.ribMax=d.ribMax;if(d.glueRibs)b.glueRibs=true;if(d.useAs)b.useAs={...d.useAs};(d.carves||[]).forEach(c=>makeCarve(b,c));
   (d.cuts||[]).forEach(c=>{let cut;if(c.q){cut=makeCut(b,new V(...c.p),new V(0,0,1));cut.quaternion.fromArray(c.q)}else cut=makeCut(b,new V(...c.p),new V(...c.n));if(c.cid)cut.userData.cid=c.cid});
   updateMass(b);return b;
 }
@@ -1093,7 +1093,7 @@ let dirty=true,meshDirty=true;
 function dropGroup(b){const g=b._grp;if(!g)return;panelGroup.remove(g);g.traverse(x=>{x.geometry?.dispose();x.userData.stencilGeo?.dispose();x.material?.dispose?.()});b._grp=null}
 function rebuild(){const _t0=performance.now();let _tp=0;dirty=false;
   lastPanels=[];allScrews=[];allFixes=[];const cfg=cfgSig();
-  blocks.forEach(b=>{const sig=JSON.stringify(serBlock(b))+cfg;
+  blocks.forEach(b=>{const sig=JSON.stringify({...serBlock(b),useAs:undefined})+cfg;
     if(b._sig!==sig||!b._res){let res={panels:[],screws:[],sd:.1,sLen:1,joints:[],planes:[]};const _a=performance.now();try{res=panelizeBlock(b)}catch(e){console.error(e)}_tp+=performance.now()-_a;
       res.panels.forEach(p=>{p.K=res.planes;p.block=b});b._res=res;b._sig=sig;dropGroup(b)}
     const res=b._res;b.joints=res.joints||[];b.tModel=thkModel();res.panels.forEach(p=>lastPanels.push(p));
@@ -1689,8 +1689,30 @@ function restFaces(b){const H=hullOf(b),{W,c}=massOf(b),out=[],allP=H.flatMap(F=
   for(const F of H){const d0=F.n.dot(F.poly[0]);if(allP.some(p=>F.n.dot(p)>d0+.05))continue;const M=restMatrix(F,c),fp=footprint(H,M),cr=c.clone().applyMatrix4(M),m=margin2(fp,cr.x,cr.z);
     let Htop=0;H.forEach(G=>G.poly.forEach(p=>{Htop=Math.max(Htop,p.clone().applyMatrix4(M).y)}));
     let Ft=Infinity;if(m>.05)for(let i=0;i<72;i++){const a=i/72*Math.PI*2,dx=Math.cos(a),dz=Math.sin(a);Ft=Math.min(Ft,W*(supportD(fp,dx,dz)-(cr.x*dx+cr.z*dz))/Math.max(Htop,1))}
-    out.push({id:F.id,stable:m>.05,Ft,Htop,area:area3(F.poly,F.n)})}
+    let topA=0,topTilt=0;H.forEach(G=>{const n=G.n.clone().transformDirection(M);if(n.y<.5)return;const a=area3(G.poly,G.n);if(a>topA){topA=a;topTilt=Math.acos(Math.min(1,n.y))*180/Math.PI}});
+    out.push({id:F.id,stable:m>.05,Ft,Htop,area:area3(F.poly,F.n),M,topTilt})}
+  /* which poses are meant to be used: steady ones that sit on a real face, not ones balancing on a small one; the owner can overrule each */
+  const big=Math.max(0,...out.filter(r=>r.stable).map(r=>r.area)),light=.25*S.jumperLb;
+  for(const r of out){r.auto=r.stable&&r.area>=big*.3&&r.Ft>=light;r.why=!r.stable?'rolls over':r.area<big*.3?'balances on a small face':r.Ft<light?'tips with a light push':'';
+    const o=b.useAs?.[r.id];r.use=o==null?r.auto:o;r.forced=o!=null&&o!==r.auto}
   return out}
+/* a general read of what a pose is good for, from how high its top is and whether the top slopes */
+function useOf(r){const h=r.Htop,k=h<12?'a low step, or something to balance and land on':h<24?'a step-up or a seat':h<44?'vault height':h<72?'a wall to climb or run up':'a tall wall';
+  return `Top at ${Math.round(h)} in: ${k}${r.topTilt>12?', with a slanted top':''}.`}
+/* small pictures of the obstacle sitting each way */
+const thumbScene=new THREE.Scene();thumbScene.background=new THREE.Color(0xF4F5F7);const thumbCam=new THREE.PerspectiveCamera(30,4/3,1,6000);
+{thumbScene.add(new THREE.HemisphereLight(0xffffff,0x8a8f98,1.2));const l=new THREE.DirectionalLight(0xffffff,1.5);l.position.set(3,6,4);thumbScene.add(l)}
+const thumbMesh=new THREE.Mesh(new THREE.BufferGeometry(),new THREE.MeshStandardMaterial({roughness:.8})),thumbLines=new THREE.LineSegments(new THREE.BufferGeometry(),new THREE.LineBasicMaterial({color:0x15181d}));
+const thumbGround=new THREE.Mesh(new THREE.CircleGeometry(1,48),new THREE.MeshBasicMaterial({color:0xD9DDE3}));thumbGround.rotation.x=-Math.PI/2;thumbMesh.matrixAutoUpdate=thumbLines.matrixAutoUpdate=false;thumbScene.add(thumbMesh,thumbLines,thumbGround);
+const thumbCv=document.createElement('canvas');thumbCv.width=240;thumbCv.height=180;const thumbCache=new Map();
+function poseThumb(b,r){if(renderer.xr.isPresenting||!b.mesh.geometry.attributes.position)return '';const key=b._sig+'|'+r.id+'|'+r.use;if(thumbCache.has(key))return thumbCache.get(key);
+  thumbMesh.geometry=b.mesh.geometry;thumbMesh.material.color.set(b.color);thumbMesh.matrix.copy(r.M);thumbLines.geometry=b.lines.geometry;thumbLines.matrix.copy(r.M);
+  const box=new THREE.Box3(),pos=b.mesh.geometry.attributes.position,v=new V();for(let i=0;i<pos.count;i++)box.expandByPoint(v.fromBufferAttribute(pos,i).applyMatrix4(r.M));
+  const c=box.getCenter(new V()),R=box.getSize(new V()).length()/2,src=renderer.domElement,sw=Math.min(src.width,src.height*4/3),sh=sw*.75;
+  thumbGround.scale.setScalar(R*1.35);thumbGround.position.set(c.x,-.05,c.z);thumbGround.material.color.set(r.use?0xBFE8CB:0xDADDE2);
+  thumbCam.aspect=src.width/src.height;thumbCam.position.copy(c).add(new V(1,.7,1.3).normalize().multiplyScalar(R/Math.sin(15*Math.PI/180)*1.08*src.height/sh));thumbCam.lookAt(c);thumbCam.updateProjectionMatrix();
+  renderer.render(thumbScene,thumbCam);const x=thumbCv.getContext('2d');x.drawImage(src,(src.width-sw)/2,(src.height-sh)/2,sw,sh,0,0,240,180);
+  const url=thumbCv.toDataURL('image/jpeg',.82);if(thumbCache.size>60)thumbCache.clear();thumbCache.set(key,url);return url}
 /* panel flex: largest free circle between a face panel's edges and the ribs and blocks screwed to it */
 function flexOf(b){const res=[],t=S.fullThk,P=S.jumperLb*S.landG,r0=2,nu=.3;
   const backers=lastPanels.filter(p=>p.block===b&&p.kind!=='face');
@@ -1761,10 +1783,15 @@ function landColor(q){const A=T.info,L=A.Ld,W=A.W;const g=(k)=>{const gx=(W*A.cr
 function renderTestPanel(){const A=T.info,b=T.b;if(!A)return;
   $('#tBoxes').innerHTML=blocks.length>1?blocks.map((x,i)=>`<button class="btn${x===b?' primary':''}" data-tb="${i}">${x.name}</button>`).join(''):'';
   $$('#tBoxes [data-tb]').forEach(e=>e.onclick=()=>{T.b=blocks[+e.dataset.tb];T.face=null;T.dirPos=null;buildTest()});
-  const st=T.rests.filter(r=>r.stable).sort((a,c)=>c.Ft-a.Ft),un=T.rests.length-st.length;
-  $('#tRests').innerHTML=st.map(r=>{const s=(r.Ft<=A.Fs&&A.Fp>=r.Ft)?'tip':(A.Fp>=A.Fs)?'slide':'hold';return `<div class="item${r.id===T.face?' on':''}" data-rf="${r.id}"><span class="dot ${s}"></span><span class="nm">${faceName(b,r.id)} down</span><span class="meta">tips at ${fmtLb(r.Ft)}</span></div>`}).join('')
+  const st=T.rests.filter(r=>r.stable).sort((a,c)=>(c.use-a.use)||c.Ft-a.Ft),un=T.rests.length-st.length,used=st.filter(r=>r.use);
+  $('#tWays').textContent=!st.length?'It has no face it can sit on without rolling.':`${st.length} way${st.length>1?'s':''} it can sit. ${used.length?used.length+(used.length>1?' are':' is')+' guessed to be in use':'None looks meant to be in use'}: steady, and not balancing on a small face. Tap a switch to overrule the guess.`;
+  $('#tRests').innerHTML=st.map(r=>{const s=(r.Ft<=A.Fs&&A.Fp>=r.Ft)?'tip':(A.Fp>=A.Fs)?'slide':'hold',img=poseThumb(b,r);
+    return `<div class="pose${r.id===T.face?' on':''}${r.use?'':' off'}" data-rf="${r.id}">${img?`<img src="${img}" alt="">`:''}<div class="pt"><div class="ph"><span class="dot ${r.use?s:''}"></span><b>${faceName(b,r.id)} down</b></div>
+      <div class="pl">${useOf(r)}</div><div class="pl">${r.Ft>=1e5?'A push will not tip it':'A '+fmtLb(r.Ft)+' push at the top tips it'}${r.why?' ('+r.why+')':''}.</div>
+      <div class="pu"><button class="usebtn" data-use="${r.id}" aria-pressed="${r.use}" title="Is the obstacle meant to be used sitting this way? Tap to switch.">${r.use?'In use':'Not in use'}</button><span>${r.forced?'your choice':'guessed'}</span></div></div></div>`}).join('')
     +(un?`<p class="note">${un} other face${un>1?'s':''} roll${un>1?'':'s'} over if set down on ${un>1?'them':'it'}.</p>`:'');
   $$('#tRests [data-rf]').forEach(e=>e.onclick=()=>{T.face=e.dataset.rf;T.dirPos=null;buildTest()});
+  $$('#tRests [data-use]').forEach(e=>e.onclick=ev=>{ev.stopPropagation();const id=e.dataset.use,r=T.rests.find(x=>x.id===id);b.useAs=b.useAs||{};const nv=!r.use;if(nv===r.auto)delete b.useAs[id];else b.useAs[id]=nv;save();buildTest(true)});
   if(T.mode==='strength'){renderStrength();return}
   $('#tBalCtl').hidden=false;
   const tipSides=A.ring.filter(s=>s.st==='tip').length,slideSides=A.ring.filter(s=>s.st==='slide').length,lb=Math.round(A.Fp);
@@ -1777,6 +1804,8 @@ function renderTestPanel(){const A=T.info,b=T.b;if(!A)return;
     rows.push([bad?'tip':near?'slide':'hold',bad?`<b>Landing tips it</b> on ${Math.round(bad/tot*100)}% of the top. A ${Math.round(A.Ld)} lb landing there flips it.`:near?`<b>Landing holds</b>, though yellow areas tip at twice a ${Math.round(A.Ld)} lb landing.`:`<b>Landing holds</b> everywhere on top, even at twice a ${Math.round(A.Ld)} lb landing.`])}
   const up=T.flex.filter(f=>f.n.clone().transformDirection(A.M).y>=.3).sort((a,c)=>c.sig-a.sig)[0];
   if(up)rows.push([up.st,`<b>${up.st==='hold'?'Panels hold':'Panel '+up.label+(up.st==='tip'?' is too springy':' flexes a lot')}.</b> Widest free span on top is ${up.label}, ${(up.r*2).toFixed(0)}" across. A ${Math.round(A.Ld)} lb landing bends it ${up.def.toFixed(2)}" at about ${Math.round(up.sig).toLocaleString()} psi.${up.st==='hold'?'':' Tighten rib spacing or use thicker ply.'}`]);
+  const weak=T.rests.filter(r=>r.use&&r.id!==T.face&&r.Ft<A.Fp&&r.Ft<=A.Fs);
+  if(weak.length)rows.push(['tip',`<b>${weak.map(r=>faceName(b,r.id)+' down').join(', ')}</b> ${weak.length>1?'are':'is'} marked in use, but a ${lb} lb push tips ${weak.length>1?'them':'it'}. Widen ${weak.length>1?'those faces':'that face'}, or switch ${weak.length>1?'them':'it'} to "Not in use".`]);
   const steady=T.rests.filter(r=>r.stable).sort((a,c)=>c.Ft-a.Ft)[0];
   if(A.stable&&(tipSides||A.ring.some(s=>s.st==='tip')))rows.push(['slide',`<b>Fixes:</b> rest it on a wider face, add ballast low inside, or anchor it down.${steady&&steady.id!==T.face?` <button class="btn" id="tRestBest" style="margin-top:6px">Rest it on ${faceName(b,steady.id)}</button>`:''}`]);
   $('#tResult').innerHTML=rows.map(([s,h])=>`<div class="tr"><span class="dot ${s}"></span><div>${h}</div></div>`).join('');
@@ -2172,7 +2201,7 @@ new MutationObserver(applyTheme).observe(document.documentElement,{attributes:tr
 /* ---------------- persistence ---------------- */
 const KEY='plyGrammar.v2';let saveT=0;
 const serBlock=b=>({name:b.name,p:b.pivot.position.toArray(),q:b.pivot.quaternion.toArray(),s:b.sizer.scale.toArray(),edgeOpts:b.edgeOpts,
-  ribMax:b.ribMax||undefined,glueRibs:b.glueRibs||undefined,cuts:b.cuts.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray()})),
+  ribMax:b.ribMax||undefined,glueRibs:b.glueRibs||undefined,useAs:b.useAs&&Object.keys(b.useAs).length?b.useAs:undefined,cuts:b.cuts.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray()})),
   carves:b.carves.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray(),s:c.userData.sizer.scale.toArray()}))});
 const serModel=()=>({app:'ply-grammar',v:3,S,blocks:blocks.map(serBlock)});
 /* undo: every saved state of the model, newest last */
