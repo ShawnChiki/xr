@@ -3724,7 +3724,7 @@ class BCConn {
   constructor(p, id){ this.p = p; this.peer = id; this.h = {}; this.open = false; }
   on(e, f){ (this.h[e] = this.h[e] || []).push(f); } emit(e, ...a){ (this.h[e] || []).forEach(f => f(...a)); }
   ready(){ if (this.open) return; this.open = true; setTimeout(() => this.emit('open'), 0); }
-  send(d){ this.p.bc.postMessage({ to: this.peer, from: this.p.id, k: 'data', d: JSON.parse(JSON.stringify(d)) }); }
+  send(d){ const s = JSON.stringify(d); if (new TextEncoder().encode(s).byteLength >= 16300){ this.emit('error', { type: 'message-too-big' }); return; } this.p.bc.postMessage({ to: this.peer, from: this.p.id, k: 'data', d: JSON.parse(s) }); }
   close(){ this.p.bc.postMessage({ to: this.peer, from: this.p.id, k: 'close' }); this.emit('close'); }
 }
 class BCPeer {
@@ -3782,12 +3782,23 @@ const NET = (() => {
   function welcomeState(){ const d = snapshot(); delete d.dio; return d; }
 
   // ---- connections. The host keeps one per guest and passes messages on; a guest has one, to the host.
-  function send(m, except){ const s = c => { try { c.send(m); } catch (e){} };
-    if (ns.host){ for (const [pid, c] of ns.conns) if (pid !== except && c.ready) s(c); } else if (ns.conn) s(ns.conn); }
+  // PeerJS refuses JSON messages of 16 KB or more, so anything bigger goes in pieces (5000 characters is under that even in the worst case)
+  let ckN = 0; const PIECE = 5000, asm = new Map();
+  function wire(m){ const s = JSON.stringify(m); if (s.length <= PIECE) return [m]; const k = (++ckN).toString(36) + Math.random().toString(36).slice(2, 6), n = Math.ceil(s.length / PIECE), out = [];
+    for (let i = 0; i < n; i++) out.push({ t: 'ck', k, i, n, d: s.slice(i * PIECE, (i + 1) * PIECE) }); return out; }
+  function sendTo(c, parts){ for (const p of parts) try { c.send(p); } catch (e){ console.warn('send', e); } }
+  function send(m, except){ const parts = wire(m);
+    if (ns.host){ for (const [pid, c] of ns.conns) if (pid !== except && c.ready) sendTo(c, parts); } else if (ns.conn) sendTo(ns.conn, parts); }
+  function pieceIn(m, from){
+    const key = from + ':' + m.k; let a = asm.get(key); if (!a){ a = { n: m.n, got: 0, parts: [] }; asm.set(key, a); }
+    if (a.parts[m.i] === undefined){ a.parts[m.i] = m.d; a.got++; }
+    if (!ns.synced && a.n > 10) status('Getting the park… ' + Math.round(a.got / a.n * 100) + '%');
+    if (a.got < a.n) return; asm.delete(key); let full; try { full = JSON.parse(a.parts.join('')); } catch (e){ return; } onData(full, from);
+  }
   const rosterMsg = () => ({ t: 'roster', list: ns.roster.map(p => ({ slot: p.slot, pid: p.pid })) });
   function reset(){
     voiceStop(); for (const c of ns.conns.values()) try { c.close(); } catch (e){} try { ns.conn?.close(); } catch (e){} try { ns.peer?.destroy(); } catch (e){}
-    Object.assign(ns, { on: false, host: false, guest: false, ui: 'idle', peer: null, conn: null, roster: [], slot: 0, synced: false, menuSentN: -1 }); ns.conns = new Map(); ns.gsSent.clear();
+    Object.assign(ns, { on: false, host: false, guest: false, ui: 'idle', peer: null, conn: null, roster: [], slot: 0, synced: false, menuSentN: -1 }); ns.conns = new Map(); ns.gsSent.clear(); asm.clear();
     for (const s of [...avatars.keys()]) dropAvatar(s); for (const k of [...ghosts.keys()]) dropGhost(k); genes.clear(); menuDirty = true;
   }
   // a park that once came from someone else's headset may have their ids: number it again before opening a room
@@ -3813,13 +3824,13 @@ const NET = (() => {
       if (ns.roster.length >= 8){ try { c.send({ t: 'full-room' }); c.close(); } catch (e){} return; }
       let slot = 1; while (ns.roster.some(p => p.slot === slot)) slot++;
       flushMine(); c.ready = true; ns.conns.set(c.peer, c); ns.roster.push({ slot, pid: c.peer });
-      c.send({ t: 'welcome', slot, state: welcomeState(), others: ns.roster.filter(p => p.pid !== c.peer).map(p => ({ slot: p.slot, pid: p.pid })) });
+      sendTo(c, wire({ t: 'welcome', slot, state: welcomeState(), others: ns.roster.filter(p => p.pid !== c.peer).map(p => ({ slot: p.slot, pid: p.pid })) }));
       send(rosterMsg()); newcomer(); flash('Player ' + (slot + 1) + ' joined'); chime(true);
     });
     c.on('data', m => onData(m, c.peer));
     const gone = () => { if (!ns.conns.has(c.peer)) return; ns.conns.delete(c.peer); const p = ns.roster.find(q => q.pid === c.peer); ns.roster = ns.roster.filter(q => q.pid !== c.peer);
       if (p){ forget(p.slot); flash('Player ' + (p.slot + 1) + ' left'); } send(rosterMsg()); menuDirty = true; chime(false); };
-    c.on('close', gone); c.on('error', gone);
+    c.on('close', gone); c.on('error', e => { console.warn('connection', e); if (!c.open) gone(); });
   }
   async function join(code){
     reset(); ns.ui = 'busy'; ns.code = code; status('Connecting to ' + code + '…');
@@ -3829,7 +3840,7 @@ const NET = (() => {
       c.on('open', () => { Object.assign(ns, { on: true, guest: true, host: false, ui: 'live' }); status('Joining room ' + code + '…'); });
       c.on('data', m => onData(m, 'host'));
       const lost = () => { if (!ns.on) return; reset(); status('The host left. Your copy of the park is still here.'); flash('The host left the room'); chime(false); };
-      c.on('close', lost); c.on('error', lost); });
+      c.on('close', lost); c.on('error', e => { console.warn('connection', e); if (!c.open) lost(); }); });
     peer.on('call', c => (voice.ready || Promise.resolve()).then(() => { c.answer(voice.local || silentStream()); voiceAttach(c); }));
     peer.on('error', e => { if (ns.on) return; ns.ui = 'idle';
       status(e.type === 'peer-unavailable' ? 'No room with code ' + code + '. Check the number.' : e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' ? 'Can\'t reach the matchmaker. Check the internet and try again.' : 'Something went wrong (' + e.type + '). Try again.'); });
@@ -3851,6 +3862,7 @@ const NET = (() => {
   const RELAY = ['ops', 'coins', 'flag', 'p', 'rd', 'gs', 'ev', 'mi'];
   function onData(m, from){
     if (!m || !m.t) return;
+    if (m.t === 'ck') return pieceIn(m, from);
     if (ns.host && from !== 'host' && RELAY.includes(m.t)) send(m, from);   // pass it on to everyone else
     if (m.t === 'welcome') welcome(m);
     else if (m.t === 'roster'){ const had = ns.roster.length; ns.roster = m.list; for (const s of [...avatars.keys()]) if (!m.list.some(p => p.slot === s)) forget(s); if (m.list.length > had) newcomer(); menuDirty = true; }
