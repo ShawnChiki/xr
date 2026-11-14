@@ -17,10 +17,12 @@ function gen(seed){const R=rng(seed*7919+13),ri=(a,b)=>Math.round(a+R()*(b-a)),p
   b.name='A';return {b,desc:`box ${s.join('x')} cuts ${cuts.map(c=>c.n.map(x=>x.toFixed(2)).join(',')+'@'+c.p.map(x=>x.toFixed(0)).join(',')).join(' | ')} carves ${b.carves.map(c=>c.userData.sizer.scale.toArray().join('x')+'@'+c.position.toArray().join(',')).join(' | ')}`}}
 /* surface coverage: walk a grid over every outside face, half a ply under the surface; each point must be inside some part.
    Returns the bare spots per face, largest first. */
-function coverage(b,r,step=.5,depth=.06){const t=thkModel(),ps=r.panels.filter(p=>p.part?.length),parts=ps.map((p,i)=>asmPart(p,i)),out=[];
+function coverage(b,r,step=.5,depth=.06){const t=thkModel(),meets=(r.joints||[]).filter(j=>j.joint==='meet').map(j=>({a:j.a,d:j.b.clone().sub(j.a),w:t*Math.tan((180-j.ang)/2*Math.PI/180)+.5})),
+  /* the open strip either side of a meet joint is there by design (the two panels stop short and touch at their inside corners) */
+  nearMeet=X=>meets.some(m=>{const l2=m.d.lengthSq()||1,u=Math.max(0,Math.min(1,X.clone().sub(m.a).dot(m.d)/l2));return m.a.clone().addScaledVector(m.d,u).distanceTo(X)<m.w}),ps=r.panels.filter(p=>p.part?.length),parts=ps.map((p,i)=>asmPart(p,i)),out=[];
   const faces=b.brep?b.brep.faces.filter(f=>!f.skip).map(f=>({name:'A'+f.num,n:f.n,O:f.O,u:f.u,v:f.v,cts:f.cts})):solidFaces(blockPlanes(b)).map((f,i)=>{const n=f.pl.n,O=f.poly[0],u=f.poly[1].clone().sub(O).normalize(),v=new V().crossVectors(n,u);return {name:'f'+i+':'+f.pl.id,n,O,u,v,cts:[f.poly.map(p=>{const q=p.clone().sub(O);return [q.dot(u),q.dot(v)]})]}});
   for(const f of faces){let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;f.cts[0].forEach(([x,y])=>{x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x);y1=Math.max(y1,y)});const bare=[];
-    for(let x=x0+.2;x<x1;x+=step)for(let y=y0+.2;y<y1;y+=step){if(!pip2(f.cts,x,y))continue;const X0=f.O.clone().addScaledVector(f.u,x).addScaledVector(f.v,y);
+    for(let x=x0+.2;x<x1;x+=step)for(let y=y0+.2;y<y1;y+=step){if(!pip2(f.cts,x,y))continue;const X0=f.O.clone().addScaledVector(f.u,x).addScaledVector(f.v,y);if(nearMeet(X0))continue;
       /* a see-through hole: no wood anywhere through the skin at this spot */
       if([.06,.25,.45,.68].every(h=>{const X=X0.clone().addScaledVector(f.n,-h*t/.75);return !parts.some(P=>inPart(P,X.x,X.y,X.z))}))bare.push([x,y])}
     /* group touching bare points */
@@ -47,14 +49,23 @@ function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,
         for(const [x,y] of out2){const X=x*cs+y*sn,Y=-x*sn+y*cs;x0=Math.min(x0,X);x1=Math.max(x1,X);y0=Math.min(y0,Y);y1=Math.max(y1,Y)}const w=x1-x0,h=y1-y0;if((w<=Wu&&h<=Hu)||(w<=Hu&&h<=Wu))ok=true}
       if(!ok)I('oversize',p.label)}}
   if(b.brep&&b.freeEdges)I('open-shell',b.freeEdges+' free edges');
+  /* no panel in two pieces, and none held together by a neck narrower than 5/8 in */
+  for(const p of ps){if(p.kind!=='face')continue;const outs=p.part.filter(c=>areaF(c)>.05);
+    /* a face that is itself drawn with a thin arm or neck (a cut-out that leaves a lip) is the design's doing, not the joints' */
+    if(p.face&&outs.length>1&&!p.splice){const fo=offsetC(p.face.map(c=>rawC(c)),-1.1,false).map(fromC),big=outs.reduce((m,c)=>areaF(c)>areaF(m)?c:m,outs[0]);
+      if(outs.every(c=>c===big||(()=>{const cx=c.reduce((s_,q)=>s_+q[0],0)/c.length,cy=c.reduce((s_,q)=>s_+q[1],0)/c.length;return !pip2(fo,cx,cy)})())){I('thin-face(explained)',p.label);continue}}
+    if(outs.length>1&&!p.splice){I('split-part',p.label+' in '+outs.length);continue}
+    const sm=offsetC(p.part.map(rawC),-.31,false).map(fromC).filter(c=>areaF(c)>.3);if(sm.length>outs.length)I('thin-neck',p.label)}
   /* no see-through hole an inch square or more anywhere on the outside */
   {const hs=coverage(b,r).filter(x=>x.sq);if(hs.length)I('hole',hs.length+' biggest '+hs[0].face+' '+hs[0].area.toFixed(1)+'sq in')}
   /* every outside corner filled: walk each shell edge half a ply under both faces; that stick of wood must belong to some part.
      And no two neighbors may lie in one plane: that is one plate wrongly cut in two. */
   if(b.brep){const t=thkModel(),parts=ps.map((p,i)=>asmPart(p,i)),F=b.brep.faces.slice().sort((x,y)=>x.i-y.i);
+    /* beside a meet joint the corner is cut back on purpose, and the panels at its ends are trimmed to match */
+    const meets=(r.joints||[]).filter(j=>j.joint==='meet').map(j=>({a:j.a,d:j.b.clone().sub(j.a),w:t*Math.tan((180-j.ang)/2*Math.PI/180)+1.2})),nearM=X=>meets.some(m=>{const l2=m.d.lengthSq()||1,u=Math.max(0,Math.min(1,X.clone().sub(m.a).dot(m.d)/l2));return m.a.clone().addScaledVector(m.d,u).distanceTo(X)<m.w});
     F.forEach(f=>f.E.forEach(e=>{if(e.nb<0||e.nb<f.i||e.L<4*t)return;const g=F[e.nb];if(f.skip||g.skip)return;const c=f.n.dot(g.n);
-      if(c>.999){I('split-plate',name0+f.num+'|'+name0+g.num);return}if(!e.convex||c<-.9||(S.meetAngle>0&&c>Math.cos(S.meetAngle*Math.PI/180)))return;/* a 'meet' joint is an open V by design */const a=-(t/2)/(1+c),dir=e.B.clone().sub(e.A).normalize();let miss=0,run=0,best=0;
-      for(let s=3*t;s<e.L-3*t;s+=.25){const X=e.A.clone().addScaledVector(dir,s).addScaledVector(f.n,a).addScaledVector(g.n,a);if(parts.some(P=>inPart(P,X.x,X.y,X.z)))run=0;else{miss++;run++;best=Math.max(best,run)}}
+      if(c>.999){I('split-plate',name0+f.num+'|'+name0+g.num);return}if(!e.convex||c<-.9||(S.meetAngle>0&&c>Math.cos(S.meetAngle*Math.PI/180))||(S.meetSharp>0&&-c>Math.cos(S.meetSharp*Math.PI/180)))return;/* a 'meet' joint is an open V by design */const a=-(t/2)/(1+c),dir=e.B.clone().sub(e.A).normalize();let miss=0,run=0,best=0;
+      for(let s=3*t;s<e.L-3*t;s+=.25){const X=e.A.clone().addScaledVector(dir,s).addScaledVector(f.n,a).addScaledVector(g.n,a);if(nearM(X)||parts.some(P=>inPart(P,X.x,X.y,X.z)))run=0;else{miss++;run++;best=Math.max(best,run)}}
       if(best>=4){const th=b.thin||[],ex=th.some(x=>[x.A,x.B].includes(name0+f.num)||[x.A,x.B].includes(name0+g.num));I(ex?'empty-socket-thin(explained)':'empty-socket',name0+f.num+'|'+name0+g.num+' '+(best*.25).toFixed(1)+'in')}}))}
   const mp=mergeSplices(ps),faces=mp.filter(p=>p.kind==='face');if(!faces.length){I('nofaces','');return out}
   const base=basePanel(faces).label,plan=planAssembly(mp,base),P=plan.parts,thin=b.thin||[];

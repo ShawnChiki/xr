@@ -21,7 +21,7 @@
 
 The torture test also checks that every outside corner is filled (no socket without its finger) and that no plate is cut in two along a flat face.
 It also walks a grid over every outside face and reports any see-through hole an inch square or more.
-With those checks: plain boxes 100% clean, boxes with cuts 99%, straight cut-outs 97%, everyday turned cut-outs 79% (linings that cannot slide past ribs, and thin sharp triangle faces, are the open problems).
+With those checks: plain boxes 100% clean, boxes with cuts 99%, straight cut-outs 94%, everyday turned cut-outs 73% (the test got stricter in v1.15: a panel cut in two, or held by a neck under 5/8 in, now fails; under these checks v1.14 scored lower) (linings that cannot slide past ribs, and thin sharp triangle faces, are the open problems).
     python3 mkh.py test9.js && node h.mjs      # the original boxes
     python3 mkh.py cv.js && node h.mjs         # cut-outs: step, tunnel, sloped corner, 110" box
     python3 mkh.py dn.js && node h.mjs         # holes through the middle
@@ -30,3 +30,5 @@ Run the torture test before every push. On 13 Nov 2026 it stood at: plain boxes 
 `node h.mjs 1 1 <seed>` prints one failing shape so it can be looked at.
 
 Other checks added with v1.14: `par.py <design.json>...` (every part's 3D mesh is a closed solid, or the Section view shows cuts that are not there), `gf.js` (the app's gap finder run over random shapes: `node h.mjs 120 1`, prints see-through spots and dents), `cc.js` (the corner square along every inside edge is filled), `scr.py` (screws by hand), `hinge.py` (tilt about an edge).
+
+v1.15 added to the torture test: `split-part` (a panel in two pieces) and `thin-neck` (a panel that falls apart when 5/16 in is shaved off all round). `bst.py` checks the build steps (bench steps, pause, scrub).
