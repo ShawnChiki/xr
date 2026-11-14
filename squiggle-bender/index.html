@@ -199,6 +199,7 @@ body.xr .rb.xrb{margin-top:10px!important}
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 /* ================= constants ================= */
 const DS = 0.02;               // analysis sample spacing (m)
@@ -435,37 +436,70 @@ function simPiece(G, i0, iE, roll) {
   }
   return null;
 }
+// the same tube read from the other end, so a piece can go into the machine either way round
+function revG(G) {
+  const n = G.n, g = { n };
+  for (const k of ['px', 'py', 'pz', 'tx', 'ty', 'tz', 'ux', 'uy', 'uz', 'wx', 'wy', 'wz']) g[k] = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const j = n - 1 - i;
+    g.px[i] = G.px[j]; g.py[i] = G.py[j]; g.pz[i] = G.pz[j];
+    g.tx[i] = -G.tx[j]; g.ty[i] = -G.ty[j]; g.tz[i] = -G.tz[j];
+    g.ux[i] = G.ux[j]; g.uy[i] = G.uy[j]; g.uz[i] = G.uz[j];
+    g.wx[i] = -G.wx[j]; g.wy[i] = -G.wy[j]; g.wz[i] = -G.wz[j];
+  }
+  return g;
+}
+// try all 12 roll angles; keep the one that bends furthest before hitting anything
+function bestRoll(G, a, b) {
+  let best = null, bestK = -1, roll = 0;
+  for (const r of ROLLS) { const c = simPiece(G, a, b, r), kk = c ? c.k : Infinity; if (kk > bestK) { bestK = kk; best = c; roll = r; } if (kk === Infinity) break; }
+  return { best, roll };
+}
+// the machine-frame tube and sample range a piece is bent from (reversed pieces are fed far end first)
+const pieceG = (sd, p) => p.rev ? (sd.Gr || (sd.Gr = revG(sd.G))) : sd.G;
+const toOrig = (sd, p, g) => p.rev ? sd.P.length - 1 - g : g;
 function argmaxR(R, lo, hi) { let b = hi, bv = -1; for (let i = lo; i <= hi; i++) if (R[i] > bv) { bv = R[i]; b = i; } return b; }
 function splitStroke(P, R, G, cuts) {
-  const n = P.length, M = S.machine;
+  const n = P.length, M = S.machine, Gr = revG(G);
   const mode = S.split || 'fewest';
   let maxS = Math.max(15, Math.floor((M.maxStock - M.grip) / DS));
   if (mode === 'handle') maxS = Math.max(15, Math.min(maxS, Math.floor(S.handleLen / DS)));
   if (mode === 'even') { const count = Math.ceil((n - 1) / maxS); maxS = Math.min(maxS, Math.ceil((n - 1) / count) + Math.round(0.3 / DS)); }
-  const minS = Math.round(0.3 / DS), back = Math.round((mode === 'straight' ? 1.5 : mode === 'even' ? 0.6 : 0.4) / DS);
+  const minS = Math.round(0.3 / DS), back = Math.round((mode === 'straight' ? 1.5 : mode === 'even' ? 0.6 : 0.4) / DS), stepS = Math.round(0.25 / DS);
   const E = env(); const pieces = []; let i0 = 0, guard = 0;
   const forced = (cuts || []).map(c => Math.round(c / DS)).filter(i => i > minS && i < n - minS).sort((a, b) => a - b);
+  // the clean way to bend [a, b]: fed start first, or fed far end first
+  const revOK = (a, b) => { const r = bestRoll(Gr, n - 1 - b, n - 1 - a); return r.best ? null : r.roll; };
   while (i0 < n - 1 && guard++ < 300) {
     let iE = Math.min(n - 1, i0 + maxS);
     let reason = iE === n - 1 ? 'end' : 'stock';
-    const fc = forced.find(c => c > i0 + minS / 2);
+    // a cut you placed wins, unless the machine already had to cut right before it (no tiny stubs)
+    const fc = forced.find(c => c > i0 + minS);
     if (fc !== undefined && fc <= iE) { iE = fc; reason = 'user'; }
-    let best = null, bestK = -1, bestRoll = 0;
-    for (const r of ROLLS) {
-      const c = simPiece(G, i0, iE, r), kk = c ? c.k : Infinity;
-      if (kk > bestK) { bestK = kk; best = c; bestRoll = r; }
-      if (kk === Infinity) break;
+    const fw = bestRoll(G, i0, iE);
+    let best = fw.best, roll = fw.roll, rev = false;
+    if (best) {
+      // the start-first feed hits something: try feeding the far end first (tight bends come out first)
+      const rr = revOK(i0, iE);
+      if (rr !== null) { best = null; roll = rr; rev = true; }
+      else if (reason !== 'user') {
+        const fcut = best.k - 2;
+        for (let e = iE - stepS; e > Math.max(fcut + stepS, i0 + minS); e -= stepS) {
+          const r2 = revOK(i0, e); if (r2 !== null) { iE = e; reason = best.type; best = null; roll = r2; rev = true; break; }
+        }
+      }
     }
     let end = iE, flagged = false, col = null;
     if (best) {
       const cut = best.k - 2;
       if (cut < i0 + minS) { end = Math.min(n - 1, i0 + minS); flagged = true; col = best; reason = 'stuck'; }
       else { end = argmaxR(R, Math.max(i0 + minS, cut - back), cut); reason = best.type; }
-    } else if (reason === 'stock') end = argmaxR(R, Math.max(i0 + minS, iE - back), iE);
+    } else if (reason === 'stock' && !rev) end = argmaxR(R, Math.max(i0 + minS, iE - back), iE);
     let shrunk = false;
     while (end - i0 > minS && !fits(obb(P, i0, end).dims, E)) { end = Math.max(i0 + minS, end - Math.round(0.15 / DS)); shrunk = true; }
     if (shrunk && !flagged) reason = 'ship';
-    pieces.push({ i0, i1: end, roll: bestRoll, reason, flagged, col, len: (end - i0) * DS });
+    if (shrunk && rev) { const r3 = revOK(i0, end); if (r3 !== null) roll = r3; else rev = false; }
+    pieces.push({ i0, i1: end, roll, rev, g0: rev ? n - 1 - end : i0, g1: rev ? n - 1 - i0 : end, reason, flagged, col, len: (end - i0) * DS });
     i0 = end;
   }
   return pieces;
@@ -752,7 +786,7 @@ function analyze() {
       const s = R[i] < mR ? 2 : (S.safety.on && R[i] < S.safety.minR ? 1 : 0); status[i] = s;
       if (s === 2 && prev !== 2) runsM++; if (s === 1 && prev === 0) runsS++; prev = s; minR = Math.min(minR, R[i]);
     }
-    res.strokes.push({ id: st.id, si, P, R, F, G, pieces, seams, asms, footings, openEnds, status, runsM, runsS, minR, len: (P.length - 1) * DS, maxY: Math.max(...P.map(p => p.y)) });
+    res.strokes.push({ id: st.id, si, P, R, F, G, Gr: null, pieces, seams, asms, footings, openEnds, status, runsM, runsS, minR, len: (P.length - 1) * DS, maxY: Math.max(...P.map(p => p.y)) });
   });
   // junctions: a tube end landing on another tube
   res.junctions = [];
@@ -874,6 +908,8 @@ renderer.xr.enabled = true;
 view.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 const BG = new THREE.Color('#E6E2DA'); scene.background = BG;
+const sky = new THREE.Mesh(new THREE.SphereGeometry(120, 32, 16), new THREE.MeshBasicMaterial({ color: BG, side: THREE.BackSide, depthWrite: false, fog: false }));
+sky.renderOrder = -100; sky.visible = false; scene.add(sky);
 const xrCam = new THREE.PerspectiveCamera(50, 1, 0.02, 300);
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
@@ -1230,7 +1266,7 @@ function animateMachine(js, stock, pts, p, k) {
   const rollShut = js.phase === 'bend' || js.phase === 'cut' || (js.phase === 'load' && js.f > 0.8);
   const ry = dyn.upRoll.position.y + ((rollShut ? H + r + 0.03 : H + r + 0.09) - dyn.upRoll.position.y) * 0.2;
   dyn.upRoll.position.set(dyn.gx, ry, 0);
-  if (js.phase === 'bend') dyn.roll = (k - p.i0) * DS / 0.03;
+  if (js.phase === 'bend') dyn.roll = (k - p.g0) * DS / 0.03;
   dyn.upRoll.rotation.set(Math.PI / 2, dyn.roll, 0);
   rod(dyn.upRod, V3(dyn.gx, ry, 0), V3(dyn.gx, H + 0.3, 0));
   const op = dyn.op; op.visible = S.helpers;
@@ -1267,7 +1303,7 @@ function animateMachine(js, stock, pts, p, k) {
     c.textAlign = 'right'; c.fillText(clock(jobT), 496, 30); c.textAlign = 'left';
     c.fillStyle = js.phase === 'bend' ? '#5fd88a' : '#FFC20E'; c.font = '800 30px system-ui, sans-serif'; c.fillText(PHNAME[js.phase].toUpperCase(), 16, 88);
     c.fillStyle = '#d6dbe4'; c.font = '600 24px ui-monospace, Menlo, monospace';
-    const fed = (k - p.i0) * DS * 1000;
+    const fed = (k - p.g0) * DS * 1000;
     c.fillText(`FEED   ${fed.toFixed(0).padStart(6)} mm`, 16, 134);
     c.fillText(`DIE Y  ${((dp.y - H) * 1000).toFixed(1).padStart(6)} mm`, 16, 172);
     c.fillText(`DIE Z  ${(dp.z * 1000).toFixed(1).padStart(6)} mm`, 16, 210);
@@ -1343,7 +1379,7 @@ function buildProgram(i) {
   const lines = []; let n = 0;
   const line = (code, note, phase, k) => { n += 10; const t = `N${String(n).padStart(4, '0')} ${code}`; lines.push({ t, phase, k, html: `<span class="n">N${String(n).padStart(4, '0')}</span> ${esc(code)}${note ? ` <span class="cm">(${esc(note)})</span>` : ''}` }); };
   lines.push({ t: '', phase: 'head', html: `<span class="ln-h">O${String(i + 1).padStart(4, '0')} (PIECE ${i + 1} OF ${L.length} · TUBE ${sd.si + 1})</span>` });
-  lines.push({ t: '', phase: 'head', html: `(${(T.od * 1000).toFixed(1)} X ${(T.wall * 1000).toFixed(2)} SUS304 · ${(p.len * 1000).toFixed(0)} MM · ROLL ${Math.round(p.roll * 180 / Math.PI)} DEG)` });
+  lines.push({ t: '', phase: 'head', html: `(${(T.od * 1000).toFixed(1)} X ${(T.wall * 1000).toFixed(2)} SUS304 · ${(p.len * 1000).toFixed(0)} MM · ROLL ${Math.round(p.roll * 180 / Math.PI)} DEG${p.rev ? ' · FEED FAR END FIRST' : ''})` });
   line('G21 G90', 'millimetres, absolute', 'load');
   line('M61', 'load tube onto the supports', 'load');
   line('M10', 'close chuck on the feeder bar', 'load');
@@ -1351,11 +1387,12 @@ function buildProgram(i) {
   line('G00 X0 Y0 Z0', 'moving die to centre', 'load');
   line('M08', 'lube on', 'load');
   const step = 3; let c = 0;
-  for (let kk = p.i0 + step; kk <= p.i1; kk += step) {
-    const j = Math.max(p.i0, kk - m); toMachine(sd.G, kk, j, p.roll, w);
-    const ok = w.x > 0.1, Y = ok ? w.y * 1000 : 0, Z = ok ? w.z * 1000 : 0, R = sd.R[kk];
+  const PG = pieceG(sd, p);
+  for (let kk = p.g0 + step; kk <= p.g1; kk += step) {
+    const j = Math.max(p.g0, kk - m); toMachine(PG, kk, j, p.roll, w);
+    const ok = w.x > 0.1, Y = ok ? w.y * 1000 : 0, Z = ok ? w.z * 1000 : 0, R = sd.R[toOrig(sd, p, kk)];
     const note = c++ % 8 === 0 ? (R > 5 ? 'straight' : `radius ${(R * 1000).toFixed(0)}`) : '';
-    line(`G01 X${((kk - p.i0) * DS * 1000).toFixed(1)} Y${Y.toFixed(2)} Z${Z.toFixed(2)} F${feed}`, note, 'bend', kk);
+    line(`G01 X${((kk - p.g0) * DS * 1000).toFixed(1)} Y${Y.toFixed(2)} Z${Z.toFixed(2)} F${feed}`, note, 'bend', kk);
   }
   line('M09', 'lube off', 'cut');
   line('G00 Y0 Z0', 'moving die back to centre', 'cut');
@@ -1388,7 +1425,7 @@ function updateBendPanel() {
   const L = allPieces(), x = L[selPiece]; if (!x) return;
   document.querySelectorAll('.pc').forEach((b, i) => b.classList.toggle('on', i === selPiece));
   const set = (k, v) => { const el = document.querySelector(`[data-out="${k}"]`); if (el) el.textContent = v; };
-  set('pieceLabel', `Piece ${selPiece + 1} of ${L.length} · Tube ${x.sd.si + 1}`); set('pieceLen', fL(x.p.len)); set('stockLen', fL(x.p.len + S.machine.grip)); set('reason', REASONS[x.p.reason]);
+  set('pieceLabel', `Piece ${selPiece + 1} of ${L.length} · Tube ${x.sd.si + 1}`); set('pieceLen', fL(x.p.len)); set('stockLen', fL(x.p.len + S.machine.grip)); set('reason', REASONS[x.p.reason] + (x.p.rev ? ' Fed far end first, so the tight bends come out of the machine before they can swing into anything.' : ''));
 }
 const _w = new THREE.Vector3();
 function updateBend() {
@@ -1401,9 +1438,9 @@ function updateBend() {
   if (js.st.i !== selPiece) { selPiece = js.st.i; rebuildDesign(); rebuildShip(); updateBendPanel(); drawWrist(); }
   const { sd, p, pi } = list[js.st.i], M = S.machine, r = tube().od / 2, H = M.dieH;
   const bf = js.phase === 'load' ? 0 : js.phase === 'bend' ? js.f : 1;
-  const k = p.i0 + Math.round(bf * (p.i1 - p.i0));
+  const k = p.g0 + Math.round(bf * (p.g1 - p.g0)), PG = pieceG(sd, p);
   const pts = [];
-  for (let j = p.i0; j <= k; j++) { toMachine(sd.G, k, j, p.roll, _w); pts.push(V3(_w.x, _w.y + H, _w.z)); }
+  for (let j = p.g0; j <= k; j++) { toMachine(PG, k, j, p.roll, _w); pts.push(V3(_w.x, _w.y + H, _w.z)); }
   const off = V3(0, 0, 0);
   if (js.phase === 'unload' && pts.length) {
     const e = js.f < 0.5 ? 2 * js.f * js.f : 1 - Math.pow(-2 * js.f + 2, 2) / 2, minY = Math.min(...pts.map(q => q.y));
@@ -1411,8 +1448,8 @@ function updateBend() {
   }
   if (pts.length >= 2) { bentMesh = new THREE.Mesh(tubeGeo(pts, r), pieceMat(p.flagged ? 0x14161B : PIECE_COLS[(pi + sd.si) % PIECE_COLS.length])); bentMesh.position.copy(off); machineGroup.add(bentMesh); }
   // straight tube still in the machine; the gripped end stays on the part and leaves with it (trimmed by hand later)
-  const full = (p.i1 - p.i0) * DS + M.grip;
-  const stock = js.phase === 'load' ? full : js.phase === 'bend' ? (p.i1 - k) * DS + M.grip : M.grip;
+  const full = (p.g1 - p.g0) * DS + M.grip;
+  const stock = js.phase === 'load' ? full : js.phase === 'bend' ? (p.g1 - k) * DS + M.grip : M.grip;
   const lift = js.phase === 'load' ? (1 - Math.min(1, js.f * 1.6)) * 0.9 : 0;
   stockMesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, stock, 16), steel);
   stockMesh.rotation.z = Math.PI / 2; stockMesh.position.set(-stock / 2, H + lift, 0).add(off); machineGroup.add(stockMesh);
@@ -1686,6 +1723,12 @@ function onDown(e, pane) {
   if (tab !== 'draw' && o.userData.seamKey) { drag = { kind: 'seam', pane, ring: o, sd: A.strokes.find(s => s.id === o.userData.sid), seamNo: o.userData.seamNo, newIdx: null }; pane.ctrl.enabled = false; }
 }
 let hoverT = 0;
+addEventListener('keydown', e => {
+  if ((e.key === 'Delete' || e.key === 'Backspace') && hlKey && !$('#hovertip').hidden && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) {
+    const sd = A && A.strokes.find(x => x.seams.some(y => y.key === hlKey));
+    if (sd) { e.preventDefault(); deleteSeam(hlKey); $('#hovertip').hidden = true; hlKey = null; }
+  }
+});
 function hoverAt(e, pane) {
   const tipEl = $('#hovertip'), now = performance.now();
   if (now - hoverT < 70) return; hoverT = now;
@@ -1693,7 +1736,7 @@ function hoverAt(e, pane) {
   const hit = pick(e, pane), info = hit && jointInfo(hit.object);
   if (!info) { if (!tipEl.hidden) { tipEl.hidden = true; hlKey = null; pane.body.style.cursor = ''; } return; }
   const vr = view.getBoundingClientRect();
-  tipEl.innerHTML = `<b>${esc(info.text)}</b>${esc(info.hint)}`; tipEl.hidden = false;
+  tipEl.innerHTML = `<b>${esc(info.text)}</b>${info.why ? esc(info.why) + '<br>' : ''}${esc(info.hint)}${info.seam ? ' · Delete key removes it' : ''}`; tipEl.hidden = false;
   tipEl.style.left = (e.clientX - vr.left) + 'px'; tipEl.style.top = (e.clientY - vr.top) + 'px';
   hlKey = info.key; pane.body.style.cursor = 'pointer';
 }
@@ -1737,7 +1780,7 @@ function onUp(e, pane) {
     if (moved && d.newIdx != null) {
       pushHist(); const st = strokes.find(s => s.id === d.sd.id);
       st.cuts = d.sd.seams.map((s, k) => (k === d.seamNo ? d.newIdx : s.idx) * DS).sort((a, b) => a - b);
-      schedule(); return;
+      seamCheck = { sid: d.sd.id, want: d.sd.seams.length, near: d.newIdx, no: d.seamNo + 1, moved: true }; schedule(); return;
     }
     cycleSeam(d.ring.userData.seamKey); return;
   }
@@ -1757,11 +1800,35 @@ function cycleSeam(key) {
   pushHist(); seamOverrides[key] = nx; schedule();
   toast(`Joint ${no} is now: ${JOINTS[nx].name}. ${JOINTS[nx].desc} Tap again for the next type.`);
 }
+// remove a joint; if the bender still needs one there, the analysis puts it back and says why
+let seamCheck = null;
+function deleteSeam(key) {
+  const sd = A && A.strokes.find(x => x.seams.some(y => y.key === key)); if (!sd) return;
+  const k = sd.seams.findIndex(x => x.key === key), se = sd.seams[k], st = strokes.find(x => x.id === sd.id); if (!st) return;
+  pushHist(); st.cuts = sd.seams.filter((_, i) => i !== k).map(x => x.idx * DS);
+  for (const kk of Object.keys(seamOverrides)) if (kk.startsWith(sd.id + ':')) delete seamOverrides[kk];
+  seamCheck = { sid: sd.id, want: sd.seams.length - 1, near: se.idx, no: seamNumber(key) };
+  schedule();
+}
+function seamAfterCheck() {
+  if (!seamCheck || !A) return; const c = seamCheck; seamCheck = null;
+  const sd = A.strokes.find(x => x.id === c.sid); if (!sd) return;
+  if (sd.seams.length <= c.want) { toast(c.moved ? `Joint ${c.no} moved.` : `Joint ${c.no} deleted.`); return; }
+  let bi = 0, bd = 1e9; sd.pieces.forEach((p, i) => { if (i < sd.pieces.length - 1 && p.reason !== 'user') { const d = Math.abs(p.i1 - c.near); if (d < bd) { bd = d; bi = i; } } });
+  const why = sd.pieces[bi].reason, fix = why === 'stock' ? `Pieces can be up to ${fL(S.machine.maxStock - S.machine.grip)} long here; that limit is in Setup.`
+    : why === 'ship' ? 'Without it that piece won’t fit your shipping size (Deliver → Ship).'
+    : 'Try a wider curve there, or watch it on the Bend page.';
+  toast(`${c.moved ? `Joint ${c.no} moved, but the` : 'The'} bender needs a joint nearby, so it added one. ${REASONS[why].replace(/^Split here /, 'It splits ')} ${fix}`);
+}
 function seamNumber(key) { let no = 0, out = 0; A.strokes.forEach(sd => sd.seams.forEach(se => { no++; if (se.key === key) out = no; })); return out; }
 // what a ring or ball is, for hover labels
 function jointInfo(o) {
   if (!A || !o) return null;
-  if (o.userData.seamKey) { const se = A.strokes.flatMap(sd => sd.seams).find(x => x.key === o.userData.seamKey); if (!se) return null; return { key: se.key, text: `Joint ${seamNumber(se.key)}: ${JOINTS[se.type].name}`, hint: 'Tap to change type · drag along the tube to move it' }; }
+  if (o.userData.seamKey) {
+    const sd = A.strokes.find(x => x.seams.some(y => y.key === o.userData.seamKey)); if (!sd) return null;
+    const k = sd.seams.findIndex(x => x.key === o.userData.seamKey), se = sd.seams[k], why = sd.pieces[k] ? sd.pieces[k].reason : 'user';
+    return { key: se.key, seam: true, text: `Joint ${seamNumber(se.key)}: ${JOINTS[se.type].name}`, why: why === 'user' ? 'You placed this one.' : 'The bender needs it: ' + REASONS[why].replace(/^Split here (because |to |so )?/, '').replace(/^\w/, c => c.toUpperCase()), hint: 'Tap to change type · drag along the tube to move it' };
+  }
   if (o.userData.juncKey) { const j = A.junctions.find(x => x.key === o.userData.juncKey); if (!j) return null; return { key: j.key, text: `Where tubes meet: ${JUNCS[j.type].name}`, hint: 'Tap to change type' }; }
   return null;
 }
@@ -2027,7 +2094,8 @@ function exportCSV() {
   let no = 0; const w = new THREE.Vector3();
   A.strokes.forEach(sd => sd.pieces.forEach(p => {
     no++;
-    for (let j = p.i0; j <= p.i1; j++) { toMachine(sd.G, p.i0, j, p.roll, w, true); lines.push(`${no},${j - p.i0},${(w.x * 1000).toFixed(1)},${(w.y * 1000).toFixed(1)},${(w.z * 1000).toFixed(1)}`); }
+    const PG = pieceG(sd, p);
+    for (let j = p.g0; j <= p.g1; j++) { toMachine(PG, p.g0, j, p.roll, w, true); lines.push(`${no},${j - p.g0},${(w.x * 1000).toFixed(1)},${(w.y * 1000).toFixed(1)},${(w.z * 1000).toFixed(1)}`); }
   }));
   return lines.join('\n');
 }
@@ -2060,7 +2128,7 @@ function schedule() {
     planCache = null; const n = allPieces().length; selPiece = Math.min(selPiece, Math.max(0, n - 1)); if (buildStep != null && buildStep >= n) buildStep = null;
     rebuildStrength(); rebuildHeights(); setView();
     if (fitNext) { leaves().forEach(fitPane); fitNext = false; }
-    renderPanel(); drawWrist(); save(); updateStatus();
+    renderPanel(); drawWrist(); save(); updateStatus(); seamAfterCheck();
   }, 30);
 }
 function updateStatus() {
@@ -2086,7 +2154,7 @@ const ICONS = {
 };
 const TAB_NAMES = { draw: 'Draw', check: 'Check', bend: 'Bend', joints: 'Joints', strength: 'Strength', cost: 'Cost', ship: 'Ship', export: 'Export', versions: 'Versions', setup: 'Setup' };
 // the rail shows groups; groups with more than one page get page buttons at the top of the panel
-const GROUPS = [['draw', 'Draw', ['draw']], ['check', 'Check', ['check']], ['bend', 'Bend', ['bend']], ['build', 'Build', ['joints', 'strength']], ['deliver', 'Deliver', ['cost', 'ship', 'export']], ['versions', 'Versions', ['versions']], ['setup', 'Setup', ['setup']]];
+const GROUPS = [['setup', 'Setup', ['setup']], ['draw', 'Draw', ['draw']], ['check', 'Check', ['check']], ['bend', 'Bend', ['bend']], ['build', 'Build', ['joints', 'strength']], ['deliver', 'Deliver', ['cost', 'ship', 'export']], ['versions', 'Versions', ['versions']]];
 ICONS.build = ICONS.joints; ICONS.deliver = ICONS.ship;
 const groupOf = t => GROUPS.find(g => g[0] === t || g[2].includes(t));
 const lastSub = {};
@@ -2152,6 +2220,7 @@ function renderPanel() {
     <p class="sub" style="font-size:13px">${hint}</p></div>
     ${xr ? `<div class="grp"><span class="lab">Quest controls</span>
       <p class="sub" style="font-size:13px"><b style="color:var(--ink)">Either grip</b> grab the world and move it · <b style="color:var(--ink)">Both grips</b> pull apart or together to make yourself smaller or bigger, twist to turn · <b style="color:var(--ink)">1:1</b> on the rail goes back to life size · <b style="color:var(--ink)">A</b> next page · <b style="color:var(--ink)">B</b> undo · <b style="color:var(--ink)">Left trigger</b> move the sculpture · <b style="color:var(--ink)">X</b> hide or show the panels · <b style="color:var(--ink)">Y</b> put the panels back on your hand. Grab any panel by its dark strip on top to put it where you like. Point at a joint ring to see what it is; the trigger changes it, hold and drag to slide it along the tube. In Bend, point at the bender's taped floor frame and hold the trigger to slide it; tilt the right stick while holding to turn it.</p>
+      ${seg('ctrlLabels', [['on', 'Button labels on'], ['off', 'Labels off']], S.ctrlLabels === false ? 'off' : 'on')}
       <button class="btn alt" data-act="infront" style="align-self:start">Bring the sculpture in front of me</button></div>` : ''}
     ${tool === 'draw' ? `<div class="grp"><span class="lab">Draw on</span>${seg('plane', [['upright', 'Upright sheet'], ['ground', 'Flat sheet']], S.plane)}
     ${S.plane === 'ground' ? slider('planeH', 'Sheet height', 0, 3, 0.05, S.planeH, fL(S.planeH)) : ''}</div>
@@ -2209,7 +2278,7 @@ function renderPanel() {
       <div class="row"><button class="btn" data-act="play">${bendPlay ? 'Pause' : 'Play'}</button>${seg('speed', [['1', '1×'], ['5', '5×'], ['20', '20×'], ['60', '60×']], String(jobSpeed))}</div>
       <div class="slider"><label for="jobT">Job timeline</label><span class="val" data-out="jobT">${js ? `${PHNAME[js.phase]} · ${clock(jobT)} of ${clock(js.total)}` : ''}</span><input type="range" id="jobT" data-set="jobT" min="0" max="${js ? js.total : 1}" step="0.5" value="${jobT}"></div>
       <div class="stat"><div><span>Piece length</span><b data-out="pieceLen">${fL(p.len)}</b></div><div><span>Stock length</span><b data-out="stockLen">${fL(p.len + S.machine.grip)}</b></div></div>
-      <p class="note" data-out="reason">${REASONS[p.reason]}</p>
+      <p class="note" data-out="reason">${REASONS[p.reason]}${p.rev ? ' Fed far end first, so the tight bends come out of the machine before they can swing into anything.' : ''}</p>
       <div class="grp"><span class="lab">View settings</span>
       ${seg('progwin', [['on', 'Program window'], ['off', 'No program']], leaves().some(x => x.view === 'program') ? 'on' : 'off')}
       ${seg('helpers', [['on', 'People'], ['off', 'No people']], S.helpers ? 'on' : 'off')}
@@ -2375,6 +2444,7 @@ $('#panel').addEventListener('click', e => {
   else if (act === 'speed') { jobSpeed = +v; renderPanel(); }
   else if (act === 'cutaway') { S.cutaway = v === 'on'; buildMachine(); renderPanel(); save(); }
   else if (act === 'helpers') { S.helpers = v === 'on'; renderPanel(); save(); }
+  else if (act === 'ctrlLabels') { S.ctrlLabels = v === 'on'; renderPanel(); save(); }
   else if (act === 'labels') { S.labels = v === 'on'; buildMachine(); renderPanel(); save(); }
   else if (act === 'progwin') {
     S.progWin = v === 'on';
@@ -2632,10 +2702,144 @@ const ctrls = [0, 1].map(i => {
   c.userData.prev = [];
   c.addEventListener('connected', e => { c.userData.src = e.data; c.userData.hand = e.data.handedness; if (e.data.handedness === 'right') { c.add(tip); c.add(rayLine); } });
   c.addEventListener('disconnected', () => { c.userData.src = null; });
-  g.addEventListener('connected', e => { if (e.data.handedness === 'left') g.add(holder); });
-  const stub = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.016, 0.1, 12), matOf(0x14161B)); stub.rotation.x = Math.PI / 2; g.add(stub);
-  scene.add(c, g); return c;
+  g.addEventListener('connected', e => { g.userData.src = e.data; if (e.data.handedness === 'left') g.add(holder); if (!e.data.hand) loadCtrlModel(g, e.data); });
+  g.addEventListener('disconnected', () => { g.userData.src = null; });
+  c.userData.grip = g; scene.add(c, g); return c;
 });
+
+/* ================= Quest controllers: the real Touch Plus models, with a label beside each button ================= */
+// models: Meta Quest Touch Plus from the WebXR input-profiles library (MIT), shipped next to this page as quest-models.js, with the CDN copy as a backup
+const CTRL_GLB = {};
+function ctrlGLB(side) {
+  if (!CTRL_GLB[side]) CTRL_GLB[side] = new Promise((res, rej) => {
+    const L = new GLTFLoader();
+    const cdn = () => L.load(`https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0.20/dist/profiles/meta-quest-touch-plus/${side}.glb`, gl => res(gl.scene), undefined, rej);
+    const parse = () => { try { const bin = Uint8Array.from(atob(window.QUEST_GLB[side]), ch => ch.charCodeAt(0)); L.parse(bin.buffer, '', gl => res(gl.scene), cdn); } catch (e) { cdn(); } };
+    if (window.QUEST_GLB) parse();
+    else { const sc = document.createElement('script'); sc.src = 'quest-models.js'; sc.onload = () => window.QUEST_GLB ? parse() : cdn(); sc.onerror = cdn; document.head.appendChild(sc); }
+  });
+  return CTRL_GLB[side];
+}
+const nodesOf = m => { const o = {}; m.traverse(x => { if (x.name) o[x.name] = x; }); return o; };
+// where each button's geometry actually sits, in the grip's own space (the model's pivots all sit at the middle)
+function ctrlAnchors(g) {
+  if (g.userData.anchors) return g.userData.anchors;
+  const nodes = g.userData.nodes, out = {}; g.updateMatrixWorld(true);
+  const inv = g.matrixWorld.clone().invert();
+  for (const nm of ['a_button', 'b_button', 'x_button', 'y_button', 'thumbstick', 'trigger', 'squeeze']) {
+    const comp = { thumbstick: 'xr_standard_thumbstick', trigger: 'xr_standard_trigger', squeeze: 'xr_standard_squeeze' }[nm] || nm;
+    const bb = new THREE.Box3();
+    [nodes[nm], nodes[comp + '_pressed_value']].forEach(n => { if (n) n.traverse(o => { if (o.isMesh) bb.expandByObject(o); }); });
+    if (!bb.isEmpty()) out[nm] = bb.getCenter(new THREE.Vector3()).applyMatrix4(inv);
+  }
+  return (g.userData.anchors = out);
+}
+// a plain stand-in until (or if) the real model can't load
+function fallbackCtrl(side) {
+  const g = new THREE.Group(), dark = matOf(0x24262c), s = side === 'left' ? -1 : 1;
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.019, 0.075, 6, 16), dark); body.rotation.x = Math.PI / 2 - 0.35; body.position.set(0, -0.01, 0.03); g.add(body);
+  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.03, 0.022, 28), dark); head.position.set(0, 0.012, -0.045); head.rotation.x = 0.5; g.add(head);
+  const at = (name, x, y, z, r, col) => { const m = new THREE.Mesh(new THREE.SphereGeometry(r, 14, 10), matOf(col)); m.name = name; m.position.set(x, y, z); g.add(m); };
+  at(side === 'left' ? 'x_button' : 'a_button', 0.012 * s, 0.03, -0.04, 0.006, 0x3a3d45); at(side === 'left' ? 'y_button' : 'b_button', 0.0, 0.032, -0.055, 0.006, 0x3a3d45);
+  at('thumbstick', -0.012 * s, 0.032, -0.045, 0.008, 0x14161B); at('trigger', 0, -0.02, -0.05, 0.007, 0x3a3d45); at('squeeze', -0.02 * s, -0.012, 0.0, 0.007, 0x3a3d45);
+  return g;
+}
+function loadCtrlModel(g, src) {
+  const side = src.handedness === 'left' ? 'left' : 'right';
+  if (g.userData.model && g.userData.side === side) return;
+  if (g.userData.model) g.remove(g.userData.model);
+  g.userData.side = side;
+  const fb = fallbackCtrl(side); g.add(fb); g.userData.model = fb; g.userData.nodes = nodesOf(fb); g.userData.anchors = null;
+  ctrlGLB(side).then(sc => {
+    if (g.userData.side !== side) return;
+    const m = sc.clone(true); m.traverse(o => { if (o.isMesh) o.frustumCulled = false; });
+    g.remove(fb); g.add(m); g.userData.model = m; g.userData.nodes = nodesOf(m); g.userData.tint = {}; g.userData.anchors = null;
+  }).catch(() => {});
+}
+// what each button does right now, from what you're doing
+function ctrlMap(side) {
+  if (side === 'left') return [
+    { node: 'y_button', text: 'Panels to hand' },
+    { node: 'x_button', text: panelsShown ? 'Hide panels' : 'Show panels' },
+    { node: 'trigger', text: 'Move the sculpture' },
+    { node: 'squeeze', text: nav ? 'Moving the world' : 'Move world · both: size' },
+  ];
+  const hov = xrHover && xrHover.kind, seamy = !!seamDrag || hov === 'seam', ui = xrCtx.panel;
+  const tools = { draw: 'Draw a tube', points: cpDrag ? 'Moving the point' : 'Grab a point', reshape: xrPull ? 'Pulling the tube' : 'Pull a tube', erase: 'Erase a tube', orbit: 'Measure · select' };
+  const trig = vpGrab ? 'Carrying the panel' : xrCtx.bar ? 'Grab the panel' : ui ? 'Press' : seamDrag ? (seamDrag.moved ? 'Let go to place it' : 'Tap: next type') : hov === 'seam' ? 'Type · hold to slide' : hov === 'junc' ? 'Change type' : machDrag ? 'Sliding the bender' : hov === 'pad' ? 'Slide the bender' : tab === 'draw' ? tools[tool] : tab === 'bend' ? 'Pick a piece' : 'Measure · select';
+  const stick = ui ? '↕ Scroll' : vpGrab || cpDrag ? '↕ Push · pull' : machDrag ? '↔ Turn the bender' : hov === 'seam' || hov === 'junc' ? '↕ Label size' : tab === 'bend' ? '↔ Next piece' : '';
+  const nx = MODES_XR[(MODES_XR.indexOf(tab) + 1) % MODES_XR.length];
+  return [
+    seamy ? { node: 'b_button', text: '✕ Delete joint', kind: 'danger' } : { node: 'b_button', text: '↶ Undo' },
+    { node: 'a_button', text: 'Next: ' + TAB_NAMES[nx] },
+    { node: 'thumbstick', text: stick },
+    { node: 'trigger', text: trig, kind: 'primary' },
+    { node: 'squeeze', text: nav ? (nav.sig.includes(',') ? 'Sizing the world' : 'Moving the world') : 'Move world · both: size' },
+  ];
+}
+let xrCtx = { panel: false, bar: false };
+const LBL_W = 0.095, LBL_H = 0.021, labelSets = new Map();
+function mkLabel() {
+  const cv = document.createElement('canvas'); cv.width = 480; cv.height = 106; const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(LBL_W, LBL_H), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false })); m.renderOrder = 90; scene.add(m);
+  const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V3(0, 0, 0), V3(0, 0, 0)]), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, depthTest: false })); ln.renderOrder = 89; scene.add(ln);
+  return { m, ln, cv, t, sig: '' };
+}
+function drawLabel(L, text, kind) {
+  const sig = text + '|' + kind; if (sig === L.sig) return; L.sig = sig;
+  const c = L.cv.getContext('2d'), W = L.cv.width, H = L.cv.height; c.clearRect(0, 0, W, H);
+  c.font = '800 42px Inter, system-ui, sans-serif'; const tw = Math.min(W - 8, c.measureText(text).width + 48);
+  rrect(c, (W - tw) / 2, 8, tw, H - 16, (H - 16) / 2);
+  c.fillStyle = kind === 'danger' ? '#E5352B' : kind === 'primary' ? '#1E56D9' : 'rgba(20,22,27,.9)'; c.fill();
+  c.lineWidth = 5; c.strokeStyle = kind === 'danger' ? '#fff' : 'rgba(255,255,255,.35)'; c.stroke();
+  c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(text, W / 2, H / 2 + 2, W - 40); L.t.needsUpdate = true;
+}
+// a real button turns red when it would delete something
+const redMat = new THREE.MeshStandardMaterial({ color: 0xE5352B, emissive: 0xE5352B, emissiveIntensity: 0.6, roughness: 0.4 });
+function tintButton(g, name, on) {
+  const nodes = g.userData.nodes || {}, tint = g.userData.tint || (g.userData.tint = {});
+  if (!!tint[name] === on) return;
+  const roots = [nodes[name], nodes[name + '_pressed_value']].filter(Boolean);
+  if (on) { const saved = []; roots.forEach(r => r.traverse(o => { if (o.isMesh) { saved.push([o, o.material]); o.material = redMat; } })); tint[name] = saved; }
+  else { (tint[name] || []).forEach(([o, mt]) => { o.material = mt; }); tint[name] = null; }
+}
+const PRESS = [['xr_standard_trigger', 0], ['xr_standard_squeeze', 1], ['xr_standard_thumbstick', 3], ['a_button', 4], ['b_button', 5], ['x_button', 4], ['y_button', 5]];
+const _hq = new THREE.Quaternion(), _hp = new THREE.Vector3();
+function syncControllers() {
+  const cam = renderer.xr.getCamera(); cam.getWorldPosition(_hp); cam.getWorldQuaternion(_hq);
+  const right = V3(1, 0, 0).applyQuaternion(_hq); right.y = 0; if (right.lengthSq() < 1e-6) right.set(1, 0, 0); right.normalize();
+  for (const c of ctrls) {
+    const g = c.userData.grip, src = g && g.userData.src, gp = src && src.gamepad, side = g && g.userData.side;
+    let set = labelSets.get(g); if (!set) { set = {}; labelSets.set(g, set); }
+    for (const k in set) { set[k].m.visible = false; set[k].ln.visible = false; }
+    if (!g || !gp || !g.userData.model || !g.visible) continue;
+    const nodes = g.userData.nodes;
+    // buttons dip and the stick tilts, like the real ones
+    for (const [nm, idx] of PRESS) {
+      const v = nodes[nm + '_pressed_value'], mn = nodes[nm + '_pressed_min'], mx = nodes[nm + '_pressed_max'];
+      if (v && mn && mx && gp.buttons[idx]) { const f = gp.buttons[idx].value || (gp.buttons[idx].pressed ? 1 : 0); v.position.lerpVectors(mn.position, mx.position, f); v.quaternion.copy(mn.quaternion).slerp(mx.quaternion, f); }
+    }
+    for (const [ax, ai] of [['xaxis', 2], ['yaxis', 3]]) {
+      const v = nodes[`xr_standard_thumbstick_${ax}_pressed_value`], mn = nodes[`xr_standard_thumbstick_${ax}_pressed_min`], mx = nodes[`xr_standard_thumbstick_${ax}_pressed_max`];
+      if (v && mn && mx) { const f = ((gp.axes[ai] || 0) + 1) / 2; v.quaternion.copy(mn.quaternion).slerp(mx.quaternion, f); }
+    }
+    const map = ctrlMap(side);
+    tintButton(g, 'b_button', side === 'right' && map[0].kind === 'danger');
+    if (S.ctrlLabels === false) continue;
+    g.updateMatrixWorld(true);
+    const gpos = g.getWorldPosition(new THREE.Vector3()), dir = right.clone().multiplyScalar(side === 'left' ? -0.085 : 0.085);
+    const ys = side === 'left' ? [0.035, 0.012, -0.011, -0.034] : [0.07, 0.047, 0.024, 0.001, -0.022];
+    map.forEach((it, i) => {
+      if (!it.text) return;
+      const L = set[it.node] || (set[it.node] = mkLabel()); drawLabel(L, it.text, it.kind || '');
+      const al = ctrlAnchors(g)[it.node], anchor = al ? g.localToWorld(al.clone()) : gpos.clone();
+      const pos = gpos.clone().add(dir).add(V3(0, ys[i], 0));
+      L.m.position.copy(pos); L.m.lookAt(_hp); L.m.visible = true;
+      const edge = pos.clone().add(anchor.clone().sub(pos).normalize().multiplyScalar(LBL_W * 0.45));
+      const a = L.ln.geometry.attributes.position; a.setXYZ(0, anchor.x, anchor.y, anchor.z); a.setXYZ(1, edge.x, edge.y, edge.z); a.needsUpdate = true; L.ln.visible = true;
+    });
+  }
+}
 let arOK = false, xrLook = 'vr', machPlaced = false, machDrag = null;
 const groundPlane = new THREE.Plane(V3(0, 1, 0), 0);
 // the world's floor, wherever you've moved it
@@ -2659,7 +2863,8 @@ async function checkXR() {
 }
 function updateXRLabel() { const l = $('#xrLabel'); if (l) l.textContent = !renderer.xr.isPresenting ? 'VR' : (xrLook === 'mr' ? 'To VR' : 'To MR'); }
 function applyLook() {
-  if (xrLook === 'mr') { scene.background = null; floor.visible = false; } else { scene.background = BG; floor.visible = true; }
+  const xr = renderer.xr.isPresenting;
+  if (xrLook === 'mr') { scene.background = null; floor.visible = false; sky.visible = false; } else { scene.background = BG; floor.visible = true; sky.visible = xr; }
   updateXRLabel(); tabDirty = true;
 }
 // flips passthrough on and off inside one mixed-reality session, so you never leave the headset
@@ -2680,7 +2885,7 @@ async function startXR(look) {
     $('#panel').classList.remove('collapsed'); dockPanels(); VPS.forEach(vp => vp.mesh.visible = true); panelsShown = true; tabDirty = true; renderPanel();
     s.addEventListener('end', () => {
       document.body.classList.remove('xr');
-      scene.background = BG; floor.visible = true; hitDot.visible = false; clearMeasure(); machDrag = null; resetWorld(); hideVrTip(); xrStroke = xrPull = seamDrag = cpDrag = vpGrab = nav = null; clearPreview(); dockPanels();
+      scene.background = BG; floor.visible = true; sky.visible = false; hitDot.visible = false; clearMeasure(); machDrag = null; resetWorld(); hideVrTip(); xrStroke = xrPull = seamDrag = cpDrag = vpGrab = nav = null; clearPreview(); dockPanels();
       designGroup.position.set(0, 0, 0); designGroup.rotation.set(0, 0, 0); machineGroup.position.set(0, 0, 0); machineGroup.rotation.set(0, 0, 0); shipGroup.position.set(0, 0, 0);
       updateXRLabel(); resize(); setView(); renderPanel();
     });
@@ -2707,7 +2912,7 @@ function putInFront() {
 $('#btnVR').onclick = () => startXR('vr');
 $('#btnMR').onclick = () => startXR('mr');
 
-let xrStroke = null, grab = null, xrPull = null, xrPrevT = 0, seamDrag = null, cpDrag = null, vpGrab = null, nav = null;
+let xrStroke = null, grab = null, xrPull = null, xrPrevT = 0, seamDrag = null, cpDrag = null, vpGrab = null, nav = null, xrHover = null;
 const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), uiRay = new THREE.Raycaster();
 function haptic(src, amt, ms) { try { const h = src.gamepad.hapticActuators && src.gamepad.hapticActuators[0]; if (h && h.pulse) h.pulse(amt, ms); } catch (e) {} }
 function startPull(src, byTrigger) {
@@ -2719,21 +2924,31 @@ function startPull(src, byTrigger) {
   xrPull = { sd: best.sd, sid: best.sd.id, idx: best.i, base: best.sd.P.map(q => q.clone()), start: lp, pts: null, trig: byTrigger };
   hideStroke(best.sd.id, true); haptic(src, 0.4, 30);
 }
-// a small two-line label that floats over whatever the ray is on
-let vrTip = null, vrTipKey = '';
+// a small label that floats over whatever the ray is on; the right stick makes it bigger or smaller
+let vrTip = null, vrTipKey = '', tipSaveT = 0;
 function tipSprite(a, b) {
-  const c0 = document.createElement('canvas').getContext('2d'); c0.font = '800 34px system-ui, sans-serif'; let w = c0.measureText(a).width; c0.font = '600 26px system-ui, sans-serif'; if (b) w = Math.max(w, c0.measureText(b).width);
-  const cv = document.createElement('canvas'), W = Math.ceil(w) + 44, H = b ? 104 : 64; cv.width = W; cv.height = H;
+  const F1 = '800 34px system-ui, sans-serif', F2 = '600 26px system-ui, sans-serif', MAXW = 680;
+  const c0 = document.createElement('canvas').getContext('2d'); c0.font = F2;
+  const rows = [];
+  (b ? b.split('\n') : []).forEach(par => { let line = ''; par.split(' ').forEach(w => { const t = line ? line + ' ' + w : w; if (c0.measureText(t).width > MAXW && line) { rows.push(line); line = w; } else line = t; }); if (line) rows.push(line); });
+  let w = 0; rows.forEach(r => { w = Math.max(w, c0.measureText(r).width); }); c0.font = F1; w = Math.max(w, c0.measureText(a).width);
+  const cv = document.createElement('canvas'), W = Math.ceil(w) + 44, H = 64 + rows.length * 36 + (rows.length ? 4 : 0); cv.width = W; cv.height = H;
   const g = cv.getContext('2d'); g.fillStyle = '#fff'; rrect(g, 3, 3, W - 6, H - 6, 16); g.fill(); g.lineWidth = 5; g.strokeStyle = '#14161B'; g.stroke();
-  g.fillStyle = '#14161B'; g.font = '800 34px system-ui, sans-serif'; g.fillText(a, 22, 44); if (b) { g.fillStyle = '#4a5160'; g.font = '600 26px system-ui, sans-serif'; g.fillText(b, 22, 82); }
+  g.fillStyle = '#14161B'; g.font = F1; g.fillText(a, 22, 44);
+  g.font = F2; rows.forEach((r, i) => { g.fillStyle = i === rows.length - 1 && rows.length > 1 ? '#1E56D9' : '#4a5160'; g.fillText(r, 22, 82 + i * 36); });
   const tx = new THREE.CanvasTexture(cv); tx.colorSpace = THREE.SRGBColorSpace;
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tx, depthTest: false })); sp.renderOrder = 30; sp.userData.aspect = W / H; sp.userData.h = H / 64; return sp;
 }
 function showVrTip(a, b, pos, dist) {
   const key = a + '|' + (b || '');
   if (key !== vrTipKey) { hideVrTip(true); vrTip = tipSprite(a, b); scene.add(vrTip); vrTipKey = key; }
-  const h = 0.028 * vrTip.userData.h * Math.max(0.5, dist); vrTip.scale.set(vrTip.userData.aspect * h, h, 1);
-  vrTip.position.copy(pos).add(V3(0, h * 0.75 + 0.02, 0)); vrTip.visible = true;
+  const h = 0.028 * (S.tipScale || 1) * vrTip.userData.h * Math.max(0.5, dist); vrTip.scale.set(vrTip.userData.aspect * h, h, 1);
+  vrTip.position.copy(pos).add(V3(0, h * 0.55 + 0.02, 0)); vrTip.visible = true;
+}
+function sizeTips(ay) {
+  if (Math.abs(ay) < 0.25) return false;
+  S.tipScale = Math.min(3.5, Math.max(0.35, (S.tipScale || 1) * (1 - ay * 0.035)));
+  clearTimeout(tipSaveT); tipSaveT = setTimeout(save, 600); return true;
 }
 function hideVrTip(dispose) {
   if (!vrTip) return;
@@ -2780,7 +2995,7 @@ function xrTick() {
         const hs = uiRay.intersectObjects(VPS.map(vp => vp.mesh), false)[0];
         if (hs && hs.uv) { tvp = VPS.find(vp => vp.mesh === hs.object); tpt = tabletPoint(tvp, hs.uv); tD = hs.distance; }
       }
-      rayLine.visible = false; hitDot.visible = false;
+      rayLine.visible = false; hitDot.visible = false; xrHover = null; xrCtx = { panel: !!tpt, bar: !!(tpt && tpt.bar) };
       const hot = tpt && tpt.bar ? tvp : null; if (hot !== vpHot) { vpHot = hot; tabDirty = true; }
       if (vpGrab) {
         // carrying a panel: it rides on the controller; the stick pushes it away or pulls it in
@@ -2823,7 +3038,7 @@ function xrTick() {
           } else {
             const h = uiRay.intersectObjects(designClick, false).find(x => x.object.userData.cpSid != null);
             rayLine.visible = true; rayLine.scale.set(1, 1, h ? h.distance : 1.5);
-            if (h) { hitDot.visible = true; hitDot.position.copy(h.point); showVrTip(`Point ${h.object.userData.cpIdx + 1}`, 'Hold the trigger to move it', h.object.getWorldPosition(new THREE.Vector3()), h.distance); }
+            if (h) { hitDot.visible = true; hitDot.position.copy(h.point); showVrTip(`Point ${h.object.userData.cpIdx + 1}`, 'Hold the trigger to move it', h.object.getWorldPosition(new THREE.Vector3()), h.distance); sizeTips(ax[3] || 0); }
             else hideVrTip();
             if (dn(0) && h) { cpDrag = cpStart(h.object); if (cpDrag) { cpDrag.dist = h.distance; haptic(src, 0.4, 25); } }
           }
@@ -2835,10 +3050,10 @@ function xrTick() {
             if (seamDrag.moved) { seamDrag.ring.position.copy(seamDrag.sd.P[bi]); seamDrag.ring.quaternion.setFromUnitVectors(V3(0, 0, 1), seamDrag.sd.F.T[bi]); }
             const wp = designGroup.localToWorld(seamDrag.sd.P[bi].clone());
             rayLine.visible = true; rayLine.scale.set(1, 1, uiRay.ray.origin.distanceTo(wp)); hitDot.visible = true; hitDot.position.copy(wp);
-            if (seamDrag.moved) showVrTip(`Joint ${seamDrag.no}`, 'Let go to put the joint here', wp, uiRay.ray.origin.distanceTo(wp));
+            if (seamDrag.moved) showVrTip(`Joint ${seamDrag.no}`, 'Let go to put the joint here · B: delete it', wp, uiRay.ray.origin.distanceTo(wp));
           } else {
             const d = seamDrag; seamDrag = null; hideVrTip(true);
-            if (d.moved && d.newIdx != null) { pushHist(); const st = strokes.find(x => x.id === d.sd.id); st.cuts = d.sd.seams.map((x, k) => (k === d.seamNo ? d.newIdx : x.idx) * DS).sort((p1, p2) => p1 - p2); schedule(); toast(`Joint ${d.no} moved.`); }
+            if (d.moved && d.newIdx != null) { pushHist(); const st = strokes.find(x => x.id === d.sd.id); st.cuts = d.sd.seams.map((x, k) => (k === d.seamNo ? d.newIdx : x.idx) * DS).sort((p1, p2) => p1 - p2); seamCheck = { sid: d.sd.id, want: d.sd.seams.length, near: d.newIdx, no: d.no, moved: true }; schedule(); }
             else cycleSeam(d.key);
           }
         } else {
@@ -2849,7 +3064,11 @@ function xrTick() {
           rayLine.visible = true; rayLine.scale.set(1, 1, pad ? pad.distance : h ? h.distance : 1.5);
           if (pad) { hitDot.visible = true; hitDot.position.copy(pad.point); } else if (h) { hitDot.visible = true; hitDot.position.copy(h.point); }
           const info = h && v === 'model' && !machDrag ? jointInfo(h.object) : null;
-          if (info) { showVrTip(info.text, info.hint.replace('Tap', 'Trigger').replace('drag', 'hold and drag'), h.object.getWorldPosition(new THREE.Vector3()), h.distance); hlKey = info.key; }
+          xrHover = info ? { kind: info.seam ? 'seam' : 'junc', key: info.key } : pad && !machDrag ? { kind: 'pad' } : null;
+          if (info) {
+            showVrTip(info.text, (info.why ? info.why + '\n' : '') + (info.seam ? 'Trigger: change type · hold + drag: slide it · B: delete' : 'Trigger: change type'), h.object.getWorldPosition(new THREE.Vector3()), h.distance); hlKey = info.key;
+            sizeTips(ax[3] || 0);
+          }
           else { hideVrTip(); if (hlKey && !$('#panel').matches(':hover')) hlKey = null; }
           if (pad && !machDrag) showVrTip('Bender floor frame', 'Hold the trigger to slide it · stick turns it', pad.point, pad.distance);
           if (dn(0)) {
@@ -2882,7 +3101,11 @@ function xrTick() {
         }
       }
       if (dn(4)) { const i = MODES_XR.indexOf(tab); setTab(MODES_XR[(i + 1) % MODES_XR.length]); }
-      if (dn(5)) undo();
+      if (dn(5)) {
+        if (seamDrag) { const d = seamDrag; seamDrag = null; hideVrTip(true); deleteSeam(d.key); haptic(src, 0.6, 40); }
+        else if (xrHover && xrHover.kind === 'seam') { deleteSeam(xrHover.key); xrHover = null; hideVrTip(true); haptic(src, 0.6, 40); }
+        else undo();
+      }
       const sx = ax[2] || 0, was = c.userData.stick || 0;
       if (!tpt && !machDrag && !vpGrab && !cpDrag && tab === 'bend' && Math.abs(sx) > 0.7 && Math.abs(was) <= 0.7) { const L = allPieces().length; if (L) select((selPiece + (sx > 0 ? 1 : -1) + L) % L); }
       c.userData.stick = sx;
@@ -2899,6 +3122,7 @@ function xrTick() {
     c.userData.prev = b.map(x => x.pressed);
   }
   navTick();
+  syncControllers();
   if (measureSprite && measureSprite.userData.base) { const k = 1 / worldRoot.scale.x; measureSprite.scale.copy(measureSprite.userData.base).multiplyScalar(k); measureSprite.scale.z = 1; measureSprite.position.copy(measureSprite.userData.at).add(V3(0, 0.07 * k, 0)); }
 }
 function tabletMove(pt) { if (tabDrag) setRange(tabDrag, pt.x); }
