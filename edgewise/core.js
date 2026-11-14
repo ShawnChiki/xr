@@ -253,7 +253,7 @@ function distToPoly2(p, poly){
 // Loops are kept smallest first, and an edge belongs to at most two faces.
 // o: { rel: how flat, as a share of the loop's edge length (0.18), minTol, maxSides (8) }
 export function findFaces(sk, pos, o = {}){
-  const rel = o.rel ?? 0.22, minTol = o.minTol ?? 0.015, maxSides = o.maxSides ?? 8;
+  const rel = o.rel ?? 0.22, minTol = o.minTol ?? 0.015, maxSides = o.maxSides ?? 32;
   const P = id => pos[id];
   const adj = new Map();
   for (const v of sk.v) adj.set(v.id, []);
@@ -268,7 +268,7 @@ export function findFaces(sk, pos, o = {}){
     const path = [s, t], onPath = new Set(path), pl = { n: null, c: null };
     let maxL = dist(P(s), P(t));
     const go = () => {
-      if (++work > 400000) return;
+      if (++work > 3000000) return;
       const last = path[path.length - 1];
       for (const w of adj.get(last)){
         if (w === s && path.length >= 3){ const k = faceKey(path); if (!cands.has(k)) cands.set(k, path.slice()); continue; }
