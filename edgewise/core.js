@@ -204,6 +204,7 @@ export function cleanup(sk){
   sk.s = sk.s.filter(s => used.has(s.id));
   const alive = new Set(sk.v.map(v => v.id));
   sk.skip = (sk.skip || []).filter(k => k.split('.').every(id => alive.has(+id)));
+  sk.locks = (sk.locks || []).filter(L => [L.e, L.ea, L.eb].every(e => !e || e.every(id => alive.has(id))));
 }
 
 // ---------------------------------------------------------------- faces
@@ -492,9 +493,15 @@ export function solve(sk, F, o = {}){
     for (const [c, a] of acc) yaw.set(c, Math.atan2(a[1], a[0]) / 4);
   }
   const faces = F.faces.filter(f => !f.open);
-  const byKey = new Map(F.faces.map(f => [f.key, f])), locks = (sk.locks || []).filter(L => L.f ? byKey.has(L.f) : byKey.has(L.a) && byKey.has(L.b));
+  const byKey = new Map(F.faces.map(f => [f.key, f])), locks = (sk.locks || []).filter(L => lockAlive(L, byKey, X));
   const lockedV = new Set();
-  for (const L of locks) for (const k of [L.f, L.a, L.b]) if (k) for (const id of byKey.get(k).all) lockedV.add(id);
+  for (const L of locks){
+    // a lock that sets a face's or line's direction takes its lines out of Square up (they follow the lock);
+    // one plane / parallel faces and level or floor faces leave Square up to keep them square
+    if (L.mode === 'coplanar' || L.mode === 'parallel' && !L.ea || L.mode === 'level' || L.mode === 'floor') continue;
+    for (const k of [L.f, L.a, L.b]) if (k) for (const id of byKey.get(k).all) lockedV.add(id);
+    for (const e of [L.e, L.ea, L.eb]) if (e) for (const id of e) lockedV.add(id);
+  }
   const G = {}, W = {};
   for (let it = 0; it < iters; it++){
     for (const id of ids){ G[id] = mul(A[id], wA[id]); W[id] = wA[id]; }
@@ -531,7 +538,7 @@ export function solve(sk, F, o = {}){
         G[e.b] = add(G[e.b], mul(add(m, mul(t, 0.5)), wSq)); W[e.b] += wSq;
       }
     }
-    if (locks.length) applyLocks(sk, locks, byKey, X, G, W, 30);
+    if (locks.length) applyLocks(sk, locks, byKey, X, G, W, 30, wSq ? (o.squareDeg ?? 10) : 0);
     if (o.floor){
       for (const id of ids){
         if (A[id][1] < (o.floorR ?? 0.05) && A[id][1] > -(o.floorR ?? 0.05)){ G[id] = add(G[id], mul([X[id][0], 0, X[id][2]], 2)); W[id] += 2; }
@@ -540,6 +547,18 @@ export function solve(sk, F, o = {}){
     for (const id of ids) X[id] = mul(G[id], 1 / W[id]);
   }
   hardFlat(faces, X, wA, o.hardIters ?? 400);
+  // locks are firm too: take turns holding them exactly and flattening again, until both settle
+  if (locks.length){
+    for (let r = 0; r < 30; r++){
+      const G2 = {}, W2 = {};
+      for (const id of ids){ G2[id] = [0, 0, 0]; W2[id] = 0; }
+      applyLocks(sk, locks, byKey, X, G2, W2, 1, wSq ? (o.squareDeg ?? 10) : 0);
+      let moved = 0;
+      for (const id of ids) if (W2[id]){ const q = mul(G2[id], 1 / W2[id]); moved = Math.max(moved, dist(q, X[id])); X[id] = q; }
+      hardFlat(faces, X, wA, 60);
+      if (moved < 1e-5) break;
+    }
+  }
   return X;
 }
 
@@ -616,19 +635,59 @@ export function lockTarget(L, deg){
   return L.deg;
 }
 function orientTarget(L, n){
-  if (L.mode === 'level') return [0, n[1] < 0 ? -1 : 1, 0];
+  if (L.mode === 'level' || L.mode === 'floor') return [0, n[1] < 0 ? -1 : 1, 0];
   if (L.mode === 'upright'){ const h = Math.hypot(n[0], n[2]); return h > 1e-6 ? [n[0] / h, 0, n[2] / h] : null; }
   if (L.mode === 'hold' && L.n) return dot(L.n, n) < 0 ? mul(L.n, -1) : L.n;
   return null;
 }
-function applyLocks(sk, locks, byKey, X, G, W, w){
+// a lock still applies while what it holds is still there (faces by their corners, lines by their two ends)
+export function lockAlive(L, byKey, X){
+  if (L.f) return byKey.has(L.f);
+  if (L.a) return byKey.has(L.a) && byKey.has(L.b);
+  if (L.e) return !!(X[L.e[0]] && X[L.e[1]]);
+  if (L.ea) return !!(X[L.ea[0]] && X[L.ea[1]] && X[L.eb[0]] && X[L.eb[1]]);
+  return false;
+}
+// turn face points P (ids) about centroid c so normal n becomes t
+function turnTo(ids, X, c, n, t, goal){
+  const ax = cross(n, t), sl = len(ax), a = Math.atan2(sl, dot(n, t));
+  for (const id of ids) goal(id, sl > 1e-9 ? rotAbout(X[id], c, mul(ax, 1 / sl), a) : X[id]);
+}
+// a line's two ends set so it runs along t (a unit direction), same length, same middle
+function lineTo(e, X, t, goal){
+  const a = X[e[0]], b = X[e[1]], d = sub(b, a), L = len(d), m = mul(add(a, b), 0.5), tt = dot(t, d) < 0 ? mul(t, -1) : t;
+  goal(e[0], sub(m, mul(tt, L / 2))); goal(e[1], add(m, mul(tt, L / 2)));
+}
+function applyLocks(sk, locks, byKey, X, G, W, w, sqDeg){
   const goal = (id, p) => { G[id] = add(G[id], mul(p, w)); W[id] += w; };
   for (const L of locks){
     if (L.f){
       const f = byKey.get(L.f), pl = planeOf(f.ids.map(id => X[id])), t = orientTarget(L, pl.n);
+      if (L.mode === 'floor'){ for (const id of f.all) goal(id, [X[id][0], 0, X[id][2]]); continue; }   // lying on the floor
       if (!t) continue;
-      const ax = cross(pl.n, t), sl = len(ax), a = Math.atan2(sl, dot(pl.n, t));
-      for (const id of f.all) goal(id, sl > 1e-9 ? rotAbout(X[id], pl.c, mul(ax, 1 / sl), a) : X[id]);
+      turnTo(f.all, X, pl.c, pl.n, t, goal);
+    } else if (L.e){
+      // a line held upright or level
+      const d = norm(sub(X[L.e[1]], X[L.e[0]]));
+      if (L.mode === 'upright') lineTo(L.e, X, [0, 1, 0], goal);
+      else { const h = Math.hypot(d[0], d[2]); if (h > 1e-6) lineTo(L.e, X, [d[0] / h, 0, d[2] / h], goal); }
+    } else if (L.ea){
+      // two lines held parallel or square to each other
+      let dA = norm(sub(X[L.ea[1]], X[L.ea[0]])), dB = norm(sub(X[L.eb[1]], X[L.eb[0]]));
+      if (L.mode === 'parallel'){ if (dot(dA, dB) < 0) dB = mul(dB, -1); const t = norm(add(dA, dB)); lineTo(L.ea, X, t, goal); lineTo(L.eb, X, t, goal); }
+      else { const c = dot(dA, dB); lineTo(L.ea, X, norm(sub(dA, mul(dB, c * 0.5))), goal); lineTo(L.eb, X, norm(sub(dB, mul(dA, c * 0.5))), goal); }
+    } else if (L.mode === 'coplanar' || L.mode === 'parallel'){
+      // two faces on one plane, or facing the same way
+      const FA = byKey.get(L.a), FB = byKey.get(L.b), pA = planeOf(FA.ids.map(id => X[id])), pB = planeOf(FB.ids.map(id => X[id]));
+      const nB = dot(pA.n, pB.n) < 0 ? mul(pB.n, -1) : pB.n;
+      let n = norm(add(pA.n, nB));
+      // with Square up on, a shared plane that's nearly level or upright becomes exactly so
+      if (sqDeg){ const sn = Math.sin(sqDeg * Math.PI / 180), h = Math.hypot(n[0], n[2]);
+        if (h < sn) n = [0, Math.sign(n[1]) || 1, 0]; else if (Math.abs(n[1]) < sn) n = [n[0] / h, 0, n[2] / h]; }
+      if (L.mode === 'parallel'){ turnTo(FA.all, X, pA.c, pA.n, n, goal); turnTo(FB.all, X, pB.c, nB, n, goal); continue; }
+      const ids = [...new Set([...FA.all, ...FB.all])];
+      let c = [0, 0, 0]; for (const id of ids) c = add(c, X[id]); c = mul(c, 1 / ids.length);
+      for (const id of ids) goal(id, sub(X[id], mul(n, dot(n, sub(X[id], c)))));
     } else {
       const FA = byKey.get(L.a), FB = byKey.get(L.b), g = faceAngle(FA.ids, FB.ids, X);
       if (!g) continue;
@@ -647,9 +706,10 @@ export function snapHeld(sk, F, key, T, X){
   for (const L of sk.locks || []){
     if (L.f === key){
       const pl = planeOf(f.ids.map(id => P[id])), t = orientTarget(L, pl.n); if (!t) continue;
-      const ax = cross(pl.n, t), sl = len(ax); if (sl < 1e-9) continue;
-      for (const id of f.all) if (P[id]) P[id] = rotAbout(P[id], pl.c, mul(ax, 1 / sl), Math.atan2(sl, dot(pl.n, t)));
-    } else if ((L.a === key || L.b === key) && byKey.has(L.a) && byKey.has(L.b)){
+      const ax = cross(pl.n, t), sl = len(ax);
+      if (sl > 1e-9) for (const id of f.all) if (P[id]) P[id] = rotAbout(P[id], pl.c, mul(ax, 1 / sl), Math.atan2(sl, dot(pl.n, t)));
+      if (L.mode === 'floor') for (const id of f.all) if (P[id]) P[id] = [P[id][0], 0, P[id][2]];   // it slides along the floor
+    } else if ((L.a === key || L.b === key) && byKey.has(L.a) && byKey.has(L.b) && (L.mode === 'fixed' || L.mode === 'step')){
       const other = byKey.get(L.a === key ? L.b : L.a).ids, g = faceAngle(f.ids, other, P); if (!g) continue;
       // g is measured from the held face to the other one: turning the held face by -d widens the angle by d
       const d = (lockTarget(L, g.deg) - g.deg) * Math.PI / 180;

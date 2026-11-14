@@ -39,11 +39,13 @@ const toV = a => new V3(a[0], a[1], a[2]), toA = v => [v.x, v.y, v.z];
 // Settings and the sketch
 // ======================================================================
 const SET_KEY = 'edgewise:set', SK_KEY = 'edgewise:sketch', LIB_KEY = 'edgewise:lib';
-const S = Object.assign({ join: true, tags: true, tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
+const S = Object.assign({ lineW: 'mid', pt: 'small', tagSize: 'small', join: true, tags: true, tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
   (() => { try { return JSON.parse(localStorage.getItem(SET_KEY)) || {}; } catch (e) { return {}; } })());
+const SIZE = { line: { thin: 0.0022, mid: 0.0035, thick: 0.0055 }, pt: { small: 0.0075, big: 0.012 }, tag: { small: [0.06, 0.0225], big: [0.1, 0.0375] } };
 const saveSet = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(S)); } catch (e) {} };
 let sk = (() => { try { const j = JSON.parse(localStorage.getItem(SK_KEY)); if (j && j.v) return j; } catch (e) {} return null; })();
 const firstRun = !sk;
+if (S.points === false && !('ptMigrated' in S)){ S.pt = 'hide'; } if (S.tags === false && !('ptMigrated' in S)) S.tagSize = 'hide'; S.ptMigrated = 1;
 if (!sk) sk = C.emptySketch();
 let saveT = 0;
 const saveSketch = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(SK_KEY, JSON.stringify(sk)); } catch (e) {} }, 250); };
@@ -160,8 +162,9 @@ function rebuild(){
   for (const v of sk.v) if (!D[v.id]) D[v.id] = (preview && preview.P[v.id]) || X[v.id];
   for (const id in D) if (!X[id]) delete D[id];
   strokesDirty = true; menuDirty = true;
-  if (sel.a && !faceByKey(sel.a)) sel = { a: null, b: null };
-  if (sel.b && !faceByKey(sel.b)) sel.b = null;
+  const ok = k => sel.kind === 'face' ? !!faceByKey(k) : edgeAlive(k);
+  if (sel.a && !ok(sel.a)) sel = noSel();
+  if (sel.b && !ok(sel.b)) sel.b = null;
 }
 function afterEdit(){ rebuild(); saveSketch(); }
 
@@ -192,8 +195,8 @@ function drawModel(){
     try { tris = THREE.ShapeUtils.triangulateShape(c2.slice(0, f.ids.length), holes2); } catch (e) { continue; }
     const out = f.open ? hpos : pos;
     tmpC.set(colorOf(f.piece));
-    if (S.tool === 'lock' && sel.a === f.key) tmpC.lerp(new THREE.Color('#FFF27A'), 0.6);
-    else if (S.tool === 'lock' && sel.b === f.key) tmpC.lerp(new THREE.Color('#FF8A00'), 0.6);
+    if (S.tool === 'lock' && sel.kind === 'face' && sel.a === f.key) tmpC.lerp(new THREE.Color('#FFF27A'), 0.6);
+    else if (S.tool === 'lock' && sel.kind === 'face' && sel.b === f.key) tmpC.lerp(new THREE.Color('#FF8A00'), 0.6);
     else if (hover && hover.kind === 'face' && hover.key === f.key && !preview) tmpC.lerp(new THREE.Color('#FFFFFF'), 0.4);
     for (const t of tris){
       // every triangle wound the same way as the face, with the face's own normal, so it shades as one flat face
@@ -216,13 +219,14 @@ function drawModel(){
     for (const r of f.rings) for (let i = 0; i < r.length && sn < MAXI; i++){
       const A = toV(r[i]), B = toV(r[(i + 1) % r.length]), L = A.distanceTo(B); if (L < 1e-5) continue;
       tmpQ.setFromUnitVectors(UP, B.clone().sub(A).normalize());
-      tmpM.compose(A.add(B).multiplyScalar(0.5), tmpQ, new V3(0.003 * k, L, 0.003 * k)); seamInst.setMatrixAt(sn++, tmpM);
+      const sr = SIZE.line[S.lineW] * 0.8 * k;
+      tmpM.compose(A.add(B).multiplyScalar(0.5), tmpQ, new V3(sr, L, sr)); seamInst.setMatrixAt(sn++, tmpM);
     }
   }
   seamInst.count = sn; seamInst.instanceMatrix.needsUpdate = true;
   setGeo(faceMesh.geometry, pos, col, nrm); setGeo(holeMesh.geometry, hpos, null);
   // edges
-  const r = 0.0038 * k;
+  const r = SIZE.line[S.lineW] * k;
   let n = 0;
   for (const e of M.sk.e){
     const a = M.P[e.a], b = M.P[e.b]; if (!a || !b || n >= MAXI) continue;
@@ -233,6 +237,7 @@ function drawModel(){
     const use = M.F.edgeUse.get(e.id) || 0;
     let c = use ? '#141414' : '#FF2D95';
     if (e.id === M.newEdge) c = '#1E5EFF';
+    if (S.tool === 'lock' && sel.kind === 'edge'){ const ek = ekey([e.a, e.b]); if (ek === sel.a) c = '#FFD60A'; else if (ek === sel.b) c = '#FF8A00'; }
     if (eraseMarks.has(e.id)) c = '#FF3B30';
     if (hover && hover.kind === 'edge' && hover.id === e.id) c = '#FFD60A';
     edgeInst.setColorAt(n++, tmpC.set(c));
@@ -240,12 +245,12 @@ function drawModel(){
   edgeInst.count = n; edgeInst.instanceMatrix.needsUpdate = true; if (edgeInst.instanceColor) edgeInst.instanceColor.needsUpdate = true;
   // corners: the control points
   n = 0;
-  if (S.points || preview){
+  if (S.pt !== 'hide' || preview){
     const deg = new Map(); for (const e of M.sk.e){ deg.set(e.a, (deg.get(e.a) || 0) + 1); deg.set(e.b, (deg.get(e.b) || 0) + 1); }
     for (const v of M.sk.v){
       const p = M.P[v.id]; if (!p || n >= MAXI) continue;
       const hot = hover && ((hover.kind === 'vert' && hover.id === v.id) || (hover.kind === 'face' && hover.ids?.includes(v.id)) || (hover.kind === 'edge' && hover.ids?.includes(v.id)));
-      const rr = (hot ? 0.012 : 0.0085) * k;
+      const rr = (SIZE.pt[S.pt] || SIZE.pt.small) * (hot ? 1.45 : 1) * k;
       tmpM.compose(toV(p), tmpQ.identity(), new V3(rr, rr, rr)); cornInst.setMatrixAt(n, tmpM);
       cornInst.setColorAt(n++, tmpC.set(eraseMarksV.has(v.id) ? '#FF3B30' : hot ? '#FFD60A' : (deg.get(v.id) || 0) < 2 ? '#FF2D95' : v.pin ? '#2EC4B6' : '#FFFFFF'));
     }
@@ -263,24 +268,49 @@ function drawModel(){
 // little tags on locked faces and locked angles
 const badgeGroup = new THREE.Group(); world.add(badgeGroup);
 const badgeTex = new Map();
-function badgeMat(text, bg){
-  const k = text + bg; if (badgeTex.has(k)) return badgeTex.get(k);
+// a tag: optional symbol (drawn, so every headset has it) then text. Symbols: par ∥, perp ⊥, eq = (on one plane)
+function badgeMat(text, bg, sym){
+  const k = text + bg + (sym || ''); if (badgeTex.has(k)) return badgeTex.get(k);
   const c = document.createElement('canvas'); c.width = 256; c.height = 96; const g = c.getContext('2d');
   g.fillStyle = '#111'; g.beginPath(); g.roundRect(6, 8, 244, 84, 22); g.fill();
   g.fillStyle = bg; g.beginPath(); g.roundRect(2, 2, 242, 82, 22); g.fill(); g.lineWidth = 5; g.strokeStyle = '#111'; g.stroke();
-  g.fillStyle = '#111'; g.font = '900 44px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 123, 46);
+  g.fillStyle = '#111'; g.strokeStyle = '#111'; g.lineWidth = 9; g.lineCap = 'round';
+  let tx = 123;
+  if (sym){
+    const x = text ? 64 : 123; tx = text ? 160 : 123; g.beginPath();
+    if (sym === 'par'){ g.moveTo(x - 16, 72); g.lineTo(x - 2, 20); g.moveTo(x + 4, 72); g.lineTo(x + 18, 20); }
+    else if (sym === 'perp'){ g.moveTo(x - 24, 70); g.lineTo(x + 24, 70); g.moveTo(x, 70); g.lineTo(x, 20); }
+    else if (sym === 'eq'){ g.moveTo(x - 24, 36); g.lineTo(x + 24, 36); g.moveTo(x - 24, 58); g.lineTo(x + 24, 58); }
+    g.stroke();
+  }
+  g.font = '900 44px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; if (text) g.fillText(text, tx, 46);
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
   const m = new THREE.SpriteMaterial({ map: t, transparent: true });
   badgeTex.set(k, m); return m;
 }
+const ekey = ids => Math.min(ids[0], ids[1]) + '-' + Math.max(ids[0], ids[1]);
+const eids = k => k.split('-').map(Number);
 function drawBadges(M){
   const want = [];
   const byKey = new Map(M.F.faces.map(f => [f.key, f]));
+  let pairN = 0;
+  const mid = e => C.V.mul(C.V.add(M.P[e[0]], M.P[e[1]]), 0.5);
   for (const L of M.sk.locks || []){
     if (L.f){
       const f = byKey.get(L.f); if (!f || f.ids.some(id => !M.P[id])) continue;
       const pl = C.planeOf(f.ids.map(id => M.P[id]));
-      want.push({ at: pl.c, text: L.mode === 'level' ? 'LEVEL' : L.mode === 'upright' ? 'UPRIGHT' : 'HELD', bg: PINK });
+      want.push({ at: pl.c, text: L.mode === 'level' ? 'LEVEL' : L.mode === 'upright' ? 'UPRIGHT' : L.mode === 'floor' ? 'FLOOR' : 'HELD', bg: PINK });
+    } else if (L.e){
+      if (!M.P[L.e[0]] || !M.P[L.e[1]]) continue;
+      want.push({ at: mid(L.e), text: L.mode === 'upright' ? 'UPRIGHT' : 'LEVEL', bg: '#C79BFF' });
+    } else if (L.ea){
+      if (![...L.ea, ...L.eb].every(id => M.P[id])) continue;
+      const n = String(++pairN), sym = L.mode === 'parallel' ? 'par' : 'perp';
+      want.push({ at: mid(L.ea), text: n, sym, bg: '#C79BFF' }, { at: mid(L.eb), text: n, sym, bg: '#C79BFF' });
+    } else if (L.mode === 'coplanar' || L.mode === 'parallel'){
+      const A = byKey.get(L.a), B = byKey.get(L.b); if (!A || !B) continue;
+      const n = String(++pairN), sym = L.mode === 'parallel' ? 'par' : 'eq';
+      for (const f of [A, B]) want.push({ at: C.planeOf(f.ids.map(id => M.P[id])).c, text: n, sym, bg: '#7FB2FF' });
     } else {
       const A = byKey.get(L.a), B = byKey.get(L.b); if (!A || !B) continue;
       const g = C.faceAngle(A.ids, B.ids, M.P); if (!g) continue;
@@ -292,8 +322,9 @@ function drawBadges(M){
   while (badgeGroup.children.length < want.length){ const sp = new THREE.Sprite(); sp.renderOrder = 20; badgeGroup.add(sp); }
   // a tag stands a little off its face toward you, and grows and shrinks with the model
   const eye = toA(world.worldToLocal(camera.getWorldPosition(new V3())));
-  want.forEach((w, i) => { const sp = badgeGroup.children[i]; sp.material = badgeMat(w.text, w.bg); const t = C.V.mul(C.V.norm(C.V.sub(eye, w.at)), 0.03); sp.position.set(...C.V.add(w.at, t)); sp.scale.set(0.11, 0.041, 1); });
-  badgeGroup.visible = S.tags;
+  const sz = SIZE.tag[S.tagSize] || SIZE.tag.small;
+  want.forEach((w, i) => { const sp = badgeGroup.children[i]; sp.material = badgeMat(w.text, w.bg, w.sym); const t = C.V.mul(C.V.norm(C.V.sub(eye, w.at)), sz[0] * 0.3); sp.position.set(...C.V.add(w.at, t)); sp.scale.set(sz[0], sz[1], 1); });
+  badgeGroup.visible = S.tagSize !== 'hide';
 }
 function setGeo(g, pos, col, nrm){
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -495,19 +526,38 @@ function grabEnd(){
   drag = null; dragF = null;
 }
 // ---- locks: tap a face, then (optionally) a face beside it
-let sel = { a: null, b: null };
+// sel.kind 'face' (keys are face keys) or 'edge' (keys are "end-end")
+let sel = { kind: null, a: null, b: null };
+const noSel = () => ({ kind: null, a: null, b: null });
 const faceByKey = k => F && F.faces.find(f => f.key === k);
+const edgeAlive = k => { const [u, v] = eids(k); return !!(X[u] && X[v]); };
 function lockTap(h){
-  if (!h || h.kind !== 'face'){ if (sel.a){ sel = { a: null, b: null }; flash('Nothing picked'); } menuDirty = true; return; }
-  if (sel.a === h.key) sel = { a: null, b: null };
-  else if (sel.b === h.key) sel.b = null;
-  else if (sel.a && faceByKey(sel.a) && C.sharedEdge(faceByKey(sel.a).ids, h.ids)) sel.b = h.key;
-  else sel = { a: h.key, b: null };
+  if (!h || (h.kind !== 'face' && h.kind !== 'edge')){ if (sel.a){ sel = noSel(); flash('Nothing picked'); } menuDirty = true; return; }
+  const key = h.kind === 'face' ? h.key : ekey(h.ids);
+  if (sel.kind !== h.kind || !sel.a) sel = { kind: h.kind, a: key, b: null };
+  else if (sel.a === key) sel = noSel();
+  else if (sel.b === key) sel.b = null;
+  else sel.b = key;                                   // any second face (touching or not) or line
   if (S.tab !== 'tidy'){ S.tab = 'tidy'; saveSet(); }
   menuDirty = true; buzz(0.3, 15);
 }
 const faceLock = k => (sk.locks || []).find(L => L.f === k);
 const angleLock = (a, b) => (sk.locks || []).find(L => (L.a === a && L.b === b) || (L.a === b && L.b === a));
+const lineLock = k => (sk.locks || []).find(L => L.e && ekey(L.e) === k);
+const linePair = (a, b) => (sk.locks || []).find(L => L.ea && ((ekey(L.ea) === a && ekey(L.eb) === b) || (ekey(L.ea) === b && ekey(L.eb) === a)));
+function setLineLock(mode){
+  if (!sel.a || !edgeAlive(sel.a)) return;
+  pushUndo(); sk.locks = sk.locks.filter(L => L !== lineLock(sel.a));
+  if (mode !== 'free') sk.locks.push({ e: eids(sel.a), mode });
+  afterEdit(); flash(mode === 'free' ? 'Line is free' : mode === 'upright' ? 'Line locked upright' : 'Line locked level');
+}
+function setLinePair(mode){
+  if (!sel.a || !sel.b || !edgeAlive(sel.a) || !edgeAlive(sel.b)) return;
+  pushUndo(); sk.locks = sk.locks.filter(L => L !== linePair(sel.a, sel.b));
+  if (mode !== 'free') sk.locks.push({ ea: eids(sel.a), eb: eids(sel.b), mode });
+  afterEdit(); flash(mode === 'free' ? 'Lines are free' : mode === 'parallel' ? 'Lines locked parallel' : 'Lines locked square to each other');
+}
+const lineAngle = (a, b) => { const [u, v] = eids(a), [x, y] = eids(b), d1 = C.V.norm(C.V.sub(X[v], X[u])), d2 = C.V.norm(C.V.sub(X[y], X[x])); return Math.acos(Math.min(1, Math.abs(C.V.dot(d1, d2)))) * 180 / Math.PI; };
 function setFaceLock(mode){
   const f = faceByKey(sel.a); if (!f) return;
   pushUndo(); sk.locks = sk.locks.filter(L => L.f !== sel.a);
@@ -516,20 +566,24 @@ function setFaceLock(mode){
     if (mode === 'hold') L.n = C.planeOf(f.ids.map(id => X[id])).n.map(x => +x.toFixed(5));
     sk.locks.push(L);
   }
-  afterEdit(); flash(mode === 'free' ? 'Face is free' : mode === 'level' ? 'Face locked level' : mode === 'upright' ? 'Face locked upright' : 'Face holds its tilt');
+  afterEdit(); flash(mode === 'free' ? 'Face is free' : mode === 'level' ? 'Face locked level' : mode === 'upright' ? 'Face locked upright' : mode === 'floor' ? 'Face locked to the floor' : 'Face holds its tilt');
 }
 function setAngleLock(mode){
   const A = faceByKey(sel.a), B = faceByKey(sel.b); if (!A || !B) return;
-  const g = C.faceAngle(A.ids, B.ids, X); if (!g) return;
+  const g = C.faceAngle(A.ids, B.ids, X);
+  if (!g && mode !== 'free' && mode !== 'coplanar' && mode !== 'parallel') return;
   pushUndo(); sk.locks = sk.locks.filter(L => L !== angleLock(sel.a, sel.b));
+  if (mode === 'coplanar' || mode === 'parallel') sk.locks.push({ a: sel.a, b: sel.b, mode });
   if (mode === '90') sk.locks.push({ a: sel.a, b: sel.b, mode: 'fixed', deg: 90 });
   else if (mode === 's15') sk.locks.push({ a: sel.a, b: sel.b, mode: 'step', step: 15 });
   else if (mode === 's45') sk.locks.push({ a: sel.a, b: sel.b, mode: 'step', step: 45 });
   else if (mode === 'keep') sk.locks.push({ a: sel.a, b: sel.b, mode: 'fixed', deg: Math.round(g.deg) });
   afterEdit();
-  flash(mode === 'free' ? 'Angle is free' : mode === '90' ? 'Locked at 90°' : mode === 'keep' ? 'Locked at ' + Math.round(g.deg) + '°' : 'Clicks in ' + (mode === 's15' ? 15 : 45) + '° steps');
+  flash(mode === 'free' ? 'Faces are free' : mode === 'coplanar' ? 'Faces locked on one plane' : mode === 'parallel' ? 'Faces locked parallel' : mode === '90' ? 'Locked at 90°' : mode === 'keep' ? 'Locked at ' + Math.round(g.deg) + '°' : 'Clicks in ' + (mode === 's15' ? 15 : 45) + '° steps');
 }
 function clearLocks(){ if (!sk.locks.length) return flash('No locks'); pushUndo(); sk.locks = []; afterEdit(); flash('Every lock is off'); }
+// what the Lock tool would take at the pen: a line close by, otherwise a face
+const lockPick = (p, reach) => pickEdge(p, reach * 0.6) || pickFace(p, reach * 1.5);
 
 function unpinAll(){
   if (!sk.v.some(v => v.pin)) return flash('Every corner already follows your strokes');
@@ -635,7 +689,7 @@ function drawMenu(){
     button(x0, y + 18, W, 76, 'Let moved corners follow my lines again', unpinAll, false, { fs: 25 });
   } else if (S.tab === 'tidy'){
     const locking = S.tool === 'lock';
-    button(x0, y, W, 76, locking ? 'Locking faces: tap here to draw again' : 'Lock faces: level, upright or at an angle', () => { S.tool = locking ? 'draw' : 'lock'; if (locking) sel = { a: null, b: null }; saveSet(); }, locking, { fs: 25, onColor: PINK }); y += 100;
+    button(x0, y, W, 76, locking ? 'Locking: tap here to draw again' : 'Lock faces and lines', () => { S.tool = locking ? 'draw' : 'lock'; if (locking) sel = noSel(); saveSet(); }, locking, { fs: 25, onColor: PINK }); y += 100;
     if (locking){
       y = drawLockMenu(x0, y, W);
       if ((sk.locks || []).length) button(x0, y + 10, W, 72, 'Take off all ' + sk.locks.length + (sk.locks.length === 1 ? ' lock' : ' locks'), clearLocks, false, { fs: 26 });
@@ -654,13 +708,15 @@ function drawMenu(){
     para('Every face is made exactly flat' + (mm === null ? '.' : ': right now no corner is more than ' + (mm < 0.01 ? '0.01' : mm.toFixed(2)) + ' mm off its face.'), x0, y, W);
   } else if (S.tab === 'view'){
     label('Your sketch strokes', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.strokes, v => S.strokes = v, 28); y += 100;
-    label('Lock tags (LEVEL, 90°…)', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.tags, v => S.tags = v, 28); y += 100;
+    seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.strokes, v => S.strokes = v, 28); y += 96;
+    label('Line weight', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [['thin', 'Thin'], ['mid', 'Medium'], ['thick', 'Thick']], S.lineW, v => S.lineW = v, 28); y += 96;
     label('Control points', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.points, v => S.points = v, 28); y += 100;
+    seg(x0, y, W, 72, [['hide', 'Hide'], ['small', 'Small'], ['big', 'Big']], S.pt, v => S.pt = v, 28); y += 96;
+    label('Lock tags (LEVEL, 90°, ∥ …)', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [['hide', 'Hide'], ['small', 'Small'], ['big', 'Big']], S.tagSize, v => S.tagSize = v, 28); y += 96;
     label('Drawing hand', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [['left', 'Left'], ['right', 'Right']], S.hand, v => { S.hand = v; placeMenu(); }, 28); y += 100;
+    seg(x0, y, W, 72, [['left', 'Left'], ['right', 'Right']], S.hand, v => { S.hand = v; placeMenu(); }, 28); y += 92;
     const s = ws(), sc = s >= 0.995 && s <= 1.005 ? '1:1' : s < 1 ? '1:' + (1 / s).toFixed(s > 0.2 ? 1 : 0) : (s).toFixed(1) + ':1';
     label('Shown at ' + sc, x0, y + 24, 28, INK); y += 44;
     button(x0, y, W, 72, 'Back to 1:1 on the floor', resetView, false, { fs: 26 });
@@ -681,19 +737,32 @@ function drawMenu(){
   finishMenu();
 }
 function drawLockMenu(x0, y, W){
-  const A = sel.a && faceByKey(sel.a), B = sel.b && faceByKey(sel.b);
-  if (!A){
-    return para('Tap a face to lock how it sits. Then tap a face next to it to lock the angle between the two.', x0, y + 6, W);
+  if (!sel.a) return para('Tap a face or a line to lock it. Then tap a second face or line to lock the two together.', x0, y + 6, W);
+  if (sel.kind === 'edge'){
+    const ll = lineLock(sel.a);
+    label('This line (yellow)', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [['free', 'Free'], ['upright', 'Upright'], ['level', 'Level']], ll ? ll.mode : 'free', setLineLock, 26); y += 100;
+    if (!sel.b) return para('Tap another line to lock the two parallel or square to each other. Tap the yellow line again to let go.', x0, y + 6, W);
+    const lp = linePair(sel.a, sel.b);
+    label('With the orange line: now ' + Math.round(lineAngle(sel.a, sel.b)) + '°', x0, y + 20, 26, INK); y += 34;
+    seg(x0, y, W, 72, [['free', 'Free'], ['parallel', 'Parallel'], ['perp', 'Square (90°)']], lp ? lp.mode : 'free', setLinePair, 25); y += 100;
+    return y;
   }
+  const A = faceByKey(sel.a), B = sel.b && faceByKey(sel.b);
   const fl = faceLock(sel.a);
   label('This face (yellow)', x0, y + 20); y += 34;
-  seg(x0, y, W, 72, [['free', 'Free'], ['level', 'Level'], ['upright', 'Upright'], ['hold', 'Hold tilt']], fl ? fl.mode : 'free', setFaceLock, 24); y += 100;
-  if (!B) return para('Tap a face beside it to lock the angle between them. Tap the yellow face again to let go.', x0, y + 6, W);
+  seg(x0, y, W, 72, [['free', 'Free'], ['level', 'Level'], ['upright', 'Upright'], ['floor', 'Floor'], ['hold', 'Hold tilt']], fl ? fl.mode : 'free', setFaceLock, 21); y += 100;
+  if (!B) return para('Tap another face, touching or not, to lock the two together. Tap the yellow face again to let go.', x0, y + 6, W);
   const g = C.faceAngle(A.ids, B.ids, X), al = angleLock(sel.a, sel.b);
-  const cur = !al ? 'free' : al.mode === 'step' ? 's' + al.step : al.deg === 90 ? '90' : 'keep';
-  label('Angle to the orange face: ' + (g ? Math.round(g.deg) + '°' : '?'), x0, y + 20, 26, INK); y += 34;
-  seg(x0, y, W, 72, [['free', 'Free'], ['90', '90°'], ['keep', 'Keep ' + (al && al.mode === 'fixed' && al.deg !== 90 ? al.deg : g ? Math.round(g.deg) : '') + '°']], cur, setAngleLock, 26); y += 88;
-  seg(x0, y, W, 72, [['s15', 'Snap to 15°'], ['s45', 'Snap to 45°']], cur, setAngleLock, 26); y += 100;
+  const cur = !al ? 'free' : al.mode === 'coplanar' || al.mode === 'parallel' ? al.mode : al.mode === 'step' ? 's' + al.step : al.deg === 90 ? '90' : 'keep';
+  if (!g){
+    label('With the orange face', x0, y + 20, 26, INK); y += 34;
+    seg(x0, y, W, 72, [['free', 'Free'], ['coplanar', 'One plane'], ['parallel', 'Parallel']], cur, setAngleLock, 26); y += 100;
+    return para('One plane: both faces lie on the same flat plane, like two tops at the same height.', x0, y + 6, W);
+  }
+  label('With the orange face: now ' + Math.round(g.deg) + '°', x0, y + 20, 26, INK); y += 34;
+  seg(x0, y, W, 72, [['free', 'Free'], ['90', '90°'], ['keep', 'Keep ' + (al && al.mode === 'fixed' && al.deg !== 90 ? al.deg : Math.round(g.deg)) + '°']], cur, setAngleLock, 26); y += 88;
+  seg(x0, y, W, 72, [['s15', 'Snap 15°'], ['s45', 'Snap 45°'], ['coplanar', 'One plane']], cur, setAngleLock, 26); y += 100;
   return para('Snap: the angle clicks to the nearest step, also while you grab and tilt a face. Keep holds the angle it has now.', x0, y + 6, W);
 }
 // what the controller buttons do, along the bottom of the Draw tab
@@ -936,7 +1005,7 @@ function xrInput(){
         if (S.tool === 'draw'){ h.act = 'draw'; strokeStart(p); }
         else if (S.tool === 'erase'){ h.act = 'erase'; eraseAt(p); }
         else if (S.tool === 'hole') toggleHole(pickFace(p, reach * 1.5));
-        else if (S.tool === 'lock') lockTap(pickFace(p, reach * 1.5));
+        else if (S.tool === 'lock') lockTap(lockPick(p, reach));
         else if (S.tool === 'grab'){ const hit = pickAny(p, reach); if (hit && grabStart(hit, frameOf(h))){ h.act = 'grab'; } }
       }
       if (b[0] && h.act === 'draw') strokeMove(p);
@@ -949,7 +1018,7 @@ function xrInput(){
       if (Math.abs(sx) < 0.3) h.stickHeld = false;
       // hover: show what grip would take
       if (!h.act && !drag && !onMenu){
-        const hv = (S.tool === 'hole' || S.tool === 'lock') ? pickFace(p, reach * 1.5) : S.tool === 'erase' ? pickEdge(p, 0.025 / ws()) : S.tool === 'draw' ? pickVert(p, S.snap / 100 / ws()) : pickAny(p, reach);
+        const hv = S.tool === 'lock' ? lockPick(p, reach) : S.tool === 'hole' ? pickFace(p, reach * 1.5) : S.tool === 'erase' ? pickEdge(p, 0.025 / ws()) : S.tool === 'draw' ? pickVert(p, S.snap / 100 / ws()) : pickAny(p, reach);
         setHover(hv);
       }
       h.tip.material.color.set(S.tool === 'erase' ? '#FF3B30' : S.tool === 'hole' ? '#2EC4B6' : S.tool === 'grab' ? '#FFD60A' : '#111111');
@@ -1035,7 +1104,7 @@ renderer.domElement.addEventListener('pointermove', e => {
   if (renderer.xr.isPresenting) return;
   const r = mouseRay(e);
   if (!mouse){
-    setHover(S.tool === 'grab' ? (cornerAtMouse(e) || edgeAtMouse(e) || rayFace(r.o, r.d)) : S.tool === 'erase' ? edgeAtMouse(e) : (S.tool === 'hole' || S.tool === 'lock') ? rayFace(r.o, r.d) : cornerAtMouse(e));
+    setHover(S.tool === 'grab' ? (cornerAtMouse(e) || edgeAtMouse(e) || rayFace(r.o, r.d)) : S.tool === 'erase' ? edgeAtMouse(e) : S.tool === 'lock' ? (edgeAtMouse(e, 8) || rayFace(r.o, r.d)) : S.tool === 'hole' ? rayFace(r.o, r.d) : cornerAtMouse(e));
     return;
   }
   if (mouse.kind === 'draw'){
@@ -1058,7 +1127,7 @@ let tapAt = null;
 addEventListener('pointerup', e => {
   if (tapAt && !renderer.xr.isPresenting){
     const moved = Math.hypot(e.clientX - tapAt.x, e.clientY - tapAt.y); tapAt = null;
-    if (moved < 7){ const r = mouseRay(e), h = rayFace(r.o, r.d); if (S.tool === 'hole') toggleHole(h); else if (S.tool === 'lock') lockTap(h); }
+    if (moved < 7){ const r = mouseRay(e); if (S.tool === 'hole') toggleHole(rayFace(r.o, r.d)); else if (S.tool === 'lock') lockTap(edgeAtMouse(e, 8) || rayFace(r.o, r.d)); }
   }
   if (!mouse) return;
   if (mouse.kind === 'draw') strokeEnd();
@@ -1132,7 +1201,7 @@ renderer.setAnimationLoop(() => {
 
 rebuild(); for (const id in X) D[id] = X[id].slice();
 if (firstRun) loadSample();
-window.edgewise = { objText: () => joinedOBJ(joinSolids(sk, F, X, window.polygonClipping)), summary, doExtrude, deleteHeld, get drag(){ return drag; }, lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
+window.edgewise = { setLineLock, setLinePair, ekey, objText: () => joinedOBJ(joinSolids(sk, F, X, window.polygonClipping)), summary, doExtrude, deleteHeld, get drag(){ return drag; }, lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
 </script>
 <script src="../updated.js"></script>
 </body>
