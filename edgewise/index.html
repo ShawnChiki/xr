@@ -166,7 +166,14 @@ function rebuild(){
   if (sel.a && !ok(sel.a)) sel = noSel();
   if (sel.b && !ok(sel.b)) sel.b = null;
 }
-function afterEdit(){ rebuild(); saveSketch(); }
+// after every change, corners that ended up practically on top of each other (closer than about a centimetre) join
+function afterEdit(){ rebuild(); if (C.weld(sk, X, 0.012 / ws())) rebuild(); saveSketch(); }
+function joinNear(){
+  pushUndo();
+  const n = C.weld(sk, X, S.snap / 200 / ws());
+  if (!n){ undoS.pop(); return flash('No points close enough to join'); }
+  afterEdit(); flash(n === 1 ? 'Joined 1 pair of points' : 'Joined ' + n + ' pairs of points');
+}
 
 // ======================================================================
 // Drawing the model
@@ -237,6 +244,7 @@ function drawModel(){
     const use = M.F.edgeUse.get(e.id) || 0;
     let c = use ? '#141414' : '#FF2D95';
     if (e.id === M.newEdge) c = '#1E5EFF';
+    if (drag && drag.drops && drag.drops.some(d => d.edge === e.id)) c = '#FFD60A';
     if (S.tool === 'lock' && sel.kind === 'edge'){ const ek = ekey([e.a, e.b]); if (ek === sel.a) c = '#FFD60A'; else if (ek === sel.b) c = '#FF8A00'; }
     if (eraseMarks.has(e.id)) c = '#FF3B30';
     if (hover && hover.kind === 'edge' && hover.id === e.id) c = '#FFD60A';
@@ -249,7 +257,7 @@ function drawModel(){
     const deg = new Map(); for (const e of M.sk.e){ deg.set(e.a, (deg.get(e.a) || 0) + 1); deg.set(e.b, (deg.get(e.b) || 0) + 1); }
     for (const v of M.sk.v){
       const p = M.P[v.id]; if (!p || n >= MAXI) continue;
-      const hot = hover && ((hover.kind === 'vert' && hover.id === v.id) || (hover.kind === 'face' && hover.ids?.includes(v.id)) || (hover.kind === 'edge' && hover.ids?.includes(v.id)));
+      const hot = (drag && drag.drops && drag.drops.some(d => d.to === v.id || d.from === v.id)) || hover && ((hover.kind === 'vert' && hover.id === v.id) || (hover.kind === 'face' && hover.ids?.includes(v.id)) || (hover.kind === 'edge' && hover.ids?.includes(v.id)));
       const rr = (SIZE.pt[S.pt] || SIZE.pt.small) * (hot ? 1.45 : 1) * k;
       tmpM.compose(toV(p), tmpQ.identity(), new V3(rr, rr, rr)); cornInst.setMatrixAt(n, tmpM);
       cornInst.setColorAt(n++, tmpC.set(eraseMarksV.has(v.id) ? '#FF3B30' : hot ? '#FFD60A' : (deg.get(v.id) || 0) < 2 ? '#FF2D95' : v.pin ? '#2EC4B6' : '#FFFFFF'));
@@ -479,6 +487,31 @@ function grabMove(frame){
   drag.targets = drag.kind === 'face' ? C.snapHeld(sk, dragF, drag.key, targets, X) : targets;
   X = C.solve(sk, dragF, solveOpts({ drag: drag.targets, warm: X, iters: 30 }));
   for (const id in X) D[id] = X[id];
+  drag.drops = dropTargets();
+}
+// where the held corners would join if you let go now: another corner close by, or (holding one corner) a line
+function dropTargets(){
+  if (!drag) return [];
+  const r = 0.04 / ws(), held = new Set(drag.ids), out = [];
+  const nb = id => sk.e.filter(e => e.a === id || e.b === id).map(e => e.a === id ? e.b : e.a);
+  for (const id of drag.ids){
+    const p = X[id]; if (!p) continue;
+    const adj = new Set(nb(id));
+    let best = null, bd = r;
+    for (const v of sk.v){ if (held.has(v.id) || adj.has(v.id) || !X[v.id]) continue; const d = C.V.dist(p, X[v.id]); if (d < bd){ bd = d; best = { from: id, to: v.id }; } }
+    if (!best && drag.kind === 'vert'){
+      let be = r * 0.7;
+      for (const e of sk.e){
+        if (held.has(e.a) || held.has(e.b) || !X[e.a] || !X[e.b]) continue;
+        const ab = C.V.sub(X[e.b], X[e.a]), L2 = C.V.dot(ab, ab), t = L2 ? C.V.dot(C.V.sub(p, X[e.a]), ab) / L2 : 0;
+        if (t < 0.05 || t > 0.95) continue;
+        const q = C.V.add(X[e.a], C.V.mul(ab, t)), d = C.V.dist(p, q);
+        if (d < be){ be = d; best = { from: id, edge: e.id, at: q }; }
+      }
+    }
+    if (best) out.push(best);
+  }
+  return out;
 }
 // Pull the held face out as a block: its corners are copied, the copies joined back by side lines, and you keep
 // holding the new face. dir: +1 / -1 along the face's normal, or 0 to go toward your hand.
@@ -520,8 +553,15 @@ function grabEnd(){
   if (drag.targets || drag.extruded){
     // where you let go is where those corners stay (they no longer follow their strokes)
     for (const id of drag.ids){ const v = sk.v.find(x => x.id === id); if (v && X[id]) v.pin = X[id].map(x => +x.toFixed(4)); }
+    // dropped onto another corner (or a line): they join, at the corner you dropped onto
+    const drops = drag.drops || [];
+    for (const d of drops){
+      if (!sk.v.some(v => v.id === d.from)) continue;
+      if (d.to !== undefined){ if (sk.v.some(v => v.id === d.to)) C.mergeVerts(sk, d.to, d.from, X[d.to]); }
+      else if (sk.e.some(e => e.id === d.edge)){ const nid = C.splitEdgeAt(sk, d.edge, d.at); C.mergeVerts(sk, nid, d.from, d.at); }
+    }
     pushUndo(drag.before); afterEdit();
-    flash(drag.extruded ? 'Block pulled out' : drag.kind === 'face' ? 'Face moved' : drag.kind === 'edge' ? 'Edge moved' : 'Corner moved');
+    flash(drops.length ? (drops.length === 1 ? 'Joined' : 'Joined ' + drops.length + ' corners') : drag.extruded ? 'Block pulled out' : drag.kind === 'face' ? 'Face moved' : drag.kind === 'edge' ? 'Edge moved' : 'Corner moved');
   }
   drag = null; dragF = null;
 }
@@ -696,16 +736,17 @@ function drawMenu(){
       return finishMenu();
     }
     label('Square up', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.square, v => { S.square = v; rebuild(); }, 28); y += 100;
-    y = para('Lines that are nearly upright, level or square to their neighbours snap exactly so.', x0, y, W) + 6;
+    seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.square, v => { S.square = v; rebuild(); }, 28); y += 90;
+    y = para('Nearly upright, level or square lines snap exactly so.', x0, y + 22, W) - 4;
     label('Snap when within', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[5, '5°'], [10, '10°'], [15, '15°']], S.sqDeg, v => { S.sqDeg = v; rebuild(); }, 28); y += 104;
+    seg(x0, y, W, 72, [[5, '5°'], [10, '10°'], [15, '15°']], S.sqDeg, v => { S.sqDeg = v; rebuild(); }, 28); y += 90;
     label('Corners near the floor sit on it', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.floor, v => { S.floor = v; rebuild(); }, 28); y += 100;
+    seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.floor, v => { S.floor = v; rebuild(); }, 28); y += 90;
+    button(x0, y, W, 64, 'Join points that almost touch', joinNear, false, { fs: 25 }); y += 78;
     label('Solids that overlap or touch join into one', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[true, 'Join'], [false, 'Keep apart']], S.join, v => { S.join = v; joinCache.F = null; }, 28); y += 100;
+    seg(x0, y, W, 72, [[true, 'Join'], [false, 'Keep apart']], S.join, v => { S.join = v; joinCache.F = null; }, 28); y += 90;
     const mm = flatMM();
-    para('Every face is made exactly flat' + (mm === null ? '.' : ': right now no corner is more than ' + (mm < 0.01 ? '0.01' : mm.toFixed(2)) + ' mm off its face.'), x0, y, W);
+    para('All faces flat' + (mm === null ? '.' : ', within ' + (mm < 0.01 ? '0.01' : mm.toFixed(2)) + ' mm.'), x0, y + 22, W);
   } else if (S.tab === 'view'){
     label('Your sketch strokes', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.strokes, v => S.strokes = v, 28); y += 96;
@@ -1201,7 +1242,7 @@ renderer.setAnimationLoop(() => {
 
 rebuild(); for (const id in X) D[id] = X[id].slice();
 if (firstRun) loadSample();
-window.edgewise = { setLineLock, setLinePair, ekey, objText: () => joinedOBJ(joinSolids(sk, F, X, window.polygonClipping)), summary, doExtrude, deleteHeld, get drag(){ return drag; }, lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
+window.edgewise = { joinNear, setLineLock, setLinePair, ekey, objText: () => joinedOBJ(joinSolids(sk, F, X, window.polygonClipping)), summary, doExtrude, deleteHeld, get drag(){ return drag; }, lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
 </script>
 <script src="../updated.js"></script>
 </body>

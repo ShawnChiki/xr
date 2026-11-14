@@ -146,6 +146,38 @@ export function removeEdges(sk, ids){
   sk.e = sk.e.filter(e => !set.has(e.id));
   cleanup(sk);
 }
+// Join two corners into one: every line to `drop` goes to `keep` (a line between them disappears, doubled lines become
+// one), faces, holes and locks follow. `at` pins the joined corner there.
+export function mergeVerts(sk, keepId, dropId, at){
+  if (keepId === dropId) return;
+  const keep = vById(sk, keepId), drop = vById(sk, dropId); if (!keep || !drop) return;
+  for (const e of sk.e){ if (e.a === dropId) e.a = keepId; if (e.b === dropId) e.b = keepId; }
+  const seen = new Set();
+  sk.e = sk.e.filter(e => { if (e.a === e.b) return false; const k = e.a < e.b ? e.a + '-' + e.b : e.b + '-' + e.a; if (seen.has(k)) return false; seen.add(k); return true; });
+  keep.ends = keep.ends.concat(drop.ends);
+  if (at) keep.pin = at.map(x => +x.toFixed(4));
+  else if (drop.pin && !keep.pin) keep.pin = anchorOf(keep).map(x => +x.toFixed(4));
+  sk.v = sk.v.filter(v => v !== drop);
+  renameFaces(sk, ids => ids.includes(dropId) ? [...new Set(ids.map(i => i === dropId ? keepId : i))] : null);
+  for (const L of sk.locks || []) for (const k of ['e', 'ea', 'eb']) if (L[k]) L[k] = L[k].map(i => i === dropId ? keepId : i);
+  sk.locks = (sk.locks || []).filter(L => ['e', 'ea', 'eb'].every(k => !L[k] || L[k][0] !== L[k][1]));
+  cleanup(sk);
+}
+// Corners closer than r (positions P) become one. Returns how many joined.
+export function weld(sk, P, r){
+  let n = 0, again = true;
+  while (again){
+    again = false;
+    for (let i = 0; i < sk.v.length && !again; i++) for (let j = i + 1; j < sk.v.length && !again; j++){
+      const a = sk.v[i], b = sk.v[j], pa = P[a.id], pb = P[b.id];
+      if (!pa || !pb || dist(pa, pb) >= r) continue;
+      mergeVerts(sk, a.id, b.id); n++; again = true;
+    }
+  }
+  return n;
+}
+export function splitEdgeAt(sk, eid, at){ return splitEdge(sk, eid, at); }
+
 export function removeVert(sk, id){
   const es = sk.e.filter(e => e.a === id || e.b === id);
   if (es.length === 2){
