@@ -205,7 +205,7 @@ function distToPoly2(p, poly){
 // Loops are kept smallest first, and an edge belongs to at most two faces.
 // o: { rel: how flat, as a share of the loop's edge length (0.18), minTol, maxSides (8) }
 export function findFaces(sk, pos, o = {}){
-  const rel = o.rel ?? 0.18, minTol = o.minTol ?? 0.015, maxSides = o.maxSides ?? 8;
+  const rel = o.rel ?? 0.22, minTol = o.minTol ?? 0.015, maxSides = o.maxSides ?? 8;
   const P = id => pos[id];
   const adj = new Map();
   for (const v of sk.v) adj.set(v.id, []);
@@ -403,7 +403,32 @@ export function solve(sk, F, o = {}){
     }
     for (const id of ids) X[id] = mul(G[id], 1 / W[id]);
   }
+  hardFlat(faces, X, wA, o.hardIters ?? 400);
   return X;
+}
+
+// Flat is a rule, not a wish: after the soft pass, every face is projected onto its own plane, one face at a time,
+// over and over, until no corner is more than a hundredth of a millimetre off any of its faces. Each plane passes
+// through its corners' weighted middle, so a corner you're holding (or have placed) barely moves and the others give.
+export function hardFlat(faces, X, wt, maxIt){
+  if (!faces.length) return 0;
+  let worst = 0;
+  for (let it = 0; it < maxIt; it++){
+    worst = 0;
+    for (const f of faces){
+      const P = f.ids.map(id => X[id]), pl = planeOf(P);
+      let c = [0, 0, 0], sw = 0;
+      for (const id of f.ids){ const w = wt ? wt[id] || 1 : 1; c = add(c, mul(X[id], w)); sw += w; }
+      c = mul(c, 1 / sw);
+      for (const id of f.ids){
+        const d = dot(pl.n, sub(X[id], c));
+        if (Math.abs(d) > worst) worst = Math.abs(d);
+        X[id] = sub(X[id], mul(pl.n, d));
+      }
+    }
+    if (worst < 1e-5) break;
+  }
+  return worst;
 }
 
 // How far from flat each face still is (for a little readout), as a share of its size
