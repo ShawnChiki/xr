@@ -19,7 +19,8 @@ function gen(seed){const R=rng(seed*7919+13),ri=(a,b)=>Math.round(a+R()*(b-a)),p
    Returns the bare spots per face, largest first. */
 function coverage(b,r,step=.5,depth=.06){const t=thkModel(),meets=(r.joints||[]).filter(j=>j.joint==='meet').map(j=>({a:j.a,d:j.b.clone().sub(j.a),w:t*Math.tan((180-j.ang)/2*Math.PI/180)+.5})),
   /* the open strip either side of a meet joint is there by design (the two panels stop short and touch at their inside corners) */
-  nearMeet=X=>meets.some(m=>{const l2=m.d.lengthSq()||1,u=Math.max(0,Math.min(1,X.clone().sub(m.a).dot(m.d)/l2));return m.a.clone().addScaledVector(m.d,u).distanceTo(X)<m.w}),ps=r.panels.filter(p=>p.part?.length),parts=ps.map((p,i)=>asmPart(p,i)),out=[];
+  /* ...and so is the mouth of that strip at either end, where the end panel is trimmed back to match */
+  nearMeet=X=>meets.some(m=>{const l2=m.d.lengthSq()||1,ex=t*1.5/Math.sqrt(l2),u=Math.max(-ex,Math.min(1+ex,X.clone().sub(m.a).dot(m.d)/l2));return m.a.clone().addScaledVector(m.d,u).distanceTo(X)<m.w}),ps=r.panels.filter(p=>p.part?.length),parts=ps.map((p,i)=>asmPart(p,i)),out=[];
   const faces=b.brep?b.brep.faces.filter(f=>!f.skip).map(f=>({name:'A'+f.num,n:f.n,O:f.O,u:f.u,v:f.v,cts:f.cts})):solidFaces(blockPlanes(b)).map((f,i)=>{const n=f.pl.n,O=f.poly[0],u=f.poly[1].clone().sub(O).normalize(),v=new V().crossVectors(n,u);return {name:'f'+i+':'+f.pl.id,n,O,u,v,cts:[f.poly.map(p=>{const q=p.clone().sub(O);return [q.dot(u),q.dot(v)]})]}});
   for(const f of faces){let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;f.cts[0].forEach(([x,y])=>{x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x);y1=Math.max(y1,y)});const bare=[];
     for(let x=x0+.2;x<x1;x+=step)for(let y=y0+.2;y<y1;y+=step){if(!pip2(f.cts,x,y))continue;const X0=f.O.clone().addScaledVector(f.u,x).addScaledVector(f.v,y);if(nearMeet(X0))continue;
@@ -30,10 +31,10 @@ function coverage(b,r,step=.5,depth=.06){const t=thkModel(),meets=(r.joints||[])
     for(const p of bare){const k0=key(...p);if(seen.has(k0))continue;const q=[p],grp=[];seen.add(k0);while(q.length){const c=q.pop();grp.push(c);for(const [dx,dy] of [[step,0],[-step,0],[0,step],[0,-step]]){const k=key(c[0]+dx,c[1]+dy);if(S_.has(k)&&!seen.has(k)){seen.add(k);q.push(S_.get(k))}}}
       let a=1e9,b_=1e9,c=-1e9,d=-1e9;grp.forEach(([x,y])=>{a=Math.min(a,x);b_=Math.min(b_,y);c=Math.max(c,x);d=Math.max(d,y)});
       const sq=grp.some(([x,y])=>S_.has(key(x+step,y))&&S_.has(key(x,y+step))&&S_.has(key(x+step,y+step)));
-      out.push({face:f.name,sq,area:grp.length*step*step,w:c-a+step,h:d-b_+step,at:[+((a+c)/2).toFixed(1),+((b_+d)/2).toFixed(1)],ext:[+(x1-x0).toFixed(1),+(y1-y0).toFixed(1)]})}}
+      out.push({face:f.name,sq,area:grp.length*step*step,w:c-a+step,h:d-b_+step,at:[+((a+c)/2).toFixed(1),+((b_+d)/2).toFixed(1)],p3:f.O.clone().addScaledVector(f.u,(a+c)/2).addScaledVector(f.v,(b_+d)/2).toArray().map(x=>+x.toFixed(1)),ext:[+(x1-x0).toFixed(1),+(y1-y0).toFixed(1)]})}}
   return out.sort((p,q)=>q.area-p.area)}
 
-function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,desc}=gen(seed),out={seed,desc,issues:[]},I=(k,m)=>out.issues.push([k,m]),name0='A';
+function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,desc}=gen(seed);if(process.env.DUMP&&verbose)require('fs').writeFileSync('d_seed'+seed+'.json',JSON.stringify({app:'ply-grammar',v:3,blocks:[{name:'A',p:b.pivot.position.toArray(),s:b.sizer.scale.toArray(),cuts:b.cuts.map(c=>({p:c.position.toArray(),q:c.quaternion.toArray()})),carves:b.carves.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray(),s:c.userData.sizer.scale.toArray()}))}]}));const out={seed,desc,issues:[]},I=(k,m)=>out.issues.push([k,m]),name0='A';
   if(process.env.KEY)S.keyShape=process.env.KEY;
   if(process.env.FORCE){try{const r0=panelizeBlock(b),ar=p=>p.part.reduce((x,c)=>x+areaF(c),0),big=r0.panels.filter(p=>p.part?.length&&p.kind!=='cleat'&&!p.splice).sort((x,y)=>ar(y)-ar(x)).slice(0,2);b.forceSplit={};big.forEach(p=>b.forceSplit[p.label]=2);out.forced=big.map(p=>p.label)}catch(e){}}
   let r;try{r=panelizeBlock(b)}catch(e){I('crash',e.message+' @ '+(e.stack.split('\n')[1]||'').trim().slice(0,90));return out}
@@ -57,7 +58,7 @@ function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,
     if(outs.length>1&&!p.splice){I('split-part',p.label+' in '+outs.length);continue}
     const sm=offsetC(p.part.map(rawC),-.31,false).map(fromC).filter(c=>areaF(c)>.3);if(sm.length>outs.length)I('thin-neck',p.label)}
   /* no see-through hole an inch square or more anywhere on the outside */
-  {const hs=coverage(b,r).filter(x=>x.sq);if(hs.length)I('hole',hs.length+' biggest '+hs[0].face+' '+hs[0].area.toFixed(1)+'sq in')}
+  {const hs=coverage(b,r).filter(x=>x.sq);if(hs.length)I('hole',hs.length+' biggest '+hs[0].face+' '+hs[0].area.toFixed(1)+'sq in'+(verbose?' at '+JSON.stringify(hs.map(h=>[h.face,h.p3,h.w,h.h])):''))}
   /* every outside corner filled: walk each shell edge half a ply under both faces; that stick of wood must belong to some part.
      And no two neighbors may lie in one plane: that is one plate wrongly cut in two. */
   if(b.brep){const t=thkModel(),parts=ps.map((p,i)=>asmPart(p,i)),F=b.brep.faces.slice().sort((x,y)=>x.i-y.i);
