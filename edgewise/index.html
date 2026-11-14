@@ -11,6 +11,8 @@
   #bar button{font:800 15px system-ui,sans-serif;padding:10px 16px;border:3px solid #111;border-radius:10px;background:#FFD60A;box-shadow:4px 4px 0 #111;cursor:pointer}
   #bar button:disabled{opacity:.45;cursor:default}
   #bar button#mr{background:#2EC4B6}
+  #bar button#drag{background:#FFFFFF}
+  #bar button#drag.on{background:#1E5EFF;color:#fff}
   #title{position:fixed;left:12px;bottom:10px;font:900 20px system-ui,sans-serif;letter-spacing:.02em;z-index:5;pointer-events:none}
   #title small{display:block;font:600 12px system-ui,sans-serif;opacity:.7;max-width:520px}
   #menu2d{position:fixed;left:12px;top:12px;width:340px;border:3px solid #111;border-radius:14px;box-shadow:5px 5px 0 #111;background:#FFF6E5;z-index:5;touch-action:none}
@@ -19,8 +21,8 @@
 </head>
 <body>
 <canvas id="gl"></canvas>
-<div id="bar"><span id="status"></span><button id="vr" disabled>Enter VR</button><button id="mr" disabled>Enter MR</button></div>
-<div id="title">Edgewise XR<small>Left-drag draws a line (on the floor, or on the face you start on; hold Shift for an upright line). Right-drag turns the view, wheel zooms. Grab tool + Alt on a face pulls it out as a block. Ctrl+Z undoes.</small></div>
+<div id="bar"><span id="status"></span><button id="drag" title="What dragging on the page does"></button><button id="vr" disabled>Enter VR</button><button id="mr" disabled>Enter MR</button></div>
+<div id="title">Edgewise XR<small id="help"></small></div>
 <script src="polygon-clipping.min.js"></script>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 <script type="module">
@@ -67,7 +69,21 @@ const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 2
 camera.position.set(1.9, 1.7, 1.6);
 const orbit = new OrbitControls(camera, renderer.domElement);
 orbit.target.set(0, 0.3, -0.6);
-orbit.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+// On the flat page, dragging either turns the view or uses the tool (draw, grab, erase). In the Quest browser, before
+// you go into the headset view, the controller is a one-button mouse, so there it starts on turning the view.
+const onQuestPage = /OculusBrowser|Quest/i.test(navigator.userAgent) || matchMedia('(pointer: coarse)').matches;
+let dragDraws = (() => { try { const v = localStorage.getItem('edgewise:dragDraws'); return v === null ? !onQuestPage : v === '1'; } catch (e) { return !onQuestPage; } })();
+function applyDragMode(){
+  orbit.mouseButtons = { LEFT: dragDraws ? null : THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+  orbit.touches = { ONE: dragDraws ? null : THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+  const b = document.querySelector('#drag');
+  b.textContent = dragDraws ? '✏️ Dragging draws' : '↻ Dragging turns the view'; b.classList.toggle('on', dragDraws);
+  document.querySelector('#help').textContent = dragDraws
+    ? 'Dragging uses the tool: Draw starts on the floor or on the face you start on (hold Shift for an upright line). Right-drag turns the view, wheel zooms. Grab tool + Alt on a face pulls it out as a block. Ctrl+Z undoes.'
+    : 'Dragging turns the view, wheel or thumbstick zooms. Tap the button at the top to draw instead. Holes and Lock still work with a tap.';
+}
+document.querySelector('#drag').onclick = () => { dragDraws = !dragDraws; try { localStorage.setItem('edgewise:dragDraws', dragDraws ? '1' : '0'); } catch (e) {} applyDragMode(); };
+applyDragMode();
 orbit.update();
 scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8070, 1.6));
 const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(2, 4, 3); scene.add(sun);
@@ -990,6 +1006,8 @@ function planeHit(r, pl){ const dn = C.V.dot(r.d, pl.n); if (Math.abs(dn) < 1e-6
 function camFacingUpright(c){ const d = new V3(); camera.getWorldDirection(d); d.applyQuaternion(world.quaternion.clone().invert()); d.y = 0; if (d.lengthSq() < 1e-6) d.set(0, 0, 1); d.normalize(); return { n: toA(d), c }; }
 renderer.domElement.addEventListener('pointerdown', e => {
   if (e.button !== 0 || renderer.xr.isPresenting) return;
+  // turning the view: a drag never draws, grabs or erases (taps for Holes and Lock still work)
+  if (!dragDraws && (S.tool === 'draw' || S.tool === 'grab' || S.tool === 'erase')) return;
   const r = mouseRay(e);
   if (S.tool === 'draw'){
     // start on a corner, a face, or the floor; the line is drawn in a flat plane through that start
@@ -1011,8 +1029,7 @@ renderer.domElement.addEventListener('pointerdown', e => {
     if (h.kind === 'face' && e.altKey) doExtrude({ p: world.localToWorld(toV(p0)), q: new THREE.Quaternion() }, 1, 0);
     renderer.domElement.setPointerCapture(e.pointerId);
   } else if (S.tool === 'erase'){ mouse = { kind: 'erase' }; eraseMouse(e); renderer.domElement.setPointerCapture(e.pointerId); }
-  else if (S.tool === 'hole'){ toggleHole(rayFace(r.o, r.d)); }
-  else if (S.tool === 'lock'){ lockTap(rayFace(r.o, r.d)); }
+  else if (S.tool === 'hole' || S.tool === 'lock') tapAt = { x: e.clientX, y: e.clientY };   // a tap, not a drag (see pointerup)
 });
 renderer.domElement.addEventListener('pointermove', e => {
   if (renderer.xr.isPresenting) return;
@@ -1037,7 +1054,12 @@ renderer.domElement.addEventListener('pointermove', e => {
     if (p) grabMove({ p: world.localToWorld(toV(p)), q: new THREE.Quaternion(), noTilt: true });
   } else if (mouse.kind === 'erase') eraseMouse(e);
 });
-addEventListener('pointerup', () => {
+let tapAt = null;
+addEventListener('pointerup', e => {
+  if (tapAt && !renderer.xr.isPresenting){
+    const moved = Math.hypot(e.clientX - tapAt.x, e.clientY - tapAt.y); tapAt = null;
+    if (moved < 7){ const r = mouseRay(e), h = rayFace(r.o, r.d); if (S.tool === 'hole') toggleHole(h); else if (S.tool === 'lock') lockTap(h); }
+  }
   if (!mouse) return;
   if (mouse.kind === 'draw') strokeEnd();
   if (mouse.kind === 'grab') grabEnd();
