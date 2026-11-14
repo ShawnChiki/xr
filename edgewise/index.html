@@ -115,11 +115,15 @@ function solveOpts(extra){
   return Object.assign({ square: S.square, squareDeg: S.sqDeg, floor: S.floor, floorR: 0.05 * k, flat: 1, minTol: 0.015 * k, rel: 0.18, iters: 60 }, extra);
 }
 function rebuild(){
-  const o = C.build(sk, solveOpts({ warm: X }));
+  if (!sk.locks) sk.locks = [];
+  if (!sk.open) sk.open = [];
+  const o = C.build(sk, solveOpts({ warm: X, iters: sk.locks.length ? 120 : 60 }));
   F = o.F; X = o.X;
   for (const v of sk.v) if (!D[v.id]) D[v.id] = (preview && preview.P[v.id]) || X[v.id];
   for (const id in D) if (!X[id]) delete D[id];
   strokesDirty = true; menuDirty = true;
+  if (sel.a && !faceByKey(sel.a)) sel = { a: null, b: null };
+  if (sel.b && !faceByKey(sel.b)) sel.b = null;
 }
 function afterEdit(){ rebuild(); saveSketch(); }
 
@@ -145,7 +149,9 @@ function drawModel(){
     try { tris = THREE.ShapeUtils.triangulateShape(c2, []); } catch (e) { continue; }
     const out = f.open ? hpos : pos;
     tmpC.set(pieceColor(M.F, f.piece));
-    if (hover && hover.kind === 'face' && hover.key === f.key && !preview) tmpC.lerp(new THREE.Color('#FFF27A'), 0.55);
+    if (S.tool === 'lock' && sel.a === f.key) tmpC.lerp(new THREE.Color('#FFF27A'), 0.6);
+    else if (S.tool === 'lock' && sel.b === f.key) tmpC.lerp(new THREE.Color('#FF8A00'), 0.6);
+    else if (hover && hover.kind === 'face' && hover.key === f.key && !preview) tmpC.lerp(new THREE.Color('#FFFFFF'), 0.4);
     for (const t of tris){
       // every triangle wound the same way as the face, with the face's own normal, so it shades as one flat face
       const [i0, i1, i2] = t, nn = C.V.cross(C.V.sub(P[i1], P[i0]), C.V.sub(P[i2], P[i0])), tt = C.V.dot(nn, pl.n) < 0 ? [i0, i2, i1] : t;
@@ -190,6 +196,40 @@ function drawModel(){
     setGeo(strokeLines.geometry, sp, null);
   }
   strokeLines.visible = S.strokes;
+  drawBadges(M);
+}
+// little tags on locked faces and locked angles
+const badgeGroup = new THREE.Group(); world.add(badgeGroup);
+const badgeTex = new Map();
+function badgeMat(text, bg){
+  const k = text + bg; if (badgeTex.has(k)) return badgeTex.get(k);
+  const c = document.createElement('canvas'); c.width = 256; c.height = 96; const g = c.getContext('2d');
+  g.fillStyle = '#111'; g.beginPath(); g.roundRect(6, 8, 244, 84, 22); g.fill();
+  g.fillStyle = bg; g.beginPath(); g.roundRect(2, 2, 242, 82, 22); g.fill(); g.lineWidth = 5; g.strokeStyle = '#111'; g.stroke();
+  g.fillStyle = '#111'; g.font = '900 44px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 123, 46);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.SpriteMaterial({ map: t, depthTest: false, transparent: true });
+  badgeTex.set(k, m); return m;
+}
+function drawBadges(M){
+  const want = [];
+  const byKey = new Map(M.F.faces.map(f => [f.key, f]));
+  for (const L of M.sk.locks || []){
+    if (L.f){
+      const f = byKey.get(L.f); if (!f || f.ids.some(id => !M.P[id])) continue;
+      const pl = C.planeOf(f.ids.map(id => M.P[id]));
+      want.push({ at: pl.c, text: L.mode === 'level' ? 'LEVEL' : L.mode === 'upright' ? 'UPRIGHT' : 'HELD', bg: PINK });
+    } else {
+      const A = byKey.get(L.a), B = byKey.get(L.b); if (!A || !B) continue;
+      const g = C.faceAngle(A.ids, B.ids, M.P); if (!g) continue;
+      const mid = C.V.mul(C.V.add(M.P[g.se[0]], M.P[g.se[1]]), 0.5), into = C.V.norm(C.V.add(g.dA, g.dB));
+      want.push({ at: C.V.add(mid, C.V.mul(into, 0.06 / ws())), text: Math.round(g.deg) + '°', bg: L.mode === 'step' ? '#2EC4B6' : YEL });
+    }
+  }
+  while (badgeGroup.children.length > want.length) badgeGroup.remove(badgeGroup.children[badgeGroup.children.length - 1]);
+  while (badgeGroup.children.length < want.length){ const sp = new THREE.Sprite(); sp.renderOrder = 20; badgeGroup.add(sp); }
+  const k = 1 / ws();
+  want.forEach((w, i) => { const sp = badgeGroup.children[i]; sp.material = badgeMat(w.text, w.bg); sp.position.set(...w.at); sp.scale.set(0.12 * k, 0.045 * k, 1); });
 }
 function setGeo(g, pos, col, nrm){
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -319,8 +359,8 @@ function grabMove(frame){
     } else w = drag.P0[id].clone().add(T);
     targets[id] = toA(world.worldToLocal(w));
   }
-  drag.targets = targets;
-  X = C.solve(sk, dragF, solveOpts({ drag: targets, warm: X, iters: 30 }));
+  drag.targets = drag.kind === 'face' ? C.snapHeld(sk, dragF, drag.key, targets, X) : targets;
+  X = C.solve(sk, dragF, solveOpts({ drag: drag.targets, warm: X, iters: 30 }));
   for (const id in X) D[id] = X[id];
 }
 function grabEnd(){
@@ -333,6 +373,43 @@ function grabEnd(){
   }
   drag = null; dragF = null;
 }
+// ---- locks: tap a face, then (optionally) a face beside it
+let sel = { a: null, b: null };
+const faceByKey = k => F && F.faces.find(f => f.key === k);
+function lockTap(h){
+  if (!h || h.kind !== 'face'){ if (sel.a){ sel = { a: null, b: null }; flash('Nothing picked'); } menuDirty = true; return; }
+  if (sel.a === h.key) sel = { a: null, b: null };
+  else if (sel.b === h.key) sel.b = null;
+  else if (sel.a && faceByKey(sel.a) && C.sharedEdge(faceByKey(sel.a).ids, h.ids)) sel.b = h.key;
+  else sel = { a: h.key, b: null };
+  if (S.tab !== 'draw'){ S.tab = 'draw'; saveSet(); }
+  menuDirty = true; buzz(0.3, 15);
+}
+const faceLock = k => (sk.locks || []).find(L => L.f === k);
+const angleLock = (a, b) => (sk.locks || []).find(L => (L.a === a && L.b === b) || (L.a === b && L.b === a));
+function setFaceLock(mode){
+  const f = faceByKey(sel.a); if (!f) return;
+  pushUndo(); sk.locks = sk.locks.filter(L => L.f !== sel.a);
+  if (mode !== 'free'){
+    const L = { f: sel.a, mode };
+    if (mode === 'hold') L.n = C.planeOf(f.ids.map(id => X[id])).n.map(x => +x.toFixed(5));
+    sk.locks.push(L);
+  }
+  afterEdit(); flash(mode === 'free' ? 'Face is free' : mode === 'level' ? 'Face locked level' : mode === 'upright' ? 'Face locked upright' : 'Face holds its tilt');
+}
+function setAngleLock(mode){
+  const A = faceByKey(sel.a), B = faceByKey(sel.b); if (!A || !B) return;
+  const g = C.faceAngle(A.ids, B.ids, X); if (!g) return;
+  pushUndo(); sk.locks = sk.locks.filter(L => L !== angleLock(sel.a, sel.b));
+  if (mode === '90') sk.locks.push({ a: sel.a, b: sel.b, mode: 'fixed', deg: 90 });
+  else if (mode === 's15') sk.locks.push({ a: sel.a, b: sel.b, mode: 'step', step: 15 });
+  else if (mode === 's45') sk.locks.push({ a: sel.a, b: sel.b, mode: 'step', step: 45 });
+  else if (mode === 'keep') sk.locks.push({ a: sel.a, b: sel.b, mode: 'fixed', deg: Math.round(g.deg) });
+  afterEdit();
+  flash(mode === 'free' ? 'Angle is free' : mode === '90' ? 'Locked at 90°' : mode === 'keep' ? 'Locked at ' + Math.round(g.deg) + '°' : 'Clicks in ' + (mode === 's15' ? 15 : 45) + '° steps');
+}
+function clearLocks(){ if (!sk.locks.length) return flash('No locks'); pushUndo(); sk.locks = []; afterEdit(); flash('Every lock is off'); }
+
 function unpinAll(){
   if (!sk.v.some(v => v.pin)) return flash('Every corner already follows your strokes');
   pushUndo(); for (const v of sk.v) delete v.pin; afterEdit(); flash('Moved corners go back to your strokes');
@@ -385,7 +462,7 @@ const ICON = {
   files(x, y, c){ mx.strokeStyle = c; mx.lineWidth = 6; mx.lineJoin = 'round'; mx.beginPath(); mx.moveTo(x - 24, y - 16); mx.lineTo(x - 8, y - 16); mx.lineTo(x - 2, y - 9); mx.lineTo(x + 24, y - 9); mx.lineTo(x + 24, y + 18); mx.lineTo(x - 24, y + 18); mx.closePath(); mx.stroke(); },
 };
 const TABS = [['draw', 'Draw'], ['move', 'Move'], ['tidy', 'Tidy'], ['view', 'View'], ['files', 'Files']];
-const TOOLS = [['draw', 'Draw'], ['grab', 'Grab'], ['erase', 'Erase'], ['hole', 'Holes']];
+const TOOLS = [['draw', 'Draw'], ['grab', 'Grab'], ['erase', 'Erase'], ['hole', 'Holes'], ['lock', 'Lock']];
 function summary(){
   if (!F || !sk.e.length) return 'Draw the edges of a box: one stroke per edge.';
   const closed = F.pieces.filter(p => p.closed).length, open = F.pieces.filter(p => !p.closed && p.faces).length, loose = F.loose.length;
@@ -415,9 +492,12 @@ function drawMenu(){
   let y = 118;
   if (S.tab === 'draw'){
     label('Trigger does', x0, y + 20); y += 34;
-    seg(x0, y, W, 84, TOOLS, S.tool, v => S.tool = v, 27); y += 112;
-    label('Ends click onto corners and edges within', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[3, '3 cm'], [6, '6 cm'], [10, '10 cm']], S.snap, v => S.snap = v, 28); y += 104;
+    seg(x0, y, W, 84, TOOLS, S.tool, v => S.tool = v, 24); y += 112;
+    if (S.tool === 'lock'){ drawLockMenu(x0, y, W); return finishMenu(); }
+    if (S.tool === 'draw'){
+      label('Ends click onto corners and edges within', x0, y + 20); y += 34;
+      seg(x0, y, W, 72, [[3, '3 cm'], [6, '6 cm'], [10, '10 cm']], S.snap, v => S.snap = v, 28); y += 104;
+    }
     para(S.tool === 'draw' ? 'One stroke makes one straight line. Close a loop of lines and it fills in as a flat face, with as many sides as the loop has.'
       : S.tool === 'grab' ? 'Trigger (or grip, any time) takes the corner, line or face nearest your pen and moves it.'
       : S.tool === 'erase' ? 'Hold the trigger and brush over lines: they turn red and go when you let go.'
@@ -436,7 +516,8 @@ function drawMenu(){
     seg(x0, y, W, 72, [[5, '5°'], [10, '10°'], [15, '15°']], S.sqDeg, v => { S.sqDeg = v; rebuild(); }, 28); y += 104;
     label('Corners near the floor sit on it', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.floor, v => { S.floor = v; rebuild(); }, 28); y += 100;
-    para('Faces are always made flat.', x0, y, W);
+    y = para('Faces are always made flat.', x0, y, W);
+    if ((sk.locks || []).length) button(x0, y + 10, W, 72, 'Take off all ' + sk.locks.length + (sk.locks.length === 1 ? ' lock' : ' locks'), clearLocks, false, { fs: 26 });
   } else if (S.tab === 'view'){
     label('Your sketch strokes', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.strokes, v => S.strokes = v, 28); y += 100;
@@ -461,6 +542,26 @@ function drawMenu(){
       y += 78;
     });
   }
+  finishMenu();
+}
+function drawLockMenu(x0, y, W){
+  const A = sel.a && faceByKey(sel.a), B = sel.b && faceByKey(sel.b);
+  if (!A){
+    para('Tap a face to lock how it sits. Then tap a face next to it to lock the angle between the two.', x0, y + 6, W);
+    return;
+  }
+  const fl = faceLock(sel.a);
+  label('This face (yellow)', x0, y + 20); y += 34;
+  seg(x0, y, W, 72, [['free', 'Free'], ['level', 'Level'], ['upright', 'Upright'], ['hold', 'Hold tilt']], fl ? fl.mode : 'free', setFaceLock, 24); y += 100;
+  if (!B){ para('Tap a face beside it to lock the angle between them. Tap the yellow face again to let go.', x0, y + 6, W); return; }
+  const g = C.faceAngle(A.ids, B.ids, X), al = angleLock(sel.a, sel.b);
+  const cur = !al ? 'free' : al.mode === 'step' ? 's' + al.step : al.deg === 90 ? '90' : 'keep';
+  label('Angle to the orange face: ' + (g ? Math.round(g.deg) + '°' : '?'), x0, y + 20, 26, INK); y += 34;
+  seg(x0, y, W, 72, [['free', 'Free'], ['90', '90°'], ['keep', 'Keep ' + (al && al.mode === 'fixed' && al.deg !== 90 ? al.deg : g ? Math.round(g.deg) : '') + '°']], cur, setAngleLock, 26); y += 88;
+  seg(x0, y, W, 72, [['s15', 'Snap to 15°'], ['s45', 'Snap to 45°']], cur, setAngleLock, 26); y += 100;
+  para('Steps: the angle clicks to the nearest step, also while you grab and tilt a face. Keep holds the angle it has now.', x0, y + 6, W);
+}
+function finishMenu(){
   // status line
   const msg = flashT > 0 ? flashText : summary();
   rr(RAIL + 16, MH - 92, MW - RAIL - 36, 72, 16); mx.fillStyle = flashT > 0 ? YEL : '#FFFFFF'; mx.fill(); mx.lineWidth = 4; mx.strokeStyle = INK; mx.stroke();
@@ -610,6 +711,7 @@ function xrInput(){
         if (S.tool === 'draw'){ h.act = 'draw'; strokeStart(p); }
         else if (S.tool === 'erase'){ h.act = 'erase'; eraseAt(p); }
         else if (S.tool === 'hole') toggleHole(pickFace(p, reach * 1.5));
+        else if (S.tool === 'lock') lockTap(pickFace(p, reach * 1.5));
         else if (S.tool === 'grab'){ const hit = pickAny(p, reach); if (hit && grabStart(hit, frameOf(h))){ h.act = 'grab'; } }
       }
       if (b[0] && h.act === 'draw') strokeMove(p);
@@ -624,7 +726,7 @@ function xrInput(){
       if (Math.abs(sx) < 0.3) h.stickHeld = false;
       // hover: show what grip would take
       if (!h.act && !drag && !onMenu){
-        const hv = S.tool === 'hole' ? pickFace(p, reach * 1.5) : S.tool === 'erase' ? pickEdge(p, 0.025 / ws()) : S.tool === 'draw' ? pickVert(p, S.snap / 100 / ws()) : pickAny(p, reach);
+        const hv = (S.tool === 'hole' || S.tool === 'lock') ? pickFace(p, reach * 1.5) : S.tool === 'erase' ? pickEdge(p, 0.025 / ws()) : S.tool === 'draw' ? pickVert(p, S.snap / 100 / ws()) : pickAny(p, reach);
         setHover(hv);
       }
       h.tip.material.color.set(S.tool === 'erase' ? '#FF3B30' : S.tool === 'hole' ? '#2EC4B6' : S.tool === 'grab' ? '#FFD60A' : '#111111');
@@ -696,12 +798,13 @@ renderer.domElement.addEventListener('pointerdown', e => {
     renderer.domElement.setPointerCapture(e.pointerId);
   } else if (S.tool === 'erase'){ mouse = { kind: 'erase' }; const h = edgeAtMouse(e); if (h) eraseMarks.add(h.id); renderer.domElement.setPointerCapture(e.pointerId); }
   else if (S.tool === 'hole'){ toggleHole(rayFace(r.o, r.d)); }
+  else if (S.tool === 'lock'){ lockTap(rayFace(r.o, r.d)); }
 });
 renderer.domElement.addEventListener('pointermove', e => {
   if (renderer.xr.isPresenting) return;
   const r = mouseRay(e);
   if (!mouse){
-    setHover(S.tool === 'grab' ? (cornerAtMouse(e) || edgeAtMouse(e) || rayFace(r.o, r.d)) : S.tool === 'erase' ? edgeAtMouse(e) : S.tool === 'hole' ? rayFace(r.o, r.d) : cornerAtMouse(e));
+    setHover(S.tool === 'grab' ? (cornerAtMouse(e) || edgeAtMouse(e) || rayFace(r.o, r.d)) : S.tool === 'erase' ? edgeAtMouse(e) : (S.tool === 'hole' || S.tool === 'lock') ? rayFace(r.o, r.d) : cornerAtMouse(e));
     return;
   }
   if (mouse.kind === 'draw'){
@@ -730,7 +833,7 @@ addEventListener('pointerup', () => {
 addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z'){ e.preventDefault(); e.shiftKey ? redo() : undo(); }
   else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y'){ e.preventDefault(); redo(); }
-  else if ('1234'.includes(e.key) && !e.ctrlKey){ S.tool = TOOLS[+e.key - 1][0]; saveSet(); menuDirty = true; flash('Mouse: ' + TOOLS[+e.key - 1][1]); }
+  else if ('12345'.includes(e.key) && !e.ctrlKey){ S.tool = TOOLS[+e.key - 1][0]; saveSet(); menuDirty = true; flash('Mouse: ' + TOOLS[+e.key - 1][1]); }
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 // no accidental browser zoom
@@ -789,7 +892,7 @@ renderer.setAnimationLoop(() => {
 
 rebuild(); for (const id in X) D[id] = X[id].slice();
 if (firstRun) loadSample();
-window.edgewise = { orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
+window.edgewise = { lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
 </script>
 <script src="../updated.js"></script>
 </body>

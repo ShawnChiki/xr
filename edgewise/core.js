@@ -47,7 +47,15 @@ function closestOnSeg(p, a, b){
 }
 
 // ---------------------------------------------------------------- the sketch
-export function emptySketch(){ return { v: [], e: [], s: [], open: [], nid: 1 }; }
+export function emptySketch(){ return { v: [], e: [], s: [], open: [], locks: [], nid: 1 }; }
+
+// Faces are named by their corners (a key like "3.8.12.15"). When a corner is added to an edge, or healed away,
+// every saved face name (holes, locks) that runs along that edge is renamed to match.
+function renameFaces(sk, fn){
+  const re = k => { const ids = k.split('.').map(Number), r = fn(ids); return r ? faceKey(r) : k; };
+  sk.open = (sk.open || []).map(re);
+  for (const L of sk.locks || []){ if (L.f) L.f = re(L.f); if (L.a) L.a = re(L.a); if (L.b) L.b = re(L.b); }
+}
 export const clone = sk => JSON.parse(JSON.stringify(sk));
 
 export function anchorOf(v){
@@ -85,6 +93,7 @@ function splitEdge(sk, eid, at){
   sk.v.push(n);
   sk.e.splice(sk.e.indexOf(e), 1);
   sk.e.push({ id: sk.nid++, a: e.a, b: n.id, s: e.s }, { id: sk.nid++, a: n.id, b: e.b, s: e.s });
+  renameFaces(sk, ids => ids.includes(e.a) && ids.includes(e.b) ? [...ids, n.id] : null);
   return n.id;
 }
 
@@ -139,6 +148,7 @@ export function cleanup(sk){
         sk.e = sk.e.filter(e => e !== es[0] && e !== es[1]);
         sk.e.push({ id: sk.nid++, a: o0, b: o1, s: es[0].s });
         sk.v = sk.v.filter(x => x !== v);
+        renameFaces(sk, ids => ids.includes(v.id) ? ids.filter(i => i !== v.id) : null);
         changed = true; break;
       }
     }
@@ -330,7 +340,7 @@ export function solve(sk, F, o = {}){
   const ids = sk.v.map(v => v.id), A = {}, X = {}, wA = {};
   for (const v of sk.v){
     A[v.id] = (o.drag && o.drag[v.id]) || anchorOf(v);
-    wA[v.id] = (o.drag && o.drag[v.id]) ? 40 : v.pin ? 8 : 0.6;
+    wA[v.id] = (o.drag && o.drag[v.id]) ? 40 : v.pin ? 4 : 0.6;
     X[v.id] = (o.warm && o.warm[v.id] && !(o.drag && o.drag[v.id])) ? o.warm[v.id].slice() : A[v.id].slice();
   }
   // each piece's grid direction in plan: the length-weighted average of its level edges' directions (mod 90°)
@@ -346,6 +356,9 @@ export function solve(sk, F, o = {}){
     for (const [c, a] of acc) yaw.set(c, Math.atan2(a[1], a[0]) / 4);
   }
   const faces = F.faces.filter(f => !f.open);
+  const byKey = new Map(F.faces.map(f => [f.key, f])), locks = (sk.locks || []).filter(L => L.f ? byKey.has(L.f) : byKey.has(L.a) && byKey.has(L.b));
+  const lockedV = new Set();
+  for (const L of locks) for (const k of [L.f, L.a, L.b]) if (k) for (const id of byKey.get(k).ids) lockedV.add(id);
   const G = {}, W = {};
   for (let it = 0; it < iters; it++){
     for (const id of ids){ G[id] = mul(A[id], wA[id]); W[id] = wA[id]; }
@@ -360,6 +373,7 @@ export function solve(sk, F, o = {}){
     }
     if (wSq){
       for (const e of sk.e){
+        if (lockedV.has(e.a) && lockedV.has(e.b)) continue;   // a locked face's own lines follow its lock
         const a = X[e.a], b = X[e.b], d = sub(b, a), L = len(d);
         if (!L) continue;
         const u = mul(d, 1 / L);
@@ -381,6 +395,7 @@ export function solve(sk, F, o = {}){
         G[e.b] = add(G[e.b], mul(add(m, mul(t, 0.5)), wSq)); W[e.b] += wSq;
       }
     }
+    if (locks.length) applyLocks(sk, locks, byKey, X, G, W, 30);
     if (o.floor){
       for (const id of ids){
         if (A[id][1] < (o.floorR ?? 0.05) && A[id][1] > -(o.floorR ?? 0.05)){ G[id] = add(G[id], mul([X[id][0], 0, X[id][2]], 2)); W[id] += 2; }
@@ -403,6 +418,86 @@ export function flatness(F, X){
   return worst;
 }
 export { planeOf, basis };
+
+// ---------------------------------------------------------------- locks
+// A face can be locked Level, Upright, or Held at its tilt; two faces sharing an edge can be locked at an angle
+// (a fixed one, or the nearest of a step like 15°). The angle between two faces is measured inside, across their
+// shared edge: 90° at a box corner, 180° where they carry on flat.
+
+// turn point x about the line through p along unit k by angle a
+export function rotAbout(x, p, k, a){
+  const v = sub(x, p), c = Math.cos(a), sn = Math.sin(a);
+  return add(p, add(add(mul(v, c), mul(cross(k, v), sn)), mul(k, dot(k, v) * (1 - c))));
+}
+export function sharedEdge(A, B){
+  for (let i = 0; i < A.length; i++){
+    const u = A[i], v = A[(i + 1) % A.length], j = B.indexOf(u);
+    if (j < 0) continue;
+    if (B[(j + 1) % B.length] === v || B[(j - 1 + B.length) % B.length] === v) return [u, v];
+  }
+  return null;
+}
+// the faces' inside directions away from their shared edge, and the angle between them
+export function faceAngle(A, B, X){
+  const se = sharedEdge(A, B); if (!se) return null;
+  const p = X[se[0]], q = X[se[1]], e = norm(sub(q, p));
+  const inward = ids => {
+    const pl = planeOf(ids.map(id => X[id])), i = ids.indexOf(se[0]), fwd = ids[(i + 1) % ids.length] === se[1];
+    return norm(cross(pl.n, fwd ? e : mul(e, -1)));   // the inside of a loop is on its left
+  };
+  const dA = inward(A), dB = inward(B);
+  const deg = Math.acos(Math.max(-1, Math.min(1, dot(dA, dB)))) * 180 / Math.PI;
+  const s = Math.sign(dot(e, cross(dA, dB))) || 1;
+  return { deg, se, p, k: mul(e, s), dA, dB };
+}
+export function lockTarget(L, deg){
+  if (L.mode === 'step') return Math.max(L.step, Math.min(180, Math.round(deg / L.step) * L.step));
+  return L.deg;
+}
+function orientTarget(L, n){
+  if (L.mode === 'level') return [0, n[1] < 0 ? -1 : 1, 0];
+  if (L.mode === 'upright'){ const h = Math.hypot(n[0], n[2]); return h > 1e-6 ? [n[0] / h, 0, n[2] / h] : null; }
+  if (L.mode === 'hold' && L.n) return dot(L.n, n) < 0 ? mul(L.n, -1) : L.n;
+  return null;
+}
+function applyLocks(sk, locks, byKey, X, G, W, w){
+  const goal = (id, p) => { G[id] = add(G[id], mul(p, w)); W[id] += w; };
+  for (const L of locks){
+    if (L.f){
+      const f = byKey.get(L.f), pl = planeOf(f.ids.map(id => X[id])), t = orientTarget(L, pl.n);
+      if (!t) continue;
+      const ax = cross(pl.n, t), sl = len(ax), a = Math.atan2(sl, dot(pl.n, t));
+      for (const id of f.ids) goal(id, sl > 1e-9 ? rotAbout(X[id], pl.c, mul(ax, 1 / sl), a) : X[id]);
+    } else {
+      const A = byKey.get(L.a).ids, B = byKey.get(L.b).ids, g = faceAngle(A, B, X);
+      if (!g) continue;
+      const d = (lockTarget(L, g.deg) - g.deg) * Math.PI / 180;
+      // turn both faces about their shared edge, half each, toward the locked angle
+      for (const id of B) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, d / 2));
+      for (const id of A) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, -d / 2));
+    }
+  }
+}
+// Snap a moved face (targets for its corners) to its locks before the solver sees it, so a locked face clicks
+// into place while you hold it: orientation locks keep its tilt, angle locks swing it about the shared edge.
+export function snapHeld(sk, F, key, T, X){
+  const byKey = new Map(F.faces.map(f => [f.key, f])), f = byKey.get(key); if (!f) return T;
+  const P = Object.assign({}, X, T);
+  for (const L of sk.locks || []){
+    if (L.f === key){
+      const pl = planeOf(f.ids.map(id => P[id])), t = orientTarget(L, pl.n); if (!t) continue;
+      const ax = cross(pl.n, t), sl = len(ax); if (sl < 1e-9) continue;
+      for (const id of f.ids) P[id] = rotAbout(P[id], pl.c, mul(ax, 1 / sl), Math.atan2(sl, dot(pl.n, t)));
+    } else if ((L.a === key || L.b === key) && byKey.has(L.a) && byKey.has(L.b)){
+      const other = byKey.get(L.a === key ? L.b : L.a).ids, g = faceAngle(f.ids, other, P); if (!g) continue;
+      // g is measured from the held face to the other one: turning the held face by -d widens the angle by d
+      const d = (lockTarget(L, g.deg) - g.deg) * Math.PI / 180;
+      for (const id of f.ids) if (!g.se.includes(id)) P[id] = rotAbout(P[id], g.p, g.k, -d);
+    }
+  }
+  const out = {}; for (const id in T) out[id] = P[id];
+  return out;
+}
 
 // One call for the app: find faces on the sketch, solve, then look again on the solved shape (catches loops that
 // only came flat once squared up) and solve once more from there.
