@@ -13,8 +13,9 @@
   #vrbtn{background:#ff3b30;color:#fff;border:0;border-radius:24px;padding:9px 20px;font-weight:800;font-size:15px;cursor:pointer}
   #vrbtn:disabled{background:#555;cursor:default}
   #ui{position:fixed;left:12px;top:60px;width:330px;height:468px;border-radius:14px;box-shadow:0 6px 0 #0004;z-index:4;cursor:pointer}
+  #ui2{position:fixed;right:12px;top:60px;width:240px;height:373px;border-radius:14px;box-shadow:0 6px 0 #0004;z-index:4;cursor:pointer;display:none}
   #keys{position:fixed;left:12px;bottom:12px;color:#fff;background:#111c;padding:8px 12px;border-radius:10px;font-size:12px;line-height:1.5;z-index:4}
-  #toast{position:fixed;left:50%;top:64px;transform:translateX(-50%);background:#ffd400;color:#111;font-weight:800;padding:8px 18px;border-radius:20px;z-index:6;display:none;max-width:70vw;text-align:center}
+  #toast{position:fixed;left:50%;top:64px;transform:translateX(-50%);background:#ffd400;color:#111;font-weight:800;padding:8px 18px;border-radius:20px;z-index:6;display:none;max-width:60vw;text-align:center}
   canvas#gl{display:block}
   #file{display:none}
 </style>
@@ -28,6 +29,7 @@
 <body>
 <div id="top"><b>Chiki<span>Movie</span>Magic</b><div class="sp"></div><button id="vrbtn" disabled>Checking VR…</button></div>
 <canvas id="ui" width="480" height="680"></canvas>
+<canvas id="ui2" width="360" height="560"></canvas>
 <div id="keys"></div>
 <div id="toast"></div>
 <input id="file" type="file" accept=".json,.cmm,application/json">
@@ -37,14 +39,20 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 /* ============================================================
-   ChikiMovieMagic v0.3 — BUILD, CAST, PERFORM, SHOOT, EDIT
-   Every sculpt stamp goes through applyOp(op) so it can be
-   sent to other players later (multiplayer).
-   Layers are objects: each has a pose (its group transform);
-   clay, doodles and blocks live in the layer's own space.
+   ChikiMovieMagic v0.4 — BUILD, CHARACTERS, PERFORM, SHOOT, EDIT
+   - World layers are the scenery (BUILD). They never move.
+   - Characters live in their own studio (CHARACTERS) with their own
+     view and size. A character is a puppet (head + hands) or a prop
+     (one piece). Its parts are layers inside the character's root.
+   - PERFORM places characters into the world, grabs them, steps into
+     puppets, and records motion (root in world space, parts in
+     character space) plus voice.
+   - Windows (menu, layers, camera) can be pulled out with the grip,
+     left in the room, or dropped onto the left hand to dock.
+   Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.3';
+const VERSION = '0.4';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -55,22 +63,23 @@ const SMIN = 0.005, SMAX = 200;
 const PALETTE = ['#ff3b30','#ff9500','#ffd400','#34c759','#00c7be','#1e6bff',
                  '#5e2bff','#ff2d95','#ffffff','#9aa0a6','#2b2b2b','#a0522d'];
 const PHASES = [
-  {id:'build',   name:'BUILD',   col:'#ff9500'},
-  {id:'light',   name:'LIGHT',   col:'#ffd400'},
-  {id:'cast',    name:'CAST',    col:'#34c759'},
-  {id:'perform', name:'PERFORM', col:'#ff2d95'},
-  {id:'shoot',   name:'SHOOT',   col:'#1e6bff'},
-  {id:'edit',    name:'EDIT',    col:'#5e2bff'},
+  {id:'build',      name:'BUILD',      col:'#ff9500'},
+  {id:'light',      name:'LIGHT',      col:'#ffd400'},
+  {id:'characters', name:'CHARACTERS', col:'#34c759'},
+  {id:'perform',    name:'PERFORM',    col:'#ff2d95'},
+  {id:'shoot',      name:'SHOOT',      col:'#1e6bff'},
+  {id:'edit',       name:'EDIT',       col:'#5e2bff'},
 ];
 const PLANNED = { light: ['Lights','Materials','Bake'] };
 const RAILS = {
-  build:   [['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['layers','Layers'],['world','World'],['scene','Scene']],
-  cast:    [['puppets','Puppets'],['layers','Layers'],['scene','Scene']],
-  perform: [['perform','Perform'],['tracks','Motion'],['scene','Scene']],
-  shoot:   [['takes','Takes'],['path','Path'],['keys','Keys'],['lens','Lens'],['scene','Scene']],
-  edit:    [['timeline','Timeline'],['export','Export'],['scene','Scene']],
+  build:      [['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['layers','Layers'],['world','World'],['scene','Scene']],
+  characters: [['chars','Characters'],['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['layers','Parts'],['scene','Scene']],
+  perform:    [['perform','Perform'],['tracks','Motion'],['scene','Scene']],
+  shoot:      [['takes','Takes'],['path','Path'],['keys','Keys'],['lens','Lens'],['scene','Scene']],
+  edit:       [['timeline','Timeline'],['export','Export'],['scene','Scene']],
 };
-const FIRST_PAGE = {build:'tools', cast:'puppets', perform:'perform', shoot:'takes', edit:'timeline'};
+const FIRST_PAGE = {build:'tools', characters:'chars', perform:'perform', shoot:'takes', edit:'timeline'};
+const SCULPT_PHASES = ['build','characters'];
 const SKIES = {
   day:    {name:'Day',    top:'#1e6bff', hor:'#aee9ff', low:'#3fbf5f', light:1},
   sunset: {name:'Sunset', top:'#5e2bff', hor:'#ff9500', low:'#ff2d95', light:0.85},
@@ -84,6 +93,7 @@ const SKIES = {
   custom: {name:'Mine'},
 };
 const SHAPES = {cube:[1,1,1], brick:[1,0.5,0.5], plank:[2,0.125,0.5], pillar:[0.5,2,0.5]};
+const PART_NAMES = {head:'Head', lh:'Left hand', rh:'Right hand', body:'Body', extra:'Extra'};
 
 const state = {
   phase:'build', page:'tools', dialOpen:false,
@@ -91,13 +101,14 @@ const state = {
   size:0.08, strength:0.6, color:'#ff9500',
   doodle:'tube', doodleSize:0.012,
   blockMode:'stamp', blockShape:'cube', blockSize:0.1, blockSnap:true, blockMix:false,
-  flySpeed:2.0, panelOpen:true, activeLayer:1, labels:true, mic:false, mirror:true,
+  flySpeed:2.0, panelOpen:true, activeWorld:1, activePart:null, selChar:null,
+  labels:true, mic:false, mirror:true, win:{layers:true, preview:true},
   world:{sky:'day', water:true, fog:true, custom:{top:[220,0.5], hor:[195,0.8], low:[140,0.45]}},
   fov:50,
   confirm:null, toastMsg:'', toastT:0,
 };
 const shots = {takes:[], seq:[], sel:null, seqSel:null, aspect:'16:9', res:1080, fps:30, blackRoom:true, showAll:false, playhead:0, takeSeq:1, keyT:0, keySel:-1};
-const show = {tracks:{}, audio:[], puppets:[], puppetSel:null, t:0, playing:false, rec:null, grab:null, embodied:null, puppetSeq:1, audioSeq:1};
+const show = {tracks:{}, audio:[], chars:[], t:0, playing:false, rec:null, grab:null, embodied:null, charSeq:1, audioSeq:1};
 
 /* ---------------- renderer / scene ---------------- */
 const renderer = new THREE.WebGLRenderer({antialias:true});
@@ -121,7 +132,18 @@ const water = new THREE.Mesh(new THREE.CircleGeometry(600, 64),
   new THREE.MeshStandardMaterial({color:'#1e6bff', roughness:0.35, metalness:0.0}));
 water.rotation.x = -Math.PI/2; water.position.y = -0.02; scene.add(water);
 
-const world = new THREE.Group(); scene.add(world);
+const world = new THREE.Group(); scene.add(world);       // scenery layers
+const actors = new THREE.Group(); scene.add(actors);     // character roots
+const studio = new THREE.Group(); scene.add(studio); studio.visible = false;
+{
+  const disc = new THREE.Mesh(new THREE.CylinderGeometry(1.1,1.1,0.04,64), new THREE.MeshStandardMaterial({color:'#ffd400', roughness:0.6}));
+  disc.position.y = -0.02; studio.add(disc);
+  const rim = new THREE.Mesh(new THREE.CylinderGeometry(1.16,1.16,0.03,64), new THREE.MeshStandardMaterial({color:'#ff2d95', roughness:0.6}));
+  rim.position.y = -0.035; studio.add(rim);
+  const mark = new THREE.Mesh(new THREE.BoxGeometry(0.06,0.012,0.3), new THREE.MeshStandardMaterial({color:'#1e6bff'}));
+  mark.position.set(0,0.005,0.85); studio.add(mark);   // the "front" of the stage, facing you
+}
+const STUDIO_BG = new THREE.Color('#1b2050');
 const clayMat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.85, metalness:0});
 
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -152,6 +174,10 @@ function fmtTime(s){ s=Math.max(0,s); const m=Math.floor(s/60); return m+':'+Str
 function detailFor(target){ let best=DETAILS[0]; for (const d of DETAILS) if (Math.abs(Math.log(d/target)) < Math.abs(Math.log(best/target))) best=d; return best; }
 function yourScale(){ return renderer.xr.isPresenting ? rig.scale.x : Math.max(0.05, camera.position.distanceTo(controls.target)/3); }
 function unscaled(obj){ obj.updateMatrixWorld(true); const p=V(), q=new THREE.Quaternion(), s=V(); obj.matrixWorld.decompose(p,q,s); return new THREE.Matrix4().compose(p,q,ONE); }
+function setObjMatrix(obj, m){ const p=V(), q=new THREE.Quaternion(), s=V(); m.decompose(p,q,s); obj.position.copy(p); obj.quaternion.copy(q); obj.scale.setScalar(s.x); obj.updateMatrixWorld(true); }
+const poseOfObj = o => ({p:o.position.toArray(), q:o.quaternion.toArray(), s:o.scale.x});
+function setPoseObj(o, pose){ o.position.fromArray(pose.p); o.quaternion.fromArray(pose.q); o.scale.setScalar(pose.s); }
+const inStudio = () => state.phase==='characters';
 
 /* ---------------- sky / world ---------------- */
 let skyTex = null;
@@ -162,7 +188,7 @@ function skyColors(){
   return SKIES[w.sky] || SKIES.day;
 }
 function applyWorld(){
-  const w = state.world, Sk = skyColors();
+  const Sk = skyColors();
   const skyCanvas = document.createElement('canvas'); skyCanvas.width = 1024; skyCanvas.height = 512;
   const g2 = skyCanvas.getContext('2d'), H = skyCanvas.height;
   const gr = g2.createLinearGradient(0,0,0,H);
@@ -173,35 +199,48 @@ function applyWorld(){
   if (skyTex) skyTex.dispose();
   skyTex = new THREE.CanvasTexture(skyCanvas);
   skyTex.mapping = THREE.EquirectangularReflectionMapping; skyTex.colorSpace = THREE.SRGBColorSpace;
-  scene.background = skyTex;
-  scene.fog = w.fog ? fogObj() : null;
-  water.visible = w.water;
   hemi.intensity = 1.4*Sk.light; sun.intensity = 2.2*Sk.light;
 }
 let _fog = null; function fogObj(){ const Sk = skyColors(); if (!_fog) _fog = new THREE.Fog(Sk.hor, 60, 300); _fog.color.set(Sk.hor); return _fog; }
 applyWorld();
+// what's on stage this frame: the world, or the character studio
+function applyStage(){
+  const st = inStudio();
+  world.visible = !st; studio.visible = st;
+  if (st){ water.visible = false; scene.background = STUDIO_BG; scene.fog = null; }
+  else { water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? fogObj() : null; }
+  for (const c of show.chars) c.root.visible = st ? c.id===state.selChar : c.placed;
+}
 
 /* ---------------- layers & chunks ---------------- */
 let layers = []; let layerSeq = 1;
-function makeLayer(name, vs, id){
-  const L = {id: id ?? layerSeq++, name, vs, visible:true, locked:false,
+function makeLayer(name, vs, id, parent){
+  const L = {id: id ?? layerSeq++, name, vs, visible:true, locked:false, char:null, part:null,
              chunks:new Map(), group:new THREE.Group(), strokes:[], rest:{p:[0,0,0], q:[0,0,0,1], s:1}};
   layerSeq = Math.max(layerSeq, L.id+1);
-  world.add(L.group); layers.push(L); return L;
+  (parent || world).add(L.group); layers.push(L); return L;
 }
-const layerById = id => layers.find(l => l.id === id);
-const activeLayer = () => layerById(state.activeLayer) || layers[0];
+const layerById = id => layers.find(l => l.id === +id);
+const worldLayers = () => layers.filter(L => !L.char);
+const partsOf = c => layers.filter(L => L.char===c.id);
+function activeLayer(){
+  if (inStudio()){ const c = selChar(); const L = layerById(state.activePart); return (c && L && L.char===c.id) ? L : (c ? partsOf(c)[0] : null); }
+  const L = layerById(state.activeWorld); return (L && !L.char) ? L : worldLayers()[0];
+}
+const domainLayers = () => inStudio() ? (selChar() ? partsOf(selChar()) : []) : worldLayers();
+function setActive(L){ if (L.char) state.activePart = L.id; else state.activeWorld = L.id; requestUI(); }
 function layerHasClay(L){ for (const ch of L.chunks.values()) if (ch.d) return true; return false; }
-function setPose(L, p, q, s){ L.group.position.fromArray(p); L.group.quaternion.fromArray(q); L.group.scale.setScalar(s); L.group.updateMatrixWorld(true); }
-function poseOf(L){ return {p:L.group.position.toArray(), q:L.group.quaternion.toArray(), s:L.group.scale.x}; }
-function setGroupMatrix(L, m){ const p=V(), q=new THREE.Quaternion(), s=V(); m.decompose(p,q,s); L.group.position.copy(p); L.group.quaternion.copy(q); L.group.scale.setScalar(s.x); L.group.updateMatrixWorld(true); }
-function layerCenter(L){ const b = new THREE.Box3().setFromObject(L.group); return b.isEmpty() ? L.group.position.clone() : b.getCenter(V()); }
+function layerCenter(L){ const b = new THREE.Box3().setFromObject(L.group); return b.isEmpty() ? L.group.getWorldPosition(V()) : b.getCenter(V()); }
 function layerOf(obj){ let o = obj; while (o){ for (const L of layers) if (L.group===o) return L; o = o.parent; } return null; }
-// world <-> layer space
+function removeLayer(L){
+  L.group.parent?.remove(L.group); disposeMesh(L.group); layers = layers.filter(l=>l!==L); delete show.tracks[String(L.id)];
+  for (const k of [...dirty.keys()]) if (k.startsWith(L.id+'|')) dirty.delete(k);
+}
+// world <-> layer space (works through any parent: world, a character root, or the studio)
 function wToL(L, p){ L.group.updateMatrixWorld(true); return L.group.worldToLocal(p.clone()); }
-function rToL(L, r){ return r / L.group.scale.x; }
-function qToL(L, q){ return L.group.quaternion.clone().invert().multiply(q); }
-function dToL(L, d){ return d.clone().applyQuaternion(L.group.quaternion.clone().invert()); }
+function rToL(L, r){ return r / L.group.getWorldScale(V()).x; }
+function qToL(L, q){ return L.group.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(q); }
+function dToL(L, d){ return d.clone().applyQuaternion(L.group.getWorldQuaternion(new THREE.Quaternion()).invert()); }
 
 function getChunk(L, cx, cy, cz, create){
   const k = ckey(cx,cy,cz); let ch = L.chunks.get(k);
@@ -221,7 +260,6 @@ function markAround(L, cx0,cy0,cz0, cx1,cy1,cz1){
 }
 
 /* ---------------- sculpt ops (layer space, multiplayer-ready) ---------------- */
-// op = {t:'clay'|'carve'|'smooth'|'paint', L:layerId, p:[x,y,z] (layer space), r, s, col:[r,g,b]}
 const _cache = {k:null, ch:null};
 function sampleD(L, gx, gy, gz){
   const cx = Math.floor(gx/CN), cy = Math.floor(gy/CN), cz = Math.floor(gz/CN);
@@ -320,7 +358,7 @@ const S = CN+2, C = CN+1;
 const sd = new Float32Array(S*S*S), sc = new Uint8Array(S*S*S*3);
 const vidx = new Int32Array(C*C*C);
 const offA = new Int8Array(S), locA = new Int8Array(S);
-for (let i=0;i<S;i++){ const g=i-1; const o=Math.floor(g/CN); offA[i]=o; locA[i]=g-o*CN; }
+for (let i=0;i<S;i++){ const gg=i-1; const o=Math.floor(gg/CN); offA[i]=o; locA[i]=gg-o*CN; }
 const CORN = []; for (let n=0;n<8;n++) CORN.push([n&1,(n>>1)&1,(n>>2)&1]);
 const EDGES = []; for (let n=0;n<8;n++) for (const b of [1,2,4]) if(!(n&b)) EDGES.push([n,n|b]);
 const cd = new Float32Array(8);
@@ -506,7 +544,6 @@ function restoreStrokes(L, snap){
   for (const [s, it] of snap.items) s.items = it.slice();
   for (const s of L.strokes) rebuildStroke(L, s);
 }
-// remove blocks / doodles that sit fully inside a sphere (layer space). Returns true if anything went.
 function eraseInside(L, p, r){
   let any = false; const tmp = V();
   for (const s of [...L.strokes]){
@@ -531,11 +568,11 @@ let stroke = null; let sceneDirty = false;
 const undoStack = [], redoStack = [];
 function pushUndo(r){ undoStack.push(r); if (undoStack.length>50) undoStack.shift(); redoStack.length=0; }
 function canEdit(){
-  if (state.phase!=='build') return false;
+  if (!SCULPT_PHASES.includes(state.phase)) return false;
   const L = activeLayer();
-  if (!L){ toast('Make a layer first'); return false; }
-  if (L.locked){ toast('Layer "'+L.name+'" is locked'); return false; }
-  if (!L.visible){ toast('Layer "'+L.name+'" is hidden'); return false; }
+  if (!L){ toast(inStudio() ? 'Make a character first' : 'Make a layer first'); return false; }
+  if (L.locked){ toast('"'+L.name+'" is locked'); return false; }
+  if (!L.visible){ toast('"'+L.name+'" is hidden'); return false; }
   return true;
 }
 let hintT = -1e9;
@@ -565,7 +602,7 @@ function strokeTo(pW, rWorld, pressure, upW, dt, qW){
   if (!stroke) return;
   const L = stroke.L;
   if (stroke.kind==='blocks'){ blockStrokeTo(pW, qW); return; }
-  if (stroke.kind==='angle'){ return; }
+  if (stroke.kind==='angle') return;
   const p = wToL(L, pW), up = upW ? dToL(L, upW) : new THREE.Vector3(0,1,0), rL = rToL(L, rWorld);
   if (stroke.kind==='vox'){
     const r = clamp(rL, L.vs*0.7, L.vs*MAXVOX);
@@ -622,7 +659,7 @@ function endStroke(cancel){
 function blockDims(){ return SHAPES[state.blockShape]; }
 function blockColor(){ return hexRgb(state.blockMix ? PALETTE[Math.floor(Math.random()*8)] : state.color); }
 function pushBlockW(s, L, pW, qW, dW, col){
-  const p = wToL(L, pW), q = qToL(L, qW), k = 1/L.group.scale.x;
+  const p = wToL(L, pW), q = qToL(L, qW), k = 1/L.group.getWorldScale(V()).x;
   s.items.push(+p.x.toFixed(5),+p.y.toFixed(5),+p.z.toFixed(5), +q.x.toFixed(5),+q.y.toFixed(5),+q.z.toFixed(5),+q.w.toFixed(5),
     +(dW[0]*k).toFixed(5), +(dW[1]*k).toFixed(5), +(dW[2]*k).toFixed(5), col[0],col[1],col[2]);
 }
@@ -672,7 +709,6 @@ function blockStrokeTo(p, q){
   rebuildLiveThrottle();
 }
 function rebuildLiveThrottle(force){ const now=performance.now(); if (force || now - stroke.lastBuild > 50){ rebuildStroke(stroke.L, stroke.s); stroke.lastBuild = now; } }
-/* 4-point box: drag an edge, click for width, click for height — any angle */
 function angleUpdate(p, held, sideHint){
   const st = stroke; if (!st || st.kind!=='angle') return;
   const u = st.u ?? (st.u = blockSizeWorld());
@@ -701,14 +737,15 @@ function angleClick(){
 function angleBuild(){
   const st = stroke, s = st.s, u = st.u, A = st.A, B = st.B || A;
   s.items.length = 0;
-  const xv = V().subVectors(B, A); const lx = Math.max(xv.length(), u*0.05); const x = lx > 1e-6 ? xv.normalize() : new THREE.Vector3(1,0,0);
-  let W = st.W || V(); let z = W.lengthSq()>1e-10 ? W.clone().normalize() : (Math.abs(x.y)<0.9 ? V().crossVectors(x, new THREE.Vector3(0,1,0)).normalize() : new THREE.Vector3(0,0,1));
+  const xv = V().subVectors(B, A); const lx = Math.max(xv.length(), u*0.05); const x = xv.length() > 1e-6 ? xv.normalize() : new THREE.Vector3(1,0,0);
+  const W = st.W || V();
+  const z = W.lengthSq()>1e-10 ? W.clone().normalize() : (Math.abs(x.y)<0.9 ? V().crossVectors(x, new THREE.Vector3(0,1,0)).normalize() : new THREE.Vector3(0,0,1));
   const lz = Math.max(W.length(), u*0.05);
-  const y = V().crossVectors(z, x).normalize(); z.crossVectors(x, y).normalize();
+  const y = V().crossVectors(z, x).normalize(); const zz = V().crossVectors(x, y).normalize();
   const h = st.stage>=2 ? (st.H ?? u*0.05) : u*0.05;
   const ly = Math.max(Math.abs(h), u*0.05);
-  const c = A.clone().addScaledVector(x, lx/2).addScaledVector(W.lengthSq()>1e-10 ? W.clone().normalize() : z, lz/2).addScaledVector(y, (h>=0?1:-1)*ly/2);
-  const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+  const c = A.clone().addScaledVector(x, lx/2).addScaledVector(zz, lz/2).addScaledVector(y, (h>=0?1:-1)*ly/2);
+  const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, zz));
   st.boxCol = st.boxCol || blockColor();
   pushBlockW(s, st.L, c, q, [lx, ly, lz], st.boxCol);
   rebuildLiveThrottle();
@@ -731,11 +768,11 @@ function eraseAt(p, r){
     }
   }
 }
-/* grab one block and move it (BUILD) */
+/* grab one block and move it (BUILD / CHARACTERS) */
 let blockGrab = null;
 function findBlockAt(pW){
   let best = null, bd = 1e9; const inv = new THREE.Matrix4(), m = new THREE.Matrix4(), lp = V();
-  for (const L of layers){
+  for (const L of domainLayers()){
     if (!L.visible || L.locked) continue;
     const pl = wToL(L, pW);
     for (const s of L.strokes){
@@ -744,8 +781,8 @@ function findBlockAt(pW){
       for (let o=0, i=0; o<it.length; o+=13, i++){
         m.compose(new THREE.Vector3(it[o],it[o+1],it[o+2]), new THREE.Quaternion(it[o+3],it[o+4],it[o+5],it[o+6]), new THREE.Vector3(it[o+7],it[o+8],it[o+9]));
         inv.copy(m).invert(); lp.copy(pl).applyMatrix4(inv);
-        const pad = 0.15; const out = Math.max(Math.abs(lp.x), Math.abs(lp.y), Math.abs(lp.z));
-        if (out <= 0.5 + pad){ const dist = Math.hypot(it[o]-pl.x, it[o+1]-pl.y, it[o+2]-pl.z); if (dist < bd){ bd = dist; best = {L, s, i}; } }
+        const out = Math.max(Math.abs(lp.x), Math.abs(lp.y), Math.abs(lp.z));
+        if (out <= 0.65){ const dist = Math.hypot(it[o]-pl.x, it[o+1]-pl.y, it[o+2]-pl.z); if (dist < bd){ bd = dist; best = {L, s, i}; } }
       }
     }
   }
@@ -776,7 +813,7 @@ function swapChunks(L, map){
   }
   return other;
 }
-function applyRec(r){   // swaps state <-> record: the same call does undo and redo
+function applyRec(r){
   if (r.type==='multi'){ for (const p of r.parts) applyRec(p); return true; }
   if (r.type==='shots'){ const cur = snapShots(); restoreShots(r.snap); r.snap = cur; return true; }
   if (r.type==='show'){ const cur = snapShow(); restoreShow(r.snap); r.snap = cur; return true; }
@@ -807,8 +844,78 @@ function flipCarve(){ if (state.tool!=='clay') setTool('clay'); else state.carve
 function swapTool(){ setTool(state.lastTool); }
 
 /* ============================================================
-   SHOW: layer motion tracks, puppets, voice clips
-   track = {samples:[t,px,py,pz,qx,qy,qz,qw,s, ...]}  (9 per sample)
+   CHARACTERS
+   char = {id, name, type:'puppet'|'prop', place:{p,q,s}, placed, root:Group}
+   its parts are layers with L.char = id and L.part = head|lh|rh|body|extra
+   ============================================================ */
+const charById = id => show.chars.find(c=>c.id===id);
+const selChar = () => charById(state.selChar);
+const partLayer = (c, part) => partsOf(c).find(L=>L.part===part);
+function makeChar(type, name, id){
+  const c = {id: id ?? show.charSeq++, name, type, place:{p:[0,0,0], q:[0,0,0,1], s:1}, placed:false, root:new THREE.Group()};
+  show.charSeq = Math.max(show.charSeq, c.id+1);
+  actors.add(c.root); show.chars.push(c); return c;
+}
+function addPart(c, part, vs){
+  const L = makeLayer(c.name+' '+PART_NAMES[part].toLowerCase(), vs, undefined, c.root);
+  L.char = c.id; L.part = part; return L;
+}
+function newCharacter(type){
+  if (layers.length > 40){ toast('Too many layers — delete some first'); return; }
+  const n = show.charSeq;
+  const c = makeChar(type, (type==='puppet' ? 'Puppet ' : 'Prop ')+n);
+  const col = hexRgb(PALETTE[(n*3)%8]), white=[255,255,255], black=[30,30,30];
+  const op = (L, t, p, r, cl) => applyOp({t, L:L.id, p:[p.x,p.y,p.z], r, s:1, col:cl});
+  if (type==='puppet'){
+    const H = addPart(c,'head',0.0125), LH = addPart(c,'lh',0.0125), RH = addPart(c,'rh',0.0125);
+    const h = new THREE.Vector3(0,1.5,0), front = new THREE.Vector3(0,0,1);
+    op(H,'clay',h,0.12,col);
+    for (const sx of [-1,1]){ const e = h.clone().addScaledVector(front,0.1).add(new THREE.Vector3(sx*0.045,0.03,0)); op(H,'clay',e,0.032,white); op(H,'clay',e.clone().addScaledVector(front,0.022),0.016,black); }
+    op(H,'clay',h.clone().addScaledVector(front,0.1).add(new THREE.Vector3(0,-0.05,0)),0.03,hexRgb('#ff3b30'));
+    for (const [Lh, sx] of [[LH,-1],[RH,1]]){ const hp = new THREE.Vector3(sx*0.3,1.15,0.05); op(Lh,'clay',hp,0.05,col); op(Lh,'clay',hp.clone().add(new THREE.Vector3(-sx*0.045,0.03,0)),0.022,col); }
+    state.activePart = H.id;
+  } else {
+    const B = addPart(c,'body',0.025);
+    op(B,'clay',new THREE.Vector3(0,1.0,0),0.18,col); op(B,'clay',new THREE.Vector3(0,1.2,0),0.12,col);
+    state.activePart = B.id;
+  }
+  state.selChar = c.id; sceneDirty = true;
+  toast(c.name+' made — sculpt it here, then place it in Perform'); requestUI();
+  return c;
+}
+function deleteChar(c){
+  if (show.embodied && show.embodied.c===c) stepOut();
+  for (const L of partsOf(c)) removeLayer(L);
+  delete show.tracks['r'+c.id]; actors.remove(c.root);
+  show.chars = show.chars.filter(x=>x!==c);
+  if (state.selChar===c.id) state.selChar = show.chars[0]?.id ?? null;
+  sceneDirty = true; requestUI();
+}
+function placeChar(c){
+  if (!c) return;
+  const before = snapShow();
+  const s = yourScale(); let p, yaw = 0;
+  if (renderer.xr.isPresenting){
+    const head = V(); camera.getWorldPosition(head); const fwd = V(); camera.getWorldDirection(fwd); fwd.y=0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
+    p = head.clone().addScaledVector(fwd, 1.2*s); p.y = rig.position.y;
+    yaw = Math.atan2(-fwd.x, -fwd.z);
+  } else {
+    p = controls.target.clone(); const d = V().subVectors(camera.position, p); yaw = Math.atan2(d.x, d.z);
+  }
+  const k = renderer.xr.isPresenting ? s : 1;
+  // stand it on the ground under that spot
+  const down = new THREE.Raycaster(new THREE.Vector3(p.x, p.y + 3*k, p.z), new THREE.Vector3(0,-1,0), 0, 30*k);
+  const hitG = down.intersectObjects(worldLayers().filter(L=>L.visible).map(L=>L.group), true)[0];
+  if (hitG) p.y = hitG.point.y; else if (state.world.water && p.y < 0) p.y = 0;
+  c.place = {p:p.toArray(), q:new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), yaw).toArray(), s:k};
+  c.placed = true; pushUndo({type:'show', snap:before}); sceneDirty = true;
+  toast(c.name+' is in the scene'); requestUI();
+}
+
+/* ============================================================
+   SHOW: motion tracks, voice clips
+   tracks: 'r<charId>' = character root (world space), '<layerId>' = part (character space)
+   samples: [t,px,py,pz,qx,qy,qz,qw,s, ...]
    ============================================================ */
 function showLength(){
   let L = 0;
@@ -828,31 +935,44 @@ function trackAt(tr, t, outP, outQ){
   _tq2.set(S9[a+4],S9[a+5],S9[a+6],S9[a+7]); _tq3.set(S9[b+4],S9[b+5],S9[b+6],S9[b+7]); outQ.copy(_tq2).slerp(_tq3, u);
   return S9[a+8]+(S9[b+8]-S9[a+8])*u;
 }
-function controlledIds(){
+function controlledKeys(){
   const set = new Set();
-  if (show.grab) set.add(show.grab.L.id);
-  if (show.embodied) for (const part of show.embodied.parts) set.add(part.L.id);
+  if (show.grab) set.add('r'+show.grab.c.id);
+  if (show.embodied) for (const part of show.embodied.parts) set.add(String(part.L.id));
   return set;
 }
+function objForKey(key){
+  if (key[0]==='r'){ const c = charById(+key.slice(1)); return c ? {obj:c.root, rest:c.place} : null; }
+  const L = layerById(+key); return L ? {obj:L.group, rest:L.rest} : null;
+}
+function poseFromTrack(obj, key, t, rest){
+  const tr = show.tracks[key];
+  if (tr && tr.samples.length){ const s = trackAt(tr, t, _tp, _tq2); obj.position.copy(_tp); obj.quaternion.copy(_tq2); obj.scale.setScalar(s); }
+  else setPoseObj(obj, rest);
+}
 function applyShowPose(t){
-  const ctl = controlledIds();
+  const ctl = controlledKeys(), st = inStudio();
   for (const L of layers){
-    if (ctl.has(L.id)) continue;
-    const tr = show.tracks[L.id];
-    if (tr && tr.samples.length){ const s = trackAt(tr, t, _tp, _tq2); L.group.position.copy(_tp); L.group.quaternion.copy(_tq2); L.group.scale.setScalar(s); }
-    else { L.group.position.fromArray(L.rest.p); L.group.quaternion.fromArray(L.rest.q); L.group.scale.setScalar(L.rest.s); }
+    if (!L.char){ setPoseObj(L.group, L.rest); continue; }
+    if (ctl.has(String(L.id))) continue;
+    if (st) setPoseObj(L.group, L.rest); else poseFromTrack(L.group, String(L.id), t, L.rest);
+  }
+  for (const c of show.chars){
+    if (st){ c.root.position.set(0,0,0); c.root.quaternion.identity(); c.root.scale.setScalar(1); continue; }
+    if (ctl.has('r'+c.id)) continue;
+    poseFromTrack(c.root, 'r'+c.id, t, c.place);
   }
 }
 function snapShow(){
-  return {tracks:{...show.tracks}, audio:show.audio.slice(), puppets:show.puppets.map(p=>({...p})), rests:Object.fromEntries(layers.map(L=>[L.id, JSON.parse(JSON.stringify(L.rest))]))};
+  return {tracks:{...show.tracks}, audio:show.audio.slice(), chars:show.chars.map(c=>({id:c.id, name:c.name, place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}))};
 }
 function restoreShow(s){
-  show.tracks = {...s.tracks}; show.audio = s.audio.slice(); show.puppets = s.puppets.map(p=>({...p}));
-  for (const L of layers) if (s.rests[L.id]) L.rest = JSON.parse(JSON.stringify(s.rests[L.id]));
+  show.tracks = {...s.tracks}; show.audio = s.audio.slice();
+  for (const sc of s.chars){ const c = charById(sc.id); if (c){ c.name = sc.name; c.place = JSON.parse(JSON.stringify(sc.place)); c.placed = sc.placed; } }
   requestUI();
 }
 
-/* audio: voice clips recorded in PERFORM play back with the show */
+/* audio */
 let actx = null; const audioBufs = new Map(); let audioSrcs = []; let audioToken = 0;
 function ac(){ if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)(); if (actx.state==='suspended') actx.resume(); return actx; }
 async function decodeClip(c){
@@ -878,93 +998,64 @@ async function ensureMic(){
   return micStream;
 }
 
-/* puppets: floating head + hands made from layers */
-const puppetById = id => show.puppets.find(p=>p.id===id);
-const selPuppet = () => puppetById(show.puppetSel);
-function makeStarterPuppet(){
-  const s = yourScale();
-  let head = V(), fwd = V(), right = V();
-  if (renderer.xr.isPresenting){ camera.getWorldPosition(head); camera.getWorldDirection(fwd); }
-  else { head.copy(controls.target).add(new THREE.Vector3(0, 0.5*s, 0)); camera.getWorldDirection(fwd); }
-  fwd.y = 0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize(); right.crossVectors(fwd, new THREE.Vector3(0,1,0)).normalize();
-  const c = renderer.xr.isPresenting ? head.clone().addScaledVector(fwd, 0.7*s) : head.clone();
-  const vs = detailFor(0.02*s);
-  const n = show.puppetSeq++;
-  const mk = (name) => { if (layers.length>=12){ return null; } return makeLayer('P'+n+' '+name, vs); };
-  const H = mk('head'), LH = mk('left hand'), RH = mk('right hand');
-  if (!H || !LH || !RH){ toast('Too many layers — delete some first'); return; }
-  const col = hexRgb(PALETTE[(n*3)%8]), white=[255,255,255], black=[30,30,30];
-  const toward = fwd.clone().negate();   // face looks back at you
-  const op = (L, t, p, r, cl) => applyOp({t, L:L.id, p:[p.x,p.y,p.z], r, s:1, col:cl});
-  op(H, 'clay', c, 0.12*s, col);
-  for (const side of [-1,1]){
-    const e = c.clone().addScaledVector(toward, 0.1*s).addScaledVector(right, side*0.045*s).add(new THREE.Vector3(0,0.03*s,0));
-    op(H, 'clay', e, 0.032*s, white);
-    op(H, 'clay', e.clone().addScaledVector(toward, 0.022*s), 0.016*s, black);
-  }
-  op(H, 'clay', c.clone().addScaledVector(toward, 0.1*s).add(new THREE.Vector3(0,-0.05*s,0)), 0.03*s, hexRgb('#ff3b30'));
-  for (const [Lh, side] of [[LH,-1],[RH,1]]){
-    const hp = c.clone().addScaledVector(right, side*0.3*s).add(new THREE.Vector3(0,-0.35*s,0));
-    op(Lh, 'clay', hp, 0.05*s, col);
-    op(Lh, 'clay', hp.clone().addScaledVector(right, -side*0.045*s).add(new THREE.Vector3(0,0.03*s,0)), 0.022*s, col);
-  }
-  const p = {id:n, name:'Puppet '+n, head:H.id, lh:LH.id, rh:RH.id, scale:s};
-  show.puppets.push(p); show.puppetSel = p.id; sceneDirty = true;
-  toast('Puppet '+n+' made — sculpt on its layers, then step in'); requestUI();
-}
-function stepIn(p){
-  if (!p) return;
+/* step into a puppet */
+function stepIn(c){
+  if (!c || c.type!=='puppet') return;
   if (!renderer.xr.isPresenting){ toast('Step in from the headset'); return; }
   if (show.rec) return;
+  if (!c.placed) placeChar(c);
   stopShow(); show.grab = null;
-  const H = layerById(p.head), LH = layerById(p.lh), RH = layerById(p.rh);
-  // become the puppet's size and stand where its head is
-  rig.scale.setScalar(p.scale || 1); rig.updateMatrixWorld(true);
+  applyShowPose(0);
+  c.root.updateMatrixWorld(true);
+  const H = partLayer(c,'head'), LH = partLayer(c,'lh'), RH = partLayer(c,'rh');
+  rig.scale.setScalar(c.place.s || 1); rig.updateMatrixWorld(true);
   if (H){ const hc = layerCenter(H), cw = V(); camera.getWorldPosition(cw); rig.position.add(hc.sub(cw)); rig.updateMatrixWorld(true); }
   const parts = [];
   if (H) parts.push({L:H, tracker:camera, off: unscaled(camera).invert().multiply(H.group.matrixWorld.clone())});
-  for (const [Lh, c] of [[LH, ctrl.left], [RH, ctrl.right]]){
-    if (!Lh || !c) continue;
-    const gp = V(); c.grip.getWorldPosition(gp);
-    Lh.group.position.add(gp.sub(layerCenter(Lh))); Lh.group.updateMatrixWorld(true);
-    parts.push({L:Lh, tracker:c.grip, off: unscaled(c.grip).invert().multiply(Lh.group.matrixWorld.clone())});
+  for (const [Lh, cc] of [[LH, ctrl.left], [RH, ctrl.right]]){
+    if (!Lh || !cc) continue;
+    const gp = V(); cc.grip.getWorldPosition(gp);
+    const shift = new THREE.Matrix4().makeTranslation(...gp.sub(layerCenter(Lh)).toArray());
+    const wantW = shift.multiply(Lh.group.matrixWorld.clone());
+    parts.push({L:Lh, tracker:cc.grip, off: unscaled(cc.grip).invert().multiply(wantW)});
   }
-  show.embodied = {p, parts};
-  placeMirror(); toast('You are '+p.name+' — A records, B plays'); requestUI();
+  show.embodied = {c, parts};
+  placeMirror(); toast('You are '+c.name+' — A records, B plays'); requestUI();
 }
 function stepOut(){
   if (!show.embodied || show.rec) return;
-  for (const part of show.embodied.parts) part.L.rest = poseOf(part.L);
-  show.embodied = null; sceneDirty = true; toast('Stepped out'); requestUI();
+  show.embodied = null; toast('Stepped out'); requestUI();
 }
 function updateEmbodied(){
   if (!show.embodied) return;
-  for (const part of show.embodied.parts) setGroupMatrix(part.L, unscaled(part.tracker).multiply(part.off));
+  const root = show.embodied.c.root; root.updateMatrixWorld(true);
+  const inv = root.matrixWorld.clone().invert();
+  for (const part of show.embodied.parts) setObjMatrix(part.L.group, inv.clone().multiply(unscaled(part.tracker).multiply(part.off)));
 }
 
-/* grabbing whole layers (PERFORM) */
-function findLayerAt(pW){
+/* grab whole characters (PERFORM). Scenery never moves. */
+function findCharAt(pW){
   let best = null, bv = Infinity;
-  for (const L of layers){
-    if (!L.visible || L.locked) continue;
-    const b = new THREE.Box3().setFromObject(L.group); if (b.isEmpty()) continue;
-    const pad = 0.03*yourScale(); b.expandByScalar(pad);
+  for (const c of show.chars){
+    if (!c.placed) continue;
+    const b = new THREE.Box3().setFromObject(c.root); if (b.isEmpty()) continue;
+    b.expandByScalar(0.04*yourScale());
     if (!b.containsPoint(pW)) continue;
     const sz = b.getSize(V()); const vol = sz.x*sz.y*sz.z;
-    if (vol < bv){ bv = vol; best = L; }
+    if (vol < bv){ bv = vol; best = c; }
   }
   return best;
 }
-function startLayerGrab(L, ctrlM){
-  if (show.tracks[L.id] && !show.rec){ toast('"'+L.name+'" has motion — record over it, or clear it in Motion'); return false; }
-  L.group.updateMatrixWorld(true);
-  show.grab = {L, rel: ctrlM.clone().invert().multiply(L.group.matrixWorld.clone()), before: snapShow()};
-  pulse('right',0.5,30); return true;
+function startCharGrab(c, ctrlM){
+  if (show.tracks['r'+c.id] && !show.rec){ toast(c.name+' has recorded moves — record over them, or clear them in Motion'); return false; }
+  c.root.updateMatrixWorld(true);
+  show.grab = {c, rel: ctrlM.clone().invert().multiply(c.root.matrixWorld.clone()), before: snapShow()};
+  state.selChar = c.id; pulse('right',0.5,30); requestUI(); return true;
 }
-function moveLayerGrab(ctrlM){ if (show.grab) setGroupMatrix(show.grab.L, ctrlM.clone().multiply(show.grab.rel)); }
-function endLayerGrab(){
-  const g = show.grab; if (!g) return; show.grab = null;
-  if (!show.rec){ g.L.rest = poseOf(g.L); pushUndo({type:'show', snap:g.before}); sceneDirty = true; }
+function moveCharGrab(ctrlM){ if (show.grab) setObjMatrix(show.grab.c.root, ctrlM.clone().multiply(show.grab.rel)); }
+function endCharGrab(){
+  const g0 = show.grab; if (!g0) return; show.grab = null;
+  if (!show.rec){ g0.c.place = poseOfObj(g0.c.root); pushUndo({type:'show', snap:g0.before}); sceneDirty = true; }
 }
 
 /* the show clock + recording motion */
@@ -978,7 +1069,7 @@ function stopShow(){ if (show.playing){ show.playing = false; audioStop(); reque
 function startShowRec(){
   if (show.rec || rec) return;
   stopShow();
-  show.rec = {phase:'count', t:3, layers:new Map(), last:-1, before:snapShow(), mr:null, chunks:[]};
+  show.rec = {phase:'count', t:3, keys:new Map(), last:-1, before:snapShow(), mr:null, chunks:[]};
   setRecLabel('3'); pulse('right',0.4,40); requestUI();
   if (state.mic) ensureMic();
 }
@@ -987,7 +1078,7 @@ function cutShowRec(cancel){
   show.rec = null; setRecLabel(''); audioStop();
   if (r.phase!=='rec' || cancel){ if (r.mr && r.mr.state!=='inactive') r.mr.stop(); requestUI(); return; }
   let n = 0;
-  for (const [id, samples] of r.layers){ if (samples.length >= 18){ show.tracks[id] = {samples}; n++; } }
+  for (const [key, samples] of r.keys){ if (samples.length >= 18){ show.tracks[key] = {samples}; n++; } }
   let clip = null;
   if (r.mr){
     clip = {id: show.audioSeq++, b64:null, mime:r.mr.mimeType, dur:r.t};
@@ -1000,10 +1091,10 @@ function cutShowRec(cancel){
     };
     if (r.mr.state!=='inactive') r.mr.stop();
   }
-  if (!n && !clip){ toast('Nothing moved — grab a layer or step into a puppet'); requestUI(); return; }
+  if (!n && !clip){ toast('Nothing moved — grab a character or step into a puppet'); requestUI(); return; }
   if (show.grab) show.grab.before = snapShow();
   pushUndo({type:'show', snap:r.before}); sceneDirty = true;
-  toast('Recorded '+fmtTime(r.t)+(n?' · '+n+' moving layer'+(n>1?'s':''):'')+(clip?' · voice':'')); requestUI();
+  toast('Recorded '+fmtTime(r.t)+(n?' · '+n+' moving part'+(n>1?'s':''):'')+(clip?' · voice':'')); requestUI();
 }
 function updateShow(dt){
   const r = show.rec;
@@ -1022,12 +1113,15 @@ function updateShow(dt){
     setRecLabel('● REC '+fmtTime(r.t));
     if (r.t - r.last >= 1/45){
       r.last = r.t;
-      for (const id of controlledIds()){
-        const L = layerById(id); if (!L) continue;
-        let arr = r.layers.get(id);
-        if (!arr){ arr = []; r.layers.set(id, arr);
-          if (r.t > 0.05){ const tr = show.tracks[id]; const p0 = tr ? (trackAt(tr, 0, _tp, _tq2), [_tp.x,_tp.y,_tp.z,_tq2.x,_tq2.y,_tq2.z,_tq2.w, tr.samples[8]]) : [...L.rest.p, ...L.rest.q, L.rest.s]; arr.push(0, ...p0); } }
-        const g = L.group; arr.push(+r.t.toFixed(4), g.position.x, g.position.y, g.position.z, g.quaternion.x, g.quaternion.y, g.quaternion.z, g.quaternion.w, g.scale.x);
+      for (const key of controlledKeys()){
+        const o = objForKey(key); if (!o) continue;
+        let arr = r.keys.get(key);
+        if (!arr){ arr = []; r.keys.set(key, arr);
+          if (r.t > 0.05){ const tr = show.tracks[key]; let p0;
+            if (tr && tr.samples.length){ const s = trackAt(tr, 0, _tp, _tq2); p0 = [_tp.x,_tp.y,_tp.z,_tq2.x,_tq2.y,_tq2.z,_tq2.w,s]; }
+            else p0 = [...o.rest.p, ...o.rest.q, o.rest.s];
+            arr.push(0, ...p0); } }
+        const ob = o.obj; arr.push(+r.t.toFixed(4), ob.position.x, ob.position.y, ob.position.z, ob.quaternion.x, ob.quaternion.y, ob.quaternion.z, ob.quaternion.w, ob.scale.x);
       }
     }
     uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); }
@@ -1039,10 +1133,7 @@ function updateShow(dt){
 }
 
 /* ============================================================
-   SHOOT: camera takes
-   take = {id,name,samples:[t,px,py,pz,qx,qy,qz,qw,...], dur, smooth, every, sharp, speed,
-           fov, fovTrack:[t,fov,...], keys:[{t,p:[3],q:[4]}], edited, inT, outT, scale}
-   Path time u runs 0..dur; the show plays at path time, so slowing a take slows the show too.
+   SHOOT: camera takes (path time u; the show plays at u)
    ============================================================ */
 const shotCam = new THREE.PerspectiveCamera(50, 16/9, 0.01, 5000);
 const ASPECTS = {'16:9':16/9, '1:1':1, '9:16':9/16};
@@ -1119,8 +1210,8 @@ function snapShots(){ return {takes: shots.takes.map(copyTake), seq:shots.seq.sl
 function restoreShots(s){ shots.takes = s.takes.map(copyTake); shots.seq = s.seq.slice(); shots.sel = s.sel; pathDirty = true; requestUI(); }
 function pushShotsUndo(before){ pushUndo({type:'shots', snap:before}); }
 
-let rec = null;   // camera take recording
-let play = null;  // {mode:'take'|'film', t (take: path time u, film: film seconds), tk, lens, clipId}
+let rec = null;
+let play = null;
 const camPoseP = V(), camPoseQ = new THREE.Quaternion();
 function startRecording(){
   if (rec || show.rec) return; stopPlay(); stopShow();
@@ -1161,14 +1252,14 @@ function startPlay(mode){
   stopShow();
   if (mode==='take'){ const tk = selTake(); if (!tk){ toast('Film a take first'); return; } play = {mode, t:tk.inT, tk}; audioPlayFrom(tk.inT, spd(tk)); }
   else { if (!filmClips().length){ toast('No clips on the timeline'); return; } play = {mode, t: shots.playhead >= filmLength()-0.05 ? 0 : shots.playhead, clipId:null}; }
-  placeBigScreen(); requestUI();
+  if (state.phase==='edit') placeBigScreen();
+  requestUI();
 }
 function stopPlay(){
   if (!play) return;
   const p = play; play = null; audioStop();
   if (p.lens && p.lens.samples.length >= 4){
     const tk = p.tk, ls = p.lens.samples, t0 = ls[0], t1 = ls[ls.length-2];
-    const before = p.lens.before;
     const old = tk.fovTrack && tk.fovTrack.length>=4 ? tk.fovTrack : null;
     const out = [];
     const keepOld = (lo, hi) => { if (old) for (let i=0;i<old.length;i+=2) if (old[i] >= lo && old[i] <= hi) out.push(old[i], old[i+1]); };
@@ -1179,7 +1270,7 @@ function stopPlay(){
     keepOld(t1+0.02, 1e9);
     if (!old){ out.unshift(0, tk.fov); out.push(tk.dur, tk.fov); }
     const pairs = []; for (let i=0;i<out.length;i+=2) pairs.push([out[i], out[i+1]]); pairs.sort((a,b)=>a[0]-b[0]);
-    tk.fovTrack = pairs.flat(); pushShotsUndo(before); sceneDirty = true; toast('Zoom moves recorded');
+    tk.fovTrack = pairs.flat(); pushShotsUndo(p.lens.before); sceneDirty = true; toast('Zoom moves recorded');
   }
   requestUI();
 }
@@ -1190,7 +1281,7 @@ function updatePlay(dt){
     play.t += dt*spd(play.tk);
     if (play.t >= play.tk.outT){ stopPlay(); return; }
     poseShotCam(play.tk, play.t);
-    if (play.lens){   // once you touch the zoom during playback, the lens follows you until the take ends
+    if (play.lens){
       const ls = play.lens.samples;
       if (play.t - ls[ls.length-2] > 1/30) ls.push(+play.t.toFixed(3), +state.fov.toFixed(2));
       shotCam.fov = state.fov; shotCam.updateProjectionMatrix();
@@ -1225,7 +1316,6 @@ function deleteKey(tk, i){
   pushShotsUndo(before); pathDirty = true; sceneDirty = true; requestUI();
 }
 
-/* path display */
 const pathGroup = new THREE.Group(); scene.add(pathGroup);
 let pathDirty = true;
 const keyDots = [];
@@ -1259,7 +1349,7 @@ function rebuildPaths(){
   }
 }
 
-/* hand camera (right hand in SHOOT) + monitors + HUD */
+/* hand camera (right hand in SHOOT) */
 let rtW = 512, rtH = 288;
 const rt = new THREE.WebGLRenderTarget(rtW, rtH, {samples:4});
 const camModel = new THREE.Group();
@@ -1290,28 +1380,21 @@ function setRecLabel(t){
   recTex.needsUpdate = true;
 }
 camModel.visible = false;
+// Edit room big screen
 const bigScreen = new THREE.Mesh(new THREE.PlaneGeometry(1,1), monitorMat);
 bigScreen.visible = false; scene.add(bigScreen);
 const bigFrame = new THREE.Mesh(new THREE.PlaneGeometry(1,1), new THREE.MeshBasicMaterial({color:'#111'}));
 bigFrame.position.z = -0.002; bigScreen.add(bigFrame);
 const mirrorCam = new THREE.PerspectiveCamera(55, 16/9, 0.01, 5000);
 
-function setAspect(a){
-  shots.aspect = a; const r = ASPECTS[a];
-  rtW = r>=1 ? 512 : Math.round(512*r); rtH = r>=1 ? Math.round(512/r) : 512;
-  rt.setSize(rtW, rtH);
-  const w = 0.09; handMonitor.scale.set(r>=1? w : w*r, r>=1 ? w/r : w, 1);
-  sizeBigScreen(); requestUI();
-}
 let bigW = 2.4;
 function sizeBigScreen(){ const r = ASPECTS[shots.aspect]; const w = r>=1 ? bigW : bigW*r*1.6; bigScreen.scale.set(w, w/r, 1); bigFrame.scale.set(1.04, 1+0.04*r, 1); }
 function placeBigScreen(){
   if (!renderer.xr.isPresenting) return;
   const s = rig.scale.x; const head = V(); camera.getWorldPosition(head);
   const fwd = V(); camera.getWorldDirection(fwd); fwd.y = 0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
-  const dist = state.phase==='edit' ? 2.6 : 1.5;
-  bigW = (state.phase==='edit' ? 2.4 : 1.1) * s;
-  bigScreen.position.copy(head).addScaledVector(fwd, dist*s); bigScreen.position.y = head.y;
+  bigW = 2.4 * s;
+  bigScreen.position.copy(head).addScaledVector(fwd, 2.6*s); bigScreen.position.y = head.y;
   bigScreen.lookAt(head.x, head.y, head.z);
   sizeBigScreen();
 }
@@ -1319,22 +1402,17 @@ function placeMirror(){
   if (!renderer.xr.isPresenting) return;
   const s = rig.scale.x; const head = V(); camera.getWorldPosition(head);
   const fwd = V(); camera.getWorldDirection(fwd); fwd.y = 0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
-  const right = V().crossVectors(fwd, new THREE.Vector3(0,1,0)).normalize();
-  bigW = 0.9*s;
-  bigScreen.position.copy(head).addScaledVector(fwd, 1.4*s).addScaledVector(right, 0.55*s); bigScreen.position.y = head.y - 0.1*s;
-  bigScreen.lookAt(head.x, head.y, head.z); sizeBigScreen();
   mirrorCam.position.copy(head).addScaledVector(fwd, 1.6*s).add(new THREE.Vector3(0,0.05*s,0));
   mirrorCam.lookAt(head.x, head.y - 0.15*s, head.z); mirrorCam.near = 0.01*s; mirrorCam.far = 5000*s;
 }
 
-/* everything in shotHidden stays out of the movie */
 const shotHidden = [];
 function withShotView(fn){
   const vis = shotHidden.map(o=>o.visible); shotHidden.forEach(o=>o.visible=false);
-  const wv = world.visible, wa = water.visible, bg = scene.background, fg = scene.fog;
-  world.visible = true; water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? fogObj() : null;
+  const wv = world.visible, wa = water.visible, bg = scene.background, fg = scene.fog, sv = studio.visible;
+  world.visible = true; studio.visible = false; water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? fogObj() : null;
   fn();
-  world.visible = wv; water.visible = wa; scene.background = bg; scene.fog = fg; shotHidden.forEach((o,i)=>o.visible=vis[i]);
+  world.visible = wv; studio.visible = sv; water.visible = wa; scene.background = bg; scene.fog = fg; shotHidden.forEach((o,i)=>o.visible=vis[i]);
 }
 function renderPreview(cam){
   withShotView(() => {
@@ -1346,7 +1424,7 @@ function renderPreview(cam){
 }
 
 /* ============================================================
-   EXPORT: MP4 via WebCodecs, rendered frame by frame (picture only for now)
+   EXPORT: MP4 via WebCodecs (picture only for now)
    ============================================================ */
 let exporting = null;
 function exportSize(){
@@ -1408,6 +1486,29 @@ async function exportMP4(){
   finally { if (er){ er.dispose(); er.forceContextLoss?.(); } exporting = null; requestUI(); }
 }
 
+/* ---------------- views: the world and the studio each remember where you were ---------------- */
+const views = {world:{xr:null, desk:null}, studio:{xr:null, desk:null}};
+const stageName = ph => ph==='characters' ? 'studio' : 'world';
+function captureView(name){
+  if (renderer.xr.isPresenting) views[name].xr = {p:rig.position.toArray(), q:rig.quaternion.toArray(), s:rig.scale.x};
+  else views[name].desk = {p:camera.position.toArray(), t:controls.target.toArray()};
+}
+function applyView(name){
+  if (renderer.xr.isPresenting){
+    const v = views[name].xr;
+    if (v){ rig.position.fromArray(v.p); rig.quaternion.fromArray(v.q); rig.scale.setScalar(v.s); }
+    else if (name==='studio'){ rig.position.set(0,0,1.4); rig.quaternion.identity(); rig.scale.setScalar(1); }
+    else { rig.position.set(0, Math.max(0, islandH(0,7)), 7); rig.quaternion.identity(); rig.scale.setScalar(1); }
+    rig.updateMatrixWorld(true);
+  } else {
+    const v = views[name].desk;
+    if (v){ camera.position.fromArray(v.p); controls.target.fromArray(v.t); }
+    else if (name==='studio'){ camera.position.set(0,1.7,2.4); controls.target.set(0,1.3,0); }
+    else { camera.position.set(0,7,15); controls.target.set(0,1,0); }
+    controls.update();
+  }
+}
+
 /* ---------------- save / load ---------------- */
 function u8ToB64(u8){ let s=''; for (let i=0;i<u8.length;i+=0x8000) s+=String.fromCharCode.apply(null, u8.subarray(i,i+0x8000)); return btoa(s); }
 function b64ToU8(b){ const s=atob(b); const u=new Uint8Array(s.length); for (let i=0;i<s.length;i++) u[i]=s.charCodeAt(i); return u; }
@@ -1427,17 +1528,19 @@ function rleDec(u8, w, len){
 }
 const r5 = a => a.map(v => Math.round(v*1e5)/1e5);
 function serialize(){
+  captureView(stageName(state.phase));
   return {
-    app:'ChikiMovieMagic', v:4, enc:'rle', saved:new Date().toISOString(),
+    app:'ChikiMovieMagic', v:5, enc:'rle', saved:new Date().toISOString(),
     settings:{color:state.color, size:state.size, strength:state.strength, tool:state.tool, doodle:state.doodle, doodleSize:state.doodleSize,
               blockMode:state.blockMode, blockShape:state.blockShape, blockSize:state.blockSize, blockSnap:state.blockSnap, blockMix:state.blockMix,
-              activeLayer:state.activeLayer, flySpeed:state.flySpeed, fov:state.fov, labels:state.labels, mirror:state.mirror},
+              activeWorld:state.activeWorld, activePart:state.activePart, selChar:state.selChar, flySpeed:state.flySpeed, fov:state.fov, labels:state.labels, mirror:state.mirror, win:state.win},
     world: state.world,
-    xrRig: xrRigSaved,
+    views,
     shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq},
-    show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64), puppets:show.puppets, puppetSel:show.puppetSel, puppetSeq:show.puppetSeq, audioSeq:show.audioSeq},
+    show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64),
+           chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
-      id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, rest:L.rest,
+      id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, rest:L.rest, char:L.char, part:L.part,
       chunks: [...L.chunks.values()].filter(ch => ch.d && ch.d.some(v=>v>-DMAX+0.01)).map(ch => {
         const q = new Int8Array(CN3); for (let i=0;i<CN3;i++) q[i]=Math.round(ch.d[i]/DMAX*127);
         return {k:ch.k, d:u8ToB64(rleEnc(new Uint8Array(q.buffer),1)), c:u8ToB64(rleEnc(ch.c,3))};
@@ -1447,14 +1550,20 @@ function serialize(){
   };
 }
 function clearScene(){
-  for (const L of layers){ world.remove(L.group); disposeMesh(L.group); }
+  for (const L of layers){ L.group.parent?.remove(L.group); disposeMesh(L.group); }
+  for (const c of show.chars) actors.remove(c.root);
   layers = []; dirty.clear(); undoStack.length=0; redoStack.length=0;
-  show.tracks = {}; show.audio = []; show.puppets = []; show.puppetSel = null; show.embodied = null; show.grab = null; show.t = 0; audioBufs.clear();
+  show.tracks = {}; show.audio = []; show.chars = []; show.embodied = null; show.grab = null; show.t = 0; audioBufs.clear();
+  state.selChar = null; state.activePart = null;
 }
 function deserialize(o){
   clearScene();
+  const sh = o.show || {};
+  for (const cd of (sh.chars||[])){ const c = makeChar(cd.type, cd.name, cd.id); c.place = cd.place; c.placed = cd.placed; }
   for (const ld of o.layers){
-    const L = makeLayer(ld.name, ld.vs || 0.1, ld.id); L.visible=ld.visible; L.locked=ld.locked; L.group.visible=L.visible;
+    const c = ld.char ? charById(ld.char) : null;
+    const L = makeLayer(ld.name, ld.vs || 0.1, ld.id, c ? c.root : world); L.visible=ld.visible; L.locked=ld.locked; L.group.visible=L.visible;
+    if (c){ L.char = c.id; L.part = ld.part || 'extra'; }
     if (ld.rest) L.rest = ld.rest;
     for (const cd of ld.chunks){
       const [cx,cy,cz] = cd.k.split(',').map(Number);
@@ -1468,14 +1577,32 @@ function deserialize(o){
     for (const ch of [...L.chunks.values()]) markAround(L, ch.cx-1,ch.cy-1,ch.cz-1, ch.cx+1,ch.cy+1,ch.cz+1);
     for (const s of ld.strokes){ L.strokes.push(s); rebuildStroke(L, s); }
   }
-  if (o.settings) Object.assign(state, o.settings);
+  if (o.settings){ Object.assign(state, o.settings); if (o.settings.activeLayer && !o.settings.activeWorld) state.activeWorld = o.settings.activeLayer; }
+  state.win = Object.assign({layers:true, preview:true}, state.win || {});
   state.world = Object.assign({sky:'day', water:true, fog:true, custom:{top:[220,0.5], hor:[195,0.8], low:[140,0.45]}}, o.world || {});
   if (!state.world.custom) state.world.custom = {top:[220,0.5], hor:[195,0.8], low:[140,0.45]};
-  if (o.xrRig) xrRigSaved = o.xrRig;
+  if (o.views){ views.world = o.views.world || {xr:null,desk:null}; views.studio = o.views.studio || {xr:null,desk:null}; }
+  else if (o.xrRig) views.world.xr = o.xrRig;
   if (o.shots){ Object.assign(shots, o.shots); shots.takes = (shots.takes || []).map(copyTake); shots.seq = shots.seq || []; }
   else { shots.takes=[]; shots.seq=[]; shots.sel=null; }
-  if (o.show){ show.tracks = o.show.tracks||{}; show.audio = o.show.audio||[]; show.puppets = o.show.puppets||[]; show.puppetSel = o.show.puppetSel ?? null; show.puppetSeq = o.show.puppetSeq||1; show.audioSeq = o.show.audioSeq||1; }
-  if (!layerById(state.activeLayer)) state.activeLayer = layers[0]?.id;
+  show.tracks = sh.tracks||{}; show.audio = sh.audio||[]; show.charSeq = Math.max(show.charSeq, sh.charSeq||1); show.audioSeq = sh.audioSeq||1;
+  // v0.3 saves: puppets made of world layers, and moving world layers, become characters
+  if (!sh.chars && (o.v||0) < 5){
+    for (const L of worldLayers()) if (/^ground/i.test(L.name)) L.rest = {p:[0,0,0], q:[0,0,0,1], s:1};
+    for (const p of (sh.puppets||[])){
+      const c = makeChar('puppet', p.name); c.placed = true;
+      for (const [part, id] of [['head',p.head],['lh',p.lh],['rh',p.rh]]){ const L = layerById(id); if (L && !L.char){ c.root.attach(L.group); L.char = c.id; L.part = part; } }
+    }
+    // a moving world layer becomes a prop, except the ground (in v0.3 it could get grabbed by mistake)
+    const firstWorld = worldLayers()[0];
+    for (const key of Object.keys(show.tracks)){
+      const L = layerById(+key); if (!L || L.char) continue;
+      if (L===firstWorld || /^ground/i.test(L.name) || worldLayers().length<=1){ delete show.tracks[key]; L.rest = {p:[0,0,0], q:[0,0,0,1], s:1}; continue; }
+      const c = makeChar('prop', L.name); c.placed = true; c.root.attach(L.group); L.char = c.id; L.part = 'body';
+    }
+  }
+  if (!layerById(state.activeWorld) || layerById(state.activeWorld).char) state.activeWorld = worldLayers()[0]?.id;
+  if (!charById(state.selChar)) state.selChar = show.chars[0]?.id ?? null;
   applyWorld(); setAspect(shots.aspect||'16:9'); applyShowPose(0); pathDirty = true; requestUI();
 }
 function idb(){ return new Promise((res,rej)=>{ const r=indexedDB.open('chikimoviemagic',1);
@@ -1497,7 +1624,7 @@ function downloadFile(){
 const fileIn = document.getElementById('file');
 fileIn.onchange = async () => {
   const f = fileIn.files[0]; if (!f) return;
-  try { deserialize(JSON.parse(await f.text())); toast('Loaded '+f.name); sceneDirty=true; }
+  try { deserialize(JSON.parse(await f.text())); applyView(stageName(state.phase)); toast('Loaded '+f.name); sceneDirty=true; }
   catch(e){ console.error(e); toast('That file did not load'); }
   fileIn.value='';
 };
@@ -1509,27 +1636,105 @@ function newScene(kind){
   clearScene();
   shots.takes=[]; shots.seq=[]; shots.sel=null; shots.seqSel=null; shots.playhead=0; shots.takeSeq=1; pathDirty=true;
   if (kind==='island'){
-    const L = makeLayer('Ground', 0.1); state.activeLayer = L.id; genIsland(L);
+    const L = makeLayer('Ground', 0.1); state.activeWorld = L.id; genIsland(L);
     Object.assign(state.world, {sky:'day', water:true, fog:true});
   } else {
-    const L = makeLayer('Layer 1', detailFor(0.025*yourScale())); state.activeLayer = L.id;
+    const L = makeLayer('Layer 1', detailFor(0.025*yourScale())); state.activeWorld = L.id;
     Object.assign(state.world, {sky:'day', water:false, fog:false});
   }
-  applyWorld(); if (!renderer.xr.isPresenting) xrRigSaved = null;
-  sceneDirty = true; toast(kind==='island' ? 'New island' : 'New empty sky'); requestUI();
+  applyWorld(); sceneDirty = true; toast(kind==='island' ? 'New island' : 'New empty sky'); requestUI();
 }
 let autosaveT = 0;
 function autosaveTick(dt){ autosaveT += dt; if (autosaveT > 20){ autosaveT = 0; if (sceneDirty && !stroke && !rec && !show.rec && !exporting) saveLocal(true); } }
 addEventListener('visibilitychange', () => { if (document.hidden && sceneDirty) saveLocal(true); });
 
-/* ---------------- left-hand panel UI (shared VR + desktop) ---------------- */
+/* ============================================================
+   WINDOWS: menu, layers, camera preview.
+   Point at one and squeeze right grip to pull it out; let go in the room
+   to leave it there, or near your left hand to dock it.
+   ============================================================ */
 const UIW=480, UIH=680;
 const uiCanvas = document.getElementById('ui');
-const g = uiCanvas.getContext('2d');
-const panelTex = new THREE.CanvasTexture(uiCanvas); panelTex.colorSpace = THREE.SRGBColorSpace;
+const menuCtx = uiCanvas.getContext('2d');
+let g = menuCtx;
 let hits = [], uiNeeds = true, drag = null;
 function requestUI(){ uiNeeds = true; }
 const hit = (x,y,w,h,fn,dragFn) => hits.push({x,y,w,h,fn,drag:dragFn});
+function makeWin(id, canvas, metersW, slot, title){
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas); tex.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(metersW, metersW*canvas.height/canvas.width), new THREE.MeshBasicMaterial({map:tex, toneMapped:false}));
+  const win = {id, canvas, ctx, tex, mesh, hits:[], cw:canvas.width, ch:canvas.height, dock:'hand', slot, title, placedOnce:false};
+  mesh.userData.win = win; mesh.visible = false;
+  return win;
+}
+const menuWin = makeWin('menu', uiCanvas, 0.2, {p:[0,0.13,-0.07], r:[-0.75,0,0], s:1}, 'Menu');
+const layersWin = makeWin('layers', document.getElementById('ui2'), 0.15, {p:[-0.19,0.12,-0.05], r:[-0.75,0.55,0], s:1}, 'Layers');
+const previewHeadCanvas = document.createElement('canvas'); previewHeadCanvas.width = 400; previewHeadCanvas.height = 56;
+const previewWin = makeWin('preview', previewHeadCanvas, 0.4, {p:[-0.2,0.34,-0.08], r:[-0.35,0.45,0], s:0.55}, 'Camera');
+const previewScreen = new THREE.Mesh(new THREE.PlaneGeometry(1,1), monitorMat);
+previewWin.mesh.add(previewScreen);
+previewScreen.userData.win = previewWin;
+function sizePreview(){ const r = ASPECTS[shots.aspect]; const w = 0.4, h = r>=1 ? w/r : w*1.2; const ww = r>=1 ? w : h*r; previewScreen.scale.set(ww, h, 1); previewScreen.position.set(0, -(0.028 + h/2 + 0.004), 0); }
+const panelMesh = menuWin.mesh;
+const WINS = [menuWin, layersWin, previewWin];
+function winVisible(win){
+  if (win===menuWin) return state.panelOpen;
+  if (win===layersWin) return state.win.layers && SCULPT_PHASES.includes(state.phase);
+  if (win===previewWin) return (state.phase==='shoot' && state.win.preview) || (state.phase==='perform' && state.mirror && !!show.embodied);
+  return false;
+}
+function dockWin(win){
+  const L = ctrl.left; if (!L) return;
+  L.grip.add(win.mesh); win.mesh.position.fromArray(win.slot.p); win.mesh.rotation.set(...win.slot.r); win.mesh.scale.setScalar(win.slot.s);
+  win.dock = 'hand'; requestUI();
+}
+function roomWin(win, inFront){
+  if (inFront && renderer.xr.isPresenting){
+    const s = rig.scale.x, head = V(); camera.getWorldPosition(head);
+    const fwd = V(); camera.getWorldDirection(fwd); fwd.y = 0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
+    const right = V().crossVectors(fwd, new THREE.Vector3(0,1,0)).normalize();
+    scene.attach(win.mesh);
+    win.mesh.position.copy(head).addScaledVector(fwd, 0.75*s).addScaledVector(right, (win===previewWin?0.35:win===layersWin?-0.35:0)*s);
+    win.mesh.position.y = head.y + (win===previewWin ? 0.15*s : -0.05*s);
+    win.mesh.lookAt(head); win.mesh.scale.setScalar(s);
+  }
+  rig.attach(win.mesh); if (inFront) win.mesh.scale.setScalar(1);
+  win.dock = 'room'; win.placedOnce = true; requestUI();
+}
+function updateWins(){
+  for (const w of WINS){
+    const v = renderer.xr.isPresenting && winVisible(w);
+    if (v && w===previewWin && !w.placedOnce){ roomWin(w, true); }
+    if (v && w.dock==='hand' && !w.mesh.parent && ctrl.left) dockWin(w);
+    w.mesh.visible = v;
+  }
+  layersWin.canvas.style.display = (!renderer.xr.isPresenting && winVisible(layersWin)) ? 'block' : 'none';
+}
+// window grabbing (rig-local so it stays put in your room)
+let winGrab = null;
+function startWinGrab(win, R){
+  if (win.dock==='hand') toast('Let go in the room to leave it there, or bring your hands together to dock it');
+  rig.attach(win.mesh); win.mesh.updateMatrix(); R.grip.updateMatrix();
+  winGrab = {win, rel: R.grip.matrix.clone().invert().multiply(win.mesh.matrix.clone())};
+  pulse('right',0.4,25);
+}
+function moveWinGrab(R){
+  if (!winGrab) return; R.grip.updateMatrix();
+  const m = R.grip.matrix.clone().multiply(winGrab.rel); const p=V(), q=new THREE.Quaternion(), s=V(); m.decompose(p,q,s);
+  winGrab.win.mesh.position.copy(p); winGrab.win.mesh.quaternion.copy(q);
+}
+function endWinGrab(){
+  if (!winGrab) return; const w = winGrab.win; winGrab = null;
+  const L = ctrl.left;
+  const R = ctrl.right;
+  const near = L && (w.mesh.position.distanceTo(L.grip.position) < 0.16 || (R && R.grip.position.distanceTo(L.grip.position) < 0.15));
+  if (near){ dockWin(w); toast(w.title+' docked on your hand'); }
+  else { w.dock = 'room'; w.placedOnce = true; }
+  requestUI();
+}
+
+/* drawing helpers (draw into whichever window g / hits point at) */
 function rr(x,y,w,h,r,fill,strokeCol){ g.beginPath(); g.roundRect(x,y,w,h,r); if(fill){g.fillStyle=fill;g.fill();} if(strokeCol){g.strokeStyle=strokeCol;g.lineWidth=3;g.stroke();} }
 function txt(s,x,y,size=20,col='#fff',align='left',weight=800){ g.font=`${weight} ${size}px system-ui,sans-serif`; g.fillStyle=col; g.textAlign=align; g.textBaseline='middle'; g.fillText(s,x,y); }
 function para(lines, x, y, size=15, col='#8f97c7', lh=22){ g.font=`600 ${size}px system-ui,sans-serif`; g.fillStyle=col; g.textAlign='left'; g.textBaseline='middle'; lines.forEach((l,i)=>g.fillText(l,x,y+i*lh)); }
@@ -1575,60 +1780,128 @@ function icon(name,cx,cy,col){
   else if (name==='lens'){ g.beginPath(); g.arc(0,0,13,0,7); g.stroke(); g.beginPath(); g.arc(0,0,6,0,7); g.fill(); }
   else if (name==='timeline'){ g.lineWidth=3; g.strokeRect(-14,-8,28,16); g.fillRect(-14,-8,9,16); g.fillRect(-1,-8,6,16); g.beginPath(); g.moveTo(8,-13); g.lineTo(8,13); g.stroke(); }
   else if (name==='export'){ g.beginPath(); g.moveTo(0,-13); g.lineTo(0,6); g.stroke(); g.beginPath(); g.moveTo(-7,-1); g.lineTo(0,6); g.lineTo(7,-1); g.stroke(); g.fillRect(-13,9,26,4); }
-  else if (name==='puppets'){ g.beginPath(); g.arc(0,-4,9,0,7); g.fill(); g.beginPath(); g.arc(-13,10,5,0,7); g.fill(); g.beginPath(); g.arc(13,10,5,0,7); g.fill(); }
+  else if (name==='chars'){ g.beginPath(); g.arc(0,-4,9,0,7); g.fill(); g.beginPath(); g.arc(-13,10,5,0,7); g.fill(); g.beginPath(); g.arc(13,10,5,0,7); g.fill(); }
   else if (name==='perform'){ g.beginPath(); g.arc(0,0,13,0,7); g.stroke(); g.beginPath(); g.arc(0,0,7,0,7); g.fillStyle='#ff3b30'; g.fill(); }
   else if (name==='tracks'){ g.beginPath(); g.moveTo(-14,8); g.bezierCurveTo(-6,-12,4,12,14,-8); g.stroke(); g.beginPath(); g.arc(14,-8,4,0,7); g.fill(); }
   else { g.beginPath(); g.arc(0,0,11,0,7); g.stroke(); }
   g.restore();
 }
 const KEYS_VR = {
-  build:['Right trigger: tool   A: add↔carve   B: last tool','X: undo   Y: redo   Left trigger: this menu','Right grip on a block: move it   Grip: world','Left stick: fly   Right stick: size ↕ strength ↔'],
-  cast: ['Make a starter puppet, sculpt on its layers,','then Perform → Step in.','Grip: drag world   Both grips: move/turn/scale','X: undo   Y: redo   Left trigger: this menu'],
-  perform:['A: record (3-2-1) / cut   B: play the show','Right grip on a layer: grab and move it','Stepped in: your head and hands move it','X: undo   Y: redo   Left trigger: this menu'],
+  build:['Right trigger: tool   A: add↔carve   B: last tool','X: undo   Y: redo   Left trigger: menu','Right grip on a block: move it   Grip: world','Point + grip on a window: pull it out'],
+  characters:['A separate studio: sculpt characters here at','any size, then place them from PERFORM.','Right trigger: tool   A: add↔carve   B: last tool','Point + grip on a window: pull it out'],
+  perform:['A: record (3-2-1) / cut   B: play the show','Right grip on a character: grab and move it','Stepped in: your head and hands move it','Grip elsewhere: move / scale yourself'],
   shoot:['Hold right trigger: film a take (3-2-1)','A: play/stop take   B: next take','Right stick ↕: zoom (records while playing)','Right grip on a dot: move that key'],
-  edit: ['A: play/stop the film','Tap the strip to jump, tap a clip to trim it','X: undo   Y: redo   Left trigger: this menu','Grip: drag world   Left stick: fly'],
+  edit: ['A: play/stop the film','Tap the strip to jump, tap a clip to trim it','X: undo   Y: redo   Left trigger: menu','Grip: drag world   Left stick: fly'],
 };
 const KEYS_DESK = {
   build:'Left-drag: use tool · Shift-drag a block: move it · Right-drag: orbit · Middle-drag: pan · Wheel: zoom<br>A / Space: add↔carve · B: last tool · X: undo · Y: redo · [ ]: size · 1–6: tools · Tab: menu',
-  cast: 'Right-drag: orbit · Wheel: zoom · X: undo · Y: redo · Tab: menu',
-  perform:'Left-drag a layer: move it · R: record (3-2-1) / cut · Space: play the show<br>Right-drag: orbit · X: undo · Y: redo · Tab: menu',
+  characters:'The character studio — sculpt here, it doesn’t touch the world · Left-drag: tool · Right-drag: orbit<br>A / Space: add↔carve · B: last tool · X: undo · Y: redo · [ ]: size · Tab: menu',
+  perform:'Left-drag a character: move it · R: record (3-2-1) / cut · Space: play the show<br>Right-drag: orbit · X: undo · Y: redo · Tab: menu',
   shoot:'R: record your view (3-2-1) · A / Space: play take · B: next take · - / =: zoom (records while playing)<br>Right-drag: orbit · Middle-drag: pan · Wheel: zoom · X: undo · Y: redo · Tab: menu',
   edit: 'A / Space: play / stop the film · X: undo · Y: redo · Tab: menu',
 };
 function drawUI(){
-  uiNeeds = false; hits = [];
+  uiNeeds = false;
+  g = menuCtx; hits = [];
   const ph = PHASES.find(p=>p.id===state.phase);
   g.clearRect(0,0,UIW,UIH);
   rr(0,0,UIW,UIH,26,'#151935');
-  rr(12,12,196,50,25,ph.col); txt(ph.name+'  ▾', 32, 38, 24, '#111');
-  hit(12,12,196,50,()=>{ state.dialOpen=!state.dialOpen; requestUI(); });
+  rr(12,12,214,50,25,ph.col); txt(ph.name+' ▾', 26, 38, ph.name.length>8?19:24, '#111');
+  hit(12,12,214,50,()=>{ state.dialOpen=!state.dialOpen; requestUI(); });
   drawChip();
   rr(10,76,84,UIH-88,18,'#0d1029');
   const rail = RAILS[state.phase] || [...(PLANNED[state.phase]||[]).map(n=>['soon',n]), ['scene','Scene']];
   rail.forEach(([id,label],i) => {
-    const y = 84 + i*80; const on = state.page===id;
+    const y = 84 + i*80;
+    const on = id==='layers' ? state.win.layers : state.page===id;
     const disabled = id==='soon';
-    if (on) rr(16,y,72,72,14,'#ffd400');
+    if (on) rr(16,y,72,72,14, id==='layers' ? '#00c7be' : '#ffd400');
     icon(id, 52, y+26, on ? '#111' : disabled ? '#4a5080' : '#fff');
     txt(label.length>8?label.slice(0,8)+'…':label, 52, y+57, 13, on?'#111':disabled?'#4a5080':'#cfd6ff','center',700);
     if (!disabled) hit(16,y,72,72,()=>openPage(id));
   });
   const X=110, W=UIW-X-16;
-  ({soon:()=>drawSoon(X,W,ph), tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, layers:drawLayers, world:drawWorld, sky:drawSky,
+  ({soon:()=>drawSoon(X,W,ph), tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, world:drawWorld, sky:drawSky,
     scene:drawScene, takes:drawTakes, path:drawPath, keys:drawKeysPage, lens:drawLens, timeline:drawTimeline, export:drawExport,
-    puppets:drawPuppets, perform:drawPerform, tracks:drawTracks}[state.page] || (()=>drawSoon(X,W,ph)))(X,W,ph);
+    chars:drawChars, perform:drawPerform, tracks:drawTracks}[state.page] || (()=>drawSoon(X,W,ph)))(X,W,ph);
   if (state.toastT>0){
     const lines = wrap(state.toastMsg, W-24, 15).slice(0,3); const h = 22+lines.length*20;
     rr(X,UIH-16-h,W,h,18,'#ffd400'); lines.forEach((l,i)=>txt(l, X+W/2, UIH-16-h+21+i*20, 15, '#111','center'));
   }
   if (state.dialOpen) drawDial();
-  panelTex.needsUpdate = true;
+  menuWin.hits = hits; menuWin.tex.needsUpdate = true;
   document.getElementById('keys').innerHTML = KEYS_DESK[state.phase] || KEYS_DESK.build;
-  drawLegends();
+  drawLayersWin(); drawPreviewHead(); drawLegends();
+}
+function winHeader(win, W){
+  rr(0,0,W,48,0,'#0d1029'); txt(win.title, 16, 25, 19, '#fff');
+  if (renderer.xr.isPresenting){
+    const dockLbl = win.dock==='hand' ? 'Pull out' : 'To hand';
+    rr(W-150,7,92,34,17,'#1e6bff'); txt(dockLbl, W-104, 25, 14, '#fff','center'); hit(W-150,7,92,34,()=>{ win.dock==='hand' ? roomWin(win,true) : dockWin(win); });
+  }
+  rr(W-50,7,40,34,17,'#ff3b30'); txt('✕', W-30, 25, 16, '#fff','center');
+  hit(W-50,7,40,34,()=>{ if (win===layersWin) state.win.layers=false; else if (win===previewWin){ if (state.phase==='perform') state.mirror=false; else state.win.preview=false; } requestUI(); });
+}
+function drawLayersWin(){
+  const win = layersWin, W = win.cw, H = win.ch;
+  g = win.ctx; hits = [];
+  g.clearRect(0,0,W,H); rr(0,0,W,H,22,'#151935');
+  win.title = inStudio() ? (selChar() ? selChar().name+' parts' : 'Parts') : 'Layers';
+  winHeader(win, W);
+  const list = domainLayers().slice().reverse().slice(0,7);
+  const studioMode = inStudio();
+  if (studioMode && !selChar()) para(['Make a character first','on the Characters page.'], 16, 80, 16);
+  list.forEach((L,i)=>{
+    const y = 58 + i*54, on = activeLayer()===L;
+    rr(12,y,W-24,48,12,on?'#ff9500':'#2a3060');
+    const nm = studioMode ? (PART_NAMES[L.part]||L.name) : L.name;
+    txt(nm.length>15?nm.slice(0,14)+'…':nm, 24, y+17, 17, on?'#111':'#fff');
+    txt('detail '+fmtLen(L.vs), 24, y+36, 12, on?'#3a2000':'#8f97c7','left',700);
+    hit(12,y,W-120,48,()=>{ setActive(L); });
+    rr(W-108,y+6,44,36,10,L.visible?'#1e6bff':'#0d1029'); txt(L.visible?'👁':'—', W-86, y+25, 17,'#fff','center');
+    hit(W-108,y+6,44,36,()=>{ L.visible=!L.visible; L.group.visible=L.visible; sceneDirty=true; requestUI(); });
+    rr(W-58,y+6,44,36,10,L.locked?'#ff3b30':'#0d1029'); txt(L.locked?'🔒':'🔓', W-36, y+25, 16,'#fff','center');
+    hit(W-58,y+6,44,36,()=>{ L.locked=!L.locked; sceneDirty=true; requestUI(); });
+  });
+  const y = 58 + Math.max(1,list.length)*54 + 6, hw = (W-24-8)/2;
+  const nd = detailFor(0.025*yourScale());
+  if (!studioMode || selChar()){
+    button(12,y,hw,46, studioMode?'+ Extra part':'+ New layer',false,()=>{
+      if (layers.length>=40){ toast('Too many layers for now'); return; }
+      let L; if (studioMode){ const c = selChar(); L = addPart(c,'extra',detailFor(0.025*yourScale())); state.activePart = L.id; }
+      else { L = makeLayer('Layer '+layerSeq, nd); state.activeWorld = L.id; }
+      sceneDirty=true; toast('New '+(studioMode?'part':'layer')+' · detail '+fmtLen(L.vs)); requestUI(); },'#34c759');
+    const armed = state.confirm==='dellayer';
+    button(12+hw+8,y,hw,46,armed?'Tap again':'Delete',armed,()=>{
+      if (!armed){ state.confirm='dellayer'; requestUI(); return; }
+      state.confirm=null; const L = activeLayer(); if (!L) return;
+      if (!studioMode && worldLayers().length<=1){ toast('Keep at least one layer'); return; }
+      if (studioMode && partsOf(selChar()).length<=1){ toast('A character needs at least one part'); return; }
+      removeLayer(L); sceneDirty=true; requestUI(); },'#ff3b30');
+    button(12,y+54,hw,42,'Finer',false,()=>changeDetail(activeLayer(),-1),'#1e6bff');
+    button(12+hw+8,y+54,hw,42,'Coarser',false,()=>changeDetail(activeLayer(),1),'#1e6bff');
+    if (y+150 < H) para(['New layers match your size now:', fmtLen(nd)+' detail.'], 16, y+124, 13);
+  }
+  win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
+}
+function drawPreviewHead(){
+  const win = previewWin, W = win.cw;
+  g = win.ctx; hits = []; g.clearRect(0,0,W,win.ch);
+  win.title = state.phase==='perform' ? 'Mirror' : 'Camera';
+  rr(0,0,W,win.ch,14,'#0d1029');
+  txt(win.title, 16, 28, 20, '#fff');
+  if (renderer.xr.isPresenting){
+    const dockLbl = win.dock==='hand' ? 'Pull out' : 'To hand';
+    rr(W-150,10,92,36,18,'#1e6bff'); txt(dockLbl, W-104, 28, 14, '#fff','center'); hit(W-150,10,92,36,()=>{ win.dock==='hand' ? roomWin(win,true) : dockWin(win); });
+  }
+  rr(W-50,10,40,36,18,'#ff3b30'); txt('✕', W-30, 28, 16, '#fff','center');
+  hit(W-50,10,40,36,()=>{ if (state.phase==='perform') state.mirror=false; else state.win.preview=false; requestUI(); });
+  win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
 }
 function openPage(id){
+  if (id==='layers'){ state.win.layers = !state.win.layers; if (state.win.layers && renderer.xr.isPresenting && layersWin.dock==='hand') dockWin(layersWin); requestUI(); return; }
   state.page=id; state.confirm=null;
-  if (state.phase==='build'){
+  if (SCULPT_PHASES.includes(state.phase)){
     if (id==='blocks' && state.tool!=='blocks') setTool('blocks');
     else if (id==='doodle' && state.tool!=='doodle' && state.tool!=='erase') setTool('doodle');
     else if (id==='tools' && !['clay','smooth','paint'].includes(state.tool)) setTool(state.lastSculpt||'clay');
@@ -1637,18 +1910,17 @@ function openPage(id){
 }
 function drawChip(){
   let t='', tc='#fff';
-  if (state.phase==='build'){
+  if (SCULPT_PHASES.includes(state.phase)){
     t = state.tool==='clay' ? (state.carve?'CARVE':'ADD') : state.tool==='blocks' ? ({stamp:'STAMP',box:'BOX',angle:'4-POINT',fill:'FILL'}[state.blockMode]) : state.tool.toUpperCase();
     tc = state.tool==='clay' ? (state.carve?'#ff3b30':'#34c759') : state.tool==='smooth' ? '#1e6bff' : state.tool==='erase' ? '#ff3b30' : state.color;
   } else if (state.phase==='shoot'){
     t = rec ? (rec.phase==='rec' ? 'REC '+fmtTime(rec.t) : 'READY…') : play ? 'PLAYING' : (selTake()?.name || 'NO TAKES').toUpperCase();
     tc = rec ? '#ff3b30' : '#1e6bff';
   } else if (state.phase==='edit'){ t = 'FILM '+fmtTime(filmLength()); tc = '#5e2bff'; }
-  else if (state.phase==='perform'){ t = show.rec ? (show.rec.phase==='rec' ? 'REC '+fmtTime(show.rec.t) : 'READY…') : show.playing ? 'PLAYING' : show.embodied ? 'IN '+show.embodied.p.name.toUpperCase() : 'SHOW '+fmtTime(showLength()); tc = show.rec ? '#ff3b30' : '#ff2d95'; }
-  else if (state.phase==='cast'){ t = (selPuppet()?.name || 'NO PUPPET').toUpperCase(); tc = '#34c759'; }
+  else if (state.phase==='perform'){ t = show.rec ? (show.rec.phase==='rec' ? 'REC '+fmtTime(show.rec.t) : 'READY…') : show.playing ? 'PLAYING' : show.embodied ? 'IN '+show.embodied.c.name.toUpperCase() : 'SHOW '+fmtTime(showLength()); tc = show.rec ? '#ff3b30' : '#ff2d95'; }
   else return;
-  rr(UIW-176,16,162,42,21,'#0d1029'); g.beginPath(); g.arc(UIW-154,37,10,0,7); g.fillStyle=tc; g.fill();
-  txt(t.length>11?t.slice(0,11):t, UIW-136, 38, 17, '#fff');
+  rr(UIW-160,16,146,42,21,'#0d1029'); g.beginPath(); g.arc(UIW-138,37,10,0,7); g.fillStyle=tc; g.fill();
+  txt(t.length>10?t.slice(0,10):t, UIW-120, 38, 16, '#fff');
 }
 function drawSoon(X,W,ph){
   txt(ph.name, X, 100, 28, ph.col);
@@ -1669,7 +1941,7 @@ function drawTools(X,W){
   rr(X,440,52,52,12,state.color); txt('Brush color', X+64, 466, 18, '#cfd6ff','left',700);
   hit(X,440,W,52,()=>{state.page='color'; requestUI();});
   const L = activeLayer();
-  if (L) para(['Layer "'+L.name+'": '+fmtLen(L.vs)+' detail','Carve also clears blocks and doodles','that sit fully inside the brush.'], X, 530, 14);
+  if (L) para(['Working on "'+(L.name.length>20?L.name.slice(0,19)+'…':L.name)+'" ('+fmtLen(L.vs)+')','Carve also clears blocks and doodles','that sit fully inside the brush.'], X, 530, 14);
 }
 function drawColor(X,W){
   txt('Color', X, 100, 26);
@@ -1712,38 +1984,9 @@ function drawBlocks(X,W){
   button(X,470,W,46,'Eraser',state.tool==='erase',()=>setTool('erase'),'#ff3b30');
   para(BLOCK_HINTS[state.blockMode].concat(['Right grip on any block picks it up.']), X, 540, 14, '#8f97c7', 21);
 }
-function drawLayers(X,W){
-  txt('Layers', X, 100, 26);
-  const rows = [...layers].reverse().slice(0,8);
-  rows.forEach((L,i)=>{
-    const y=122+i*52, on=L.id===state.activeLayer;
-    rr(X,y,W,46,12,on?'#ff9500':'#2a3060');
-    txt(L.name.length>16?L.name.slice(0,15)+'…':L.name, X+12, y+16, 17, on?'#111':'#fff');
-    txt('detail '+fmtLen(L.vs)+(show.tracks[L.id]?' · moves':''), X+12, y+34, 12, on?'#3a2000':'#8f97c7','left',700);
-    hit(X,y,W-104,46,()=>{state.activeLayer=L.id; requestUI();});
-    rr(X+W-100,y+5,44,36,10,L.visible?'#1e6bff':'#0d1029'); txt(L.visible?'👁':'—', X+W-78, y+24, 17,'#fff','center');
-    hit(X+W-100,y+5,44,36,()=>{L.visible=!L.visible; L.group.visible=L.visible; sceneDirty=true; requestUI();});
-    rr(X+W-50,y+5,44,36,10,L.locked?'#ff3b30':'#0d1029'); txt(L.locked?'🔒':'🔓', X+W-28, y+24, 16,'#fff','center');
-    hit(X+W-50,y+5,44,36,()=>{L.locked=!L.locked; sceneDirty=true; requestUI();});
-  });
-  const y = 122+Math.min(8,layers.length)*52+6, hw=(W-8)/2;
-  const nd = detailFor(0.025*yourScale());
-  button(X,y,hw,48,'+ New layer',false,()=>{ if(layers.length>=12){toast('12 layers max for now');return;} const L=makeLayer('Layer '+(layerSeq), nd); state.activeLayer=L.id; sceneDirty=true; toast('New layer · detail '+fmtLen(nd)); requestUI(); },'#34c759');
-  const armed = state.confirm==='dellayer';
-  button(X+hw+8,y,hw,48,armed?'Tap to confirm':'Delete layer',armed,()=>{
-    if (!armed){ state.confirm='dellayer'; requestUI(); return; }
-    state.confirm=null; if (layers.length<=1){ toast('Keep at least one layer'); return; }
-    const L=activeLayer(); world.remove(L.group); disposeMesh(L.group); layers=layers.filter(l=>l!==L); delete show.tracks[L.id];
-    for (const k of [...dirty.keys()]) if (k.startsWith(L.id+'|')) dirty.delete(k);
-    state.activeLayer=layers[layers.length-1].id; sceneDirty=true; requestUI(); },'#ff3b30');
-  const L = activeLayer();
-  if (L && y+104 < UIH-60){
-    button(X,y+56,hw,42,'Finer',false,()=>changeDetail(L,-1),'#1e6bff');
-    button(X+hw+8,y+56,hw,42,'Coarser',false,()=>changeDetail(L,1),'#1e6bff');
-  }
-}
 function changeDetail(L, dir){
-  if (layerHasClay(L)){ toast('This layer already has clay, so its detail is fixed. Tap + New layer for finer clay.'); return; }
+  if (!L) return;
+  if (layerHasClay(L)){ toast('This layer already has clay, so its detail is fixed. Make a new layer for finer clay.'); return; }
   const i = DETAILS.indexOf(L.vs); const j = clamp((i<0?5:i) - dir, 0, DETAILS.length-1);
   L.vs = DETAILS[j]; L.chunks.clear(); toast('"'+L.name+'" detail '+fmtLen(L.vs)); sceneDirty=true; requestUI();
 }
@@ -1762,8 +2005,8 @@ function drawWorld(X,W){
     txt(SKIES[k].name, x+bw/2, y+70, 13, '#cfd6ff','center',700);
     hit(x,y,bw,78,()=>{ state.world.sky=k; applyWorld(); sceneDirty=true; requestUI(); }); });
   button(X,318,W,44,'Edit my sky colors',false,()=>{ if (state.world.sky!=='custom'){ copySkyToCustom(); state.world.sky='custom'; applyWorld(); } state.page='sky'; requestUI(); },'#5e2bff');
-  toggle(X,374,W,46,'Water floor',state.world.water,()=>{ state.world.water=!state.world.water; applyWorld(); sceneDirty=true; requestUI(); },'#1e6bff');
-  toggle(X,428,W,46,'Fog',state.world.fog,()=>{ state.world.fog=!state.world.fog; applyWorld(); sceneDirty=true; requestUI(); },'#00c7be');
+  toggle(X,374,W,46,'Water floor',state.world.water,()=>{ state.world.water=!state.world.water; sceneDirty=true; requestUI(); },'#1e6bff');
+  toggle(X,428,W,46,'Fog',state.world.fog,()=>{ state.world.fog=!state.world.fog; sceneDirty=true; requestUI(); },'#00c7be');
   para(['With the water off, things float in the sky.','Start fresh: Scene → New empty sky.'], X, 506, 14);
 }
 function copySkyToCustom(){
@@ -1775,11 +2018,9 @@ function drawSky(X,W){
   txt('My sky', X, 100, 26);
   const c = state.world.custom;
   skySwatch(X+W-70, 82, 70, 40, {top:hsl(...c.top), hor:hsl(...c.hor), low:hsl(...c.low)});
-  const rows = [['top','Top of the sky'],['hor','Horizon'],['low','Below the horizon']];
-  rows.forEach(([k,label],i)=>{
+  [['top','Top of the sky'],['hor','Horizon'],['low','Below the horizon']].forEach(([k,label],i)=>{
     const y = 140 + i*150;
     rr(X, y-14, 26, 26, 8, hsl(...c[k])); txt(label, X+36, y, 17, '#fff');
-    // hue strip
     const hy = y+22; const gr = g.createLinearGradient(X,0,X+W,0);
     for (let h=0; h<=360; h+=30) gr.addColorStop(h/360, hsl(h, 0.5));
     g.beginPath(); g.roundRect(X,hy,W,26,13); g.fillStyle=gr; g.fill();
@@ -1802,9 +2043,10 @@ function drawScene(X,W){
   button(X+hw+8,240,hw,50,a2?'Tap to confirm':'New empty sky',a2,()=>{ if(!a2){state.confirm='newempty';requestUI();return;} state.confirm=null; newScene('empty'); },'#ff3b30');
   slider(X,318,W,'Fly speed (left stick)', state.flySpeed, 0.5, 8, v=>state.flySpeed=v, '#00c7be');
   toggle(X,370,W,44,'Button labels on controllers',state.labels,()=>{ state.labels=!state.labels; requestUI(); },'#ffd400');
+  if (renderer.xr.isPresenting) button(X,422,W,40,'Dock all windows to my hand',false,()=>{ for (const w of WINS) dockWin(w); },'#00c7be');
   const ys = yourScale();
-  txt('Your size  '+(ys<1 ? '1/'+(+(1/ys).toFixed(1)) : (+ys.toFixed(1)))+'×', X, 442, 16, '#cfd6ff','left',700);
-  para(KEYS_VR[state.phase] || KEYS_VR.build, X, 474, 14, '#8f97c7', 23);
+  txt('Your size  '+(ys<1 ? '1/'+(+(1/ys).toFixed(1)) : (+ys.toFixed(1)))+'×', X, 482, 16, '#cfd6ff','left',700);
+  para(KEYS_VR[state.phase] || KEYS_VR.build, X, 512, 13, '#8f97c7', 21);
   txt('v'+VERSION, X+W, UIH-24, 13, '#4a5080','right',600);
 }
 function drawTakes(X,W){
@@ -1814,12 +2056,13 @@ function drawTakes(X,W){
   else button(X,122,W,50, rec ? '■ Stop recording' : '● Record my view  (R)', !!rec, ()=>{ rec ? stopRecording() : startRecording(); }, '#ff3b30');
   button(X,180,hw,48, play?.mode==='take' ? '■ Stop' : '▶ Play take', play?.mode==='take', ()=>{ play ? stopPlay() : startPlay('take'); }, '#34c759');
   button(X+hw+8,180,hw,48,'Next take',false,()=>nextTake(),'#1e6bff');
-  const list = shots.takes.slice(-7);
+  const list = shots.takes.slice(-6);
   if (!list.length) para(['No takes yet.','In this phase your right hand is a','camera; its screen shows the shot.','The show plays while you film.'], X, 268, 15);
   list.forEach((tk,i)=>{ const y=238+i*48, on=tk.id===shots.sel;
     rr(X,y,W,42,10,on?'#1e6bff':'#2a3060'); txt(tk.name, X+12, y+21, 17, '#fff');
     txt(clipLen(tk).toFixed(1)+' s'+(tk.edited?' · edited':'')+(tk.fovTrack?' · zoom':''), X+W-12, y+21, 14, on?'#fff':'#8f97c7','right',700);
     hit(X,y,W,42,()=>{ shots.sel=tk.id; shots.keySel=-1; stopPlay(); pathDirty=true; requestUI(); }); });
+  if (renderer.xr.isPresenting) toggle(X,UIH-170,W,42,'Camera window',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
   const a = state.confirm==='deltake';
   if (selTake()) button(X,UIH-118,W,44,a?'Tap to confirm':'Delete '+selTake().name,a,()=>{
     if(!a){state.confirm='deltake';requestUI();return;} state.confirm=null;
@@ -1845,10 +2088,10 @@ function drawKeysPage(X,W){
   const tk = selTake();
   if (!tk){ para(['Film a take first.'], X, 140, 16); return; }
   txt(tk.name, X+W, 100, 17, '#ffd400','right');
-  slider(X,130,W,'Scrub the path', shots.keyT, 0, tk.dur, v=>{ shots.keyT=v; let bi=-1, bd=1e9; tk.keys.forEach((k,i)=>{ const d=Math.abs(k.t-v); if (d<bd){bd=d;bi=i;} }); if (bi!==shots.keySel){ shots.keySel = bd < Math.max(0.15, tk.every*0.3) ? bi : -1; pathDirty=true; } }, '#ffd400', shots.keyT.toFixed(1)+' s');
-  const hw=(W-8)/2, tw=(W-16)/3;
+  slider(X,130,W,'Scrub the path', shots.keyT, 0, tk.dur, v=>{ shots.keyT=v; let bi=-1, bd=1e9; tk.keys.forEach((k,i)=>{ const d=Math.abs(k.t-v); if (d<bd){bd=d;bi=i;} }); const ns = bd < Math.max(0.15, tk.every*0.3) ? bi : -1; if (ns!==shots.keySel){ shots.keySel = ns; pathDirty=true; } }, '#ffd400', shots.keyT.toFixed(1)+' s');
+  const tw=(W-16)/3;
   button(X,194,W,48,'+ Add a key here',false,()=>addKeyAt(tk, shots.keyT),'#34c759');
-  button(X,250,tw,46,'◀ Key',false,()=>{ const i = Math.max(0,(shots.keySel<0? tk.keys.findIndex(k=>k.t>=shots.keyT) : shots.keySel)-1); shots.keySel=i; shots.keyT=tk.keys[i].t; pathDirty=true; requestUI(); },'#1e6bff');
+  button(X,250,tw,46,'◀ Key',false,()=>{ const i = clamp((shots.keySel<0? tk.keys.findIndex(k=>k.t>=shots.keyT) : shots.keySel)-1, 0, tk.keys.length-1); shots.keySel=i; shots.keyT=tk.keys[i].t; pathDirty=true; requestUI(); },'#1e6bff');
   button(X+tw+8,250,tw,46,'Key ▶',false,()=>{ const i = clamp((shots.keySel<0? tk.keys.findIndex(k=>k.t>shots.keyT)-1 : shots.keySel)+1, 0, tk.keys.length-1); shots.keySel=i; shots.keyT=tk.keys[i].t; pathDirty=true; requestUI(); },'#1e6bff');
   button(X+2*(tw+8),250,tw,46,'Delete',false,()=>deleteKey(tk, shots.keySel),'#ff3b30');
   txt(shots.keySel>=0 ? 'Key '+(shots.keySel+1)+' of '+tk.keys.length+' (white dot)' : tk.keys.length+' keys · none picked', X, 318, 15, '#cfd6ff','left',700);
@@ -1922,59 +2165,64 @@ function drawExport(X,W){
   } else button(X,410,W,56,'Export MP4',false,exportMP4,'#ff3b30');
   para(['Renders every frame cleanly, so it runs','best in desktop Chrome: open the same','scene there (Scene → Download / Load).','Picture only for now — voices come next.'], X, 500, 14);
 }
-function drawPuppets(X,W){
-  txt('Puppets', X, 100, 26);
-  button(X,122,W,50,'+ Starter puppet (head + hands)',false,makeStarterPuppet,'#34c759');
-  const list = show.puppets.slice(-4);
-  list.forEach((p,i)=>{ const y=182+i*46, on=p.id===show.puppetSel;
-    rr(X,y,W,40,10,on?'#34c759':'#2a3060'); txt(p.name, X+12, y+20, 17, on?'#111':'#fff');
-    hit(X,y,W,40,()=>{ show.puppetSel=p.id; requestUI(); }); });
-  const p = selPuppet();
-  const y0 = 182+Math.max(1,list.length)*46+10;
-  if (!p){ para(['Make one, or build head and hand','layers yourself and pick them here.'], X, y0+10, 15); return; }
-  const slots = [['head','Head'],['lh','Left hand'],['rh','Right hand']];
-  const ids = [null, ...layers.map(L=>L.id)];
-  slots.forEach(([k,label],i)=>{
-    const y = y0 + i*48;
-    txt(label, X, y+20, 15, '#cfd6ff','left',700);
-    const bx = X+92, bw = W-92;
-    rr(bx, y, bw, 40, 10, '#0d1029');
-    const L = layerById(p[k]); txt(L ? (L.name.length>14?L.name.slice(0,13)+'…':L.name) : '— none —', bx+bw/2, y+20, 15, L?'#fff':'#8f97c7','center');
-    const cyc = d => { let j = ids.indexOf(p[k] ?? null); j = (j + d + ids.length) % ids.length; p[k] = ids[j]; sceneDirty=true; requestUI(); };
-    rr(bx, y, 36, 40, 10, '#1e6bff'); txt('◀', bx+18, y+20, 16, '#fff','center'); hit(bx, y, 36, 40, ()=>cyc(-1));
-    rr(bx+bw-36, y, 36, 40, 10, '#1e6bff'); txt('▶', bx+bw-18, y+20, 16, '#fff','center'); hit(bx+bw-36, y, 36, 40, ()=>cyc(1));
-  });
-  const yb = y0 + 150;
+function drawChars(X,W){
+  txt('Characters', X, 100, 26);
   const hw=(W-8)/2;
-  button(X,yb,hw,46, show.embodied ? 'Step out' : 'Step in', !!show.embodied, ()=>{ show.embodied ? stepOut() : stepIn(p); }, '#ff2d95');
-  const a = state.confirm==='delpup';
-  button(X+hw+8,yb,hw,46,a?'Tap to confirm':'Delete puppet',a,()=>{ if(!a){state.confirm='delpup';requestUI();return;} state.confirm=null; const b=snapShow(); show.puppets=show.puppets.filter(x=>x!==p); show.puppetSel=show.puppets[0]?.id ?? null; pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); },'#ff3b30');
-  if (yb+60 < UIH-70) para(['Body: floating head + hands for now.','Size: you become '+(+(p.scale||1).toFixed(2))+'× when you step in.'], X, yb+70, 14);
+  button(X,122,hw,50,'+ Puppet',false,()=>newCharacter('puppet'),'#34c759');
+  button(X+hw+8,122,hw,50,'+ Prop',false,()=>newCharacter('prop'),'#00c7be');
+  const list = show.chars.slice(-5);
+  if (!list.length) para(['This is your character studio: it has','its own space and your own size here,','separate from the world.','','Puppet: a head and two hands you can','step inside. Prop: one piece you grab','and move around.'], X, 200, 14);
+  list.forEach((c,i)=>{ const y=182+i*46, on=c.id===state.selChar;
+    rr(X,y,W,40,10,on?'#34c759':'#2a3060'); txt(c.name, X+12, y+20, 17, on?'#111':'#fff');
+    txt(c.type==='puppet'?'puppet':'prop', X+W-12, y+20, 13, on?'#0b3a17':'#8f97c7','right',700);
+    hit(X,y,W,40,()=>{ state.selChar=c.id; state.activePart = partsOf(c)[0]?.id ?? null; requestUI(); }); });
+  const c = selChar(); if (!c) return;
+  const y0 = 182 + list.length*46 + 12;
+  txt('Sculpt which part?', X, y0+8, 15, '#cfd6ff','left',700);
+  const parts = partsOf(c); const pw = (W - 8*(Math.min(3,parts.length)-1))/Math.min(3,parts.length);
+  parts.slice(0,6).forEach((L,i)=>{ const x = X+(i%3)*(pw+8), y = y0+22+Math.floor(i/3)*50;
+    button(x,y,pw,44,PART_NAMES[L.part]||L.part, activeLayer()===L, ()=>setActive(L),'#ff9500'); });
+  const yb = y0 + 22 + Math.ceil(Math.min(6,parts.length)/3)*50 + 8;
+  const a = state.confirm==='delchar';
+  if (yb+46 < UIH-70) button(X,yb,W,42,a?'Tap to confirm — this removes it':'Delete '+c.name,a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
 }
 function drawPerform(X,W){
   txt('Perform', X, 100, 26);
-  const p = selPuppet(), hw=(W-8)/2;
-  if (show.embodied) button(X,122,W,48,'Step out of '+show.embodied.p.name,true,stepOut,'#ff2d95');
-  else button(X,122,W,48, p ? 'Step into '+p.name : 'Make a puppet in CAST', false, ()=>{ p ? stepIn(p) : setPhase('cast'); }, '#ff2d95');
-  button(X,180,hw,54, show.rec ? '■ Cut  (A)' : '● Record  (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
-  button(X+hw+8,180,hw,54, show.playing ? '■ Stop  (B)' : '▶ Play  (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
-  toggle(X,246,hw,44,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on — your voice records with the show'); } },'#ff9500');
-  toggle(X+hw+8,246,hw,44,'Mirror',state.mirror,()=>{ state.mirror=!state.mirror; if (state.mirror) placeMirror(); requestUI(); },'#1e6bff');
+  const hw=(W-8)/2;
+  button(X,122,hw,52, show.rec ? '■ Cut  (A)' : '● Record  (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
+  button(X+hw+8,122,hw,52, show.playing ? '■ Stop  (B)' : '▶ Play  (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
   const len = Math.max(showLength(), 0.1);
-  slider(X,312,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
-  para(['Grab any unlocked layer with right grip','and move it; while recording, the move is','kept. Lock layers you don’t want to grab.','Each new recording plays the others too,','so you can layer one part at a time.'], X, 392, 14, '#8f97c7', 22);
+  slider(X,190,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
+  txt('Characters', X, 260, 16, '#cfd6ff','left',700);
+  const list = show.chars.slice(-4);
+  if (!list.length) para(['Make one in CHARACTERS first.'], X, 290, 15);
+  list.forEach((c,i)=>{ const y = 274 + i*50, on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c;
+    rr(X,y,W,44,10,on?'#ff2d95':'#2a3060'); txt(c.name.length>10?c.name.slice(0,9)+'…':c.name, X+10, y+22, 16, on?'#111':'#fff');
+    hit(X,y,W-176,44,()=>{ state.selChar=c.id; requestUI(); });
+    rr(X+W-170,y+5,80,34,10,'#1e6bff'); txt(c.placed?'Bring here':'Place', X+W-130, y+22, 13, '#fff','center'); hit(X+W-170,y+5,80,34,()=>placeChar(c));
+    if (c.type==='puppet'){ rr(X+W-84,y+5,80,34,10,inside?'#ffd400':'#34c759'); txt(inside?'Step out':'Step in', X+W-44, y+22, 13, '#111','center'); hit(X+W-84,y+5,80,34,()=>{ inside ? stepOut() : stepIn(c); }); }
+  });
+  const ty = 274 + Math.max(1,list.length)*50 + 6;
+  toggle(X,ty,hw,42,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on — your voice records with the show'); } },'#ff9500');
+  toggle(X+hw+8,ty,hw,42,'Mirror',state.mirror,()=>{ state.mirror=!state.mirror; if (state.mirror) placeMirror(); requestUI(); },'#1e6bff');
+  if (ty+60 < UIH-70) para(['Grip a character to move it — the','scenery never moves. Grip anywhere','else to move or shrink yourself.'], X, ty+70, 14);
 }
 function drawTracks(X,W){
   txt('Motion', X, 100, 26);
   const rows = [];
-  for (const id in show.tracks){ const L = layerById(+id); const s = show.tracks[id].samples; rows.push({kind:'t', id, name: L ? L.name : 'Layer '+id, len: s.length ? s[s.length-9] : 0}); }
+  for (const key in show.tracks){
+    const s = show.tracks[key].samples; let name;
+    if (key[0]==='r'){ const c = charById(+key.slice(1)); name = (c?c.name:'Character')+' · moves'; }
+    else { const L = layerById(+key); const c = L ? charById(L.char) : null; name = (c?c.name+' · ':'')+(L ? (PART_NAMES[L.part]||L.name) : 'Part'); }
+    rows.push({kind:'t', key, name, len: s.length ? s[s.length-9] : 0});
+  }
   for (const a of show.audio) rows.push({kind:'a', a, name:'Voice '+a.id, len:a.dur||0});
   if (!rows.length) para(['Nothing recorded yet.','Go to Perform and press Record.'], X, 140, 15);
   rows.slice(0,9).forEach((r,i)=>{ const y=124+i*48;
-    rr(X,y,W,42,10,'#2a3060'); txt((r.kind==='a'?'🎤 ':'')+r.name, X+12, y+21, 16, '#fff');
+    rr(X,y,W,42,10,'#2a3060'); txt((r.kind==='a'?'🎤 ':'')+(r.name.length>20?r.name.slice(0,19)+'…':r.name), X+12, y+21, 15, '#fff');
     txt(r.len.toFixed(1)+' s', X+W-60, y+21, 14, '#8f97c7','right',700);
     rr(X+W-46,y+4,40,34,10,'#ff3b30'); txt('✕', X+W-26, y+21, 16, '#fff','center');
-    hit(X+W-46,y+4,40,34,()=>{ const b=snapShow(); if (r.kind==='t') delete show.tracks[r.id]; else show.audio=show.audio.filter(x=>x!==r.a); pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); });
+    hit(X+W-46,y+4,40,34,()=>{ const b=snapShow(); if (r.kind==='t') delete show.tracks[r.key]; else show.audio=show.audio.filter(x=>x!==r.a); pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); });
   });
   const a = state.confirm==='clearshow';
   if (rows.length) button(X,UIH-118,W,44,a?'Tap to confirm':'Clear all motion and voices',a,()=>{ if(!a){state.confirm='clearshow';requestUI();return;} state.confirm=null; const b=snapShow(); show.tracks={}; show.audio=[]; pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); },'#ff3b30');
@@ -1990,7 +2238,7 @@ function drawDial(){
     g.beginPath(); g.moveTo(cx+Math.cos(a0)*r0, cy+Math.sin(a0)*r0); g.arc(cx,cy,R,a0,a1); g.arc(cx,cy,r0,a1,a0,true); g.closePath();
     g.fillStyle = p.id===state.phase ? p.col : '#2a3060'; g.fill(); g.strokeStyle='#151935'; g.lineWidth=6; g.stroke();
     const am=(a0+a1)/2, tx=cx+Math.cos(am)*(R+r0)/2, ty=cy+Math.sin(am)*(R+r0)/2;
-    txt(p.name, tx, ty-(ready?0:8), 20, p.id===state.phase?'#111':ready?p.col:'#5a6090','center');
+    txt(p.name, tx, ty-(ready?0:8), p.name.length>8?15:20, p.id===state.phase?'#111':ready?p.col:'#5a6090','center');
     if (!ready) txt('soon', tx, ty+14, 12, '#5a6090','center',700);
   });
   g.beginPath(); g.arc(cx,cy,r0-6,0,7); g.fillStyle='#151935'; g.fill(); txt('close', cx, cy, 17, '#cfd6ff','center',700);
@@ -2004,26 +2252,32 @@ function drawDial(){
 }
 function setPhase(id){
   if (stroke) endStroke(true); if (rec) stopRecording(true); if (show.rec) cutShowRec(true); stopPlay(); stopShow();
-  if (blockGrab) endBlockGrab(); if (show.grab) endLayerGrab();
-  if (id!=='perform' && id!=='cast' && show.embodied) stepOut();
+  if (blockGrab) endBlockGrab(); if (show.grab) endCharGrab();
+  if (id!=='perform' && show.embodied) stepOut();
+  const from = stageName(state.phase), to = stageName(id);
+  if (from !== to){ captureView(from); }
   state.phase=id; state.dialOpen=false; state.page = FIRST_PAGE[id] || 'soon'; state.confirm=null;
-  pathDirty = true; if (id==='edit' || id==='shoot') placeBigScreen();
+  if (from !== to){ applyView(to); if (to==='studio' && !selChar() && show.chars.length) state.selChar = show.chars[0].id; }
+  pathDirty = true; if (id==='edit') placeBigScreen();
   if (id==='perform' && state.mirror) placeMirror();
   requestUI();
 }
-function uiPointer(type, x, y){
+function uiPointer(win, type, x, y){
   if (type==='down'){
-    for (let i=hits.length-1;i>=0;i--){ const h=hits[i];
+    const hs = win.hits;
+    for (let i=hs.length-1;i>=0;i--){ const h=hs[i];
       if (x>=h.x && x<=h.x+h.w && y>=h.y && y<=h.y+h.h){ drag=h; h.fn && h.fn(x,y); pulse('right',0.25,15); break; } }
   } else if (type==='move'){ if (drag && drag.drag) drag.drag(x,y); }
   else drag=null;
   requestUI();
 }
-let uiMouse = false;
-function uiXY(e){ const r=uiCanvas.getBoundingClientRect(); return [(e.clientX-r.left)/r.width*UIW, (e.clientY-r.top)/r.height*UIH]; }
-uiCanvas.addEventListener('pointerdown', e => { uiMouse=true; uiCanvas.setPointerCapture(e.pointerId); uiPointer('down', ...uiXY(e)); e.preventDefault(); });
-uiCanvas.addEventListener('pointermove', e => { if (uiMouse) uiPointer('move', ...uiXY(e)); });
-uiCanvas.addEventListener('pointerup', e => { uiMouse=false; uiPointer('up', ...uiXY(e)); });
+for (const win of [menuWin, layersWin]){
+  let down = false;
+  const xy = e => { const r=win.canvas.getBoundingClientRect(); return [(e.clientX-r.left)/r.width*win.cw, (e.clientY-r.top)/r.height*win.ch]; };
+  win.canvas.addEventListener('pointerdown', e => { down=true; win.canvas.setPointerCapture(e.pointerId); uiPointer(win,'down', ...xy(e)); e.preventDefault(); });
+  win.canvas.addEventListener('pointermove', e => { if (down) uiPointer(win,'move', ...xy(e)); });
+  win.canvas.addEventListener('pointerup', e => { down=false; uiPointer(win,'up', ...xy(e)); });
+}
 
 /* ---------------- controller button labels ---------------- */
 const legendL = document.createElement('canvas'), legendR = document.createElement('canvas');
@@ -2037,14 +2291,14 @@ legMeshR.position.set(0.085, 0.01, 0.03); legMeshR.rotation.set(-1.1, -0.35, 0);
 const BADGE = {A:'#34c759', B:'#ff3b30', X:'#1e6bff', Y:'#ffd400', T:'#ff9500', G:'#5e2bff', S:'#00c7be'};
 function legendLines(hand){
   const ph = state.phase, toolName = {clay: state.carve?'carve':'add clay', smooth:'smooth', paint:'paint', doodle:'doodle', blocks:'blocks', erase:'erase'}[state.tool];
-  if (hand==='L') return [['T','open / close menu'],['X','undo'],['Y','redo'],['S','fly'],['G','drag world']];
+  if (hand==='L') return [['T','open / close menu'],['X','undo'],['Y','redo'],['S','fly'],['G','move / scale world']];
+  const sculpt = [['T', toolName],['A', state.tool==='clay' ? (state.carve?'switch to add':'switch to carve') : 'clay add / carve'],['B','last tool'],['S','size ↕  strength ↔'],['G','block / window / world']];
   return ({
-    build:  [['T', toolName],['A', state.tool==='clay' ? (state.carve?'switch to add':'switch to carve') : 'clay add / carve'],['B','last tool'],['S','size ↕  strength ↔'],['G','grab block / world']],
-    shoot:  [['T','film (hold)'],['A', play?'stop':'play take'],['B','next take'],['S','zoom'],['G','grab key / world']],
-    edit:   [['A', play?'stop':'play film'],['T','menu clicks'],['G','drag world']],
-    cast:   [['T','menu clicks'],['G','drag world']],
-    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['G', show.embodied?'(you are the puppet)':'grab a layer'],['T','menu clicks']],
-  }[ph] || [['T','menu clicks']]);
+    build: sculpt, characters: sculpt,
+    shoot:  [['T','film (hold)'],['A', play?'stop':'play take'],['B','next take'],['S','zoom'],['G','key dot / window / world']],
+    edit:   [['A', play?'stop':'play film'],['T','menu clicks'],['G','window / world']],
+    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['G', show.embodied?'(you are the puppet)':'character / window / world'],['T','menu clicks']],
+  }[ph] || [['T','menu clicks'],['G','window / world']]);
 }
 function drawLegend(cv, lines){
   const c = cv.getContext('2d'); c.clearRect(0,0,320,200);
@@ -2052,7 +2306,7 @@ function drawLegend(cv, lines){
   lines.slice(0,5).forEach(([k,t],i)=>{ const y = 22+i*38;
     c.fillStyle = BADGE[k]; c.beginPath(); c.arc(26,y,15,0,7); c.fill();
     c.fillStyle = k==='Y'?'#111':'#fff'; c.font='900 17px system-ui'; c.textAlign='center'; c.textBaseline='middle'; c.fillText(k==='T'?'⌐':k==='G'?'✊':k==='S'?'◎':k,26,y+1);
-    c.fillStyle='#fff'; c.font='700 21px system-ui'; c.textAlign='left'; c.fillText(t,52,y+1); });
+    c.fillStyle='#fff'; c.font='700 20px system-ui'; c.textAlign='left'; c.fillText(t,52,y+1); });
 }
 let legendKey = '';
 function drawLegends(){
@@ -2088,10 +2342,12 @@ function showBlockGhost(p, q){
 const ray = new THREE.Raycaster(); ray.layers.enableAll();
 const mouse = new THREE.Vector2();
 let mouseDown = false, lastHover = null, deskGrab = null;
-function castMouse(e){ mouse.set(e.clientX/innerWidth*2-1, -(e.clientY/innerHeight)*2+1); ray.setFromCamera(mouse, camera); }
+function castMouse(e){ ray.far = Infinity; mouse.set(e.clientX/innerWidth*2-1, -(e.clientY/innerHeight)*2+1); ray.setFromCamera(mouse, camera); }
 function pickSurface(e){
   castMouse(e);
-  const targets = []; for (const L of layers) if (L.visible) targets.push(L.group);
+  const targets = [];
+  if (state.phase==='perform') { for (const c of show.chars) if (c.placed) targets.push(c.root); for (const L of worldLayers()) if (L.visible) targets.push(L.group); }
+  else for (const L of domainLayers()) if (L.visible) targets.push(L.group);
   const live = stroke && stroke.s ? stroke.s._mesh : null;
   const hitsR = ray.intersectObjects(targets, true).filter(h => !live || (h.object!==live && h.object.parent!==live));
   if (hitsR.length){ const h=hitsR[0]; let n = V().set(0,1,0);
@@ -2103,7 +2359,7 @@ function pickSurface(e){
 function desktopRadius(){
   if (state.tool==='doodle') return state.doodleSize*6;
   if (state.tool==='erase') return 0.25*yourScale();
-  return state.size*7;
+  return state.size*(inStudio() ? 2.5 : 7);
 }
 function desktopPoint(h){
   const r = desktopRadius();
@@ -2116,23 +2372,23 @@ function desktopPoint(h){
 renderer.domElement.addEventListener('pointerdown', e => {
   if (e.button!==0 || renderer.xr.isPresenting) return;
   const h = pickSurface(e);
-  // move a whole layer (PERFORM) or one block (BUILD + shift)
-  if (state.phase==='perform' && h && h.obj){
-    const L = layerOf(h.obj);
-    if (L && !L.locked){
-      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(V()).negate(), h.p);
-      const m0 = new THREE.Matrix4().makeTranslation(h.p.x,h.p.y,h.p.z);
-      if (startLayerGrab(L, m0)){ deskGrab = {kind:'layer', plane}; renderer.domElement.setPointerCapture(e.pointerId); }
+  if (state.phase==='perform'){
+    if (h && h.obj){
+      const L = layerOf(h.obj); const c = L && L.char ? charById(L.char) : null;
+      if (c){
+        const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(V()).negate(), h.p);
+        if (startCharGrab(c, new THREE.Matrix4().makeTranslation(h.p.x,h.p.y,h.p.z))){ deskGrab = {kind:'char', plane}; renderer.domElement.setPointerCapture(e.pointerId); }
+      }
     }
     return;
   }
-  if (state.phase==='build' && e.shiftKey && h && h.obj && h.obj.isInstancedMesh && h.obj.userData.stroke?.type==='blocks'){
+  if (SCULPT_PHASES.includes(state.phase) && e.shiftKey && h && h.obj && h.obj.isInstancedMesh && h.obj.userData.stroke?.type==='blocks'){
     const L = layerOf(h.obj); if (!L || L.locked) return;
     const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(V()).negate(), h.p);
     startBlockGrab({L, s:h.obj.userData.stroke, i:h.inst}, new THREE.Matrix4().makeTranslation(h.p.x,h.p.y,h.p.z));
     deskGrab = {kind:'block', plane}; renderer.domElement.setPointerCapture(e.pointerId); return;
   }
-  if (state.phase!=='build' || !h) return;
+  if (!SCULPT_PHASES.includes(state.phase) || !h) return;
   if (stroke && stroke.kind==='angle'){ if (stroke.stage>=1) angleClick(); return; }
   if (!beginStroke(desktopRadius())) return;
   mouseDown = true; renderer.domElement.setPointerCapture(e.pointerId);
@@ -2146,7 +2402,7 @@ renderer.domElement.addEventListener('pointerdown', e => {
 });
 renderer.domElement.addEventListener('pointermove', e => {
   if (renderer.xr.isPresenting) return;
-  if (deskGrab){ castMouse(e); const p = ray.ray.intersectPlane(deskGrab.plane, V()); if (p){ const m = new THREE.Matrix4().makeTranslation(p.x,p.y,p.z); deskGrab.kind==='layer' ? moveLayerGrab(m) : moveBlockGrab(m); } return; }
+  if (deskGrab){ castMouse(e); const p = ray.ray.intersectPlane(deskGrab.plane, V()); if (p){ const m = new THREE.Matrix4().makeTranslation(p.x,p.y,p.z); deskGrab.kind==='char' ? moveCharGrab(m) : moveBlockGrab(m); } return; }
   lastHover = pickSurface(e);
   if (stroke && stroke.kind==='angle'){
     castMouse(e);
@@ -2164,7 +2420,7 @@ renderer.domElement.addEventListener('pointermove', e => {
   } else if (mouseDown && lastHover) strokeTo(desktopPoint(lastHover), desktopRadius(), 0.8, lastHover.n, 0.016);
 });
 renderer.domElement.addEventListener('pointerup', e => {
-  if (deskGrab){ deskGrab.kind==='layer' ? endLayerGrab() : endBlockGrab(); deskGrab = null; return; }
+  if (deskGrab){ deskGrab.kind==='char' ? endCharGrab() : endBlockGrab(); deskGrab = null; return; }
   if (!mouseDown) return; mouseDown=false;
   if (stroke && stroke.kind==='angle'){ if (stroke.stage===0){ castMouse(e); const p = stroke.plane ? ray.ray.intersectPlane(stroke.plane, V()) : null; angleUpdate(p || stroke.B || stroke.A, false); } return; }
   endStroke();
@@ -2177,7 +2433,7 @@ addEventListener('keydown', e => {
   if (k==='escape' && stroke){ endStroke(true); return; }
   if (k==='a' || k===' '){
     e.preventDefault();
-    if (state.phase==='build') flipCarve();
+    if (SCULPT_PHASES.includes(state.phase)) flipCarve();
     else if (state.phase==='shoot') play ? stopPlay() : startPlay('take');
     else if (state.phase==='edit') play ? stopPlay() : startPlay('film');
     else if (state.phase==='perform') show.playing ? stopShow() : playShow();
@@ -2190,18 +2446,19 @@ addEventListener('keydown', e => {
   else if (k==='y') redo();
   else if (k==='[') { state.size=clamp(state.size/1.15,0.01,0.3); requestUI(); }
   else if (k===']') { state.size=clamp(state.size*1.15,0.01,0.3); requestUI(); }
-  else if (state.phase==='build' && k>='1' && k<='6') setTool(['clay','smooth','paint','doodle','blocks','erase'][+k-1]);
+  else if (SCULPT_PHASES.includes(state.phase) && k>='1' && k<='6') setTool(['clay','smooth','paint','doodle','blocks','erase'][+k-1]);
   else if (k==='tab'){ state.panelOpen=!state.panelOpen; uiCanvas.style.display=state.panelOpen?'block':'none'; e.preventDefault(); }
 });
 function desktopUpdate(dt){
   controls.enabled = state.phase!=='edit' && !deskGrab;
   controls.update();
   cursor.visible = false; ghost.visible = false;
-  if (state.phase==='build' && lastHover && !deskGrab){
+  if (SCULPT_PHASES.includes(state.phase) && lastHover && !deskGrab){
     const p = desktopPoint(lastHover);
     if (state.tool==='blocks'){ if (!stroke) showBlockGhost(p); }
     else { const L = activeLayer(); const vox = ['clay','smooth','paint'].includes(state.tool);
-      cursor.visible = true; cursor.position.copy(p); cursor.scale.setScalar(vox && L ? clamp(rToL(L,desktopRadius()), L.vs*0.7, L.vs*MAXVOX)*L.group.scale.x : desktopRadius()); styleCursor(); }
+      cursor.visible = true; cursor.position.copy(p);
+      cursor.scale.setScalar(vox && L ? clamp(rToL(L,desktopRadius()), L.vs*0.7, L.vs*MAXVOX)*L.group.getWorldScale(V()).x : desktopRadius()); styleCursor(); }
   }
   if (state.phase==='shoot'){
     camera.getWorldPosition(camPoseP); camera.getWorldQuaternion(camPoseQ);
@@ -2219,7 +2476,7 @@ function updateGhostCam(mult){
 
 /* ---------------- VR ---------------- */
 const vrBtn = document.getElementById('vrbtn');
-let xrRigSaved = null, deskCam = null;
+let deskCam = null;
 if (navigator.xr){
   navigator.xr.isSessionSupported('immersive-vr').then(ok => {
     vrBtn.disabled = !ok; vrBtn.textContent = ok ? 'Enter VR' : 'VR not available here';
@@ -2234,28 +2491,27 @@ vrBtn.onclick = async () => {
   } catch(e){ console.error(e); toast('Could not start VR'); }
 };
 renderer.xr.addEventListener('sessionstart', () => {
+  captureView(stageName(state.phase));     // remembers the desktop view
   deskCam = {p:camera.position.clone(), q:camera.quaternion.clone()};
   camera.position.set(0,0,0); camera.quaternion.identity();
-  if (xrRigSaved){ rig.position.fromArray(xrRigSaved.p); rig.quaternion.fromArray(xrRigSaved.q); rig.scale.setScalar(xrRigSaved.s); }
-  else { rig.position.set(0, Math.max(0, islandH(0,7)), 7); rig.quaternion.identity(); rig.scale.setScalar(1); }
-  vrBtn.textContent = 'Exit VR'; panelMesh.visible = state.panelOpen;
-  setTimeout(()=>{ placeBigScreen(); if (state.phase==='perform') placeMirror(); }, 300); requestUI();
+  applyView(stageName(state.phase));
+  vrBtn.textContent = 'Exit VR';
+  setTimeout(()=>{ if (state.phase==='edit') placeBigScreen(); if (state.phase==='perform') placeMirror(); }, 300); requestUI();
 });
 renderer.xr.addEventListener('sessionend', () => {
   if (show.embodied) stepOut();
-  xrRigSaved = {p:rig.position.toArray(), q:rig.quaternion.toArray(), s:rig.scale.x};
+  views[stageName(state.phase)].xr = {p:rig.position.toArray(), q:rig.quaternion.toArray(), s:rig.scale.x};
   rig.position.set(0,0,0); rig.quaternion.identity(); rig.scale.setScalar(1);
   if (deskCam){ camera.position.copy(deskCam.p); camera.quaternion.copy(deskCam.q); }
   camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); controls.update();
   vrBtn.textContent = 'Enter VR'; if (stroke) endStroke(true); if (rec) stopRecording(true); if (show.rec) cutShowRec(true);
-  camModel.visible = false; bigScreen.visible = false; hudLabel.visible = false; requestUI();
+  camModel.visible = false; bigScreen.visible = false; hudLabel.visible = false;
+  for (const w of WINS) w.mesh.visible = false;
+  requestUI();
 });
 
 const ctrl = {left:null, right:null};
 const factory = new XRControllerModelFactory();
-const panelMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 0.2*UIH/UIW),
-  new THREE.MeshBasicMaterial({map:panelTex, toneMapped:false}));
-panelMesh.position.set(0.0, 0.13, -0.07); panelMesh.rotation.x = -0.75;
 const pointerGeo = new THREE.BufferGeometry().setFromPoints([V(), new THREE.Vector3(0,0,-1)]);
 const pointer = new THREE.Line(pointerGeo, new THREE.LineBasicMaterial({color:'#ffd400'}));
 pointer.scale.z = 0.3; pointer.visible = false;
@@ -2268,14 +2524,14 @@ for (let i=0;i<2;i++){
   rayC.addEventListener('connected', e => {
     const hand = e.data.handedness; if (hand!=='left' && hand!=='right') return;
     ctrl[hand] = {ray:rayC, grip, src:e.data, prev:{}};
-    if (hand==='left'){ grip.add(panelMesh); grip.add(legMeshL); }
+    if (hand==='left'){ grip.add(legMeshL); for (const w of WINS) if (w.dock==='hand') dockWin(w); }
     if (hand==='right'){ rayC.add(pointer); rayC.add(camModel); grip.add(legMeshR); }
   });
   rayC.addEventListener('disconnected', () => {
     for (const h of ['left','right']) if (ctrl[h] && ctrl[h].ray===rayC) ctrl[h]=null;
   });
 }
-shotHidden.push(cursor, ghost, pointerDot, pathGroup, ghostCam, bigScreen, camModel);
+shotHidden.push(cursor, ghost, pointerDot, pathGroup, ghostCam, bigScreen, camModel, menuWin.mesh, layersWin.mesh, previewWin.mesh);
 
 function pulse(hand, v, ms){ try { ctrl[hand]?.src?.gamepad?.hapticActuators?.[0]?.pulse(v, ms); } catch(e){} }
 function readPad(c){
@@ -2338,7 +2594,6 @@ function resetScale(){
   toast('Human size'); requestUI();
 }
 
-/* key grabbing (SHOOT) */
 let keyGrab = null;
 const _m4 = new THREE.Matrix4();
 function tryGrabKey(R){
@@ -2361,16 +2616,26 @@ function updateKeyGrab(R){
 }
 function endKeyGrab(){ if (!keyGrab) return; pushShotsUndo(keyGrab.before); keyGrab = null; sceneDirty = true; requestUI(); }
 
+// the window under the right controller's ray, if any
+function rayWindow(R){
+  const meshes = [];
+  for (const w of WINS){ if (!w.mesh.visible) continue; meshes.push(w.mesh); if (w===previewWin) meshes.push(previewScreen); }
+  if (!meshes.length) return null;
+  ray.set(_o, _d); ray.far = 1.2*rig.scale.x;
+  const h = ray.intersectObjects(meshes, false)[0];
+  return h ? {h, win:h.object.userData.win, screen:h.object===previewScreen} : null;
+}
+
 const _tip = V(), _up = V(), _o = V(), _d = V(), _tq = new THREE.Quaternion();
-let uiCapture = false;
+let uiCapture = null;
 function xrUpdate(dt){
   const L = ctrl.left, R = ctrl.right;
   const pl = L ? readPad(L) : null, pr = R ? readPad(R) : null;
-  const ph = state.phase, shoot = ph==='shoot', edit = ph==='edit', build = ph==='build', perform = ph==='perform';
+  const ph = state.phase, shoot = ph==='shoot', edit = ph==='edit', sculpt = SCULPT_PHASES.includes(ph), perform = ph==='perform';
   const embodied = !!show.embodied;
 
   if (L && pl){
-    if (edge(L,pl,'trigP')){ state.panelOpen = !state.panelOpen; panelMesh.visible = state.panelOpen; pulse('left',0.2,20); }
+    if (edge(L,pl,'trigP')){ state.panelOpen = !state.panelOpen; pulse('left',0.2,20); }
     if (edge(L,pl,'a')) undo();
     if (edge(L,pl,'b')) redo();
     const dz = Math.abs(pl.sy) > 0.15 ? pl.sy : 0, dx = Math.abs(pl.sx) > 0.15 ? pl.sx : 0;
@@ -2380,18 +2645,26 @@ function xrUpdate(dt){
       rig.position.addScaledVector(_d, -dz*sp).addScaledVector(right, dx*sp);
     }
   }
+  // right controller ray (used for windows)
+  let hover = null;
+  if (R){
+    R.ray.updateMatrixWorld(true);
+    _o.setFromMatrixPosition(R.ray.matrixWorld);
+    _d.set(0,0,-1).transformDirection(R.ray.matrixWorld);
+    hover = rayWindow(R);
+  }
   let rightGripUsed = false;
   if (R && pr){
     if (edge(R,pr,'a')){
-      if (build) flipCarve(); else if (shoot) (play ? stopPlay() : startPlay('take')); else if (edit) (play ? stopPlay() : startPlay('film'));
+      if (sculpt) flipCarve(); else if (shoot) (play ? stopPlay() : startPlay('take')); else if (edit) (play ? stopPlay() : startPlay('film'));
       else if (perform) (show.rec ? cutShowRec() : startShowRec());
       pulse('right',0.3,20);
     }
     if (edge(R,pr,'b')){
-      if (shoot) nextTake(); else if (build){ if (stroke && stroke.kind==='angle') endStroke(true); else swapTool(); } else if (perform) (show.playing ? stopShow() : playShow());
+      if (shoot) nextTake(); else if (sculpt){ if (stroke && stroke.kind==='angle') endStroke(true); else swapTool(); } else if (perform) (show.playing ? stopShow() : playShow());
       pulse('right',0.3,20);
     }
-    if (build){
+    if (sculpt){
       if (Math.abs(pr.sy) > 0.2){
         if (state.tool==='blocks') state.blockSize = clamp(state.blockSize*Math.exp(-pr.sy*dt*1.6), 0.02, 0.5);
         else if (state.tool==='doodle') state.doodleSize = clamp(state.doodleSize*Math.exp(-pr.sy*dt*1.6), 0.002, 0.05);
@@ -2401,23 +2674,23 @@ function xrUpdate(dt){
       if (Math.abs(pr.sx) > 0.3){ state.strength = clamp(state.strength + pr.sx*dt*0.7, 0.05, 1); requestUI(); }
     }
     if (shoot && Math.abs(pr.sy) > 0.3) lensNudge(pr.sy*dt*30);
-    // right grip: grab the thing under your hand, otherwise the world
+    // right grip: a window you point at, else the thing under your hand, else the world
     if (edge(R,pr,'grip')){
       const gp = V(); R.grip.getWorldPosition(gp);
-      if (shoot && !keyGrab) tryGrabKey(R);
-      else if (build && !blockGrab){ const b = findBlockAt(gp); if (b) startBlockGrab(b, unscaled(R.grip)); }
-      else if (perform && !embodied && !show.grab){ const Lg = findLayerAt(gp); if (Lg) startLayerGrab(Lg, unscaled(R.grip)); }
+      if (hover && !(pl && pl.grip)) startWinGrab(hover.win, R);
+      else if (shoot && !keyGrab) tryGrabKey(R);
+      else if (sculpt && !blockGrab){ const b = findBlockAt(gp); if (b) startBlockGrab(b, unscaled(R.grip)); }
+      else if (perform && !embodied && !show.grab){ const c = findCharAt(gp); if (c) startCharGrab(c, unscaled(R.grip)); }
     }
-    if (keyGrab && !pr.grip) endKeyGrab();
-    if (blockGrab && !pr.grip) endBlockGrab();
-    if (show.grab && !pr.grip) endLayerGrab();
-    rightGripUsed = !!(keyGrab || blockGrab || show.grab);
+    if (!pr.grip){ if (winGrab) endWinGrab(); if (keyGrab) endKeyGrab(); if (blockGrab) endBlockGrab(); if (show.grab) endCharGrab(); }
+    rightGripUsed = !!(winGrab || keyGrab || blockGrab || show.grab);
   }
   if (!embodied) navUpdate(pl?.grip, pr?.grip && !rightGripUsed); else nav = null;
   rig.updateMatrixWorld(true);
+  if (winGrab && R) moveWinGrab(R);
   if (keyGrab && R) updateKeyGrab(R);
   if (blockGrab && R) moveBlockGrab(unscaled(R.grip));
-  if (show.grab && R) moveLayerGrab(unscaled(R.grip));
+  if (show.grab && R) moveCharGrab(unscaled(R.grip));
   updateEmbodied();
 
   let onPanel = false;
@@ -2425,19 +2698,19 @@ function xrUpdate(dt){
     R.ray.updateMatrixWorld(true);
     _o.setFromMatrixPosition(R.ray.matrixWorld);
     _d.set(0,0,-1).transformDirection(R.ray.matrixWorld);
-    if (panelMesh.visible && L){
-      ray.set(_o, _d); ray.far = 2*rig.scale.x;
-      const h = ray.intersectObject(panelMesh, false)[0];
-      if (h && h.uv){
-        onPanel = true; pointerDot.visible = true; pointerDot.position.copy(h.point); pointerDot.scale.setScalar(rig.scale.x);
-        pointer.visible = true; pointer.scale.z = h.distance / rig.scale.x;
-        const x = h.uv.x*UIW, y = (1-h.uv.y)*UIH;
-        if (pr && edge(R,pr,'trigP') && !(stroke && stroke.kind!=='angle') && !rec){ uiCapture = true; uiPointer('down', x, y); }
-        else if (uiCapture && pr?.trigP) uiPointer('move', x, y);
+    hover = winGrab ? null : rayWindow(R);
+    if (hover){
+      onPanel = true; const h = hover.h;
+      pointerDot.visible = true; pointerDot.position.copy(h.point); pointerDot.scale.setScalar(rig.scale.x);
+      pointer.visible = true; pointer.scale.z = h.distance / rig.scale.x;
+      if (!hover.screen){
+        const x = h.uv.x*hover.win.cw, y = (1-h.uv.y)*hover.win.ch;
+        if (pr && edge(R,pr,'trigP') && !(stroke && stroke.kind!=='angle') && !rec){ uiCapture = hover.win; uiPointer(hover.win, 'down', x, y); }
+        else if (uiCapture===hover.win && pr?.trigP) uiPointer(hover.win, 'move', x, y);
       }
     }
-    if (!onPanel){ pointer.visible = panelMesh.visible && !shoot; pointer.scale.z = 0.25; pointerDot.visible = false; }
-    if (uiCapture && !pr?.trigP){ uiCapture = false; uiPointer('up',0,0); }
+    if (!onPanel){ pointer.visible = !shoot && (menuWin.mesh.visible || layersWin.mesh.visible); pointer.scale.z = 0.25; pointerDot.visible = false; }
+    if (uiCapture && !pr?.trigP){ uiPointer(uiCapture, 'up',0,0); uiCapture = null; }
 
     R.grip.updateMatrixWorld(true);
     _tip.set(0, -0.01, -0.07); R.grip.localToWorld(_tip);
@@ -2446,8 +2719,8 @@ function xrUpdate(dt){
     const L2 = activeLayer();
     const isVox = ['clay','smooth','paint'].includes(state.tool);
     const base = (state.tool==='doodle' ? state.doodleSize : state.size) * rig.scale.x;
-    const rShown = isVox && L2 ? clamp(rToL(L2,base), L2.vs*0.7, L2.vs*MAXVOX)*L2.group.scale.x : base;
-    const showTool = build && !onPanel && !uiCapture && !blockGrab;
+    const rShown = isVox && L2 ? clamp(rToL(L2,base), L2.vs*0.7, L2.vs*MAXVOX)*L2.group.getWorldScale(V()).x : base;
+    const showTool = sculpt && !onPanel && !uiCapture && !blockGrab && !winGrab;
     cursor.visible = showTool && state.tool!=='blocks';
     ghost.visible = false;
     if (showTool){
@@ -2455,7 +2728,7 @@ function xrUpdate(dt){
       else { cursor.position.copy(_tip); cursor.scale.setScalar(rShown); styleCursor(); }
     }
     const pressEdge = pr && edge(R,pr,'trigP');
-    if (state.tool==='blocks' && state.blockMode==='angle' && build){
+    if (sculpt && state.tool==='blocks' && state.blockMode==='angle'){
       const held = !!(pr && pr.trig > 0.12);
       if (showTool && pressEdge){ if (!stroke) { if (beginStroke(base)) { stroke.A = _tip.clone(); } } else angleClick(); }
       if (stroke && stroke.kind==='angle'){ const side = V().set(1,0,0).transformDirection(R.grip.matrixWorld); angleUpdate(_tip, stroke.stage===0 && held, side); }
@@ -2477,7 +2750,7 @@ function xrUpdate(dt){
   }
   if (edit && !play){ const f = filmAt(shots.playhead); if (f) poseShotCam(f.tk, f.u); }
   updateGhostCam(1);
-  bigScreen.visible = edit || (shoot && !!play) || (perform && state.mirror);
+  bigScreen.visible = edit;
   hudLabel.visible = !!(show.rec || (rec && !camModel.visible));
   legMeshL.visible = legMeshR.visible = state.labels;
   if (L && pl) L.prev = pl;
@@ -2494,10 +2767,17 @@ function currentShowTime(){
   if (ph==='edit'){ const f = filmAt(play ? play.t : shots.playhead); return f ? f.u : 0; }
   return 0;
 }
+function setAspect(a){
+  shots.aspect = a; const r = ASPECTS[a];
+  rtW = r>=1 ? 512 : Math.round(512*r); rtH = r>=1 ? Math.round(512/r) : 512;
+  rt.setSize(rtW, rtH);
+  const w = 0.09; handMonitor.scale.set(r>=1? w : w*r, r>=1 ? w/r : w, 1);
+  sizeBigScreen(); sizePreview(); requestUI();
+}
 renderer.setAnimationLoop(() => {
   const raw = clock.getDelta();
-  const dt = Math.min(raw, 0.05);      // for hand movement
-  const tdt = Math.min(raw, 0.25);     // recording and playback keep real time even when frames drop
+  const dt = Math.min(raw, 0.05);
+  const tdt = Math.min(raw, 0.25);
   if (state.toastT > 0){ state.toastT -= tdt; if (state.toastT <= 0) requestUI(); }
   const xr = renderer.xr.isPresenting;
   if (xr) xrUpdate(dt); else desktopUpdate(dt);
@@ -2508,18 +2788,20 @@ renderer.setAnimationLoop(() => {
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
   if (uiNeeds) drawUI();
+  updateWins();
   autosaveTick(dt);
+  applyStage();
   if (xr){
     if (state.phase==='shoot' || state.phase==='edit') renderPreview(shotCam);
-    else if (state.phase==='perform' && state.mirror) renderPreview(mirrorCam);
+    else if (state.phase==='perform' && state.mirror && show.embodied) renderPreview(mirrorCam);
     const dark = state.phase==='edit' && shots.blackRoom;
-    const wv = world.visible, wa = water.visible, bg = scene.background, fg = scene.fog;
+    const wv = world.visible, wa = water.visible, bg = scene.background, fg = scene.fog, av = actors.visible;
     const headL = show.embodied ? show.embodied.parts.find(p=>p.tracker===camera)?.L : null;
     const hv = headL ? headL.group.visible : false;
     if (headL) headL.group.visible = false;   // don't see the inside of your own puppet head
-    if (dark){ world.visible = false; water.visible = false; scene.background = BLACK; scene.fog = null; }
+    if (dark){ world.visible = false; actors.visible = false; water.visible = false; scene.background = BLACK; scene.fog = null; }
     renderer.render(scene, camera);
-    if (dark){ world.visible = wv; water.visible = wa; scene.background = bg; scene.fog = fg; }
+    if (dark){ world.visible = wv; actors.visible = av; water.visible = wa; scene.background = bg; scene.fog = fg; }
     if (headL) headL.group.visible = hv;
   } else desktopRender();
 });
@@ -2552,12 +2834,13 @@ function desktopRender(){
 (async () => {
   let loaded = false;
   try { const s = await idbGet('scene'); if (s){ deserialize(JSON.parse(s)); loaded = true; } } catch(e){ console.warn('no saved scene', e); }
-  if (!loaded){ const L = makeLayer('Ground', 0.1); state.activeLayer = L.id; genIsland(L); setAspect('16:9'); }
+  if (!loaded){ const L = makeLayer('Ground', 0.1); state.activeWorld = L.id; genIsland(L); setAspect('16:9'); }
   requestUI();
-  window.__cmm = {state, shots, show, layers:()=>layers, applyOp, dirty, serialize, deserialize, rig, camera, scene, undo, redo, controls,
-    setPhase, openPage, startRecording, stopRecording, startPlay, stopPlay, exportMP4, filmLength, newScene, setAspect, makeStarterPuppet,
-    startShowRec, cutShowRec, playShow, stopShow, startLayerGrab, moveLayerGrab, endLayerGrab, layerById, addKeyAt, deleteKey, lensNudge,
-    findBlockAt, startBlockGrab, moveBlockGrab, endBlockGrab, beginStroke, angleUpdate, angleClick, setTool,
+  window.__cmm = {state, shots, show, views, layers:()=>layers, applyOp, dirty, serialize, deserialize, rig, camera, scene, undo, redo, controls,
+    setPhase, openPage, startRecording, stopRecording, startPlay, stopPlay, exportMP4, filmLength, newScene, setAspect,
+    newCharacter, placeChar, deleteChar, startShowRec, cutShowRec, playShow, stopShow, startCharGrab, moveCharGrab, endCharGrab, findCharAt,
+    layerById, charById, addKeyAt, deleteKey, lensNudge, findBlockAt, startBlockGrab, moveBlockGrab, endBlockGrab, beginStroke, setTool, activeLayer,
+    ctrl, WINS, dockWin, roomWin, startWinGrab, moveWinGrab, endWinGrab, get winGrab(){return winGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
 })();
 </script>
