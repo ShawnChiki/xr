@@ -1,0 +1,796 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Edgewise XR</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#E9E4DA;font:600 14px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;color:#111}
+  canvas#gl{display:block;width:100%;height:100%;touch-action:none}
+  #bar{position:fixed;top:12px;right:12px;display:flex;gap:10px;align-items:center;z-index:5}
+  #bar button{font:800 15px system-ui,sans-serif;padding:10px 16px;border:3px solid #111;border-radius:10px;background:#FFD60A;box-shadow:4px 4px 0 #111;cursor:pointer}
+  #bar button:disabled{opacity:.45;cursor:default}
+  #bar button#mr{background:#2EC4B6}
+  #title{position:fixed;left:12px;bottom:10px;font:900 20px system-ui,sans-serif;letter-spacing:.02em;z-index:5;pointer-events:none}
+  #title small{display:block;font:600 12px system-ui,sans-serif;opacity:.7;max-width:520px}
+  #menu2d{position:fixed;left:12px;top:12px;width:340px;border:3px solid #111;border-radius:14px;box-shadow:5px 5px 0 #111;background:#FFF6E5;z-index:5;touch-action:none}
+  #status{font-weight:600}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="bar"><span id="status"></span><button id="vr" disabled>Enter VR</button><button id="mr" disabled>Enter MR</button></div>
+<div id="title">Edgewise XR<small>Left-drag draws a line (on the floor, or on the face you start on; hold Shift for an upright line). Right-drag turns the view, wheel zooms. Ctrl+Z undoes.</small></div>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import * as C from './core.js';
+
+const V3 = THREE.Vector3, $ = s => document.querySelector(s);
+const toV = a => new V3(a[0], a[1], a[2]), toA = v => [v.x, v.y, v.z];
+
+// ======================================================================
+// Settings and the sketch
+// ======================================================================
+const SET_KEY = 'edgewise:set', SK_KEY = 'edgewise:sketch', LIB_KEY = 'edgewise:lib';
+const S = Object.assign({ tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
+  (() => { try { return JSON.parse(localStorage.getItem(SET_KEY)) || {}; } catch (e) { return {}; } })());
+const saveSet = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(S)); } catch (e) {} };
+let sk = (() => { try { const j = JSON.parse(localStorage.getItem(SK_KEY)); if (j && j.v) return j; } catch (e) {} return null; })();
+const firstRun = !sk;
+if (!sk) sk = C.emptySketch();
+let saveT = 0;
+const saveSketch = () => { clearTimeout(saveT); saveT = setTimeout(() => { try { localStorage.setItem(SK_KEY, JSON.stringify(sk)); } catch (e) {} }, 250); };
+
+// undo: whole-sketch snapshots (they're small)
+const undoS = [], redoS = [];
+const snap = () => JSON.stringify(sk);
+function pushUndo(s){ undoS.push(s || snap()); if (undoS.length > 120) undoS.shift(); redoS.length = 0; }
+function undo(){ if (!undoS.length) return flash('Nothing to undo'); redoS.push(snap()); sk = JSON.parse(undoS.pop()); afterEdit(); flash('Undo'); }
+function redo(){ if (!redoS.length) return flash('Nothing to redo'); undoS.push(snap()); sk = JSON.parse(redoS.pop()); afterEdit(); flash('Redo'); }
+
+// ======================================================================
+// Three.js scene
+// ======================================================================
+const renderer = new THREE.WebGLRenderer({ canvas: $('#gl'), antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+const scene = new THREE.Scene();
+const BG = new THREE.Color('#E9E4DA');
+scene.background = BG;
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 200);
+camera.position.set(1.9, 1.7, 1.6);
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.target.set(0, 0.3, -0.6);
+orbit.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+orbit.update();
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8070, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(2, 4, 3); scene.add(sun);
+const fill = new THREE.DirectionalLight(0xffffff, 0.5); fill.position.set(-3, 1, -2); scene.add(fill);
+
+// everything you make lives in "world", which you can grab, turn and scale; 1 unit = 1 m at 1:1
+const world = new THREE.Group(); scene.add(world);
+const floorGrid = new THREE.GridHelper(6, 30, 0x9a907f, 0xc9c0b0); floorGrid.material.transparent = true; floorGrid.material.opacity = 0.7; world.add(floorGrid);
+const ws = () => world.scale.x;
+
+// bold playground colours, one per piece
+const PAL = ['#FF3B30', '#1E5EFF', '#FFC400', '#18B85C', '#FF8A00', '#9B4DFF', '#00B8D9', '#FF2D95'];
+// colour by the order pieces were started (their oldest corner), so a piece keeps its colour as you add to it
+let colorCache = null;
+function pieceColor(F, pc){
+  if (!colorCache || colorCache.F !== F){
+    const minId = new Map(); for (const [id, c] of F.comp) if (!minId.has(c) || id < minId.get(c)) minId.set(c, id);
+    const order = [...minId.entries()].sort((a, b) => a[1] - b[1]).map(x => x[0]);
+    colorCache = { F, idx: new Map(order.map((c, i) => [c, i])) };
+  }
+  return PAL[(colorCache.idx.get(pc) || 0) % PAL.length];
+}
+
+const faceMat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.75, metalness: 0, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+const holeMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false });
+const faceMesh = new THREE.Mesh(new THREE.BufferGeometry(), faceMat), holeMesh = new THREE.Mesh(new THREE.BufferGeometry(), holeMat);
+world.add(faceMesh, holeMesh);
+const MAXI = 4096;
+const edgeInst = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 8, 1, true), new THREE.MeshBasicMaterial({ color: 0xffffff }), MAXI);
+const cornInst = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 14, 10), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 }), MAXI);
+edgeInst.count = cornInst.count = 0; edgeInst.frustumCulled = cornInst.frustumCulled = false;
+world.add(edgeInst, cornInst);
+const strokeLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x3b3a36, transparent: true, opacity: 0.35 }));
+world.add(strokeLines);
+const liveBuf = new Float32Array(3 * 4000);
+const liveGeo = new THREE.BufferGeometry(); liveGeo.setAttribute('position', new THREE.BufferAttribute(liveBuf, 3)); liveGeo.setDrawRange(0, 0);
+const liveLine = new THREE.Line(liveGeo, new THREE.LineBasicMaterial({ color: 0x111111 })); liveLine.frustumCulled = false; world.add(liveLine);
+
+// ======================================================================
+// Build: sketch → faces → solved corners
+// ======================================================================
+let F = null, X = {}, D = {};         // faces, solved corners, corners as drawn on screen (they glide to X)
+let preview = null;                     // while drawing: the sketch as it would be with this stroke
+let dragF = null;                       // faces held still while you drag
+function solveOpts(extra){
+  const k = 1 / ws();
+  return Object.assign({ square: S.square, squareDeg: S.sqDeg, floor: S.floor, floorR: 0.05 * k, flat: 1, minTol: 0.015 * k, rel: 0.18, iters: 60 }, extra);
+}
+function rebuild(){
+  const o = C.build(sk, solveOpts({ warm: X }));
+  F = o.F; X = o.X;
+  for (const v of sk.v) if (!D[v.id]) D[v.id] = (preview && preview.P[v.id]) || X[v.id];
+  for (const id in D) if (!X[id]) delete D[id];
+  strokesDirty = true; menuDirty = true;
+}
+function afterEdit(){ rebuild(); saveSketch(); }
+
+// ======================================================================
+// Drawing the model
+// ======================================================================
+const tmpM = new THREE.Matrix4(), tmpQ = new THREE.Quaternion(), UP = new V3(0, 1, 0), tmpC = new THREE.Color();
+let strokesDirty = true;
+let hover = null;              // { kind: 'vert'|'edge'|'face', id / key }
+let eraseMarks = new Set();
+function drawModel(){
+  const M = preview ? { sk: preview.sk, F: preview.F, P: preview.P, newEdge: preview.edge } : { sk, F, P: D };
+  if (!M.F) return;
+  const k = 1 / ws();
+  // faces: each one a flat polygon of any number of sides (filled for display only)
+  const pos = [], col = [], nrm = [], hpos = [];
+  for (const f of M.F.faces){
+    const P = f.ids.map(id => M.P[id]);
+    if (P.some(p => !p)) continue;
+    const pl = C.planeOf(P), [u, w] = C.basis(pl.n);
+    const c2 = P.map(p => { const d = C.V.sub(p, pl.c); return new THREE.Vector2(C.V.dot(d, u), C.V.dot(d, w)); });
+    let tris;
+    try { tris = THREE.ShapeUtils.triangulateShape(c2, []); } catch (e) { continue; }
+    const out = f.open ? hpos : pos;
+    tmpC.set(pieceColor(M.F, f.piece));
+    if (hover && hover.kind === 'face' && hover.key === f.key && !preview) tmpC.lerp(new THREE.Color('#FFF27A'), 0.55);
+    for (const t of tris){
+      // every triangle wound the same way as the face, with the face's own normal, so it shades as one flat face
+      const [i0, i1, i2] = t, nn = C.V.cross(C.V.sub(P[i1], P[i0]), C.V.sub(P[i2], P[i0])), tt = C.V.dot(nn, pl.n) < 0 ? [i0, i2, i1] : t;
+      for (const i of tt){ out.push(...P[i]); if (!f.open){ col.push(tmpC.r, tmpC.g, tmpC.b); nrm.push(...pl.n); } }
+    }
+  }
+  setGeo(faceMesh.geometry, pos, col, nrm); setGeo(holeMesh.geometry, hpos, null);
+  // edges
+  const r = 0.0038 * k;
+  let n = 0;
+  for (const e of M.sk.e){
+    const a = M.P[e.a], b = M.P[e.b]; if (!a || !b || n >= MAXI) continue;
+    const A = toV(a), B = toV(b), L = A.distanceTo(B);
+    tmpQ.setFromUnitVectors(UP, B.clone().sub(A).normalize());
+    tmpM.compose(A.add(B).multiplyScalar(0.5), tmpQ, new V3(r, L, r));
+    edgeInst.setMatrixAt(n, tmpM);
+    const use = M.F.edgeUse.get(e.id) || 0;
+    let c = use ? '#141414' : '#FF2D95';
+    if (e.id === M.newEdge) c = '#1E5EFF';
+    if (eraseMarks.has(e.id)) c = '#FF3B30';
+    if (hover && hover.kind === 'edge' && hover.id === e.id) c = '#FFD60A';
+    edgeInst.setColorAt(n++, tmpC.set(c));
+  }
+  edgeInst.count = n; edgeInst.instanceMatrix.needsUpdate = true; if (edgeInst.instanceColor) edgeInst.instanceColor.needsUpdate = true;
+  // corners: the control points
+  n = 0;
+  if (S.points || preview){
+    const deg = new Map(); for (const e of M.sk.e){ deg.set(e.a, (deg.get(e.a) || 0) + 1); deg.set(e.b, (deg.get(e.b) || 0) + 1); }
+    for (const v of M.sk.v){
+      const p = M.P[v.id]; if (!p || n >= MAXI) continue;
+      const hot = hover && ((hover.kind === 'vert' && hover.id === v.id) || (hover.kind === 'face' && hover.ids?.includes(v.id)) || (hover.kind === 'edge' && hover.ids?.includes(v.id)));
+      const rr = (hot ? 0.012 : 0.0085) * k;
+      tmpM.compose(toV(p), tmpQ.identity(), new V3(rr, rr, rr)); cornInst.setMatrixAt(n, tmpM);
+      cornInst.setColorAt(n++, tmpC.set(hot ? '#FFD60A' : (deg.get(v.id) || 0) < 2 ? '#FF2D95' : v.pin ? '#2EC4B6' : '#FFFFFF'));
+    }
+  }
+  cornInst.count = n; cornInst.instanceMatrix.needsUpdate = true; if (cornInst.instanceColor) cornInst.instanceColor.needsUpdate = true;
+  if (strokesDirty){
+    strokesDirty = false;
+    const sp = [];
+    for (const s of sk.s) for (let i = 1; i < s.p.length; i++) sp.push(...s.p[i - 1], ...s.p[i]);
+    setGeo(strokeLines.geometry, sp, null);
+  }
+  strokeLines.visible = S.strokes;
+}
+function setGeo(g, pos, col, nrm){
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  if (col) g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  if (nrm) g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+  else if (pos.length) g.computeVertexNormals();
+  g.computeBoundingSphere();
+}
+
+// ======================================================================
+// Picking (model space)
+// ======================================================================
+function pickVert(p, r){
+  let best = null, bd = r;
+  for (const v of sk.v){ const q = D[v.id]; if (!q) continue; const d = C.V.dist(p, q); if (d < bd){ bd = d; best = { kind: 'vert', id: v.id, ids: [v.id], d }; } }
+  return best;
+}
+function segDist(p, a, b){ const ab = C.V.sub(b, a), t = Math.max(0, Math.min(1, C.V.dot(C.V.sub(p, a), ab) / (C.V.dot(ab, ab) || 1))); return C.V.dist(p, C.V.add(a, C.V.mul(ab, t))); }
+function pickEdge(p, r){
+  let best = null, bd = r;
+  for (const e of sk.e){ const a = D[e.a], b = D[e.b]; if (!a || !b) continue; const d = segDist(p, a, b); if (d < bd){ bd = d; best = { kind: 'edge', id: e.id, ids: [e.a, e.b], d }; } }
+  return best;
+}
+function facePoly(f){ const P = f.ids.map(id => D[id]); const pl = C.planeOf(P), [u, w] = C.basis(pl.n); return { P, pl, u, w, poly: P.map(p => { const d = C.V.sub(p, pl.c); return [C.V.dot(d, u), C.V.dot(d, w)]; }) }; }
+function inPoly(q, poly){ let ins = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++){ const a = poly[i], b = poly[j]; if ((a[1] > q[1]) !== (b[1] > q[1]) && q[0] < (b[0] - a[0]) * (q[1] - a[1]) / (b[1] - a[1]) + a[0]) ins = !ins; } return ins; }
+function pickFace(p, r){
+  if (!F) return null;
+  let best = null, bd = r;
+  for (const f of F.faces){
+    if (f.ids.some(id => !D[id])) continue;
+    const { pl, u, w, poly } = facePoly(f), d = C.V.sub(p, pl.c), h = Math.abs(C.V.dot(d, pl.n));
+    if (h < bd && inPoly([C.V.dot(d, u), C.V.dot(d, w)], poly)){ bd = h; best = { kind: 'face', key: f.key, ids: f.ids.slice(), n: pl.n, c: pl.c, d: h }; }
+  }
+  return best;
+}
+// what a grab at p would take: a corner first, then an edge, then a face
+function pickAny(p, r){ return pickVert(p, r) || pickEdge(p, r * 0.8) || pickFace(p, r); }
+// ray (model space) against faces
+function rayFace(o, dir){
+  if (!F) return null;
+  let best = null;
+  for (const f of F.faces){
+    if (f.ids.some(id => !D[id])) continue;
+    const { pl, u, w, poly } = facePoly(f), dn = C.V.dot(dir, pl.n);
+    if (Math.abs(dn) < 1e-6) continue;
+    const t = C.V.dot(C.V.sub(pl.c, o), pl.n) / dn; if (t <= 0) continue;
+    const hit = C.V.add(o, C.V.mul(dir, t)), d = C.V.sub(hit, pl.c);
+    if (inPoly([C.V.dot(d, u), C.V.dot(d, w)], poly) && (!best || t < best.t)) best = { kind: 'face', key: f.key, ids: f.ids.slice(), n: pl.n, c: pl.c, t, hit };
+  }
+  return best;
+}
+
+// ======================================================================
+// Strokes, erasing, holes, grabbing (shared by headset and computer)
+// ======================================================================
+let stroke = null;   // { pts: [[x,y,z]...] in model space }
+let lastPrev = 0;
+function strokeStart(p){ stroke = { pts: [p] }; liveGeo.setDrawRange(0, 0); pushLive(p); }
+function pushLive(p){ const n = liveGeo.drawRange.count; if (n >= 4000) return; liveBuf.set(p, n * 3); liveGeo.setDrawRange(0, n + 1); liveGeo.attributes.position.needsUpdate = true; liveGeo.computeBoundingSphere(); }
+function strokeMove(p){
+  if (!stroke) return;
+  const last = stroke.pts[stroke.pts.length - 1];
+  if (C.V.dist(last, p) < 0.004 / ws()) return;
+  stroke.pts.push(p); pushLive(p);
+  const now = performance.now();
+  if (now - lastPrev > 60){ lastPrev = now; updatePreview(); }
+}
+function updatePreview(){
+  if (!stroke || stroke.pts.length < 3){ preview = null; return; }
+  const psk = C.clone(sk), r = C.addStroke(psk, stroke.pts, D, { snapR: S.snap / 100 / ws() });
+  if (!r.ok){ preview = null; return; }
+  const o = C.build(psk, solveOpts({ warm: X, iters: 30 }));
+  // new corners start where the stroke put them; the rest show where they'd settle
+  preview = { sk: psk, F: o.F, P: o.X, edge: r.edge };
+}
+function strokeEnd(){
+  if (!stroke) return;
+  const pts = stroke.pts; stroke = null; liveGeo.setDrawRange(0, 0);
+  if (pts.length < 3){ preview = null; return; }
+  const before = snap();
+  const r = C.addStroke(sk, pts, D, { snapR: S.snap / 100 / ws() });
+  if (!r.ok){ preview = null; flash(r.why === 'too short' ? 'Too short for a line' : 'That runs along an edge already'); return; }
+  pushUndo(before); afterEdit(); preview = null;
+  const nf = F.faces.filter(f => f.ids.includes(r.a) && f.ids.includes(r.b)).length;
+  flash(nf ? (nf === 1 ? 'Line in: it closed a face' : 'Line in: it closed ' + nf + ' faces') : 'Line in');
+}
+function eraseAt(p){
+  const e = pickEdge(p, 0.025 / ws());
+  if (e && !eraseMarks.has(e.id)){ eraseMarks.add(e.id); buzz(0.3, 20); }
+}
+function eraseEnd(){
+  if (!eraseMarks.size) return;
+  pushUndo(); C.removeEdges(sk, [...eraseMarks]); flash(eraseMarks.size === 1 ? 'Erased a line' : 'Erased ' + eraseMarks.size + ' lines'); eraseMarks.clear(); afterEdit();
+}
+function toggleHole(h){
+  if (!h || h.kind !== 'face') return;
+  pushUndo();
+  const i = sk.open.indexOf(h.key);
+  if (i >= 0){ sk.open.splice(i, 1); flash('Face closed'); } else { sk.open.push(h.key); flash('Face opened: it\'s a hole now'); }
+  afterEdit();
+}
+
+// Grabbing a corner, edge or face. "frame" is where the hand (or mouse) was at the start: world position + rotation.
+let drag = null;
+function grabStart(h, frame){
+  if (!h) return false;
+  const P0 = {}; for (const id of h.ids) P0[id] = world.localToWorld(toV(D[id]));
+  drag = { kind: h.kind, ids: h.ids, P0, f0: { p: frame.p.clone(), q: frame.q.clone() }, before: snap(), key: h.key };
+  if (h.kind === 'face'){
+    drag.c0 = world.localToWorld(toV(h.c));
+    drag.n0 = toV(h.n).transformDirection(world.matrixWorld).normalize();
+  }
+  dragF = F;
+  buzz(0.5, 30);
+  return true;
+}
+function grabMove(frame){
+  if (!drag) return;
+  const T = frame.p.clone().sub(drag.f0.p), R = frame.q.clone().multiply(drag.f0.q.clone().invert());
+  const targets = {};
+  for (const id of drag.ids){
+    let w;
+    if (drag.kind === 'face'){
+      // push along the face (and tilt with your wrist); slide too only if you asked for it
+      const t = S.slide ? T : drag.n0.clone().multiplyScalar(T.dot(drag.n0));
+      w = drag.P0[id].clone().sub(drag.c0).applyQuaternion(frame.noTilt ? tmpQ.identity() : R).add(drag.c0).add(t);
+    } else w = drag.P0[id].clone().add(T);
+    targets[id] = toA(world.worldToLocal(w));
+  }
+  drag.targets = targets;
+  X = C.solve(sk, dragF, solveOpts({ drag: targets, warm: X, iters: 30 }));
+  for (const id in X) D[id] = X[id];
+}
+function grabEnd(){
+  if (!drag) return;
+  if (drag.targets){
+    // where you let go is where those corners stay (they no longer follow their strokes)
+    for (const id of drag.ids){ const v = sk.v.find(x => x.id === id); if (v) v.pin = X[id].map(x => +x.toFixed(4)); }
+    pushUndo(drag.before); afterEdit();
+    flash(drag.kind === 'face' ? 'Face moved' : drag.kind === 'edge' ? 'Edge moved' : 'Corner moved');
+  }
+  drag = null; dragF = null;
+}
+function unpinAll(){
+  if (!sk.v.some(v => v.pin)) return flash('Every corner already follows your strokes');
+  pushUndo(); for (const v of sk.v) delete v.pin; afterEdit(); flash('Moved corners go back to your strokes');
+}
+
+// ======================================================================
+// Menu: one canvas, on your left controller in the headset, at the top left on a computer
+// ======================================================================
+const MW = 768, MH = 1040, RAIL = 128;
+const menuCanvas = document.createElement('canvas'); menuCanvas.width = MW; menuCanvas.height = MH; menuCanvas.id = 'menu2d';
+document.body.appendChild(menuCanvas);
+const mx = menuCanvas.getContext('2d'), menuTex = new THREE.CanvasTexture(menuCanvas); menuTex.colorSpace = THREE.SRGBColorSpace; menuTex.anisotropy = 4;
+const MENU_W = 0.2, MENU_H = MENU_W * MH / MW, MENU_TILT = -1.2;
+const menuMesh = new THREE.Mesh(new THREE.PlaneGeometry(MENU_W, MENU_H), new THREE.MeshBasicMaterial({ map: menuTex, side: THREE.DoubleSide, transparent: true }));
+menuMesh.rotation.x = MENU_TILT; menuMesh.position.set(0, 0.035 + MENU_H / 2 * Math.cos(MENU_TILT), -0.035 + MENU_H / 2 * Math.sin(MENU_TILT));
+menuMesh.visible = false; menuMesh.renderOrder = 10;
+let menuDirty = true, menuHover = null, menuShown = true, flashText = '', flashT = 0, clearArmed = 0;
+const BTN = [];
+function flash(t, secs){ flashText = t; flashT = secs || 2.4; menuDirty = true; if (!renderer.xr.isPresenting) $('#status').textContent = t; }
+
+const INK = '#111', CREAM = '#FFF6E5', BLUE = '#1E5EFF', YEL = '#FFD60A', PINK = '#FF2D95';
+function rr(x, y, w, h, r){ mx.beginPath(); mx.moveTo(x + r, y); mx.arcTo(x + w, y, x + w, y + h, r); mx.arcTo(x + w, y + h, x, y + h, r); mx.arcTo(x, y + h, x, y, r); mx.arcTo(x, y, x + w, y, r); mx.closePath(); }
+function button(x, y, w, h, label, act, on, opt = {}){
+  const hot = menuHover && menuHover.x === x && menuHover.y === y;
+  rr(x + 6, y + 6, w, h, 14); mx.fillStyle = INK; mx.fill();
+  rr(x, y, w, h, 14); mx.fillStyle = on ? (opt.onColor || BLUE) : hot ? '#FFF27A' : opt.bg || '#FFFFFF'; mx.fill();
+  mx.lineWidth = 5; mx.strokeStyle = INK; mx.stroke();
+  mx.fillStyle = on && !opt.onColor ? '#FFFFFF' : INK; mx.font = `800 ${opt.fs || 30}px system-ui,sans-serif`; mx.textAlign = 'center'; mx.textBaseline = 'middle';
+  if (opt.icon) opt.icon(x + w / 2, y + h / 2 - (label ? 14 : 0), on ? '#FFF' : INK);
+  if (label) mx.fillText(label, x + w / 2, y + h / 2 + (opt.icon ? 30 : 2));
+  BTN.push({ x, y, w, h, act });
+}
+function seg(x, y, w, h, items, cur, set, fs){
+  const n = items.length, g = 12, bw = (w - g * (n - 1)) / n;
+  items.forEach(([v, lab], i) => button(x + i * (bw + g), y, bw, h, lab, () => { set(v); saveSet(); menuDirty = true; }, cur === v, { fs }));
+}
+function label(t, x, y, fs = 26, c = '#555'){ mx.fillStyle = c; mx.font = `700 ${fs}px system-ui,sans-serif`; mx.textAlign = 'left'; mx.textBaseline = 'alphabetic'; mx.fillText(t, x, y); }
+function para(t, x, y, w, fs = 25, c = '#333'){
+  mx.fillStyle = c; mx.font = `600 ${fs}px system-ui,sans-serif`; mx.textAlign = 'left'; mx.textBaseline = 'alphabetic';
+  let line = '', yy = y;
+  for (const word of t.split(' ')){ const tt = line ? line + ' ' + word : word; if (mx.measureText(tt).width > w && line){ mx.fillText(line, x, yy); line = word; yy += fs * 1.3; } else line = tt; }
+  if (line) mx.fillText(line, x, yy); return yy + fs * 1.3;
+}
+// tab icons, drawn as thick strokes
+const ICON = {
+  draw(x, y, c){ mx.strokeStyle = c; mx.lineWidth = 6; mx.lineCap = 'round'; mx.beginPath(); mx.moveTo(x - 20, y + 18); mx.lineTo(x + 16, y - 18); mx.stroke(); mx.beginPath(); mx.moveTo(x - 24, y - 4); mx.lineTo(x - 10, y - 18); mx.stroke(); mx.fillStyle = c; mx.beginPath(); mx.arc(x - 20, y + 18, 5, 0, 7); mx.fill(); mx.beginPath(); mx.arc(x + 16, y - 18, 5, 0, 7); mx.fill(); },
+  move(x, y, c){ mx.strokeStyle = c; mx.lineWidth = 6; mx.lineJoin = 'round'; mx.beginPath(); mx.moveTo(x - 20, y + 4); mx.lineTo(x + 2, y - 10); mx.lineTo(x + 22, y + 2); mx.lineTo(x, y + 16); mx.closePath(); mx.stroke(); mx.beginPath(); mx.moveTo(x, y - 6); mx.lineTo(x, y - 26); mx.moveTo(x - 7, y - 19); mx.lineTo(x, y - 26); mx.lineTo(x + 7, y - 19); mx.stroke(); },
+  tidy(x, y, c){ mx.strokeStyle = c; mx.lineWidth = 7; mx.lineJoin = 'miter'; mx.beginPath(); mx.moveTo(x - 18, y - 22); mx.lineTo(x - 18, y + 18); mx.lineTo(x + 22, y + 18); mx.stroke(); mx.lineWidth = 4; mx.beginPath(); mx.moveTo(x - 18, y + 4); mx.lineTo(x - 4, y + 4); mx.lineTo(x - 4, y + 18); mx.stroke(); },
+  view(x, y, c){ mx.strokeStyle = c; mx.lineWidth = 6; mx.beginPath(); mx.moveTo(x - 26, y); mx.quadraticCurveTo(x, y - 26, x + 26, y); mx.quadraticCurveTo(x, y + 26, x - 26, y); mx.stroke(); mx.fillStyle = c; mx.beginPath(); mx.arc(x, y, 8, 0, 7); mx.fill(); },
+  files(x, y, c){ mx.strokeStyle = c; mx.lineWidth = 6; mx.lineJoin = 'round'; mx.beginPath(); mx.moveTo(x - 24, y - 16); mx.lineTo(x - 8, y - 16); mx.lineTo(x - 2, y - 9); mx.lineTo(x + 24, y - 9); mx.lineTo(x + 24, y + 18); mx.lineTo(x - 24, y + 18); mx.closePath(); mx.stroke(); },
+};
+const TABS = [['draw', 'Draw'], ['move', 'Move'], ['tidy', 'Tidy'], ['view', 'View'], ['files', 'Files']];
+const TOOLS = [['draw', 'Draw'], ['grab', 'Grab'], ['erase', 'Erase'], ['hole', 'Holes']];
+function summary(){
+  if (!F || !sk.e.length) return 'Draw the edges of a box: one stroke per edge.';
+  const closed = F.pieces.filter(p => p.closed).length, open = F.pieces.filter(p => !p.closed && p.faces).length, loose = F.loose.length;
+  const bits = [];
+  if (closed) bits.push(closed + (closed === 1 ? ' solid' : ' solids'));
+  if (open) bits.push(open + (open === 1 ? ' open surface' : ' open surfaces'));
+  if (loose) bits.push(loose + (loose === 1 ? ' loose line' : ' loose lines'));
+  if (!bits.length) return F.faces.length + ' faces';
+  return bits.join(' · ');
+}
+function drawMenu(){
+  menuDirty = false; BTN.length = 0;
+  mx.clearRect(0, 0, MW, MH);
+  rr(0, 0, MW, MH, 30); mx.fillStyle = CREAM; mx.fill();
+  // icon rail down the left side
+  rr(0, 0, RAIL, MH, 30); mx.fillStyle = INK; mx.fill();
+  TABS.forEach(([id, name], i) => {
+    const y = 26 + i * 150, on = S.tab === id;
+    button(14, y, RAIL - 34, 128, name, () => { S.tab = id; saveSet(); menuDirty = true; }, on, { onColor: YEL, fs: 22, icon: ICON[id], bg: '#FFFFFF' });
+  });
+  const x0 = RAIL + 26, W = MW - x0 - 30;
+  // title, with undo / redo always at hand
+  mx.fillStyle = INK; mx.font = '900 40px system-ui,sans-serif'; mx.textAlign = 'left'; mx.textBaseline = 'alphabetic';
+  mx.fillText(TABS.find(t => t[0] === S.tab)[1], x0, 66);
+  button(MW - 30 - 220, 22, 104, 64, '↶', undo, false, { fs: 44 });
+  button(MW - 30 - 104, 22, 104, 64, '↷', redo, false, { fs: 44 });
+  let y = 118;
+  if (S.tab === 'draw'){
+    label('Trigger does', x0, y + 20); y += 34;
+    seg(x0, y, W, 84, TOOLS, S.tool, v => S.tool = v, 27); y += 112;
+    label('Ends click onto corners and edges within', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[3, '3 cm'], [6, '6 cm'], [10, '10 cm']], S.snap, v => S.snap = v, 28); y += 104;
+    para(S.tool === 'draw' ? 'One stroke makes one straight line. Close a loop of lines and it fills in as a flat face, with as many sides as the loop has.'
+      : S.tool === 'grab' ? 'Trigger (or grip, any time) takes the corner, line or face nearest your pen and moves it.'
+      : S.tool === 'erase' ? 'Hold the trigger and brush over lines: they turn red and go when you let go.'
+      : 'Tap a face to open it up (an open side, like a box with no lid). Tap it again to close it.', x0, y + 6, W);
+  } else if (S.tab === 'move'){
+    label('Grabbing a face', x0, y + 20); y += 34;
+    seg(x0, y, W, 76, [[false, 'Push + tilt'], [true, 'Push, tilt, slide']], S.slide, v => S.slide = v, 27); y += 106;
+    y = para('Grip near a corner, a line or a face to move it. A face moves out and in as you push and tilts as you turn your wrist; the faces around it follow and stay flat.', x0, y + 10, W);
+    y = para('Grip in empty space to move the whole model. Grip with both hands to scale and turn it.', x0, y + 8, W);
+    button(x0, y + 18, W, 76, 'Let moved corners follow my lines again', unpinAll, false, { fs: 25 });
+  } else if (S.tab === 'tidy'){
+    label('Square up', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.square, v => { S.square = v; rebuild(); }, 28); y += 100;
+    y = para('Lines that are nearly upright, level or square to their neighbours snap exactly so.', x0, y, W) + 6;
+    label('Snap when within', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[5, '5°'], [10, '10°'], [15, '15°']], S.sqDeg, v => { S.sqDeg = v; rebuild(); }, 28); y += 104;
+    label('Corners near the floor sit on it', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.floor, v => { S.floor = v; rebuild(); }, 28); y += 100;
+    para('Faces are always made flat.', x0, y, W);
+  } else if (S.tab === 'view'){
+    label('Your sketch strokes', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.strokes, v => S.strokes = v, 28); y += 100;
+    label('Control points', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.points, v => S.points = v, 28); y += 100;
+    label('Drawing hand', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [['left', 'Left'], ['right', 'Right']], S.hand, v => { S.hand = v; placeMenu(); }, 28); y += 100;
+    const s = ws(), sc = s >= 0.995 && s <= 1.005 ? '1:1' : s < 1 ? '1:' + (1 / s).toFixed(s > 0.2 ? 1 : 0) : (s).toFixed(1) + ':1';
+    label('Shown at ' + sc, x0, y + 24, 28, INK); y += 44;
+    button(x0, y, W, 72, 'Back to 1:1 on the floor', resetView, false, { fs: 26 });
+  } else if (S.tab === 'files'){
+    const half = (W - 12) / 2;
+    button(x0, y, half, 72, clearArmed > 0 ? 'Sure? Press again' : 'New sketch', clearSketch, clearArmed > 0, { fs: 25, onColor: PINK });
+    button(x0 + half + 12, y, half, 72, 'Try a sample', loadSample, false, { fs: 25 }); y += 96;
+    button(x0, y, W, 72, 'Save for Rhino (.obj)', exportOBJ, false, { fs: 26 }); y += 96;
+    button(x0, y, W, 72, 'Keep a copy in the library', saveToLib, false, { fs: 26 }); y += 100;
+    const lib = getLib();
+    label(lib.length ? 'Library' : 'Library is empty', x0, y + 20); y += 36;
+    lib.slice(0, 5).forEach((it, i) => {
+      button(x0, y, W - 92, 64, it.name, () => openLib(i), false, { fs: 24 });
+      button(x0 + W - 78, y, 78, 64, '✕', () => delLib(i), false, { fs: 28 });
+      y += 78;
+    });
+  }
+  // status line
+  const msg = flashT > 0 ? flashText : summary();
+  rr(RAIL + 16, MH - 92, MW - RAIL - 36, 72, 16); mx.fillStyle = flashT > 0 ? YEL : '#FFFFFF'; mx.fill(); mx.lineWidth = 4; mx.strokeStyle = INK; mx.stroke();
+  mx.fillStyle = INK; mx.font = '700 25px system-ui,sans-serif'; mx.textAlign = 'center'; mx.textBaseline = 'middle';
+  let m = msg; while (mx.measureText(m).width > MW - RAIL - 70 && m.length > 4) m = m.slice(0, -2);
+  mx.fillText(m === msg ? m : m + '…', RAIL + 16 + (MW - RAIL - 36) / 2, MH - 56);
+  menuTex.needsUpdate = true;
+}
+function menuClick(px, py){ for (let i = BTN.length - 1; i >= 0; i--){ const b = BTN[i]; if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h){ b.act(); buzz(0.4, 15); menuDirty = true; return true; } } return false; }
+function menuHoverAt(px, py){
+  let h = null; for (const b of BTN) if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) h = b;
+  const k = h ? h.x + ',' + h.y : null, cur = menuHover ? menuHover.x + ',' + menuHover.y : null;
+  if (k !== cur){ menuHover = h; menuDirty = true; }
+}
+// on a computer: the canvas itself is the menu
+menuCanvas.addEventListener('pointerdown', e => { e.stopPropagation(); const r = menuCanvas.getBoundingClientRect(); menuClick((e.clientX - r.left) * MW / r.width, (e.clientY - r.top) * MH / r.height); });
+menuCanvas.addEventListener('pointermove', e => { const r = menuCanvas.getBoundingClientRect(); menuHoverAt((e.clientX - r.left) * MW / r.width, (e.clientY - r.top) * MH / r.height); });
+menuCanvas.addEventListener('pointerleave', () => { menuHover = null; menuDirty = true; });
+
+// ======================================================================
+// Files
+// ======================================================================
+function clearSketch(){
+  if (clearArmed <= 0){ clearArmed = 3; flash('Press New sketch again to start over'); return; }
+  clearArmed = 0; pushUndo(); sk = C.emptySketch(); X = {}; D = {}; afterEdit(); flash('New sketch. Undo brings the old one back.');
+}
+const getLib = () => { try { return JSON.parse(localStorage.getItem(LIB_KEY)) || []; } catch (e) { return []; } };
+const setLib = l => { try { localStorage.setItem(LIB_KEY, JSON.stringify(l)); } catch (e) { flash('Couldn\'t save: storage is full'); } };
+function saveToLib(){
+  if (!sk.e.length) return flash('Draw something first');
+  const d = new Date(), name = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' · ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) + ' · ' + summary().split(' · ')[0];
+  const l = getLib(); l.unshift({ name, sk }); setLib(l.slice(0, 12)); flash('Kept in the library');
+}
+function openLib(i){ const it = getLib()[i]; if (!it) return; pushUndo(); sk = C.clone(it.sk); X = {}; D = {}; afterEdit(); flash('Opened ' + it.name); }
+function delLib(i){ const l = getLib(); l.splice(i, 1); setLib(l); flash('Removed from the library'); }
+function exportOBJ(){
+  if (!F || !F.faces.length) return flash('No faces yet to save');
+  const blob = new Blob([C.toOBJ(sk, F, X, 1000)], { type: 'text/plain' }), a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'edgewise-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.obj'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  flash('Saved (mm, Z up, faces with all their sides)');
+}
+// a few wobbly hand-drawn shapes: a box, a ramp and an L-shaped platform
+function loadSample(){
+  pushUndo();
+  sk = C.emptySketch(); X = {}; D = {};
+  let seed = 7; const rnd = () => { seed = (seed * 16807) % 2147483647; return (seed / 2147483647 - 0.5) * 2; };
+  const wob = (a, b) => { const p = [], n = 14, bow = [rnd() * 0.02, rnd() * 0.02, rnd() * 0.02]; for (let i = 0; i < n; i++){ const t = i / (n - 1), s = Math.sin(t * Math.PI); p.push([a[0] + (b[0] - a[0]) * t + bow[0] * s + rnd() * 0.006, a[1] + (b[1] - a[1]) * t + bow[1] * s + rnd() * 0.006, a[2] + (b[2] - a[2]) * t + bow[2] * s + rnd() * 0.006]); } return p; };
+  const at = (p, o, a) => [o[0] + p[0] * Math.cos(a) - p[2] * Math.sin(a), o[1] + p[1], o[2] + p[0] * Math.sin(a) + p[2] * Math.cos(a)];
+  const add = (pts, E, o, a) => { for (const [i, j] of E){ const A = at(pts[i], o, a), B = at(pts[j], o, a); C.addStroke(sk, wob(A.map(x => x + rnd() * 0.012), B.map(x => x + rnd() * 0.012)), {}, { snapR: 0.06 }); X = C.build(sk, solveOpts({ warm: X })).X; } };
+  const box = [[0, 0, 0], [0.9, 0, 0], [0.9, 0, 0.6], [0, 0, 0.6], [0, 0.45, 0], [0.9, 0.45, 0], [0.9, 0.45, 0.6], [0, 0.45, 0.6]];
+  add(box, [[0, 1], [1, 2], [2, 3], [3, 0], [0, 4], [1, 5], [2, 6], [3, 7], [4, 5], [5, 6], [6, 7], [7, 4]], [-1.2, 0, -1.1], 0.08);
+  const ramp = [[0, 0, 0], [0.8, 0, 0], [0.8, 0, 0.7], [0, 0, 0.7], [0.8, 0.4, 0], [0.8, 0.4, 0.7]];
+  add(ramp, [[0, 1], [1, 2], [2, 3], [3, 0], [1, 4], [2, 5], [4, 5], [0, 4], [3, 5]], [-0.15, 0, -1.25], 0.08);
+  const L = [[0, 0], [1, 0], [1, 0.4], [0.45, 0.4], [0.45, 0.9], [0, 0.9]];
+  const Lp = [...L.map(([x, z]) => [x, 0, z]), ...L.map(([x, z]) => [x, 0.3, z])], LE = [];
+  for (let i = 0; i < 6; i++) LE.push([i, (i + 1) % 6], [i, 6 + i], [6 + i, 6 + (i + 1) % 6]);
+  add(Lp, LE, [0.9, 0, -1.3], 0.08);
+  afterEdit(); for (const id in X) D[id] = X[id];
+  if (!renderer.xr.isPresenting){ orbit.target.set(0.2, 0.25, -1.0); camera.position.set(1.6, 1.8, 1.4); orbit.update(); }
+  flash('Sample: a box, a ramp and an L platform, drawn wobbly');
+}
+function resetView(){ world.position.set(0, 0, 0); world.quaternion.identity(); world.scale.setScalar(1); menuDirty = true; flash('Back to 1:1'); }
+
+// ======================================================================
+// Headset: controllers
+// ======================================================================
+const ctrlFactory = new XRControllerModelFactory();
+const hands = [0, 1].map(i => {
+  const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
+  grip.add(ctrlFactory.createControllerModel(grip));
+  scene.add(ray, grip);
+  const tip = new THREE.Mesh(new THREE.SphereGeometry(0.006, 14, 10), new THREE.MeshBasicMaterial({ color: 0x111111 }));
+  tip.position.set(0, 0, -0.02); ray.add(tip);
+  const beam = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xffffff }));
+  beam.visible = false; ray.add(beam);
+  const h = { i, ray, grip, tip, beam, source: null, hand: null, prev: [], grab: null, act: null };
+  ray.addEventListener('connected', e => { if (e.data.hand){ h.source = null; return; } h.source = e.data; h.hand = e.data.handedness; placeMenu(); });
+  ray.addEventListener('disconnected', () => { h.source = null; h.hand = null; });
+  return h;
+});
+const isDraw = h => h.hand === S.hand, isMenuHand = h => h.hand && h.hand !== S.hand;
+function placeMenu(){ const m = hands.find(isMenuHand); if (m){ m.grip.add(menuMesh); menuMesh.visible = menuShown && renderer.xr.isPresenting; } menuDirty = true; }
+function buzz(s, ms){ for (const h of hands) if (h.source && isDraw(h)) h.source.gamepad?.hapticActuators?.[0]?.pulse?.(s, ms); }
+const tipWorld = h => h.tip.getWorldPosition(new V3());
+const tipModel = h => toA(world.worldToLocal(tipWorld(h)));
+const frameOf = h => ({ p: tipWorld(h), q: h.ray.getWorldQuaternion(new THREE.Quaternion()) });
+
+let worldGrab = null;
+function worldGrabStart(){
+  const gs = hands.filter(h => h.grab === 'world');
+  const yawOf = q => { const f = new V3(0, 0, -1).applyQuaternion(q); return Math.atan2(f.x, f.z); };
+  const w0 = { p: world.position.clone(), q: world.quaternion.clone(), s: ws() };
+  if (gs.length === 1){ const fr = frameOf(gs[0]); worldGrab = { two: false, h: gs[0], p0: fr.p, yaw0: yawOf(fr.q), w0, yawOf }; }
+  else if (gs.length === 2){ const a = tipWorld(gs[0]), b = tipWorld(gs[1]); worldGrab = { two: true, a: gs[0], b: gs[1], d0: a.distanceTo(b), m0: a.clone().add(b).multiplyScalar(0.5), ang0: Math.atan2(b.x - a.x, b.z - a.z), w0 }; }
+  else worldGrab = null;
+}
+function worldGrabMove(){
+  const g = worldGrab; if (!g) return;
+  const Ry = a => new THREE.Quaternion().setFromAxisAngle(UP, a);
+  if (!g.two){
+    const fr = frameOf(g.h), dy = g.yawOf(fr.q) - g.yaw0, q = Ry(dy);
+    world.position.copy(g.w0.p.clone().sub(g.p0).applyQuaternion(q).add(fr.p));
+    world.quaternion.copy(q.multiply(g.w0.q));
+  } else {
+    const a = tipWorld(g.a), b = tipWorld(g.b), m = a.clone().add(b).multiplyScalar(0.5);
+    const s = Math.max(0.01, Math.min(20, g.w0.s * a.distanceTo(b) / g.d0)), dy = Math.atan2(b.x - a.x, b.z - a.z) - g.ang0, q = Ry(dy);
+    world.scale.setScalar(s);
+    world.position.copy(g.w0.p.clone().sub(g.m0).multiplyScalar(s / g.w0.s).applyQuaternion(q).add(m));
+    world.quaternion.copy(q.multiply(g.w0.q));
+    menuDirty = true;
+  }
+}
+
+const rc = new THREE.Raycaster();
+function xrInput(){
+  let menuHit = null;
+  for (const h of hands){
+    const gp = h.source && h.source.gamepad; if (!gp) { h.tip.visible = false; continue; }
+    h.tip.visible = true;
+    const b = gp.buttons.map(x => x && x.pressed), down = i => b[i] && !h.prev[i], up = i => !b[i] && h.prev[i];
+    const ax = gp.axes || [];
+    // the drawing hand points at the menu to use it
+    let onMenu = false;
+    if (isDraw(h) && menuMesh.visible){
+      const o = h.ray.getWorldPosition(new V3()), d = new V3(0, 0, -1).applyQuaternion(h.ray.getWorldQuaternion(new THREE.Quaternion()));
+      rc.set(o, d); rc.far = 1.2;
+      const hit = !h.act && rc.intersectObject(menuMesh, false)[0];
+      if (hit && hit.uv){ onMenu = true; menuHit = hit; menuHoverAt(hit.uv.x * MW, (1 - hit.uv.y) * MH); h.beam.visible = true; h.beam.scale.z = hit.distance; if (down(0)) menuClick(hit.uv.x * MW, (1 - hit.uv.y) * MH); }
+      else h.beam.visible = false;
+    }
+    const p = tipModel(h), reach = 0.035 / ws();
+    // grip: grab what's near the pen tip, or the world
+    if (down(1)){
+      const hit = !drag && pickAny(p, reach);
+      if (hit && grabStart(hit, frameOf(h))) h.grab = 'thing';
+      else { h.grab = 'world'; worldGrabStart(); }
+    }
+    if (up(1)){
+      if (h.grab === 'thing') grabEnd();
+      if (h.grab === 'world'){ h.grab = null; worldGrabStart(); }
+      h.grab = null;
+    }
+    if (h.grab === 'thing') grabMove(frameOf(h));
+    if (isDraw(h)){
+      if (!onMenu && down(0) && !h.grab){
+        if (S.tool === 'draw'){ h.act = 'draw'; strokeStart(p); }
+        else if (S.tool === 'erase'){ h.act = 'erase'; eraseAt(p); }
+        else if (S.tool === 'hole') toggleHole(pickFace(p, reach * 1.5));
+        else if (S.tool === 'grab'){ const hit = pickAny(p, reach); if (hit && grabStart(hit, frameOf(h))){ h.act = 'grab'; } }
+      }
+      if (b[0] && h.act === 'draw') strokeMove(p);
+      if (b[0] && h.act === 'erase') eraseAt(p);
+      if (b[0] && h.act === 'grab') grabMove(frameOf(h));
+      if (up(0) && h.act){ if (h.act === 'draw') strokeEnd(); if (h.act === 'erase') eraseEnd(); if (h.act === 'grab') grabEnd(); h.act = null; }
+      if (down(4)) undo();
+      if (down(5)) redo();
+      // stick left / right steps through the tools
+      const sx = ax[2] || 0;
+      if (Math.abs(sx) > 0.75 && !h.stickHeld){ h.stickHeld = true; const i = TOOLS.findIndex(t => t[0] === S.tool); S.tool = TOOLS[(i + (sx > 0 ? 1 : TOOLS.length - 1)) % TOOLS.length][0]; saveSet(); menuDirty = true; flash('Trigger: ' + TOOLS.find(t => t[0] === S.tool)[1]); }
+      if (Math.abs(sx) < 0.3) h.stickHeld = false;
+      // hover: show what grip would take
+      if (!h.act && !drag && !onMenu){
+        const hv = S.tool === 'hole' ? pickFace(p, reach * 1.5) : S.tool === 'erase' ? pickEdge(p, 0.025 / ws()) : S.tool === 'draw' ? pickVert(p, S.snap / 100 / ws()) : pickAny(p, reach);
+        setHover(hv);
+      }
+      h.tip.material.color.set(S.tool === 'erase' ? '#FF3B30' : S.tool === 'hole' ? '#2EC4B6' : S.tool === 'grab' ? '#FFD60A' : '#111111');
+    } else {
+      if (down(4) || down(5)){ menuShown = !menuShown; placeMenu(); }
+    }
+    h.prev = b;
+  }
+  if (!menuHit && menuHover){ menuHover = null; menuDirty = true; }
+  worldGrabMove();
+}
+function setHover(hv){
+  const k = hv ? hv.kind + (hv.id ?? hv.key) : '', cur = hover ? hover.kind + (hover.id ?? hover.key) : '';
+  if (k !== cur){ hover = hv; if (hv) buzz(0.15, 8); }
+}
+
+// ======================================================================
+// Computer: mouse
+// ======================================================================
+const ndc = new THREE.Vector2();
+let mouse = null;   // { kind: 'draw'|'grab'|'erase', plane }
+function mouseRay(e){
+  ndc.set(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1);
+  rc.setFromCamera(ndc, camera);
+  const inv = new THREE.Matrix4().copy(world.matrixWorld).invert();
+  const o = rc.ray.origin.clone().applyMatrix4(inv), d = rc.ray.direction.clone().transformDirection(inv).normalize();
+  return { o: toA(o), d: toA(d), ray: rc.ray.clone() };
+}
+function screenOf(p){ const v = world.localToWorld(toV(p)).project(camera); return [(v.x + 1) / 2 * innerWidth, (1 - v.y) / 2 * innerHeight, v.z]; }
+function cornerAtMouse(e, px = 16, plane){
+  let best = null, bd = px;
+  for (const v of sk.v){ const q = D[v.id]; if (!q) continue;
+    if (plane && Math.abs(C.V.dot(plane.n, C.V.sub(q, plane.c))) > S.snap / 100 / ws()) continue; const s = screenOf(q); if (s[2] > 1) continue; const d = Math.hypot(s[0] - e.clientX, s[1] - e.clientY); if (d < bd){ bd = d; best = { kind: 'vert', id: v.id, ids: [v.id] }; } }
+  return best;
+}
+function edgeAtMouse(e, px = 9){
+  let best = null, bd = px;
+  for (const ed of sk.e){
+    const a = D[ed.a], b = D[ed.b]; if (!a || !b) continue;
+    const A = screenOf(a), B = screenOf(b), ab = [B[0] - A[0], B[1] - A[1]], L2 = ab[0] * ab[0] + ab[1] * ab[1];
+    const t = L2 ? Math.max(0, Math.min(1, ((e.clientX - A[0]) * ab[0] + (e.clientY - A[1]) * ab[1]) / L2)) : 0;
+    const d = Math.hypot(e.clientX - A[0] - ab[0] * t, e.clientY - A[1] - ab[1] * t);
+    if (d < bd){ bd = d; best = { kind: 'edge', id: ed.id, ids: [ed.a, ed.b] }; }
+  }
+  return best;
+}
+function planeHit(r, pl){ const dn = C.V.dot(r.d, pl.n); if (Math.abs(dn) < 1e-6) return null; const t = C.V.dot(C.V.sub(pl.c, r.o), pl.n) / dn; return t > 0 ? C.V.add(r.o, C.V.mul(r.d, t)) : null; }
+function camFacingUpright(c){ const d = new V3(); camera.getWorldDirection(d); d.applyQuaternion(world.quaternion.clone().invert()); d.y = 0; if (d.lengthSq() < 1e-6) d.set(0, 0, 1); d.normalize(); return { n: toA(d), c }; }
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || renderer.xr.isPresenting) return;
+  const r = mouseRay(e);
+  if (S.tool === 'draw'){
+    // start on a corner, a face, or the floor; the line is drawn in a flat plane through that start
+    const cv = cornerAtMouse(e), fh = rayFace(r.o, r.d);
+    let start, pl;
+    if (cv){ start = D[cv.id].slice(); pl = e.shiftKey ? camFacingUpright(start) : { n: [0, 1, 0], c: start }; }
+    else if (fh && !e.shiftKey){ start = fh.hit; pl = { n: fh.n, c: fh.c }; }
+    else { pl = { n: [0, 1, 0], c: [0, 0, 0] }; start = planeHit(r, pl); if (start && e.shiftKey) pl = camFacingUpright(start); }
+    if (!start) return;
+    mouse = { kind: 'draw', plane: pl }; strokeStart(start);
+    renderer.domElement.setPointerCapture(e.pointerId);
+  } else if (S.tool === 'grab'){
+    const h = cornerAtMouse(e) || edgeAtMouse(e) || rayFace(r.o, r.d);
+    if (!h) return;
+    const p0 = h.kind === 'face' ? h.hit : D[h.ids[0]];
+    const pl = h.kind === 'face' ? null : (e.shiftKey ? camFacingUpright(p0) : { n: [0, 1, 0], c: p0 });
+    mouse = { kind: 'grab', plane: pl, p0, h, n: h.n };
+    grabStart(h, { p: world.localToWorld(toV(p0)), q: new THREE.Quaternion() });
+    renderer.domElement.setPointerCapture(e.pointerId);
+  } else if (S.tool === 'erase'){ mouse = { kind: 'erase' }; const h = edgeAtMouse(e); if (h) eraseMarks.add(h.id); renderer.domElement.setPointerCapture(e.pointerId); }
+  else if (S.tool === 'hole'){ toggleHole(rayFace(r.o, r.d)); }
+});
+renderer.domElement.addEventListener('pointermove', e => {
+  if (renderer.xr.isPresenting) return;
+  const r = mouseRay(e);
+  if (!mouse){
+    setHover(S.tool === 'grab' ? (cornerAtMouse(e) || edgeAtMouse(e) || rayFace(r.o, r.d)) : S.tool === 'erase' ? edgeAtMouse(e) : S.tool === 'hole' ? rayFace(r.o, r.d) : cornerAtMouse(e));
+    return;
+  }
+  if (mouse.kind === 'draw'){
+    let p = planeHit(r, mouse.plane); if (!p) return;
+    // the end clicks onto a corner under the mouse
+    const cv = cornerAtMouse(e, 16, mouse.plane); if (cv) p = D[cv.id].slice();
+    strokeMove(p);
+  } else if (mouse.kind === 'grab'){
+    let p;
+    if (mouse.plane) p = planeHit(r, mouse.plane);
+    else {
+      // a face slides out and in along its normal: the point on that line closest to the mouse ray
+      const n = mouse.n, w0 = C.V.sub(mouse.p0, r.o), b = C.V.dot(n, r.d), dd = C.V.dot(n, w0), e2 = C.V.dot(r.d, w0), den = 1 - b * b;
+      const s = den > 1e-6 ? (b * e2 - dd) / den : 0; p = C.V.add(mouse.p0, C.V.mul(n, s));
+    }
+    if (p) grabMove({ p: world.localToWorld(toV(p)), q: new THREE.Quaternion(), noTilt: true });
+  } else if (mouse.kind === 'erase'){ const h = edgeAtMouse(e); if (h) eraseMarks.add(h.id); }
+});
+addEventListener('pointerup', () => {
+  if (!mouse) return;
+  if (mouse.kind === 'draw') strokeEnd();
+  if (mouse.kind === 'grab') grabEnd();
+  if (mouse.kind === 'erase') eraseEnd();
+  mouse = null;
+});
+addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z'){ e.preventDefault(); e.shiftKey ? redo() : undo(); }
+  else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y'){ e.preventDefault(); redo(); }
+  else if ('1234'.includes(e.key) && !e.ctrlKey){ S.tool = TOOLS[+e.key - 1][0]; saveSet(); menuDirty = true; flash('Mouse: ' + TOOLS[+e.key - 1][1]); }
+});
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+// no accidental browser zoom
+addEventListener('wheel', e => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
+
+// ======================================================================
+// Entering the headset
+// ======================================================================
+const vrBtn = $('#vr'), mrBtn = $('#mr'), status = $('#status');
+let arOK = false, mrOn = false;
+async function setupButtons(){
+  if (!('xr' in navigator)){ status.textContent = 'Open this page in the Quest browser to draw in the headset.'; return; }
+  const [vr, ar] = await Promise.all([navigator.xr.isSessionSupported('immersive-vr').catch(() => false), navigator.xr.isSessionSupported('immersive-ar').catch(() => false)]);
+  arOK = ar; vrBtn.disabled = !vr; mrBtn.disabled = !ar;
+  status.textContent = ar ? 'MR draws over your real room.' : vr ? 'Headset found.' : '';
+}
+async function start(kind){
+  const live = renderer.xr.getSession(); if (live){ live.end(); return; }
+  const session = await navigator.xr.requestSession(kind, { requiredFeatures: ['local-floor'] }).catch(err => { status.textContent = 'Could not start: ' + err.message; return null; });
+  if (!session) return;
+  mrOn = kind === 'immersive-ar';
+  scene.background = mrOn ? null : BG; floorGrid.material.opacity = mrOn ? 0.25 : 0.7;
+  renderer.xr.setReferenceSpaceType('local-floor');
+  await renderer.xr.setSession(session);
+  placeMenu(); menuCanvas.style.display = 'none';
+  (mrOn ? mrBtn : vrBtn).textContent = 'Exit';
+  session.addEventListener('end', () => {
+    for (const h of hands){ h.act = null; h.grab = null; }
+    stroke = null; preview = null; drag = null; worldGrab = null; liveGeo.setDrawRange(0, 0);
+    scene.background = BG; floorGrid.material.opacity = 0.7; menuMesh.visible = false; menuCanvas.style.display = '';
+    vrBtn.textContent = 'Enter VR'; mrBtn.textContent = 'Enter MR'; setupButtons();
+  });
+}
+vrBtn.onclick = () => start('immersive-vr');
+mrBtn.onclick = () => start('immersive-ar');
+setupButtons();
+
+// ======================================================================
+// Loop
+// ======================================================================
+const clock = new THREE.Clock();
+let menuT = 0;
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (renderer.xr.isPresenting) xrInput();
+  // corners glide to where the solver put them
+  if (!drag){ for (const id in X){ const d = D[id], x = X[id]; if (!d){ D[id] = x.slice(); continue; } for (let k = 0; k < 3; k++) d[k] += (x[k] - d[k]) * Math.min(1, dt * 12); } }
+  if (flashT > 0){ flashT -= dt; if (flashT <= 0){ menuDirty = true; if (!renderer.xr.isPresenting) status.textContent = ''; } }
+  if (clearArmed > 0){ clearArmed -= dt; if (clearArmed <= 0) menuDirty = true; }
+  menuT += dt;
+  if (menuDirty && menuT > 0.05){ menuT = 0; drawMenu(); }
+  drawModel();
+  if (!renderer.xr.isPresenting) orbit.update();
+  renderer.render(scene, camera);
+});
+
+rebuild(); for (const id in X) D[id] = X[id].slice();
+if (firstRun) loadSample();
+window.edgewise = { orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
+</script>
+<script src="../updated.js"></script>
+</body>
+</html>
