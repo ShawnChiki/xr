@@ -160,7 +160,7 @@ export function removeVert(sk, id){
 
 // Pull a face out into a block: copies of its corners (where they are now, nudged out by `off` along n) joined back
 // to the originals by side lines. The old loop is marked as the cap inside the extrusion. Returns the new face's corners.
-export function extrude(sk, f, X, n, off){
+export function extrude(sk, f, X, n, off, keepCap){
   const loops = [f.ids, ...(f.holes || [])], map = new Map();
   for (const L of loops) for (const id of L){
     const v = { id: sk.nid++, ends: [add(X[id], mul(n, off)).map(x => +x.toFixed(4))] };
@@ -168,11 +168,13 @@ export function extrude(sk, f, X, n, off){
     sk.e.push({ id: sk.nid++, a: id, b: v.id, s: null });
   }
   for (const L of loops) for (let i = 0; i < L.length; i++) sk.e.push({ id: sk.nid++, a: map.get(L[i]), b: map.get(L[(i + 1) % L.length]), s: null });
+  // pulled out of a bigger face, the old loop stays as the new block's bottom (Join hides it); pulled out of a
+  // solid's own face, the old loop is now inside that solid
   sk.skip = sk.skip || [];
-  if (!sk.skip.includes(f.key)) sk.skip.push(f.key);
+  if (!keepCap && !sk.skip.includes(f.key)) sk.skip.push(f.key);
   // a lock or hole on the old face carries on to the new one
   const nk = faceKey(f.ids.map(id => map.get(id)));
-  for (const L of sk.locks || []){ if (L.f === f.key) L.f = nk; if (L.a === f.key) L.a = nk; if (L.b === f.key) L.b = nk; }
+  if (!keepCap) for (const L of sk.locks || []){ if (L.f === f.key) L.f = nk; if (L.a === f.key) L.a = nk; if (L.b === f.key) L.b = nk; }
   sk.open = (sk.open || []).map(k => k === f.key ? nk : k);
   return { key: nk, ids: [...map.values()], map };
 }
@@ -347,6 +349,9 @@ export function findFaces(sk, pos, o = {}){
     const holes = [];
     for (const I of islands){
       if (I.contacts) continue;                     // a single spur off the rim: just a loose line on the face
+      // only a shape drawn flat in the face is a hole in it; something standing on the face (lines leaving the
+      // plane) is a solid of its own, and Join sorts out where they meet
+      if ([...I.set].some(id => adj.get(id).some(y => !I.set.has(y)))) continue;
       const loop = islandLoop(I.set, adj, cands, P);
       if (loop) holes.push(loop);
     }
@@ -356,6 +361,26 @@ export function findFaces(sk, pos, o = {}){
     let area = pl.area;
     for (const h of top) area -= planeOf(h.map(P)).area;
     good.push({ key: k, ids, holes: top, all: top.length ? [...ids, ...top.flat()] : ids, n: pl.n, c: pl.c, area, err: err / tol, poly });
+  }
+  // a wall between two solids drawn sharing a face is inside them: along every one of its lines, two other faces
+  // carry straight on across it (flat, one each side), like the two tops of boxes drawn side by side. Drop it.
+  {
+    const byE = new Map(), ek = (a, b) => a < b ? a + '-' + b : b + '-' + a;
+    for (const f of good) for (let i = 0; i < f.ids.length; i++){ const k = ek(f.ids[i], f.ids[(i + 1) % f.ids.length]); if (!byE.has(k)) byE.set(k, []); byE.get(k).push(f); }
+    const crossesAt = (W, a, b) => {
+      const others = (byE.get(ek(a, b)) || []).filter(g => g !== W);
+      const A = P(a), ed = norm(sub(P(b), A));
+      const side = g => { const d = sub(g.c, A); return sub(d, mul(ed, dot(d, ed))); };
+      for (let i = 0; i < others.length; i++) for (let j = i + 1; j < others.length; j++){
+        const g = others[i], h = others[j];
+        if (Math.abs(dot(g.n, h.n)) > 0.995 && dot(side(g), side(h)) < 0) return true;
+      }
+      return false;
+    };
+    for (let i = good.length - 1; i >= 0; i--){
+      const f = good[i];
+      if (!f.holes.length && f.ids.every((id, j) => crossesAt(f, id, f.ids[(j + 1) % f.ids.length]))) good.splice(i, 1);
+    }
   }
   good.sort((a, b) => (a.area * (1 + a.err)) - (b.area * (1 + b.err)));
   const ekey = (a, b) => a < b ? a + '-' + b : b + '-' + a;

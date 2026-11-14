@@ -21,12 +21,14 @@
 <canvas id="gl"></canvas>
 <div id="bar"><span id="status"></span><button id="vr" disabled>Enter VR</button><button id="mr" disabled>Enter MR</button></div>
 <div id="title">Edgewise XR<small>Left-drag draws a line (on the floor, or on the face you start on; hold Shift for an upright line). Right-drag turns the view, wheel zooms. Grab tool + Alt on a face pulls it out as a block. Ctrl+Z undoes.</small></div>
+<script src="polygon-clipping.min.js"></script>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 import * as C from './core.js';
+import { joinSolids } from './join.js';
 
 const V3 = THREE.Vector3, $ = s => document.querySelector(s);
 const toV = a => new V3(a[0], a[1], a[2]), toA = v => [v.x, v.y, v.z];
@@ -35,7 +37,7 @@ const toV = a => new V3(a[0], a[1], a[2]), toA = v => [v.x, v.y, v.z];
 // Settings and the sketch
 // ======================================================================
 const SET_KEY = 'edgewise:set', SK_KEY = 'edgewise:sketch', LIB_KEY = 'edgewise:lib';
-const S = Object.assign({ tags: true, tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
+const S = Object.assign({ join: true, tags: true, tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
   (() => { try { return JSON.parse(localStorage.getItem(SET_KEY)) || {}; } catch (e) { return {}; } })());
 const saveSet = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(S)); } catch (e) {} };
 let sk = (() => { try { const j = JSON.parse(localStorage.getItem(SK_KEY)); if (j && j.v) return j; } catch (e) {} return null; })();
@@ -103,6 +105,20 @@ const MAXI = 4096;
 const edgeInst = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 8, 1, true), new THREE.MeshBasicMaterial({ color: 0xffffff }), MAXI);
 const cornInst = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 14, 10), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 }), MAXI);
 edgeInst.count = cornInst.count = 0; edgeInst.frustumCulled = cornInst.frustumCulled = false;
+const seamInst = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 6, 1, true), new THREE.MeshBasicMaterial({ color: 0x141414 }), MAXI);
+seamInst.count = 0; seamInst.frustumCulled = false; world.add(seamInst);
+// Join: worked out from what's on screen, at most about ten times a second while things move
+let joinCache = { F: null, at: 0, J: null };
+function joinFor(M){
+  if (!S.join || !window.polygonClipping) return null;
+  const now = performance.now(), moving = !!drag || !!preview || gliding;
+  if (joinCache.F === M.F && (!moving || now - joinCache.at < 100)) return joinCache.J;
+  let J = null;
+  try { J = joinSolids(M.sk, M.F, M.P, window.polygonClipping); } catch (e) { J = null; }
+  joinCache = { F: M.F, at: now, J };
+  return J;
+}
+let gliding = false;
 world.add(edgeInst, cornInst);
 const strokeLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x3b3a36, transparent: true, opacity: 0.35 }));
 world.add(strokeLines);
@@ -144,9 +160,12 @@ function drawModel(){
   const M = preview ? { sk: preview.sk, F: preview.F, P: preview.P, newEdge: preview.edge } : { sk, F, P: D };
   if (!M.F) return;
   const k = 1 / ws();
+  const J = joinFor(M);
   // faces: each one a flat polygon of any number of sides (filled for display only)
   const pos = [], col = [], nrm = [], hpos = [];
+  const colorOf = pc => pieceColor(M.F, J ? (J.group.get(pc) ?? pc) : pc);
   for (const f of M.F.faces){
+    if (J && J.replaced.has(f.key)) continue;     // drawn trimmed, below
     const P = f.all.map(id => M.P[id]);
     if (P.some(p => !p)) continue;
     const pl = C.planeOf(P.slice(0, f.ids.length)), [u, w] = C.basis(pl.n);
@@ -156,7 +175,7 @@ function drawModel(){
     const holes2 = f.holes.map(H => { const r = c2.slice(at, at + H.length); at += H.length; return r; });
     try { tris = THREE.ShapeUtils.triangulateShape(c2.slice(0, f.ids.length), holes2); } catch (e) { continue; }
     const out = f.open ? hpos : pos;
-    tmpC.set(pieceColor(M.F, f.piece));
+    tmpC.set(colorOf(f.piece));
     if (S.tool === 'lock' && sel.a === f.key) tmpC.lerp(new THREE.Color('#FFF27A'), 0.6);
     else if (S.tool === 'lock' && sel.b === f.key) tmpC.lerp(new THREE.Color('#FF8A00'), 0.6);
     else if (hover && hover.kind === 'face' && hover.key === f.key && !preview) tmpC.lerp(new THREE.Color('#FFFFFF'), 0.4);
@@ -166,6 +185,25 @@ function drawModel(){
       for (const i of tt){ out.push(...P[i]); if (!f.open){ col.push(tmpC.r, tmpC.g, tmpC.b); nrm.push(...pl.n); } }
     }
   }
+  // faces of solids that overlap, trimmed to what's outside the others
+  let sn = 0;
+  if (J) for (const f of J.faces){
+    const [u, w] = C.basis(f.n), o = f.rings[0][0], to2 = p => { const d = C.V.sub(p, o); return new THREE.Vector2(C.V.dot(d, u), C.V.dot(d, w)); };
+    const all = f.rings.flat(), c2 = f.rings.map(r => r.map(to2));
+    let tris; try { tris = THREE.ShapeUtils.triangulateShape(c2[0], c2.slice(1)); } catch (e) { continue; }
+    tmpC.set(colorOf(f.piece));
+    for (const t of tris){
+      const [i0, i1, i2] = t, nn = C.V.cross(C.V.sub(all[i1], all[i0]), C.V.sub(all[i2], all[i0])), tt = C.V.dot(nn, f.n) < 0 ? [i0, i2, i1] : t;
+      for (const i of tt){ pos.push(...all[i]); col.push(tmpC.r, tmpC.g, tmpC.b); nrm.push(...f.n); }
+    }
+    // the seams where solids meet, drawn like lines
+    for (const r of f.rings) for (let i = 0; i < r.length && sn < MAXI; i++){
+      const A = toV(r[i]), B = toV(r[(i + 1) % r.length]), L = A.distanceTo(B); if (L < 1e-5) continue;
+      tmpQ.setFromUnitVectors(UP, B.clone().sub(A).normalize());
+      tmpM.compose(A.add(B).multiplyScalar(0.5), tmpQ, new V3(0.003 * k, L, 0.003 * k)); seamInst.setMatrixAt(sn++, tmpM);
+    }
+  }
+  seamInst.count = sn; seamInst.instanceMatrix.needsUpdate = true;
   setGeo(faceMesh.geometry, pos, col, nrm); setGeo(holeMesh.geometry, hpos, null);
   // edges
   const r = 0.0038 * k;
@@ -408,7 +446,7 @@ function doExtrude(frame, dir, dist){
   const off = Math.max(0.004, (dist || 0)) / ws();
   // start from the face as it was when you took hold of it
   sk = JSON.parse(drag.before);
-  const ex = C.extrude(sk, f, X, n, off);
+  const ex = C.extrude(sk, f, X, n, off, drag.island);
   const o = C.build(sk, solveOpts({ warm: X })); F = o.F; X = o.X; dragF = F;
   for (const id in X) if (!D[id]) D[id] = X[id].slice();
   const nf = faceByKey(ex.key), ids = nf ? nf.all : ex.ids;
@@ -533,7 +571,7 @@ const TABS = [['draw', 'Draw'], ['move', 'Move'], ['tidy', 'Tidy'], ['view', 'Vi
 const TOOLS = [['draw', 'Draw'], ['grab', 'Grab'], ['erase', 'Erase'], ['hole', 'Holes'], ['lock', 'Lock']];
 function summary(){
   if (!F || !sk.e.length) return 'Draw the edges of a box: one stroke per edge.';
-  const closed = F.pieces.filter(p => p.closed).length, open = F.pieces.filter(p => !p.closed && p.faces).length, loose = F.loose.length;
+  const J = joinCache.J, closed = new Set(F.pieces.filter(p => p.closed).map(p => J ? (J.group.get(p.id) ?? p.id) : p.id)).size, open = F.pieces.filter(p => !p.closed && p.faces).length, loose = F.loose.length;
   const bits = [];
   if (closed) bits.push(closed + (closed === 1 ? ' solid' : ' solids'));
   if (open) bits.push(open + (open === 1 ? ' open surface' : ' open surfaces'));
@@ -594,6 +632,8 @@ function drawMenu(){
     seg(x0, y, W, 72, [[5, '5°'], [10, '10°'], [15, '15°']], S.sqDeg, v => { S.sqDeg = v; rebuild(); }, 28); y += 104;
     label('Corners near the floor sit on it', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.floor, v => { S.floor = v; rebuild(); }, 28); y += 100;
+    label('Solids that overlap or touch join into one', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[true, 'Join'], [false, 'Keep apart']], S.join, v => { S.join = v; joinCache.F = null; }, 28); y += 100;
     const mm = flatMM();
     para('Every face is made exactly flat' + (mm === null ? '.' : ': right now no corner is more than ' + (mm < 0.01 ? '0.01' : mm.toFixed(2)) + ' mm off its face.'), x0, y, W);
   } else if (S.tab === 'view'){
@@ -690,10 +730,43 @@ function openLib(i){ const it = getLib()[i]; if (!it) return; pushUndo(); sk = C
 function delLib(i){ const l = getLib(); l.splice(i, 1); setLib(l); flash('Removed from the library'); }
 function exportOBJ(){
   if (!F || !F.faces.length) return flash('No faces yet to save');
-  const blob = new Blob([C.toOBJ(sk, F, X, 1000)], { type: 'text/plain' }), a = document.createElement('a');
+  const J = S.join && window.polygonClipping ? joinSolids(sk, F, X, window.polygonClipping) : null;
+  const text = J && J.faces.length ? joinedOBJ(J) : C.toOBJ(sk, F, X, 1000, f => holeTris(f.all.map(id => X[id]), f.ids.length, f.holes.map(h => h.length)).map(t => t.map(i => f.all[i])));
+  const blob = new Blob([text], { type: 'text/plain' }), a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = 'edgewise-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.obj'; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   flash('Saved (mm, Z up, faces with all their sides)');
+}
+// triangles for a face with holes: P = rim points then each hole's points
+function holeTris(P, nRim, holeLens){
+  const pl = C.planeOf(P.slice(0, nRim)), [u, w] = C.basis(pl.n), c2 = P.map(p => { const d = C.V.sub(p, pl.c); return new THREE.Vector2(C.V.dot(d, u), C.V.dot(d, w)); });
+  let at = nRim; const holes = holeLens.map(L => { const r = c2.slice(at, at + L); at += L; return r; });
+  try { return THREE.ShapeUtils.triangulateShape(c2.slice(0, nRim), holes); } catch (e) { return []; }
+}
+// the joined surface as one OBJ: untouched faces keep all their sides (wound outward), trimmed ones too unless they
+// have a hole (then triangles); each joined group is one object
+function joinedOBJ(J){
+  const verts = [], key = new Map();
+  const vi = p => { const k = p.map(x => Math.round(x * 1e5)).join(','); if (!key.has(k)){ verts.push(p); key.set(k, verts.length); } return key.get(k); };
+  const objs = new Map(), push = (g, f) => { if (!objs.has(g)) objs.set(g, []); objs.get(g).push(f); };
+  for (const pc of F.pieces){
+    const fs = F.faces.filter(f => f.piece === pc.id && !f.open && !J.replaced.has(f.key)); if (!fs.length) continue;
+    const loops = C.orient(fs, X), g = J.group.get(pc.id) ?? pc.id;
+    fs.forEach((f, i) => {
+      if (f.holes.length){ const all = f.all.map(id => X[id]), n = C.planeOf(loops[i].map(id => X[id])).n; for (const t of holeTris(all, f.ids.length, f.holes.map(h => h.length))){ const c = C.V.cross(C.V.sub(all[t[1]], all[t[0]]), C.V.sub(all[t[2]], all[t[0]])); push(g, (C.V.dot(c, n) < 0 ? [t[0], t[2], t[1]] : t).map(i => vi(all[i]))); } }
+      else push(g, loops[i].map(id => vi(X[id])));
+    });
+  }
+  for (const f of J.faces){
+    if (f.rings.length === 1){ push(f.group, f.rings[0].map(vi)); continue; }
+    const all = f.rings.flat();
+    for (const t of holeTris(all, f.rings[0].length, f.rings.slice(1).map(r => r.length))){ const c = C.V.cross(C.V.sub(all[t[1]], all[t[0]]), C.V.sub(all[t[2]], all[t[0]])); push(f.group, (C.V.dot(c, f.n) < 0 ? [t[0], t[2], t[1]] : t).map(i => vi(all[i]))); }
+  }
+  let s = '# Edgewise XR (joined)\n';
+  for (const p of verts) s += `v ${(p[0] * 1000).toFixed(3)} ${(-p[2] * 1000).toFixed(3)} ${(p[1] * 1000).toFixed(3)}\n`;
+  let n = 0;
+  for (const [, fs] of objs){ s += `o Solid_${++n}\n`; for (const f of fs) s += 'f ' + f.join(' ') + '\n'; }
+  return s;
 }
 // a few wobbly hand-drawn shapes: a box, a ramp and an L-shaped platform
 function loadSample(){
@@ -1025,7 +1098,7 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   if (renderer.xr.isPresenting) xrInput();
   // corners glide to where the solver put them
-  if (!drag){ for (const id in X){ const d = D[id], x = X[id]; if (!d){ D[id] = x.slice(); continue; } for (let k = 0; k < 3; k++) d[k] += (x[k] - d[k]) * Math.min(1, dt * 20); } }
+  if (!drag){ let mv = 0; for (const id in X){ const d = D[id], x = X[id]; if (!d){ D[id] = x.slice(); continue; } for (let k = 0; k < 3; k++){ const s = (x[k] - d[k]) * Math.min(1, dt * 20); d[k] += s; mv = Math.max(mv, Math.abs(s)); } } const was = gliding; gliding = mv > 1e-6; if (was && !gliding) joinCache.F = null; }
   if (flashT > 0){ flashT -= dt; if (flashT <= 0){ menuDirty = true; if (!renderer.xr.isPresenting) status.textContent = ''; } }
   if (clearArmed > 0){ clearArmed -= dt; if (clearArmed <= 0) menuDirty = true; }
   menuT += dt;
@@ -1037,7 +1110,7 @@ renderer.setAnimationLoop(() => {
 
 rebuild(); for (const id in X) D[id] = X[id].slice();
 if (firstRun) loadSample();
-window.edgewise = { doExtrude, deleteHeld, get drag(){ return drag; }, lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
+window.edgewise = { objText: () => joinedOBJ(joinSolids(sk, F, X, window.polygonClipping)), summary, doExtrude, deleteHeld, get drag(){ return drag; }, lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
 </script>
 <script src="../updated.js"></script>
 </body>
