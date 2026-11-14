@@ -304,16 +304,28 @@ export function findFaces(sk, pos, o = {}){
     let err = 0;
     for (const p of pts) err = Math.max(err, Math.abs(dot(pl.n, sub(p, pl.c))));
     if (err > tol) continue;
-    // a chord: an edge joining two corners of the loop that aren't next to each other cuts it in two
+    const [u, w] = basis(pl.n), to2 = p => { const d = sub(p, pl.c); return [dot(d, u), dot(d, w)]; };
+    const poly = pts.map(to2);
+    // a chord: an edge joining two corners of the loop that aren't next to each other, running across the inside,
+    // cuts it in two. (One running outside it, across the mouth of a notch, like the bottom of a box standing in
+    // the notch, doesn't.)
     let chord = false;
     for (let i = 0; i < ids.length && !chord; i++)
       for (let j = i + 2; j < ids.length && !chord; j++){
         if (i === 0 && j === ids.length - 1) continue;
-        if (hasEdge(ids[i], ids[j])) chord = true;
+        if (!hasEdge(ids[i], ids[j])) continue;
+        // inside means inside on both sides of it (a line along the mouth of a notch has the notch on one side
+        // and the outside on the other); tested a little either side so a line lying along the rim can't fool it
+        const a = poly[i], b = poly[j], dx = b[0] - a[0], dy = b[1] - a[1], Lc = Math.hypot(dx, dy) || 1, e = 0.02 * Lc;
+        const nx = -dy / Lc * e, ny = dx / Lc * e;
+        let both = 0;
+        for (const t of [0.3, 0.5, 0.7]){
+          const m = [a[0] + dx * t, a[1] + dy * t];
+          if (insidePoly2([m[0] + nx, m[1] + ny], poly) && insidePoly2([m[0] - nx, m[1] - ny], poly)) both++;
+        }
+        if (both >= 2) chord = true;
       }
     if (chord) continue;
-    const [u, w] = basis(pl.n), to2 = p => { const d = sub(p, pl.c); return [dot(d, u), dot(d, w)]; };
-    const poly = pts.map(to2);
     // must not cross itself
     let selfX = false;
     for (let i = 0; i < poly.length && !selfX; i++)
@@ -396,9 +408,11 @@ export function findFaces(sk, pos, o = {}){
       for (const g of byEdge.get(es[i]) || []){
         if (g.holes.some(h => h.includes(f.ids[i]) && h.includes(f.ids[(i + 1) % f.ids.length]))) continue;   // the face filling g's hole
         if (Math.abs(dot(g.n, f.n)) < 0.97) continue;
-        const a = P(f.ids[i]), b = P(f.ids[(i + 1) % f.ids.length]), ed = norm(sub(b, a));
-        const side = F => { let s = 0; for (const id of F.ids){ const d = sub(P(id), a); const off = sub(d, mul(ed, dot(d, ed))); s += dot(cross(ed, off), f.n); } return s; };
-        if (side(f) * side(g) > 0) overlap = true;
+        // which side of the shared line each face lies on: the inside of a loop is on its left (works for notched faces too)
+        const ia = f.ids[i], ib = f.ids[(i + 1) % f.ids.length];
+        const inward = (F, u, v) => { const L = F.ids, k = L.indexOf(u), fwd = L[(k + 1) % L.length] === v; return cross(F.n, norm(fwd ? sub(P(v), P(u)) : sub(P(u), P(v)))); };
+        if (g.ids.indexOf(ia) < 0 || g.ids.indexOf(ib) < 0) continue;
+        if (dot(inward(f, ia, ib), inward(g, ia, ib)) > 0) overlap = true;
       }
     }
     if (overlap) continue;
