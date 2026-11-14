@@ -58,7 +58,8 @@ b=poly([(14,116),Ci,O,(14,128)],'w')+poly([Ci,O,e_out,e_in],'w')
 leg=52;dP=(-1,0)
 P=lambda d,s:(Ci[0]+d[0]*s,Ci[1]+d[1]*s)
 A1,A2,B1,B2=P(dP,4),P(dP,leg),P(u2,leg),P(u2,4)
-b+=f'<path class="w2" d="M{f(A1[0])},{f(A1[1])} L{f(A2[0])},{f(A2[1])} A{leg} {leg} 0 0 1 {f(B1[0])},{f(B1[1])} L{f(B2[0])},{f(B2[1])} Z"/>'
+dp=26;I=(Ci[0]+dp/.866*(dP[0]+u2[0]),Ci[1]+dp/.866*(dP[1]+u2[1]))
+b+=poly([A1,A2,(A2[0],A2[1]-dp),I,(B1[0]+dp*n2[0],B1[1]+dp*n2[1]),B1,B2],'w2')
 on=(-n2[0],-n2[1]);q=lambda p,a,s:(p[0]+a[0]*s,p[1]+a[1]*s)
 b+=rect(Ci[0]-31,116,10,14,'w2')
 c=P(u2,26);b+=poly([q(c,u2,-5),q(c,u2,5),q(q(c,u2,5),on,t+2),q(q(c,u2,-5),on,t+2)],'w2')
@@ -67,6 +68,7 @@ for d_ in (16,42):x=Ci[0]-d_;b+=f'<line class="scr" x1="{f(x)}" y1="128" x2="{f(
 for s_ in (40,10):p0=q(P(u2,s_),on,t);p1=q(P(u2,s_),n2,dep);b+=f'<line class="scr" x1="{f(p0[0])}" y1="{f(p0[1])}" x2="{f(p1[0])}" y2="{f(p1[1])}"/>'
 b+=call('cleatScrews',Ci[0]-42,108,92,99,'Screws per wall',20,96,'start')
 b+=dim('cleatLeg',A2[0],139,Ci[0],139,'Leg length',(A2[0]+Ci[0])/2,149)
+b+=dim('cleatDepth',A2[0]-7,116,A2[0]-7,116-dp,'Leg depth',A2[0]-12,104,'end')
 b+=rect(14,14,136,10,'w')+''.join(rect(x,24,12,10,'w2') for x in (30,70,110))
 b+=dim('cleatSpacing',36,42,76,42,'Spacing',56,52)+txt(156,22,'along the joint, from inside')
 b+=txt(276,148,'screws stagger so their tips stay apart','end')

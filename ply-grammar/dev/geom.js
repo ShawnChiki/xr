@@ -21,8 +21,8 @@ const FONT={"0":[[[.15,0],[.55,0],[.7,.2],[.7,.8],[.55,1],[.15,1],[0,.8],[0,.2],
 const textW=(s,h)=>((s.length-1)*.95+.7)*h;
 function strokes(text,c,h,ax=[1,0]){
   const out=[], up=[-ax[1],ax[0]], x0=-textW(text,h)/2, y0=-h/2;
-  [...text].forEach((ch,k)=>{(FONT[ch]||[]).forEach(st=>{out.push(st.map(([px,py])=>{
-    const lx=x0+(k*.95+px)*h, ly=y0+py*h; return [c[0]+ax[0]*lx+up[0]*ly, c[1]+ax[1]*lx+up[1]*ly];}))})});
+  [...text].forEach((ch,k)=>{(FONT[ch]||[]).forEach(st=>{const pl=st.map(([px,py])=>{
+    const lx=x0+(k*.95+px)*h, ly=y0+py*h; return [c[0]+ax[0]*lx+up[0]*ly, c[1]+ax[1]*lx+up[1]*ly];});pl.h=h;out.push(pl)})});
   return out;
 }
 

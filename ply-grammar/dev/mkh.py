@@ -1,5 +1,5 @@
 import sys
-pre=open('pre.js').read();geom=open('geom.js').read();s=open('post.js').read()
+pre=open('pre.js').read();geom=open('geom.js').read();s=open(sys.argv[2] if len(sys.argv)>2 else 'post.js').read()
 hdr="import * as THREE from 'three';import {createRequire} from 'module';const require=createRequire(import.meta.url);globalThis.ClipperLib=require('clipper-lib');\n"
 body=pre.split('\n',4)[4]
 core=s[:s.index('/* ---------------- three.js scene')]

@@ -13,7 +13,7 @@ const MODEL_DEF={machine:'laser',fitTol:.003,sand:.004,slotTol:.003,tabExtra:.01
   bitD:.0625,overcut:.005,stepdown:.03,engDepth:.01,pokeDepth:.02,engFlatD:.0156,dogW:.001,dogExtra:0,chamfer:0,kerf:.006,feed:30,sheetCost:6,screwCost:0,shopRate:0,cleanR:.03,keyGap:3};
 const S=Object.assign({scaleDen:1,fullThk:.75,stock:.09375,finger:6,ribs:true,waffle:true,slotEdgeMin:.75,ribMax:16,ribAxis:'long',tabW:3,tabGap:10,tabMargin:3,fingerScrews:2,fingerScrewGap:4,screwMark:'poke',
   screwLen:1.625,screwEvery:1,screwCorner:2,screwMin:1,screwAngle:15,skipFlagged:false,labels:true,explode:false,
-  engTool:'v60',dogEars:true,showPaths:true,xrScale:'life',ribScrews:true,cleats:true,cleatSpacing:6,cleatLeg:5,cleatScrews:2,keyShape:'round',sanded:false,look:'color',glue:false,jumperLb:180,landG:3,pushX:1,mu:.5,plyPcf:42,secOn:false,secAx:'x',secPos:.5,secFlip:false,splice:true,screwFix:true,priceOn:true,showScrews:false,tipOpen:false},FULL_DEF);
+  engTool:'v60',dogEars:true,showPaths:true,xrScale:'life',ribScrews:true,cleats:true,cleatSpacing:6,cleatLeg:5,cleatScrews:2,keyShape:'round',flatLabels:false,meetAngle:45,ribScrewGap:6,cleatDepth:2.5,sanded:false,look:'color',glue:false,jumperLb:180,landG:3,pushX:1,mu:.5,plyPcf:42,secOn:false,secAx:'x',secPos:.5,secFlip:false,splice:true,screwFix:true,priceOn:true,showScrews:false,tipOpen:false},FULL_DEF);
 const scl=()=>1/S.scaleDen;                                            // model units (full-size inches) -> as cut
 const thkModel=()=>S.scaleDen===1?S.fullThk:S.stock*S.scaleDen;       // panel thickness in model units
 const PAL=['#E2366B','#8FCB2E','#2F6BFF','#FF8A1F','#19B5A1','#B03BE0','#F2C524','#FF4B3A','#4FC1FF','#6E52FF','#2FBF5B','#FF6FB0'];

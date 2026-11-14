@@ -53,7 +53,7 @@ function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,
      And no two neighbors may lie in one plane: that is one plate wrongly cut in two. */
   if(b.brep){const t=thkModel(),parts=ps.map((p,i)=>asmPart(p,i)),F=b.brep.faces.slice().sort((x,y)=>x.i-y.i);
     F.forEach(f=>f.E.forEach(e=>{if(e.nb<0||e.nb<f.i||e.L<4*t)return;const g=F[e.nb];if(f.skip||g.skip)return;const c=f.n.dot(g.n);
-      if(c>.999){I('split-plate',name0+f.num+'|'+name0+g.num);return}if(!e.convex||c<-.9)return;const a=-(t/2)/(1+c),dir=e.B.clone().sub(e.A).normalize();let miss=0,run=0,best=0;
+      if(c>.999){I('split-plate',name0+f.num+'|'+name0+g.num);return}if(!e.convex||c<-.9||(S.meetAngle>0&&c>Math.cos(S.meetAngle*Math.PI/180)))return;/* a 'meet' joint is an open V by design */const a=-(t/2)/(1+c),dir=e.B.clone().sub(e.A).normalize();let miss=0,run=0,best=0;
       for(let s=3*t;s<e.L-3*t;s+=.25){const X=e.A.clone().addScaledVector(dir,s).addScaledVector(f.n,a).addScaledVector(g.n,a);if(parts.some(P=>inPart(P,X.x,X.y,X.z)))run=0;else{miss++;run++;best=Math.max(best,run)}}
       if(best>=4){const th=b.thin||[],ex=th.some(x=>[x.A,x.B].includes(name0+f.num)||[x.A,x.B].includes(name0+g.num));I(ex?'empty-socket-thin(explained)':'empty-socket',name0+f.num+'|'+name0+g.num+' '+(best*.25).toFixed(1)+'in')}}))}
   const mp=mergeSplices(ps),faces=mp.filter(p=>p.kind==='face');if(!faces.length){I('nofaces','');return out}
