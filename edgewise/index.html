@@ -20,7 +20,7 @@
 <body>
 <canvas id="gl"></canvas>
 <div id="bar"><span id="status"></span><button id="vr" disabled>Enter VR</button><button id="mr" disabled>Enter MR</button></div>
-<div id="title">Edgewise XR<small>Left-drag draws a line (on the floor, or on the face you start on; hold Shift for an upright line). Right-drag turns the view, wheel zooms. Ctrl+Z undoes.</small></div>
+<div id="title">Edgewise XR<small>Left-drag draws a line (on the floor, or on the face you start on; hold Shift for an upright line). Right-drag turns the view, wheel zooms. Grab tool + Alt on a face pulls it out as a block. Ctrl+Z undoes.</small></div>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 <script type="module">
 import * as THREE from 'three';
@@ -35,7 +35,7 @@ const toV = a => new V3(a[0], a[1], a[2]), toA = v => [v.x, v.y, v.z];
 // Settings and the sketch
 // ======================================================================
 const SET_KEY = 'edgewise:set', SK_KEY = 'edgewise:sketch', LIB_KEY = 'edgewise:lib';
-const S = Object.assign({ tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
+const S = Object.assign({ tags: true, tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
   (() => { try { return JSON.parse(localStorage.getItem(SET_KEY)) || {}; } catch (e) { return {}; } })());
 const saveSet = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(S)); } catch (e) {} };
 let sk = (() => { try { const j = JSON.parse(localStorage.getItem(SK_KEY)); if (j && j.v) return j; } catch (e) {} return null; })();
@@ -75,6 +75,12 @@ const fill = new THREE.DirectionalLight(0xffffff, 0.5); fill.position.set(-3, 1,
 const world = new THREE.Group(); scene.add(world);
 const floorGrid = new THREE.GridHelper(6, 30, 0x9a907f, 0xc9c0b0); floorGrid.material.transparent = true; floorGrid.material.opacity = 0.7; world.add(floorGrid);
 const ws = () => world.scale.x;
+// in the headset the session is always MR-capable, so "VR" draws its own backdrop and floor over the room
+const backdrop = new THREE.Mesh(new THREE.SphereGeometry(80, 32, 16), new THREE.MeshBasicMaterial({ color: BG, side: THREE.BackSide, depthWrite: false }));
+backdrop.renderOrder = -10; backdrop.frustumCulled = false;
+const floorFill = new THREE.Mesh(new THREE.CircleGeometry(40, 48), new THREE.MeshStandardMaterial({ color: '#D8CFBF', roughness: 1, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 }));
+floorFill.rotation.x = -Math.PI / 2; floorFill.position.y = -0.002; floorFill.renderOrder = -9;
+scene.add(backdrop, floorFill);
 
 // bold playground colours, one per piece
 const PAL = ['#FF3B30', '#1E5EFF', '#FFC400', '#18B85C', '#FF8A00', '#9B4DFF', '#00B8D9', '#FF2D95'];
@@ -133,7 +139,7 @@ function afterEdit(){ rebuild(); saveSketch(); }
 const tmpM = new THREE.Matrix4(), tmpQ = new THREE.Quaternion(), UP = new V3(0, 1, 0), tmpC = new THREE.Color();
 let strokesDirty = true;
 let hover = null;              // { kind: 'vert'|'edge'|'face', id / key }
-let eraseMarks = new Set();
+let eraseMarks = new Set(), eraseMarksV = new Set();
 function drawModel(){
   const M = preview ? { sk: preview.sk, F: preview.F, P: preview.P, newEdge: preview.edge } : { sk, F, P: D };
   if (!M.F) return;
@@ -141,12 +147,14 @@ function drawModel(){
   // faces: each one a flat polygon of any number of sides (filled for display only)
   const pos = [], col = [], nrm = [], hpos = [];
   for (const f of M.F.faces){
-    const P = f.ids.map(id => M.P[id]);
+    const P = f.all.map(id => M.P[id]);
     if (P.some(p => !p)) continue;
-    const pl = C.planeOf(P), [u, w] = C.basis(pl.n);
+    const pl = C.planeOf(P.slice(0, f.ids.length)), [u, w] = C.basis(pl.n);
     const c2 = P.map(p => { const d = C.V.sub(p, pl.c); return new THREE.Vector2(C.V.dot(d, u), C.V.dot(d, w)); });
-    let tris;
-    try { tris = THREE.ShapeUtils.triangulateShape(c2, []); } catch (e) { continue; }
+    // the rim, then any holes (a shape drawn inside the face)
+    let tris, at = f.ids.length;
+    const holes2 = f.holes.map(H => { const r = c2.slice(at, at + H.length); at += H.length; return r; });
+    try { tris = THREE.ShapeUtils.triangulateShape(c2.slice(0, f.ids.length), holes2); } catch (e) { continue; }
     const out = f.open ? hpos : pos;
     tmpC.set(pieceColor(M.F, f.piece));
     if (S.tool === 'lock' && sel.a === f.key) tmpC.lerp(new THREE.Color('#FFF27A'), 0.6);
@@ -185,7 +193,7 @@ function drawModel(){
       const hot = hover && ((hover.kind === 'vert' && hover.id === v.id) || (hover.kind === 'face' && hover.ids?.includes(v.id)) || (hover.kind === 'edge' && hover.ids?.includes(v.id)));
       const rr = (hot ? 0.012 : 0.0085) * k;
       tmpM.compose(toV(p), tmpQ.identity(), new V3(rr, rr, rr)); cornInst.setMatrixAt(n, tmpM);
-      cornInst.setColorAt(n++, tmpC.set(hot ? '#FFD60A' : (deg.get(v.id) || 0) < 2 ? '#FF2D95' : v.pin ? '#2EC4B6' : '#FFFFFF'));
+      cornInst.setColorAt(n++, tmpC.set(eraseMarksV.has(v.id) ? '#FF3B30' : hot ? '#FFD60A' : (deg.get(v.id) || 0) < 2 ? '#FF2D95' : v.pin ? '#2EC4B6' : '#FFFFFF'));
     }
   }
   cornInst.count = n; cornInst.instanceMatrix.needsUpdate = true; if (cornInst.instanceColor) cornInst.instanceColor.needsUpdate = true;
@@ -208,7 +216,7 @@ function badgeMat(text, bg){
   g.fillStyle = bg; g.beginPath(); g.roundRect(2, 2, 242, 82, 22); g.fill(); g.lineWidth = 5; g.strokeStyle = '#111'; g.stroke();
   g.fillStyle = '#111'; g.font = '900 44px system-ui,sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 123, 46);
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
-  const m = new THREE.SpriteMaterial({ map: t, depthTest: false, transparent: true });
+  const m = new THREE.SpriteMaterial({ map: t, transparent: true });
   badgeTex.set(k, m); return m;
 }
 function drawBadges(M){
@@ -228,8 +236,10 @@ function drawBadges(M){
   }
   while (badgeGroup.children.length > want.length) badgeGroup.remove(badgeGroup.children[badgeGroup.children.length - 1]);
   while (badgeGroup.children.length < want.length){ const sp = new THREE.Sprite(); sp.renderOrder = 20; badgeGroup.add(sp); }
-  const k = 1 / ws();
-  want.forEach((w, i) => { const sp = badgeGroup.children[i]; sp.material = badgeMat(w.text, w.bg); sp.position.set(...w.at); sp.scale.set(0.12 * k, 0.045 * k, 1); });
+  // a tag stands a little off its face toward you, and grows and shrinks with the model
+  const eye = toA(world.worldToLocal(camera.getWorldPosition(new V3())));
+  want.forEach((w, i) => { const sp = badgeGroup.children[i]; sp.material = badgeMat(w.text, w.bg); const t = C.V.mul(C.V.norm(C.V.sub(eye, w.at)), 0.03); sp.position.set(...C.V.add(w.at, t)); sp.scale.set(0.11, 0.041, 1); });
+  badgeGroup.visible = S.tags;
 }
 function setGeo(g, pos, col, nrm){
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -253,15 +263,19 @@ function pickEdge(p, r){
   for (const e of sk.e){ const a = D[e.a], b = D[e.b]; if (!a || !b) continue; const d = segDist(p, a, b); if (d < bd){ bd = d; best = { kind: 'edge', id: e.id, ids: [e.a, e.b], d }; } }
   return best;
 }
-function facePoly(f){ const P = f.ids.map(id => D[id]); const pl = C.planeOf(P), [u, w] = C.basis(pl.n); return { P, pl, u, w, poly: P.map(p => { const d = C.V.sub(p, pl.c); return [C.V.dot(d, u), C.V.dot(d, w)]; }) }; }
+function facePoly(f){
+  const P = f.ids.map(id => D[id]), pl = C.planeOf(P), [u, w] = C.basis(pl.n), to2 = p => { const d = C.V.sub(p, pl.c); return [C.V.dot(d, u), C.V.dot(d, w)]; };
+  return { P, pl, u, w, poly: P.map(to2), holes: f.holes.map(H => H.map(id => to2(D[id]))) };
+}
+const inFace = (q, fp) => inPoly(q, fp.poly) && !fp.holes.some(h => inPoly(q, h));
 function inPoly(q, poly){ let ins = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++){ const a = poly[i], b = poly[j]; if ((a[1] > q[1]) !== (b[1] > q[1]) && q[0] < (b[0] - a[0]) * (q[1] - a[1]) / (b[1] - a[1]) + a[0]) ins = !ins; } return ins; }
 function pickFace(p, r){
   if (!F) return null;
   let best = null, bd = r;
   for (const f of F.faces){
-    if (f.ids.some(id => !D[id])) continue;
-    const { pl, u, w, poly } = facePoly(f), d = C.V.sub(p, pl.c), h = Math.abs(C.V.dot(d, pl.n));
-    if (h < bd && inPoly([C.V.dot(d, u), C.V.dot(d, w)], poly)){ bd = h; best = { kind: 'face', key: f.key, ids: f.ids.slice(), n: pl.n, c: pl.c, d: h }; }
+    if (f.all.some(id => !D[id])) continue;
+    const fp = facePoly(f), { pl, u, w } = fp, d = C.V.sub(p, pl.c), h = Math.abs(C.V.dot(d, pl.n));
+    if (h < bd && inFace([C.V.dot(d, u), C.V.dot(d, w)], fp)){ bd = h; best = { kind: 'face', key: f.key, ids: f.all.slice(), n: pl.n, c: pl.c, d: h }; }
   }
   return best;
 }
@@ -272,12 +286,12 @@ function rayFace(o, dir){
   if (!F) return null;
   let best = null;
   for (const f of F.faces){
-    if (f.ids.some(id => !D[id])) continue;
-    const { pl, u, w, poly } = facePoly(f), dn = C.V.dot(dir, pl.n);
+    if (f.all.some(id => !D[id])) continue;
+    const fp = facePoly(f), { pl, u, w } = fp, dn = C.V.dot(dir, pl.n);
     if (Math.abs(dn) < 1e-6) continue;
     const t = C.V.dot(C.V.sub(pl.c, o), pl.n) / dn; if (t <= 0) continue;
     const hit = C.V.add(o, C.V.mul(dir, t)), d = C.V.sub(hit, pl.c);
-    if (inPoly([C.V.dot(d, u), C.V.dot(d, w)], poly) && (!best || t < best.t)) best = { kind: 'face', key: f.key, ids: f.ids.slice(), n: pl.n, c: pl.c, t, hit };
+    if (inFace([C.V.dot(d, u), C.V.dot(d, w)], fp) && (!best || t < best.t)) best = { kind: 'face', key: f.key, ids: f.all.slice(), n: pl.n, c: pl.c, t, hit };
   }
   return best;
 }
@@ -299,7 +313,7 @@ function strokeMove(p){
 }
 function updatePreview(){
   if (!stroke || stroke.pts.length < 3){ preview = null; return; }
-  const psk = C.clone(sk), r = C.addStroke(psk, stroke.pts, D, { snapR: S.snap / 100 / ws() });
+  const psk = C.clone(sk), r = C.addStroke(psk, stroke.pts, D, { snapR: S.snap / 100 / ws(), faces: F && F.faces });
   if (!r.ok){ preview = null; return; }
   const o = C.build(psk, solveOpts({ warm: X, iters: 30 }));
   // new corners start where the stroke put them; the rest show where they'd settle
@@ -310,19 +324,28 @@ function strokeEnd(){
   const pts = stroke.pts; stroke = null; liveGeo.setDrawRange(0, 0);
   if (pts.length < 3){ preview = null; return; }
   const before = snap();
-  const r = C.addStroke(sk, pts, D, { snapR: S.snap / 100 / ws() });
+  const r = C.addStroke(sk, pts, D, { snapR: S.snap / 100 / ws(), faces: F && F.faces });
   if (!r.ok){ preview = null; flash(r.why === 'too short' ? 'Too short for a line' : 'That runs along an edge already'); return; }
   pushUndo(before); afterEdit(); preview = null;
   const nf = F.faces.filter(f => f.ids.includes(r.a) && f.ids.includes(r.b)).length;
   flash(nf ? (nf === 1 ? 'Line in: it closed a face' : 'Line in: it closed ' + nf + ' faces') : 'Line in');
 }
+// the eraser takes a control point if you brush it (two lines through it become one), otherwise a line
 function eraseAt(p){
+  const v = pickVert(p, 0.02 / ws());
+  if (v){ if (!eraseMarksV.has(v.id)){ eraseMarksV.add(v.id); buzz(0.3, 20); } return; }
   const e = pickEdge(p, 0.025 / ws());
   if (e && !eraseMarks.has(e.id)){ eraseMarks.add(e.id); buzz(0.3, 20); }
 }
 function eraseEnd(){
-  if (!eraseMarks.size) return;
-  pushUndo(); C.removeEdges(sk, [...eraseMarks]); flash(eraseMarks.size === 1 ? 'Erased a line' : 'Erased ' + eraseMarks.size + ' lines'); eraseMarks.clear(); afterEdit();
+  if (!eraseMarks.size && !eraseMarksV.size) return;
+  pushUndo();
+  const nv = eraseMarksV.size, ne = eraseMarks.size;
+  for (const id of eraseMarksV) if (sk.v.some(v => v.id === id)) C.removeVert(sk, id);
+  const left = [...eraseMarks].filter(id => sk.e.some(e => e.id === id));
+  if (left.length) C.removeEdges(sk, left);
+  flash('Erased ' + [nv ? nv + (nv === 1 ? ' point' : ' points') : '', ne ? ne + (ne === 1 ? ' line' : ' lines') : ''].filter(Boolean).join(' and '));
+  eraseMarks.clear(); eraseMarksV.clear(); afterEdit();
 }
 function toggleHole(h){
   if (!h || h.kind !== 'face') return;
@@ -337,10 +360,12 @@ let drag = null;
 function grabStart(h, frame){
   if (!h) return false;
   const P0 = {}; for (const id of h.ids) P0[id] = world.localToWorld(toV(D[id]));
-  drag = { kind: h.kind, ids: h.ids, P0, f0: { p: frame.p.clone(), q: frame.q.clone() }, before: snap(), key: h.key };
+  drag = { kind: h.kind, ids: h.ids, id: h.id, P0, f0: { p: frame.p.clone(), q: frame.q.clone() }, before: snap(), key: h.key };
   if (h.kind === 'face'){
     drag.c0 = world.localToWorld(toV(h.c));
     drag.n0 = toV(h.n).transformDirection(world.matrixWorld).normalize();
+    // a face drawn inside a bigger face pulls out as a block instead of tearing the big face
+    drag.island = F.faces.some(g => g.holes.some(H => C.faceKey(H) === h.key));
   }
   dragF = F;
   buzz(0.5, 30);
@@ -348,7 +373,14 @@ function grabStart(h, frame){
 }
 function grabMove(frame){
   if (!drag) return;
-  const T = frame.p.clone().sub(drag.f0.p), R = frame.q.clone().multiply(drag.f0.q.clone().invert());
+  let T = frame.p.clone().sub(drag.f0.p);
+  if (drag.island && !drag.extruded){
+    const push = T.dot(drag.n0);
+    if (Math.abs(push) < 0.015) return;           // it stays put in its face until you clearly push or pull it
+    doExtrude(frame, Math.sign(push), Math.abs(push));
+    T = frame.p.clone().sub(drag.f0.p);
+  }
+  const R = frame.q.clone().multiply(drag.f0.q.clone().invert());
   const targets = {};
   for (const id of drag.ids){
     let w;
@@ -363,13 +395,48 @@ function grabMove(frame){
   X = C.solve(sk, dragF, solveOpts({ drag: drag.targets, warm: X, iters: 30 }));
   for (const id in X) D[id] = X[id];
 }
+// Pull the held face out as a block: its corners are copied, the copies joined back by side lines, and you keep
+// holding the new face. dir: +1 / -1 along the face's normal, or 0 to go toward your hand.
+function doExtrude(frame, dir, dist){
+  if (!drag || drag.kind !== 'face' || drag.extruded) return;
+  const f = dragF.faces.find(x => x.key === drag.key); if (!f) return;
+  const pl = C.planeOf(f.ids.map(id => X[id]));
+  let n = pl.n;
+  const nw = toV(n).transformDirection(world.matrixWorld).normalize();
+  const s = dir ? dir * Math.sign(nw.dot(drag.n0) || 1) : (Math.sign(frame.p.clone().sub(drag.c0).dot(nw)) || 1);
+  if (s < 0) n = C.V.mul(n, -1);
+  const off = Math.max(0.004, (dist || 0)) / ws();
+  // start from the face as it was when you took hold of it
+  sk = JSON.parse(drag.before);
+  const ex = C.extrude(sk, f, X, n, off);
+  const o = C.build(sk, solveOpts({ warm: X })); F = o.F; X = o.X; dragF = F;
+  for (const id in X) if (!D[id]) D[id] = X[id].slice();
+  const nf = faceByKey(ex.key), ids = nf ? nf.all : ex.ids;
+  const P0 = {}; for (const id of ids) P0[id] = world.localToWorld(toV(X[id]));
+  const c = C.planeOf((nf ? nf.ids : ex.ids).map(id => X[id])).c;
+  const nW = toV(n).transformDirection(world.matrixWorld).normalize();
+  Object.assign(drag, { ids, P0, key: ex.key, extruded: true, island: false, f0: { p: frame.p.clone(), q: frame.q.clone() }, c0: world.localToWorld(toV(c)), n0: nW });
+  strokesDirty = true; menuDirty = true; buzz(0.7, 40); flash('Pulled out as a block: move it to set how far');
+}
+// the red X button while holding something: the held corner (its two lines become one), line, or face (opened up) goes
+function deleteHeld(){
+  if (!drag) return false;
+  const d = drag; drag = null; dragF = null;
+  for (const h of hands){ if (h.grab === 'thing') h.grab = null; if (h.act === 'grab') h.act = null; }
+  sk = JSON.parse(d.before);
+  if (d.kind === 'vert'){ C.removeVert(sk, d.ids[0]); flash('Point deleted'); }
+  else if (d.kind === 'edge'){ C.removeEdges(sk, [d.id]); flash('Line deleted'); }
+  else { if (!sk.open.includes(d.key)) sk.open.push(d.key); flash('Face deleted: it\'s an opening now (Holes tool closes it)'); }
+  pushUndo(d.before); afterEdit(); buzz(0.8, 50);
+  return true;
+}
 function grabEnd(){
   if (!drag) return;
-  if (drag.targets){
+  if (drag.targets || drag.extruded){
     // where you let go is where those corners stay (they no longer follow their strokes)
-    for (const id of drag.ids){ const v = sk.v.find(x => x.id === id); if (v) v.pin = X[id].map(x => +x.toFixed(4)); }
+    for (const id of drag.ids){ const v = sk.v.find(x => x.id === id); if (v && X[id]) v.pin = X[id].map(x => +x.toFixed(4)); }
     pushUndo(drag.before); afterEdit();
-    flash(drag.kind === 'face' ? 'Face moved' : drag.kind === 'edge' ? 'Edge moved' : 'Corner moved');
+    flash(drag.extruded ? 'Block pulled out' : drag.kind === 'face' ? 'Face moved' : drag.kind === 'edge' ? 'Edge moved' : 'Corner moved');
   }
   drag = null; dragF = null;
 }
@@ -532,6 +599,8 @@ function drawMenu(){
   } else if (S.tab === 'view'){
     label('Your sketch strokes', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.strokes, v => S.strokes = v, 28); y += 100;
+    label('Lock tags (LEVEL, 90°…)', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.tags, v => S.tags = v, 28); y += 100;
     label('Control points', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.points, v => S.points = v, 28); y += 100;
     label('Drawing hand', x0, y + 20); y += 34;
@@ -574,7 +643,7 @@ function drawLockMenu(x0, y, W){
 // what the controller buttons do, along the bottom of the Draw tab
 function legend(x0, W){
   if (!renderer.xr.isPresenting) return;
-  para('A draw / erase · B undo · Y redo · X hide menu · Grip moves things · Stick switches tool', x0, MH - 160, W, 23, '#555');
+  para('Grip moves things. While holding a face, the trigger pulls it out as a block; the red X button deletes what you hold.', x0, MH - 160, W, 23, '#555');
 }
 // how far the worst corner is from its face's plane, in mm at 1:1
 function flatMM(){
@@ -654,17 +723,60 @@ function resetView(){ world.position.set(0, 0, 0); world.quaternion.identity(); 
 const ctrlFactory = new XRControllerModelFactory();
 const hands = [0, 1].map(i => {
   const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
-  grip.add(ctrlFactory.createControllerModel(grip));
+  const model = ctrlFactory.createControllerModel(grip); grip.add(model);
   scene.add(ray, grip);
   const tip = new THREE.Mesh(new THREE.SphereGeometry(0.006, 14, 10), new THREE.MeshBasicMaterial({ color: 0x111111 }));
   tip.position.set(0, 0, -0.02); ray.add(tip);
   const beam = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(), new V3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xffffff }));
   beam.visible = false; ray.add(beam);
-  const h = { i, ray, grip, tip, beam, source: null, hand: null, prev: [], grab: null, act: null };
-  ray.addEventListener('connected', e => { if (e.data.hand){ h.source = null; return; } h.source = e.data; h.hand = e.data.handedness; placeMenu(); });
+  const h = { i, ray, grip, tip, beam, model, source: null, hand: null, prev: [], grab: null, act: null, icons: {} };
+  ray.addEventListener('connected', e => { if (e.data.hand){ h.source = null; return; } h.source = e.data; h.hand = e.data.handedness; for (const k in h.icons) h.icons[k].parent?.remove(h.icons[k]); h.icons = {}; h.decorTries = 0; placeMenu(); });
   ray.addEventListener('disconnected', () => { h.source = null; h.hand = null; });
   return h;
 });
+// ---- icons on the face buttons: what each does, instead of A / B / X / Y
+const iconTex = {};
+function btnTex(kind){
+  if (iconTex[kind]) return iconTex[kind];
+  const c = document.createElement('canvas'); c.width = c.height = 128; const g = c.getContext('2d');
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  const disc = (fill) => { g.beginPath(); g.arc(64, 64, 54, 0, 7); g.fillStyle = fill; g.fill(); g.lineWidth = 9; g.strokeStyle = '#111'; g.stroke(); };
+  if (kind === 'undo' || kind === 'redo'){
+    g.save(); if (kind === 'redo'){ g.translate(128, 0); g.scale(-1, 1); }
+    const arc = () => { g.beginPath(); g.arc(70, 76, 33, Math.PI * 0.12, Math.PI * 1.0, true); };
+    const head = () => { g.beginPath(); g.moveTo(9, 70); g.lineTo(65, 70); g.lineTo(37, 112); g.closePath(); };
+    arc(); g.lineWidth = 32; g.strokeStyle = '#111'; g.stroke(); head(); g.lineWidth = 10; g.stroke(); g.fillStyle = '#111'; g.fill();
+    const col = kind === 'undo' ? '#FF4A50' : '#4D7DFF'; arc(); g.lineWidth = 20; g.strokeStyle = col; g.stroke(); head(); g.fillStyle = col; g.fill();
+    g.restore();
+  } else if (kind === 'pen'){
+    disc('#FFFFFF'); g.strokeStyle = '#111'; g.lineWidth = 12; g.beginPath(); g.moveTo(42, 86); g.lineTo(88, 40); g.stroke(); g.fillStyle = '#111'; g.beginPath(); g.moveTo(30, 98); g.lineTo(35, 78); g.lineTo(50, 93); g.closePath(); g.fill();
+  } else if (kind === 'erase'){
+    disc('#FF2D95'); g.save(); g.translate(64, 64); g.rotate(-0.6); g.fillStyle = '#FFFFFF'; g.fillRect(-30, -16, 60, 32); g.lineWidth = 6; g.strokeStyle = '#111'; g.strokeRect(-30, -16, 60, 32); g.beginPath(); g.moveTo(-6, -16); g.lineTo(-6, 16); g.stroke(); g.restore();
+  } else if (kind === 'del'){
+    disc('#FF3B30'); g.strokeStyle = '#FFFFFF'; g.lineWidth = 16; g.beginPath(); g.moveTo(40, 40); g.lineTo(88, 88); g.moveTo(88, 40); g.lineTo(40, 88); g.stroke();
+  } else {
+    disc('#FFD60A'); g.strokeStyle = '#111'; g.lineWidth = 10; g.beginPath(); for (const y of [44, 64, 84]){ g.moveTo(40, y); g.lineTo(88, y); } g.stroke();
+  }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return iconTex[kind] = t;
+}
+const BTN_IDS = { right: ['a-button', 'b-button'], left: ['x-button', 'y-button'] };
+function iconFor(id){ return id === 'a-button' ? (drag ? 'del' : S.tool === 'erase' ? 'erase' : 'pen') : id === 'b-button' ? 'undo' : id === 'y-button' ? 'redo' : 'menu'; }
+function decorate(h){
+  if (!h.hand || !h.model) return;
+  const ids = BTN_IDS[h.hand] || [], mc = h.model.motionController;
+  if (mc && h.model.children.length && ids.some(id => !h.icons[id]) && (h.decorTries = (h.decorTries || 0) + 1) < 900){
+    for (const id of ids){
+      if (h.icons[id]) continue;
+      const comp = mc.components && mc.components[id], root = comp && comp.rootNodeName ? h.model.getObjectByName(comp.rootNodeName) : null; if (!root) continue;
+      h.grip.updateMatrixWorld(true); const b = new THREE.Box3().setFromObject(root); if (b.isEmpty()) continue;
+      const cw = b.getCenter(new V3()); cw.y = b.max.y;
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: btnTex(iconFor(id)), transparent: true }));
+      sp.scale.set(0.017, 0.017, 1); sp.position.copy(h.grip.worldToLocal(cw)).add(new V3(0, 0.009, 0)); sp.renderOrder = 15;
+      sp.userData.k = iconFor(id); h.grip.add(sp); h.icons[id] = sp;
+    }
+  }
+  for (const id in h.icons){ const sp = h.icons[id], k = iconFor(id); if (sp.userData.k !== k){ sp.material.map = btnTex(k); sp.material.needsUpdate = true; sp.userData.k = k; } }
+}
 const isDraw = h => h.hand === S.hand, isMenuHand = h => h.hand && h.hand !== S.hand;
 function placeMenu(){ const m = hands.find(isMenuHand); if (m){ m.grip.add(menuMesh); menuMesh.visible = menuShown && renderer.xr.isPresenting; } menuDirty = true; }
 function buzz(s, ms){ for (const h of hands) if (h.source && isDraw(h)) h.source.gamepad?.hapticActuators?.[0]?.pulse?.(s, ms); }
@@ -703,6 +815,7 @@ function xrInput(){
   let menuHit = null;
   for (const h of hands){
     const gp = h.source && h.source.gamepad; if (!gp) { h.tip.visible = false; continue; }
+    decorate(h);
     h.tip.visible = true;
     const b = gp.buttons.map(x => x && x.pressed), down = i => b[i] && !h.prev[i], up = i => !b[i] && h.prev[i];
     const ax = gp.axes || [];
@@ -727,6 +840,7 @@ function xrInput(){
       if (h.grab === 'world'){ h.grab = null; worldGrabStart(); }
       h.grab = null;
     }
+    if (h.grab === 'thing' && down(0) && drag && drag.kind === 'face') doExtrude(frameOf(h), 0, 0);
     if (h.grab === 'thing') grabMove(frameOf(h));
     if (isDraw(h)){
       if (!onMenu && down(0) && !h.grab){
@@ -752,7 +866,7 @@ function xrInput(){
       h.tip.material.color.set(S.tool === 'erase' ? '#FF3B30' : S.tool === 'hole' ? '#2EC4B6' : S.tool === 'grab' ? '#FFD60A' : '#111111');
     }
     // the face buttons, by the controller they're on: A draw / erase, B undo, Y redo, X shows or hides the menu
-    if (h.hand === 'right'){ if (down(4)) toggleDrawErase(); if (down(5)) undo(); }
+    if (h.hand === 'right'){ if (down(4)){ if (!deleteHeld()) toggleDrawErase(); } if (down(5)) undo(); }
     if (h.hand === 'left'){ if (down(5)) redo(); if (down(4)){ menuShown = !menuShown; placeMenu(); } }
     h.prev = b;
   }
@@ -798,6 +912,7 @@ function edgeAtMouse(e, px = 9){
   }
   return best;
 }
+function eraseMouse(e){ const v = cornerAtMouse(e, 10); if (v){ eraseMarksV.add(v.id); return; } const h = edgeAtMouse(e); if (h) eraseMarks.add(h.id); }
 function planeHit(r, pl){ const dn = C.V.dot(r.d, pl.n); if (Math.abs(dn) < 1e-6) return null; const t = C.V.dot(C.V.sub(pl.c, r.o), pl.n) / dn; return t > 0 ? C.V.add(r.o, C.V.mul(r.d, t)) : null; }
 function camFacingUpright(c){ const d = new V3(); camera.getWorldDirection(d); d.applyQuaternion(world.quaternion.clone().invert()); d.y = 0; if (d.lengthSq() < 1e-6) d.set(0, 0, 1); d.normalize(); return { n: toA(d), c }; }
 renderer.domElement.addEventListener('pointerdown', e => {
@@ -820,8 +935,9 @@ renderer.domElement.addEventListener('pointerdown', e => {
     const pl = h.kind === 'face' ? null : (e.shiftKey ? camFacingUpright(p0) : { n: [0, 1, 0], c: p0 });
     mouse = { kind: 'grab', plane: pl, p0, h, n: h.n };
     grabStart(h, { p: world.localToWorld(toV(p0)), q: new THREE.Quaternion() });
+    if (h.kind === 'face' && e.altKey) doExtrude({ p: world.localToWorld(toV(p0)), q: new THREE.Quaternion() }, 1, 0);
     renderer.domElement.setPointerCapture(e.pointerId);
-  } else if (S.tool === 'erase'){ mouse = { kind: 'erase' }; const h = edgeAtMouse(e); if (h) eraseMarks.add(h.id); renderer.domElement.setPointerCapture(e.pointerId); }
+  } else if (S.tool === 'erase'){ mouse = { kind: 'erase' }; eraseMouse(e); renderer.domElement.setPointerCapture(e.pointerId); }
   else if (S.tool === 'hole'){ toggleHole(rayFace(r.o, r.d)); }
   else if (S.tool === 'lock'){ lockTap(rayFace(r.o, r.d)); }
 });
@@ -846,7 +962,7 @@ renderer.domElement.addEventListener('pointermove', e => {
       const s = den > 1e-6 ? (b * e2 - dd) / den : 0; p = C.V.add(mouse.p0, C.V.mul(n, s));
     }
     if (p) grabMove({ p: world.localToWorld(toV(p)), q: new THREE.Quaternion(), noTilt: true });
-  } else if (mouse.kind === 'erase'){ const h = edgeAtMouse(e); if (h) eraseMarks.add(h.id); }
+  } else if (mouse.kind === 'erase') eraseMouse(e);
 });
 addEventListener('pointerup', () => {
   if (!mouse) return;
@@ -869,7 +985,7 @@ addEventListener('wheel', e => { if (e.ctrlKey) e.preventDefault(); }, { passive
 // ======================================================================
 const vrBtn = $('#vr'), mrBtn = $('#mr'), status = $('#status');
 let arOK = false, mrOn = false, sessionAR = false;
-function applyLook(){ scene.background = mrOn ? null : BG; floorGrid.material.opacity = mrOn ? 0.25 : 0.7; menuDirty = true; }
+function applyLook(){ scene.background = mrOn ? null : BG; backdrop.visible = floorFill.visible = !mrOn; floorGrid.material.opacity = mrOn ? 0.25 : 0.7; menuDirty = true; }
 function toggleMR(){ mrOn = !mrOn; applyLook(); flash(mrOn ? 'Mixed reality: your room shows through' : 'VR'); }
 async function setupButtons(){
   if (!('xr' in navigator)){ status.textContent = 'Open this page in the Quest browser to draw in the headset.'; return; }
@@ -921,7 +1037,7 @@ renderer.setAnimationLoop(() => {
 
 rebuild(); for (const id in X) D[id] = X[id].slice();
 if (firstRun) loadSample();
-window.edgewise = { lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
+window.edgewise = { doExtrude, deleteHeld, get drag(){ return drag; }, lockTap, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
 </script>
 <script src="../updated.js"></script>
 </body>

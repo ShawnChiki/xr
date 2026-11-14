@@ -47,13 +47,14 @@ function closestOnSeg(p, a, b){
 }
 
 // ---------------------------------------------------------------- the sketch
-export function emptySketch(){ return { v: [], e: [], s: [], open: [], locks: [], nid: 1 }; }
+export function emptySketch(){ return { v: [], e: [], s: [], open: [], locks: [], skip: [], nid: 1 }; }
 
 // Faces are named by their corners (a key like "3.8.12.15"). When a corner is added to an edge, or healed away,
 // every saved face name (holes, locks) that runs along that edge is renamed to match.
 function renameFaces(sk, fn){
   const re = k => { const ids = k.split('.').map(Number), r = fn(ids); return r ? faceKey(r) : k; };
   sk.open = (sk.open || []).map(re);
+  sk.skip = (sk.skip || []).map(re);
   for (const L of sk.locks || []){ if (L.f) L.f = re(L.f); if (L.a) L.a = re(L.a); if (L.b) L.b = re(L.b); }
 }
 export const clone = sk => JSON.parse(JSON.stringify(sk));
@@ -69,7 +70,7 @@ const edgeBetween = (sk, a, b) => sk.e.find(e => (e.a === a && e.b === b) || (e.
 
 // Where would a stroke end at p land? On a corner, on an edge (splitting it), or free.
 // pos: the positions you can see (solved), so you aim at what's on screen.
-export function snapEnd(sk, p, pos, snapR, skipVert){
+export function snapEnd(sk, p, pos, snapR, skipVert, faces){
   let best = null, bd = snapR;
   for (const v of sk.v){
     if (v.id === skipVert) continue;
@@ -83,6 +84,18 @@ export function snapEnd(sk, p, pos, snapR, skipVert){
     const A = pos[e.a] || anchorOf(vById(sk, e.a)), B = pos[e.b] || anchorOf(vById(sk, e.b));
     const { t, q } = closestOnSeg(p, A, B), d = dist(p, q), L = dist(A, B);
     if (d < bd && t * L > snapR * 0.7 && (1 - t) * L > snapR * 0.7){ bd = d; best = { kind: 'edge', id: e.id, at: q, t }; }
+  }
+  if (best) return best;
+  // a loose end close to a face lands on it (so a shape drawn on a big face lies flat in it)
+  if (faces) for (const f of faces){
+    const P = f.ids.map(id => pos[id]); if (P.some(x => !x)) continue;
+    const pl = planeOf(P), h = dot(pl.n, sub(p, pl.c));
+    if (Math.abs(h) > snapR) continue;
+    const q = sub(p, mul(pl.n, h)), [u, w] = basis(pl.n), to2 = x => { const d = sub(x, pl.c); return [dot(d, u), dot(d, w)]; };
+    const q2 = to2(q);
+    if (!insidePoly2(q2, P.map(to2))) continue;
+    if ((f.holes || []).some(H => insidePoly2(q2, H.map(id => to2(pos[id]))))) continue;
+    if (!best || Math.abs(h) < best.h) best = { kind: 'free', at: q, h: Math.abs(h), face: f.key };
   }
   return best || { kind: 'free', at: p };
 }
@@ -102,8 +115,8 @@ export function addStroke(sk, pts, pos, o){
   const f = fitLine(pts);
   if (!f) return { ok: false, why: 'too short' };
   const snapR = o.snapR;
-  const sa = snapEnd(sk, f.a, pos, snapR);
-  const sb = snapEnd(sk, f.b, pos, snapR, sa.kind === 'vert' ? sa.id : undefined);
+  const sa = snapEnd(sk, f.a, pos, snapR, undefined, o.faces);
+  const sb = snapEnd(sk, f.b, pos, snapR, sa.kind === 'vert' ? sa.id : undefined, o.faces);
   const A = sa.at, B = sb.at;
   if (dist(A, B) < Math.max(snapR * 0.9, o.minLen || 0)) return { ok: false, why: 'too short' };
   if (sa.kind === 'edge' && sb.kind === 'edge' && sa.id === sb.id) return { ok: false, why: 'runs along an edge' };
@@ -119,7 +132,7 @@ export function addStroke(sk, pts, pos, o){
   let sb2 = sb;
   if (sb.kind === 'edge' && sa.kind === 'edge'){
     // the first split may have replaced the edge the far end was going to land on: find it again
-    sb2 = snapEnd(sk, f.b, pos, snapR, a);
+    sb2 = snapEnd(sk, f.b, pos, snapR, a, o.faces);
   }
   const b = endTo(sb2, sb2.kind === 'vert' ? f.b.map(x => +x.toFixed(4)) : B);
   let e = edgeBetween(sk, a, b);
@@ -133,6 +146,37 @@ export function removeEdges(sk, ids){
   sk.e = sk.e.filter(e => !set.has(e.id));
   cleanup(sk);
 }
+export function removeVert(sk, id){
+  const es = sk.e.filter(e => e.a === id || e.b === id);
+  if (es.length === 2){
+    const o0 = es[0].a === id ? es[0].b : es[0].a, o1 = es[1].a === id ? es[1].b : es[1].a;
+    sk.e = sk.e.filter(e => e !== es[0] && e !== es[1]);
+    if (o0 !== o1 && !edgeBetween(sk, o0, o1)) sk.e.push({ id: sk.nid++, a: o0, b: o1, s: es[0].s });
+  } else sk.e = sk.e.filter(e => e.a !== id && e.b !== id);
+  sk.v = sk.v.filter(v => v.id !== id);
+  renameFaces(sk, ids => ids.includes(id) ? ids.filter(i => i !== id) : null);
+  cleanup(sk);
+}
+
+// Pull a face out into a block: copies of its corners (where they are now, nudged out by `off` along n) joined back
+// to the originals by side lines. The old loop is marked as the cap inside the extrusion. Returns the new face's corners.
+export function extrude(sk, f, X, n, off){
+  const loops = [f.ids, ...(f.holes || [])], map = new Map();
+  for (const L of loops) for (const id of L){
+    const v = { id: sk.nid++, ends: [add(X[id], mul(n, off)).map(x => +x.toFixed(4))] };
+    v.pin = v.ends[0]; sk.v.push(v); map.set(id, v.id);
+    sk.e.push({ id: sk.nid++, a: id, b: v.id, s: null });
+  }
+  for (const L of loops) for (let i = 0; i < L.length; i++) sk.e.push({ id: sk.nid++, a: map.get(L[i]), b: map.get(L[(i + 1) % L.length]), s: null });
+  sk.skip = sk.skip || [];
+  if (!sk.skip.includes(f.key)) sk.skip.push(f.key);
+  // a lock or hole on the old face carries on to the new one
+  const nk = faceKey(f.ids.map(id => map.get(id)));
+  for (const L of sk.locks || []){ if (L.f === f.key) L.f = nk; if (L.a === f.key) L.a = nk; if (L.b === f.key) L.b = nk; }
+  sk.open = (sk.open || []).map(k => k === f.key ? nk : k);
+  return { key: nk, ids: [...map.values()], map };
+}
+
 export function cleanup(sk){
   for (let pass = 0; pass < 4; pass++){
     const deg = new Map();
@@ -156,6 +200,8 @@ export function cleanup(sk){
   }
   const used = new Set(sk.e.map(e => e.s));
   sk.s = sk.s.filter(s => used.has(s.id));
+  const alive = new Set(sk.v.map(v => v.id));
+  sk.skip = (sk.skip || []).filter(k => k.split('.').every(id => alive.has(+id)));
 }
 
 // ---------------------------------------------------------------- faces
@@ -212,6 +258,7 @@ export function findFaces(sk, pos, o = {}){
   for (const e of sk.e){ adj.get(e.a)?.push(e.b); adj.get(e.b)?.push(e.a); }
   const hasEdge = (a, b) => adj.get(a)?.includes(b);
   const cands = new Map();
+  const skipSet = new Set(sk.skip || []);
   let work = 0;
   for (const e of sk.e){
     // loops through this edge, found from the loop's smallest corner (so the search stays small)
@@ -273,31 +320,56 @@ export function findFaces(sk, pos, o = {}){
         if (segsCross2(poly[i], poly[(i + 1) % poly.length], poly[j], poly[(j + 1) % poly.length])) selfX = true;
       }
     if (selfX) continue;
-    // no other corner sitting inside it (on its plane)
-    const inSet = new Set(ids);
-    let blocked = false;
+    // a loop that's the cap left inside an extrusion isn't a face (while something still stands on it)
+    if (skipSet.has(k) && ids.every(id => adj.get(id).length >= 3)) continue;
+    // corners sitting inside it, on its plane: a closed loop of them (touching nothing on the rim) is a hole,
+    // like a rectangle drawn in the middle of a big face; lines that cut across from rim to rim mean it isn't one face
+    // (lying on it means close to its plane by the measure of a hand's wobble, much tighter than the loop's own test)
+    const inSet = new Set(ids), inner = new Set(), tolIn = Math.max(minTol * 2, Math.min(tol, 0.06 * sumL / pts.length));
     for (const v of sk.v){
       if (inSet.has(v.id)) continue;
       const p = P(v.id);
-      if (Math.abs(dot(pl.n, sub(p, pl.c))) > tol) continue;
+      if (Math.abs(dot(pl.n, sub(p, pl.c))) > tolIn) continue;
       const q = to2(p);
-      if (insidePoly2(q, poly) && distToPoly2(q, poly) > tol * 0.5){ blocked = true; break; }
+      if (insidePoly2(q, poly) && distToPoly2(q, poly) > tol * 0.5) inner.add(v.id);
+    }
+    let blocked = false;
+    const islands = [];
+    for (const start of inner){
+      if (islands.some(I => I.set.has(start))) continue;
+      const set = new Set([start]), st = [start];
+      let contacts = 0;
+      while (st.length){ const x = st.pop(); for (const y of adj.get(x)){ if (inner.has(y) && !set.has(y)){ set.add(y); st.push(y); } else if (inSet.has(y)) contacts++; } }
+      if (contacts >= 2){ blocked = true; break; }
+      islands.push({ set, contacts });
     }
     if (blocked) continue;
-    // nor an edge passing through it
-    good.push({ key: k, ids, n: pl.n, c: pl.c, area: pl.area, err: err / tol, poly });
+    const holes = [];
+    for (const I of islands){
+      if (I.contacts) continue;                     // a single spur off the rim: just a loose line on the face
+      const loop = islandLoop(I.set, adj, cands, P);
+      if (loop) holes.push(loop);
+    }
+    // only the outermost islands are holes in this face (one inside another belongs to that one)
+    const hp = holes.map(h => h.map(id => to2(P(id))));
+    const top = holes.filter((h, i) => !hp.some((q, j) => j !== i && insidePoly2(to2(P(h[0])), q)));
+    let area = pl.area;
+    for (const h of top) area -= planeOf(h.map(P)).area;
+    good.push({ key: k, ids, holes: top, all: top.length ? [...ids, ...top.flat()] : ids, n: pl.n, c: pl.c, area, err: err / tol, poly });
   }
   good.sort((a, b) => (a.area * (1 + a.err)) - (b.area * (1 + b.err)));
   const ekey = (a, b) => a < b ? a + '-' + b : b + '-' + a;
   const use = new Map(), faces = [], byEdge = new Map();
   const openSet = new Set(sk.open || []);
   for (const f of good){
-    const es = f.ids.map((id, i) => ekey(id, f.ids[(i + 1) % f.ids.length]));
+    const loopEdges = L => L.map((id, i) => ekey(id, L[(i + 1) % L.length]));
+    const es = [f.ids, ...f.holes].flatMap(loopEdges);
     if (es.some(k => (use.get(k) || 0) >= 2)) continue;
     // two faces folded flat onto each other over a shared edge (same plane, same side) overlap: skip
     let overlap = false;
-    for (let i = 0; i < es.length && !overlap; i++){
+    for (let i = 0; i < f.ids.length && !overlap; i++){
       for (const g of byEdge.get(es[i]) || []){
+        if (g.holes.some(h => h.includes(f.ids[i]) && h.includes(f.ids[(i + 1) % f.ids.length]))) continue;   // the face filling g's hole
         if (Math.abs(dot(g.n, f.n)) < 0.97) continue;
         const a = P(f.ids[i]), b = P(f.ids[(i + 1) % f.ids.length]), ed = norm(sub(b, a));
         const side = F => { let s = 0; for (const id of F.ids){ const d = sub(P(id), a); const off = sub(d, mul(ed, dot(d, ed))); s += dot(cross(ed, off), f.n); } return s; };
@@ -318,6 +390,12 @@ export function findFaces(sk, pos, o = {}){
     while (st.length){ const x = st.pop(); for (const y of adj.get(x)) if (!comp.has(y)){ comp.set(y, nc); st.push(y); } }
     nc++;
   }
+  // a face with a hole joins the hole's corners into its piece (a block standing on a face is part of that piece)
+  const par = Array.from({ length: nc }, (_, i) => i), root = i => par[i] === i ? i : (par[i] = root(par[i]));
+  for (const f of faces) for (const h of f.holes) par[root(comp.get(h[0]))] = root(comp.get(f.ids[0]));
+  const renum = new Map();
+  for (const [id, c] of comp){ const r = root(c); if (!renum.has(r)) renum.set(r, renum.size); comp.set(id, renum.get(r)); }
+  nc = renum.size;
   const pieces = Array.from({ length: nc }, (_, i) => ({ id: i, closed: true, faces: 0, edges: 0 }));
   const loose = [];
   for (const e of sk.e){
@@ -330,6 +408,25 @@ export function findFaces(sk, pos, o = {}){
   for (const pc of pieces) if (!pc.faces) pc.closed = false;
   const edgeUse = new Map(sk.e.map(e => [e.id, use.get(ekey(e.a, e.b)) || 0]));
   return { faces, pieces, comp, loose, edgeUse };
+}
+
+// the boundary of an island of corners: walk it if it's a plain ring, otherwise the biggest flat loop through
+// its corners that has all the rest inside
+function islandLoop(set, adj, cands, P){
+  const nb = id => adj.get(id).filter(y => set.has(y));
+  if ([...set].every(id => nb(id).length === 2)){
+    const s0 = [...set][0], L = [s0];
+    let prev = s0, cur = nb(s0)[0];
+    while (cur !== s0 && L.length <= set.size){ L.push(cur); const nx = nb(cur).find(y => y !== prev); prev = cur; cur = nx; }
+    return L.length === set.size ? L : null;
+  }
+  let best = null, ba = 0;
+  for (const [, ids] of cands){
+    if (!ids.every(id => set.has(id))) continue;
+    const a = planeOf(ids.map(P)).area;
+    if (a > ba){ ba = a; best = ids; }
+  }
+  return best;
 }
 
 // ---------------------------------------------------------------- solver
@@ -358,14 +455,14 @@ export function solve(sk, F, o = {}){
   const faces = F.faces.filter(f => !f.open);
   const byKey = new Map(F.faces.map(f => [f.key, f])), locks = (sk.locks || []).filter(L => L.f ? byKey.has(L.f) : byKey.has(L.a) && byKey.has(L.b));
   const lockedV = new Set();
-  for (const L of locks) for (const k of [L.f, L.a, L.b]) if (k) for (const id of byKey.get(k).ids) lockedV.add(id);
+  for (const L of locks) for (const k of [L.f, L.a, L.b]) if (k) for (const id of byKey.get(k).all) lockedV.add(id);
   const G = {}, W = {};
   for (let it = 0; it < iters; it++){
     for (const id of ids){ G[id] = mul(A[id], wA[id]); W[id] = wA[id]; }
     if (wFlat){
       for (const f of faces){
-        const pts = f.ids.map(id => X[id]), pl = planeOf(pts);
-        for (const id of f.ids){
+        const pl = planeOf(f.ids.map(id => X[id]));
+        for (const id of f.all){
           const p = X[id], q = sub(p, mul(pl.n, dot(pl.n, sub(p, pl.c))));
           G[id] = add(G[id], mul(q, wFlat)); W[id] += wFlat;
         }
@@ -416,11 +513,11 @@ export function hardFlat(faces, X, wt, maxIt){
   for (let it = 0; it < maxIt; it++){
     worst = 0;
     for (const f of faces){
-      const P = f.ids.map(id => X[id]), pl = planeOf(P);
+      const all = f.all || f.ids, pl = planeOf(f.ids.map(id => X[id]));
       let c = [0, 0, 0], sw = 0;
-      for (const id of f.ids){ const w = wt ? wt[id] || 1 : 1; c = add(c, mul(X[id], w)); sw += w; }
+      for (const id of all){ const w = wt ? wt[id] || 1 : 1; c = add(c, mul(X[id], w)); sw += w; }
       c = mul(c, 1 / sw);
-      for (const id of f.ids){
+      for (const id of all){
         const d = dot(pl.n, sub(X[id], c));
         if (Math.abs(d) > worst) worst = Math.abs(d);
         X[id] = sub(X[id], mul(pl.n, d));
@@ -438,7 +535,7 @@ export function flatness(F, X){
     if (f.open) continue;
     const pts = f.ids.map(id => X[id]), pl = planeOf(pts);
     let s = 0; for (let i = 0; i < pts.length; i++) s = Math.max(s, dist(pts[i], pts[(i + 1) % pts.length]));
-    for (const p of pts) worst = Math.max(worst, Math.abs(dot(pl.n, sub(p, pl.c))) / (s || 1));
+    for (const p of f.all.map(id => X[id])) worst = Math.max(worst, Math.abs(dot(pl.n, sub(p, pl.c))) / (s || 1));
   }
   return worst;
 }
@@ -492,14 +589,14 @@ function applyLocks(sk, locks, byKey, X, G, W, w){
       const f = byKey.get(L.f), pl = planeOf(f.ids.map(id => X[id])), t = orientTarget(L, pl.n);
       if (!t) continue;
       const ax = cross(pl.n, t), sl = len(ax), a = Math.atan2(sl, dot(pl.n, t));
-      for (const id of f.ids) goal(id, sl > 1e-9 ? rotAbout(X[id], pl.c, mul(ax, 1 / sl), a) : X[id]);
+      for (const id of f.all) goal(id, sl > 1e-9 ? rotAbout(X[id], pl.c, mul(ax, 1 / sl), a) : X[id]);
     } else {
-      const A = byKey.get(L.a).ids, B = byKey.get(L.b).ids, g = faceAngle(A, B, X);
+      const FA = byKey.get(L.a), FB = byKey.get(L.b), g = faceAngle(FA.ids, FB.ids, X);
       if (!g) continue;
       const d = (lockTarget(L, g.deg) - g.deg) * Math.PI / 180;
       // turn both faces about their shared edge, half each, toward the locked angle
-      for (const id of B) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, d / 2));
-      for (const id of A) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, -d / 2));
+      for (const id of FB.all) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, d / 2));
+      for (const id of FA.all) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, -d / 2));
     }
   }
 }
@@ -512,12 +609,12 @@ export function snapHeld(sk, F, key, T, X){
     if (L.f === key){
       const pl = planeOf(f.ids.map(id => P[id])), t = orientTarget(L, pl.n); if (!t) continue;
       const ax = cross(pl.n, t), sl = len(ax); if (sl < 1e-9) continue;
-      for (const id of f.ids) P[id] = rotAbout(P[id], pl.c, mul(ax, 1 / sl), Math.atan2(sl, dot(pl.n, t)));
+      for (const id of f.all) if (P[id]) P[id] = rotAbout(P[id], pl.c, mul(ax, 1 / sl), Math.atan2(sl, dot(pl.n, t)));
     } else if ((L.a === key || L.b === key) && byKey.has(L.a) && byKey.has(L.b)){
       const other = byKey.get(L.a === key ? L.b : L.a).ids, g = faceAngle(f.ids, other, P); if (!g) continue;
       // g is measured from the held face to the other one: turning the held face by -d widens the angle by d
       const d = (lockTarget(L, g.deg) - g.deg) * Math.PI / 180;
-      for (const id of f.ids) if (!g.se.includes(id)) P[id] = rotAbout(P[id], g.p, g.k, -d);
+      for (const id of f.all) if (!g.se.includes(id)) P[id] = rotAbout(P[id], g.p, g.k, -d);
     }
   }
   const out = {}; for (const id in T) out[id] = P[id];
@@ -567,7 +664,7 @@ export function orient(fs, X){
 }
 function pick(warm, anchors){ const r = {}; for (const k in anchors) if (warm[k]) r[k] = warm[k]; return r; }
 
-export function toOBJ(sk, F, X, scale = 1){
+export function toOBJ(sk, F, X, scale = 1, tri){
   const ids = sk.v.map(v => v.id), idx = new Map(ids.map((id, i) => [id, i + 1]));
   let s = '# Edgewise XR\n';
   for (const id of ids){ const p = X[id]; s += `v ${(p[0] * scale).toFixed(5)} ${(-p[2] * scale).toFixed(5)} ${(p[1] * scale).toFixed(5)}\n`; }
@@ -579,7 +676,13 @@ export function toOBJ(sk, F, X, scale = 1){
     const loops = orient(fs, X);
     fs.forEach((f, i) => f._loop = loops[i]);
     s += `o ${F.pieces[pc].closed ? 'Solid' : 'Surface'}_${++n}\n`;
-    for (const f of fs) s += 'f ' + f._loop.map(id => idx.get(id)).join(' ') + '\n';
+    for (const f of fs){
+      if (f.holes && f.holes.length && tri){
+        // a face with a hole goes out as triangles (OBJ faces can't have holes), wound like its rim
+        const n = planeOf(f._loop.map(id => X[id])).n;
+        for (const t of tri(f)){ const c = cross(sub(X[t[1]], X[t[0]]), sub(X[t[2]], X[t[0]])); const tt = dot(c, n) < 0 ? [t[0], t[2], t[1]] : t; s += 'f ' + tt.map(id => idx.get(id)).join(' ') + '\n'; }
+      } else s += 'f ' + f._loop.map(id => idx.get(id)).join(' ') + '\n';
+    }
   }
   return s;
 }
