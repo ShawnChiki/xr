@@ -52,7 +52,7 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.4';
+const VERSION = '0.5';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -101,7 +101,7 @@ const state = {
   size:0.08, strength:0.6, color:'#ff9500',
   doodle:'tube', doodleSize:0.012,
   blockMode:'stamp', blockShape:'cube', blockSize:0.1, blockSnap:true, blockMix:false,
-  flySpeed:2.0, panelOpen:true, activeWorld:1, activePart:null, selChar:null,
+  flySpeed:2.0, panelOpen:true, eraseFor:'doodle', recent:[], rename:null, activeWorld:1, activePart:null, selChar:null,
   labels:true, mic:false, mirror:true, win:{layers:true, preview:true},
   world:{sky:'day', water:true, fog:true, custom:{top:[220,0.5], hor:[195,0.8], low:[140,0.45]}},
   fov:50,
@@ -117,6 +117,7 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.xr.enabled = true;
+renderer.xr.cameraAutoUpdate = false;   // we update the headset camera ourselves: see xrCameraUpdate
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -142,6 +143,7 @@ const studio = new THREE.Group(); scene.add(studio); studio.visible = false;
   rim.position.y = -0.035; studio.add(rim);
   const mark = new THREE.Mesh(new THREE.BoxGeometry(0.06,0.012,0.3), new THREE.MeshStandardMaterial({color:'#1e6bff'}));
   mark.position.set(0,0.005,0.85); studio.add(mark);   // the "front" of the stage, facing you
+  const grid = new THREE.GridHelper(30, 60, '#4a5bd0', '#2a3470'); grid.position.y = -0.045; studio.add(grid);
 }
 const STUDIO_BG = new THREE.Color('#1b2050');
 const clayMat = new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.85, metalness:0});
@@ -201,6 +203,8 @@ function applyWorld(){
   skyTex.mapping = THREE.EquirectangularReflectionMapping; skyTex.colorSpace = THREE.SRGBColorSpace;
   hemi.intensity = 1.4*Sk.light; sun.intensity = 2.2*Sk.light;
 }
+let _xrFog = null;
+function xrFogObj(){ const Sk = skyColors(); if (!_xrFog) _xrFog = new THREE.Fog(Sk.hor, 60, 300); _xrFog.color.set(Sk.hor); const s = rig.scale.x; _xrFog.near = 60/s; _xrFog.far = 300/s; return _xrFog; }
 let _fog = null; function fogObj(){ const Sk = skyColors(); if (!_fog) _fog = new THREE.Fog(Sk.hor, 60, 300); _fog.color.set(Sk.hor); return _fog; }
 applyWorld();
 // what's on stage this frame: the world, or the character studio
@@ -208,8 +212,10 @@ function applyStage(){
   const st = inStudio();
   world.visible = !st; studio.visible = st;
   if (st){ water.visible = false; scene.background = STUDIO_BG; scene.fog = null; }
-  else { water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? fogObj() : null; }
+  else { water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? (renderer.xr.isPresenting ? xrFogObj() : fogObj()) : null; }
   for (const c of show.chars) c.root.visible = st ? c.id===state.selChar : c.placed;
+  const gc = selChar(); guides.visible = st && !!gc && gc.type==='puppet' && !!gc.guide;
+  if (guides.visible){ guideHead.position.fromArray(gc.guide.head); guideHands[0].position.fromArray(gc.guide.lh); guideHands[1].position.fromArray(gc.guide.rh); }
 }
 
 /* ---------------- layers & chunks ---------------- */
@@ -229,7 +235,7 @@ function activeLayer(){
 }
 const domainLayers = () => inStudio() ? (selChar() ? partsOf(selChar()) : []) : worldLayers();
 function setActive(L){ if (L.char) state.activePart = L.id; else state.activeWorld = L.id; requestUI(); }
-function layerHasClay(L){ for (const ch of L.chunks.values()) if (ch.d) return true; return false; }
+function layerHasClay(L){ for (const ch of L.chunks.values()) if (ch.d) for (let i=0;i<CN3;i++) if (ch.d[i] > 0) return true; return false; }
 function layerCenter(L){ const b = new THREE.Box3().setFromObject(L.group); return b.isEmpty() ? L.group.getWorldPosition(V()) : b.getCenter(V()); }
 function layerOf(obj){ let o = obj; while (o){ for (const L of layers) if (L.group===o) return L; o = o.parent; } return null; }
 function removeLayer(L){
@@ -493,36 +499,75 @@ function buildStrokeMesh(s){
   }
   const n = s.pts.length/3; if (n < 2) return null;
   const P = []; for (let i=0;i<n;i++) P.push(new THREE.Vector3(s.pts[i*3], s.pts[i*3+1], s.pts[i*3+2]));
+  const R = rng(s.seed || 1), r = s.r;
   let mesh;
-  if (s.type==='tube'){
+  if (s.type==='tube' || s.type==='neon'){
     const curve = new THREE.CatmullRomCurve3(P);
-    const geo = new THREE.TubeGeometry(curve, Math.min(800, n*3), s.r, 8, false);
-    const mat = new THREE.MeshStandardMaterial({color:s.col, roughness:0.45});
+    const geo = new THREE.TubeGeometry(curve, Math.min(800, n*3), r, 8, false);
+    const mat = s.type==='neon' ? new THREE.MeshBasicMaterial({color:s.col, toneMapped:false}) : new THREE.MeshStandardMaterial({color:s.col, roughness:0.45});
     mesh = new THREE.Mesh(geo, mat);
-    const cap = new THREE.SphereGeometry(s.r, 10, 8);
-    for (const p of [P[0], P[n-1]]){ const m=new THREE.Mesh(cap, mat); m.position.copy(p); mesh.add(m); }
+    const cap = new THREE.SphereGeometry(r, 10, 8);
+    for (const pp of [P[0], P[n-1]]){ const m=new THREE.Mesh(cap, mat); m.position.copy(pp); mesh.add(m); }
+    if (s.type==='neon'){
+      const glow = new THREE.Mesh(new THREE.TubeGeometry(curve, Math.min(800, n*3), r*2.6, 8, false),
+        new THREE.MeshBasicMaterial({color:s.col, transparent:true, opacity:0.22, depthWrite:false, blending:THREE.AdditiveBlending, toneMapped:false}));
+      mesh.add(glow);
+    }
   } else if (s.type==='ribbon'){
     const pos=[], idx=[]; const t=V(), up=V(), side=V();
     for (let i=0;i<n;i++){
       t.subVectors(P[Math.min(n-1,i+1)], P[Math.max(0,i-1)]).normalize();
       up.set(s.ups[i*3], s.ups[i*3+1], s.ups[i*3+2]);
       side.crossVectors(t, up); if (side.lengthSq()<1e-6) side.set(1,0,0);
-      side.normalize().multiplyScalar(s.r*3);
+      side.normalize().multiplyScalar(r*3);
       pos.push(P[i].x-side.x, P[i].y-side.y, P[i].z-side.z, P[i].x+side.x, P[i].y+side.y, P[i].z+side.z);
-      if (i<n-1){ const a=i*2; idx.push(a,a+1,a+2, a+1,a+3,a+2); }
+      if (i<n-1){ const a2=i*2; idx.push(a2,a2+1,a2+2, a2+1,a2+3,a2+2); }
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
     geo.setIndex(idx); geo.computeVertexNormals(); geo.computeBoundingSphere();
     mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color:s.col, roughness:0.5, side:THREE.DoubleSide}));
+  } else if (s.type==='coil'){
+    const A = along(P, r*0.5), N = A.pts.length, fr = A.curve.computeFrenetFrames(N-1, false);
+    const hp = []; const R2 = r*2.2, pitch = r*3.2;
+    for (let i=0;i<N;i++){ const th = (i*r*0.5/pitch)*Math.PI*2; hp.push(A.pts[i].clone().addScaledVector(fr.normals[i], Math.cos(th)*R2).addScaledVector(fr.binormals[i], Math.sin(th)*R2)); }
+    mesh = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(hp), Math.min(1600, N*2), r*0.45, 6, false), new THREE.MeshStandardMaterial({color:s.col, roughness:0.35, metalness:0.2}));
+  } else if (s.type==='fuzz'){
+    const A = along(P, r*0.8), pos = [], cols = [], c0 = new THREE.Color(s.col), c1 = new THREE.Color();
+    for (const pp of A.pts) for (let k=0;k<6;k++){
+      const d = new THREE.Vector3(R()-.5,R()-.5,R()-.5).normalize().multiplyScalar(r*(2+R()*3));
+      pos.push(pp.x,pp.y,pp.z, pp.x+d.x,pp.y+d.y,pp.z+d.z);
+      c1.copy(c0).offsetHSL(0,0,(R()-.5)*0.3); cols.push(c0.r,c0.g,c0.b, c1.r,c1.g,c1.b);
+    }
+    const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos,3)); geo.setAttribute('color', new THREE.Float32BufferAttribute(cols,3)); geo.computeBoundingSphere();
+    mesh = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({vertexColors:true}));
+  } else if (['beads','cubes','dashes','chain','stars'].includes(s.type)){
+    const step = {beads:r*2.2, cubes:r*2.4, dashes:r*5, chain:r*2.6, stars:r*3}[s.type];
+    const A = along(P, step), list = [];
+    const X = new THREE.Vector3(1,0,0), Z = new THREE.Vector3(0,0,1);
+    A.pts.forEach((pp,i)=>{
+      const t = A.tans[i];
+      if (s.type==='beads') list.push({p:pp, q:new THREE.Quaternion(), s:new THREE.Vector3(r,r,r), col:s.col});
+      else if (s.type==='cubes') list.push({p:pp, q:new THREE.Quaternion().setFromUnitVectors(Z,t), s:new THREE.Vector3(r*1.5,r*1.5,r*1.5), col:s.col});
+      else if (s.type==='dashes') list.push({p:pp, q:new THREE.Quaternion().setFromUnitVectors(Z,t), s:new THREE.Vector3(r,r,r*3), col:s.col});
+      else if (s.type==='chain'){ const q = new THREE.Quaternion().setFromUnitVectors(X,t).multiply(new THREE.Quaternion().setFromAxisAngle(X, i%2 ? Math.PI/2 : 0)); list.push({p:pp, q, s:new THREE.Vector3(r*2.2,r*1.4,r*1.4), col:s.col}); }
+      else { const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(R()*6.3,R()*6.3,R()*6.3)); const k = r*(1.1+R()*0.8); list.push({p:pp, q, s:new THREE.Vector3(k,k,k), col:PALETTE[Math.floor(R()*8)]}); }
+    });
+    let geo;
+    if (s.type==='beads') geo = new THREE.SphereGeometry(1, 12, 8);
+    else if (s.type==='cubes') geo = new THREE.BoxGeometry(1,1,1);
+    else if (s.type==='dashes') geo = new THREE.CylinderGeometry(1,1,1,10).rotateX(Math.PI/2);
+    else if (s.type==='chain') geo = new THREE.TorusGeometry(1, 0.28, 8, 18);
+    else { const sh = new THREE.Shape(); for (let k=0;k<10;k++){ const a2 = k/10*Math.PI*2 - Math.PI/2, rr2 = k%2 ? 0.45 : 1; k ? sh.lineTo(Math.cos(a2)*rr2, Math.sin(a2)*rr2) : sh.moveTo(Math.cos(a2)*rr2, Math.sin(a2)*rr2); } geo = new THREE.ExtrudeGeometry(sh, {depth:0.35, bevelEnabled:false}); geo.center(); }
+    mesh = instancedList(geo, new THREE.MeshStandardMaterial({roughness: s.type==='chain' ? 0.3 : 0.45, metalness: s.type==='chain' ? 0.4 : 0}), list);
   } else {
-    const R = rng(s.seed); const geo = new THREE.IcosahedronGeometry(1, 1);
+    const geo = new THREE.IcosahedronGeometry(1, 1);
     const im = new THREE.InstancedMesh(geo, new THREE.MeshStandardMaterial({roughness:0.4}), n);
     const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sc3 = V(), col = new THREE.Color();
     for (let i=0;i<n;i++){
-      const k = s.r*(0.6 + R()*1.6); sc3.set(k,k,k);
-      const p = P[i].clone().add(new THREE.Vector3(R()-.5,R()-.5,R()-.5).multiplyScalar(s.r*2));
-      m4.compose(p, q, sc3); im.setMatrixAt(i, m4);
+      const k = r*(0.6 + R()*1.6); sc3.set(k,k,k);
+      const pp = P[i].clone().add(new THREE.Vector3(R()-.5,R()-.5,R()-.5).multiplyScalar(r*2));
+      m4.compose(pp, q, sc3); im.setMatrixAt(i, m4);
       col.set(PALETTE[Math.floor(R()*8)]); im.setColorAt(i, col);
     }
     im.computeBoundingSphere();
@@ -531,10 +576,31 @@ function buildStrokeMesh(s){
   mesh.userData.stroke = s;
   return mesh;
 }
+function along(P, step){
+  const curve = new THREE.CatmullRomCurve3(P), len = curve.getLength();
+  const n = Math.max(2, Math.min(700, Math.floor(len/Math.max(step,1e-6))+1));
+  const pts = [], tans = [];
+  for (let i=0;i<n;i++){ const u = i/(n-1); pts.push(curve.getPointAt(u)); tans.push(curve.getTangentAt(u).normalize()); }
+  return {curve, pts, tans, len};
+}
+function instancedList(geo, mat, list){
+  const im = new THREE.InstancedMesh(geo, mat, Math.max(1,list.length)), m4 = new THREE.Matrix4(), col = new THREE.Color();
+  list.forEach((it,i)=>{ im.setMatrixAt(i, m4.compose(it.p, it.q, it.s)); im.setColorAt(i, col.set(it.col)); });
+  im.count = list.length; im.computeBoundingSphere(); return im;
+}
 function disposeMesh(m){ m.traverse(o => { if (o.geometry && o.geometry!==boxGeo) o.geometry.dispose(); if (o.material && o.material!==clayMat) o.material.dispose?.(); }); }
 function rebuildStroke(L, s){
+  if (s.type==='blocks' && s._mesh && s._mesh.isInstancedMesh && s.items.length && s._mesh.count === s.items.length/13){ updateBlockMesh(s); return; }
   if (s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh=null; }
   const m = buildStrokeMesh(s); if (m){ s._mesh=m; L.group.add(m); }
+}
+function updateBlockMesh(s){
+  const im = s._mesh, it = s.items, m4 = new THREE.Matrix4(), p = V(), q = new THREE.Quaternion(), sc3 = V(), col = new THREE.Color();
+  for (let i=0, o=0; o<it.length; i++, o+=13){
+    p.set(it[o],it[o+1],it[o+2]); q.set(it[o+3],it[o+4],it[o+5],it[o+6]); sc3.set(it[o+7],it[o+8],it[o+9]);
+    im.setMatrixAt(i, m4.compose(p,q,sc3)); col.setRGB(it[o+10]/255,it[o+11]/255,it[o+12]/255, THREE.SRGBColorSpace); im.setColorAt(i, col);
+  }
+  im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; im.computeBoundingSphere();
 }
 function dropStroke(L, s){ if (s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh=null; } L.strokes = L.strokes.filter(x=>x!==s); }
 function snapStrokes(L){ return {list:L.strokes.slice(), items:new Map(L.strokes.filter(s=>s.type==='blocks').map(s=>[s, s.items.slice()]))}; }
@@ -578,6 +644,7 @@ function canEdit(){
 let hintT = -1e9;
 function beginStroke(rWorld){
   if (!canEdit()) return false;
+  if (['clay','paint','doodle','blocks'].includes(state.tool) && !state.carve) addRecent(state.color);
   const L = activeLayer();
   if (state.tool==='doodle'){
     stroke = {kind:'doodle', L, snap:snapStrokes(L), s:{type:state.doodle, pts:[], ups:[], r:0, col:state.color, seed:(Math.random()*1e9)|0}, last:null, lastBuild:0};
@@ -632,6 +699,7 @@ function stamp(p, r, pressure){
   const t = state.tool==='clay' ? (state.carve ? 'carve' : 'clay') : state.tool;
   applyOp({t, L:stroke.L.id, p:[p.x,p.y,p.z], r, s:clamp(state.strength*(0.35+0.65*pressure),0.02,1), col:hexRgb(state.color)}, stroke.map);
   if (t==='carve' && eraseInside(stroke.L, p, r)) stroke.strokesChanged = true;
+  if (t==='paint' && recolorAt(stroke.L, p, r)) stroke.strokesChanged = true;
 }
 function endStroke(cancel){
   if (!stroke) return;
@@ -761,32 +829,97 @@ function eraseAt(p, r){
         for (let k=0;k<13;k++) keep.push(it[o+k]);
       }
       if (gone){ s.items = keep; stroke.changed = true; if (keep.length) rebuildStroke(L, s); else dropStroke(L, s); }
-    } else {
-      const P = s.pts; let hitIt = false;
-      for (let o=0;o<P.length;o+=3){ tmp.set(P[o],P[o+1],P[o+2]); if (tmp.distanceTo(p) < r + s.r*2){ hitIt = true; break; } }
-      if (hitIt){ dropStroke(L, s); stroke.changed = true; }
+    } else if (s.pts){
+      // erase only the part of the doodle inside the eraser; the rest splits into pieces
+      const P = s.pts, U = s.ups || [], segs = []; let cur = null, cut = false;
+      for (let o=0;o<P.length;o+=3){
+        tmp.set(P[o],P[o+1],P[o+2]);
+        if (tmp.distanceTo(p) < r + s.r){ cut = true; cur = null; continue; }
+        if (!cur){ cur = {pts:[], ups:[]}; segs.push(cur); }
+        cur.pts.push(P[o],P[o+1],P[o+2]); if (U.length) cur.ups.push(U[o],U[o+1],U[o+2]);
+      }
+      if (!cut) continue;
+      dropStroke(L, s); stroke.changed = true;
+      segs.forEach((sg,k)=>{ if (sg.pts.length < 6) return; const ns = {type:s.type, pts:sg.pts, ups:sg.ups, r:s.r, col:s.col, seed:(s.seed||1)+k*7919}; L.strokes.push(ns); rebuildStroke(L, ns); });
     }
   }
 }
 /* grab one block and move it (BUILD / CHARACTERS) */
 let blockGrab = null;
-function findBlockAt(pW){
-  let best = null, bd = 1e9; const inv = new THREE.Matrix4(), m = new THREE.Matrix4(), lp = V();
+// what's under your brush: a sphere around the tool tip, not the middle of the controller
+const _bp = V(), _bq = new THREE.Quaternion();
+function findBlockAt(pW, rW=0){
+  let best = null, bd = 1e9; const m = new THREE.Matrix4(), inv = new THREE.Matrix4(), lp = V(), cl = V();
   for (const L of domainLayers()){
     if (!L.visible || L.locked) continue;
-    const pl = wToL(L, pW);
+    const pl = wToL(L, pW), rl = rToL(L, rW) + 1e-6;
     for (const s of L.strokes){
       if (s.type!=='blocks') continue;
       const it = s.items;
       for (let o=0, i=0; o<it.length; o+=13, i++){
-        m.compose(new THREE.Vector3(it[o],it[o+1],it[o+2]), new THREE.Quaternion(it[o+3],it[o+4],it[o+5],it[o+6]), new THREE.Vector3(it[o+7],it[o+8],it[o+9]));
+        m.compose(_bp.set(it[o],it[o+1],it[o+2]), _bq.set(it[o+3],it[o+4],it[o+5],it[o+6]), ONE);
         inv.copy(m).invert(); lp.copy(pl).applyMatrix4(inv);
-        const out = Math.max(Math.abs(lp.x), Math.abs(lp.y), Math.abs(lp.z));
-        if (out <= 0.65){ const dist = Math.hypot(it[o]-pl.x, it[o+1]-pl.y, it[o+2]-pl.z); if (dist < bd){ bd = dist; best = {L, s, i}; } }
+        const hx = it[o+7]/2, hy = it[o+8]/2, hz = it[o+9]/2;
+        cl.set(clamp(lp.x,-hx,hx), clamp(lp.y,-hy,hy), clamp(lp.z,-hz,hz));
+        const d = lp.distanceTo(cl);
+        if (d <= rl){ const score = d + lp.length()*0.01; if (score < bd){ bd = score; best = {L, s, i}; } }
       }
     }
   }
   return best;
+}
+function findStrokeAt(pW, rW=0){
+  let best = null, bd = 1e9; const tmp = V();
+  for (const L of domainLayers()){
+    if (!L.visible || L.locked) continue;
+    const pl = wToL(L, pW), rl = rToL(L, rW) + 1e-6;
+    for (const s of L.strokes){
+      if (!s.pts) continue;
+      for (let o=0;o<s.pts.length;o+=3){ const d = tmp.set(s.pts[o],s.pts[o+1],s.pts[o+2]).distanceTo(pl) - s.r*2; if (d <= rl && d < bd){ bd = d; best = {L, s}; } }
+    }
+  }
+  return best;
+}
+function strokeObj(o){ while (o){ if (o.userData && o.userData.stroke) return o; o = o.parent; } return null; }
+let doodleGrab = null;
+function startDoodleGrab(d, ctrlM){
+  d.L.group.updateMatrixWorld(true);
+  const Linv = d.L.group.matrixWorld.clone().invert();
+  doodleGrab = {...d, before:snapStrokes(d.L), Linv, M0inv: Linv.clone().multiply(ctrlM).invert(), T:null};
+  if (d.s._mesh) d.s._mesh.matrixAutoUpdate = false;
+  pulse('right',0.5,30);
+}
+function moveDoodleGrab(ctrlM){
+  const d = doodleGrab; if (!d) return;
+  d.T = d.Linv.clone().multiply(ctrlM).multiply(d.M0inv);
+  if (d.s._mesh){ d.s._mesh.matrix.copy(d.T); d.s._mesh.matrixWorldNeedsUpdate = true; }
+}
+function endDoodleGrab(){
+  const d = doodleGrab; if (!d) return; doodleGrab = null;
+  const s = d.s, L = d.L;
+  if (!d.T){ if (s._mesh){ s._mesh.matrixAutoUpdate = true; s._mesh.matrix.identity(); } return; }
+  const ns = {type:s.type, r:s.r, col:s.col, seed:s.seed, pts:[], ups:[]}, v = V(), nm = new THREE.Matrix3().getNormalMatrix(d.T);
+  for (let o=0;o<s.pts.length;o+=3){ v.set(s.pts[o],s.pts[o+1],s.pts[o+2]).applyMatrix4(d.T); ns.pts.push(+v.x.toFixed(5),+v.y.toFixed(5),+v.z.toFixed(5)); }
+  if (s.ups) for (let o=0;o<s.ups.length;o+=3){ v.set(s.ups[o],s.ups[o+1],s.ups[o+2]).applyMatrix3(nm).normalize(); ns.ups.push(+v.x.toFixed(3),+v.y.toFixed(3),+v.z.toFixed(3)); }
+  dropStroke(L, s); L.strokes.push(ns); rebuildStroke(L, ns);
+  pushUndo({type:'strokes', L:L.id, snap:d.before}); sceneDirty = true;
+}
+// Paint tool: recolors blocks and doodles it touches
+function recolorAt(L, p, r){
+  const col = hexRgb(state.color), tmp = V(); let any = false;
+  for (const s of [...L.strokes]){
+    if (s.type==='blocks'){
+      const it = s.items; let ch = false;
+      for (let o=0;o<it.length;o+=13){
+        if (tmp.set(it[o],it[o+1],it[o+2]).distanceTo(p) < r + 0.5*Math.max(it[o+7],it[o+8],it[o+9]) && (it[o+10]!==col[0]||it[o+11]!==col[1]||it[o+12]!==col[2])){ it[o+10]=col[0]; it[o+11]=col[1]; it[o+12]=col[2]; ch = true; }
+      }
+      if (ch){ rebuildStroke(L, s); any = true; }
+    } else if (s.pts && s.col!==state.color && s.type!=='dots' && s.type!=='stars'){
+      let near = false; for (let o=0;o<s.pts.length;o+=3) if (tmp.set(s.pts[o],s.pts[o+1],s.pts[o+2]).distanceTo(p) < r + s.r){ near = true; break; }
+      if (near){ const ns = {...s, col:state.color, _mesh:null}; dropStroke(L, s); L.strokes.push(ns); rebuildStroke(L, ns); any = true; }
+    }
+  }
+  return any;
 }
 function blockMatrixW(b){ const o=b.i*13, it=b.s.items; b.L.group.updateMatrixWorld(true);
   return b.L.group.matrixWorld.clone().multiply(new THREE.Matrix4().compose(new THREE.Vector3(it[o],it[o+1],it[o+2]), new THREE.Quaternion(it[o+3],it[o+4],it[o+5],it[o+6]), ONE)); }
@@ -818,6 +951,14 @@ function applyRec(r){
   if (r.type==='shots'){ const cur = snapShots(); restoreShots(r.snap); r.snap = cur; return true; }
   if (r.type==='show'){ const cur = snapShow(); restoreShow(r.snap); r.snap = cur; return true; }
   const L = layerById(r.L); if (!L) return false;
+  if (r.type==='detail'){
+    const cur = {vs:L.vs, chunks:L.chunks};
+    for (const ch of L.chunks.values()) dropMesh(L, ch);
+    for (const k of [...dirty.keys()]) if (k.startsWith(L.id+'|')) dirty.delete(k);
+    L.chunks = r.chunks; L.vs = r.vs;
+    for (const ch of [...L.chunks.values()]) if (ch.d) markAround(L, ch.cx-1,ch.cy-1,ch.cz-1, ch.cx+1,ch.cy+1,ch.cz+1);
+    r.chunks = cur.chunks; r.vs = cur.vs; return true;
+  }
   if (r.type==='vox') r.map = swapChunks(L, r.map);
   else if (r.type==='strokes'){ const cur = snapStrokes(L); restoreStrokes(L, r.snap); r.snap = cur; }
   return true;
@@ -840,7 +981,15 @@ function setTool(t){
   if (['clay','smooth','paint'].includes(t)) state.lastSculpt = t;
   requestUI();
 }
-function flipCarve(){ if (state.tool!=='clay') setTool('clay'); else state.carve=!state.carve; requestUI(); }
+function toolFamily(){ if (state.tool==='erase') return state.eraseFor || 'doodle'; if (['clay','smooth','paint'].includes(state.tool)) return 'sculpt'; return state.tool; }
+function pageFamily(){ return {tools:'sculpt', doodle:'doodle', blocks:'blocks'}[state.page] || toolFamily(); }
+// A flips inside the tab you're on: Sculpt add<->carve, Doodle draw<->erase, Blocks build<->erase
+function flipCarve(){
+  const f = pageFamily();
+  if (f==='doodle' || f==='blocks'){ state.eraseFor = f; setTool(state.tool==='erase' ? f : 'erase'); toast(state.tool==='erase' ? 'Eraser' : (f==='doodle'?'Doodle':'Blocks')); }
+  else if (state.tool!=='clay') setTool('clay'); else state.carve=!state.carve;
+  requestUI();
+}
 function swapTool(){ setTool(state.lastTool); }
 
 /* ============================================================
@@ -851,6 +1000,26 @@ function swapTool(){ setTool(state.lastTool); }
 const charById = id => show.chars.find(c=>c.id===id);
 const selChar = () => charById(state.selChar);
 const partLayer = (c, part) => partsOf(c).find(L=>L.part===part);
+const guideMat = new THREE.MeshBasicMaterial({color:'#00c7be', transparent:true, opacity:0.3, depthTest:false, depthWrite:false});
+const guideEdge = new THREE.LineBasicMaterial({color:'#ffffff', transparent:true, opacity:0.75, depthTest:false});
+function guideMesh(geo, x=0, y=0, z=0){
+  const g2 = new THREE.Group(), m = new THREE.Mesh(geo, guideMat), e = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), guideEdge);
+  m.renderOrder = e.renderOrder = 30; g2.add(m, e); g2.position.set(x,y,z); return g2;
+}
+// see-through Quest headset and controllers: where your head and hands go when you step in
+const guides = new THREE.Group(); studio.add(guides);
+const guideHead = new THREE.Group();
+guideHead.add(guideMesh(new THREE.BoxGeometry(0.19,0.11,0.09), 0, 0, -0.05));
+{ const strap = guideMesh(new THREE.TorusGeometry(0.09,0.01,6,28), 0, 0, 0.03); strap.rotation.x = Math.PI/2; strap.scale.set(1,1.2,1); guideHead.add(strap); }
+const guideHands = [0,1].map(()=>{
+  const gh = new THREE.Group();
+  const ring = guideMesh(new THREE.TorusGeometry(0.038,0.008,6,24), 0, 0.025, -0.035); ring.rotation.x = 0.7; gh.add(ring);
+  const hd = guideMesh(new THREE.CylinderGeometry(0.016,0.019,0.1,10), 0, -0.02, 0.015); hd.rotation.x = -0.45; gh.add(hd);
+  return gh;
+});
+guides.add(guideHead, ...guideHands);
+for (const o of [guideHead, ...guideHands]) o.rotation.y = Math.PI;   // facing the front of the stage, like the puppet
+const GUIDE = {head:[0,1.5,0], lh:[-0.3,1.15,0.05], rh:[0.3,1.15,0.05]};
 function makeChar(type, name, id){
   const c = {id: id ?? show.charSeq++, name, type, place:{p:[0,0,0], q:[0,0,0,1], s:1}, placed:false, root:new THREE.Group()};
   show.charSeq = Math.max(show.charSeq, c.id+1);
@@ -873,6 +1042,7 @@ function newCharacter(type){
     for (const sx of [-1,1]){ const e = h.clone().addScaledVector(front,0.1).add(new THREE.Vector3(sx*0.045,0.03,0)); op(H,'clay',e,0.032,white); op(H,'clay',e.clone().addScaledVector(front,0.022),0.016,black); }
     op(H,'clay',h.clone().addScaledVector(front,0.1).add(new THREE.Vector3(0,-0.05,0)),0.03,hexRgb('#ff3b30'));
     for (const [Lh, sx] of [[LH,-1],[RH,1]]){ const hp = new THREE.Vector3(sx*0.3,1.15,0.05); op(Lh,'clay',hp,0.05,col); op(Lh,'clay',hp.clone().add(new THREE.Vector3(-sx*0.045,0.03,0)),0.022,col); }
+    c.guide = JSON.parse(JSON.stringify(GUIDE));
     state.activePart = H.id;
   } else {
     const B = addPart(c,'body',0.025);
@@ -938,7 +1108,7 @@ function trackAt(tr, t, outP, outQ){
 function controlledKeys(){
   const set = new Set();
   if (show.grab) set.add('r'+show.grab.c.id);
-  if (show.embodied) for (const part of show.embodied.parts) set.add(String(part.L.id));
+  if (show.embodied){ for (const part of show.embodied.parts) set.add(String(part.L.id)); if (show.embodied.rootMoved) set.add('r'+show.embodied.c.id); }
   return set;
 }
 function objForKey(key){
@@ -974,6 +1144,7 @@ function restoreShow(s){
 
 /* audio */
 let actx = null; const audioBufs = new Map(); let audioSrcs = []; let audioToken = 0;
+function beep(freq, dur=0.12, vol=0.22){ try { const a = ac(); const o = a.createOscillator(), gn = a.createGain(); o.type='square'; o.frequency.value=freq; gn.gain.setValueAtTime(vol, a.currentTime); gn.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur); o.connect(gn); gn.connect(a.destination); o.start(); o.stop(a.currentTime+dur+0.03); } catch(e){} }
 function ac(){ if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)(); if (actx.state==='suspended') actx.resume(); return actx; }
 async function decodeClip(c){
   if (audioBufs.has(c.id)) return audioBufs.get(c.id);
@@ -1009,15 +1180,36 @@ function stepIn(c){
   c.root.updateMatrixWorld(true);
   const H = partLayer(c,'head'), LH = partLayer(c,'lh'), RH = partLayer(c,'rh');
   rig.scale.setScalar(c.place.s || 1); rig.updateMatrixWorld(true);
-  if (H){ const hc = layerCenter(H), cw = V(); camera.getWorldPosition(cw); rig.position.add(hc.sub(cw)); rig.updateMatrixWorld(true); }
   const parts = [];
-  if (H) parts.push({L:H, tracker:camera, off: unscaled(camera).invert().multiply(H.group.matrixWorld.clone())});
-  for (const [Lh, cc] of [[LH, ctrl.left], [RH, ctrl.right]]){
-    if (!Lh || !cc) continue;
-    const gp = V(); cc.grip.getWorldPosition(gp);
-    const shift = new THREE.Matrix4().makeTranslation(...gp.sub(layerCenter(Lh)).toArray());
-    const wantW = shift.multiply(Lh.group.matrixWorld.clone());
-    parts.push({L:Lh, tracker:cc.grip, off: unscaled(cc.grip).invert().multiply(wantW)});
+  if (c.guide){
+    const rootQ = c.root.getWorldQuaternion(new THREE.Quaternion());
+    const faceQ = rootQ.clone().multiply(new THREE.Quaternion().setFromAxisAngle(_y, Math.PI));
+    // turn you to face the way the puppet faces, then put your eyes where the headset guide is
+    const fc = V(); camera.getWorldDirection(fc); fc.y = 0;
+    const fp = new THREE.Vector3(0,0,1).applyQuaternion(rootQ); fp.y = 0;
+    if (fc.lengthSq() > 1e-6 && fp.lengthSq() > 1e-6){
+      const qd = new THREE.Quaternion().setFromAxisAngle(_y, Math.atan2(fp.x,fp.z) - Math.atan2(fc.x,fc.z));
+      const cp = V(); camera.getWorldPosition(cp);
+      rig.position.sub(cp).applyQuaternion(qd).add(cp); rig.quaternion.premultiply(qd); rig.updateMatrixWorld(true);
+    }
+    const headW = c.root.localToWorld(new THREE.Vector3(...c.guide.head));
+    const cw = V(); camera.getWorldPosition(cw); rig.position.add(headW.clone().sub(cw)); rig.updateMatrixWorld(true);
+    const idealInv = pos => new THREE.Matrix4().compose(pos, faceQ, ONE).invert();
+    if (H) parts.push({L:H, tracker:camera, off: idealInv(headW).multiply(H.group.matrixWorld.clone())});
+    for (const [Lh, cc, key] of [[LH, ctrl.left, 'lh'], [RH, ctrl.right, 'rh']]){
+      if (!Lh || !cc) continue;
+      parts.push({L:Lh, tracker:cc.grip, off: idealInv(c.root.localToWorld(new THREE.Vector3(...c.guide[key]))).multiply(Lh.group.matrixWorld.clone())});
+    }
+  } else {
+    if (H){ const hc = layerCenter(H), cw = V(); camera.getWorldPosition(cw); rig.position.add(hc.sub(cw)); rig.updateMatrixWorld(true); }
+    if (H) parts.push({L:H, tracker:camera, off: unscaled(camera).invert().multiply(H.group.matrixWorld.clone())});
+    for (const [Lh, cc] of [[LH, ctrl.left], [RH, ctrl.right]]){
+      if (!Lh || !cc) continue;
+      const gp = V(); cc.grip.getWorldPosition(gp);
+      const shift = new THREE.Matrix4().makeTranslation(...gp.sub(layerCenter(Lh)).toArray());
+      const wantW = shift.multiply(Lh.group.matrixWorld.clone());
+      parts.push({L:Lh, tracker:cc.grip, off: unscaled(cc.grip).invert().multiply(wantW)});
+    }
   }
   show.embodied = {c, parts};
   placeMirror(); toast('You are '+c.name+' — A records, B plays'); requestUI();
@@ -1034,17 +1226,44 @@ function updateEmbodied(){
 }
 
 /* grab whole characters (PERFORM). Scenery never moves. */
-function findCharAt(pW){
-  let best = null, bv = Infinity;
+function findCharAt(pW, rW=0){
+  let best = null, bv = Infinity; const b = new THREE.Box3();
   for (const c of show.chars){
     if (!c.placed) continue;
-    const b = new THREE.Box3().setFromObject(c.root); if (b.isEmpty()) continue;
-    b.expandByScalar(0.04*yourScale());
-    if (!b.containsPoint(pW)) continue;
+    b.setFromObject(c.root); if (b.isEmpty()) continue;
+    if (b.distanceToPoint(pW) > rW) continue;
     const sz = b.getSize(V()); const vol = sz.x*sz.y*sz.z;
     if (vol < bv){ bv = vol; best = c; }
   }
   return best;
+}
+function setCharScale(c, sNew){
+  if (!c) return; sNew = clamp(sNew, 0.02, 50);
+  const f = sNew / (c.place.s || 1); c.place.s = sNew;
+  const tr = show.tracks['r'+c.id]; if (tr){ const S9 = tr.samples; for (let i=8;i<S9.length;i+=9) S9[i] *= f; }
+  sceneDirty = true; requestUI();
+}
+// PERFORM: right trigger aims at the ground; let go to jump there (same size)
+let tpArmed = false, tpAim = null;
+const tpRing = new THREE.Mesh(new THREE.TorusGeometry(0.25,0.03,8,40), new THREE.MeshBasicMaterial({color:'#00c7be', depthTest:false, transparent:true}));
+tpRing.rotation.x = -Math.PI/2; tpRing.renderOrder = 15; tpRing.visible = false; scene.add(tpRing);
+const tpLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(), V()]), new THREE.LineBasicMaterial({color:'#00c7be'}));
+tpLine.frustumCulled = false; tpLine.visible = false; scene.add(tpLine);
+function teleportAim(o, d){
+  const far = 300*rig.scale.x;
+  const rc = new THREE.Raycaster(o.clone(), d.clone(), 0, far);
+  const h = rc.intersectObjects(worldLayers().filter(L=>L.visible).map(L=>L.group), true)[0];
+  if (h) return h.point.clone();
+  if (state.world.water && d.y < -0.01){ const t = -o.y/d.y; if (t > 0 && t < far) return o.clone().addScaledVector(d, t); }
+  return null;
+}
+function doTeleport(p){
+  rig.updateMatrixWorld(true);
+  const feet = rig.localToWorld(new THREE.Vector3(camera.position.x, 0, camera.position.z));
+  const d = V().subVectors(p, feet);
+  rig.position.add(d); rig.updateMatrixWorld(true);
+  if (show.embodied){ const c = show.embodied.c; c.root.position.add(d); c.root.updateMatrixWorld(true); show.embodied.rootMoved = true; if (!show.rec){ c.place.p = c.root.position.toArray(); sceneDirty = true; } }
+  pulse('right',0.4,30);
 }
 function startCharGrab(c, ctrlM){
   if (show.tracks['r'+c.id] && !show.rec){ toast(c.name+' has recorded moves — record over them, or clear them in Motion'); return false; }
@@ -1100,9 +1319,9 @@ function updateShow(dt){
   const r = show.rec;
   if (r){
     if (r.phase==='count'){
-      r.t -= dt; const n = Math.ceil(r.t); if (n>0) setRecLabel(String(n));
+      r.t -= dt; const n = Math.ceil(r.t); if (n>0){ setRecLabel(String(n)); if (n!==r.lastN){ r.lastN = n; beep(660); } }
       if (r.t <= 0){
-        r.phase='rec'; r.t=0; show.t=0; pulse('right',0.7,60); audioPlayFrom(0);
+        r.phase='rec'; r.t=0; show.t=0; pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(0);
         if (state.mic && micStream && window.MediaRecorder){
           try { r.mr = new MediaRecorder(micStream); r.mr.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); }; r.mr.start(250); } catch(e){ toast('Mic recording failed'); }
         }
@@ -1235,8 +1454,8 @@ function updateRecording(dt){
   if (!rec) return;
   if (rec.phase==='count'){
     rec.t -= dt; const n = Math.ceil(rec.t);
-    if (n>0) setRecLabel(String(n));
-    if (rec.t <= 0){ rec.phase='rec'; rec.t=0; pulse('right',0.7,60); audioPlayFrom(0); }
+    if (n>0){ setRecLabel(String(n)); if (n!==rec.lastN){ rec.lastN = n; beep(660); } }
+    if (rec.t <= 0){ rec.phase='rec'; rec.t=0; pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(0); }
     return;
   }
   rec.t += dt;
@@ -1533,12 +1752,12 @@ function serialize(){
     app:'ChikiMovieMagic', v:5, enc:'rle', saved:new Date().toISOString(),
     settings:{color:state.color, size:state.size, strength:state.strength, tool:state.tool, doodle:state.doodle, doodleSize:state.doodleSize,
               blockMode:state.blockMode, blockShape:state.blockShape, blockSize:state.blockSize, blockSnap:state.blockSnap, blockMix:state.blockMix,
-              activeWorld:state.activeWorld, activePart:state.activePart, selChar:state.selChar, flySpeed:state.flySpeed, fov:state.fov, labels:state.labels, mirror:state.mirror, win:state.win},
+              activeWorld:state.activeWorld, activePart:state.activePart, selChar:state.selChar, flySpeed:state.flySpeed, fov:state.fov, labels:state.labels, mirror:state.mirror, win:state.win, recent:state.recent, eraseFor:state.eraseFor},
     world: state.world,
     views,
     shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq},
     show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64),
-           chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed})), charSeq:show.charSeq, audioSeq:show.audioSeq},
+           chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
       id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, rest:L.rest, char:L.char, part:L.part,
       chunks: [...L.chunks.values()].filter(ch => ch.d && ch.d.some(v=>v>-DMAX+0.01)).map(ch => {
@@ -1559,7 +1778,7 @@ function clearScene(){
 function deserialize(o){
   clearScene();
   const sh = o.show || {};
-  for (const cd of (sh.chars||[])){ const c = makeChar(cd.type, cd.name, cd.id); c.place = cd.place; c.placed = cd.placed; }
+  for (const cd of (sh.chars||[])){ const c = makeChar(cd.type, cd.name, cd.id); c.place = cd.place; c.placed = cd.placed; c.guide = cd.guide || null; }
   for (const ld of o.layers){
     const c = ld.char ? charById(ld.char) : null;
     const L = makeLayer(ld.name, ld.vs || 0.1, ld.id, c ? c.root : world); L.visible=ld.visible; L.locked=ld.locked; L.group.visible=L.visible;
@@ -1681,13 +1900,42 @@ const WINS = [menuWin, layersWin, previewWin];
 function winVisible(win){
   if (win===menuWin) return state.panelOpen;
   if (win===layersWin) return state.win.layers && SCULPT_PHASES.includes(state.phase);
-  if (win===previewWin) return (state.phase==='shoot' && state.win.preview) || (state.phase==='perform' && state.mirror && !!show.embodied);
+  if (win===previewWin) return state.win.preview && (state.phase==='shoot' || (state.phase==='perform' && ((state.mirror && !!show.embodied) || !!selTake())));
+  if (win.isPage) return win.page!=='layers' && (RAILS[state.phase]||[]).some(([id])=>id===win.page);
   return false;
 }
 function dockWin(win){
+  if (win.isPage){ state.page = win.page; closePageWin(win); return; }
   const L = ctrl.left; if (!L) return;
-  L.grip.add(win.mesh); win.mesh.position.fromArray(win.slot.p); win.mesh.rotation.set(...win.slot.r); win.mesh.scale.setScalar(win.slot.s);
+  L.grip.add(win.mesh);
+  if (win.slotFn) win.slotFn().decompose(win.mesh.position, win.mesh.quaternion, win.mesh.scale);
+  else { win.mesh.position.fromArray(win.slot.p); win.mesh.rotation.set(...win.slot.r); win.mesh.scale.setScalar(win.slot.s); }
   win.dock = 'hand'; requestUI();
+}
+// the camera window docks at the bottom right of the menu
+previewWin.slotFn = () => {
+  const ms = menuWin.slot, ps = 0.45, r = ASPECTS[shots.aspect], w = 0.4, hh = 0.056;
+  const sh = r>=1 ? w/r : w*1.2, totalH = (hh + 0.004 + sh)*ps;
+  const menuW = 0.2, menuH = 0.2*UIH/UIW;
+  const M = new THREE.Matrix4().compose(new THREE.Vector3(...ms.p), new THREE.Quaternion().setFromEuler(new THREE.Euler(...ms.r)), ONE);
+  return M.multiply(new THREE.Matrix4().compose(new THREE.Vector3(menuW/2 + w*ps/2 + 0.008, -menuH/2 + totalH - hh*ps/2, 0.002), new THREE.Quaternion(), new THREE.Vector3(ps,ps,ps)));
+};
+// tear a tab off the menu into its own window
+const pageWins = [];
+function tearOff(page){
+  const have = pageWins.find(w=>w.page===page); if (have) return {win:have, isNew:false};
+  if (pageWins.length >= 6){ toast('Six windows is the most for now'); return null; }
+  const cv = document.createElement('canvas'); cv.width = 380; cv.height = UIH;
+  const w = makeWin('page:'+page, cv, 0.16, null, page); w.page = page; w.isPage = true; w.dock = 'room'; w.placedOnce = true;
+  rig.add(w.mesh); rig.updateMatrixWorld(true); menuWin.mesh.updateMatrixWorld(true);
+  rig.matrixWorld.clone().invert().multiply(menuWin.mesh.matrixWorld).decompose(w.mesh.position, w.mesh.quaternion, w.mesh.scale);
+  w.mesh.translateZ(0.02);
+  pageWins.push(w); WINS.push(w); requestUI(); drawUI();
+  return {win:w, isNew:true};
+}
+function closePageWin(w){
+  w.mesh.parent?.remove(w.mesh); w.tex.dispose(); w.mesh.geometry.dispose(); w.mesh.material.dispose();
+  pageWins.splice(pageWins.indexOf(w),1); WINS.splice(WINS.indexOf(w),1); requestUI();
 }
 function roomWin(win, inFront){
   if (inFront && renderer.xr.isPresenting){
@@ -1710,14 +1958,51 @@ function updateWins(){
     w.mesh.visible = v;
   }
   layersWin.canvas.style.display = (!renderer.xr.isPresenting && winVisible(layersWin)) ? 'block' : 'none';
+  updateOrb();
+}
+// the 3D color ball: hue around, vivid outward, light upward. It floats above whichever window shows Color.
+const orb = new THREE.Group(); orb.visible = false;
+const ORB_R = 0.05, ORB_H = 0.08;
+{
+  const list = [], one = new THREE.Vector3(0.0034,0.0034,0.0034);
+  const mk = (x,y,z,h,s2,l) => list.push({p:new THREE.Vector3(x,y,z), q:new THREE.Quaternion(), s:one, col:'#'+new THREE.Color().setHSL(h,s2,l).getHexString()});
+  for (let li=0; li<=8; li++){
+    const l = li/8, y = -ORB_H/2 + l*ORB_H; mk(0,y,0,0,0,l);
+    if (li===0 || li===8) continue;
+    for (let si=1; si<=4; si++) for (let hi=0; hi<24; hi++){ const h = hi/24, a = h*Math.PI*2, rad = si/4*ORB_R; mk(Math.cos(a)*rad, y, Math.sin(a)*rad, h, si/4, l); }
+  }
+  orb.add(instancedList(new THREE.SphereGeometry(1,8,6), new THREE.MeshBasicMaterial({toneMapped:false}), list));
+  orb.add(new THREE.Mesh(new THREE.CylinderGeometry(ORB_R*1.12, ORB_R*1.12, ORB_H*1.12, 32, 1, true),
+    new THREE.MeshBasicMaterial({color:'#ffffff', transparent:true, opacity:0.07, side:THREE.DoubleSide, depthWrite:false})));
+}
+function orbPick(pW){
+  const p = orb.worldToLocal(pW.clone()), rad = Math.hypot(p.x, p.z);
+  if (rad > ORB_R*1.2 || Math.abs(p.y) > ORB_H*0.62) return null;
+  return '#'+new THREE.Color().setHSL(((Math.atan2(p.z,p.x)/(Math.PI*2))+1)%1, clamp(rad/ORB_R,0,1), clamp((p.y+ORB_H/2)/ORB_H,0,1)).getHexString();
+}
+function updateOrb(){
+  let host = null;
+  const pw = pageWins.find(w=>w.page==='color' && w.mesh.visible);
+  if (pw) host = pw; else if (menuWin.mesh.visible && state.page==='color' && !state.dialOpen) host = menuWin;
+  if (!host || !renderer.xr.isPresenting){ orb.visible = false; return; }
+  if (orb.parent !== host.mesh) host.mesh.add(orb);
+  orb.position.set(0, host.mesh.geometry.parameters.height/2 + 0.065, 0.03); orb.visible = true;
 }
 // window grabbing (rig-local so it stays put in your room)
 let winGrab = null;
-function startWinGrab(win, R){
-  if (win.dock==='hand') toast('Let go in the room to leave it there, or bring your hands together to dock it');
+function startWinGrab(win, R, torn){
+  const orig = {parent:win.mesh.parent, p:win.mesh.position.clone(), q:win.mesh.quaternion.clone(), s:win.mesh.scale.clone(), dock:win.dock, torn};
+  if (torn) toast('Let go anywhere. Right stick ↕ resizes it. Bring it back to your left hand to put it back in the menu.');
+  else if (win.dock==='hand') toast('Let go in the room to leave it there. Right stick ↕ resizes it.');
   rig.attach(win.mesh); win.mesh.updateMatrix(); R.grip.updateMatrix();
-  winGrab = {win, rel: R.grip.matrix.clone().invert().multiply(win.mesh.matrix.clone())};
+  winGrab = {win, orig, rel: R.grip.matrix.clone().invert().multiply(win.mesh.matrix.clone())};
   pulse('right',0.4,25);
+}
+function cancelWinGrab(){
+  const g0 = winGrab; if (!g0) return; winGrab = null; const w = g0.win, o = g0.orig;
+  if (o.torn){ closePageWin(w); return; }
+  if (o.parent){ o.parent.add(w.mesh); w.mesh.position.copy(o.p); w.mesh.quaternion.copy(o.q); w.mesh.scale.copy(o.s); }
+  w.dock = o.dock;
 }
 function moveWinGrab(R){
   if (!winGrab) return; R.grip.updateMatrix();
@@ -1729,7 +2014,7 @@ function endWinGrab(){
   const L = ctrl.left;
   const R = ctrl.right;
   const near = L && (w.mesh.position.distanceTo(L.grip.position) < 0.16 || (R && R.grip.position.distanceTo(L.grip.position) < 0.15));
-  if (near){ dockWin(w); toast(w.title+' docked on your hand'); }
+  if (near){ if (w.isPage){ dockWin(w); toast('Back in the menu'); } else { dockWin(w); toast(w.title+' docked on your hand'); } }
   else { w.dock = 'room'; w.placedOnce = true; }
   requestUI();
 }
@@ -1747,7 +2032,9 @@ function wrap(text, maxW, size, weight=800){
 function button(x,y,w,h,label,on,fn,col='#1e6bff'){
   rr(x,y,w,h,12, on?col:'#2a3060');
   if (on) rr(x+2,y+2,w-4,h-4,10,null,'#ffffff');
-  txt(label, x+w/2, y+h/2, Math.min(19, h*0.42), '#fff', 'center');
+  let fs = Math.min(19, h*0.42); g.font = `800 ${fs}px system-ui,sans-serif`;
+  while (fs > 10 && g.measureText(label).width > w-10){ fs--; g.font = `800 ${fs}px system-ui,sans-serif`; }
+  txt(label, x+w/2, y+h/2, fs, '#fff', 'center');
   hit(x,y,w,h,fn);
 }
 function toggle(x,y,w,h,label,on,fn,col='#34c759'){
@@ -1787,19 +2074,30 @@ function icon(name,cx,cy,col){
   g.restore();
 }
 const KEYS_VR = {
-  build:['Right trigger: tool   A: add↔carve   B: last tool','X: undo   Y: redo   Left trigger: menu','Right grip on a block: move it   Grip: world','Point + grip on a window: pull it out'],
-  characters:['A separate studio: sculpt characters here at','any size, then place them from PERFORM.','Right trigger: tool   A: add↔carve   B: last tool','Point + grip on a window: pull it out'],
-  perform:['A: record (3-2-1) / cut   B: play the show','Right grip on a character: grab and move it','Stepped in: your head and hands move it','Grip elsewhere: move / scale yourself'],
+  build:['Right trigger: tool   A: add↔carve   B: last tool','X: undo   Y: redo   Left trigger: menu','Right grip on a block or doodle: move it','Grip a tab in the menu: tear it off as a window'],
+  characters:['A separate studio: sculpt characters here at','any size, then place them from PERFORM.','Right trigger: tool   A: add↔carve   B: last tool','Grip a tab in the menu: tear it off as a window'],
+  perform:['A: record (3-2-1) / cut   B: play the show','Right trigger at the ground: jump there','Grip a character: move it (stick: size)','Stepped in: your head and hands move it'],
   shoot:['Hold right trigger: film a take (3-2-1)','A: play/stop take   B: next take','Right stick ↕: zoom (records while playing)','Right grip on a dot: move that key'],
   edit: ['A: play/stop the film','Tap the strip to jump, tap a clip to trim it','X: undo   Y: redo   Left trigger: menu','Grip: drag world   Left stick: fly'],
 };
 const KEYS_DESK = {
-  build:'Left-drag: use tool · Shift-drag a block: move it · Right-drag: orbit · Middle-drag: pan · Wheel: zoom<br>A / Space: add↔carve · B: last tool · X: undo · Y: redo · [ ]: size · 1–6: tools · Tab: menu',
+  build:'Left-drag: use tool · Shift-drag a block or doodle: move it · Right-drag: orbit · Middle-drag: pan · Wheel: zoom<br>A / Space: add↔carve · B: last tool · X: undo · Y: redo · [ ]: size · 1–6: tools · Tab: menu',
   characters:'The character studio — sculpt here, it doesn’t touch the world · Left-drag: tool · Right-drag: orbit<br>A / Space: add↔carve · B: last tool · X: undo · Y: redo · [ ]: size · Tab: menu',
-  perform:'Left-drag a character: move it · R: record (3-2-1) / cut · Space: play the show<br>Right-drag: orbit · X: undo · Y: redo · Tab: menu',
+  perform:'Left-drag a character: move it · - / =: its size · R: record (3-2-1) / cut · Space: play the show<br>Right-drag: orbit · X: undo · Y: redo · Tab: menu',
   shoot:'R: record your view (3-2-1) · A / Space: play take · B: next take · - / =: zoom (records while playing)<br>Right-drag: orbit · Middle-drag: pan · Wheel: zoom · X: undo · Y: redo · Tab: menu',
   edit: 'A / Space: play / stop the film · X: undo · Y: redo · Tab: menu',
 };
+const PAGE_DRAW = {soon:drawSoon, tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, world:drawWorld, sky:drawSky,
+  scene:drawScene, takes:drawTakes, path:drawPath, keys:drawKeysPage, lens:drawLens, timeline:drawTimeline, export:drawExport,
+  chars:drawChars, perform:drawPerform, tracks:drawTracks, rename:drawRename};
+function drawPageWin(win){
+  const W = win.cw; g = win.ctx; hits = [];
+  g.clearRect(0,0,W,win.ch); rr(0,0,W,win.ch,22,'#151935');
+  win.title = (RAILS[state.phase]||[]).find(([id])=>id===win.page)?.[1] || win.page;
+  winHeader(win, W);
+  if (winVisible(win)) (PAGE_DRAW[win.page] || drawSoon)(16, W-32, PHASES.find(p=>p.id===state.phase));
+  win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
+}
 function drawUI(){
   uiNeeds = false;
   g = menuCtx; hits = [];
@@ -1821,9 +2119,7 @@ function drawUI(){
     if (!disabled) hit(16,y,72,72,()=>openPage(id));
   });
   const X=110, W=UIW-X-16;
-  ({soon:()=>drawSoon(X,W,ph), tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, world:drawWorld, sky:drawSky,
-    scene:drawScene, takes:drawTakes, path:drawPath, keys:drawKeysPage, lens:drawLens, timeline:drawTimeline, export:drawExport,
-    chars:drawChars, perform:drawPerform, tracks:drawTracks}[state.page] || (()=>drawSoon(X,W,ph)))(X,W,ph);
+  (PAGE_DRAW[state.page] || drawSoon)(X,W,ph);
   if (state.toastT>0){
     const lines = wrap(state.toastMsg, W-24, 15).slice(0,3); const h = 22+lines.length*20;
     rr(X,UIH-16-h,W,h,18,'#ffd400'); lines.forEach((l,i)=>txt(l, X+W/2, UIH-16-h+21+i*20, 15, '#111','center'));
@@ -1831,16 +2127,16 @@ function drawUI(){
   if (state.dialOpen) drawDial();
   menuWin.hits = hits; menuWin.tex.needsUpdate = true;
   document.getElementById('keys').innerHTML = KEYS_DESK[state.phase] || KEYS_DESK.build;
-  drawLayersWin(); drawPreviewHead(); drawLegends();
+  drawLayersWin(); drawPreviewHead(); for (const w of pageWins) drawPageWin(w); drawLegends();
 }
 function winHeader(win, W){
   rr(0,0,W,48,0,'#0d1029'); txt(win.title, 16, 25, 19, '#fff');
   if (renderer.xr.isPresenting){
-    const dockLbl = win.dock==='hand' ? 'Pull out' : 'To hand';
+    const dockLbl = win.isPage ? 'To menu' : win.dock==='hand' ? 'Pull out' : 'To hand';
     rr(W-150,7,92,34,17,'#1e6bff'); txt(dockLbl, W-104, 25, 14, '#fff','center'); hit(W-150,7,92,34,()=>{ win.dock==='hand' ? roomWin(win,true) : dockWin(win); });
   }
   rr(W-50,7,40,34,17,'#ff3b30'); txt('✕', W-30, 25, 16, '#fff','center');
-  hit(W-50,7,40,34,()=>{ if (win===layersWin) state.win.layers=false; else if (win===previewWin){ if (state.phase==='perform') state.mirror=false; else state.win.preview=false; } requestUI(); });
+  hit(W-50,7,40,34,()=>{ if (win===layersWin) state.win.layers=false; else if (win.isPage) closePageWin(win); requestUI(); });
 }
 function drawLayersWin(){
   const win = layersWin, W = win.cw, H = win.ch;
@@ -1848,7 +2144,7 @@ function drawLayersWin(){
   g.clearRect(0,0,W,H); rr(0,0,W,H,22,'#151935');
   win.title = inStudio() ? (selChar() ? selChar().name+' parts' : 'Parts') : 'Layers';
   winHeader(win, W);
-  const list = domainLayers().slice().reverse().slice(0,7);
+  const list = domainLayers().slice().reverse().slice(0,6);
   const studioMode = inStudio();
   if (studioMode && !selChar()) para(['Make a character first','on the Characters page.'], 16, 80, 16);
   list.forEach((L,i)=>{
@@ -1880,14 +2176,15 @@ function drawLayersWin(){
       removeLayer(L); sceneDirty=true; requestUI(); },'#ff3b30');
     button(12,y+54,hw,42,'Finer',false,()=>changeDetail(activeLayer(),-1),'#1e6bff');
     button(12+hw+8,y+54,hw,42,'Coarser',false,()=>changeDetail(activeLayer(),1),'#1e6bff');
-    if (y+150 < H) para(['New layers match your size now:', fmtLen(nd)+' detail.'], 16, y+124, 13);
+    button(12,y+104,hw,42,'Rename',false,()=>{ const L = activeLayer(); if (L) openRename('layer', L.id); },'#5e2bff');
+    if (!studioMode) button(12+hw+8,y+104,hw,42,'Make it a prop',false,()=>layerToProp(activeLayer()),'#ff2d95');
   }
   win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
 }
 function drawPreviewHead(){
   const win = previewWin, W = win.cw;
   g = win.ctx; hits = []; g.clearRect(0,0,W,win.ch);
-  win.title = state.phase==='perform' ? 'Mirror' : 'Camera';
+  win.title = (state.phase==='perform' && state.mirror && show.embodied) ? 'Mirror' : 'Camera';
   rr(0,0,W,win.ch,14,'#0d1029');
   txt(win.title, 16, 28, 20, '#fff');
   if (renderer.xr.isPresenting){
@@ -1895,15 +2192,36 @@ function drawPreviewHead(){
     rr(W-150,10,92,36,18,'#1e6bff'); txt(dockLbl, W-104, 28, 14, '#fff','center'); hit(W-150,10,92,36,()=>{ win.dock==='hand' ? roomWin(win,true) : dockWin(win); });
   }
   rr(W-50,10,40,36,18,'#ff3b30'); txt('✕', W-30, 28, 16, '#fff','center');
-  hit(W-50,10,40,36,()=>{ if (state.phase==='perform') state.mirror=false; else state.win.preview=false; requestUI(); });
+  hit(W-50,10,40,36,()=>{ state.win.preview=false; requestUI(); });
   win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
+}
+function openRename(kind, id){
+  const obj = kind==='layer' ? layerById(id) : charById(id); if (!obj) return;
+  if (!renderer.xr.isPresenting){ const n = prompt('New name', obj.name); if (n && n.trim()) applyName(kind, id, n.trim().slice(0,28)); return; }
+  state.rename = {kind, id, text:obj.name, caps:false, back:state.page}; state.page = 'rename'; state.panelOpen = true; requestUI();
+}
+function applyName(kind, id, name){ const obj = kind==='layer' ? layerById(id) : charById(id); if (!obj) return; obj.name = name; sceneDirty = true; requestUI(); }
+function drawRename(X,W){
+  const R0 = state.rename; if (!R0){ state.page = FIRST_PAGE[state.phase] || 'scene'; return; }
+  txt('Name', X, 100, 26);
+  rr(X,116,W,50,12,'#0d1029'); txt((R0.text.length>22 ? '…'+R0.text.slice(-21) : R0.text)+'▏', X+12, 141, 20, '#fff');
+  const rows = ['1234567890','QWERTYUIOP','ASDFGHJKL','ZXCVBNM'], kw = (W-9*4)/10, kh = 46;
+  const type = ch => { if (R0.text.length < 28) R0.text += ch; R0.caps = false; requestUI(); };
+  rows.forEach((row,ri)=>{ const off = (10-row.length)*(kw+4)/2;
+    [...row].forEach((ch,ci)=>{ const c2 = (R0.caps || /\d/.test(ch)) ? ch : ch.toLowerCase(); button(X+off+ci*(kw+4), 180+ri*(kh+6), kw, kh, c2, false, ()=>type(c2), '#2a3060'); }); });
+  const y = 180+4*(kh+6), bw = kw*1.6;
+  button(X, y, bw, kh, '⇧', R0.caps, ()=>{ R0.caps = !R0.caps; requestUI(); }, '#1e6bff');
+  button(X+bw+4, y, W-2*(bw+4), kh, 'space', false, ()=>type(' '), '#2a3060');
+  button(X+W-bw, y, bw, kh, '⌫', false, ()=>{ R0.text = R0.text.slice(0,-1); requestUI(); }, '#ff9500');
+  const hw = (W-8)/2;
+  button(X, y+kh+14, hw, 50, 'Cancel', false, ()=>{ state.page = R0.back; state.rename = null; requestUI(); }, '#ff3b30');
+  button(X+hw+8, y+kh+14, hw, 50, 'Done', true, ()=>{ if (R0.text.trim()) applyName(R0.kind, R0.id, R0.text.trim()); state.page = R0.back; state.rename = null; requestUI(); }, '#34c759');
 }
 function openPage(id){
   if (id==='layers'){ state.win.layers = !state.win.layers; if (state.win.layers && renderer.xr.isPresenting && layersWin.dock==='hand') dockWin(layersWin); requestUI(); return; }
   state.page=id; state.confirm=null;
   if (SCULPT_PHASES.includes(state.phase)){
-    if (id==='blocks' && state.tool!=='blocks') setTool('blocks');
-    else if (id==='doodle' && state.tool!=='doodle' && state.tool!=='erase') setTool('doodle');
+    if (id==='blocks' || id==='doodle'){ if (state.tool==='erase') state.eraseFor = id; else if (state.tool!==id) setTool(id); }
     else if (id==='tools' && !['clay','smooth','paint'].includes(state.tool)) setTool(state.lastSculpt||'clay');
   }
   requestUI();
@@ -1943,25 +2261,43 @@ function drawTools(X,W){
   const L = activeLayer();
   if (L) para(['Working on "'+(L.name.length>20?L.name.slice(0,19)+'…':L.name)+'" ('+fmtLen(L.vs)+')','Carve also clears blocks and doodles','that sit fully inside the brush.'], X, 530, 14);
 }
+function curHSL(){ const o = {}; new THREE.Color(state.color).getHSL(o); return o; }
+function setHSL(h,s2,l){ state.color = '#'+new THREE.Color().setHSL(h,s2,l).getHexString(); requestUI(); }
+function addRecent(hex){ state.recent = [hex, ...(state.recent||[]).filter(c=>c!==hex)].slice(0,10); }
 function drawColor(X,W){
   txt('Color', X, 100, 26);
-  rr(X,124,W,56,14,state.color); txt('clay, paint, doodles & blocks', X+W/2, 152, 15, '#111','center',700);
-  const cw=(W-3*8)/4;
-  PALETTE.forEach((c,i)=>{ const x=X+(i%4)*(cw+8), y=196+Math.floor(i/4)*(cw*0.8+8);
-    rr(x,y,cw,cw*0.8,12,c);
-    if (state.color===c){ rr(x-3,y-3,cw+6,cw*0.8+6,14,null,'#ffd400'); }
-    hit(x,y,cw,cw*0.8,()=>{state.color=c; requestUI();}); });
+  const o = curHSL();
+  rr(X,116,W,46,14,state.color); txt(state.color.toUpperCase(), X+W/2, 139, 15, o.l>0.6?'#111':'#fff','center',700);
+  const cw = (W-5*6)/6, chh = 34;
+  PALETTE.forEach((c,i)=>{ const x = X+(i%6)*(cw+6), y = 174+Math.floor(i/6)*(chh+6);
+    rr(x,y,cw,chh,10,c); if (state.color===c) rr(x-3,y-3,cw+6,chh+6,12,null,'#ffd400');
+    hit(x,y,cw,chh,()=>{ state.color = c; addRecent(c); requestUI(); }); });
+  const hy = 270; txt('Hue', X, hy-6, 16, '#cfd6ff','left',700);
+  const gr = g.createLinearGradient(X,0,X+W,0); for (let h=0; h<=360; h+=30) gr.addColorStop(h/360, hsl(h,0.5));
+  g.beginPath(); g.roundRect(X,hy+8,W,26,13); g.fillStyle = gr; g.fill();
+  g.beginPath(); g.arc(clamp(X+o.h*W,X+13,X+W-13), hy+21, 14, 0, 7); g.strokeStyle = '#fff'; g.lineWidth = 4; g.stroke();
+  const setH = px => setHSL(clamp((px-X)/W,0,1), o.s<0.05 ? 0.85 : o.s, (o.l<0.05||o.l>0.95) ? 0.5 : o.l);
+  hit(X-10,hy-2,W+20,46,setH,setH);
+  slider(X,326,W,'Vivid ↔ gray', o.s, 0, 1, v=>setHSL(o.h, v, o.l), state.color);
+  slider(X,388,W,'Dark ↔ light', o.l, 0, 1, v=>setHSL(o.h, o.s, v), state.color);
+  const rec = state.recent || [];
+  if (rec.length){ txt('Used lately', X, 456, 16, '#cfd6ff','left',700);
+    const rw = (W-9*6)/10; rec.slice(0,10).forEach((c,i)=>{ const x = X+i*(rw+6); rr(x,470,rw,30,8,c); hit(x,470,rw,30,()=>{ state.color = c; requestUI(); }); }); }
+  if (renderer.xr.isPresenting) para(['Or reach into the color ball above this','window and squeeze the trigger.'], X, 530, 14);
 }
+const DOODLES = [['tube','Tube'],['ribbon','Ribbon'],['neon','Neon'],['coil','Coil'],['chain','Chain'],['beads','Beads'],['cubes','Cubes'],['dashes','Dashes'],['fuzz','Fuzz'],['stars','Stars'],['dots','Confetti']];
 function drawDoodle(X,W){
   txt('Doodle', X, 100, 26);
-  const bw=(W-16)/3;
-  [['tube','Tube'],['ribbon','Ribbon'],['dots','Confetti']].forEach(([id,l],i)=>
-    button(X+i*(bw+8),124,bw,56,l,state.tool==='doodle'&&state.doodle===id,()=>{ setTool('doodle'); state.doodle=id; requestUI(); }, '#ff2d95'));
-  slider(X,206,W,'Thickness  (right stick ↕)', state.doodleSize, 0.002, 0.05, v=>state.doodleSize=v, '#ff2d95');
-  button(X,270,W,50,'Eraser (doodles & blocks)',state.tool==='erase',()=>setTool('erase'),'#ff3b30');
-  para(['Doodles sit on the active layer.','Tube & Ribbon use your color,','Confetti picks its own.'], X, 350, 15);
-  rr(X,430,52,52,12,state.color); txt('Color', X+64, 456, 18, '#cfd6ff','left',700);
-  hit(X,430,W,52,()=>{state.page='color'; requestUI();});
+  const cols = 4, bw = (W-8*(cols-1))/cols;
+  DOODLES.forEach(([id,l],i)=>{ const x = X+(i%cols)*(bw+8), y = 118+Math.floor(i/cols)*50;
+    button(x,y,bw,44,l,state.tool==='doodle'&&state.doodle===id,()=>{ setTool('doodle'); state.doodle=id; requestUI(); }, '#ff2d95'); });
+  slider(X,286,W,'Thickness  (right stick ↕)', state.doodleSize, 0.002, 0.05, v=>state.doodleSize=v, '#ff2d95');
+  const hw=(W-8)/2;
+  button(X,348,hw,48,'Draw',state.tool==='doodle',()=>setTool('doodle'),'#34c759');
+  button(X+hw+8,348,hw,48,'Erase bits',state.tool==='erase',()=>{ setTool('erase'); state.eraseFor='doodle'; requestUI(); },'#ff3b30');
+  para(['A flips draw ↔ erase. The eraser only takes','the part it touches. Right grip on a doodle','moves it. Paint (Sculpt tab) recolors it.'], X, 424, 14);
+  rr(X,494,52,52,12,state.color); txt('Color', X+64, 520, 18, '#cfd6ff','left',700);
+  hit(X,494,W,52,()=>{state.page='color'; requestUI();});
 }
 const BLOCK_HINTS = {
   stamp:['Tap to place one block, drag for a trail.','Snap off: blocks follow your hand’s angle.'],
@@ -1981,14 +2317,82 @@ function drawBlocks(X,W){
   slider(X,300,W,'Block size  (right stick ↕)', state.blockSize, 0.02, 0.5, v=>state.blockSize=v, '#ffd400', fmtLen(blockSizeWorld()));
   toggle(X,362,W,46,'Snap to grid',state.blockSnap,()=>{state.blockSnap=!state.blockSnap; requestUI();});
   toggle(X,414,W,46,'Mixed colors',state.blockMix,()=>{state.blockMix=!state.blockMix; requestUI();},'#ff2d95');
-  button(X,470,W,46,'Eraser',state.tool==='erase',()=>setTool('erase'),'#ff3b30');
-  para(BLOCK_HINTS[state.blockMode].concat(['Right grip on any block picks it up.']), X, 540, 14, '#8f97c7', 21);
+  const hw2=(W-8)/2;
+  button(X,470,hw2,46,'Build',state.tool==='blocks',()=>setTool('blocks'),'#34c759');
+  button(X+hw2+8,470,hw2,46,'Erase',state.tool==='erase',()=>{ setTool('erase'); state.eraseFor='blocks'; requestUI(); },'#ff3b30');
+  para(BLOCK_HINTS[state.blockMode].concat(['A flips build ↔ erase. Right grip picks a block up.']), X, 540, 14, '#8f97c7', 21);
 }
 function changeDetail(L, dir){
   if (!L) return;
-  if (layerHasClay(L)){ toast('This layer already has clay, so its detail is fixed. Make a new layer for finer clay.'); return; }
   const i = DETAILS.indexOf(L.vs); const j = clamp((i<0?5:i) - dir, 0, DETAILS.length-1);
-  L.vs = DETAILS[j]; L.chunks.clear(); toast('"'+L.name+'" detail '+fmtLen(L.vs)); sceneDirty=true; requestUI();
+  const nv = DETAILS[j];
+  if (nv===L.vs){ toast(dir<0 ? 'That is the finest detail' : 'That is the coarsest detail'); return; }
+  if (!layerHasClay(L)){
+    for (const ch of L.chunks.values()) dropMesh(L, ch);
+    for (const k of [...dirty.keys()]) if (k.startsWith(L.id+'|')) dirty.delete(k);
+    L.chunks = new Map(); L.vs = nv; toast('"'+L.name+'" detail '+fmtLen(nv)); sceneDirty = true; requestUI(); return;
+  }
+  const keys = resampleKeys(L, nv), key = 'detail'+L.id+':'+nv;
+  if (keys.size > 2500 && state.confirm !== key){
+    state.confirm = key; toast('That makes about '+keys.size+' pieces of clay, so it could be slow or crash. Tap again to do it anyway.'); requestUI(); return;
+  }
+  state.confirm = null;
+  const before = {vs:L.vs, chunks:L.chunks};
+  resampleLayer(L, nv, keys);
+  pushUndo({type:'detail', L:L.id, vs:before.vs, chunks:before.chunks});
+  toast('"'+L.name+'" detail '+fmtLen(L.vs)); sceneDirty = true; requestUI();
+}
+// which new chunks the clay will need at the new detail
+function resampleKeys(L, nv){
+  const ov = L.vs, keys = new Set();
+  for (const ch of L.chunks.values()){
+    if (!ch.d) continue;
+    let any = false; for (let i=0;i<CN3;i++) if (ch.d[i] > -DMAX+0.01){ any = true; break; }
+    if (!any) continue;
+    const lo = [ch.cx,ch.cy,ch.cz].map(c=>Math.floor((c*CN-1.5)*ov/nv/CN)), hi = [ch.cx,ch.cy,ch.cz].map(c=>Math.floor(((c+1)*CN+0.5)*ov/nv/CN));
+    for (let z=lo[2]; z<=hi[2]; z++) for (let y=lo[1]; y<=hi[1]; y++) for (let x=lo[0]; x<=hi[0]; x++) keys.add(ckey(x,y,z));
+  }
+  return keys;
+}
+function resampleLayer(L, nv, keys){
+  const ov = L.vs, q = nv/ov, old = L.chunks, out = new Map();
+  let lcx = 1e9, lcy = 1e9, lcz = 1e9, lch = null;
+  const chunkAt = (gx,gy,gz) => { const cx = gx>>4, cy = gy>>4, cz = gz>>4; if (cx!==lcx||cy!==lcy||cz!==lcz){ lcx=cx; lcy=cy; lcz=cz; lch = old.get(cx+','+cy+','+cz) || null; } return lch; };
+  const D = (gx,gy,gz) => { const ch = chunkAt(gx,gy,gz); return ch && ch.d ? ch.d[(gx&15)+16*((gy&15)+16*(gz&15))] : -DMAX; };
+  for (const key of keys){
+    const [cx,cy,cz] = key.split(',').map(Number);
+    const d = new Float32Array(CN3), c = new Uint8Array(CN3*3).fill(200); let any = false;
+    for (let lz=0; lz<CN; lz++) for (let ly=0; ly<CN; ly++) for (let lx=0; lx<CN; lx++){
+      const fx = (cx*CN+lx)*q, fy = (cy*CN+ly)*q, fz = (cz*CN+lz)*q;
+      const x0 = Math.floor(fx), y0 = Math.floor(fy), z0 = Math.floor(fz), tx = fx-x0, ty = fy-y0, tz = fz-z0;
+      const c00 = D(x0,y0,z0)*(1-tx) + D(x0+1,y0,z0)*tx, c10 = D(x0,y0+1,z0)*(1-tx) + D(x0+1,y0+1,z0)*tx;
+      const c01 = D(x0,y0,z0+1)*(1-tx) + D(x0+1,y0,z0+1)*tx, c11 = D(x0,y0+1,z0+1)*(1-tx) + D(x0+1,y0+1,z0+1)*tx;
+      const v = clamp(((c00*(1-ty) + c10*ty)*(1-tz) + (c01*(1-ty) + c11*ty)*tz)/q, -DMAX, DMAX);
+      const i = lx + CN*(ly + CN*lz); d[i] = v;
+      if (v > -DMAX+0.01){
+        any = true;
+        const gx = Math.round(fx), gy = Math.round(fy), gz = Math.round(fz), ch = chunkAt(gx,gy,gz);
+        if (ch && ch.c){ const i3 = ((gx&15)+16*((gy&15)+16*(gz&15)))*3; c[i*3]=ch.c[i3]; c[i*3+1]=ch.c[i3+1]; c[i*3+2]=ch.c[i3+2]; }
+      }
+    }
+    if (any) out.set(key, {cx,cy,cz,k:key,d,c,mesh:null});
+  }
+  for (const ch of old.values()) dropMesh(L, ch);
+  for (const k of [...dirty.keys()]) if (k.startsWith(L.id+'|')) dirty.delete(k);
+  L.chunks = out; L.vs = nv;
+  for (const ch of [...out.values()]) markAround(L, ch.cx-1,ch.cy-1,ch.cz-1, ch.cx+1,ch.cy+1,ch.cz+1);
+}
+// BUILD: a scenery layer becomes a prop you can grab and move in PERFORM
+function layerToProp(L){
+  if (!L || L.char) return;
+  if (worldLayers().length <= 1){ toast('Keep at least one world layer: make a new layer first'); return; }
+  const b = new THREE.Box3().setFromObject(L.group); if (b.isEmpty()){ toast('This layer is empty'); return; }
+  const c = makeChar('prop', L.name);
+  c.root.position.set((b.min.x+b.max.x)/2, b.min.y, (b.min.z+b.max.z)/2); c.root.updateMatrixWorld(true);
+  c.root.attach(L.group); L.rest = poseOfObj(L.group); L.char = c.id; L.part = 'body';
+  c.place = poseOfObj(c.root); c.placed = true; delete show.tracks[String(L.id)];
+  state.activeWorld = worldLayers()[0].id; state.selChar = c.id;
+  toast('"'+L.name+'" is now a prop: grab it in PERFORM'); sceneDirty = true; requestUI();
 }
 function skySwatch(x,y,w,h,Sk){
   const gr=g.createLinearGradient(0,y,0,y+h); gr.addColorStop(0,Sk.top); gr.addColorStop(0.5,Sk.hor); gr.addColorStop(0.52,Sk.low); gr.addColorStop(1,Sk.low);
@@ -2043,7 +2447,7 @@ function drawScene(X,W){
   button(X+hw+8,240,hw,50,a2?'Tap to confirm':'New empty sky',a2,()=>{ if(!a2){state.confirm='newempty';requestUI();return;} state.confirm=null; newScene('empty'); },'#ff3b30');
   slider(X,318,W,'Fly speed (left stick)', state.flySpeed, 0.5, 8, v=>state.flySpeed=v, '#00c7be');
   toggle(X,370,W,44,'Button labels on controllers',state.labels,()=>{ state.labels=!state.labels; requestUI(); },'#ffd400');
-  if (renderer.xr.isPresenting) button(X,422,W,40,'Dock all windows to my hand',false,()=>{ for (const w of WINS) dockWin(w); },'#00c7be');
+  if (renderer.xr.isPresenting) button(X,422,W,40,'Dock all windows to my hand',false,()=>{ for (const w of [...WINS]) dockWin(w); },'#00c7be');
   const ys = yourScale();
   txt('Your size  '+(ys<1 ? '1/'+(+(1/ys).toFixed(1)) : (+ys.toFixed(1)))+'×', X, 482, 16, '#cfd6ff','left',700);
   para(KEYS_VR[state.phase] || KEYS_VR.build, X, 512, 13, '#8f97c7', 21);
@@ -2184,28 +2588,39 @@ function drawChars(X,W){
     button(x,y,pw,44,PART_NAMES[L.part]||L.part, activeLayer()===L, ()=>setActive(L),'#ff9500'); });
   const yb = y0 + 22 + Math.ceil(Math.min(6,parts.length)/3)*50 + 8;
   const a = state.confirm==='delchar';
-  if (yb+46 < UIH-70) button(X,yb,W,42,a?'Tap to confirm — this removes it':'Delete '+c.name,a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
+  if (yb+46 < UIH-70){
+    button(X,yb,hw,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
+    button(X+hw+8,yb,hw,42,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
+  }
+  if (c.type==='puppet' && c.guide && yb+130 < UIH-70) para(['The see-through headset and controllers','show where your head and hands go','when you step in.'], X, yb+72, 13);
 }
 function drawPerform(X,W){
   txt('Perform', X, 100, 26);
-  const hw=(W-8)/2;
-  button(X,122,hw,52, show.rec ? '■ Cut  (A)' : '● Record  (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
-  button(X+hw+8,122,hw,52, show.playing ? '■ Stop  (B)' : '▶ Play  (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
+  const hw = (W-8)/2;
+  button(X,116,hw,50, show.rec ? '■ Cut  (A)' : '● Record  (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
+  button(X+hw+8,116,hw,50, show.playing ? '■ Stop  (B)' : '▶ Play  (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
   const len = Math.max(showLength(), 0.1);
-  slider(X,190,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
-  txt('Characters', X, 260, 16, '#cfd6ff','left',700);
+  slider(X,182,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
+  txt('Characters', X, 248, 16, '#cfd6ff','left',700);
   const list = show.chars.slice(-4);
-  if (!list.length) para(['Make one in CHARACTERS first.'], X, 290, 15);
-  list.forEach((c,i)=>{ const y = 274 + i*50, on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c;
-    rr(X,y,W,44,10,on?'#ff2d95':'#2a3060'); txt(c.name.length>10?c.name.slice(0,9)+'…':c.name, X+10, y+22, 16, on?'#111':'#fff');
-    hit(X,y,W-176,44,()=>{ state.selChar=c.id; requestUI(); });
-    rr(X+W-170,y+5,80,34,10,'#1e6bff'); txt(c.placed?'Bring here':'Place', X+W-130, y+22, 13, '#fff','center'); hit(X+W-170,y+5,80,34,()=>placeChar(c));
-    if (c.type==='puppet'){ rr(X+W-84,y+5,80,34,10,inside?'#ffd400':'#34c759'); txt(inside?'Step out':'Step in', X+W-44, y+22, 13, '#111','center'); hit(X+W-84,y+5,80,34,()=>{ inside ? stepOut() : stepIn(c); }); }
+  if (!list.length) para(['Make one in CHARACTERS first.'], X, 276, 15);
+  list.forEach((c,i)=>{ const y = 262 + i*48, on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c;
+    rr(X,y,W,42,10,on?'#ff2d95':'#2a3060'); txt(c.name.length>10?c.name.slice(0,9)+'…':c.name, X+10, y+21, 16, on?'#111':'#fff');
+    hit(X,y,W-176,42,()=>{ state.selChar=c.id; requestUI(); });
+    if (!inside){ rr(X+W-170,y+4,80,34,10,'#1e6bff'); txt(c.placed?'Bring here':'Place', X+W-130, y+21, 13, '#fff','center'); hit(X+W-170,y+4,80,34,()=>placeChar(c)); }
+    if (c.type==='puppet'){ rr(X+W-84,y+4,80,34,10,inside?'#ffd400':'#34c759'); txt(inside?'Step out':'Step in', X+W-44, y+21, 13, '#111','center'); hit(X+W-84,y+4,80,34,()=>{ inside ? stepOut() : stepIn(c); }); }
   });
-  const ty = 274 + Math.max(1,list.length)*50 + 6;
-  toggle(X,ty,hw,42,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on — your voice records with the show'); } },'#ff9500');
-  toggle(X+hw+8,ty,hw,42,'Mirror',state.mirror,()=>{ state.mirror=!state.mirror; if (state.mirror) placeMirror(); requestUI(); },'#1e6bff');
-  if (ty+60 < UIH-70) para(['Grip a character to move it — the','scenery never moves. Grip anywhere','else to move or shrink yourself.'], X, ty+70, 14);
+  let ty = 262 + Math.max(1,list.length)*48 + 4;
+  const c = selChar();
+  if (c && c.placed){
+    slider(X,ty+10,W,'Size of '+(c.name.length>12?c.name.slice(0,11)+'…':c.name), Math.log2(c.place.s||1), -4, 4, v=>setCharScale(c, Math.pow(2,v)), '#ff2d95', (+(c.place.s||1).toFixed(2))+'×');
+    ty += 64;
+  }
+  const tw = (W-16)/3;
+  button(X,ty,tw,42,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on: your voice records with the show'); } },'#ff9500');
+  button(X+tw+8,ty,tw,42,'Mirror',state.mirror,()=>{ state.mirror=!state.mirror; if (state.mirror){ placeMirror(); state.win.preview = true; } requestUI(); },'#1e6bff');
+  button(X+2*(tw+8),ty,tw,42,'Camera',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
+  if (ty+110 < UIH-70) para(['Right trigger: aim at the ground and let go','to jump there. Grip a character to move it;','right stick ↕ while holding sets its size.'], X, ty+70, 13);
 }
 function drawTracks(X,W){
   txt('Motion', X, 100, 26);
@@ -2218,8 +2633,12 @@ function drawTracks(X,W){
   }
   for (const a of show.audio) rows.push({kind:'a', a, name:'Voice '+a.id, len:a.dur||0});
   if (!rows.length) para(['Nothing recorded yet.','Go to Perform and press Record.'], X, 140, 15);
+  else para(['Tap a row to pick it and play the show.'], X, UIH-150, 14);
   rows.slice(0,9).forEach((r,i)=>{ const y=124+i*48;
-    rr(X,y,W,42,10,'#2a3060'); txt((r.kind==='a'?'🎤 ':'')+(r.name.length>20?r.name.slice(0,19)+'…':r.name), X+12, y+21, 15, '#fff');
+    const cid = r.kind==='t' ? (r.key[0]==='r' ? +r.key.slice(1) : layerById(+r.key)?.char) : null, on = cid!=null && cid===state.selChar;
+    rr(X,y,W,42,10,on?'#ff2d95':'#2a3060');
+    hit(X,y,W-52,42,()=>{ if (cid!=null) state.selChar = cid; show.t = 0; stopShow(); playShow(); });
+    txt((r.kind==='a'?'🎤 ':'')+(r.name.length>20?r.name.slice(0,19)+'…':r.name), X+12, y+21, 15, '#fff');
     txt(r.len.toFixed(1)+' s', X+W-60, y+21, 14, '#8f97c7','right',700);
     rr(X+W-46,y+4,40,34,10,'#ff3b30'); txt('✕', X+W-26, y+21, 16, '#fff','center');
     hit(X+W-46,y+4,40,34,()=>{ const b=snapShow(); if (r.kind==='t') delete show.tracks[r.key]; else show.audio=show.audio.filter(x=>x!==r.a); pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); });
@@ -2256,7 +2675,7 @@ function setPhase(id){
   if (id!=='perform' && show.embodied) stepOut();
   const from = stageName(state.phase), to = stageName(id);
   if (from !== to){ captureView(from); }
-  state.phase=id; state.dialOpen=false; state.page = FIRST_PAGE[id] || 'soon'; state.confirm=null;
+  state.phase=id; state.dialOpen=false; state.page = FIRST_PAGE[id] || 'soon'; state.confirm=null; state.rename=null;
   if (from !== to){ applyView(to); if (to==='studio' && !selChar() && show.chars.length) state.selChar = show.chars[0].id; }
   pathDirty = true; if (id==='edit') placeBigScreen();
   if (id==='perform' && state.mirror) placeMirror();
@@ -2292,12 +2711,14 @@ const BADGE = {A:'#34c759', B:'#ff3b30', X:'#1e6bff', Y:'#ffd400', T:'#ff9500', 
 function legendLines(hand){
   const ph = state.phase, toolName = {clay: state.carve?'carve':'add clay', smooth:'smooth', paint:'paint', doodle:'doodle', blocks:'blocks', erase:'erase'}[state.tool];
   if (hand==='L') return [['T','open / close menu'],['X','undo'],['Y','redo'],['S','fly'],['G','move / scale world']];
-  const sculpt = [['T', toolName],['A', state.tool==='clay' ? (state.carve?'switch to add':'switch to carve') : 'clay add / carve'],['B','last tool'],['S','size ↕  strength ↔'],['G','block / window / world']];
+  const fam = pageFamily();
+  const aLbl = fam==='sculpt' ? (state.tool==='clay' ? (state.carve?'switch to add':'switch to carve') : 'clay add / carve') : state.tool==='erase' ? 'back to '+fam : 'eraser';
+  const sculpt = [['T', toolName],['A', aLbl],['B','last tool'],['S','size ↕  strength ↔'],['G','grab thing / window / world']];
   return ({
     build: sculpt, characters: sculpt,
     shoot:  [['T','film (hold)'],['A', play?'stop':'play take'],['B','next take'],['S','zoom'],['G','key dot / window / world']],
     edit:   [['A', play?'stop':'play film'],['T','menu clicks'],['G','window / world']],
-    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['G', show.embodied?'(you are the puppet)':'character / window / world'],['T','menu clicks']],
+    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T','aim at ground: jump there'],['G', show.embodied?'window / world':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
   }[ph] || [['T','menu clicks'],['G','window / world']]);
 }
 function drawLegend(cv, lines){
@@ -2388,6 +2809,14 @@ renderer.domElement.addEventListener('pointerdown', e => {
     startBlockGrab({L, s:h.obj.userData.stroke, i:h.inst}, new THREE.Matrix4().makeTranslation(h.p.x,h.p.y,h.p.z));
     deskGrab = {kind:'block', plane}; renderer.domElement.setPointerCapture(e.pointerId); return;
   }
+  if (SCULPT_PHASES.includes(state.phase) && e.shiftKey && h && h.obj){
+    const so = strokeObj(h.obj), L = so ? layerOf(so) : null;
+    if (so && so.userData.stroke.pts && L && !L.locked && L.strokes.includes(so.userData.stroke)){
+      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(V()).negate(), h.p);
+      startDoodleGrab({L, s:so.userData.stroke}, new THREE.Matrix4().makeTranslation(h.p.x,h.p.y,h.p.z));
+      deskGrab = {kind:'doodle', plane}; renderer.domElement.setPointerCapture(e.pointerId); return;
+    }
+  }
   if (!SCULPT_PHASES.includes(state.phase) || !h) return;
   if (stroke && stroke.kind==='angle'){ if (stroke.stage>=1) angleClick(); return; }
   if (!beginStroke(desktopRadius())) return;
@@ -2402,7 +2831,7 @@ renderer.domElement.addEventListener('pointerdown', e => {
 });
 renderer.domElement.addEventListener('pointermove', e => {
   if (renderer.xr.isPresenting) return;
-  if (deskGrab){ castMouse(e); const p = ray.ray.intersectPlane(deskGrab.plane, V()); if (p){ const m = new THREE.Matrix4().makeTranslation(p.x,p.y,p.z); deskGrab.kind==='char' ? moveCharGrab(m) : moveBlockGrab(m); } return; }
+  if (deskGrab){ castMouse(e); const p = ray.ray.intersectPlane(deskGrab.plane, V()); if (p){ const m = new THREE.Matrix4().makeTranslation(p.x,p.y,p.z); ({char:moveCharGrab, block:moveBlockGrab, doodle:moveDoodleGrab})[deskGrab.kind](m); } return; }
   lastHover = pickSurface(e);
   if (stroke && stroke.kind==='angle'){
     castMouse(e);
@@ -2420,7 +2849,7 @@ renderer.domElement.addEventListener('pointermove', e => {
   } else if (mouseDown && lastHover) strokeTo(desktopPoint(lastHover), desktopRadius(), 0.8, lastHover.n, 0.016);
 });
 renderer.domElement.addEventListener('pointerup', e => {
-  if (deskGrab){ deskGrab.kind==='char' ? endCharGrab() : endBlockGrab(); deskGrab = null; return; }
+  if (deskGrab){ ({char:endCharGrab, block:endBlockGrab, doodle:endDoodleGrab})[deskGrab.kind](); deskGrab = null; return; }
   if (!mouseDown) return; mouseDown=false;
   if (stroke && stroke.kind==='angle'){ if (stroke.stage===0){ castMouse(e); const p = stroke.plane ? ray.ray.intersectPlane(stroke.plane, V()) : null; angleUpdate(p || stroke.B || stroke.A, false); } return; }
   endStroke();
@@ -2442,6 +2871,7 @@ addEventListener('keydown', e => {
   else if (k==='r' && state.phase==='shoot'){ rec ? stopRecording() : startRecording(); }
   else if (k==='r' && state.phase==='perform'){ show.rec ? cutShowRec() : startShowRec(); }
   else if ((k==='-' || k==='=') && state.phase==='shoot'){ lensNudge(k==='-' ? 3 : -3); }
+  else if ((k==='-' || k==='=') && state.phase==='perform' && selChar()){ const c = selChar(); setCharScale(c, c.place.s*(k==='-' ? 0.9 : 1.1)); }
   else if (k==='x') undo();
   else if (k==='y') redo();
   else if (k==='[') { state.size=clamp(state.size/1.15,0.01,0.3); requestUI(); }
@@ -2471,6 +2901,7 @@ function updateGhostCam(mult){
   const tk = selTake();
   if (state.phase==='shoot' && play?.mode==='take'){ ghostCam.visible = true; ghostCam.position.copy(shotCam.position); ghostCam.quaternion.copy(shotCam.quaternion); ghostCam.scale.setScalar(mult*(play.tk.scale||1)); }
   else if (state.phase==='shoot' && state.page==='keys' && tk){ ghostCam.visible = true; evalTake(tk, shots.keyT, ghostCam.position, ghostCam.quaternion); ghostCam.scale.setScalar(mult*(tk.scale||1)); }
+  else if (state.phase==='perform' && tk){ poseShotCam(tk, clamp(show.t, 0, tk.dur)); ghostCam.visible = true; ghostCam.position.copy(shotCam.position); ghostCam.quaternion.copy(shotCam.quaternion); ghostCam.scale.setScalar(mult*(tk.scale||1)); }
   else ghostCam.visible = false;
 }
 
@@ -2524,7 +2955,7 @@ for (let i=0;i<2;i++){
   rayC.addEventListener('connected', e => {
     const hand = e.data.handedness; if (hand!=='left' && hand!=='right') return;
     ctrl[hand] = {ray:rayC, grip, src:e.data, prev:{}};
-    if (hand==='left'){ grip.add(legMeshL); for (const w of WINS) if (w.dock==='hand') dockWin(w); }
+    if (hand==='left'){ grip.add(legMeshL); for (const w of [...WINS]) if (w.dock==='hand') dockWin(w); }
     if (hand==='right'){ rayC.add(pointer); rayC.add(camModel); grip.add(legMeshR); }
   });
   rayC.addEventListener('disconnected', () => {
@@ -2533,6 +2964,21 @@ for (let i=0;i<2;i++){
 }
 shotHidden.push(cursor, ghost, pointerDot, pathGroup, ghostCam, bigScreen, camModel, menuWin.mesh, layersWin.mesh, previewWin.mesh);
 
+// paint the real controller buttons the same colors as the labels
+const BTN_KEYS = [['a-button','A'],['b-button','B'],['x-button','X'],['y-button','Y'],['trigger','T'],['squeeze','G'],['thumbstick','S']];
+let btnColorT = 0;
+function colorButtons(grip){
+  if (grip.userData.colored) return;
+  grip.userData.colorTries = (grip.userData.colorTries||0) + 1; if (grip.userData.colorTries > 40) return;
+  let found = 0;
+  grip.traverse(o => {
+    if (!o.isMesh || o.userData.win || o===legMeshL || o===legMeshR) return;
+    let n = o, key = null;
+    while (n && n!==grip && !key){ const nm = (n.name||'').toLowerCase().replace(/_/g,'-'); for (const [k,b] of BTN_KEYS) if (nm.includes(k)){ key = b; break; } n = n.parent; }
+    if (key){ o.material = new THREE.MeshStandardMaterial({color:BADGE[key], roughness:0.45, emissive:BADGE[key], emissiveIntensity:0.3}); found++; }
+  });
+  if (found) grip.userData.colored = true;
+}
 function pulse(hand, v, ms){ try { ctrl[hand]?.src?.gamepad?.hapticActuators?.[0]?.pulse(v, ms); } catch(e){} }
 function readPad(c){
   const gp = c?.src?.gamepad; if (!gp) return null; const b = gp.buttons;
@@ -2627,7 +3073,7 @@ function rayWindow(R){
 }
 
 const _tip = V(), _up = V(), _o = V(), _d = V(), _tq = new THREE.Quaternion();
-let uiCapture = null;
+let uiCapture = null, brushRW = 0.03, orbHeld = false;
 function xrUpdate(dt){
   const L = ctrl.left, R = ctrl.right;
   const pl = L ? readPad(L) : null, pr = R ? readPad(R) : null;
@@ -2664,7 +3110,9 @@ function xrUpdate(dt){
       if (shoot) nextTake(); else if (sculpt){ if (stroke && stroke.kind==='angle') endStroke(true); else swapTool(); } else if (perform) (show.playing ? stopShow() : playShow());
       pulse('right',0.3,20);
     }
-    if (sculpt){
+    if (winGrab && Math.abs(pr.sy) > 0.2){ const m = winGrab.win.mesh; m.scale.setScalar(clamp(m.scale.x*Math.exp(-pr.sy*dt*1.5), 0.25, 6)); }
+    else if (show.grab && Math.abs(pr.sy) > 0.2){ const f = Math.exp(-pr.sy*dt*1.5), sc = show.grab.c.root.scale.x*f; if (sc > 0.02 && sc < 50) show.grab.rel.premultiply(new THREE.Matrix4().makeScale(f,f,f)); }
+    else if (sculpt){
       if (Math.abs(pr.sy) > 0.2){
         if (state.tool==='blocks') state.blockSize = clamp(state.blockSize*Math.exp(-pr.sy*dt*1.6), 0.02, 0.5);
         else if (state.tool==='doodle') state.doodleSize = clamp(state.doodleSize*Math.exp(-pr.sy*dt*1.6), 0.002, 0.05);
@@ -2673,23 +3121,32 @@ function xrUpdate(dt){
       }
       if (Math.abs(pr.sx) > 0.3){ state.strength = clamp(state.strength + pr.sx*dt*0.7, 0.05, 1); requestUI(); }
     }
-    if (shoot && Math.abs(pr.sy) > 0.3) lensNudge(pr.sy*dt*30);
+    if (shoot && !winGrab && Math.abs(pr.sy) > 0.3) lensNudge(pr.sy*dt*30);
     // right grip: a window you point at, else the thing under your hand, else the world
     if (edge(R,pr,'grip')){
-      const gp = V(); R.grip.getWorldPosition(gp);
-      if (hover && !(pl && pl.grip)) startWinGrab(hover.win, R);
+      const tipW = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(tipW);
+      if (hover && !(pl && pl.grip)){
+        let w = hover.win, torn = false;
+        if (w===menuWin && !hover.screen){   // grip on a tab's content tears that tab off; on the rail or top bar it moves the whole menu
+          const x = hover.h.uv.x*UIW, y = (1-hover.h.uv.y)*UIH;
+          if (x > 100 && y > 70 && !state.dialOpen && state.page!=='rename' && state.page!=='soon'){ const t = tearOff(state.page); if (t){ w = t.win; torn = t.isNew; } }
+        }
+        startWinGrab(w, R, torn);
+      }
       else if (shoot && !keyGrab) tryGrabKey(R);
-      else if (sculpt && !blockGrab){ const b = findBlockAt(gp); if (b) startBlockGrab(b, unscaled(R.grip)); }
-      else if (perform && !embodied && !show.grab){ const c = findCharAt(gp); if (c) startCharGrab(c, unscaled(R.grip)); }
+      else if (sculpt && !blockGrab && !doodleGrab){ const b = findBlockAt(tipW, brushRW); if (b) startBlockGrab(b, unscaled(R.grip)); else { const d = findStrokeAt(tipW, brushRW); if (d) startDoodleGrab(d, unscaled(R.grip)); } }
+      else if (perform && !embodied && !show.grab){ const c = findCharAt(tipW, 0.06*rig.scale.x); if (c) startCharGrab(c, unscaled(R.grip)); }
     }
-    if (!pr.grip){ if (winGrab) endWinGrab(); if (keyGrab) endKeyGrab(); if (blockGrab) endBlockGrab(); if (show.grab) endCharGrab(); }
-    rightGripUsed = !!(winGrab || keyGrab || blockGrab || show.grab);
+    if (winGrab && pl && pl.grip) cancelWinGrab();   // both grips means you wanted to move yourself
+    if (!pr.grip){ if (winGrab) endWinGrab(); if (keyGrab) endKeyGrab(); if (blockGrab) endBlockGrab(); if (doodleGrab) endDoodleGrab(); if (show.grab) endCharGrab(); }
+    rightGripUsed = !!(winGrab || keyGrab || blockGrab || doodleGrab || show.grab);
   }
   if (!embodied) navUpdate(pl?.grip, pr?.grip && !rightGripUsed); else nav = null;
   rig.updateMatrixWorld(true);
   if (winGrab && R) moveWinGrab(R);
   if (keyGrab && R) updateKeyGrab(R);
   if (blockGrab && R) moveBlockGrab(unscaled(R.grip));
+  if (doodleGrab && R) moveDoodleGrab(unscaled(R.grip));
   if (show.grab && R) moveCharGrab(unscaled(R.grip));
   updateEmbodied();
 
@@ -2720,12 +3177,23 @@ function xrUpdate(dt){
     const isVox = ['clay','smooth','paint'].includes(state.tool);
     const base = (state.tool==='doodle' ? state.doodleSize : state.size) * rig.scale.x;
     const rShown = isVox && L2 ? clamp(rToL(L2,base), L2.vs*0.7, L2.vs*MAXVOX)*L2.group.getWorldScale(V()).x : base;
-    const showTool = sculpt && !onPanel && !uiCapture && !blockGrab && !winGrab;
+    brushRW = state.tool==='blocks' ? Math.max(0.03*rig.scale.x, blockSizeWorld()*0.5) : Math.max(0.02*rig.scale.x, rShown);
+    // the 3D color ball
+    const orbHex = (!onPanel && orb.visible) ? orbPick(_tip) : null;
+    if (orbHex && pr && pr.trigP){ if (state.color!==orbHex){ state.color = orbHex; requestUI(); } orbHeld = true; }
+    else if (orbHeld && !(pr && pr.trigP)){ orbHeld = false; addRecent(state.color); requestUI(); }
+    const showTool = sculpt && !onPanel && !uiCapture && !blockGrab && !doodleGrab && !winGrab && !orbHex && !orbHeld;
     cursor.visible = showTool && state.tool!=='blocks';
     ghost.visible = false;
     if (showTool){
       if (state.tool==='blocks'){ if (!stroke || state.blockMode==='stamp' || state.blockMode==='angle') showBlockGhost(_tip, _tq); }
       else { cursor.position.copy(_tip); cursor.scale.setScalar(rShown); styleCursor(); }
+    }
+    if (orbHex){ cursor.visible = true; cursor.position.copy(_tip); cursor.scale.setScalar(0.009*rig.scale.x); cursor.material.color.set(orbHex); cursor.material.opacity = 0.95; cursorRing.material.color.set('#ffffff'); }
+    if (perform && !embodied && !onPanel && !show.grab && !tpArmed){
+      const gr = 0.06*rig.scale.x, c = findCharAt(_tip, gr);
+      cursor.visible = true; cursor.position.copy(_tip); cursor.scale.setScalar(gr);
+      cursor.material.color.set(c ? '#ff2d95' : '#ffffff'); cursor.material.opacity = c ? 0.35 : 0.1; cursorRing.material.color.set(c ? '#ff2d95' : '#ffffff');
     }
     const pressEdge = pr && edge(R,pr,'trigP');
     if (sculpt && state.tool==='blocks' && state.blockMode==='angle'){
@@ -2736,6 +3204,14 @@ function xrUpdate(dt){
       if (!stroke) beginStroke(base);
       if (stroke) strokeTo(_tip, base, pr.trig, _up, dt, _tq);
     } else if (stroke && stroke.kind!=='angle' && (!pr || pr.trig < 0.08)) endStroke();
+
+    if (perform && pr){
+      if (pressEdge && !onPanel && !uiCapture && !show.grab && !winGrab) tpArmed = true;
+      if (tpArmed && pr.trigP) tpAim = teleportAim(_o, _d);
+      if (tpArmed && !pr.trigP){ if (tpAim) doTeleport(tpAim); tpArmed = false; tpAim = null; }
+    } else { tpArmed = false; tpAim = null; }
+    tpRing.visible = tpLine.visible = !!tpAim;
+    if (tpAim){ tpRing.position.copy(tpAim); tpRing.scale.setScalar(rig.scale.x); const pa = tpLine.geometry.attributes.position; pa.setXYZ(0,_o.x,_o.y,_o.z); pa.setXYZ(1,tpAim.x,tpAim.y,tpAim.z); pa.needsUpdate = true; }
 
     camModel.visible = shoot;
     if (shoot){
@@ -2755,6 +3231,23 @@ function xrUpdate(dt){
   legMeshL.visible = legMeshR.visible = state.labels;
   if (L && pl) L.prev = pl;
   if (R && pr) R.prev = pr;
+}
+
+/* three.js builds one combined camera for deciding what is in view. When the rig is scaled it
+   measures the distance between your eyes in world units, so that check's near limit slides away
+   from your face as you grow and close things (hands, tools, windows, clay) vanish. We update the
+   headset cameras with the rig at 1x, then scale the result, so it always matches your eyes. */
+const _xrTR = new THREE.Matrix4(), _xrMs = new THREE.Matrix4(), _xrS = new THREE.Matrix4(), _xrI = new THREE.Matrix4();
+function xrCameraUpdate(){
+  if (!renderer.xr.isPresenting) return;
+  const s = rig.scale.x;
+  rig.scale.setScalar(1); rig.updateMatrixWorld(true); _xrTR.copy(rig.matrixWorld);
+  renderer.xr.updateCamera(camera);
+  rig.scale.setScalar(s); rig.updateMatrixWorld(true);
+  if (s === 1) return;
+  _xrMs.copy(_xrTR).multiply(_xrS.makeScale(s,s,s)).multiply(_xrI.copy(_xrTR).invert());
+  const cx = renderer.xr.getCamera();
+  for (const c of [cx, ...cx.cameras]){ c.matrixWorld.premultiply(_xrMs); c.matrixWorldInverse.copy(c.matrixWorld).invert(); c.matrixWorld.decompose(c.position, c.quaternion, c.scale); }
 }
 
 /* ---------------- main loop ---------------- */
@@ -2780,7 +3273,7 @@ renderer.setAnimationLoop(() => {
   const tdt = Math.min(raw, 0.25);
   if (state.toastT > 0){ state.toastT -= tdt; if (state.toastT <= 0) requestUI(); }
   const xr = renderer.xr.isPresenting;
-  if (xr) xrUpdate(dt); else desktopUpdate(dt);
+  if (xr){ xrCameraUpdate(); xrUpdate(dt); btnColorT += raw; if (btnColorT > 1){ btnColorT = 0; for (const h of ['left','right']) if (ctrl[h]) colorButtons(ctrl[h].grip); } } else desktopUpdate(dt);
   updateRecording(tdt); updatePlay(tdt);
   applyShowPose(currentShowTime());
   updateShow(tdt);
@@ -2794,12 +3287,14 @@ renderer.setAnimationLoop(() => {
   if (xr){
     if (state.phase==='shoot' || state.phase==='edit') renderPreview(shotCam);
     else if (state.phase==='perform' && state.mirror && show.embodied) renderPreview(mirrorCam);
+    else if (state.phase==='perform' && selTake() && state.win.preview) renderPreview(shotCam);
     const dark = state.phase==='edit' && shots.blackRoom;
     const wv = world.visible, wa = water.visible, bg = scene.background, fg = scene.fog, av = actors.visible;
     const headL = show.embodied ? show.embodied.parts.find(p=>p.tracker===camera)?.L : null;
     const hv = headL ? headL.group.visible : false;
     if (headL) headL.group.visible = false;   // don't see the inside of your own puppet head
     if (dark){ world.visible = false; actors.visible = false; water.visible = false; scene.background = BLACK; scene.fog = null; }
+    xrCameraUpdate();
     renderer.render(scene, camera);
     if (dark){ world.visible = wv; actors.visible = av; water.visible = wa; scene.background = bg; scene.fog = fg; }
     if (headL) headL.group.visible = hv;
@@ -2819,7 +3314,7 @@ function desktopRender(){
     return;
   }
   renderer.setViewport(0,0,W,H); renderer.render(scene, camera);
-  if (state.phase==='shoot'){
+  if (state.phase==='shoot' || (state.phase==='perform' && selTake())){
     const r = ASPECTS[shots.aspect]; const iw = r>=1 ? 380 : 220, ih = iw/r;
     const ix = W - iw - 16, iy = 16;
     renderer.setScissorTest(true); renderer.setScissor(ix-4,iy-4,iw+8,ih+8); renderer.setViewport(ix-4,iy-4,iw+8,ih+8);
@@ -2840,6 +3335,7 @@ function desktopRender(){
     setPhase, openPage, startRecording, stopRecording, startPlay, stopPlay, exportMP4, filmLength, newScene, setAspect,
     newCharacter, placeChar, deleteChar, startShowRec, cutShowRec, playShow, stopShow, startCharGrab, moveCharGrab, endCharGrab, findCharAt,
     layerById, charById, addKeyAt, deleteKey, lensNudge, findBlockAt, startBlockGrab, moveBlockGrab, endBlockGrab, beginStroke, setTool, activeLayer,
+    tearOff, closePageWin, pageWins, changeDetail, layerToProp, setCharScale, flipCarve, orbPick, colorButtons, findStrokeAt, startDoodleGrab, moveDoodleGrab, endDoodleGrab, guides, openRename, drawUI, ghostCam,
     ctrl, WINS, dockWin, roomWin, startWinGrab, moveWinGrab, endWinGrab, get winGrab(){return winGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
 })();
