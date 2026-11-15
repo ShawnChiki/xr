@@ -47,7 +47,44 @@ function closestOnSeg(p, a, b){
 }
 
 // ---------------------------------------------------------------- the sketch
-export function emptySketch(){ return { v: [], e: [], s: [], open: [], locks: [], skip: [], nid: 1 }; }
+export function emptySketch(){ return { v: [], e: [], s: [], open: [], locks: [], skip: [], bodies: [], nid: 1 }; }
+
+// Bodies: a face pushed or pulled becomes a body of its own, standing on that face. Its base is the face's loop of
+// corners (shared with whatever it stands on, so it follows when that moves); its other corners carry the body's
+// id (v.b). Pulled out it adds material, pushed in it cuts material away (join.js works out the result).
+const bodyOf = (sk, id) => (sk.bodies || []).find(b => b.id === id);
+// does this body cut? (its own corners lie on the inside of the face it stands on)
+function bodyCuts(sk, B, pos){
+  if (!B || B.base.length < 3 || B.base.some(id => !pos[id])) return false;
+  const P = B.base.map(id => pos[id]);
+  let n = [0, 0, 0], cb = [0, 0, 0], ct = [0, 0, 0], nt = 0;
+  for (let i = 0; i < P.length; i++){ const a = P[i], b = P[(i + 1) % P.length]; n[0] += (a[1] - b[1]) * (a[2] + b[2]); n[1] += (a[2] - b[2]) * (a[0] + b[0]); n[2] += (a[0] - b[0]) * (a[1] + b[1]); cb = add(cb, a); }
+  for (const v of sk.v) if (v.b === B.id && pos[v.id]){ ct = add(ct, pos[v.id]); nt++; }
+  return nt > 0 && dot(sub(mul(ct, 1 / nt), mul(cb, 1 / P.length)), mul(n, B.s || 1)) < 0;
+}
+// a corner was put on the line a–b: any body base running along that line takes it in
+function basesSplit(sk, a, b, n){
+  for (const B of sk.bodies || []){
+    const L = B.base, i = L.indexOf(a), j = L.indexOf(b);
+    if (i < 0 || j < 0) continue;
+    if ((i + 1) % L.length === j) L.splice(i + 1, 0, n);
+    else if ((j + 1) % L.length === i) L.splice(j + 1, 0, n);
+  }
+}
+function basesDrop(sk, id){ for (const B of sk.bodies || []) B.base = B.base.filter(x => x !== id); }
+function basesMerge(sk, keep, drop){
+  for (const B of sk.bodies || []){
+    B.base = B.base.map(x => x === drop ? keep : x).filter((x, i, L) => x !== L[(i + 1) % L.length] || L.length === 1);
+  }
+}
+// take a whole body away (its own corners and their lines); what it stood on stays
+export function removeBody(sk, id){
+  const mine = new Set(sk.v.filter(v => v.b === id).map(v => v.id));
+  sk.e = sk.e.filter(e => !mine.has(e.a) && !mine.has(e.b));
+  sk.v = sk.v.filter(v => !mine.has(v.id));
+  sk.bodies = (sk.bodies || []).filter(b => b.id !== id);
+  cleanup(sk);
+}
 
 // Faces are named by their corners (a key like "3.8.12.15"). When a corner is added to an edge, or healed away,
 // every saved face name (holes, locks) that runs along that edge is renamed to match.
@@ -70,7 +107,7 @@ const edgeBetween = (sk, a, b) => sk.e.find(e => (e.a === a && e.b === b) || (e.
 
 // Where would a stroke end at p land? On a corner, on an edge (splitting it), or free.
 // pos: the positions you can see (solved), so you aim at what's on screen.
-export function snapEnd(sk, p, pos, snapR, skipVert, faces){
+export function snapEnd(sk, p, pos, snapR, skipVert, faces, other){
   // a corner counts as close if you're near where it's shown OR where your strokes put it (tidying can move it a
   // few cm), and a loose end waiting for its partner reaches half as far again
   let best = null, bd = Infinity;
@@ -78,7 +115,8 @@ export function snapEnd(sk, p, pos, snapR, skipVert, faces){
   for (const v of sk.v){
     if (v.id === skipVert) continue;
     const q = pos[v.id] || anchorOf(v), d = Math.min(dist(p, q), dist(p, anchorOf(v)));
-    const reach = (deg.get(v.id) || 0) <= 1 ? snapR * 1.5 : snapR;
+    if (other && dist(q, other) < d) continue;          // that corner belongs to the stroke's other end
+    const dg = deg.get(v.id) || 0, reach = dg <= 1 ? snapR * 1.5 : dg === 2 ? snapR * 1.25 : snapR;   // a corner still missing a line reaches further
     if (d < reach && d < bd){ bd = d; best = { kind: 'vert', id: v.id, at: q }; }
   }
   if (best) return best;
@@ -87,6 +125,7 @@ export function snapEnd(sk, p, pos, snapR, skipVert, faces){
     if (e.a === skipVert || e.b === skipVert) continue;
     const A = pos[e.a] || anchorOf(vById(sk, e.a)), B = pos[e.b] || anchorOf(vById(sk, e.b));
     const { t, q } = closestOnSeg(p, A, B), d = dist(p, q), L = dist(A, B);
+    if (other && dist(q, other) < d) continue;
     if (d < bd && t * L > snapR * 0.7 && (1 - t) * L > snapR * 0.7){ bd = d; best = { kind: 'edge', id: e.id, at: q, t }; }
   }
   if (best) return best;
@@ -99,7 +138,7 @@ export function snapEnd(sk, p, pos, snapR, skipVert, faces){
     const q2 = to2(q);
     if (!insidePoly2(q2, P.map(to2))) continue;
     if ((f.holes || []).some(H => insidePoly2(q2, H.map(id => to2(pos[id]))))) continue;
-    if (!best || Math.abs(h) < best.h) best = { kind: 'free', at: q, h: Math.abs(h), face: f.key };
+    if (!best || Math.abs(h) < best.h) best = { kind: 'free', at: q, h: Math.abs(h), face: f.key, L: f.L || 0 };
   }
   return best || { kind: 'free', at: p };
 }
@@ -107,6 +146,12 @@ export function snapEnd(sk, p, pos, snapR, skipVert, faces){
 function splitEdge(sk, eid, at){
   const e = sk.e.find(x => x.id === eid);
   const n = { id: sk.nid++, ends: [at], split: true };
+  // a point on a body's own line belongs to that body
+  const va = vById(sk, e.a), vb = vById(sk, e.b), ta = va && va.b, tb = vb && vb.b;
+  if (ta !== undefined && ta === tb) n.b = ta;
+  else if (ta !== undefined && bodyOf(sk, ta)?.base.includes(e.b)) n.b = ta;
+  else if (tb !== undefined && bodyOf(sk, tb)?.base.includes(e.a)) n.b = tb;
+  basesSplit(sk, e.a, e.b, n.id);
   sk.v.push(n);
   sk.e.splice(sk.e.indexOf(e), 1);
   sk.e.push({ id: sk.nid++, a: e.a, b: n.id, s: e.s }, { id: sk.nid++, a: n.id, b: e.b, s: e.s });
@@ -114,35 +159,266 @@ function splitEdge(sk, eid, at){
   return n.id;
 }
 
-// Add one stroke (array of [x,y,z]) as one straight edge. Returns { ok, why, a, b, edge } and changes sk.
+// closest approach of segments p1–q1 and p2–q2: where along each (0..1), and how far apart
+function segSeg(p1, q1, p2, q2){
+  const d1 = sub(q1, p1), d2 = sub(q2, p2), r = sub(p1, p2), a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
+  if (a < 1e-12 || e < 1e-12) return null;
+  const c = dot(d1, r), b = dot(d1, d2), den = a * e - b * b, cl = x => Math.max(0, Math.min(1, x));
+  let s = den > 1e-12 ? cl((b * f - c * e) / den) : 0, t = (b * s + f) / e;
+  if (t < 0){ t = 0; s = cl(-c / a); } else if (t > 1){ t = 1; s = cl((b - c) / a); }
+  const c1 = add(p1, mul(d1, s)), c2 = add(p2, mul(d2, t));
+  return { s, t, d: dist(c1, c2), c1, c2, cos: Math.abs(b) / Math.sqrt(a * e) };
+}
+
+// Add one stroke (array of [x,y,z]) as one straight line. Returns { ok, why, a, b, edge } and changes sk.
+// Its ends click onto corners, lines and faces; where it crosses a line already there, both get a corner at the
+// crossing (so drawing an X on a face cuts it in four, and two lines overshooting a corner make that corner).
 export function addStroke(sk, pts, pos, o){
   const f = fitLine(pts);
   if (!f) return { ok: false, why: 'too short' };
-  const snapR = o.snapR;
-  const sa = snapEnd(sk, f.a, pos, snapR, undefined, o.faces);
-  const sb = snapEnd(sk, f.b, pos, snapR, sa.kind === 'vert' ? sa.id : undefined, o.faces);
-  const A = sa.at, B = sb.at;
-  if (dist(A, B) < Math.max(snapR * 0.9, o.minLen || 0)) return { ok: false, why: 'too short' };
-  if (sa.kind === 'edge' && sb.kind === 'edge' && sa.id === sb.id) return { ok: false, why: 'runs along an edge' };
+  // shy: join only what the line really touches (see drawStroke)
+  const shy = !!o.shy;
+  if (shy) o = Object.assign({}, o, { faces: null });
+  // a short stroke reaches less far (so small shapes don't collapse onto themselves)
+  const full = o.snapR * (shy ? 0.35 : 1), snapR = Math.min(full, 0.5 * dist(f.a, f.b));
+  let sa = snapEnd(sk, f.a, pos, snapR, undefined, o.faces, f.b);
+  let sb = snapEnd(sk, f.b, pos, snapR, sa.kind === 'vert' ? sa.id : undefined, o.faces, f.a);
+  // an end that lands on nothing but ran a little past a corner (close beside the line) was aiming for that corner
+  const passed = (end, other, skip) => {
+    const d = norm(sub(other, end)), Ls = dist(end, other);
+    let best = null, bd = Infinity;
+    for (const v of sk.v){
+      if (v.id === skip) continue;
+      const q = pos[v.id] || anchorOf(v), along = dot(sub(q, end), d);
+      if (along < 0 || along > Math.min(full * 1.5, Ls * 0.4)) continue;
+      const side = dist(q, add(end, mul(d, along)));
+      if (side < Math.min(full * 0.6, Ls * 0.2) && along < bd){ bd = along; best = { kind: 'vert', id: v.id, at: q }; }
+    }
+    return best;
+  };
+  if (!shy && sa.kind === 'free' && !sa.face){ const v = passed(f.a, f.b, sb.kind === 'vert' ? sb.id : undefined); if (v) sa = v; }
+  if (!shy && sb.kind === 'free' && !sb.face){ const v = passed(f.b, f.a, sa.kind === 'vert' ? sa.id : undefined); if (v) sb = v; }
+  // a stroke that starts on a corner and runs along a line already there, stopping part way: its end is a new
+  // corner on that line
+  const along = (end, vid) => {
+    if (vid === undefined || vid === null) return null;
+    const pv = pos[vid] || anchorOf(vById(sk, vid));
+    let best = null, bd = snapR * 0.8;
+    for (const e of sk.e){
+      if (e.a !== vid && e.b !== vid) continue;
+      const o2 = e.a === vid ? e.b : e.a, po = pos[o2] || anchorOf(vById(sk, o2)), L = dist(pv, po);
+      if (L < 1e-9 || Math.abs(dot(norm(sub(po, pv)), f.dir)) < 0.94) continue;
+      const { t, q } = closestOnSeg(end, pv, po), d = dist(end, q);
+      if (d < bd && t * L > snapR * 0.7 && (1 - t) * L > snapR * 0.7){ bd = d; best = { kind: 'edge', id: e.id, at: q, t }; }
+    }
+    return best;
+  };
+  if (!shy && sb.kind === 'free' && sa.kind === 'vert'){ const v = along(f.b, sa.id); if (v) sb = v; }
+  if (!shy && sa.kind === 'free' && sb.kind === 'vert'){ const v = along(f.a, sb.id); if (v) sa = v; }
+  // a stroke drawn close beside a line that's already there, the same way, for a good stretch, lies on that line:
+  // an end of it that found nothing lands on the line (or on whatever is there on the line)
+  if (!shy && (sa.kind === 'free' || sb.kind === 'free')){
+    let best = null;
+    const Ls = dist(f.a, f.b);
+    for (const e of sk.e){
+      const pa = pos[e.a] || anchorOf(vById(sk, e.a)), pb = pos[e.b] || anchorOf(vById(sk, e.b)), L = dist(pa, pb);
+      if (L < 1e-9) continue;
+      const d = norm(sub(pb, pa)); if (Math.abs(dot(d, f.dir)) < 0.985) continue;
+      const off = p => { const r = sub(p, pa), t = dot(r, d); return { t, h: dist(r, mul(d, t)) }; };
+      const oa = off(f.a), ob = off(f.b);
+      if (oa.h > snapR * 0.8 || ob.h > snapR * 0.8) continue;
+      const lo = Math.max(0, Math.min(oa.t, ob.t)), hi = Math.min(L, Math.max(oa.t, ob.t));
+      if (hi - lo < Math.max(snapR, 0.25 * Ls)) continue;
+      if (!best || oa.h + ob.h < best.score) best = { score: oa.h + ob.h, pa, d };
+    }
+    if (best){
+      const proj = p => add(best.pa, mul(best.d, dot(sub(p, best.pa), best.d)));
+      const land = (sn, end, other, skip) => { const q = proj(end), s2 = snapEnd(sk, q, pos, snapR, skip, null, proj(other)); return s2.kind === 'free' ? Object.assign({}, sn, { at: q }) : s2; };
+      if (sa.kind === 'free') sa = land(sa, f.a, f.b, sb.kind === 'vert' ? sb.id : undefined);
+      if (sb.kind === 'free') sb = land(sb, f.b, f.a, sa.kind === 'vert' ? sa.id : undefined);
+      if (sa.kind === 'vert' && sb.kind === 'vert' && sa.id === sb.id) return { ok: false, why: 'too short' };
+    }
+  }
+  let A = sa.at, B = sb.at;
+  if (dist(A, B) < Math.max(full * 0.25, o.minLen || 0)) return { ok: false, why: 'too short' };
+  // lines it crosses on the way
+  const P = id => pos[id] || anchorOf(vById(sk, id));
+  const skipV = new Set([sa.kind === 'vert' ? sa.id : -1, sb.kind === 'vert' ? sb.id : -1]);
+  const skipE = new Set([sa.kind === 'edge' ? sa.id : -1, sb.kind === 'edge' ? sb.id : -1]);
+  const Lab = dist(A, B), margin = Math.min(full * 0.25, Lab * 0.2), tolX = Math.min(full * 0.3, Lab * 0.15);
+  // Which lines may it cut? A loose line (two lines overshooting make a corner), or a line inside a flat surface
+  // that this stroke is drawn on (an X across a face, a line across a door). A line that merely passes over the
+  // rim of some other solid's face, on its way somewhere else, leaves that solid alone.
+  const faces = o.faces || [], tolP = full * 0.5;
+  const onPlane = (G, p) => Math.abs(dot(G.n, sub(p, G.c))) < tolP;
+  const inRegion = (G, p) => {
+    for (const H of faces){
+      if ((H.L || 0) !== (G.L || 0) || Math.abs(dot(H.n, G.n)) < 0.985 || Math.abs(dot(G.n, sub(H.c, G.c))) > tolP) continue;
+      const Pp = H.ids.map(id => pos[id]); if (Pp.some(x => !x)) continue;
+      const [u, w] = basis(H.n), to2 = x => { const d = sub(x, H.c); return [dot(d, u), dot(d, w)]; };
+      const q = to2(p), poly = Pp.map(to2);
+      if (insidePoly2(q, poly) || distToPoly2(q, poly) < full * 1.5) return true;
+    }
+    return false;
+  };
+  const mayCut = e => {
+    const k = ekey2(e.a, e.b), adjF = faces.filter(G => G.es && G.es.includes(k));
+    if (!adjF.length) return true;
+    return adjF.some(G => onPlane(G, A) && onPlane(G, B) && inRegion(G, A) && inRegion(G, B));
+  };
+  let xs = [];
+  if (!shy) for (const e of sk.e){
+    if (skipE.has(e.id) || skipV.has(e.a) || skipV.has(e.b)) continue;
+    const pa = P(e.a), pb = P(e.b), r = segSeg(A, B, pa, pb);
+    if (!r || r.d > tolX || r.cos > 0.94) continue;
+    if (!mayCut(e)) continue;
+    const Le = dist(pa, pb);
+    if (r.s * Lab < margin || (1 - r.s) * Lab < margin || r.t * Le < margin * 0.5 || (1 - r.t) * Le < margin * 0.5) continue;
+    xs.push({ e: e.id, s: r.s, at: r.c2, a: e.a, b: e.b, da: r.t * Le, db: (1 - r.t) * Le, faced: faces.some(G => G.es && G.es.includes(ekey2(e.a, e.b))) });
+  }
+  // corners it runs through on the way (a line drawn along one already there and on past its end, or straight
+  // through a corner): it joins them
+  const thru = [];
+  if (!shy) for (const v of sk.v){
+    if (skipV.has(v.id)) continue;
+    const q = P(v.id), s = dot(sub(q, A), sub(B, A)) / (Lab * Lab);
+    if (s * Lab < margin || (1 - s) * Lab < margin) continue;
+    if (dist(q, add(A, mul(sub(B, A), s))) < tolX) thru.push({ v: v.id, s, at: q });
+  }
+  xs = xs.filter(x => !thru.some(t => Math.abs(t.s - x.s) * Lab <= margin));
+  xs.sort((x, y) => x.s - y.s);
+  xs = xs.filter((x, i) => !i || (x.s - xs[i - 1].s) * Lab > margin);      // two lines crossed at one spot: once
+  // an end that pokes a little past a crossing, landing on nothing, was an overshoot: the line ends at the crossing
+  let dropA = false, dropB = false;
+  // (past a loose line that can be a good way; past the rim of a face only as far as an end would have clicked onto
+  // it anyway, because further than that it's the start of something that sticks out)
+  const over = x => full * (x.faced ? 0.8 : 1.5);
+  if (xs.length && sa.kind === 'free' && !sa.face && xs[0].s * Lab < over(xs[0])) dropA = true;
+  if (xs.length && sb.kind === 'free' && !sb.face && (1 - xs[xs.length - 1].s) * Lab < over(xs[xs.length - 1]) && !(dropA && xs.length === 1)) dropB = true;
   const sid = sk.nid++;
   sk.s.push({ id: sid, p: pts.map(p => p.map(x => +x.toFixed(4))) });
-  const endTo = (sn, raw) => {
-    if (sn.kind === 'vert'){ const v = vById(sk, sn.id); v.ends.push(raw); return v.id; }
+  const fresh = new Set();
+  const endTo = (sn, raw, far) => {
+    if (sn.kind === 'vert'){
+      const v = vById(sk, sn.id), q = pos[v.id] || anchorOf(v);
+      const mine = sk.e.filter(e => e.a === v.id || e.b === v.id);
+      // meeting the loose end of one other line: the corner is where the two lines cross (so lines that run past
+      // each other, or stop short, still make the corner they were drawn toward)
+      if (mine.length === 1 && !v.pin){
+        const w = mine[0].a === v.id ? mine[0].b : mine[0].a, pw = P(w), d2 = norm(sub(q, pw)), d1 = f.dir;
+        const c = dot(d1, d2), r0 = sub(f.a, pw), den = 1 - c * c;
+        if (den > 0.12){
+          const t1 = (c * dot(d2, r0) - dot(d1, r0)) / den, t2 = (dot(d2, r0) - c * dot(d1, r0)) / den;
+          const x1 = add(f.a, mul(d1, t1)), x2 = add(pw, mul(d2, t2)), X0 = mul(add(x1, x2), 0.5);
+          // (only when both really run past the crossing: then it's where they were meant to stop)
+          const inMine = dot(sub(X0, raw), norm(sub(far, raw))), inTheirs = dot(sub(q, X0), d2);
+          if (dist(x1, x2) < full * 0.4 && inMine > full * 0.2 && inTheirs > full * 0.2 && inMine < full * 1.5 && inTheirs < full * 1.5 && dist(X0, pw) > full * 0.5){ v.ends = [X0.map(x => +x.toFixed(4))]; delete v.split; return v.id; }
+        }
+      }
+      // otherwise the corner takes the nearest point of this line (not its end, which may have run past or stopped short)
+      // (when the stroke clearly ran on past the corner, its end says nothing about where the corner is)
+      const cp = add(f.a, mul(f.dir, dot(sub(q, f.a), f.dir))), past = dot(sub(raw, cp), norm(sub(raw, far)));
+      // (a corner that was made on a line stays on that line)
+      if (!v.split) v.ends.push((past > full * 0.5 && dist(cp, q) < full ? cp : raw).map(x => +x.toFixed(4)));
+      return v.id;
+    }
     if (sn.kind === 'edge') return splitEdge(sk, sn.id, sn.at);
-    const v = { id: sk.nid++, ends: [raw] }; sk.v.push(v); return v.id;
+    const v = { id: sk.nid++, ends: [raw] };
+    if (sn.L) v.b = sn.L; else if (!sn.face) fresh.add(v.id);
+    sk.v.push(v); return v.id;
   };
   // a corner's target is the average of every stroke end that landed on it
-  const a = endTo(sa, sa.kind === 'vert' ? f.a.map(x => +x.toFixed(4)) : A);
+  const a = dropA ? null : endTo(sa, sa.kind === 'vert' ? f.a.map(x => +x.toFixed(4)) : A, f.b);
   let sb2 = sb;
-  if (sb.kind === 'edge' && sa.kind === 'edge'){
+  if (!dropB && sb.kind === 'edge' && sa.kind === 'edge'){
     // the first split may have replaced the edge the far end was going to land on: find it again
-    sb2 = snapEnd(sk, f.b, pos, snapR, a, o.faces);
+    sb2 = snapEnd(sk, f.b, pos, snapR, a, o.faces, f.a);
+    if (sb2.kind === 'free' && sa.id === sb.id){
+      // both ends on the same line: the far end lands on the piece of it next to the first new corner
+      for (const e of sk.e){
+        if (e.a !== a && e.b !== a) continue;
+        const pa = P(e.a), pb = P(e.b), c = closestOnSeg(B, pa, pb);
+        if (dist(B, c.q) < 1e-4 && c.t > 1e-6 && c.t < 1 - 1e-6){ sb2 = { kind: 'edge', id: e.id, at: B }; break; }
+      }
+    }
   }
-  const b = endTo(sb2, sb2.kind === 'vert' ? f.b.map(x => +x.toFixed(4)) : B);
-  let e = edgeBetween(sk, a, b);
-  if (!e){ e = { id: sk.nid++, a, b, s: sid }; sk.e.push(e); }
-  return { ok: true, a, b, edge: e.id, snapA: sa.kind, snapB: sb.kind };
+  const b = dropB ? null : endTo(sb2, sb2.kind === 'vert' ? f.b.map(x => +x.toFixed(4)) : B, f.a);
+  // corners at the crossings (the line already there keeps its place)
+  const chain = a === null ? [] : [a];
+  const stops = [...xs, ...thru.filter(t => !(dropA && xs.length && t.s < xs[0].s) && !(dropB && xs.length && t.s > xs[xs.length - 1].s))].sort((x, y) => x.s - y.s);
+  for (const x of stops){
+    if (x.v !== undefined){ if (vById(sk, x.v) && x.v !== a && x.v !== b && chain[chain.length - 1] !== x.v) chain.push(x.v); continue; }
+    // the crossed line may have been split by an earlier crossing or by an end: find the piece that's there now
+    let best = null, bd = Infinity;
+    for (const e of sk.e){
+      if (e.a === a || e.b === a || e.a === b || e.b === b) continue;
+      const pa = P(e.a), pb = P(e.b), c = closestOnSeg(x.at, pa, pb), d = dist(x.at, c.q);
+      if (d < bd){ bd = d; best = e; }
+    }
+    if (!best || bd > 1e-4 + tolX * 0.01){ continue; }
+    const ea = best.a, eb = best.b, da = dist(P(ea), x.at), db = dist(P(eb), x.at);
+    let n;
+    if (da < 1e-6) n = ea; else if (db < 1e-6) n = eb;
+    else {
+      n = splitEdge(sk, best.id, x.at.map(v => +v.toFixed(4)));
+      // a short loose tail of the old line past the crossing was its overshoot: trim it
+      const deg = id => sk.e.filter(e => e.a === id || e.b === id).length;
+      for (const [end, d] of [[ea, da], [eb, db]]){
+        if (d < full * 1.5 && deg(end) === 1){ sk.e = sk.e.filter(e => !((e.a === n && e.b === end) || (e.b === n && e.a === end))); sk.v = sk.v.filter(v => v.id !== end); }
+      }
+    }
+    if (chain[chain.length - 1] !== n) chain.push(n);
+  }
+  if (b !== null && chain[chain.length - 1] !== b) chain.push(b);
+  if (chain.length < 2){ sk.s.pop(); return { ok: false, why: 'too short' }; }
+  // a new loose corner belongs with what the line's other end is part of (but never with a block that cuts: what
+  // you draw is always something added)
+  const first = chain[0], last = chain[chain.length - 1];
+  for (const [me, other] of [[first, chain[1]], [last, chain[chain.length - 2]]]){
+    const v = vById(sk, me), w = vById(sk, other);
+    if (v && w && fresh.has(me) && v.b === undefined && w.b !== undefined && !fresh.has(other) && !bodyCuts(sk, bodyOf(sk, w.b), pos)) v.b = w.b;
+  }
+  let firstEdge = null;
+  for (let i = 0; i + 1 < chain.length; i++){
+    let e = edgeBetween(sk, chain[i], chain[i + 1]);
+    if (!e){ e = { id: sk.nid++, a: chain[i], b: chain[i + 1], s: sid }; sk.e.push(e); }
+    if (!firstEdge) firstEdge = e;
+  }
+  cleanupLoose(sk);
+  return { ok: true, a: first, b: last, edge: firstEdge.id, snapA: sa.kind, snapB: sb.kind, crossed: xs.length };
 }
+// Add a stroke, but never at the cost of what's already there. If clicking the new line onto the sketch would drag
+// corners that were already in place a long way (it ties things together that don't agree: faces that can't all be
+// flat), it is put in again on its own terms, joining only what it really touches. bo: the options for build().
+// Returns addStroke's result, plus built: { F, X } (the sketch rebuilt), and shy: true if it had to back off.
+export function drawStroke(sk, pts, X, o, bo = {}){
+  const saved = JSON.stringify(sk), back = () => { for (const k of Object.keys(sk)) delete sk[k]; Object.assign(sk, JSON.parse(saved)); };
+  // (dragged = a line that was already there changing length a lot; turning or shifting a whole lump to square it
+  // up changes no lengths, and flattening a wobbly face changes them only a little)
+  let old = sk.e.filter(e => X[e.a] && X[e.b]).map(e => [e.a, e.b, dist(X[e.a], X[e.b])]), settled = false;
+  // (the sketch may still have been settling by itself: measure against where it was going anyway)
+  const settle = () => { if (settled) return; settled = true; const cur = JSON.stringify(sk); back(); const b0 = build(sk, Object.assign({}, bo, { warm: X })).X; old = old.map(([a, b]) => [a, b, b0[a] && b0[b] ? dist(b0[a], b0[b]) : -1]).filter(x => x[2] >= 0); for (const k of Object.keys(sk)) delete sk[k]; Object.assign(sk, JSON.parse(cur)); };
+  const tryIt = oo => {
+    const r = addStroke(sk, pts, X, oo);
+    if (!r.ok) return r;
+    r.built = build(sk, Object.assign({}, bo, { warm: X }));
+    let m = 0;
+    for (const [a, b, L] of old){ const p = r.built.X[a], q = r.built.X[b]; if (p && q) m = Math.max(m, Math.abs(dist(p, q) - L) / Math.max(o.snapR * 1.5, 0.12 * L)); }
+    r.strain = m;
+    if (m > 1 && !settled){ settle(); m = 0; for (const [a, b, L] of old){ const p = r.built.X[a], q = r.built.X[b]; if (p && q) m = Math.max(m, Math.abs(dist(p, q) - L) / Math.max(o.snapR * 1.5, 0.12 * L)); } r.strain = m; }
+    return r;
+  };
+  let r = tryIt(o);
+  if (r.ok && r.strain > 1){
+    back();
+    r = tryIt(Object.assign({}, o, { shy: true }));
+    if (r.ok) r.shy = true;
+    if (r.ok && r.strain > 1){ back(); return { ok: false, why: 'does not fit' }; }
+  }
+  return r;
+}
+// strokes whose lines are all gone are forgotten (a light version of cleanup, safe in the middle of drawing)
+function cleanupLoose(sk){ const used = new Set(sk.e.map(e => e.s)); sk.s = sk.s.filter(s => used.has(s.id)); }
 
 // Take edges out; corners left with nothing go, and a split point left in the middle of a straight run is healed.
 export function removeEdges(sk, ids){
@@ -163,6 +439,7 @@ export function mergeVerts(sk, keepId, dropId, at){
   else if (drop.pin && !keep.pin) keep.pin = anchorOf(keep).map(x => +x.toFixed(4));
   sk.v = sk.v.filter(v => v !== drop);
   renameFaces(sk, ids => ids.includes(dropId) ? [...new Set(ids.map(i => i === dropId ? keepId : i))] : null);
+  basesMerge(sk, keepId, dropId);
   for (const L of sk.locks || []) for (const k of ['e', 'ea', 'eb']) if (L[k]) L[k] = L[k].map(i => i === dropId ? keepId : i);
   sk.locks = (sk.locks || []).filter(L => ['e', 'ea', 'eb'].every(k => !L[k] || L[k][0] !== L[k][1]));
   cleanup(sk);
@@ -178,7 +455,11 @@ export function weld(sk, P, r){
       // two loose ends (each on a single line) this close were meant to be one corner: they reach three times as far
       const da = sk.e.filter(e => e.a === a.id || e.b === a.id), db = sk.e.filter(e => e.a === b.id || e.b === b.id);
       if (da.some(e => e.a === b.id || e.b === b.id)) continue;            // never fold a line onto itself
-      const rr = da.length <= 1 && db.length <= 1 ? r * 3 : r;
+      let rr = r;
+      if (da.length <= 1 && db.length <= 1){
+        const eLen = e => dist(P[e.a] || pa, P[e.b] || pb);
+        rr = Math.min(r * 3, 0.3 * Math.min(...da.map(eLen), ...db.map(eLen), Infinity));
+      }
       if (dist(pa, pb) >= rr) continue;
       mergeVerts(sk, a.id, b.id); n++; again = true;
     }
@@ -233,6 +514,22 @@ export function extrude(sk, f, X, n, off, keepCap){
   return { key: nk, ids: [...map.values()], map };
 }
 
+// Push or pull a face: a new body stands on it. dirN: the way it goes (unit), off: how far; outN: which way is
+// out of the solid the face belongs to (if known). The body adds when it ends up on the out side, cuts on the in side.
+export function pushPull(sk, f, X, dirN, off, outN){
+  sk.bodies = sk.bodies || [];
+  const id = sk.nid++, base = f.ids.slice(), map = new Map();
+  for (const vid of base){
+    const p = add(X[vid], mul(dirN, off)).map(x => +x.toFixed(4));
+    const v = { id: sk.nid++, ends: [p], pin: p, b: id }; sk.v.push(v); map.set(vid, v.id);
+    sk.e.push({ id: sk.nid++, a: vid, b: v.id, s: null });
+  }
+  for (let i = 0; i < base.length; i++) sk.e.push({ id: sk.nid++, a: map.get(base[i]), b: map.get(base[(i + 1) % base.length]), s: null });
+  const nb = planeOf(base.map(i => X[i])).n;
+  sk.bodies.push({ id, base, s: dot(nb, outN || dirN) < 0 ? -1 : 1 });
+  return { id, key: faceKey([...map.values()]), ids: [...map.values()], map };
+}
+
 export function cleanup(sk){
   for (let pass = 0; pass < 4; pass++){
     const deg = new Map();
@@ -249,6 +546,7 @@ export function cleanup(sk){
         sk.e.push({ id: sk.nid++, a: o0, b: o1, s: es[0].s });
         sk.v = sk.v.filter(x => x !== v);
         renameFaces(sk, ids => ids.includes(v.id) ? ids.filter(i => i !== v.id) : null);
+        basesDrop(sk, v.id);
         changed = true; break;
       }
     }
@@ -259,6 +557,14 @@ export function cleanup(sk){
   const alive = new Set(sk.v.map(v => v.id));
   sk.skip = (sk.skip || []).filter(k => k.split('.').every(id => alive.has(+id)));
   sk.locks = (sk.locks || []).filter(L => [L.e, L.ea, L.eb].every(e => !e || e.every(id => alive.has(id))));
+  // bodies: a base keeps only corners that still exist; a body with no base or no corners of its own is gone
+  if (sk.bodies && sk.bodies.length){
+    for (const B of sk.bodies) B.base = B.base.filter(id => alive.has(id));
+    const has = new Set(sk.v.filter(v => v.b !== undefined).map(v => v.b));
+    sk.bodies = sk.bodies.filter(B => B.base.length >= 3 && has.has(B.id));
+    const live = new Set(sk.bodies.map(B => B.id));
+    for (const v of sk.v) if (v.b !== undefined && !live.has(v.b)) delete v.b;
+  }
 }
 
 // ---------------------------------------------------------------- faces
@@ -304,22 +610,24 @@ function distToPoly2(p, poly){
   return d;
 }
 
-// Every closed loop of edges that lies (nearly) flat and has nothing cutting across it is a face.
-// Loops are kept smallest first, and an edge belongs to at most two faces.
-// o: { rel: how flat, as a share of the loop's edge length (0.18), minTol, maxSides (8) }
-export function findFaces(sk, pos, o = {}){
+const ekey2 = (a, b) => a < b ? a + '-' + b : b + '-' + a;
+// Every closed loop of lines that lies (nearly) flat and has nothing cutting across it is a face.
+// Loops are kept smallest first, and a line belongs to at most two faces (within one layer, see findFaces).
+// vids: the corners to look among, edges: [{a, b}] between them. opt.skip: honour sk.skip, opt.keep: only these loops.
+function layerFaces(sk, pos, o, vids, edges, opt = {}){
   const rel = o.rel ?? 0.22, minTol = o.minTol ?? 0.015, maxSides = o.maxSides ?? 32;
   const P = id => pos[id];
   const adj = new Map();
-  for (const v of sk.v) adj.set(v.id, []);
-  for (const e of sk.e){ adj.get(e.a)?.push(e.b); adj.get(e.b)?.push(e.a); }
+  for (const id of vids) adj.set(id, []);
+  for (const e of edges){ if (!adj.has(e.a) || !adj.has(e.b) || adj.get(e.a).includes(e.b)) continue; adj.get(e.a).push(e.b); adj.get(e.b).push(e.a); }
   const hasEdge = (a, b) => adj.get(a)?.includes(b);
   const cands = new Map();
-  const skipSet = new Set(sk.skip || []);
+  const skipSet = new Set(opt.skip ? sk.skip || [] : []);
   let work = 0;
-  for (const e of sk.e){
-    // loops through this edge, found from the loop's smallest corner (so the search stays small)
-    const s = Math.min(e.a, e.b), t = Math.max(e.a, e.b);
+  for (const [s0, nbs] of adj) for (const t0 of nbs){
+    if (t0 < s0) continue;
+    // loops through this line, found from the loop's smallest corner (so the search stays small)
+    const s = s0, t = t0;
     const path = [s, t], onPath = new Set(path), pl = { n: null, c: null };
     let maxL = dist(P(s), P(t));
     const go = () => {
@@ -350,6 +658,7 @@ export function findFaces(sk, pos, o = {}){
   // test each loop properly
   const good = [];
   for (const [k, ids] of cands){
+    if (opt.keep && !opt.keep(ids)) continue;
     const pts = ids.map(P);
     const pl = planeOf(pts);
     if (pl.area < 1e-8) continue;
@@ -359,9 +668,14 @@ export function findFaces(sk, pos, o = {}){
     let err = 0;
     for (const p of pts) err = Math.max(err, Math.abs(dot(pl.n, sub(p, pl.c))));
     if (err > tol) continue;
+    // and every line of it has to lie along the plane (a short line standing up out of a loop of long ones is the
+    // sign of a loop that wanders over several faces)
+    let steep = false;
+    for (let i = 0; i < pts.length && !steep; i++){ const d = sub(pts[(i + 1) % pts.length], pts[i]); if (Math.abs(dot(pl.n, d)) > Math.max(minTol * 3, 0.4 * len(d))) steep = true; }
+    if (steep) continue;
     const [u, w] = basis(pl.n), to2 = p => { const d = sub(p, pl.c); return [dot(d, u), dot(d, w)]; };
     const poly = pts.map(to2);
-    // a chord: an edge joining two corners of the loop that aren't next to each other, running across the inside,
+    // a chord: a line joining two corners of the loop that aren't next to each other, running across the inside,
     // cuts it in two. (One running outside it, across the mouth of a notch, like the bottom of a box standing in
     // the notch, doesn't.)
     let chord = false;
@@ -395,12 +709,12 @@ export function findFaces(sk, pos, o = {}){
     // like a rectangle drawn in the middle of a big face; lines that cut across from rim to rim mean it isn't one face
     // (lying on it means close to its plane by the measure of a hand's wobble, much tighter than the loop's own test)
     const inSet = new Set(ids), inner = new Set(), tolIn = Math.max(minTol * 2, Math.min(tol, 0.06 * sumL / pts.length));
-    for (const v of sk.v){
-      if (inSet.has(v.id)) continue;
-      const p = P(v.id);
+    for (const vid of vids){
+      if (inSet.has(vid)) continue;
+      const p = P(vid);
       if (Math.abs(dot(pl.n, sub(p, pl.c))) > tolIn) continue;
       const q = to2(p);
-      if (insidePoly2(q, poly) && distToPoly2(q, poly) > tol * 0.5) inner.add(v.id);
+      if (insidePoly2(q, poly) && distToPoly2(q, poly) > tol * 0.5) inner.add(vid);
     }
     let blocked = false;
     const islands = [];
@@ -450,58 +764,218 @@ export function findFaces(sk, pos, o = {}){
     }
   }
   good.sort((a, b) => (a.area * (1 + a.err)) - (b.area * (1 + b.err)));
-  const ekey = (a, b) => a < b ? a + '-' + b : b + '-' + a;
-  const use = new Map(), faces = [], byEdge = new Map();
+  const use = new Map(), faces = [], byEdge = new Map(), bySet = new Set();
   const openSet = new Set(sk.open || []);
+  // which way a face heads off from one of its lines (in its plane, into the face)
+  const headings = f => {
+    const m = new Map();
+    [f.ids, ...f.holes].forEach((L, li) => {
+      const sgn = li && dot(planeOf(L.map(P)).n, f.n) > 0 ? -1 : 1;      // a hole wound like the rim has the face on its other side
+      L.forEach((id, i) => { const o = L[(i + 1) % L.length]; m.set(ekey2(id, o), mul(cross(f.n, norm(sub(P(o), P(id)))), sgn)); });
+    });
+    return m;
+  };
+  const setKey = es => es.slice().sort().join('|');
+  const xor = (A, Bset, B, Aset) => A.filter(x => !Bset.has(x)).concat(B.filter(x => !Aset.has(x)));
+  // is the loop with lines es just face g plus one or two other faces already found (their shared lines cancelling)?
+  const foldOf = (es, g) => {
+    const D = xor(es, g.esSet, g.es, new Set(es));
+    if (D.length < 3) return false;
+    if (bySet.has(setKey(D))) return true;
+    const Dset = new Set(D), seen = new Set();
+    for (const k of D) for (const h of byEdge.get(k) || []){
+      if (h === g || seen.has(h)) continue; seen.add(h);
+      const D2 = xor(D, h.esSet, h.es, Dset);
+      if (D2.length >= 3 && bySet.has(setKey(D2))) return true;
+    }
+    return false;
+  };
   for (const f of good){
-    const loopEdges = L => L.map((id, i) => ekey(id, L[(i + 1) % L.length]));
+    const loopEdges = L => L.map((id, i) => ekey2(id, L[(i + 1) % L.length]));
     const es = [f.ids, ...f.holes].flatMap(loopEdges);
-    if (es.some(k => (use.get(k) || 0) >= 2)) continue;
-    // two faces folded flat onto each other over a shared edge (same plane, same side) overlap: skip
+    if (es.some(k => (use.get(k) || 0) >= 6)) continue;
+    // More than two faces can meet along a line (a box drawn against another shares lines with it), but each has
+    // to head off its own way: a loop lying over a face that's already there (same side of the line) isn't a face.
+    // Where two faces already meet, a third has to be well clear of both.
+    const hd = headings(f), mineIds = new Set(f.all), [fu, fw] = basis(f.n);
+    // a corner (of another face) well outside this loop, seen in this loop's plane
+    const sticksOut = id => { if (mineIds.has(id)) return false; const d = sub(P(id), f.c), q = [dot(d, fu), dot(d, fw)]; return !insidePoly2(q, f.poly) && distToPoly2(q, f.poly) > minTol * 2; };
     let overlap = false;
-    for (let i = 0; i < f.ids.length && !overlap; i++){
-      for (const g of byEdge.get(es[i]) || []){
-        if (g.holes.some(h => h.includes(f.ids[i]) && h.includes(f.ids[(i + 1) % f.ids.length]))) continue;   // the face filling g's hole
-        if (Math.abs(dot(g.n, f.n)) < 0.97) continue;
-        // which side of the shared line each face lies on: the inside of a loop is on its left (works for notched faces too)
-        const ia = f.ids[i], ib = f.ids[(i + 1) % f.ids.length];
-        const inward = (F, u, v) => { const L = F.ids, k = L.indexOf(u), fwd = L[(k + 1) % L.length] === v; return cross(F.n, norm(fwd ? sub(P(v), P(u)) : sub(P(u), P(v)))); };
-        if (g.ids.indexOf(ia) < 0 || g.ids.indexOf(ib) < 0) continue;
-        if (dot(inward(f, ia, ib), inward(g, ia, ib)) > 0) overlap = true;
+    for (const k of es){
+      const mine = hd.get(k), there = byEdge.get(k) || [];
+      for (const g of there){
+        const theirs = g.hd.get(k), c = dot(mine, theirs);
+        // (two faces in one plane that merely overlap, each reaching out past the other, are both real: two boxes
+        // drawn flush have walls like that, and Join shows the overlap once)
+        // (while a loop that takes in all of the face that's there, or is that face with one or two of its
+        // neighbours folded flat onto it, like the walls of a very thin slab, isn't a face)
+        if (c > 0.97 ? !g.all.some(sticksOut) || foldOf(es, g) : c > 0.8 && there.length >= 2){ overlap = true; break; }
       }
+      if (overlap) break;
     }
     if (overlap) continue;
+    // a loop that runs round two faces folded along the line between them (near enough flat to pass) isn't a face
+    if (!f.holes.length){
+      let fold = false;
+      const mineSet = new Set(es), seen = new Set();
+      for (const k of es){
+        for (const g of byEdge.get(k) || []){
+          if (seen.has(g)) continue; seen.add(g);
+          const rest = es.filter(x => !g.esSet.has(x)).concat(g.es.filter(x => !mineSet.has(x)));
+          if (rest.length >= 3 && bySet.has(setKey(rest))){ fold = true; break; }
+        }
+        if (fold) break;
+      }
+      if (fold) continue;
+    }
     f.open = openSet.has(f.key);
-    faces.push(f);
+    f.es = es; f.esSet = new Set(es); f.hd = hd;
+    faces.push(f); bySet.add(setKey(es));
     for (const k of es){ use.set(k, (use.get(k) || 0) + 1); if (!byEdge.has(k)) byEdge.set(k, []); byEdge.get(k).push(f); }
   }
-  // pieces: corners joined by edges; a piece is closed when every edge has a face on both sides
+  return faces;
+}
+// Faces, layer by layer. The sketch you drew is layer 0. Each body (a pushed or pulled face) is a layer of its
+// own: its own corners plus the base loop it stands on, so a body and what it stands on can both be whole even
+// though they share lines. Faces that share a line (within a layer) make a shell; a shell with every line shared
+// by exactly two of its faces is a solid. Lines that tie different layers together can still make loose faces.
+// Returns { faces, pieces (the shells), comp (corner → connected lump, for tidying), loose, edgeUse, bodies }.
+export function findFaces(sk, pos, o = {}){
+  const bodies = (sk.bodies || []).filter(B => B.base.length >= 3 && B.base.every(id => pos[id]));
+  const bSet = new Map(bodies.map(B => [B.id, new Set(B.base)]));
+  const tag = new Map(sk.v.map(v => [v.id, v.b !== undefined && bSet.has(v.b) ? v.b : 0]));
+  // which layer a line is in: 0, a body's id, or -1 for a line tying two layers together
+  const layerOf = e => {
+    const ta = tag.get(e.a), tb = tag.get(e.b);
+    if (ta === tb) return ta;
+    if (ta && bSet.get(ta).has(e.b)) return ta;
+    if (tb && bSet.get(tb).has(e.a)) return tb;
+    return -1;
+  };
+  const eL = new Map(sk.e.map(e => [e.id, layerOf(e)]));
+  const faces = [], shellsOf = [];
+  const layers = [{ L: 0, vids: sk.v.filter(v => tag.get(v.id) === 0).map(v => v.id), edges: sk.e.filter(e => eL.get(e.id) === 0) }];
+  for (const B of bodies){
+    const vids = [...new Set([...sk.v.filter(v => tag.get(v.id) === B.id).map(v => v.id), ...B.base])];
+    const edges = sk.e.filter(e => eL.get(e.id) === B.id).map(e => ({ a: e.a, b: e.b }));
+    for (let i = 0; i < B.base.length; i++) edges.push({ a: B.base[i], b: B.base[(i + 1) % B.base.length] });   // the base loop, whether or not its lines are still drawn
+    layers.push({ L: B.id, vids, edges, B });
+  }
+  const pieces = [], shells = [], bodyInfo = new Map(), found = [];
+  for (const ly of layers){
+    const fs = layerFaces(sk, pos, o, ly.vids, ly.edges, { skip: ly.L === 0 });
+    let cut = false;
+    if (ly.B){
+      // a body cuts when its own corners lie on the inside of the face it stands on
+      const nb = mul(planeOf(ly.B.base.map(id => pos[id])).n, ly.B.s || 1);
+      let cb = [0, 0, 0], ct = [0, 0, 0], nt = 0;
+      for (const id of ly.B.base) cb = add(cb, pos[id]);
+      for (const id of ly.vids) if (tag.get(id) === ly.L){ ct = add(ct, pos[id]); nt++; }
+      if (nt) cut = dot(sub(mul(ct, 1 / nt), mul(cb, 1 / ly.B.base.length)), nb) < 0;
+      bodyInfo.set(ly.L, { cut, base: ly.B.base });
+    }
+    found.push({ ly, fs, cut });
+  }
+  // faces across layers: loops that use at least one line tying your sketch to a body (a box drawn up against a
+  // pulled-out block, a line from a block's corner back to the wall). They belong with your sketch.
+  const cross = new Set(sk.e.filter(e => eL.get(e.id) === -1).map(e => ekey2(e.a, e.b)));
+  if (cross.size){
+    const edges = sk.e.map(e => ({ a: e.a, b: e.b }));
+    const fs = layerFaces(sk, pos, o, sk.v.map(v => v.id), edges, { keep: ids => ids.some((id, i) => cross.has(ekey2(id, ids[(i + 1) % ids.length]))) });
+    for (const f of fs){ f.glue = true; found[0].fs.push(f); }
+  }
+  for (const { ly, fs, cut } of found){
+    addShells(fs, ly.L, cut, pieces, pos, shells);
+    for (const f of fs) faces.push(f);
+  }
+  // corners joined by lines (any layer): used for tidying a lump of sketch together
+  const adjAll = new Map(sk.v.map(v => [v.id, []]));
+  for (const e of sk.e){ adjAll.get(e.a)?.push(e.b); adjAll.get(e.b)?.push(e.a); }
   const comp = new Map();
   let nc = 0;
   for (const v of sk.v){
     if (comp.has(v.id)) continue;
     const st = [v.id]; comp.set(v.id, nc);
-    while (st.length){ const x = st.pop(); for (const y of adj.get(x)) if (!comp.has(y)){ comp.set(y, nc); st.push(y); } }
+    while (st.length){ const x = st.pop(); for (const y of adjAll.get(x)) if (!comp.has(y)){ comp.set(y, nc); st.push(y); } }
     nc++;
   }
-  // a face with a hole joins the hole's corners into its piece (a block standing on a face is part of that piece)
-  const par = Array.from({ length: nc }, (_, i) => i), root = i => par[i] === i ? i : (par[i] = root(par[i]));
-  for (const f of faces) for (const h of f.holes) par[root(comp.get(h[0]))] = root(comp.get(f.ids[0]));
-  const renum = new Map();
-  for (const [id, c] of comp){ const r = root(c); if (!renum.has(r)) renum.set(r, renum.size); comp.set(id, renum.get(r)); }
-  nc = renum.size;
-  const pieces = Array.from({ length: nc }, (_, i) => ({ id: i, closed: true, faces: 0, edges: 0 }));
-  const loose = [];
-  for (const e of sk.e){
-    const pc = pieces[comp.get(e.a)], u = use.get(ekey(e.a, e.b)) || 0;
-    pc.edges++;
-    if (u < 2) pc.closed = false;
-    if (u === 0) loose.push(e.id);
+  const useAll = new Map();
+  for (const f of faces) for (const k of f.es) useAll.set(k, (useAll.get(k) || 0) + 1);
+  const loose = [], edgeUse = new Map();
+  for (const e of sk.e){ const u = useAll.get(ekey2(e.a, e.b)) || 0; edgeUse.set(e.id, u); if (!u) loose.push(e.id); }
+  return { faces, pieces, shells, comp, loose, edgeUse, bodies: bodyInfo };
+}
+// group a layer's faces into shells (faces joined through shared lines), and find the solids in each: the closed
+// rooms its faces wall off. A plain box is one room; two boxes drawn sharing a line, a corner or part of a face are
+// two rooms with (maybe) a wall between; a flap hanging off a box is the box's room plus one loose face.
+function addShells(fs, L, cut, pieces, pos, shells){
+  const par = fs.map((_, i) => i), root = i => par[i] === i ? i : (par[i] = root(par[i]));
+  const owner = new Map();
+  fs.forEach((f, i) => { for (const k of f.es){ if (owner.has(k)) par[root(i)] = root(owner.get(k)); else owner.set(k, i); } });
+  const byRoot = new Map();
+  fs.forEach((f, i) => { const r = root(i); if (!byRoot.has(r)) byRoot.set(r, []); byRoot.get(r).push(f); });
+  for (const [, group] of byRoot){
+    const minOf = list => { let m = Infinity; for (const f of list) for (const id of f.all) if (id < m) m = id; return m; };
+    const rooms = roomsOf(group, pos);
+    const inRoom = new Set();
+    for (const R of rooms){
+      const pc = { id: pieces.length, L, cut: !!cut, solid: true, closed: !cut && !R.some(x => x.f.open), faces: R.length, minId: minOf(R.map(x => x.f)), fl: R };
+      pieces.push(pc);
+      for (const { f, loop } of R){
+        if (inRoom.has(f)){ f.wall = true; continue; }          // between two rooms: inside the solid, never on show
+        inRoom.add(f); f.piece = pc.id; f.L = L; f.loop = loop; f.out = planeOf(loop.map(id => pos[id])).n;
+      }
+    }
+    // the shell itself (for Join): clean when it's one plain closed room and nothing else
+    if (shells){
+      const sh = { id: shells.length, L, cut: !!cut, clean: rooms.length === 1 && rooms[0].length === group.length, faces: group, minId: minOf(group) };
+      shells.push(sh);
+      for (const f of group) f.shell = sh.id;
+    }
+    const rest = group.filter(f => !inRoom.has(f));
+    if (rest.length){
+      const pc = { id: pieces.length, L, cut: false, solid: false, closed: false, faces: rest.length, minId: minOf(rest) };
+      pieces.push(pc);
+      for (const f of rest){ f.piece = pc.id; f.L = L; }
+    }
   }
-  for (const f of faces){ const pc = pieces[comp.get(f.ids[0])]; pc.faces++; if (f.open) pc.closed = false; f.piece = pc.id; }
-  for (const pc of pieces) if (!pc.faces) pc.closed = false;
-  const edgeUse = new Map(sk.e.map(e => [e.id, use.get(ekey(e.a, e.b)) || 0]));
-  return { faces, pieces, comp, loose, edgeUse };
+}
+// The closed rooms among a set of faces. Every face has two sides; going round each line, the side of one face looks
+// across at the side of the next face round, and sides that see each other are in the same space. A space with
+// volume walled all round is a room. Returns [[{ f, loop (wound so its normal points out of the room) }]].
+function roomsOf(group, pos){
+  const n = group.length, par = Array.from({ length: 2 * n }, (_, i) => i);
+  const root = i => par[i] === i ? i : (par[i] = root(par[i]));
+  const P = id => pos[id];
+  const at = new Map();
+  group.forEach((f, i) => { for (const [k, w] of f.hd){ if (!at.has(k)) at.set(k, []); at.get(k).push({ i, w, f }); } });
+  for (const [k, list] of at){
+    const [a, b] = k.split('-').map(Number), d = norm(sub(P(b), P(a)));
+    let e1 = sub(list[0].w, mul(d, dot(list[0].w, d))); e1 = norm(e1); const e2 = cross(d, e1);
+    for (const it of list){
+      it.th = Math.atan2(dot(it.w, e2), dot(it.w, e1));
+      const plus = dot(it.f.n, cross(d, it.w)) > 0;        // side 0 of a face is the side its normal points to
+      it.ccw = 2 * it.i + (plus ? 0 : 1); it.cw = 2 * it.i + (plus ? 1 : 0);
+    }
+    list.sort((x, y) => x.th - y.th);
+    for (let j = 0; j < list.length; j++){ const ra = root(list[j].ccw), rb = root(list[(j + 1) % list.length].cw); if (ra !== rb) par[ra] = rb; }
+  }
+  const spaces = new Map();
+  for (let h = 0; h < 2 * n; h++){ const r = root(h); if (!spaces.has(r)) spaces.set(r, []); spaces.get(r).push(h); }
+  const rooms = [];
+  for (const [, hs] of spaces){
+    const cnt = new Map(); for (const h of hs) cnt.set(h >> 1, (cnt.get(h >> 1) || 0) + 1);
+    const walls = hs.filter(h => cnt.get(h >> 1) === 1);          // a face with both sides in here is just hanging in it
+    if (walls.length < 4) continue;
+    let vol = 0;
+    const R = walls.map(h => {
+      const f = group[h >> 1], loop = (h & 1) ? f.ids.slice() : f.ids.slice().reverse();     // the room is on side 0: flip so the normal points away
+      vol += dot((h & 1) ? f.n : mul(f.n, -1), P(f.ids[0])) * f.area / 3;
+      return { f, loop };
+    });
+    if (vol > 1e-7) rooms.push(R);
+  }
+  return rooms;
 }
 
 // the boundary of an island of corners: walk it if it's a plain ring, otherwise the biggest flat loop through
@@ -611,6 +1085,16 @@ export function solve(sk, F, o = {}){
       for (const id of ids) if (W2[id]){ const q = mul(G2[id], 1 / W2[id]); moved = Math.max(moved, dist(q, X[id])); X[id] = q; }
       hardFlat(faces, X, wA, 60);
       if (moved < 1e-5) break;
+    }
+  }
+  // corners that sit on the floor sit exactly on it (so bottoms of different solids share one plane)
+  if (o.floor){
+    const R = o.floorR ?? 0.05, fl = ids.filter(id => Math.abs(A[id][1]) < R && Math.abs(X[id][1]) < R * 2);
+    if (fl.length) for (let r = 0; r < 12; r++){
+      let moved = 0;
+      for (const id of fl){ moved = Math.max(moved, Math.abs(X[id][1])); X[id][1] = 0; }
+      if (moved < 1e-7) break;
+      if (hardFlat(faces, X, wA, 40) < 1e-5 && r > 0){ for (const id of fl) X[id][1] = 0; break; }
     }
   }
   return X;
@@ -774,6 +1258,46 @@ export function snapHeld(sk, F, key, T, X){
   return out;
 }
 
+// Should pushing or pulling this face make a body (true), or just move the face (false)? A face that is part of a
+// bigger flat surface (a door drawn on a wall, a shape drawn inside a face, half of a face cut by a line) makes a body.
+export function isSubFace(F, f){
+  for (const g of F.faces){
+    if (g === f || g.L !== f.L) continue;
+    if (Math.abs(dot(g.n, f.n)) < 0.985) continue;
+    if (f.es.some(k => g.es.includes(k))) return true;
+  }
+  return false;
+}
+// If a body already stands on this face: that body and its far face (the one to grab to push it further)
+export function bodyOn(sk, F, f, X){
+  const set = new Set(f.ids);
+  for (const B of sk.bodies || []){
+    if (B.base.length !== set.size || !B.base.every(id => set.has(id))) continue;
+    const nb = planeOf(B.base.map(id => X[id])).n;
+    let best = null, bs = 0;
+    for (const g of F.faces){
+      if (g.L !== B.id || g.ids.some(id => set.has(id))) continue;
+      const sc = Math.abs(dot(g.n, nb)) * g.area;
+      if (sc > bs){ bs = sc; best = g; }
+    }
+    if (best) return { body: B, top: best };
+  }
+  return null;
+}
+
+// While something is being dragged: has any body gone from adding to cutting (or back)? (Then look at the faces afresh.)
+export function cutsChanged(sk, F, X){
+  for (const [id, info] of F.bodies || []){
+    const B = bodyOf(sk, id); if (!B || B.base.some(v => !X[v])) continue;
+    const nb = mul(planeOf(B.base.map(v => X[v])).n, B.s || 1);
+    let cb = [0, 0, 0], ct = [0, 0, 0], nt = 0;
+    for (const v of B.base) cb = add(cb, X[v]);
+    for (const v of sk.v) if (v.b === id && X[v.id]){ ct = add(ct, X[v.id]); nt++; }
+    if (nt && (dot(sub(mul(ct, 1 / nt), mul(cb, 1 / B.base.length)), nb) < 0) !== info.cut) return true;
+  }
+  return false;
+}
+
 // One call for the app: find faces on the sketch, solve, then look again on the solved shape (catches loops that
 // only came flat once squared up) and solve once more from there.
 export function build(sk, o = {}){
@@ -784,7 +1308,9 @@ export function build(sk, o = {}){
   let X = solve(sk, F, o);
   if (o.second !== false){
     const F2 = findFaces(sk, X, fo);
-    if (F2.faces.length !== F.faces.length || F2.faces.some((f, i) => f.key !== F.faces[i]?.key)){ F = F2; X = solve(sk, F, Object.assign({}, o, { warm: X })); }
+    const changed = F2.faces.length !== F.faces.length || F2.faces.some((f, i) => f.key !== F.faces[i]?.key);
+    F = F2;                               // always the faces as they are at the solved corners (which way is out, what cuts)
+    if (changed){ X = solve(sk, F, Object.assign({}, o, { warm: X })); F = findFaces(sk, X, fo); }
   }
   return { F, X };
 }
@@ -810,6 +1336,27 @@ export function orient(fs, X){
       }
     }
   }
+  // a face lying in a hole of another (a shape drawn flat inside it) faces the same way as the one around it
+  {
+    const cid = new Array(fs.length).fill(-1); let nc = 0;
+    for (let s0 = 0; s0 < fs.length; s0++){
+      if (cid[s0] >= 0) continue;
+      cid[s0] = nc; const q = [s0];
+      while (q.length){ const i = q.shift(); for (const [, os] of owners) if (os.includes(i)) for (const j of os) if (cid[j] < 0){ cid[j] = nc; q.push(j); } }
+      nc++;
+    }
+    if (nc > 1){
+      const byKey = new Map(fs.map((f, i) => [f.key, i])), fixed = new Set([cid[0]]);
+      for (let pass = 0; pass < nc; pass++) fs.forEach((g, gi) => (g.holes || []).forEach(h => {
+        const ii = byKey.get(faceKey(h)); if (ii === undefined || cid[ii] === cid[gi]) return;
+        const [from, to] = fixed.has(cid[gi]) && !fixed.has(cid[ii]) ? [gi, ii] : fixed.has(cid[ii]) && !fixed.has(cid[gi]) ? [ii, gi] : [-1, -1];
+        if (from < 0) return;
+        const nf = planeOf(loops[from].map(id => X[id])).n, nt = planeOf(loops[to].map(id => X[id])).n;
+        if (dot(nf, nt) < 0) loops.forEach((L, k) => { if (cid[k] === cid[to]) L.reverse(); });
+        fixed.add(cid[to]);
+      }));
+    }
+  }
   let vol = 0;
   for (const L of loops){ const p0 = X[L[0]]; for (let i = 1; i < L.length - 1; i++) vol += dot(p0, cross(X[L[i]], X[L[i + 1]])); }
   if (vol < 0) loops.forEach(L => L.reverse());
@@ -822,7 +1369,7 @@ export function toOBJ(sk, F, X, scale = 1, tri){
   let s = '# Edgewise XR\n';
   for (const id of ids){ const p = X[id]; s += `v ${(p[0] * scale).toFixed(5)} ${(-p[2] * scale).toFixed(5)} ${(p[1] * scale).toFixed(5)}\n`; }
   const byPiece = new Map();
-  for (const f of F.faces){ if (f.open) continue; if (!byPiece.has(f.piece)) byPiece.set(f.piece, []); byPiece.get(f.piece).push(f); }
+  for (const f of F.faces){ if (f.open || F.pieces[f.piece].cut) continue; if (!byPiece.has(f.piece)) byPiece.set(f.piece, []); byPiece.get(f.piece).push(f); }
   let n = 0;
   for (const [pc, fs] of byPiece){
     // wind every face the same way round (neighbours run a shared edge in opposite directions), facing out
