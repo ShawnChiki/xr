@@ -187,13 +187,26 @@ export function weld(sk, P, r){
 }
 export function splitEdgeAt(sk, eid, at){ return splitEdge(sk, eid, at); }
 
-export function removeVert(sk, id){
+// Delete a corner. Lines running straight through it join back into one line (so a point in the middle of an
+// edge goes and the edge stays whole); any other line at it goes with it. A corner with just two lines joins them.
+export function removeVert(sk, id, pos){
   const es = sk.e.filter(e => e.a === id || e.b === id);
-  if (es.length === 2){
-    const o0 = es[0].a === id ? es[0].b : es[0].a, o1 = es[1].a === id ? es[1].b : es[1].a;
-    sk.e = sk.e.filter(e => e !== es[0] && e !== es[1]);
-    if (o0 !== o1 && !edgeBetween(sk, o0, o1)) sk.e.push({ id: sk.nid++, a: o0, b: o1, s: es[0].s });
-  } else sk.e = sk.e.filter(e => e.a !== id && e.b !== id);
+  const P = vid => (pos && pos[vid]) || anchorOf(vById(sk, vid));
+  const other = e => e.a === id ? e.b : e.a;
+  const keepPairs = [];
+  if (es.length === 2) keepPairs.push([es[0], es[1]]);
+  else if (es.length > 2){
+    const c = P(id), dir = e => norm(sub(P(other(e)), c)), used = new Set();
+    const pairs = [];
+    for (let i = 0; i < es.length; i++) for (let j = i + 1; j < es.length; j++){ const d = dot(dir(es[i]), dir(es[j])); if (d < -0.95) pairs.push([d, es[i], es[j]]); }
+    pairs.sort((a, b) => a[0] - b[0]);
+    for (const [, a, b] of pairs) if (!used.has(a) && !used.has(b)){ used.add(a); used.add(b); keepPairs.push([a, b]); }
+  }
+  sk.e = sk.e.filter(e => e.a !== id && e.b !== id);
+  for (const [a, b] of keepPairs){
+    const o0 = other(a), o1 = other(b);
+    if (o0 !== o1 && !edgeBetween(sk, o0, o1)) sk.e.push({ id: sk.nid++, a: o0, b: o1, s: a.s });
+  }
   sk.v = sk.v.filter(v => v.id !== id);
   renameFaces(sk, ids => ids.includes(id) ? ids.filter(i => i !== id) : null);
   cleanup(sk);
