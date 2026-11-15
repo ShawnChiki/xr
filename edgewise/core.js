@@ -71,11 +71,15 @@ const edgeBetween = (sk, a, b) => sk.e.find(e => (e.a === a && e.b === b) || (e.
 // Where would a stroke end at p land? On a corner, on an edge (splitting it), or free.
 // pos: the positions you can see (solved), so you aim at what's on screen.
 export function snapEnd(sk, p, pos, snapR, skipVert, faces){
-  let best = null, bd = snapR;
+  // a corner counts as close if you're near where it's shown OR where your strokes put it (tidying can move it a
+  // few cm), and a loose end waiting for its partner reaches half as far again
+  let best = null, bd = Infinity;
+  const deg = new Map(); for (const e of sk.e){ deg.set(e.a, (deg.get(e.a) || 0) + 1); deg.set(e.b, (deg.get(e.b) || 0) + 1); }
   for (const v of sk.v){
     if (v.id === skipVert) continue;
-    const q = pos[v.id] || anchorOf(v), d = dist(p, q);
-    if (d < bd){ bd = d; best = { kind: 'vert', id: v.id, at: q }; }
+    const q = pos[v.id] || anchorOf(v), d = Math.min(dist(p, q), dist(p, anchorOf(v)));
+    const reach = (deg.get(v.id) || 0) <= 1 ? snapR * 1.5 : snapR;
+    if (d < reach && d < bd){ bd = d; best = { kind: 'vert', id: v.id, at: q }; }
   }
   if (best) return best;
   bd = snapR * 0.8;
@@ -170,7 +174,12 @@ export function weld(sk, P, r){
     again = false;
     for (let i = 0; i < sk.v.length && !again; i++) for (let j = i + 1; j < sk.v.length && !again; j++){
       const a = sk.v[i], b = sk.v[j], pa = P[a.id], pb = P[b.id];
-      if (!pa || !pb || dist(pa, pb) >= r) continue;
+      if (!pa || !pb) continue;
+      // two loose ends (each on a single line) this close were meant to be one corner: they reach three times as far
+      const da = sk.e.filter(e => e.a === a.id || e.b === a.id), db = sk.e.filter(e => e.a === b.id || e.b === b.id);
+      if (da.some(e => e.a === b.id || e.b === b.id)) continue;            // never fold a line onto itself
+      const rr = da.length <= 1 && db.length <= 1 ? r * 3 : r;
+      if (dist(pa, pb) >= rr) continue;
       mergeVerts(sk, a.id, b.id); n++; again = true;
     }
   }
