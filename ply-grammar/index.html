@@ -249,6 +249,8 @@ kbd{font:11px var(--f-mono);border:1px solid var(--line);border-bottom-width:2px
       <div class="list" id="blockList"></div>
       <div class="row" style="margin-top:10px"><button class="btn primary" id="addBlock">+ Add box</button></div>
       <p class="note">Sizes in inches, full size.</p>
+      <div class="row" id="ewRow" style="margin-top:8px" hidden><button class="btn" id="ewBtn" title="Shapes you drew in Edgewise XR on this device">Bring in from Edgewise…</button></div>
+      <div id="skBox" hidden><p class="note" id="skLine" style="margin-bottom:6px"></p><div class="row"><button class="btn" id="skClearBtn">Remove loose lines</button></div></div>
       <h3>Design file</h3>
       <div class="row"><button class="btn" id="openDesignBtn">Open…</button><button class="btn" id="saveDesignBtn">Save design</button><button class="btn" id="copyDesignBtn">Copy design</button><input type="file" id="openDesignFile" accept=".json,application/json" hidden></div>
       <h3>Notes for Claude</h3>
@@ -504,6 +506,7 @@ kbd{font:11px var(--f-mono);border:1px solid var(--line);border-bottom-width:2px
         <li><b>Carve it.</b> Add cut-out to carve a box-shaped bite out of a box: a step, a notch, a tunnel or a window. The obstacle stays one continuous shell: holes go right through, inside corners get their own fingers, and ribs follow the new shape.</li>
         <li><b>Undo anything</b> with Ctrl+Z, redo with Ctrl+Shift+Z. Save and open designs as files from the Model tab.</li>
         <li><b>Headset.</b> On a Quest, tap VR or XR. Trigger a face to push or pull it, grip to grab and move. The menu on your left wrist adds boxes, cuts and cut-outs, deletes, undoes and switches views.</li>
+        <li><b>Draw the shape (headset).</b> Press A for the pen, as in Edgewise: every stroke is one straight line, lines join at their corners, a closed flat loop is a face, and faces that close up become a solid that is built like any box. Solids that stand on each other build as one. Back here you can push, move, size, cut and tilt a drawn shape like any other.</li>
         <li><b>Build it.</b> The Build view plays the assembly step by step, checking that every part can slide in without its wood passing through another. It flags parts that can't go in and parts that overlap.</li>
         <li><b>Test it.</b> The Test view sets each obstacle down on any face it can rest on, then shows where a shove tips or slides it, where a landing flips it, and how much the top panels flex. Hit it to watch.</li>
         <li><b>Cut.</b> Pick the scale and stock, set the machine, then save the sheets as DXF.</li>
@@ -583,7 +586,7 @@ kbd{font:11px var(--f-mono);border:1px solid var(--line);border-bottom-width:2px
 <script type="module">
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
-import {TransformControls} from 'three/addons/controls/TransformControls.js';
+import {TransformControls} from 'three/addons/controls/TransformControls.js';import {XRControllerModelFactory} from 'three/addons/webxr/XRControllerModelFactory.js';
 const V=THREE.Vector3, Q=THREE.Quaternion;
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 
@@ -686,6 +689,849 @@ function offsetC(raw,delta,round){const co=new ClipperLib.ClipperOffset(2,CS*.00
   co.AddPaths(ClipperLib.Clipper.CleanPolygons(raw,CS*.001),round?ClipperLib.JoinType.jtRound:ClipperLib.JoinType.jtMiter,ClipperLib.EndType.etClosedPolygon);const sol=new ClipperLib.Paths();co.Execute(sol,delta*CS);
   return sol.filter(c=>c.length>2&&Math.abs(ClipperLib.Clipper.Area(c))>CS*CS*1e-4)}
 const circle=(c,r,n=14)=>Array.from({length:n},(_,i)=>[c[0]+r*Math.cos(i/n*Math.PI*2),c[1]+r*Math.sin(i/n*Math.PI*2)]);
+/* ---------------- Edgewise core (from xr/edgewise/core.js): strokes -> straight edges -> flat faces ---------------- */
+const EW=(()=>{
+// Edgewise core: sketched strokes → straight edges → corners → flat faces → a tidy solid.
+// Pure math, no three.js, so it can be tested on its own. All sizes are in model units (metres at 1:1).
+//
+// The sketch is the source of truth (like Pentimento): every corner remembers each stroke end that landed on it,
+// and its target is the average of those. The solver then finds flat faces in the graph of edges and nudges the
+// corners until every face is truly flat (and, with Square up on, edges that are nearly vertical, level or on the
+// grid become exactly so), staying as close as it can to what you drew.
+
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const mul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const len = a => Math.hypot(a[0], a[1], a[2]);
+const norm = a => { const l = len(a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const dist = (a, b) => len(sub(a, b));
+const V = { sub, add, mul, dot, cross, len, norm, dist };
+
+// ---------------------------------------------------------------- strokes
+// Best straight line through a stroke: the long axis of its points, ends where the first and last points sit on it.
+function fitLine(pts){
+  const n = pts.length;
+  if (n < 2) return null;
+  let c = [0, 0, 0];
+  for (const p of pts) c = add(c, p);
+  c = mul(c, 1 / n);
+  let xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+  for (const p of pts){ const d = sub(p, c); xx += d[0] * d[0]; xy += d[0] * d[1]; xz += d[0] * d[2]; yy += d[1] * d[1]; yz += d[1] * d[2]; zz += d[2] * d[2]; }
+  let d = norm(sub(pts[n - 1], pts[0]));
+  if (!len(sub(pts[n - 1], pts[0]))) d = [1, 0, 0];
+  for (let i = 0; i < 24; i++){ // power iteration from the chord direction
+    const nd = [xx * d[0] + xy * d[1] + xz * d[2], xy * d[0] + yy * d[1] + yz * d[2], xz * d[0] + yz * d[1] + zz * d[2]];
+    const l = len(nd); if (!l) break; d = mul(nd, 1 / l);
+  }
+  if (dot(d, sub(pts[n - 1], pts[0])) < 0) d = mul(d, -1);
+  // ends: the extreme projections (a stroke that overshoots at the start still gives the full edge)
+  let t0 = Infinity, t1 = -Infinity;
+  for (const p of pts){ const t = dot(sub(p, c), d); if (t < t0) t0 = t; if (t > t1) t1 = t; }
+  return { a: add(c, mul(d, t0)), b: add(c, mul(d, t1)), dir: d };
+}
+
+// closest point on segment ab to p, with its parameter
+function closestOnSeg(p, a, b){
+  const ab = sub(b, a), L2 = dot(ab, ab);
+  const t = L2 ? Math.max(0, Math.min(1, dot(sub(p, a), ab) / L2)) : 0;
+  return { t, q: add(a, mul(ab, t)) };
+}
+
+// ---------------------------------------------------------------- the sketch
+function emptySketch(){ return { v: [], e: [], s: [], open: [], locks: [], skip: [], nid: 1 }; }
+
+// Faces are named by their corners (a key like "3.8.12.15"). When a corner is added to an edge, or healed away,
+// every saved face name (holes, locks) that runs along that edge is renamed to match.
+function renameFaces(sk, fn){
+  const re = k => { const ids = k.split('.').map(Number), r = fn(ids); return r ? faceKey(r) : k; };
+  sk.open = (sk.open || []).map(re);
+  sk.skip = (sk.skip || []).map(re);
+  for (const L of sk.locks || []){ if (L.f) L.f = re(L.f); if (L.a) L.a = re(L.a); if (L.b) L.b = re(L.b); }
+}
+const clone = sk => JSON.parse(JSON.stringify(sk));
+
+function anchorOf(v){
+  if (v.pin) return v.pin;
+  let c = [0, 0, 0];
+  for (const p of v.ends) c = add(c, p);
+  return mul(c, 1 / v.ends.length);
+}
+const vById = (sk, id) => sk.v.find(v => v.id === id);
+const edgeBetween = (sk, a, b) => sk.e.find(e => (e.a === a && e.b === b) || (e.a === b && e.b === a));
+
+// Where would a stroke end at p land? On a corner, on an edge (splitting it), or free.
+// pos: the positions you can see (solved), so you aim at what's on screen.
+function snapEnd(sk, p, pos, snapR, skipVert, faces){
+  // a corner counts as close if you're near where it's shown OR where your strokes put it (tidying can move it a
+  // few cm), and a loose end waiting for its partner reaches half as far again
+  let best = null, bd = Infinity;
+  const deg = new Map(); for (const e of sk.e){ deg.set(e.a, (deg.get(e.a) || 0) + 1); deg.set(e.b, (deg.get(e.b) || 0) + 1); }
+  for (const v of sk.v){
+    if (v.id === skipVert) continue;
+    const q = pos[v.id] || anchorOf(v), d = Math.min(dist(p, q), dist(p, anchorOf(v)));
+    const reach = (deg.get(v.id) || 0) <= 1 ? snapR * 1.5 : snapR;
+    if (d < reach && d < bd){ bd = d; best = { kind: 'vert', id: v.id, at: q }; }
+  }
+  if (best) return best;
+  bd = snapR * 0.8;
+  for (const e of sk.e){
+    if (e.a === skipVert || e.b === skipVert) continue;
+    const A = pos[e.a] || anchorOf(vById(sk, e.a)), B = pos[e.b] || anchorOf(vById(sk, e.b));
+    const { t, q } = closestOnSeg(p, A, B), d = dist(p, q), L = dist(A, B);
+    if (d < bd && t * L > snapR * 0.7 && (1 - t) * L > snapR * 0.7){ bd = d; best = { kind: 'edge', id: e.id, at: q, t }; }
+  }
+  if (best) return best;
+  // a loose end close to a face lands on it (so a shape drawn on a big face lies flat in it)
+  if (faces) for (const f of faces){
+    const P = f.ids.map(id => pos[id]); if (P.some(x => !x)) continue;
+    const pl = planeOf(P), h = dot(pl.n, sub(p, pl.c));
+    if (Math.abs(h) > snapR) continue;
+    const q = sub(p, mul(pl.n, h)), [u, w] = basis(pl.n), to2 = x => { const d = sub(x, pl.c); return [dot(d, u), dot(d, w)]; };
+    const q2 = to2(q);
+    if (!insidePoly2(q2, P.map(to2))) continue;
+    if ((f.holes || []).some(H => insidePoly2(q2, H.map(id => to2(pos[id]))))) continue;
+    if (!best || Math.abs(h) < best.h) best = { kind: 'free', at: q, h: Math.abs(h), face: f.key };
+  }
+  return best || { kind: 'free', at: p };
+}
+
+function splitEdge(sk, eid, at){
+  const e = sk.e.find(x => x.id === eid);
+  const n = { id: sk.nid++, ends: [at], split: true };
+  sk.v.push(n);
+  sk.e.splice(sk.e.indexOf(e), 1);
+  sk.e.push({ id: sk.nid++, a: e.a, b: n.id, s: e.s }, { id: sk.nid++, a: n.id, b: e.b, s: e.s });
+  renameFaces(sk, ids => ids.includes(e.a) && ids.includes(e.b) ? [...ids, n.id] : null);
+  return n.id;
+}
+
+// Add one stroke (array of [x,y,z]) as one straight edge. Returns { ok, why, a, b, edge } and changes sk.
+function addStroke(sk, pts, pos, o){
+  const f = fitLine(pts);
+  if (!f) return { ok: false, why: 'too short' };
+  const snapR = o.snapR;
+  const sa = snapEnd(sk, f.a, pos, snapR, undefined, o.faces);
+  const sb = snapEnd(sk, f.b, pos, snapR, sa.kind === 'vert' ? sa.id : undefined, o.faces);
+  const A = sa.at, B = sb.at;
+  if (dist(A, B) < Math.max(snapR * 0.9, o.minLen || 0)) return { ok: false, why: 'too short' };
+  if (sa.kind === 'edge' && sb.kind === 'edge' && sa.id === sb.id) return { ok: false, why: 'runs along an edge' };
+  const sid = sk.nid++;
+  sk.s.push({ id: sid, p: pts.map(p => p.map(x => +x.toFixed(4))) });
+  const endTo = (sn, raw) => {
+    if (sn.kind === 'vert'){ const v = vById(sk, sn.id); v.ends.push(raw); return v.id; }
+    if (sn.kind === 'edge') return splitEdge(sk, sn.id, sn.at);
+    const v = { id: sk.nid++, ends: [raw] }; sk.v.push(v); return v.id;
+  };
+  // a corner's target is the average of every stroke end that landed on it
+  const a = endTo(sa, sa.kind === 'vert' ? f.a.map(x => +x.toFixed(4)) : A);
+  let sb2 = sb;
+  if (sb.kind === 'edge' && sa.kind === 'edge'){
+    // the first split may have replaced the edge the far end was going to land on: find it again
+    sb2 = snapEnd(sk, f.b, pos, snapR, a, o.faces);
+  }
+  const b = endTo(sb2, sb2.kind === 'vert' ? f.b.map(x => +x.toFixed(4)) : B);
+  let e = edgeBetween(sk, a, b);
+  if (!e){ e = { id: sk.nid++, a, b, s: sid }; sk.e.push(e); }
+  return { ok: true, a, b, edge: e.id, snapA: sa.kind, snapB: sb.kind };
+}
+
+// Take edges out; corners left with nothing go, and a split point left in the middle of a straight run is healed.
+function removeEdges(sk, ids){
+  const set = new Set(ids);
+  sk.e = sk.e.filter(e => !set.has(e.id));
+  cleanup(sk);
+}
+// Join two corners into one: every line to `drop` goes to `keep` (a line between them disappears, doubled lines become
+// one), faces, holes and locks follow. `at` pins the joined corner there.
+function mergeVerts(sk, keepId, dropId, at){
+  if (keepId === dropId) return;
+  const keep = vById(sk, keepId), drop = vById(sk, dropId); if (!keep || !drop) return;
+  for (const e of sk.e){ if (e.a === dropId) e.a = keepId; if (e.b === dropId) e.b = keepId; }
+  const seen = new Set();
+  sk.e = sk.e.filter(e => { if (e.a === e.b) return false; const k = e.a < e.b ? e.a + '-' + e.b : e.b + '-' + e.a; if (seen.has(k)) return false; seen.add(k); return true; });
+  keep.ends = keep.ends.concat(drop.ends);
+  if (at) keep.pin = at.map(x => +x.toFixed(4));
+  else if (drop.pin && !keep.pin) keep.pin = anchorOf(keep).map(x => +x.toFixed(4));
+  sk.v = sk.v.filter(v => v !== drop);
+  renameFaces(sk, ids => ids.includes(dropId) ? [...new Set(ids.map(i => i === dropId ? keepId : i))] : null);
+  for (const L of sk.locks || []) for (const k of ['e', 'ea', 'eb']) if (L[k]) L[k] = L[k].map(i => i === dropId ? keepId : i);
+  sk.locks = (sk.locks || []).filter(L => ['e', 'ea', 'eb'].every(k => !L[k] || L[k][0] !== L[k][1]));
+  cleanup(sk);
+}
+// Corners closer than r (positions P) become one. Returns how many joined.
+function weld(sk, P, r){
+  let n = 0, again = true;
+  while (again){
+    again = false;
+    for (let i = 0; i < sk.v.length && !again; i++) for (let j = i + 1; j < sk.v.length && !again; j++){
+      const a = sk.v[i], b = sk.v[j], pa = P[a.id], pb = P[b.id];
+      if (!pa || !pb) continue;
+      // two loose ends (each on a single line) this close were meant to be one corner: they reach three times as far
+      const da = sk.e.filter(e => e.a === a.id || e.b === a.id), db = sk.e.filter(e => e.a === b.id || e.b === b.id);
+      if (da.some(e => e.a === b.id || e.b === b.id)) continue;            // never fold a line onto itself
+      const rr = da.length <= 1 && db.length <= 1 ? r * 3 : r;
+      if (dist(pa, pb) >= rr) continue;
+      mergeVerts(sk, a.id, b.id); n++; again = true;
+    }
+  }
+  return n;
+}
+function splitEdgeAt(sk, eid, at){ return splitEdge(sk, eid, at); }
+
+// Delete a corner. Lines running straight through it join back into one line (so a point in the middle of an
+// edge goes and the edge stays whole); any other line at it goes with it. A corner with just two lines joins them.
+function removeVert(sk, id, pos){
+  const es = sk.e.filter(e => e.a === id || e.b === id);
+  const P = vid => (pos && pos[vid]) || anchorOf(vById(sk, vid));
+  const other = e => e.a === id ? e.b : e.a;
+  const keepPairs = [];
+  if (es.length === 2) keepPairs.push([es[0], es[1]]);
+  else if (es.length > 2){
+    const c = P(id), dir = e => norm(sub(P(other(e)), c)), used = new Set();
+    const pairs = [];
+    for (let i = 0; i < es.length; i++) for (let j = i + 1; j < es.length; j++){ const d = dot(dir(es[i]), dir(es[j])); if (d < -0.95) pairs.push([d, es[i], es[j]]); }
+    pairs.sort((a, b) => a[0] - b[0]);
+    for (const [, a, b] of pairs) if (!used.has(a) && !used.has(b)){ used.add(a); used.add(b); keepPairs.push([a, b]); }
+  }
+  sk.e = sk.e.filter(e => e.a !== id && e.b !== id);
+  for (const [a, b] of keepPairs){
+    const o0 = other(a), o1 = other(b);
+    if (o0 !== o1 && !edgeBetween(sk, o0, o1)) sk.e.push({ id: sk.nid++, a: o0, b: o1, s: a.s });
+  }
+  sk.v = sk.v.filter(v => v.id !== id);
+  renameFaces(sk, ids => ids.includes(id) ? ids.filter(i => i !== id) : null);
+  cleanup(sk);
+}
+
+// Pull a face out into a block: copies of its corners (where they are now, nudged out by `off` along n) joined back
+// to the originals by side lines. The old loop is marked as the cap inside the extrusion. Returns the new face's corners.
+function extrude(sk, f, X, n, off, keepCap){
+  const loops = [f.ids, ...(f.holes || [])], map = new Map();
+  for (const L of loops) for (const id of L){
+    const v = { id: sk.nid++, ends: [add(X[id], mul(n, off)).map(x => +x.toFixed(4))] };
+    v.pin = v.ends[0]; sk.v.push(v); map.set(id, v.id);
+    sk.e.push({ id: sk.nid++, a: id, b: v.id, s: null });
+  }
+  for (const L of loops) for (let i = 0; i < L.length; i++) sk.e.push({ id: sk.nid++, a: map.get(L[i]), b: map.get(L[(i + 1) % L.length]), s: null });
+  // pulled out of a bigger face, the old loop stays as the new block's bottom (Join hides it); pulled out of a
+  // solid's own face, the old loop is now inside that solid
+  sk.skip = sk.skip || [];
+  if (!keepCap && !sk.skip.includes(f.key)) sk.skip.push(f.key);
+  // a lock or hole on the old face carries on to the new one
+  const nk = faceKey(f.ids.map(id => map.get(id)));
+  if (!keepCap) for (const L of sk.locks || []){ if (L.f === f.key) L.f = nk; if (L.a === f.key) L.a = nk; if (L.b === f.key) L.b = nk; }
+  sk.open = (sk.open || []).map(k => k === f.key ? nk : k);
+  return { key: nk, ids: [...map.values()], map };
+}
+
+function cleanup(sk){
+  for (let pass = 0; pass < 4; pass++){
+    const deg = new Map();
+    for (const e of sk.e){ deg.set(e.a, (deg.get(e.a) || 0) + 1); deg.set(e.b, (deg.get(e.b) || 0) + 1); }
+    sk.v = sk.v.filter(v => deg.get(v.id));
+    let changed = false;
+    for (const v of sk.v){
+      if (!v.split || deg.get(v.id) !== 2) continue;
+      const es = sk.e.filter(e => e.a === v.id || e.b === v.id);
+      const o0 = es[0].a === v.id ? es[0].b : es[0].a, o1 = es[1].a === v.id ? es[1].b : es[1].a;
+      const P = anchorOf(v), A = anchorOf(vById(sk, o0)), B = anchorOf(vById(sk, o1));
+      if (dot(norm(sub(A, P)), norm(sub(B, P))) < -0.985 && !edgeBetween(sk, o0, o1)){
+        sk.e = sk.e.filter(e => e !== es[0] && e !== es[1]);
+        sk.e.push({ id: sk.nid++, a: o0, b: o1, s: es[0].s });
+        sk.v = sk.v.filter(x => x !== v);
+        renameFaces(sk, ids => ids.includes(v.id) ? ids.filter(i => i !== v.id) : null);
+        changed = true; break;
+      }
+    }
+    if (!changed) break;
+  }
+  const used = new Set(sk.e.map(e => e.s));
+  sk.s = sk.s.filter(s => used.has(s.id));
+  const alive = new Set(sk.v.map(v => v.id));
+  sk.skip = (sk.skip || []).filter(k => k.split('.').every(id => alive.has(+id)));
+  sk.locks = (sk.locks || []).filter(L => [L.e, L.ea, L.eb].every(e => !e || e.every(id => alive.has(id))));
+}
+
+// ---------------------------------------------------------------- faces
+const faceKey = ids => [...ids].sort((a, b) => a - b).join('.');
+
+// Newell normal + centroid of a polygon
+function planeOf(P){
+  let n = [0, 0, 0], c = [0, 0, 0];
+  for (let i = 0; i < P.length; i++){
+    const a = P[i], b = P[(i + 1) % P.length];
+    n[0] += (a[1] - b[1]) * (a[2] + b[2]); n[1] += (a[2] - b[2]) * (a[0] + b[0]); n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    c = add(c, a);
+  }
+  const area = len(n) / 2;
+  return { n: norm(n), c: mul(c, 1 / P.length), area };
+}
+function basis(n){
+  const t = Math.abs(n[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+  const u = norm(cross(t, n)), w = cross(n, u);
+  return [u, w];
+}
+function segsCross2(a, b, c, d){
+  const o = (p, q, r) => (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+  const d1 = o(c, d, a), d2 = o(c, d, b), d3 = o(a, b, c), d4 = o(a, b, d);
+  return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0)) && d1 && d2 && d3 && d4;
+}
+function insidePoly2(p, poly){
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++){
+    const a = poly[i], b = poly[j];
+    if ((a[1] > p[1]) !== (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]) inside = !inside;
+  }
+  return inside;
+}
+function distToPoly2(p, poly){
+  let d = Infinity;
+  for (let i = 0; i < poly.length; i++){
+    const a = poly[i], b = poly[(i + 1) % poly.length], ab = [b[0] - a[0], b[1] - a[1]], L2 = ab[0] * ab[0] + ab[1] * ab[1];
+    const t = L2 ? Math.max(0, Math.min(1, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / L2)) : 0;
+    d = Math.min(d, Math.hypot(p[0] - a[0] - ab[0] * t, p[1] - a[1] - ab[1] * t));
+  }
+  return d;
+}
+
+// Every closed loop of edges that lies (nearly) flat and has nothing cutting across it is a face.
+// Loops are kept smallest first, and an edge belongs to at most two faces.
+// o: { rel: how flat, as a share of the loop's edge length (0.18), minTol, maxSides (8) }
+function findFaces(sk, pos, o = {}){
+  const rel = o.rel ?? 0.22, minTol = o.minTol ?? 0.015, maxSides = o.maxSides ?? 32;
+  const P = id => pos[id];
+  const adj = new Map();
+  for (const v of sk.v) adj.set(v.id, []);
+  for (const e of sk.e){ adj.get(e.a)?.push(e.b); adj.get(e.b)?.push(e.a); }
+  const hasEdge = (a, b) => adj.get(a)?.includes(b);
+  const cands = new Map();
+  const skipSet = new Set(sk.skip || []);
+  let work = 0;
+  for (const e of sk.e){
+    // loops through this edge, found from the loop's smallest corner (so the search stays small)
+    const s = Math.min(e.a, e.b), t = Math.max(e.a, e.b);
+    const path = [s, t], onPath = new Set(path), pl = { n: null, c: null };
+    let maxL = dist(P(s), P(t));
+    const go = () => {
+      if (++work > 3000000) return;
+      const last = path[path.length - 1];
+      for (const w of adj.get(last)){
+        if (w === s && path.length >= 3){ const k = faceKey(path); if (!cands.has(k)) cands.set(k, path.slice()); continue; }
+        if (onPath.has(w) || path.length >= maxSides || w < s) continue;
+        const pw = P(w), L = Math.max(maxL, dist(P(last), pw)), tol = Math.max(minTol, rel * L) * 1.6;
+        const sn = pl.n, sc = pl.c;
+        if (pl.n){ if (Math.abs(dot(pl.n, sub(pw, pl.c))) > tol) continue; }
+        else {
+          // the first time three corners make a real angle, that's the plane to test the rest against
+          const p0 = P(path[0]), p1 = P(last);
+          for (let i = 0; i < path.length - 1 && !pl.n; i++){
+            const a = norm(sub(P(path[i + 1]), P(path[i]))), b = norm(sub(pw, p1)), c = cross(sub(p1, p0), sub(pw, p0));
+            if (len(cross(a, b)) > 0.25 && len(c) > 1e-9){ pl.n = norm(c); pl.c = p0; }
+          }
+        }
+        const sL = maxL; maxL = L; path.push(w); onPath.add(w);
+        go();
+        path.pop(); onPath.delete(w); pl.n = sn; pl.c = sc; maxL = sL;
+      }
+    };
+    go();
+  }
+
+  // test each loop properly
+  const good = [];
+  for (const [k, ids] of cands){
+    const pts = ids.map(P);
+    const pl = planeOf(pts);
+    if (pl.area < 1e-8) continue;
+    let sumL = 0;
+    for (let i = 0; i < pts.length; i++) sumL += dist(pts[i], pts[(i + 1) % pts.length]);
+    const tol = Math.max(minTol, rel * sumL / pts.length);
+    let err = 0;
+    for (const p of pts) err = Math.max(err, Math.abs(dot(pl.n, sub(p, pl.c))));
+    if (err > tol) continue;
+    const [u, w] = basis(pl.n), to2 = p => { const d = sub(p, pl.c); return [dot(d, u), dot(d, w)]; };
+    const poly = pts.map(to2);
+    // a chord: an edge joining two corners of the loop that aren't next to each other, running across the inside,
+    // cuts it in two. (One running outside it, across the mouth of a notch, like the bottom of a box standing in
+    // the notch, doesn't.)
+    let chord = false;
+    for (let i = 0; i < ids.length && !chord; i++)
+      for (let j = i + 2; j < ids.length && !chord; j++){
+        if (i === 0 && j === ids.length - 1) continue;
+        if (!hasEdge(ids[i], ids[j])) continue;
+        // inside means inside on both sides of it (a line along the mouth of a notch has the notch on one side
+        // and the outside on the other); tested a little either side so a line lying along the rim can't fool it
+        const a = poly[i], b = poly[j], dx = b[0] - a[0], dy = b[1] - a[1], Lc = Math.hypot(dx, dy) || 1, e = 0.02 * Lc;
+        const nx = -dy / Lc * e, ny = dx / Lc * e;
+        let both = 0;
+        for (const t of [0.3, 0.5, 0.7]){
+          const m = [a[0] + dx * t, a[1] + dy * t];
+          if (insidePoly2([m[0] + nx, m[1] + ny], poly) && insidePoly2([m[0] - nx, m[1] - ny], poly)) both++;
+        }
+        if (both >= 2) chord = true;
+      }
+    if (chord) continue;
+    // must not cross itself
+    let selfX = false;
+    for (let i = 0; i < poly.length && !selfX; i++)
+      for (let j = i + 2; j < poly.length && !selfX; j++){
+        if (i === 0 && j === poly.length - 1) continue;
+        if (segsCross2(poly[i], poly[(i + 1) % poly.length], poly[j], poly[(j + 1) % poly.length])) selfX = true;
+      }
+    if (selfX) continue;
+    // a loop that's the cap left inside an extrusion isn't a face (while something still stands on it)
+    if (skipSet.has(k) && ids.every(id => adj.get(id).length >= 3)) continue;
+    // corners sitting inside it, on its plane: a closed loop of them (touching nothing on the rim) is a hole,
+    // like a rectangle drawn in the middle of a big face; lines that cut across from rim to rim mean it isn't one face
+    // (lying on it means close to its plane by the measure of a hand's wobble, much tighter than the loop's own test)
+    const inSet = new Set(ids), inner = new Set(), tolIn = Math.max(minTol * 2, Math.min(tol, 0.06 * sumL / pts.length));
+    for (const v of sk.v){
+      if (inSet.has(v.id)) continue;
+      const p = P(v.id);
+      if (Math.abs(dot(pl.n, sub(p, pl.c))) > tolIn) continue;
+      const q = to2(p);
+      if (insidePoly2(q, poly) && distToPoly2(q, poly) > tol * 0.5) inner.add(v.id);
+    }
+    let blocked = false;
+    const islands = [];
+    for (const start of inner){
+      if (islands.some(I => I.set.has(start))) continue;
+      const set = new Set([start]), st = [start];
+      let contacts = 0;
+      while (st.length){ const x = st.pop(); for (const y of adj.get(x)){ if (inner.has(y) && !set.has(y)){ set.add(y); st.push(y); } else if (inSet.has(y)) contacts++; } }
+      if (contacts >= 2){ blocked = true; break; }
+      islands.push({ set, contacts });
+    }
+    if (blocked) continue;
+    const holes = [];
+    for (const I of islands){
+      if (I.contacts) continue;                     // a single spur off the rim: just a loose line on the face
+      // only a shape drawn flat in the face is a hole in it; something standing on the face (lines leaving the
+      // plane) is a solid of its own, and Join sorts out where they meet
+      if ([...I.set].some(id => adj.get(id).some(y => !I.set.has(y)))) continue;
+      const loop = islandLoop(I.set, adj, cands, P);
+      if (loop) holes.push(loop);
+    }
+    // only the outermost islands are holes in this face (one inside another belongs to that one)
+    const hp = holes.map(h => h.map(id => to2(P(id))));
+    const top = holes.filter((h, i) => !hp.some((q, j) => j !== i && insidePoly2(to2(P(h[0])), q)));
+    let area = pl.area;
+    for (const h of top) area -= planeOf(h.map(P)).area;
+    good.push({ key: k, ids, holes: top, all: top.length ? [...ids, ...top.flat()] : ids, n: pl.n, c: pl.c, area, err: err / tol, poly });
+  }
+  // a wall between two solids drawn sharing a face is inside them: along every one of its lines, two other faces
+  // carry straight on across it (flat, one each side), like the two tops of boxes drawn side by side. Drop it.
+  {
+    const byE = new Map(), ek = (a, b) => a < b ? a + '-' + b : b + '-' + a;
+    for (const f of good) for (let i = 0; i < f.ids.length; i++){ const k = ek(f.ids[i], f.ids[(i + 1) % f.ids.length]); if (!byE.has(k)) byE.set(k, []); byE.get(k).push(f); }
+    const crossesAt = (W, a, b) => {
+      const others = (byE.get(ek(a, b)) || []).filter(g => g !== W);
+      const A = P(a), ed = norm(sub(P(b), A));
+      const side = g => { const d = sub(g.c, A); return sub(d, mul(ed, dot(d, ed))); };
+      for (let i = 0; i < others.length; i++) for (let j = i + 1; j < others.length; j++){
+        const g = others[i], h = others[j];
+        if (Math.abs(dot(g.n, h.n)) > 0.995 && dot(side(g), side(h)) < 0) return true;
+      }
+      return false;
+    };
+    for (let i = good.length - 1; i >= 0; i--){
+      const f = good[i];
+      if (!f.holes.length && f.ids.every((id, j) => crossesAt(f, id, f.ids[(j + 1) % f.ids.length]))) good.splice(i, 1);
+    }
+  }
+  good.sort((a, b) => (a.area * (1 + a.err)) - (b.area * (1 + b.err)));
+  const ekey = (a, b) => a < b ? a + '-' + b : b + '-' + a;
+  const use = new Map(), faces = [], byEdge = new Map();
+  const openSet = new Set(sk.open || []);
+  for (const f of good){
+    const loopEdges = L => L.map((id, i) => ekey(id, L[(i + 1) % L.length]));
+    const es = [f.ids, ...f.holes].flatMap(loopEdges);
+    if (es.some(k => (use.get(k) || 0) >= 2)) continue;
+    // two faces folded flat onto each other over a shared edge (same plane, same side) overlap: skip
+    let overlap = false;
+    for (let i = 0; i < f.ids.length && !overlap; i++){
+      for (const g of byEdge.get(es[i]) || []){
+        if (g.holes.some(h => h.includes(f.ids[i]) && h.includes(f.ids[(i + 1) % f.ids.length]))) continue;   // the face filling g's hole
+        if (Math.abs(dot(g.n, f.n)) < 0.97) continue;
+        // which side of the shared line each face lies on: the inside of a loop is on its left (works for notched faces too)
+        const ia = f.ids[i], ib = f.ids[(i + 1) % f.ids.length];
+        const inward = (F, u, v) => { const L = F.ids, k = L.indexOf(u), fwd = L[(k + 1) % L.length] === v; return cross(F.n, norm(fwd ? sub(P(v), P(u)) : sub(P(u), P(v)))); };
+        if (g.ids.indexOf(ia) < 0 || g.ids.indexOf(ib) < 0) continue;
+        if (dot(inward(f, ia, ib), inward(g, ia, ib)) > 0) overlap = true;
+      }
+    }
+    if (overlap) continue;
+    f.open = openSet.has(f.key);
+    faces.push(f);
+    for (const k of es){ use.set(k, (use.get(k) || 0) + 1); if (!byEdge.has(k)) byEdge.set(k, []); byEdge.get(k).push(f); }
+  }
+  // pieces: corners joined by edges; a piece is closed when every edge has a face on both sides
+  const comp = new Map();
+  let nc = 0;
+  for (const v of sk.v){
+    if (comp.has(v.id)) continue;
+    const st = [v.id]; comp.set(v.id, nc);
+    while (st.length){ const x = st.pop(); for (const y of adj.get(x)) if (!comp.has(y)){ comp.set(y, nc); st.push(y); } }
+    nc++;
+  }
+  // a face with a hole joins the hole's corners into its piece (a block standing on a face is part of that piece)
+  const par = Array.from({ length: nc }, (_, i) => i), root = i => par[i] === i ? i : (par[i] = root(par[i]));
+  for (const f of faces) for (const h of f.holes) par[root(comp.get(h[0]))] = root(comp.get(f.ids[0]));
+  const renum = new Map();
+  for (const [id, c] of comp){ const r = root(c); if (!renum.has(r)) renum.set(r, renum.size); comp.set(id, renum.get(r)); }
+  nc = renum.size;
+  const pieces = Array.from({ length: nc }, (_, i) => ({ id: i, closed: true, faces: 0, edges: 0 }));
+  const loose = [];
+  for (const e of sk.e){
+    const pc = pieces[comp.get(e.a)], u = use.get(ekey(e.a, e.b)) || 0;
+    pc.edges++;
+    if (u < 2) pc.closed = false;
+    if (u === 0) loose.push(e.id);
+  }
+  for (const f of faces){ const pc = pieces[comp.get(f.ids[0])]; pc.faces++; if (f.open) pc.closed = false; f.piece = pc.id; }
+  for (const pc of pieces) if (!pc.faces) pc.closed = false;
+  const edgeUse = new Map(sk.e.map(e => [e.id, use.get(ekey(e.a, e.b)) || 0]));
+  return { faces, pieces, comp, loose, edgeUse };
+}
+
+// the boundary of an island of corners: walk it if it's a plain ring, otherwise the biggest flat loop through
+// its corners that has all the rest inside
+function islandLoop(set, adj, cands, P){
+  const nb = id => adj.get(id).filter(y => set.has(y));
+  if ([...set].every(id => nb(id).length === 2)){
+    const s0 = [...set][0], L = [s0];
+    let prev = s0, cur = nb(s0)[0];
+    while (cur !== s0 && L.length <= set.size){ L.push(cur); const nx = nb(cur).find(y => y !== prev); prev = cur; cur = nx; }
+    return L.length === set.size ? L : null;
+  }
+  let best = null, ba = 0;
+  for (const [, ids] of cands){
+    if (!ids.every(id => set.has(id))) continue;
+    const a = planeOf(ids.map(P)).area;
+    if (a > ba){ ba = a; best = ids; }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------- solver
+// o: { iters, flat (0..1), square (bool), squareDeg, floor (bool), floorR, warm: positions to start from, drag: {id: [x,y,z]} }
+function solve(sk, F, o = {}){
+  const iters = o.iters ?? 60, wFlat = (o.flat ?? 1) * 2, wSq = o.square ? 1.2 : 0, cosT = Math.cos((o.squareDeg ?? 10) * Math.PI / 180);
+  const sinT = Math.sin((o.squareDeg ?? 10) * Math.PI / 180);
+  const ids = sk.v.map(v => v.id), A = {}, X = {}, wA = {};
+  for (const v of sk.v){
+    A[v.id] = (o.drag && o.drag[v.id]) || anchorOf(v);
+    wA[v.id] = (o.hold && o.hold.has(v.id)) ? 1e6 : (o.drag && o.drag[v.id]) ? 40 : v.pin ? 4 : 0.6;   // Ply Grammar: o.hold = corners of finished solids, which stay exactly where they are
+    X[v.id] = (o.warm && o.warm[v.id] && !(o.drag && o.drag[v.id])) ? o.warm[v.id].slice() : A[v.id].slice();
+  }
+  // each piece's grid direction in plan: the length-weighted average of its level edges' directions (mod 90°)
+  const yaw = new Map();
+  if (wSq){
+    const acc = new Map();
+    for (const e of sk.e){
+      const d = sub(A[e.b], A[e.a]), h = Math.hypot(d[0], d[2]);
+      if (h < 0.3 * len(d)) continue;
+      const ph = Math.atan2(d[2], d[0]) * 4, c = F.comp.get(e.a), a = acc.get(c) || [0, 0];
+      a[0] += h * Math.cos(ph); a[1] += h * Math.sin(ph); acc.set(c, a);
+    }
+    for (const [c, a] of acc) yaw.set(c, Math.atan2(a[1], a[0]) / 4);
+  }
+  const faces = F.faces.filter(f => !f.open);
+  const byKey = new Map(F.faces.map(f => [f.key, f])), locks = (sk.locks || []).filter(L => lockAlive(L, byKey, X));
+  const lockedV = new Set();
+  for (const L of locks){
+    // a lock that sets a face's or line's direction takes its lines out of Square up (they follow the lock);
+    // one plane / parallel faces and level or floor faces leave Square up to keep them square
+    if (L.mode === 'coplanar' || L.mode === 'parallel' && !L.ea || L.mode === 'level' || L.mode === 'floor') continue;
+    for (const k of [L.f, L.a, L.b]) if (k) for (const id of byKey.get(k).all) lockedV.add(id);
+    for (const e of [L.e, L.ea, L.eb]) if (e) for (const id of e) lockedV.add(id);
+  }
+  const G = {}, W = {};
+  for (let it = 0; it < iters; it++){
+    for (const id of ids){ G[id] = mul(A[id], wA[id]); W[id] = wA[id]; }
+    if (wFlat){
+      for (const f of faces){
+        const pl = planeOf(f.ids.map(id => X[id]));
+        for (const id of f.all){
+          const p = X[id], q = sub(p, mul(pl.n, dot(pl.n, sub(p, pl.c))));
+          G[id] = add(G[id], mul(q, wFlat)); W[id] += wFlat;
+        }
+      }
+    }
+    if (wSq){
+      for (const e of sk.e){
+        if (lockedV.has(e.a) && lockedV.has(e.b)) continue;   // a locked face's own lines follow its lock
+        const a = X[e.a], b = X[e.b], d = sub(b, a), L = len(d);
+        if (!L) continue;
+        const u = mul(d, 1 / L);
+        let t = null;
+        if (Math.abs(u[1]) > cosT) t = [0, Math.sign(u[1]) * L, 0];            // plumb
+        else {
+          let dy = d[1], hx = d[0], hz = d[2], h = Math.hypot(hx, hz), snapped = false;
+          if (Math.abs(u[1]) < sinT){ dy = 0; snapped = true; }                 // level
+          const y0 = yaw.get(F.comp.get(e.a));
+          if (y0 !== undefined && h > 0.2 * L){
+            const ang = Math.atan2(hz, hx), q = Math.PI / 2, k = Math.round((ang - y0) / q), ta = y0 + k * q;
+            if (Math.abs(ang - ta) < (o.squareDeg ?? 10) * Math.PI / 180){ hx = Math.cos(ta) * h; hz = Math.sin(ta) * h; snapped = true; } // on the grid
+          }
+          if (snapped){ const s = L / Math.hypot(hx, dy, hz); t = [hx * s, dy * s, hz * s]; }
+        }
+        if (!t) continue;
+        const m = mul(add(a, b), 0.5);
+        G[e.a] = add(G[e.a], mul(sub(m, mul(t, 0.5)), wSq)); W[e.a] += wSq;
+        G[e.b] = add(G[e.b], mul(add(m, mul(t, 0.5)), wSq)); W[e.b] += wSq;
+      }
+    }
+    if (locks.length) applyLocks(sk, locks, byKey, X, G, W, 30, wSq ? (o.squareDeg ?? 10) : 0);
+    if (o.floor){
+      for (const id of ids){
+        if (A[id][1] < (o.floorR ?? 0.05) && A[id][1] > -(o.floorR ?? 0.05)){ G[id] = add(G[id], mul([X[id][0], 0, X[id][2]], 2)); W[id] += 2; }
+      }
+    }
+    for (const id of ids) X[id] = (o.hold && o.hold.has(id)) ? A[id].slice() : mul(G[id], 1 / W[id]);
+  }
+  hardFlat(faces, X, wA, o.hardIters ?? 400);
+  // locks are firm too: take turns holding them exactly and flattening again, until both settle
+  if (locks.length){
+    for (let r = 0; r < 30; r++){
+      const G2 = {}, W2 = {};
+      for (const id of ids){ G2[id] = [0, 0, 0]; W2[id] = 0; }
+      applyLocks(sk, locks, byKey, X, G2, W2, 1, wSq ? (o.squareDeg ?? 10) : 0);
+      let moved = 0;
+      for (const id of ids) if (W2[id]){ const q = mul(G2[id], 1 / W2[id]); moved = Math.max(moved, dist(q, X[id])); X[id] = q; }
+      hardFlat(faces, X, wA, 60);
+      if (moved < 1e-5) break;
+    }
+  }
+  return X;
+}
+
+// Flat is a rule, not a wish: after the soft pass, every face is projected onto its own plane, one face at a time,
+// over and over, until no corner is more than a hundredth of a millimetre off any of its faces. Each plane passes
+// through its corners' weighted middle, so a corner you're holding (or have placed) barely moves and the others give.
+function hardFlat(faces, X, wt, maxIt){
+  if (!faces.length) return 0;
+  let worst = 0;
+  for (let it = 0; it < maxIt; it++){
+    worst = 0;
+    for (const f of faces){
+      const all = f.all || f.ids, pl = planeOf(f.ids.map(id => X[id]));
+      let c = [0, 0, 0], sw = 0;
+      for (const id of all){ const w = wt ? wt[id] || 1 : 1; c = add(c, mul(X[id], w)); sw += w; }
+      c = mul(c, 1 / sw);
+      for (const id of all){
+        const d = dot(pl.n, sub(X[id], c));
+        if (Math.abs(d) > worst) worst = Math.abs(d);
+        X[id] = sub(X[id], mul(pl.n, d));
+      }
+    }
+    if (worst < 1e-5) break;
+  }
+  return worst;
+}
+
+// How far from flat each face still is (for a little readout), as a share of its size
+function flatness(F, X){
+  let worst = 0;
+  for (const f of F.faces){
+    if (f.open) continue;
+    const pts = f.ids.map(id => X[id]), pl = planeOf(pts);
+    let s = 0; for (let i = 0; i < pts.length; i++) s = Math.max(s, dist(pts[i], pts[(i + 1) % pts.length]));
+    for (const p of f.all.map(id => X[id])) worst = Math.max(worst, Math.abs(dot(pl.n, sub(p, pl.c))) / (s || 1));
+  }
+  return worst;
+}
+
+// ---------------------------------------------------------------- locks
+// A face can be locked Level, Upright, or Held at its tilt; two faces sharing an edge can be locked at an angle
+// (a fixed one, or the nearest of a step like 15°). The angle between two faces is measured inside, across their
+// shared edge: 90° at a box corner, 180° where they carry on flat.
+
+// turn point x about the line through p along unit k by angle a
+function rotAbout(x, p, k, a){
+  const v = sub(x, p), c = Math.cos(a), sn = Math.sin(a);
+  return add(p, add(add(mul(v, c), mul(cross(k, v), sn)), mul(k, dot(k, v) * (1 - c))));
+}
+function sharedEdge(A, B){
+  for (let i = 0; i < A.length; i++){
+    const u = A[i], v = A[(i + 1) % A.length], j = B.indexOf(u);
+    if (j < 0) continue;
+    if (B[(j + 1) % B.length] === v || B[(j - 1 + B.length) % B.length] === v) return [u, v];
+  }
+  return null;
+}
+// the faces' inside directions away from their shared edge, and the angle between them
+function faceAngle(A, B, X){
+  const se = sharedEdge(A, B); if (!se) return null;
+  const p = X[se[0]], q = X[se[1]], e = norm(sub(q, p));
+  const inward = ids => {
+    const pl = planeOf(ids.map(id => X[id])), i = ids.indexOf(se[0]), fwd = ids[(i + 1) % ids.length] === se[1];
+    return norm(cross(pl.n, fwd ? e : mul(e, -1)));   // the inside of a loop is on its left
+  };
+  const dA = inward(A), dB = inward(B);
+  const deg = Math.acos(Math.max(-1, Math.min(1, dot(dA, dB)))) * 180 / Math.PI;
+  const s = Math.sign(dot(e, cross(dA, dB))) || 1;
+  return { deg, se, p, k: mul(e, s), dA, dB };
+}
+function lockTarget(L, deg){
+  if (L.mode === 'step') return Math.max(L.step, Math.min(180, Math.round(deg / L.step) * L.step));
+  return L.deg;
+}
+function orientTarget(L, n){
+  if (L.mode === 'level' || L.mode === 'floor') return [0, n[1] < 0 ? -1 : 1, 0];
+  if (L.mode === 'upright'){ const h = Math.hypot(n[0], n[2]); return h > 1e-6 ? [n[0] / h, 0, n[2] / h] : null; }
+  if (L.mode === 'hold' && L.n) return dot(L.n, n) < 0 ? mul(L.n, -1) : L.n;
+  return null;
+}
+// a lock still applies while what it holds is still there (faces by their corners, lines by their two ends)
+function lockAlive(L, byKey, X){
+  if (L.f) return byKey.has(L.f);
+  if (L.a) return byKey.has(L.a) && byKey.has(L.b);
+  if (L.e) return !!(X[L.e[0]] && X[L.e[1]]);
+  if (L.ea) return !!(X[L.ea[0]] && X[L.ea[1]] && X[L.eb[0]] && X[L.eb[1]]);
+  return false;
+}
+// turn face points P (ids) about centroid c so normal n becomes t
+function turnTo(ids, X, c, n, t, goal){
+  const ax = cross(n, t), sl = len(ax), a = Math.atan2(sl, dot(n, t));
+  for (const id of ids) goal(id, sl > 1e-9 ? rotAbout(X[id], c, mul(ax, 1 / sl), a) : X[id]);
+}
+// a line's two ends set so it runs along t (a unit direction), same length, same middle
+function lineTo(e, X, t, goal){
+  const a = X[e[0]], b = X[e[1]], d = sub(b, a), L = len(d), m = mul(add(a, b), 0.5), tt = dot(t, d) < 0 ? mul(t, -1) : t;
+  goal(e[0], sub(m, mul(tt, L / 2))); goal(e[1], add(m, mul(tt, L / 2)));
+}
+function applyLocks(sk, locks, byKey, X, G, W, w, sqDeg){
+  const goal = (id, p) => { G[id] = add(G[id], mul(p, w)); W[id] += w; };
+  for (const L of locks){
+    if (L.f){
+      const f = byKey.get(L.f), pl = planeOf(f.ids.map(id => X[id])), t = orientTarget(L, pl.n);
+      if (L.mode === 'floor'){ for (const id of f.all) goal(id, [X[id][0], 0, X[id][2]]); continue; }   // lying on the floor
+      if (!t) continue;
+      turnTo(f.all, X, pl.c, pl.n, t, goal);
+    } else if (L.e){
+      // a line held upright or level
+      const d = norm(sub(X[L.e[1]], X[L.e[0]]));
+      if (L.mode === 'upright') lineTo(L.e, X, [0, 1, 0], goal);
+      else { const h = Math.hypot(d[0], d[2]); if (h > 1e-6) lineTo(L.e, X, [d[0] / h, 0, d[2] / h], goal); }
+    } else if (L.ea){
+      // two lines held parallel or square to each other
+      let dA = norm(sub(X[L.ea[1]], X[L.ea[0]])), dB = norm(sub(X[L.eb[1]], X[L.eb[0]]));
+      if (L.mode === 'parallel'){ if (dot(dA, dB) < 0) dB = mul(dB, -1); const t = norm(add(dA, dB)); lineTo(L.ea, X, t, goal); lineTo(L.eb, X, t, goal); }
+      else { const c = dot(dA, dB); lineTo(L.ea, X, norm(sub(dA, mul(dB, c * 0.5))), goal); lineTo(L.eb, X, norm(sub(dB, mul(dA, c * 0.5))), goal); }
+    } else if (L.mode === 'coplanar' || L.mode === 'parallel'){
+      // two faces on one plane, or facing the same way
+      const FA = byKey.get(L.a), FB = byKey.get(L.b), pA = planeOf(FA.ids.map(id => X[id])), pB = planeOf(FB.ids.map(id => X[id]));
+      const nB = dot(pA.n, pB.n) < 0 ? mul(pB.n, -1) : pB.n;
+      let n = norm(add(pA.n, nB));
+      // with Square up on, a shared plane that's nearly level or upright becomes exactly so
+      if (sqDeg){ const sn = Math.sin(sqDeg * Math.PI / 180), h = Math.hypot(n[0], n[2]);
+        if (h < sn) n = [0, Math.sign(n[1]) || 1, 0]; else if (Math.abs(n[1]) < sn) n = [n[0] / h, 0, n[2] / h]; }
+      if (L.mode === 'parallel'){ turnTo(FA.all, X, pA.c, pA.n, n, goal); turnTo(FB.all, X, pB.c, nB, n, goal); continue; }
+      const ids = [...new Set([...FA.all, ...FB.all])];
+      let c = [0, 0, 0]; for (const id of ids) c = add(c, X[id]); c = mul(c, 1 / ids.length);
+      for (const id of ids) goal(id, sub(X[id], mul(n, dot(n, sub(X[id], c)))));
+    } else {
+      const FA = byKey.get(L.a), FB = byKey.get(L.b), g = faceAngle(FA.ids, FB.ids, X);
+      if (!g) continue;
+      const d = (lockTarget(L, g.deg) - g.deg) * Math.PI / 180;
+      // turn both faces about their shared edge, half each, toward the locked angle
+      for (const id of FB.all) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, d / 2));
+      for (const id of FA.all) goal(id, g.se.includes(id) ? X[id] : rotAbout(X[id], g.p, g.k, -d / 2));
+    }
+  }
+}
+// Snap a moved face (targets for its corners) to its locks before the solver sees it, so a locked face clicks
+// into place while you hold it: orientation locks keep its tilt, angle locks swing it about the shared edge.
+function snapHeld(sk, F, key, T, X){
+  const byKey = new Map(F.faces.map(f => [f.key, f])), f = byKey.get(key); if (!f) return T;
+  const P = Object.assign({}, X, T);
+  for (const L of sk.locks || []){
+    if (L.f === key){
+      const pl = planeOf(f.ids.map(id => P[id])), t = orientTarget(L, pl.n); if (!t) continue;
+      const ax = cross(pl.n, t), sl = len(ax);
+      if (sl > 1e-9) for (const id of f.all) if (P[id]) P[id] = rotAbout(P[id], pl.c, mul(ax, 1 / sl), Math.atan2(sl, dot(pl.n, t)));
+      if (L.mode === 'floor') for (const id of f.all) if (P[id]) P[id] = [P[id][0], 0, P[id][2]];   // it slides along the floor
+    } else if ((L.a === key || L.b === key) && byKey.has(L.a) && byKey.has(L.b) && (L.mode === 'fixed' || L.mode === 'step')){
+      const other = byKey.get(L.a === key ? L.b : L.a).ids, g = faceAngle(f.ids, other, P); if (!g) continue;
+      // g is measured from the held face to the other one: turning the held face by -d widens the angle by d
+      const d = (lockTarget(L, g.deg) - g.deg) * Math.PI / 180;
+      for (const id of f.all) if (!g.se.includes(id)) P[id] = rotAbout(P[id], g.p, g.k, -d);
+    }
+  }
+  const out = {}; for (const id in T) out[id] = P[id];
+  return out;
+}
+
+// One call for the app: find faces on the sketch, solve, then look again on the solved shape (catches loops that
+// only came flat once squared up) and solve once more from there.
+function build(sk, o = {}){
+  const anchors = {};
+  for (const v of sk.v) anchors[v.id] = (o.drag && o.drag[v.id]) || anchorOf(v);
+  const fo = { rel: o.rel, minTol: o.minTol };
+  let F = findFaces(sk, o.warm ? Object.assign({}, anchors, pick(o.warm, anchors)) : anchors, fo);
+  let X = solve(sk, F, o);
+  if (o.second !== false){
+    const F2 = findFaces(sk, X, fo);
+    if (F2.faces.length !== F.faces.length || F2.faces.some((f, i) => f.key !== F.faces[i]?.key)){ F = F2; X = solve(sk, F, Object.assign({}, o, { warm: X })); }
+  }
+  return { F, X };
+}
+// Consistent winding for a set of faces; outward when they close up (by signed volume)
+function orient(fs, X){
+  const loops = fs.map(f => f.ids.slice()), done = new Array(fs.length).fill(false);
+  const dirEdges = L => L.map((id, i) => id + '>' + L[(i + 1) % L.length]);
+  const owners = new Map();
+  fs.forEach((f, i) => f.ids.forEach((id, k) => { const o = f.ids[(k + 1) % f.ids.length], key = id < o ? id + '-' + o : o + '-' + id; if (!owners.has(key)) owners.set(key, []); owners.get(key).push(i); }));
+  for (let s0 = 0; s0 < fs.length; s0++){
+    if (done[s0]) continue;
+    done[s0] = true; const q = [s0];
+    while (q.length){
+      const i = q.shift(), mine = new Set(dirEdges(loops[i]));
+      for (const [key, os] of owners){
+        if (!os.includes(i)) continue;
+        for (const j of os){
+          if (j === i || done[j]) continue;
+          // if j runs the shared edge the same way as i, flip j
+          if (dirEdges(loops[j]).some(d => mine.has(d))) loops[j].reverse();
+          done[j] = true; q.push(j);
+        }
+      }
+    }
+  }
+  let vol = 0;
+  for (const L of loops){ const p0 = X[L[0]]; for (let i = 1; i < L.length - 1; i++) vol += dot(p0, cross(X[L[i]], X[L[i + 1]])); }
+  if (vol < 0) loops.forEach(L => L.reverse());
+  return loops;
+}
+function pick(warm, anchors){ const r = {}; for (const k in anchors) if (warm[k]) r[k] = warm[k]; return r; }
+
+function toOBJ(sk, F, X, scale = 1, tri){
+  const ids = sk.v.map(v => v.id), idx = new Map(ids.map((id, i) => [id, i + 1]));
+  let s = '# Edgewise XR\n';
+  for (const id of ids){ const p = X[id]; s += `v ${(p[0] * scale).toFixed(5)} ${(-p[2] * scale).toFixed(5)} ${(p[1] * scale).toFixed(5)}\n`; }
+  const byPiece = new Map();
+  for (const f of F.faces){ if (f.open) continue; if (!byPiece.has(f.piece)) byPiece.set(f.piece, []); byPiece.get(f.piece).push(f); }
+  let n = 0;
+  for (const [pc, fs] of byPiece){
+    // wind every face the same way round (neighbours run a shared edge in opposite directions), facing out
+    const loops = orient(fs, X);
+    fs.forEach((f, i) => f._loop = loops[i]);
+    s += `o ${F.pieces[pc].closed ? 'Solid' : 'Surface'}_${++n}\n`;
+    for (const f of fs){
+      if (f.holes && f.holes.length && tri){
+        // a face with a hole goes out as triangles (OBJ faces can't have holes), wound like its rim
+        const n = planeOf(f._loop.map(id => X[id])).n;
+        for (const t of tri(f)){ const c = cross(sub(X[t[1]], X[t[0]]), sub(X[t[2]], X[t[0]])); const tt = dot(c, n) < 0 ? [t[0], t[2], t[1]] : t; s += 'f ' + tt.map(id => idx.get(id)).join(' ') + '\n'; }
+      } else s += 'f ' + f._loop.map(id => idx.get(id)).join(' ') + '\n';
+    }
+  }
+  return s;
+}
+
+return {V,fitLine,emptySketch,clone,anchorOf,snapEnd,addStroke,removeEdges,mergeVerts,weld,splitEdgeAt,removeVert,extrude,cleanup,findFaces,solve,hardFlat,flatness,rotAbout,sharedEdge,faceAngle,lockTarget,lockAlive,snapHeld,build,orient,toOBJ,faceKey,planeOf,basis};})();
 /* ---------------- CNC toolpaths, following the Grasshopper steps:
    offset to bit center -> find inside/outside corners -> dog-ear spike on inside corners -> chamfer outside corners ---------------- */
 function toolpaths(contours,mc){
@@ -793,6 +1639,7 @@ function poseIn(obj){world.updateMatrixWorld(true);obj.updateWorldMatrix(true,fa
   const m=_wi.clone().multiply(obj.matrixWorld),p=new V(),q=new Q(),s=new V();m.decompose(p,q,s);return {p,q}}
 function blockPlanes(b){
   if(b.planes)return b.planes;
+  if(b.sk){const C=skPieces(b);return C.length===1?C[0]:[]}
   const {p:c,q}=poseIn(b.pivot),s=b.sizer.scale;
   const P=[[1,0,0,s.x],[-1,0,0,s.x],[0,1,0,s.y],[0,-1,0,s.y],[0,0,1,s.z],[0,0,-1,s.z]].map(([x,y,z,w])=>{
     const n=new V(x,y,z).applyQuaternion(q);return {n,d:n.dot(c.clone().addScaledVector(n,w/2))}});
@@ -812,8 +1659,8 @@ function carvePlanes(cv){const {p:c,q}=poseIn(cv),s=cv.userData.sizer.scale,W=[s
     return {n,d:n.dot(pv),id:cv.userData.cid+i,src:{type:'carve',carve:cv,i}}})}
 function pieceDepth(P){const F=solidFaces(P);if(F.length<4)return 0;const V_=F.flatMap(f=>f.poly);let m=Infinity;
   for(const f of F){let mx=0;for(const v of V_)mx=Math.max(mx,f.pl.d-f.pl.n.dot(v));m=Math.min(m,mx)}return m}
-function piecesOf(b){const base=blockPlanes(b);b.carveWarn=false;if(!b.carves?.length)return [base];
-  const minD=thkModel()*2.5;let pieces=[base];
+function piecesOf(b){const base=blockPlanes(b),many=b.sk&&!base.length?skPieces(b):null;b.carveWarn=false;if(!b.carves?.length)return many||[base];
+  const minD=thkModel()*2.5;let pieces=many||[base];
   for(const cv of b.carves){const C=carvePlanes(cv),next=[];
     for(const Q of pieces){if(pieceDepth([...Q,...C])<.05){next.push(Q);continue}
       C.forEach((h,i)=>{const P=[...Q,{n:h.n.clone().negate(),d:-h.d,id:h.id+'o',src:h.src},...C.slice(0,i).map(g=>({n:g.n.clone(),d:g.d,id:g.id+'i',src:{...g.src,split:true}}))];
@@ -821,8 +1668,98 @@ function piecesOf(b){const base=blockPlanes(b);b.carveWarn=false;if(!b.carves?.l
         const F=solidFaces(P);next.push(P.filter(pl=>F.some(f=>f.pl===pl)))})}
     pieces=next}
   return pieces}
+var SK=EW.emptySketch(),SKF=null,SKX={},skBusy=false,skStale=false,skG=null,skNewBlock=null,skMarkV=new Set(),skMarkE=new Set(),skM=new THREE.Matrix4(),skQ=new THREE.Quaternion(),skUp=new V(0,1,0);
+/* ---------------- sketched solids ----------------
+   A block can be a shape drawn edge by edge (Edgewise) instead of a box: b.sk holds its corners (V, in the block's own space, so
+   the block still moves and turns as one thing) and its flat faces (F, each a loop of corner ids). The solid is handed to the rest
+   of the app as convex pieces, the same way a box with cut-outs is: the faces' own planes slice the space around the shape into
+   cells, and the cells that lie inside it are the pieces. A shape with no dents comes out as one piece and is built like a plain box. */
+const skV=a=>new V(a[0],a[1],a[2]);
+function skNewell(P){const n=new V();for(let i=0;i<P.length;i++){const a=P[i],c=P[(i+1)%P.length];n.x+=(a.y-c.y)*(a.z+c.z);n.y+=(a.z-c.z)*(a.x+c.x);n.z+=(a.x-c.x)*(a.y+c.y)}return n}
+/* faces that share an edge make a shell; each shell's loops are wound so they face out. null when a shell is not closed. */
+function skShells(sk){if(sk._sh!==undefined)return sk._sh;const F=sk.F,par=F.map((_,i)=>i),root=i=>par[i]===i?i:(par[i]=root(par[i])),own=new Map(),ek=(a,c)=>a<c?a+'-'+c:c+'-'+a;
+  F.forEach((f,i)=>f.ids.forEach((a,k)=>{const key=ek(a,f.ids[(k+1)%f.ids.length]);if(own.has(key))par[root(i)]=root(own.get(key));else own.set(key,i)}));
+  const groups=new Map();F.forEach((f,i)=>{const r=root(i);if(!groups.has(r))groups.set(r,[]);groups.get(r).push(f)});const out=[];
+  for(const fs of groups.values()){if(fs.length<4)continue;const use=new Map();fs.forEach(f=>f.ids.forEach((a,k)=>{const key=ek(a,f.ids[(k+1)%f.ids.length]);use.set(key,(use.get(key)||0)+1)}));
+    if([...use.values()].some(u=>u!==2))continue;
+    const loops=EW.orient(fs,sk.V);out.push(fs.map((f,i)=>{const pts=loops[i].map(id=>skV(sk.V[id])),n=skNewell(pts).normalize();for(const k of ['x','y','z'])if(Math.abs(n[k])<2e-5)n[k]=0;n.normalize();const d=pts.reduce((s,p)=>s+n.dot(p),0)/pts.length;return {key:f.key,ids:loops[i],pts,n,d}}))}
+  return sk._sh=out.length?out:null}
+/* Tidy a finished solid, the way a carpenter reads a sketch: faces drawn nearly parallel become parallel, nearly upright ones upright,
+   nearly level ones level, walls nearly square to the biggest wall become square to it, a foot near the floor sits on the floor, and
+   (with Snap on) sizes land on whole inches and slopes on whole degrees. The biggest face of each kind is the one the others follow,
+   so tidying twice changes nothing. fs: every face of the solid {ids,pts,n,d}. Returns the new corners {id:V3}, or null to leave it. */
+function skTidy(fs,o){const area=f=>skNewell(f.pts).length()/2,F=fs.slice().sort((a,c)=>area(c)-area(a)),cl=[],rad=Math.PI/180;
+  /* families of faces that point the same way (either way round) */
+  for(const f of F){let c=cl.find(c=>Math.abs(c.u.dot(f.n))>Math.cos(2.5*rad));if(!c){c={u:f.n.clone(),pl:[]};cl.push(c)}const sg=c.u.dot(f.n)>0?1:-1;
+    let p=c.pl.find(p=>f.pts.every(q=>Math.abs(c.u.dot(q)-p.t)<.08));if(!p){p={t:f.pts.reduce((s,q)=>s+c.u.dot(q),0)/f.pts.length,a:0};c.pl.push(p)}p.a+=area(f);f._c=c;f._p=p;f._sg=sg}
+  let yaw=null;if(o.square){
+    for(const c of cl){const u=c.u;if(Math.abs(u.y)>Math.cos(2.5*rad)){u.set(0,Math.sign(u.y),0);continue}                       /* level */
+      let tilt=Math.asin(Math.max(-1,Math.min(1,u.y))),th=Math.atan2(u.z,u.x);if(Math.abs(tilt)<2.5*rad)tilt=0;   /* upright */
+      if(yaw===null){yaw=th;if(o.grid){const s=15*rad,r=Math.round(yaw/s)*s;if(Math.abs(yaw-r)<3*rad)yaw=r}th=yaw}
+      else{const q=Math.PI/2,r=yaw+Math.round((th-yaw)/q)*q;if(Math.abs(th-r)<3.5*rad)th=r}                                      /* square to the biggest wall */
+      u.set(Math.cos(th)*Math.cos(tilt),Math.sin(tilt),Math.sin(th)*Math.cos(tilt)).normalize()}}
+  for(const c of cl){const P=c.pl;P.forEach(p=>p.t0=p.t);const base=P.reduce((a,p)=>p.a>a.a?p:a,P[0]),g=o.grid||0;
+    if(o.square&&c.u.y!==0&&Math.abs(Math.abs(c.u.y)-1)<1e-9){const low=P.reduce((a,p)=>p.t*c.u.y<a.t*c.u.y?p:a,P[0]);if(Math.abs(low.t)<(o.floorR||0)){low.t=0;low.fix=true}}
+    const ref=P.find(p=>p.fix)||base;if(g&&!ref.fix&&Math.abs(Math.abs(c.u.y)-1)<1e-9)ref.t=Math.round(ref.t/g)*g;
+    for(const p of P){if(p===ref)continue;const gap=p.t0-ref.t0;p.t=ref.t+(g&&Math.abs(Math.round(gap/g))>=1?Math.round(gap/g)*g:gap)}
+    /* two faces must never land on top of each other */
+    const s=P.slice().sort((a,c)=>a.t0-c.t0);for(let i=1;i<s.length;i++)if(s[i].t-s[i-1].t<.25)return null}
+  const ids=[...new Set(fs.flatMap(f=>f.ids))],at=new Map(),out={};fs.forEach(f=>f.ids.forEach((id,i)=>at.set(id,f.pts[i])));
+  for(const id of ids){const x0=at.get(id),e=1e-6,a=[[e,0,0],[0,e,0],[0,0,e]],r=[x0.x*e,x0.y*e,x0.z*e],seen=new Set();
+    for(const f of fs){if(!f.ids.includes(id)||seen.has(f._p))continue;seen.add(f._p);const n=[f._c.u.x,f._c.u.y,f._c.u.z],d=f._p.t;for(let i=0;i<3;i++){r[i]+=d*n[i];for(let j=0;j<3;j++)a[i][j]+=n[i]*n[j]}}
+    const m=new THREE.Matrix3().set(...a[0],...a[1],...a[2]);if(Math.abs(m.determinant())<1e-30)return null;out[id]=new V(...r).applyMatrix3(m.invert());
+    if(out[id].distanceTo(x0)>(o.maxMove||3))return null}
+  const sound=X=>fs.every(f=>f.ids.every((a,i)=>{const c=f.ids[(i+1)%f.ids.length],was=f.pts[(i+1)%f.pts.length].clone().sub(f.pts[i]),now=X[c].clone().sub(X[a]);return now.length()>=.5&&was.dot(now)>0}));
+  if(!sound(out))return null;
+  /* Snap on: every corner on a whole inch, measured along the solid's own walls from its lowest corner; a slope then has a whole-inch
+     rise and run. Kept only when every face is still flat afterwards (a face with no two parallel edges may not be). */
+  if(o.grid&&o.square){const g=o.grid,th=yaw||0,ex=new V(Math.cos(th),0,Math.sin(th)),ez=new V(-Math.sin(th),0,Math.cos(th));let a0=1e9,b0=1e9;for(const id of ids){a0=Math.min(a0,out[id].dot(ex));b0=Math.min(b0,out[id].dot(ez))}
+    const X={};for(const id of ids){const p=out[id],a=a0+Math.round((p.dot(ex)-a0)/g)*g,b=b0+Math.round((p.dot(ez)-b0)/g)*g;X[id]=ex.clone().multiplyScalar(a).addScaledVector(ez,b).setY(Math.round(p.y/g)*g)}
+    const flat=fs.every(f=>{const P=f.ids.map(id=>X[id]),n=skNewell(P).normalize(),d=P.reduce((s_,q)=>s_+n.dot(q),0)/P.length;return P.every(q=>Math.abs(n.dot(q)-d)<1e-4)});
+    if(flat&&sound(X))return X}
+  return out}
+function skInside(shells,X){const D=new V(.5377,.7071,.4591).normalize();
+  for(const fs of shells){let hits=0;for(const f of fs){const den=f.n.dot(D);if(Math.abs(den)<1e-9)continue;const tt=(f.d-f.n.dot(X))/den;if(tt<=0)continue;const H=X.clone().addScaledVector(D,tt);
+      /* point in polygon, in the face's own flat coordinates */
+      const u=f.pts[1].clone().sub(f.pts[0]).normalize(),v=new V().crossVectors(f.n,u),q=H.clone().sub(f.pts[0]),x=q.dot(u),y=q.dot(v);let ins=false;
+      for(let i=0,j=f.pts.length-1;i<f.pts.length;j=i++){const a=f.pts[i].clone().sub(f.pts[0]),c=f.pts[j].clone().sub(f.pts[0]),ax=a.dot(u),ay=a.dot(v),cx=c.dot(u),cy=c.dot(v);
+        if((ay>y)!==(cy>y)&&x<(cx-ax)*(y-ay)/(cy-ay)+ax)ins=!ins}
+      if(ins)hits++}
+    if(hits%2)return true}
+  return false}
+function skClipArea(pts,n,cell,eps){let P=pts;for(const pl of cell){if(pl.n.dot(n)>.999999||pl.n.dot(n)<-.999999)continue;const out=[];
+    for(let i=0;i<P.length;i++){const a=P[i],c=P[(i+1)%P.length],fa=pl.n.dot(a)-pl.d+eps,fc=pl.n.dot(c)-pl.d+eps;if(fa<=0)out.push(a);if((fa<0&&fc>0)||(fa>0&&fc<0))out.push(a.clone().lerp(c,fa/(fa-fc)))}
+    P=out;if(P.length<3)return 0}
+  return Math.abs(skNewell(P).dot(n))/2}
+function skCells(b){const sk=b.sk;if(sk._cells)return sk._cells;const shells=skShells(sk);if(!shells)return sk._cells=[];
+  const faces=shells.flat().sort((a,c)=>skNewell(c.pts).length()-skNewell(a.pts).length()),planes=[];
+  for(const f of faces){let pl=planes.find(p=>Math.abs(p.n.dot(f.n))>1-2e-5&&f.pts.every(q=>Math.abs(p.n.dot(q)-p.d)<.03));if(!pl){pl={n:f.n.clone(),d:f.d,faces:[],ids:{}};planes.push(pl)}
+    const sg=pl.n.dot(f.n)>0?1:-1;f.sg=sg;pl.faces.push(f);const id='k'+f.key.replace(/\./g,'_');if(!pl.ids[sg]||id<pl.ids[sg]){pl.ids[sg]=id;pl['key'+sg]=f.key}}
+  const mn=new V(1e9,1e9,1e9),mx=new V(-1e9,-1e9,-1e9);faces.forEach(f=>f.pts.forEach(p=>{mn.min(p);mx.max(p)}));
+  let cells=[[[1,0,0,mx.x+1],[-1,0,0,1-mn.x],[0,1,0,mx.y+1],[0,-1,0,1-mn.y],[0,0,1,mx.z+1],[0,0,-1,1-mn.z]].map(([x,y,z,d],i)=>({n:new V(x,y,z),d,id:'bb'+i,src:{type:'sk',split:true}}))];
+  const side=(pl,sg)=>pl.ids[sg]?{n:pl.n.clone().multiplyScalar(sg),d:pl.d*sg,id:pl.ids[sg],src:{type:'sk',key:pl['key'+sg]}}:{n:pl.n.clone().multiplyScalar(sg),d:pl.d*sg,id:pl.ids[-sg]+'i',src:{type:'sk',key:pl['key'+(-sg)],split:true}};
+  /* the biggest faces slice first, so a plain shape separates from the space around it in a few clean cuts */
+  planes.sort((a,c)=>c.faces.reduce((s,f)=>s+skNewell(f.pts).length(),0)-a.faces.reduce((s,f)=>s+skNewell(f.pts).length(),0));
+  for(const pl of planes){const next=[];for(const cell of cells){if(next.length>600){next.push(cell);continue}
+      if(pl.faces.some(f=>skClipArea(f.pts,f.n,cell,.02)>.05)){const A=[...cell,side(pl,1)],B=[...cell,side(pl,-1)];if(pieceDepth(A)>.02)next.push(A);if(pieceDepth(B)>.02)next.push(B)}else next.push(cell)}
+    cells=next}
+  const out=[];for(const cell of cells){const F=solidFaces(cell);if(F.length<4)continue;const c=new V();let n=0;F.forEach(f=>f.poly.forEach(p=>{c.add(p);n++}));c.multiplyScalar(1/n);
+    if(!skInside(shells,c))continue;out.push(cell.filter(pl=>F.some(f=>f.pl===pl)))}
+  /* neighbouring cells that together still have no dent become one again (fewer, bigger pieces build better) */
+  for(let again=true;again&&out.length>1;){again=false;
+    for(let i=0;i<out.length&&!again;i++)for(let j=i+1;j<out.length&&!again;j++){const A=out[i],B=out[j],wall=A.find(p=>B.some(q=>q.n.dot(p.n)<-1+1e-7&&Math.abs(q.d+p.d)<2e-3));if(!wall)continue;
+        const back=B.find(q=>q.n.dot(wall.n)<-1+1e-7&&Math.abs(q.d+wall.d)<2e-3),same=(p,q)=>p.n.dot(q.n)>1-1e-7&&Math.abs(p.d-q.d)<2e-3,U=[];
+        for(const p of [...A.filter(p=>p!==wall),...B.filter(q=>q!==back)])if(!U.some(q=>same(p,q)))U.push(p);
+        const FU=solidFaces(U);if(FU.length<4)continue;const vol=P=>{const F=solidFaces(P);let v=0;for(const f of F)for(let k=1;k<f.poly.length-1;k++)v+=f.poly[0].dot(new V().crossVectors(f.poly[k],f.poly[k+1]));return Math.abs(v)/6};
+        if(Math.abs(vol(U)-vol(A)-vol(B))>1e-3*Math.max(1,vol(U)))continue;out[i]=U.filter(pl=>FU.some(f=>f.pl===pl));out.splice(j,1);again=true}}
+  return sk._cells=out}
+/* the pieces where the block now stands (model space), each also trimmed by the block's cut planes */
+function skPieces(b){const {p,q}=poseIn(b.pivot),cuts=b.cuts.map(cut=>{const cp=poseIn(cut),n=new V(0,0,1).applyQuaternion(cp.q).normalize();return {n,d:n.dot(cp.p),id:cut.userData.cid,src:{type:'cut',cut}}});
+  const out=[];for(const cell of skCells(b)){const P=cell.map(pl=>{const n=pl.n.clone().applyQuaternion(q);return {n,d:pl.d+n.dot(p),id:pl.id,src:pl.src}});
+    if(!cuts.length){out.push(P);continue}const all=[...P,...cuts],F=solidFaces(all);if(F.length>=4&&pieceDepth(all)>.05)out.push(all.filter(pl=>F.some(f=>f.pl===pl)))}
+  return out}
 const pieceName=(b,k,n)=>n>1?b.name+letter(k).toLowerCase():b.name;
-const pseudo=(b,P,k,n)=>({name:pieceName(b,k,n),pivot:b.pivot,sizer:b.sizer,edgeOpts:b.edgeOpts,cuts:b.cuts,planes:P,ribMax:b.ribMax,cleatEdit:b.cleatEdit,screwEdit:b.screwEdit,parent:b});
+const pseudo=(b,P,k,n)=>({name:pieceName(b,k,n),pivot:b.pivot,sizer:b.sizer,sk:b.sk,edgeOpts:b.edgeOpts,cuts:b.cuts,planes:P,ribMax:b.ribMax,ribAxis:b.ribAxis,cleatEdit:b.cleatEdit,screwEdit:b.screwEdit,parent:b});
 
 /* ---------------- carved obstacles: one continuous shell ----------------
    The convex pieces from piecesOf() describe the solid. Its outside skin is found plane by plane: on each plane, the faces
@@ -1168,8 +2105,8 @@ function panelizeShell(b,name,B){const mtV=[];
   /* ---- ribs: sections of the inside of the shell ---- */
   if(S.ribs){
     const q=poseIn(b.pivot).q,s=b.sizer.scale,vpAll=F.flatMap(f=>f.E.map(e=>e.A));
-    const first=S.ribAxis==='vertical'?new V(0,1,0):((s.x>=s.z)===(S.ribAxis!=='short')?new V(1,0,0):new V(0,0,1));
-    const fams=[first];if(S.waffle&&S.ribAxis!=='vertical')fams.push(first.x?new V(0,0,1):new V(1,0,0));
+    const first=(b.ribAxis||S.ribAxis)==='vertical'?new V(0,1,0):((s.x>=s.z)===((b.ribAxis||S.ribAxis)!=='short')?new V(1,0,0):new V(0,0,1));
+    const fams=[first];if(S.waffle&&(b.ribAxis||S.ribAxis)!=='vertical')fams.push(first.x?new V(0,0,1):new V(1,0,0));
     const ribs=[];
     const section=(axis,d)=>{const O=axis.clone().multiplyScalar(d),u=anyPerp(axis),v=new V().crossVectors(axis,u),r2=X=>{const w=X.clone().sub(O);return [w.dot(u),w.dot(v)]};
       const outer=[];for(const P of B.pieces){const p=polygonOnPlane({n:axis,d},P,1000);if(p&&p.length>2)outer.push(c2path(posC(p.map(r2))))}
@@ -1642,7 +2579,7 @@ function mergeSplices(ps){const out=[],by={};
    shape by no more than the strip is wide. If it would change more, the strip stays and is reported instead. */
 function polyWidth(poly,n){let w=Infinity;for(let i=0;i<poly.length;i++){const a=poly[i],e=poly[(i+1)%poly.length].clone().sub(a);if(e.lengthSq()<1e-9)continue;
     const m=new V().crossVectors(n,e).normalize();let hi=0;for(const p of poly)hi=Math.max(hi,Math.abs(p.clone().sub(a).dot(m)));w=Math.min(w,hi)}return w}
-function buildablePlanes(b){let P=blockPlanes(b).slice();b.softened=[];b.strips=[];const t=thkModel(),minW=2.5*t,keep=new Set();
+function buildablePlanes(b){let P=blockPlanes(b).slice();b.softened=[];b.strips=[];if(b.sk&&!P.length)return P;const t=thkModel(),minW=2.5*t,keep=new Set();
   /* what is left of a face once each edge steps back for its joint (a shallow fold steps back a long way) */
   const core=(f,FS)=>{const n=f.pl.n,p0=f.poly[0],u=f.poly[1].clone().sub(p0).normalize(),v=new V().crossVectors(n,u),to=X=>{const q=X.clone().sub(p0);return [q.dot(u),q.dot(v)]};let q2=f.poly.map(to);if(areaF(q2)<0)q2.reverse();
     const src=q2.slice();for(let i=0;i<src.length&&q2.length>2;i++){const a=src[i],c=src[(i+1)%src.length],L=Math.hypot(c[0]-a[0],c[1]-a[1]);if(L<1e-6)continue;const A3=p0.clone().addScaledVector(u,a[0]).addScaledVector(v,a[1]),C3=p0.clone().addScaledVector(u,c[0]).addScaledVector(v,c[1]);
@@ -1747,8 +2684,8 @@ function panelize(b,name){const mtV=[];
     const m=[-(c[1]-a[1])/l,(c[0]-a[0])/l];for(const p of R)if(dot(sub(p,a),m)<(f.s[q]||0)+extra)return false}return true};
   if(S.ribs){
     const q=poseIn(b.pivot).q,s=b.sizer.scale,inner=F.map(f=>({n:f.n,d:f.pl.d-t,f})),vpAll=F.flatMap(f=>f.poly);
-    const first=S.ribAxis==='vertical'?new V(0,1,0):((s.x>=s.z)===(S.ribAxis!=='short')?new V(1,0,0):new V(0,0,1));
-    const fams=[first];if(S.waffle&&S.ribAxis!=='vertical')fams.push(first.x?new V(0,0,1):new V(1,0,0));
+    const first=(b.ribAxis||S.ribAxis)==='vertical'?new V(0,1,0):((s.x>=s.z)===((b.ribAxis||S.ribAxis)!=='short')?new V(1,0,0):new V(0,0,1));
+    const fams=[first];if(S.waffle&&(b.ribAxis||S.ribAxis)!=='vertical')fams.push(first.x?new V(0,0,1):new V(1,0,0));
     const ribs=[];
     const famI=fams.map(la=>{const axis=la.clone().applyQuaternion(q).normalize(),vp=vpAll.map(p=>p.dot(axis)),mn=Math.min(...vp),mx=Math.max(...vp),L=mx-mn,nR=Math.max(0,Math.ceil(L/(b.ribMax||S.ribMax)-1e-6)-1);return {axis,vp,mn,nR,step:L/(nR+1)}});
     const ribAt=ribSpots(F.map(f=>({n:f.n,poly:f.poly})),famI,t);
@@ -2078,11 +3015,13 @@ function makeBlock(d){
   b.mesh.userData.pick=b;b.lines=new THREE.LineSegments(new THREE.BufferGeometry(),new THREE.LineBasicMaterial({color:0x15181d,transparent:true,opacity:.55}));
   massGroup.add(b.mesh,b.lines);blocks.push(b);
   b.edgeOpts=d.edgeOpts?JSON.parse(JSON.stringify(d.edgeOpts)):{};
-  if(d.ribMax)b.ribMax=d.ribMax;if(d.glueRibs)b.glueRibs=true;if(d.useAs)b.useAs={...d.useAs};if(d.forceSplit)b.forceSplit={...d.forceSplit};if(d.cleatEdit)b.cleatEdit=JSON.parse(JSON.stringify(d.cleatEdit));if(d.screwEdit)b.screwEdit=JSON.parse(JSON.stringify(d.screwEdit));(d.carves||[]).forEach(c=>makeCarve(b,c));
+  if(d.sk){b.sk={V:JSON.parse(JSON.stringify(d.sk.V)),F:d.sk.F.map(f=>({key:f.key,ids:f.ids.slice()}))};skAdopt(b)}
+  if(d.ribMax)b.ribMax=d.ribMax;if(d.ribAxis)b.ribAxis=d.ribAxis;if(d.glueRibs)b.glueRibs=true;if(d.useAs)b.useAs={...d.useAs};if(d.forceSplit)b.forceSplit={...d.forceSplit};if(d.cleatEdit)b.cleatEdit=JSON.parse(JSON.stringify(d.cleatEdit));if(d.screwEdit)b.screwEdit=JSON.parse(JSON.stringify(d.screwEdit));(d.carves||[]).forEach(c=>makeCarve(b,c));
   (d.cuts||[]).forEach(c=>{let cut;if(c.q){cut=makeCut(b,new V(...c.p),new V(0,0,1));cut.quaternion.fromArray(c.q)}else cut=makeCut(b,new V(...c.p),new V(...c.n));if(c.cid)cut.userData.cid=c.cid});
   updateMass(b);return b;
 }
 function updateMass(b){
+  if(b.sk&&!skBusy)skWriteBack(b);
   const B=brepOf(b),pos=[],ln=[];b.pieces=null;let F;
   if(B){/* carved: draw the shell's real faces, holes and all */
     F=B.faces.map(f=>{const P3=([x,y])=>f.O.clone().addScaledVector(f.u,x).addScaledVector(f.v,y),outer=f.cts[0],holes=f.cts.slice(1);
@@ -2096,7 +3035,10 @@ function updateMass(b){
   b.lines.geometry.dispose();b.lines.geometry=new THREE.BufferGeometry();b.lines.geometry.setAttribute('position',new THREE.Float32BufferAttribute(ln,3));
   if(S.secOn&&typeof secMarks!=='undefined'&&view==='mass')updateSection();
 }
-function removeBlock(b){dropGroup(b);if(tc.object&&tc.object.userData.block===b)tc.detach();world.remove(b.pivot);massGroup.remove(b.mesh,b.lines);blocks.splice(blocks.indexOf(b),1);
+function removeBlock(b,keepLines){dropGroup(b);if(tc.object&&tc.object.userData.block===b)tc.detach();world.remove(b.pivot);massGroup.remove(b.mesh,b.lines);blocks.splice(blocks.indexOf(b),1);
+  /* deleting a sketched block takes its lines out of the sketch too */
+  if(b.sk&&keepLines!==true&&!restoring&&!skBusy){const ids=new Set(Object.keys(b.sk.V).map(Number));EW.removeEdges(SK,SK.e.filter(e=>ids.has(e.a)&&ids.has(e.b)).map(e=>e.id));const alive=new Set(SK.v.map(v=>v.id));for(const id in SKX)if(!alive.has(+id))delete SKX[id];skRefind()}
+
   blocks.forEach((x,i)=>{x.color=BLOCK_PAL[i%BLOCK_PAL.length];x.mesh.material.color.set(x.color)})}
 
 /* ---------------- panel meshes with V-groove engraving ---------------- */
@@ -2228,7 +3170,7 @@ function panelObject(p,b){
 /* ---------------- rebuild ---------------- */
 let lastPanels=[],allScrews=[],allFixes=[];
 const PERF={};
-const XR={step:null,base:null,floorH:0,hover:-1,W:[],navN:0,nav:null,price:null};   /* headset state (the code is in the VR / XR section) */
+const XR={tool:'push',step:null,base:null,floorH:0,hover:-1,W:[],navN:0,nav:null,price:null};   /* headset state (the code is in the VR / XR section) */
 /* ---------------- keeping things up to date, cheaply ----------------
    Each box remembers its panelized result until the box or a build setting really changes, so an edit only reworks the box you touched.
    Panel meshes are only made for the Panels view, sheets are only nested when a price or the Sheets view needs them, and in the
@@ -2237,7 +3179,9 @@ const DISPLAY_KEYS=new Set(['secQ','showScrews','tipOpen','sandSet','cncDef2','r
 const cfgSig=()=>JSON.stringify(Object.keys(S).filter(k=>!DISPLAY_KEYS.has(k)).sort().map(k=>[k,S[k]]));
 let dirty=true,meshDirty=true;
 function dropGroup(b){const g=b._grp;if(!g)return;panelGroup.remove(g);g.traverse(x=>{x.geometry?.dispose();x.userData.stencilGeo?.dispose();x.material?.dispose?.()});b._grp=null}
-function rebuild(){if(gapMesh)clearGaps();if(typeof selScrew!=='undefined'&&selScrew&&!scDrag){selScrew=null;selScrews.length=0;scShow()}const _t0=performance.now();let _tp=0;dirty=false;
+function rebuild(){/* drawn solids that were moved, pushed or copied: see again which of them now touch and build as one */
+  if(skStale&&!pushDrag&&!hDrag&&!tc.dragging&&!ctrls.some(c=>c.userData.skGrab||c.userData.push||c.userData.hd||c.userData.grab)){skRefind();renderModelPanel()}
+  if(gapMesh)clearGaps();if(typeof selScrew!=='undefined'&&selScrew&&!scDrag){selScrew=null;selScrews.length=0;scShow()}const _t0=performance.now();let _tp=0;dirty=false;
   lastPanels=[];allScrews=[];allFixes=[];const cfg=cfgSig();
   blocks.forEach(b=>{const sig=JSON.stringify({...serBlock(b),useAs:undefined})+cfg;
     if(b._sig!==sig||!b._res){let res={panels:[],screws:[],sd:.1,sLen:1,joints:[],planes:[]};const _a=performance.now();try{res=panelizeBlock(b)}catch(e){console.error(e)}_tp+=performance.now()-_a;
@@ -2865,11 +3809,12 @@ function rayParam(e,P0,n){const r=renderer.domElement.getBoundingClientRect();mo
   const w=P0.clone().sub(o),b_=n.dot(d),den=1-b_*b_;if(den<1e-4)return null;return (b_*w.dot(d)-w.dot(n))/den}
 /* shared by mouse and headset: start a push on face h, then move it by dl inches */
 function startPush(h,t0){const src=h.f.pl.src;if(!src||src.split)return null;const b=h.b,cut=src.type==='cut'?src.cut:null,cv=src.type==='carve'?src.carve:null,bi=src.type==='box'?src.i:-1;
-  return {...h,cut,cv,ci:cv?src.i:-1,bi,n:h.f.pl.n.clone(),s0:b.sizer.scale.clone(),p0:b.pivot.position.clone(),c0:cut?cut.position.clone():null,
+  return {...h,skKey:src.type==='sk'?src.key:null,skV0:b.sk?JSON.stringify(b.sk.V):null,cut,cv,ci:cv?src.i:-1,bi,n:h.f.pl.n.clone(),s0:b.sizer.scale.clone(),p0:b.pivot.position.clone(),c0:cut?cut.position.clone():null,
     v0:cv?{p:cv.position.clone(),s:cv.userData.sizer.scale.clone()}:null,kids0:[...b.cuts,...b.carves].map(c=>c.position.clone()),t0,moved:false}}
 function pushTo(d,dl){if(snap)dl=Math.round(dl);if(Math.abs(dl)>0)d.moved=true;
   const b=d.b,ax=['x','y','z'];let msg;
-  if(d.cut){const nl=new V(0,0,1).applyQuaternion(d.cut.quaternion);d.cut.position.copy(d.c0).addScaledVector(nl,dl);msg=`Cut ${b.cuts.indexOf(d.cut)+1}: ${dl>0?'+':''}${+dl.toFixed(2)}"`}
+  if(d.skKey){b.sk={V:JSON.parse(d.skV0),F:b.sk.F};if(dl&&!skPushFace(b,d.skKey,dl))msg='That is as far as this face goes.';else msg=`${b.name} face: ${dl>0?'+':''}${+dl.toFixed(2)}"`;skFit(b)}
+  else if(d.cut){const nl=new V(0,0,1).applyQuaternion(d.cut.quaternion);d.cut.position.copy(d.c0).addScaledVector(nl,dl);msg=`Cut ${b.cuts.indexOf(d.cut)+1}: ${dl>0?'+':''}${+dl.toFixed(2)}"`}
   else if(d.cv){/* pulling a carved face outward shrinks the cut-out; its far face stays put */
     const k=ax[d.ci>>1],ns=Math.max(1,d.v0.s[k]-dl),real=d.v0.s[k]-ns;d.cv.userData.sizer.scale[k]=ns;
     const ax0=new V(...CARVE_AX[d.ci]).negate().applyQuaternion(poseIn(d.cv).q),sh=ax0.multiplyScalar(real/2).applyQuaternion(poseIn(b.pivot).q.invert());d.cv.position.copy(d.v0.p).add(sh);
@@ -2903,8 +3848,8 @@ function showHandle(hd){hDot.visible=hEdge.visible=false;if(!hd){showFace(null);
   else if(hd.type==='edge'){const d=hd.B.clone().sub(hd.A),L=d.length();hEdge.position.copy(hd.A).addScaledVector(d,.5);hEdge.quaternion.setFromUnitVectors(new V(0,1,0),d.normalize());hEdge.scale.set(r*.7,L,r*.7);hEdge.visible=true}}
 function showFaces(fs){if(!fs||!fs.length){pushHi.visible=false;return}const pos=[];for(const f of fs){const o=f.pl.n.clone().multiplyScalar(.05);for(const tr of f.tris||[])for(const q of tr)pos.push(...q.clone().add(o).toArray())}
   pushHi.geometry.dispose();pushHi.geometry=new THREE.BufferGeometry();pushHi.geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));pushHi.visible=true}
-const snapBlock=b=>({s:b.sizer.scale.clone(),p:b.pivot.position.clone(),cuts:b.cuts.map(c=>[c.position.clone(),c.quaternion.clone()]),carves:b.carves.map(c=>[c.position.clone(),c.quaternion.clone(),c.userData.sizer.scale.clone()])});
-function restoreBlock(b,z){b.sizer.scale.copy(z.s);b.pivot.position.copy(z.p);b.cuts.forEach((c,i)=>{if(z.cuts[i]){c.position.copy(z.cuts[i][0]);c.quaternion.copy(z.cuts[i][1])}});
+const snapBlock=b=>({sk:b.sk?JSON.stringify(b.sk.V):null,s:b.sizer.scale.clone(),p:b.pivot.position.clone(),cuts:b.cuts.map(c=>[c.position.clone(),c.quaternion.clone()]),carves:b.carves.map(c=>[c.position.clone(),c.quaternion.clone(),c.userData.sizer.scale.clone()])});
+function restoreBlock(b,z){if(z.sk&&b.sk)b.sk={V:JSON.parse(z.sk),F:b.sk.F};b.sizer.scale.copy(z.s);b.pivot.position.copy(z.p);b.cuts.forEach((c,i)=>{if(z.cuts[i]){c.position.copy(z.cuts[i][0]);c.quaternion.copy(z.cuts[i][1])}});
   b.carves.forEach((c,i)=>{if(z.carves[i]){c.position.copy(z.carves[i][0]);c.quaternion.copy(z.carves[i][1]);c.userData.sizer.scale.copy(z.carves[i][2])}})}
 const sameFace=(b,f)=>b.faces.find(x=>x.pl.id===f.pl.id)||b.faces.find(x=>x.pl.src&&f.pl.src&&x.pl.src.type===f.pl.src.type&&x.pl.src.i===f.pl.src.i&&(x.pl.src.carve||x.pl.src.cut)===(f.pl.src.carve||f.pl.src.cut));
 function startHandle(hd){if(!hd)return null;const b=hd.b;if(sel!==b)select(b);return {hd,b,snap:snapBlock(b),faces:hd.faces.slice(),moved:false}}
@@ -2943,7 +3888,7 @@ function setTiltTarget(h,hinge){const src=h.f.pl.src;if(!src||src.split){tilt.ta
   tilt.target={b:h.b,src,q0:tiltH.quaternion.clone(),c,hinge:hinge?{A:hinge.A.clone(),B:hinge.B.clone()}:null};if(sel!==h.b){sel=h.b;renderModelPanel()}attachGizmo();showFace(h.f)}
 function applyTilt(){const T_=tilt.target;if(!T_)return;const b=T_.b,{p:pp,q:pq}=poseIn(b.pivot),pqi=pq.clone().invert(),n=new V(0,0,1).applyQuaternion(tiltH.quaternion);
   const toLocal=P=>P.clone().sub(pp).applyQuaternion(pqi);
-  if(T_.src.type==='box'){const cut=makeCut(b,toLocal(tiltH.position),n.clone().applyQuaternion(pqi));cut.visible=true;T_.src={type:'cut',cut};toast('That face is now a cut plane, so you can tilt it.')}
+  if(T_.src.type==='box'||T_.src.type==='sk'){const cut=makeCut(b,toLocal(tiltH.position),n.clone().applyQuaternion(pqi));cut.visible=true;T_.src={type:'cut',cut};toast('That face is now a cut plane, so you can tilt it.')}
   if(T_.src.type==='cut'){const cut=T_.src.cut;cut.position.copy(toLocal(tiltH.position));cut.quaternion.copy(pqi.clone().multiply(tiltH.quaternion))}
   else if(T_.src.type==='carve'){const cv=T_.src.carve,i=T_.src.i,base=new V(...CARVE_AX[i]),cp=poseIn(cv),cqi=cp.q.clone().invert(),s_=cv.userData.sizer.scale;
     /* the wall you see faces the other way from the cut-out's own face */
@@ -2967,9 +3912,11 @@ renderer.domElement.addEventListener('pointerleave',()=>{if(!pushDrag&&!hDrag)sh
 function renderModelPanel(){
   const list=$('#blockList');list.innerHTML='';
   blocks.forEach(b=>{const s=b.sizer.scale,r=document.createElement('div');r.className='item'+(b===sel?' on':'');
-    r.innerHTML=`<span class="swatch" style="background:${b.color}"></span><span class="nm">${b.name}</span><span class="meta">${Math.round(s.x)}×${Math.round(s.y)}×${Math.round(s.z)}</span>`;
+    r.innerHTML=`<span class="swatch" style="background:${b.color}"></span><span class="nm">${b.name}</span><span class="meta">${b.sk?'drawn · ':''}${Math.round(s.x)}×${Math.round(s.y)}×${Math.round(s.z)}</span>`;
     r.onclick=()=>select(b);list.append(r)});
   if(!blocks.length)list.innerHTML='<p class="note">No boxes yet. Add one to start.</p>';
+  $('#ewRow').hidden=!ewShelf().length;
+  {const n=skLooseEdges().length;$('#skBox').hidden=!n;if(n)$('#skLine').textContent=`${n} loose ${n===1?'line':'lines'} from the headset pen, waiting to close up into a solid.`}
   $('#selBox').hidden=!sel;if(!sel)return;
   if(document.activeElement!==$('#obsName'))$('#obsName').value=sel.name;$('#namePrev').textContent=sel.name+'1, '+sel.name+'2…';syncSizeInputs();
   const cl=$('#cutList');cl.innerHTML='';
@@ -3002,7 +3949,7 @@ $('#addCarve').onclick=()=>{if(!sel)return;const s=sel.sizer.scale,cs=[Math.roun
 function syncSizeInputs(){if(!sel)return;const s=sel.sizer.scale;$('#szX').value=Math.round(s.x*10)/10;$('#szY').value=Math.round(s.y*10)/10;$('#szZ').value=Math.round(s.z*10)/10;
   const m=$('#blockList .item.on .meta');if(m)m.textContent=`${Math.round(s.x)}×${Math.round(s.y)}×${Math.round(s.z)}`}
 ['X','Y','Z'].forEach(a=>$('#sz'+a).addEventListener('change',e=>{if(!sel)return;const v=Math.max(2,+e.target.value||2);
-  const k=a.toLowerCase(),old=sel.sizer.scale[k];sel.sizer.scale[k]=v;
+  const k=a.toLowerCase(),old=sel.sizer.scale[k];if(sel.sk)skStretch(sel,k,v/old);else sel.sizer.scale[k]=v;
   if(k==='y'&&Math.abs(sel.pivot.position.y-old/2)<.01)sel.pivot.position.y=v/2;
   refreshCutVisuals(sel);updateMass(sel);renderModelPanel();schedule()}));
 $('#obsName').addEventListener('change',e=>{if(!sel)return;const v=cleanName(e.target.value);
@@ -3014,7 +3961,7 @@ $('#addBlock').onclick=()=>{let x=-1e9;blocks.forEach(b=>{const p=b.pivot.positi
 $('#addCut').onclick=()=>{if(!sel)return;const s=sel.sizer.scale,n=new V(.45,.85,.25).normalize();
   S.showPlanes=true;if(view!=='mass')setView('mass');const c=makeCut(sel,n.clone().multiplyScalar(Math.min(s.x,s.y,s.z)*.3),n);c.visible=true;updateMass(sel);setMode('rotate',true);select(sel,c);schedule()};
 $('#dupBlock').onclick=()=>{if(!sel)return;const s=sel.sizer.scale,p=sel.pivot.position;
-  const d=serBlock(sel);d.name=null;d.p=[p.x+s.x,p.y,p.z];d.cuts.forEach(c=>delete c.cid);d.carves.forEach(c=>delete c.cid);d.edgeOpts={};const b=makeBlock(d);select(b);schedule()};
+  const d=serBlock(sel);d.name=null;d.p=[p.x+s.x+(sel.sk?4:0),p.y,p.z];d.cuts.forEach(c=>delete c.cid);d.carves.forEach(c=>delete c.cid);d.edgeOpts={};const b=makeBlock(d);select(b);schedule()};
 $('#delBlock').onclick=()=>{if(!sel)return;removeBlock(sel);select(null);schedule()};
 
 /* ---------------- settings binding ---------------- */
@@ -3517,17 +4464,24 @@ function fixAll(){const SM=T.SM;if(!SM)return;const bad=[...SM.J,...SM.RC,...SM.
 function planFor(b){let panels=[];try{panels=mergeSplices(panelizeBlock(b).panels.filter(p=>p.part?.length))}catch(e){}
   if(!panels.length)return null;const faces=panels.filter(p=>p.kind==='face'),base=basePanel(faces).label;
   const plan=planAssembly(panels,base);return {bad:plan.steps.filter(s=>s.stuck).length+plan.clash.length,plan}}
-async function findBuildFix(){const b=AS.b,plan=AS.plan;if(!b||!plan)return;const P=plan.parts,stuck=plan.steps.filter(s=>s.stuck);if(!stuck.length)return;
-  toast('Looking for a fix…');await new Promise(r=>setTimeout(r,30));
-  const ids=new Set();stuck.forEach(s=>{const A=P[s.i];if(A.p.planeId)ids.add(A.p.planeId);P.filter(p=>s.stuck.includes(p.label)).forEach(p=>p.p.planeId&&ids.add(p.p.planeId))});
-  const cands=(b.joints||[]).filter(j=>j.faces.some(f=>ids.has(f.id)));const before=planFor(b).bad;
-  for(const j of cands){const keep=b.edgeOpts[j.key]?{...b.edgeOpts[j.key]}:null;
-    for(const opt of [{ends:'flush'},{joint:'over:'+j.faces[0].id},{joint:'over:'+j.faces[1].id},{joint:'over:'+j.faces[0].id,ends:'flush'},{joint:'over:'+j.faces[1].id,ends:'flush'}]){
-      b.edgeOpts[j.key]={...(keep||{}),...opt};const r=planFor(b);await new Promise(r=>setTimeout(r,0));
-      if(r&&r.bad<before){save();rebuild();toast(`Fixed: ${j.label} set to ${opt.joint?'overlap':''}${opt.joint&&opt.ends?' + ':''}${opt.ends?'flush ends':''}. Undo with Ctrl+Z.`);return}}
-    if(keep)b.edgeOpts[j.key]=keep;else delete b.edgeOpts[j.key]}
-  if(stuck.some(s=>P[s.i].kind==='rib')){const keep=b.ribMax;for(const f of [.8,1.25,.65]){b.ribMax=Math.max(6,Math.round((keep||S.ribMax)*f));const r=planFor(b);if(r&&r.bad<before){save();rebuild();toast(`Fixed: ribs every ${b.ribMax}" in ${b.name}.`);return}}b.ribMax=keep}
-  toast('No simple fix found. Try changing those joints by hand in the Panels view.')}
+async function findBuildFix(b0){const b=b0&&b0.pivot?b0:AS.b;if(!b)return 'Nothing to fix.';
+  toast('Looking for a fix…');await new Promise(r=>setTimeout(r,30));const done=[];let first=planFor(b);if(!first)return 'Nothing to fix.';let before=first.bad,plan=first.plan;if(!before){toast('Every part goes together already.');return 'Every part goes together already.'}
+  /* one fix at a time, each one kept only if fewer parts are stuck after it; then look again, until everything goes together */
+  for(let round=0;round<6&&before>0;round++){const P=plan.parts,stuck=plan.steps.filter(s=>s.stuck);if(!stuck.length)break;let won=null;
+    const ids=new Set();stuck.forEach(s=>{const A=P[s.i];if(A.p.planeId)ids.add(A.p.planeId);P.filter(p=>s.stuck.includes(p.label)).forEach(p=>p.p.planeId&&ids.add(p.p.planeId))});
+    const cands=(b.joints||[]).filter(j=>j.faces.some(f=>ids.has(f.id))).sort((x,y)=>(y.inside?1:0)-(x.inside?1:0));
+    for(const j of cands){const keep=b.edgeOpts[j.key]?{...b.edgeOpts[j.key]}:null;
+      /* a wall that stands on a face and is also held by a rib has to go on two ways at once: letting it simply meet the face frees it */
+      for(const opt of [...(j.inside?[{joint:'meet'}]:[]),{ends:'flush'},{joint:'over:'+j.faces[0].id},{joint:'over:'+j.faces[1].id},{joint:'over:'+j.faces[0].id,ends:'flush'},{joint:'over:'+j.faces[1].id,ends:'flush'},...(j.inside?[]:[{joint:'meet'}])]){
+        b.edgeOpts[j.key]={...(keep||{}),...opt};const r=planFor(b);await new Promise(r=>setTimeout(r,0));
+        if(r&&r.bad<before){won={r,msg:`${j.label} ${opt.joint==='meet'?'meets':opt.joint?'overlaps':''}${opt.joint&&opt.ends?' with ':''}${opt.ends?'flush ends':''}`};break}}
+      if(won)break;if(keep)b.edgeOpts[j.key]=keep;else delete b.edgeOpts[j.key]}
+    const ribby=stuck.some(s=>P[s.i].kind==='rib'||P.some(p=>p.kind==='rib'&&s.stuck.includes(p.label)));
+    if(!won&&ribby){const keep=b.ribMax;for(const f of [1.25,.8,1.6,.65]){b.ribMax=Math.max(6,Math.round((keep||S.ribMax)*f));const r=planFor(b);await new Promise(r=>setTimeout(r,0));if(r&&r.bad<before){won={r,msg:`ribs every ${b.ribMax}" in ${b.name}`};break}}if(!won)b.ribMax=keep}
+    if(!won&&ribby){const keep=b.ribAxis,now=keep||S.ribAxis||'long';for(const ax of ['long','short','vertical'].filter(a=>a!==now)){b.ribAxis=ax;const r=planFor(b);await new Promise(r=>setTimeout(r,0));if(r&&r.bad<before){won={r,msg:`ribs in ${b.name} run ${({long:'across the length',short:'across the width',vertical:'flat, like shelves'})[ax]}`};break}}if(!won)b.ribAxis=keep}
+    if(!won)break;done.push(won.msg);before=won.r.bad;plan=won.r.plan}
+  if(done.length){save();rebuild();const m=`Fixed: ${done.join('; ')}.${before?' '+before+' still stuck.':''}`;toast(m+' Undo with Ctrl+Z.');return m}
+  toast('No simple fix found. Try changing those joints by hand in the Panels view.');return 'No simple fix found: try the joints by hand.'}
 
 /* ---------------- files: design, 3D model, build booklet ---------------- */
 async function saveDesign(){if(!await needUnlock())return;const name=`ply-grammar-${blocks.map(b=>b.name).join('')||'design'}.json`;
@@ -3644,7 +4598,7 @@ new MutationObserver(()=>{const tx=$('#hint').textContent;$('#tips').classList.t
 function showPlanes(){const on=view==='mass'&&S.showPlanes!==false;blocks.forEach(x=>{x.cuts.forEach(c=>c.visible=on&&x===sel);x.carves.forEach(c=>c.visible=on&&x===sel)});
   const pb=$('#planesBtn');if(pb){pb.hidden=view!=='mass';pb.setAttribute('aria-pressed',S.showPlanes!==false)}}
 function togglePlanes(){S.showPlanes=S.showPlanes===false;if(S.showPlanes===false&&selCut){selCut=null}showPlanes();attachGizmo();renderModelPanel();save()}
-function setView(v){view=v;if(v!=='mass')freshen();showPlanes();$$('#viewSeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.view===v));
+function setView(v){view=v;skDraw();if(v!=='mass')freshen();showPlanes();$$('#viewSeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.view===v));
   massGroup.visible=v==='mass';panelGroup.visible=v==='panels';if(gapMesh)gapMesh.visible=v==='panels';testGroup.visible=v==='test';asmGroup.visible=v==='build';if(v==='test'){T.anim=null;buildTest()}if(v==='build')buildAsm(true);$('#explodeSeg').hidden=v!=='panels';$('#noteSeg').hidden=v!=='panels'&&v!=='mass';if(v!=='panels'&&v!=='mass'){noteMode=false;notePopClose()}drawNotes();renderNotes();$('#explodeBtn').hidden=v!=='panels';updatePanelBar();updateSection();showEdge();
   $('#flat').hidden=v!=='sheets';host.style.visibility=v==='sheets'?'hidden':'visible';$('#gizmoSeg').style.visibility=v==='sheets'||v==='test'||v==='build'?'hidden':'visible';
   if(v==='build'&&$('.tab[data-tab=build]').getAttribute('aria-selected')!=='true')$('.tab[data-tab=build]').click();
@@ -3727,46 +4681,268 @@ function cloudPush(){if(!cloud)return;clearTimeout(cloudT);cloudT=setTimeout(asy
   cloud=db;if(cloudLast===JSON.stringify(serModel()))cloudUI('ok');else cloudPush()})();
 
 const serBlock=b=>({name:b.name,p:b.pivot.position.toArray(),q:b.pivot.quaternion.toArray(),s:b.sizer.scale.toArray(),edgeOpts:b.edgeOpts,
-  ribMax:b.ribMax||undefined,glueRibs:b.glueRibs||undefined,useAs:b.useAs&&Object.keys(b.useAs).length?b.useAs:undefined,forceSplit:b.forceSplit&&Object.keys(b.forceSplit).length?b.forceSplit:undefined,cleatEdit:b.cleatEdit&&Object.keys(b.cleatEdit).length?b.cleatEdit:undefined,screwEdit:b.screwEdit&&((b.screwEdit.add||[]).length||(b.screwEdit.del||[]).length)?b.screwEdit:undefined,cuts:b.cuts.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray()})),
+  ribMax:b.ribMax||undefined,ribAxis:b.ribAxis||undefined,glueRibs:b.glueRibs||undefined,useAs:b.useAs&&Object.keys(b.useAs).length?b.useAs:undefined,forceSplit:b.forceSplit&&Object.keys(b.forceSplit).length?b.forceSplit:undefined,sk:b.sk?{V:b.sk.V,F:b.sk.F.map(f=>({key:f.key,ids:f.ids}))}:undefined,cleatEdit:b.cleatEdit&&Object.keys(b.cleatEdit).length?b.cleatEdit:undefined,screwEdit:b.screwEdit&&((b.screwEdit.add||[]).length||(b.screwEdit.del||[]).length)?b.screwEdit:undefined,cuts:b.cuts.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray()})),
   carves:b.carves.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray(),s:c.userData.sizer.scale.toArray(),tilt:c.userData.tilt&&Object.keys(c.userData.tilt).length?c.userData.tilt:undefined}))});
-const serModel=()=>({app:'ply-grammar',v:3,S,blocks:blocks.map(serBlock),notes:notes.length?notes:undefined});
+const serModel=()=>({app:'ply-grammar',v:3,S,blocks:blocks.map(serBlock),sketch:SK.e.length?SK:undefined,notes:notes.length?notes:undefined});
 /* undo: every saved state of the model, newest last */
 const undoS=[],redoS=[];let restoring=false;
 function pushUndo(j){if(restoring)return;if(undoS[undoS.length-1]===j)return;undoS.push(j);if(undoS.length>80)undoS.shift();redoS.length=0;updUndo()}
 function updUndo(){const u=$('#undoBtn'),r=$('#redoBtn');if(u)u.disabled=undoS.length<2;if(r)r.disabled=!redoS.length}
 function restoreModel(j){restoring=true;try{const d=typeof j==='string'?JSON.parse(j):j;tc.detach();blocks.slice().forEach(removeBlock);
-    if(d.S){Object.assign(S,d.S);syncInputs()}(d.blocks||[]).forEach(makeBlock);notes=Array.isArray(d.notes)?d.notes.filter(n=>n&&Array.isArray(n.p)).map(n=>({...n})):[];notePopClose();select(null);rebuild();drawNotes();renderNotes();
+    if(d.S){Object.assign(S,d.S);syncInputs()}SK=d.sketch&&d.sketch.v?JSON.parse(JSON.stringify(d.sketch)):EW.emptySketch();SKX={};SKF=null;(d.blocks||[]).forEach(x=>makeBlock(x));skLoad();notes=Array.isArray(d.notes)?d.notes.filter(n=>n&&Array.isArray(n.p)).map(n=>({...n})):[];notePopClose();select(null);rebuild();drawNotes();renderNotes();
     try{localStorage.setItem(KEY,JSON.stringify(serModel()))}catch(e){}cloudPush()}finally{restoring=false}}
 function undo(){if(undoS.length<2)return;redoS.push(undoS.pop());restoreModel(undoS[undoS.length-1]);updUndo();toast('Undone')}
 function redo(){if(!redoS.length)return;const j=redoS.pop();undoS.push(j);restoreModel(j);updUndo();toast('Redone')}
 function save(){clearTimeout(saveT);saveT=setTimeout(()=>{const j=JSON.stringify(serModel());try{localStorage.setItem(KEY,j)}catch(e){}pushUndo(j);cloudPush()},300)}
 function load(){try{let d=JSON.parse(localStorage.getItem(KEY));
-    if(d&&d.blocks){Object.assign(S,d.S||{});if(!S.rateSet&&S.scaleDen===1&&!S.shopRate)S.shopRate=FULL_DEF.shopRate;d.blocks.forEach(makeBlock);if(Array.isArray(d.notes))notes=d.notes.filter(n=>n&&Array.isArray(n.p));return true}
+    if(d&&d.blocks){Object.assign(S,d.S||{});if(!S.rateSet&&S.scaleDen===1&&!S.shopRate)S.shopRate=FULL_DEF.shopRate;if(d.sketch&&d.sketch.v)SK=d.sketch;d.blocks.forEach(x=>makeBlock(x));skLoad();if(Array.isArray(d.notes))notes=d.notes.filter(n=>n&&Array.isArray(n.p));return true}
     d=JSON.parse(localStorage.getItem('plyGrammar.v1'));               // earlier version: keep the model, reset names to letters
-    if(d&&d.blocks){d.blocks.forEach(x=>makeBlock({...x,name:null}));return true}}catch(e){}return false}
+    if(d&&d.blocks){d.blocks.forEach(x=>makeBlock({...x,name:null}));return true}}catch(e){console.warn('saved design did not load',e)}return false}
 /* a fresh start is one obstacle: the app is about getting a single piece right */
 if(!load())makeBlock({p:[0,15,0],s:[40,30,30],cuts:[{p:[0,8,9],n:[0,.85,.53]}]});
 setTimeout(()=>{pushUndo(JSON.stringify(serModel()));drawNotes();renderNotes()},0);
 
+/* ---------------- sketching: Edgewise inside Ply Grammar ----------------
+   One sketch (SK) holds every line drawn in the headset. A stroke becomes one straight edge; a closed flat loop of edges is a
+   face; a set of faces that closes up is a solid, and every solid becomes a block (b.sk) that is built like any box. Loose lines
+   and open faces just wait in the sketch until they close. SK is kept in model inches, in the model's own space. */
+function skK(){return xrMode?1/world.scale.x:1/.0254}            /* metres in your hands -> model inches */
+function skA(v){return [+v.x.toFixed(4),+v.y.toFixed(4),+v.z.toFixed(4)]}
+function skEmptyF(){return {faces:[],pieces:[],comp:new Map(),loose:[],edgeUse:new Map()}}
+function skOpts(x){const k=skK();return Object.assign({square:S.skSquare!==false,squareDeg:10,floor:true,floorR:.05*k,flat:1,minTol:.015*k,rel:.18,iters:60},x)}
+/* corners of finished solids stay exactly where they are, unless the edit touches that solid */
+function skHold(free){const adj=new Map();for(const e of SK.e){(adj.get(e.a)||adj.set(e.a,[]).get(e.a)).push(e.b);(adj.get(e.b)||adj.set(e.b,[]).get(e.b)).push(e.a)}
+  const open=new Set(),st=[...(free||[])];while(st.length){const x=st.pop();if(open.has(x))continue;open.add(x);for(const y of adj.get(x)||[])st.push(y)}
+  const h=new Set();for(const b of blocks)if(b.sk)for(const id in b.sk.V)if(!open.has(+id))h.add(+id);return h}
+function skFit(b){const mn=new V(1e9,1e9,1e9),mx=new V(-1e9,-1e9,-1e9);for(const id in b.sk.V){const p=skV(b.sk.V[id]);mn.min(p);mx.max(p)}
+  b.sizer.scale.set(Math.max(1,mx.x-mn.x),Math.max(1,mx.y-mn.y),Math.max(1,mx.z-mn.z));refreshCutVisuals(b)}
+function skWriteBack(b){skStale=true;const q=b.pivot.quaternion,p=b.pivot.position,at=new Map(SK.v.map(v=>[v.id,v]));
+  for(const id in b.sk.V){const w=skA(skV(b.sk.V[id]).applyQuaternion(q).add(p));SKX[id]=w;const v=at.get(+id);if(v){v.ends=[w];if(v.pin)v.pin=w}}}
+/* a block that arrives with its own shape (a saved design, a duplicate) puts its corners and edges into the sketch */
+function skAdopt(b){skStale=true;let ids=Object.keys(b.sk.V).map(Number);
+  if(blocks.some(x=>x!==b&&x.sk&&ids.some(id=>x.sk.V[id]))){const map=new Map(ids.map(id=>[id,SK.nid++])),V2={};ids.forEach(id=>V2[map.get(id)]=b.sk.V[id]);
+    b.sk={V:V2,F:b.sk.F.map(f=>{const n=f.ids.map(i=>map.get(i));return {key:EW.faceKey(n),ids:n}})};ids=[...map.values()]}
+  const q=b.pivot.quaternion,p=b.pivot.position,have=new Set(SK.v.map(v=>v.id));
+  for(const id of ids){const w=skA(skV(b.sk.V[id]).applyQuaternion(q).add(p));SKX[id]=w;if(!have.has(id)){SK.v.push({id,ends:[w]});SK.nid=Math.max(SK.nid,id+1)}}
+  const ek=new Set(SK.e.map(e=>e.a<e.b?e.a+'-'+e.b:e.b+'-'+e.a));
+  for(const f of b.sk.F)f.ids.forEach((a,i)=>{const c=f.ids[(i+1)%f.ids.length],k=a<c?a+'-'+c:c+'-'+a;if(!ek.has(k)){ek.add(k);SK.e.push({id:SK.nid++,a,b:c,s:null})}});skFit(b)}
+/* do two closed shells overlap, or does one stand on the other? Then they are one obstacle. */
+function skTouch(A,B){const bb=fs=>{const mn=new V(1e9,1e9,1e9),mx=new V(-1e9,-1e9,-1e9);fs.forEach(f=>f.pts.forEach(p=>{mn.min(p);mx.max(p)}));return [mn,mx]},[a0,a1]=bb(A),[b0,b1]=bb(B);
+  if(a0.x>b1.x+.05||b0.x>a1.x+.05||a0.y>b1.y+.05||b0.y>a1.y+.05||a0.z>b1.z+.05||b0.z>a1.z+.05)return false;
+  for(const f of A)for(const g of B){if(f.n.dot(g.n)>-1+1e-5||Math.abs(f.d+g.d)>.05)continue;const u=f.pts[1].clone().sub(f.pts[0]).normalize(),v=new V().crossVectors(f.n,u),to2=P=>P.map(p=>{const q=p.clone().sub(f.pts[0]);return [q.dot(u),q.dot(v)]});
+      const r=clipRun([c2path(posC(to2(f.pts)))],[c2path(posC(to2(g.pts)))],ClipperLib.ClipType.ctIntersection);if(r.contours.reduce((s_,c)=>s_+Math.abs(areaF(c)),0)>.25)return true}
+  const deep=(fs,other)=>fs.some(f=>{const c=f.pts.reduce((s_,p)=>s_.add(p),new V()).multiplyScalar(1/f.pts.length).addScaledVector(f.n,-.2);return skInside([other],c)})||fs.some(f=>f.pts.some(p=>skInside([other],p.clone().addScaledVector(f.n,-.1))));
+  return deep(A,B)||deep(B,A)}
+/* every closed solid in the sketch is a block (solids that overlap or stand on each other make one block together); a solid that
+   opens up again goes back to being loose lines. While something is being held (live) no block comes or goes, they only follow. */
+function skSync(live,tidy){skBusy=true;try{const shells=[];
+    if(SKF){const by=new Map();for(const f of SKF.faces){if(f.open)continue;if(!by.has(f.piece))by.set(f.piece,[]);by.get(f.piece).push(f)}
+      /* a piece counts as soon as some of its faces close up; a loop just drawn on one of its faces is still only a drawing */
+      for(const fs of by.values()){if(fs.length<4)continue;const all={V:{},F:fs.map(f=>({key:f.key,ids:f.ids.slice()}))};for(const f of fs)for(const id of f.ids)all.V[id]=SKX[id];for(const sh of skShells(all)||[])shells.push(sh)}}
+    const par=shells.map((_,i)=>i),root=i=>par[i]===i?i:(par[i]=root(par[i]));
+    for(let i=0;i<shells.length;i++)for(let j=i+1;j<shells.length;j++)if(root(i)!==root(j)&&skTouch(shells[i],shells[j]))par[root(i)]=root(j);
+    const groups=new Map();shells.forEach((sh,i)=>{const r=root(i);if(!groups.has(r))groups.set(r,[]);groups.get(r).push(...sh)});
+    if(tidy)for(const fs of groups.values()){const T=skTidy(fs,{square:S.skSquare!==false,grid:S.skSquare!==false&&snap?1:0,floorR:.05*skK(),maxMove:.08*skK()});if(T)for(const id in T)SKX[id]=skA(T[id])}
+    const want=[...groups.values()].map(fs=>{const tr={V:{},F:fs.map(f=>({key:f.key,ids:f.ids.slice()}))};for(const f of fs)for(const id of f.ids)tr.V[id]=SKX[id];return {ids:Object.keys(tr.V).map(Number),tr}});
+    const have=blocks.filter(b=>b.sk),used=new Set();
+    for(const w of want.sort((a,c)=>c.ids.length-a.ids.length)){let best=null,bn=0;for(const b of have){if(used.has(b))continue;const n=w.ids.reduce((s_,id)=>s_+(b.sk.V[id]?1:0),0);if(n>bn){bn=n;best=b}}if(best){used.add(best);w.b=best}}
+    if(!live)for(const b of have)if(!used.has(b)){if(sel===b)select(null);removeBlock(b,true)}
+    for(const w of want){let b=w.b,fresh=false;if(!b&&live)continue;
+      if(!b){const mn=new V(1e9,1e9,1e9),mx=new V(-1e9,-1e9,-1e9);w.ids.forEach(id=>{const p=skV(SKX[id]);mn.min(p);mx.max(p)});b=makeBlock({p:mn.add(mx).multiplyScalar(.5).toArray(),s:[1,1,1]});fresh=true}
+      const qi=b.pivot.quaternion.clone().invert(),V_={};w.ids.forEach(id=>V_[id]=skA(skV(SKX[id]).sub(b.pivot.position).applyQuaternion(qi)));
+      if(!fresh&&b.sk.F.length===w.tr.F.length&&b.sk.F.every((f,i)=>f.key===w.tr.F[i].key)&&JSON.stringify(V_)===JSON.stringify(b.sk.V))continue;
+      b.sk={V:V_,F:w.tr.F};skFit(b);updateMass(b);if(fresh)skNewBlock=b}
+  }finally{skBusy=false}}
+function skRefind(){skStale=false;for(const v of SK.v)if(!SKX[v.id])SKX[v.id]=EW.anchorOf(v).slice();SKF=SK.v.length?EW.findFaces(SK,SKX,{rel:.18,minTol:.015*skK()}):skEmptyF();skSync();skDraw()}
+function skLoad(){SKX={};if(!SK.locks)SK.locks=[];if(!SK.open)SK.open=[];if(!SK.skip)SK.skip=[];if(!SK.s)SK.s=[];for(const b of blocks)if(b.sk)skAdopt(b);skRefind()}
+function skRebuild(free){if(!SK.v.length){SKF=skEmptyF();SKX={}}else{const o=EW.build(SK,skOpts({warm:SKX,hold:skHold(free)}));SKF=o.F;SKX=o.X}skSync(false,true);skDraw()}
+/* after an edit: solve, join corners that ended up on top of each other, and remember every corner where it settled */
+function skAfter(free){skNewBlock=null;skRebuild(free);if(SK.v.length&&EW.weld(SK,SKX,.012*skK()))skRebuild(free);
+  for(const v of SK.v)if(SKX[v.id]){const w=SKX[v.id].map(x=>+x.toFixed(4));v.ends=[w];if(v.pin)v.pin=w}
+  SK.s=[];renderModelPanel();schedule();save()}
+function skInBlock(a,c){return blocks.some(b=>b.sk&&b.sk.V[a]&&b.sk.V[c])}
+function skLooseEdges(){return SK.e.filter(e=>!skInBlock(e.a,e.b))}
+$('#skClearBtn').onclick=()=>skClearLoose();
+/* Edgewise XR lives on the same site, so what you drew there is right here on this device: its table and its library */
+function ewShelf(){const out=[];try{const cur=JSON.parse(localStorage.getItem('edgewise:sketch'));if(cur&&cur.e&&cur.e.length)out.push({name:'On the Edgewise table now',sk:cur});for(const it of JSON.parse(localStorage.getItem('edgewise:lib'))||[])if(it&&it.sk&&it.sk.e&&it.sk.e.length)out.push({name:it.name||'Kept sketch',sk:it.sk})}catch(e){}return out}
+function skImport(src,name){const k=1/.0254,map=new Map(),m=id=>{if(!map.has(id))map.set(id,SK.nid++);return map.get(id)},P=a=>a.map(x=>x*k);let mn=[1e9,1e9,1e9],mx=[-1e9,-1e9,-1e9];
+  const vs=(src.v||[]).map(v=>({id:m(v.id),ends:(v.ends||[]).map(P),...(v.pin?{pin:P(v.pin)}:{})})).filter(v=>v.ends.length||v.pin);if(!vs.length)return;
+  for(const v of vs){const a=EW.anchorOf(v);for(let i=0;i<3;i++){mn[i]=Math.min(mn[i],a[i]);mx[i]=Math.max(mx[i],a[i])}}
+  /* set it down beside what is already there, standing where it stood on Edgewise's floor */
+  let right=-1e9;for(const b of blocks)for(const f of b.faces||[])for(const q of f.poly)right=Math.max(right,q.x);for(const id in SKX)right=Math.max(right,SKX[id][0]);
+  const dx=right>-1e8?right+8-mn[0]:-(mn[0]+mx[0])/2,dz=-(mn[2]+mx[2])/2,sh=a=>[+(a[0]+dx).toFixed(4),+a[1].toFixed(4),+(a[2]+dz).toFixed(4)];
+  for(const v of vs){v.ends=v.ends.map(sh);if(v.pin)v.pin=sh(v.pin);SK.v.push(v)}const ok=new Set(vs.map(v=>v.id));
+  for(const e of src.e||[]){const a=m(e.a),c=m(e.b);if(ok.has(a)&&ok.has(c)&&a!==c)SK.e.push({id:SK.nid++,a,b:c,s:null})}
+  const key=kk=>EW.faceKey(String(kk).split('.').map(x=>m(+x)));for(const kk of src.open||[])SK.open.push(key(kk));for(const kk of src.skip||[])SK.skip.push(key(kk));
+  const n0=blocks.length;skAfter([...ok]);if(view!=='mass')setView('mass');const n=blocks.length-n0,loose=skLooseEdges().length;
+  toast(`${name}: ${n?n+(n===1?' solid':' solids')+' brought in':'brought in'}${loose?`, ${loose} loose ${loose===1?'line':'lines'} still to close up`:''}.`)}
+$('#ewBtn').onclick=e=>{const L=ewShelf();if(!L.length)return toast('Nothing from Edgewise on this device yet.');const r=e.currentTarget.getBoundingClientRect();ctxOpen(r.left,r.bottom+4,'From Edgewise',L.map(it=>[it.name,()=>skImport(it.sk,it.name)]))};
+function skClearLoose(){const es=skLooseEdges().map(e=>e.id);if(!es.length)return;EW.removeEdges(SK,es);const alive=new Set(SK.v.map(v=>v.id));for(const id in SKX)if(!alive.has(+id))delete SKX[id];
+  skRefind();renderModelPanel();schedule();save();toast('Loose lines removed')}
+/* push a face of a sketched block out by dl along its own direction; its neighbours stay in their planes, so every face stays flat */
+function skPushFace(b,key,dl){const sk=b.sk,sh=skShells(sk);if(!sh)return false;const faces=sh.flat(),f=faces.find(x=>x.key===key);if(!f)return false;
+  const D=new Map(faces.map(g=>[g,g.d])),moved=new Set();
+  /* the face itself, and anything else lying in its plane (the foot of a block that stands on it) */
+  for(const g of faces){const c=g.n.dot(f.n);if(g===f||(Math.abs(Math.abs(c)-1)<2e-5&&Math.abs(g.d*Math.sign(c)-f.d)<.03)){D.set(g,g.d+dl*(g===f?1:Math.sign(c)));g.ids.forEach(id=>moved.add(id))}}
+  const V2={...sk.V};
+  for(const id of moved){const x0=skV(sk.V[id]),e=1e-7,a=[[e,0,0],[0,e,0],[0,0,e]],r=[x0.x*e,x0.y*e,x0.z*e];
+    for(const g of faces){if(!g.ids.includes(id))continue;const n=[g.n.x,g.n.y,g.n.z],d=D.get(g);for(let i=0;i<3;i++){r[i]+=d*n[i];for(let j=0;j<3;j++)a[i][j]+=n[i]*n[j]}}
+    const m=new THREE.Matrix3().set(...a[0],...a[1],...a[2]);if(Math.abs(m.determinant())<1e-30)return false;V2[id]=skA(new V(...r).applyMatrix3(m.invert()))}
+  /* never push a face so far that an edge shrinks to nothing or flips over */
+  for(const g of faces)for(let i=0;i<g.ids.length;i++){const a=g.ids[i],c=g.ids[(i+1)%g.ids.length];if(!moved.has(a)&&!moved.has(c))continue;
+      const o=skV(sk.V[c]).sub(skV(sk.V[a])),n=skV(V2[c]).sub(skV(V2[a]));if(n.length()<.5||o.dot(n)<=0)return false}
+  const X={};for(const id in V2)X[id]=V2[id].slice();const worst=EW.hardFlat(sk.F.map(g=>({ids:g.ids})),X,null,1);
+  if(worst>1e-3){EW.hardFlat(sk.F.map(g=>({ids:g.ids})),X,null,300);for(const id in X)V2[id]=X[id].map(x=>+x.toFixed(4))}
+  b.sk={V:V2,F:sk.F};return true}
+/* size boxes in the Model tab: a sketched block stretches along that direction */
+function skStretch(b,k,ratio){const i='xyz'.indexOf(k),V2={};for(const id in b.sk.V){V2[id]=b.sk.V[id].slice();V2[id][i]=+(V2[id][i]*ratio).toFixed(4)}b.sk={V:V2,F:b.sk.F};skFit(b)}
+
+/* ---- what the sketch looks like: loose lines as blue rods, their corners as dots, open faces as a see-through fill ---- */
+function skGfx(){if(skG)return skG;const g=new THREE.Group();world.add(g);
+  const rods=new THREE.InstancedMesh(new THREE.CylinderGeometry(1,1,1,8),new THREE.MeshBasicMaterial({color:0x2E5BFF}),1200);rods.count=0;rods.frustumCulled=false;
+  const dots=new THREE.InstancedMesh(new THREE.SphereGeometry(1,12,8),new THREE.MeshBasicMaterial({color:0x15181D}),1200);dots.count=0;dots.frustumCulled=false;
+  const marks=new THREE.InstancedMesh(new THREE.SphereGeometry(1,12,8),new THREE.MeshBasicMaterial({color:0xE5392B,depthTest:false}),400);marks.count=0;marks.frustumCulled=false;marks.renderOrder=13;
+  const fills=new THREE.Mesh(new THREE.BufferGeometry(),new THREE.MeshBasicMaterial({color:0x2E5BFF,transparent:true,opacity:.2,side:THREE.DoubleSide,depthWrite:false}));fills.frustumCulled=false;
+  const lg=new THREE.BufferGeometry();lg.setAttribute('position',new THREE.BufferAttribute(new Float32Array(4000*3),3));lg.setDrawRange(0,0);
+  const live=new THREE.Line(lg,new THREE.LineBasicMaterial({color:0xE5392B}));live.frustumCulled=false;
+  const prev=new THREE.Mesh(new THREE.CylinderGeometry(1,1,1,8),new THREE.MeshBasicMaterial({color:0xFFD23F,depthTest:false,transparent:true,opacity:.95}));prev.visible=false;prev.renderOrder=12;
+  g.add(fills,rods,dots,marks,live,prev);return skG={g,rods,dots,marks,fills,live,prev}}
+function skRod(mesh,i,A,B,r){const d=B.clone().sub(A),L=d.length();if(L<1e-6)return false;skQ.setFromUnitVectors(skUp,d.multiplyScalar(1/L));skM.compose(A.clone().add(B).multiplyScalar(.5),skQ,new V(r,L,r));mesh.setMatrixAt(i,skM);return true}
+function skDraw(){if(typeof world==='undefined'||(!skG&&!SK.v.length))return;const G=skGfx();G.g.visible=view==='mass';const k=skK(),r=xrMode?.0022*k:.14,pen=!!xrMode&&XR.tool!=='push';
+  let n=0;const lv=new Set();for(const e of SK.e){if(skInBlock(e.a,e.b)||!SKX[e.a]||!SKX[e.b])continue;lv.add(e.a);lv.add(e.b);if(n<1200&&skRod(G.rods,n,skV(SKX[e.a]),skV(SKX[e.b]),r))n++}
+  G.rods.count=n;G.rods.instanceMatrix.needsUpdate=true;
+  n=0;for(const v of SK.v){if(!SKX[v.id]||(!pen&&!lv.has(v.id))||n>=1200)continue;skM.compose(skV(SKX[v.id]),skQ.identity(),new V(1,1,1).multiplyScalar(r*(lv.has(v.id)?2.2:1.7)));G.dots.setMatrixAt(n++,skM)}
+  G.dots.count=n;G.dots.instanceMatrix.needsUpdate=true;
+  n=0;for(const id of skMarkV){if(SKX[id]&&n<400){skM.compose(skV(SKX[id]),skQ.identity(),new V(1,1,1).multiplyScalar(r*3));G.marks.setMatrixAt(n++,skM)}}
+  for(const id of skMarkE){const e=SK.e.find(x=>x.id===id);if(e&&SKX[e.a]&&SKX[e.b]&&n<400){skM.compose(skV(SKX[e.a]).add(skV(SKX[e.b])).multiplyScalar(.5),skQ.identity(),new V(1,1,1).multiplyScalar(r*3));G.marks.setMatrixAt(n++,skM)}}
+  G.marks.count=n;G.marks.instanceMatrix.needsUpdate=true;
+  const pos=[];if(SKF)for(const f of SKF.faces){if(f.open||f.ids.every(id=>blocks.some(b=>b.sk&&b.sk.V[id])))continue;const P=f.ids.map(id=>SKX[id]);if(P.some(p=>!p))continue;
+      const tri=THREE.ShapeUtils.triangulateShape(f.poly.map(([x,y])=>new THREE.Vector2(x,y)),[]);for(const t3 of tri)for(const i of t3)pos.push(...P[i])}
+  G.fills.geometry.dispose();G.fills.geometry=new THREE.BufferGeometry();G.fills.geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3))}
+function skLive(pts){const G=skGfx(),a=G.live.geometry.attributes.position,n=Math.min(4000,pts.length);for(let i=0;i<n;i++)a.setXYZ(i,...pts[i]);a.needsUpdate=true;G.live.geometry.setDrawRange(0,n)}
+
+/* ---- picking near the pen tip: a corner first, then a line, then a face ---- */
+function skPick(p,r){let best=null,bd=r;for(const v of SK.v){const q=SKX[v.id];if(!q)continue;const d=EW.V.dist(p,q);if(d<bd){bd=d;best={kind:'vert',id:v.id,ids:[v.id]}}}if(best)return best;
+  bd=r*.8;for(const e of SK.e){const a=SKX[e.a],c=SKX[e.b];if(!a||!c)continue;const ab=EW.V.sub(c,a),t=Math.max(0,Math.min(1,EW.V.dot(EW.V.sub(p,a),ab)/(EW.V.dot(ab,ab)||1))),d=EW.V.dist(p,EW.V.add(a,EW.V.mul(ab,t)));if(d<bd){bd=d;best={kind:'edge',id:e.id,ids:[e.a,e.b]}}}if(best)return best;
+  bd=r;if(SKF)for(const f of SKF.faces){if(f.all.some(id=>!SKX[id]))continue;const P=f.ids.map(id=>SKX[id]),pl=EW.planeOf(P),[u,w]=EW.basis(pl.n),to2=x=>{const d=EW.V.sub(x,pl.c);return [EW.V.dot(d,u),EW.V.dot(d,w)]},h=Math.abs(EW.V.dot(EW.V.sub(p,pl.c),pl.n));
+      if(h<bd&&pip2([P.map(to2)],...to2(p))&&!f.holes.some(H=>pip2([H.map(id=>to2(SKX[id]))],...to2(p)))){bd=h;best={kind:'face',key:f.key,ids:f.all.slice(),n:pl.n,c:pl.c}}}
+  return best}
+
+/* ---- the pen: one stroke, one straight line ---- */
+function skTip(c){return world.worldToLocal(c.userData.tip.getWorldPosition(new V()))}
+function skFrame(c){return {p:c.userData.tip.getWorldPosition(new V()),q:c.getWorldQuaternion(new THREE.Quaternion())}}
+function skSnapR(){return .04*skK()}
+function skStrokeStart(c){const p=skTip(c).toArray();c.userData.stroke={pts:[p],t:0};skLive([p]);buzz(c,.2,15)}
+function skStrokeMove(c){const st=c.userData.stroke,p=skTip(c).toArray();if(EW.V.dist(st.pts[st.pts.length-1],p)<.004*skK())return;st.pts.push(p);skLive(st.pts);
+  const now=performance.now();if(now-st.t<60||st.pts.length<3)return;st.t=now;
+  /* the straight line this stroke would become, with its ends where they would land */
+  const f=EW.fitLine(st.pts),G=skGfx();if(!f){G.prev.visible=false;return}const sa=EW.snapEnd(SK,f.a,SKX,skSnapR(),undefined,SKF&&SKF.faces),sb=EW.snapEnd(SK,f.b,SKX,skSnapR(),sa.kind==='vert'?sa.id:undefined,SKF&&SKF.faces);
+  G.prev.visible=skRod({setMatrixAt:(i,m)=>{m.decompose(G.prev.position,G.prev.quaternion,G.prev.scale)}},0,skV(sa.at),skV(sb.at),.0016*skK())}
+function skStrokeEnd(c){const st=c.userData.stroke;c.userData.stroke=null;skLive([]);skGfx().prev.visible=false;if(!st||st.pts.length<3)return;
+  const r=EW.addStroke(SK,st.pts,SKX,{snapR:skSnapR(),faces:SKF&&SKF.faces});
+  if(!r.ok){menuMsg=r.why==='too short'?'Too short for a line.':'That runs along a line that is already there.';drawMenu();return}
+  const n0=blocks.filter(b=>b.sk).length;skAfter([r.a,r.b]);const nf=SKF.faces.filter(f=>f.ids.includes(r.a)&&f.ids.includes(r.b)).length;
+  if(skNewBlock){select(skNewBlock);menuMsg=`That closed a solid: it is now ${skNewBlock.name}. Panels shows how it is built.`;buzz(c,.9,80)}
+  else{menuMsg=nf?(nf===1?'Line in: it closed a face.':`Line in: it closed ${nf} faces.`):'Line in.';buzz(c,nf?.6:.3,nf?40:20)}drawMenu()}
+/* ---- the eraser: brush a corner (its two lines become one) or a line ---- */
+function skEraseAt(c){const p=skTip(c).toArray(),h=skPick(p,.025*skK());if(!h||h.kind==='face')return;
+  if(h.kind==='vert'){if(!skMarkV.has(h.id)){skMarkV.add(h.id);buzz(c,.3,20);skDraw()}}else if(!skMarkE.has(h.id)){skMarkE.add(h.id);buzz(c,.3,20);skDraw()}}
+function skEraseEnd(){if(!skMarkV.size&&!skMarkE.size)return;const nv=skMarkV.size,ne=skMarkE.size,free=[];
+  for(const id of skMarkE){const e=SK.e.find(x=>x.id===id);if(e)free.push(e.a,e.b)}for(const id of skMarkV)for(const e of SK.e)if(e.a===id||e.b===id)free.push(e.a,e.b);
+  for(const id of skMarkV)if(SK.v.some(v=>v.id===id))EW.removeVert(SK,id,SKX);const left=[...skMarkE].filter(id=>SK.e.some(e=>e.id===id));if(left.length)EW.removeEdges(SK,left);
+  skMarkV.clear();skMarkE.clear();const alive=new Set(SK.v.map(v=>v.id));for(const id in SKX)if(!alive.has(+id))delete SKX[id];skAfter(free.filter(id=>alive.has(id)));
+  menuMsg='Erased '+[nv?nv+(nv===1?' corner':' corners'):'',ne?ne+(ne===1?' line':' lines'):''].filter(Boolean).join(' and ')+'.';drawMenu()}
+/* ---- grip near the pen tip: take hold of a corner, a line or a face and move it; the solver keeps every face flat ---- */
+function skGrabStart(c,h){const fr=skFrame(c),P0={};for(const id of h.ids)P0[id]=world.localToWorld(skV(SKX[id]));
+  const d={kind:h.kind,ids:h.ids,id:h.id,key:h.key,P0,f0:fr,F:SKF,hold:skHold(h.ids),before:JSON.stringify(SK),X0:JSON.stringify(SKX)};
+  if(h.kind==='face'){d.c0=world.localToWorld(skV(h.c));d.n0=skV(h.n).transformDirection(world.matrixWorld).normalize();d.island=SKF.faces.some(g=>g.holes.some(H=>EW.faceKey(H)===h.key))}
+  c.userData.skGrab=d;buzz(c,.5,30);menuMsg=h.kind==='face'?(d.island?'Push or pull: it comes out as a block.':'Holding a face. Trigger: pull it out as a new block.'):h.kind==='edge'?'Holding a line.':'Holding a corner. Drop it on another corner to join them.';drawMenu()}
+function skGrabMove(c){const d=c.userData.skGrab,fr=skFrame(c);let T=fr.p.clone().sub(d.f0.p);
+  if(d.island&&!d.extruded){const push=T.dot(d.n0);if(Math.abs(push)<.015)return;skExtrude(c,Math.sign(push),Math.abs(push));T=fr.p.clone().sub(d.f0.p)}
+  const R=fr.q.clone().multiply(d.f0.q.clone().invert()),targets={};
+  for(const id of d.ids){let w;if(d.kind==='face'){const t=d.n0.clone().multiplyScalar(T.dot(d.n0));w=d.P0[id].clone().sub(d.c0).applyQuaternion(S.skTilt===false?skQ.identity():R).add(d.c0).add(t)}else w=d.P0[id].clone().add(T);
+    targets[id]=world.worldToLocal(w).toArray()}
+  d.targets=d.kind==='face'?EW.snapHeld(SK,d.F,d.key,targets,SKX):targets;
+  SKX=EW.solve(SK,d.F,skOpts({drag:d.targets,warm:SKX,iters:30,hold:d.hold}));
+  /* where the held corners would join if you let go now */
+  const r=.04*skK(),held=new Set(d.ids);d.drops=[];
+  for(const id of d.ids){const p=SKX[id];if(!p)continue;const adj=new Set(SK.e.filter(e=>e.a===id||e.b===id).map(e=>e.a===id?e.b:e.a));let best=null,bd=r;
+    for(const v of SK.v){if(held.has(v.id)||adj.has(v.id)||!SKX[v.id])continue;const dd=EW.V.dist(p,SKX[v.id]);if(dd<bd){bd=dd;best={from:id,to:v.id}}}if(best)d.drops.push(best)}
+  hDot.visible=!!d.drops.length;if(d.drops.length){hDot.position.copy(skV(SKX[d.drops[0].to]));hDot.scale.setScalar(.012*skK())}
+  skSync(true);skDraw()}
+/* pull the held face out as a block: its corners are copied and joined back by side lines, and you keep holding the new face */
+function skExtrude(c,dir,dist){const d=c.userData.skGrab;if(!d||d.kind!=='face'||d.extruded)return;const f=d.F.faces.find(x=>x.key===d.key);if(!f)return;
+  let n=EW.planeOf(f.ids.map(id=>SKX[id])).n;const nw=skV(n).transformDirection(world.matrixWorld).normalize(),fr=skFrame(c);
+  const s=dir?dir*Math.sign(nw.dot(d.n0)||1):(Math.sign(fr.p.clone().sub(d.c0).dot(nw))||1);if(s<0)n=EW.V.mul(n,-1);
+  SK=JSON.parse(d.before);const X0=JSON.parse(d.X0),ex=EW.extrude(SK,f,X0,n,Math.max(.004,dist||0)*skK(),d.island);
+  d.hold=skHold(d.ids);const o=EW.build(SK,skOpts({warm:X0,hold:d.hold}));SKF=o.F;SKX=o.X;d.F=SKF;
+  const nf=SKF.faces.find(x=>x.key===ex.key),ids=nf?nf.all:ex.ids,P0={};for(const id of ids)P0[id]=world.localToWorld(skV(SKX[id]));
+  Object.assign(d,{ids,P0,key:ex.key,extruded:true,island:false,f0:fr,c0:world.localToWorld(skV(EW.planeOf((nf?nf.ids:ex.ids).map(id=>SKX[id])).c)),n0:skV(n).transformDirection(world.matrixWorld).normalize()});
+  buzz(c,.7,40);menuMsg='Pulled out as a block: move your hand to set how far.';drawMenu();skSync(true);skDraw()}
+function skGrabEnd(c){const d=c.userData.skGrab;c.userData.skGrab=null;hDot.visible=false;if(!d)return;
+  if(d.targets||d.extruded){for(const id of d.ids){const v=SK.v.find(x=>x.id===id);if(v&&SKX[id])v.pin=SKX[id].map(x=>+x.toFixed(4))}
+    for(const dr of d.drops||[])if(SK.v.some(v=>v.id===dr.from)&&SK.v.some(v=>v.id===dr.to))EW.mergeVerts(SK,dr.to,dr.from,SKX[dr.to]);
+    const alive=new Set(SK.v.map(v=>v.id));skAfter(d.ids.filter(id=>alive.has(id)).concat((d.drops||[]).map(x=>x.to)));
+    menuMsg=(d.drops||[]).length?'Joined.':d.extruded?'Block pulled out.':d.kind==='face'?'Face moved.':d.kind==='edge'?'Line moved.':'Corner moved.'}drawMenu()}
+/* the red X while holding something: that corner, line or face goes */
+function skDeleteHeld(){const c=ctrls.find(x=>x.userData.skGrab);if(!c)return false;const d=c.userData.skGrab;c.userData.skGrab=null;hDot.visible=false;SK=JSON.parse(d.before);SKX=JSON.parse(d.X0);
+  const free=d.ids.flatMap(id=>SK.e.filter(e=>e.a===id||e.b===id).flatMap(e=>[e.a,e.b]));
+  if(d.kind==='vert'){EW.removeVert(SK,d.ids[0],SKX);menuMsg='Corner deleted.'}else if(d.kind==='edge'){EW.removeEdges(SK,[d.id]);menuMsg='Line deleted.'}
+  else{if(!SK.open.includes(d.key))SK.open.push(d.key);menuMsg='Face deleted: it is an opening now.'}
+  const alive=new Set(SK.v.map(v=>v.id));for(const id in SKX)if(!alive.has(+id))delete SKX[id];skAfter(free.filter(id=>alive.has(id)));buzz(c,.8,50);drawMenu();return true}
+function skTool(t){XR.tool=t;menuMsg=t==='pen'?'Pen: hold the trigger and draw a line in the air. Start and end on corners to join them up. A closed shape becomes a solid.':t==='erase'?'Eraser: hold the trigger and brush the corners or lines to take out.':'Push / pull: point at a face, an edge or a corner and pull the trigger to drag it.';
+  ctrls.forEach(c=>{if(c.userData.stroke){c.userData.stroke=null;skLive([])}c.userData.erasing=false});skMarkV.clear();skMarkE.clear();if(t!=='push'&&view!=='mass')setView('mass');skDraw();drawMenu()}
+
 /* ---------------- VR / XR ----------------
    Set up like Overhang Garden: the left controller holds the menu and the right one points at it and clicks with the trigger.
    Every session starts by setting the floor (Toy Box style). Then: trigger on a face pushes or pulls it, grip on a box, cut or
-   cut-out moves it, grip on empty space moves the whole model and both grips turn and scale it, the left stick flies,
-   A undoes, B redoes, X hides the menu, Y sets the floor again. */
+   cut-out moves it, grip on empty space moves the whole model and both grips turn and scale it, the left stick flies.
+   The buttons match Edgewise XR: A steps through the tools (push / pull, pen, eraser; the red X while you hold something),
+   B undoes, Y redoes, X hides the menu. Each button wears a little picture of what it does. */
 const xray=new THREE.Raycaster();
 try{XR.floorH=+(localStorage.getItem('pgFloor')||0)||0}catch(e){}
 function ctrlModel(col){const g=new THREE.Group(),m=new THREE.MeshStandardMaterial({color:col,roughness:.45}),dk=new THREE.MeshStandardMaterial({color:0x15181D,roughness:.6});
   const body=new THREE.Mesh(new THREE.CapsuleGeometry(.019,.075,6,14),m);body.rotation.x=Math.PI/2+.45;body.position.set(0,-.018,.05);g.add(body);
   const ring=new THREE.Mesh(new THREE.TorusGeometry(.036,.0075,8,32),m);ring.position.set(0,.006,-.01);ring.rotation.x=.6;g.add(ring);
   const face=new THREE.Mesh(new THREE.CylinderGeometry(.02,.02,.006,20),dk);face.position.set(0,.012,.012);face.rotation.x=.5;g.add(face);
-  const trig=new THREE.Mesh(new THREE.BoxGeometry(.013,.022,.016),dk);trig.position.set(0,-.032,-.002);trig.rotation.x=.4;g.add(trig);return g}
+  const trig=new THREE.Mesh(new THREE.BoxGeometry(.013,.022,.016),dk);trig.position.set(0,-.032,-.002);trig.rotation.x=.4;g.add(trig);
+  /* the two face buttons (A and B on the right hand, X and Y on the left) and the stick */
+  const sx=col===0x2E5BFF?1:-1,bm=new THREE.MeshStandardMaterial({color:0x3A3F4A,roughness:.5});g.userData.btns=[new V(sx*.004,.014,.024),new V(sx*-.008,.02,.011)];
+  g.userData.btns.forEach(p=>{const b=new THREE.Mesh(new THREE.CylinderGeometry(.0048,.0048,.004,16),bm);b.position.copy(p);b.rotation.x=.5;g.add(b)});
+  const stick=new THREE.Mesh(new THREE.CylinderGeometry(.006,.005,.009,14),bm);stick.position.set(sx*.009,.02,.004);stick.rotation.x=.5;g.add(stick);return g}
+/* ---- pictures on the face buttons: what each one does right now ---- */
+const xrIconTex={};
+function xrIcon(kind){if(xrIconTex[kind])return xrIconTex[kind];const c=document.createElement('canvas');c.width=c.height=128;const g=c.getContext('2d');g.lineCap='round';g.lineJoin='round';
+  const disc=fill=>{g.beginPath();g.arc(64,64,54,0,7);g.fillStyle=fill;g.fill();g.lineWidth=9;g.strokeStyle='#111';g.stroke()};
+  if(kind==='undo'||kind==='redo'){g.save();if(kind==='redo'){g.translate(128,0);g.scale(-1,1)}
+    const arc=()=>{g.beginPath();g.arc(70,76,33,Math.PI*.12,Math.PI,true)},head=()=>{g.beginPath();g.moveTo(9,70);g.lineTo(65,70);g.lineTo(37,112);g.closePath()};
+    arc();g.lineWidth=32;g.strokeStyle='#111';g.stroke();head();g.lineWidth=10;g.stroke();g.fillStyle='#111';g.fill();const col=kind==='undo'?'#FF4A50':'#4D7DFF';arc();g.lineWidth=20;g.strokeStyle=col;g.stroke();head();g.fillStyle=col;g.fill();g.restore()}
+  else if(kind==='pen'){disc('#FFFFFF');g.strokeStyle='#111';g.lineWidth=12;g.beginPath();g.moveTo(42,86);g.lineTo(88,40);g.stroke();g.fillStyle='#111';g.beginPath();g.moveTo(30,98);g.lineTo(35,78);g.lineTo(50,93);g.closePath();g.fill()}
+  else if(kind==='erase'){disc('#FF2D95');g.save();g.translate(64,64);g.rotate(-.6);g.fillStyle='#FFFFFF';g.fillRect(-30,-16,60,32);g.lineWidth=6;g.strokeStyle='#111';g.strokeRect(-30,-16,60,32);g.beginPath();g.moveTo(-6,-16);g.lineTo(-6,16);g.stroke();g.restore()}
+  else if(kind==='del'){disc('#FF3B30');g.strokeStyle='#FFFFFF';g.lineWidth=16;g.beginPath();g.moveTo(40,40);g.lineTo(88,88);g.moveTo(88,40);g.lineTo(40,88);g.stroke()}
+  else if(kind==='push'){/* a face with an arrow coming out of it */disc('#19B5A1');g.fillStyle='#FFFFFF';g.strokeStyle='#111';g.lineWidth=6;g.fillRect(30,74,68,18);g.strokeRect(30,74,68,18);g.lineWidth=12;g.beginPath();g.moveTo(64,70);g.lineTo(64,40);g.stroke();g.fillStyle='#111';g.beginPath();g.moveTo(64,22);g.lineTo(46,46);g.lineTo(82,46);g.closePath();g.fill()}
+  else{disc('#FFD60A');g.strokeStyle='#111';g.lineWidth=10;g.beginPath();for(const y of [44,64,84]){g.moveTo(40,y);g.lineTo(88,y)}g.stroke()}
+  const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return xrIconTex[kind]=t}
+const xrIconFor=(hand,i)=>hand==='right'?(i?'undo':ctrls.some(c=>c.userData.skGrab)?'del':XR.tool==='pen'?'pen':XR.tool==='erase'?'erase':'push'):(i?'redo':'menu');
+function xrDecorate(c){const U=c.userData,hand=U.hand;if(hand!=='left'&&hand!=='right')return;const ids=hand==='right'?['a-button','b-button']:['x-button','y-button'],fm=U.fmodel,mc=fm&&fm.motionController;
+  const mk=()=>{const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:xrIcon('menu'),transparent:true,depthTest:false}));sp.scale.set(.017,.017,1);sp.renderOrder=16;U.grip.add(sp);return sp};
+  if(mc&&fm.children.length){if(U.model)U.model.visible=false;
+    if(ids.some(id=>!U.icons[id]||U.icons[id].userData.rough)&&(U.decTries=(U.decTries||0)+1)<900)for(const id of ids){if(U.icons[id]&&!U.icons[id].userData.rough)continue;
+        const comp=mc.components&&mc.components[id],root=comp&&comp.rootNodeName?fm.getObjectByName(comp.rootNodeName):null;if(!root)continue;U.grip.updateMatrixWorld(true);const bx=new THREE.Box3().setFromObject(root);if(bx.isEmpty())continue;
+        const cw=bx.getCenter(new V());cw.y=bx.max.y;const sp=U.icons[id]||(U.icons[id]=mk());sp.userData.rough=false;sp.position.copy(U.grip.worldToLocal(cw)).add(new V(0,.009,0))}}
+  else if(U.model)ids.forEach((id,i)=>{if(U.icons[id])return;const sp=U.icons[id]=mk();sp.userData.rough=true;sp.position.copy(U.model.userData.btns[i]).add(new V(0,.011,0))});
+  ids.forEach((id,i)=>{const sp=U.icons[id];if(!sp)return;const k=xrIconFor(hand,i);if(sp.userData.k!==k){sp.material.map=xrIcon(k);sp.material.needsUpdate=true;sp.userData.k=k}})}
+let ctrlFactory=null;try{ctrlFactory=new XRControllerModelFactory()}catch(e){}
 const rayGeo=new THREE.BufferGeometry().setFromPoints([new V(),new V(0,0,-1)]);
 const ctrls=[0,1].map(i=>{const c=renderer.xr.getController(i),g=renderer.xr.getControllerGrip(i);
   const line=new THREE.Line(rayGeo,new THREE.LineBasicMaterial({color:0xffffff,transparent:true,opacity:.8}));line.scale.z=4;c.add(line);
   const dot=new THREE.Mesh(new THREE.SphereGeometry(.007,12,8),new THREE.MeshBasicMaterial({color:0xF2A01F,depthTest:false}));dot.renderOrder=20;dot.visible=false;scene.add(dot);
-  Object.assign(c.userData,{line,dot,grip:g,prev:[]});
+  const tip=new THREE.Mesh(new THREE.SphereGeometry(.005,14,10),new THREE.MeshBasicMaterial({color:0x15181D}));tip.position.set(0,0,-.02);tip.visible=false;c.add(tip);
+  /* the real controller, drawn from its own model when the headset can fetch it; the simple one stands in until then */
+  let fmodel=null;try{if(ctrlFactory){fmodel=ctrlFactory.createControllerModel(g);g.add(fmodel)}}catch(e){}
+  Object.assign(c.userData,{line,dot,grip:g,prev:[],tip,fmodel,icons:{}});
   c.addEventListener('connected',e=>{c.userData.hand=e.data?.handedness;c.userData.src=e.data;const col=c.userData.hand==='left'?0x2E5BFF:0xE5392B;
-    if(c.userData.model)g.remove(c.userData.model);if(!e.data?.hand){c.userData.model=ctrlModel(col);g.add(c.userData.model)}placeMenu()});
+    if(c.userData.model)g.remove(c.userData.model);for(const k in c.userData.icons)g.remove(c.userData.icons[k]);c.userData.icons={};c.userData.decTries=0;if(!e.data?.hand){c.userData.model=ctrlModel(col);g.add(c.userData.model)}placeMenu()});
   c.addEventListener('disconnected',()=>{c.userData.src=null});
   c.addEventListener('selectstart',()=>xrTrigger(c));c.addEventListener('selectend',()=>xrTriggerEnd(c));
   c.addEventListener('squeezestart',()=>grab(c));c.addEventListener('squeezeend',()=>release(c));
@@ -3786,10 +4962,10 @@ const floorGrid=new THREE.GridHelper(3,12,0xF2A01F,0xF2A01F);floorGrid.material.
 function setFloor(h){XR.floorH=Math.round(Math.max(-.3,Math.min(1.8,h))*100)/100;try{localStorage.setItem('pgFloor',XR.floorH)}catch(e){}
   if(XR.base&&typeof XRRigidTransform!=='undefined')try{renderer.xr.setReferenceSpace(XR.base.getOffsetReferenceSpace(new XRRigidTransform({x:0,y:XR.floorH,z:0})))}catch(e){}drawMenu()}
 function floorStep(on){XR.step=on?'floor':null;floorGrid.visible=on;menu.visible=true;
-  if(!on)menuMsg=view==='mass'?'Point at a face, an edge or a corner and pull the trigger to drag it.':'Panels view: grip a part to look closer.';drawMenu()}
+  if(!on)menuMsg=view!=='mass'?'Panels view: point at a joint and pull the trigger to change it.':XR.tool==='push'?'Point at a face, an edge or a corner and pull the trigger to drag it.':'Pen: hold the trigger and draw a line in the air.';drawMenu()}
 /* the menu: one canvas on the left controller */
-const MW=1024,MH=1100;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
-const menu=new THREE.Mesh(new THREE.PlaneGeometry(.30*MW/MH,.30),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
+const MW=1024,MH=1230;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
+const menu=new THREE.Mesh(new THREE.PlaneGeometry(.335*MW/MH,.335),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
 let menuMsg='Point at a face, an edge or a corner and pull the trigger to drag it.';
 const MX=menuCv.getContext('2d');
 function mText(s,x,y,size=34,col='#E9ECF1',al='left',wt=600){MX.fillStyle=col;MX.font=`${wt} ${size}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;MX.textAlign=al;MX.textBaseline='middle';MX.fillText(s,x,y)}
@@ -3806,18 +4982,38 @@ function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.be
     y+=30;B(c3[0],y,w3,'\u25B2  Up 2 cm',{click:()=>setFloor(XR.floorH+.02)});B(c3[1],y,w3,'\u25BC  Down 2 cm',{click:()=>setFloor(XR.floorH-.02)});B(c3[2],y,w3,'Real floor',{click:()=>setFloor(0)});
     y+=140;B(48,y,MW-96,'Done',{solid:true,col:'#2FBF5B',fs:44,click:()=>floorStep(false)});
   }else{let y=120;
-    B(c2[0],y,w2,'Massing',{on:view==='mass',click:()=>{setView('mass');drawMenu()}});B(c2[1],y,w2,'Panels',{on:view==='panels',click:()=>{if(view==='panels')return;menuMsg='Building the panels…';drawMenu();setTimeout(()=>{setView('panels');menuMsg='Panels view. Grip a part to look closer.';drawMenu()},50)}});y+=124;
-    B(c3[0],y,w3,'Add box',{click:()=>menuDo('box')});B(c3[1],y,w3,'Add cut',{click:()=>menuDo('cut')});B(c3[2],y,w3,'Add cut-out',{click:()=>menuDo('carve')});y+=124;
-    B(c3[0],y,w3,'Delete',{click:()=>menuDo('del')});B(c3[1],y,w3,'Undo  (A)',{click:()=>menuDo('undo')});B(c3[2],y,w3,'Redo  (B)',{click:()=>menuDo('redo')});y+=124;
+    B(c2[0],y,w2,'Massing',{on:view==='mass',click:()=>{setView('mass');drawMenu()}});B(c2[1],y,w2,'Panels',{on:view==='panels',click:()=>{if(view==='panels')return;menuMsg='Building the panels…';drawMenu();setTimeout(()=>{setView('panels');menuMsg='Panels view. Point at a joint and pull the trigger to change it. Grip a part to look closer.';drawMenu()},50)}});y+=124;
+    const jt=view==='panels'&&selEdge?selEdge.b.joints?.find(j=>j.key===selEdge.key):null,later=(f,msg)=>()=>{menuMsg='Rebuilding…';drawMenu();setTimeout(()=>{f();rebuild();save();menuMsg=typeof msg==='function'?msg():msg;drawMenu()},30)};
+    if(jt){/* a joint is picked: the same choices as the joint card on the computer */
+      const b=selEdge.b,o=b.edgeOpts[jt.key]||{},[fA,fB]=jt.faces,cur=o.joint||'auto',put=(k,v,def)=>later(()=>{const c=b.edgeOpts[jt.key]||{};if(v===def)delete c[k];else c[k]=v;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},()=>{const j=b.joints?.find(x=>x.key===jt.key);return j?`${b.name} · ${j.label}: now ${j.joint==='meet'?'meet':j.joint?.startsWith?.('over')?'overlap':j.joint||'fingers'}.`:'Joint changed.'});
+      B(c3[0],y,w3,'Auto',{on:cur==='auto',col:'#19B5A1',click:put('joint','auto','auto')});B(c3[1],y,w3,'Fingers',{on:cur==='fingers',col:'#19B5A1',click:put('joint','fingers','auto')});B(c3[2],y,w3,'Meet',{on:cur==='meet',col:'#19B5A1',click:put('joint','meet','auto')});y+=124;
+      B(c3[0],y,w3,fA.num+' over '+fB.num,{on:cur==='over:'+fA.id,col:'#19B5A1',fs:34,click:put('joint','over:'+fA.id,'auto')});B(c3[1],y,w3,fB.num+' over '+fA.num,{on:cur==='over:'+fB.id,col:'#19B5A1',fs:34,click:put('joint','over:'+fB.id,'auto')});
+      const en=o.ends||jt.ends;B(c3[2],y,w3,'Ends: '+en,{fs:32,click:put('ends',en==='proud'?'flush':'proud',null)})}
+    else if(view==='panels'){const tb=sel||blocks[0];
+      B(c3[0],y,w3,S.explode?'Explode on':'Explode',{on:!!S.explode,col:'#19B5A1',fs:34,click:()=>{$('#explodeBtn').click();drawMenu()}});B(c3[1],y,w3,S.showScrews?'Screws on':'Screws',{on:!!S.showScrews,col:'#19B5A1',fs:34,click:()=>{$('#screwBtn').click();drawMenu()}});
+      const ra=()=>(tb&&tb.ribAxis)||S.ribAxis||'long';B(c3[2],y,w3,'Ribs: '+({long:'length',short:'width',vertical:'shelves'}[ra()]||'length'),{fs:30,click:later(()=>{if(tb)tb.ribAxis=ra()==='short'?'vertical':ra()==='vertical'?'long':'short'},()=>tb?`Ribs in ${tb.name} now run `+({long:'across the length',short:'across the width',vertical:'flat, like shelves'}[ra()])+'.':'')});y+=124;
+      const step=f=>later(()=>{if(tb)tb.ribMax=Math.max(6,Math.min(48,Math.round((tb.ribMax||S.ribMax)*f)))},()=>tb?`Ribs in ${tb.name}: one every ${tb.ribMax}" at most.`:'');
+      B(c3[0],y,w3,'Ribs closer',{fs:34,click:step(.8)});B(c3[1],y,w3,'Ribs wider',{fs:34,click:step(1.25)});B(c3[2],y,w3,'Auto fix',{fs:34,click:()=>{menuMsg='Looking for parts that cannot go together, and weak spots…';drawMenu();fixAll();Promise.all(blocks.map(b=>findBuildFix(b))).then(r=>{const m=r.filter(x=>x&&x.startsWith('Fixed'));menuMsg=m.length?m.join(' '):'Every part goes together. Weak joints and panels got glue, blocks or closer ribs where that helps.';drawMenu()})}})}
+    else{B(c3[0],y,w3,'Push / pull',{on:XR.tool==='push',col:'#19B5A1',click:()=>skTool('push')});B(c3[1],y,w3,'Pen',{on:XR.tool==='pen',col:'#E5392B',click:()=>skTool('pen')});B(c3[2],y,w3,'Eraser',{on:XR.tool==='erase',col:'#FF2D95',click:()=>skTool('erase')});y+=124;
+    if(XR.tool==='push'){B(c3[0],y,w3,'Add box',{click:()=>menuDo('box')});B(c3[1],y,w3,'Add cut',{click:()=>menuDo('cut')});B(c3[2],y,w3,'Add cut-out',{click:()=>menuDo('carve')})}
+    else{B(c3[0],y,w3,S.skSquare!==false?'Square up on':'Square up off',{on:S.skSquare!==false,col:'#19B5A1',fs:32,click:()=>{S.skSquare=S.skSquare===false;menuMsg=S.skSquare?'Square up: lines that are nearly upright, level or square to the rest become exactly so.':'Square up is off: lines stay as you draw them.';save();drawMenu()}});
+      B(c3[1],y,w3,S.skTilt!==false?'Wrist tilt on':'Wrist tilt off',{on:S.skTilt!==false,col:'#19B5A1',fs:32,click:()=>{S.skTilt=S.skTilt===false;menuMsg=S.skTilt?'A face you hold tilts with your wrist.':'A face you hold only moves in and out.';save();drawMenu()}});
+      B(c3[2],y,w3,'Clear loose',{fs:32,click:()=>{skClearLoose();menuMsg='Loose lines removed. Solids stay.';drawMenu()}})}}y+=124;
+    if(jt){const b=selEdge.b,bl=(b.edgeOpts[jt.key]||{}).blocks||'auto';B(c3[0],y,w3,'Blocks: '+bl,{fs:32,click:later(()=>{const c=b.edgeOpts[jt.key]||{},nx=bl==='auto'?'on':bl==='on'?'off':'auto';if(nx==='auto')delete c.blocks;else c.blocks=nx;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},'Corner blocks on this joint changed.')})}
+    else B(c3[0],y,w3,'Delete',{click:()=>menuDo('del')});B(c3[1],y,w3,'Undo  (B)',{click:()=>menuDo('undo')});B(c3[2],y,w3,'Redo  (Y)',{click:()=>menuDo('redo')});y+=124;
     B(c2[0],y,w2,'Tabletop 1:12',{on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}});B(c2[1],y,w2,'Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}});y+=124;
-    B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor  (Y)',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=150;
+    B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=150;
     {const c=XR.price;B(48,y-26,MW-96,c?`≈ ${money(c.cost)}  ·  ${c.sheets} sheet${c.sheets===1?'':'s'}  ·  ${hours(c.mins)} cutting`:'Price: tap to work it out',{solid:!!c,col:'#15181D',fs:c?38:34,click:()=>{menuMsg='Working out the price…';drawMenu();setTimeout(()=>{freshen();updateSheetsPanel(true);menuMsg='Price updated.';drawMenu()},50)}});y+=124}
     MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,2)+18;
-    mWrap('Trigger the middle of a face: push or pull it. Near an edge or a corner: drag that edge or corner. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly. X: hide this menu.',48,y,MW-96,26,'#8B93A1',36,4)}
+    mWrap(view!=='panels'&&XR.tool==='push'?'Trigger the middle of a face: push or pull it. Near an edge or a corner: drag that edge or corner. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly.'
+      :view==='panels'?'Point at a joint and pull the trigger: its choices come up here (fingers, meet, which panel laps over, ends, corner blocks). Trigger on empty space lets it go. Grip a part to look closer.'
+      :'Hold the trigger and draw: each stroke is one straight line. Join lines at their corners; a closed flat loop is a face, and faces that close up are a solid you can build. Grip at the pen tip: move a corner, line or face. Grip a loop drawn on a face and pull: it comes out as a block.',48,y,MW-96,26,'#8B93A1',36,5)}
   menuTex.needsUpdate=true}
 function placeMenu(){const g=leftC().userData.grip;if(menu.parent!==g){menu.parent?.remove(menu);g.add(menu)}menu.position.set(0,.08,-.13);menu.rotation.set(-.35-Math.PI/2,0,0);drawMenu()}
 function menuHit(c){if(!menu.visible||menu.parent===c.userData.grip)return null;ctrlRay(c);menu.updateWorldMatrix(true,false);const h=xray.intersectObject(menu,false)[0];if(!h)return null;
-  const px=h.uv.x*MW,py=(1-h.uv.y)*MH,i=XR.W.findIndex(w=>px>=w.x&&px<=w.x+w.w&&py>=w.y&&py<=w.y+w.h);return {i,point:h.point,dist:h.distance}}
+  const px=h.uv.x*MW,py=(1-h.uv.y)*MH,i=XR.W.findIndex(w=>px>=w.x&&px<=w.x+w.w&&py>=w.y&&py<=w.y+w.h);
+  /* with the pen or eraser out, the menu only takes the trigger when you point at one of its buttons from close by: anywhere else you are drawing */
+  if(XR.tool!=='push'&&view==='mass'&&(i<0||h.distance>.7))return null;return {i,point:h.point,dist:h.distance}}
 function menuDo(k){if(typeof k==='number')k=['box','cut','carve','del','undo','redo','view','snap'][k];
   if(k==='box'){const cam=renderer.xr.getCamera(),p=new V().setFromMatrixPosition(cam.matrixWorld),f=new V(0,0,-1).transformDirection(cam.matrixWorld);f.y=0;f.normalize();
     const at=world.worldToLocal(p.addScaledVector(f,S.xrScale==='table'?.4:1.2)),bx=makeBlock({p:[Math.round(at.x),12,Math.round(at.z)],s:[24,24,24]});select(bx);schedule();save();menuMsg='Box '+bx.name+' added in front of you.'}
@@ -3828,24 +5024,38 @@ function menuDo(k){if(typeof k==='number')k=['box','cut','carve','del','undo','r
   drawMenu()}
 function xrTrigger(c){const mh=menuHit(c);if(mh){if(mh.i>=0){buzz(c,.25,15);XR.W[mh.i].click?.()}return}
   if(XR.step==='floor'){setFloor(XR.floorH+gripPos(c).y-.02);buzz(c,.5,60);return}
+  /* holding a face with the grip: the trigger pulls it out as a new block */
+  if(c.userData.skGrab){if(c.userData.skGrab.kind==='face')skExtrude(c,0,0);return}
+  if(XR.tool!=='push'&&view==='mass'){if(XR.tool==='pen')skStrokeStart(c);else{c.userData.erasing=true;skEraseAt(c)}return}
+  if(view==='panels'){const j=xrJoint(c);
+    if(j){selEdge={b:j.b,key:j.jt.key};selPanel=null;highlightPanel();showEdge();buzz(c,.4,25);menuMsg=`${j.b.name} · ${j.jt.label}: a ${j.jt.ang}° joint, now ${j.jt.joint==='meet'?'meet':String(j.jt.joint||'fingers').startsWith('over')?'overlap':j.jt.joint||'fingers'}. Change it on the menu.`;drawMenu();return}
+    if(selEdge){selEdge=null;showEdge();menuMsg='Panels view. Point at a joint and pull the trigger to change it.';drawMenu();return}}
   /* what you point at decides what you grab: the middle of a face, an edge, or a corner */
   const h=xrFace(c),hd=pickHandle(h);
   if(hd&&hd.type!=='face'){const g=startHandle(hd);if(g){c.userData.hd={g,D0:h.dist,P0:h.P.clone()};buzz(c,.3,20);menuMsg=hd.type==='edge'?'Moving an edge: both faces follow.':'Moving a corner: all its faces follow.';drawMenu();return}}
   if(h){const d=startPush(h,xrParam(c,h.P,h.f.pl.n));if(d){c.userData.push=d;if(sel!==h.b)select(h.b);buzz(c,.2,15);return}}
   grab(c)}
-function xrTriggerEnd(c){if(c.userData.hd){const g=c.userData.hd.g;c.userData.hd=null;endHandle(g);drawMenu();return}
+/* the joint you point at in Panels view (the nearest one to where the pointer lands on a part) */
+function xrJoint(c){ctrlRay(c);const T=[];panelGroup.traverse(o=>{if(o.isMesh&&!o.userData.isStencil&&o.visible&&o.userData.pick)T.push(o)});const hit=xray.intersectObjects(T,false)[0];if(!hit)return null;
+  const b=hit.object.userData.pick;if(!b||b.isObject3D||!b.joints)return null;let off=new V();for(let o=hit.object;o;o=o.parent)if(o.userData?.clip){off=o.userData.clip.off;break}
+  const P=world.worldToLocal(hit.point.clone()).sub(off);let best=null;for(const jt of b.joints){const ab=jt.b.clone().sub(jt.a),tt=THREE.MathUtils.clamp(P.clone().sub(jt.a).dot(ab)/ab.lengthSq(),0,1),d=P.distanceTo(jt.a.clone().addScaledVector(ab,tt));if(!best||d<best.d)best={d,jt,b}}
+  return best&&best.d<Math.max(3.5*b.tModel,2.5)?best:null}
+function xrTriggerEnd(c){if(c.userData.stroke){skStrokeEnd(c);return}if(c.userData.erasing){c.userData.erasing=false;skEraseEnd();skDraw();return}
+  if(c.userData.hd){const g=c.userData.hd.g;c.userData.hd=null;endHandle(g);drawMenu();return}
   const d=c.userData.push;if(d){c.userData.push=null;showFace(null);if(d.moved){renderModelPanel();schedule();save()}return}release(c)}
-function grab(c){if(XR.step==='floor')return;ctrlRay(c);
+function grab(c){if(XR.step==='floor')return;
+  if(XR.tool!=='push'&&view==='mass'&&!c.userData.stroke){const h=skPick(skTip(c).toArray(),.035*skK());if(h){skGrabStart(c,h);return}}
+  ctrlRay(c);
   const targets=[];blocks.forEach(b=>{b.cuts.forEach(cu=>{if(cu.visible)targets.push(cu.userData.vis)});b.carves.forEach(cv=>{if(cv.visible)targets.push(cv.userData.vis)})});
   (view==='mass'?massGroup:panelGroup).traverse(o=>{if(o.isMesh&&!o.userData.isStencil)targets.push(o)});
   const hit=xray.intersectObjects(targets,false)[0],pk=hit?.object.userData.pick;let obj,b;
   if(pk?.isObject3D&&pk.userData.isCut){obj=pk;b=pk.userData.block}else{b=pk;obj=b?.pivot}
   if(!b){c.userData.nav=true;buzz(c,.15,15);return}
   select(b,obj===b.pivot?null:obj);c.userData.grab={obj,parent:obj.parent,b};c.attach(obj);buzz(c,.3,20);drawMenu()}
-function release(c){if(c.userData.nav){c.userData.nav=false;return}const g=c.userData.grab;if(!g)return;g.parent.attach(g.obj);c.userData.grab=null;updateMass(g.b);schedule();save()}
+function release(c){if(c.userData.skGrab){skGrabEnd(c);return}if(c.userData.nav){c.userData.nav=false;return}const g=c.userData.grab;if(!g)return;g.parent.attach(g.obj);c.userData.grab=null;updateMass(g.b);schedule();save()}
 /* moving the whole model: one grip drags it, both grips turn and scale it about the middle of your hands */
 function navTick(dt){const ns=ctrls.filter(c=>c.userData.nav),n=Math.min(2,ns.length);
-  if(n!==XR.navN){XR.navN=n;XR.nav={pos:world.position.clone(),q:world.quaternion.clone(),s:world.scale.x,a:ns[0]&&gripPos(ns[0]),b:ns[1]&&gripPos(ns[1])};}
+  if(n!==XR.navN){if(XR.navN===2)skDraw();XR.navN=n;XR.nav={pos:world.position.clone(),q:world.quaternion.clone(),s:world.scale.x,a:ns[0]&&gripPos(ns[0]),b:ns[1]&&gripPos(ns[1])};}
   else if(n===1)world.position.copy(XR.nav.pos).add(gripPos(ns[0]).sub(XR.nav.a));
   else if(n===2){const N=XR.nav,pa=gripPos(ns[0]),pb=gripPos(ns[1]),m0=N.a.clone().add(N.b).multiplyScalar(.5),m1=pa.clone().add(pb).multiplyScalar(.5),d0=N.b.clone().sub(N.a),d1=pb.clone().sub(pa);
     const base=S.xrScale==='table'?.0254/12:.0254,f=Math.max(base*.25/N.s,Math.min(base*4/N.s,d1.length()/Math.max(1e-4,d0.length())));
@@ -3857,24 +5067,34 @@ function navTick(dt){const ns=ctrls.filter(c=>c.userData.nav),n=Math.min(2,ns.le
 let xrT0=0;
 function xrTick(){const now=performance.now(),dt=Math.min(.05,(now-(xrT0||now))/1000);xrT0=now;
   const L=leftC(),R=rightC();
-  if(edgeB(L,4)){menu.visible=!menu.visible;buzz(L,.2,15)}if(edgeB(L,5))floorStep(true);
-  if(R&&R!==L){if(edgeB(R,4)){menuDo('undo');buzz(R,.3,20)}if(edgeB(R,5)){menuDo('redo');buzz(R,.3,20)}}
-  navTick(dt);let hov=-1;
+  if(edgeB(L,4)){menu.visible=!menu.visible;buzz(L,.2,15)}if(edgeB(L,5)&&R!==L){menuDo('redo');buzz(L,.3,20)}
+  if(R&&R!==L){if(edgeB(R,4)){if(!skDeleteHeld()&&!XR.step)skTool(XR.tool==='push'?'pen':XR.tool==='pen'?'erase':'push');buzz(R,.4,20)}if(edgeB(R,5)){menuDo('undo');buzz(R,.3,20)}}
+  navTick(dt);let hov=-1,skHov=null;const pen=XR.tool!=='push'&&!XR.step&&view==='mass';
   for(const c of ctrls){const U=c.userData;U.line.visible=!(menu.visible&&menu.parent===U.grip);U.dot.visible=false;U.line.scale.z=4;
+    U.tip.visible=pen;U.tip.material.color.set(XR.tool==='erase'?0xFF2D95:0x15181D);xrDecorate(c);
+    if(U.skGrab){U.line.visible=false;skGrabMove(c);continue}
+    if(U.stroke){U.line.visible=false;skStrokeMove(c);const h=skPick(skTip(c).toArray(),skSnapR());if(h&&h.kind==='vert')skHov=h;continue}
+    if(U.erasing){U.line.visible=false;skEraseAt(c);continue}
     if(U.grab){updateMass(U.grab.b);schedule();continue}
     if(U.hd){ctrlRay(c);const Q=world.worldToLocal(xray.ray.origin.clone().addScaledVector(xray.ray.direction,U.hd.D0)),m=dragHandle(U.hd.g,Q.sub(U.hd.P0));if(m&&m!==menuMsg){menuMsg=m;drawMenu()}continue}
     const d=U.push;if(d){const t=xrParam(c,d.P,d.n);if(t!=null&&d.t0!=null){const m=pushTo(d,t-d.t0);if(m&&m!==menuMsg){menuMsg=m;drawMenu()}}continue}
     if(!U.line.visible)continue;
     const mh=menuHit(c);if(mh){hov=mh.i;U.line.scale.z=mh.dist;U.dot.position.copy(mh.point);U.dot.visible=true;continue}
     if(XR.step==='floor')continue;
+    /* pen and eraser work at the tip, so the pointer line only shows on the menu; the corner the tip would catch lights up */
+    if(pen){U.line.visible=false;const h=skPick(skTip(c).toArray(),XR.tool==='pen'?skSnapR():.035*skK());if(h&&h.kind==='vert'&&!skHov)skHov=h;continue}
     const h=xrFace(c);if(h){U.line.scale.z=h.dist;U.dot.position.copy(h.W);U.dot.visible=true}}
-  if(!ctrls.some(c=>c.userData.push||c.userData.hd)){const c=R||ctrls[0],h=hov<0&&!XR.step?xrFace(c):null;showHandle(pickHandle(h))}
+  if(pen){if(!ctrls.some(c=>c.userData.skGrab)){hDot.visible=!!skHov;hEdge.visible=false;if(skHov){hDot.position.copy(skV(SKX[skHov.id]));hDot.scale.setScalar(.011*skK())}}}
+  else if(!ctrls.some(c=>c.userData.push||c.userData.hd)){const c=R||ctrls[0],h=hov<0&&!XR.step?xrFace(c):null;showHandle(pickHandle(h))}
   if(hov!==XR.hover){XR.hover=hov;drawMenu()}}
-function placeWorld(){setTimeout(updateSection,0);world.quaternion.identity();if(S.xrScale==='table'){world.scale.setScalar(.0254/12);world.position.set(0,.8,-.6)}else{world.scale.setScalar(.0254);world.position.set(0,0,-1.6)}}
+function placeWorld(){setTimeout(updateSection,0);setTimeout(skDraw,0);world.quaternion.identity();if(S.xrScale==='table'){world.scale.setScalar(.0254/12);world.position.set(0,.8,-.6)}else{world.scale.setScalar(.0254);world.position.set(0,0,-1.6)}}
 async function enterXR(kind){
   try{const sess=await navigator.xr.requestSession(kind==='ar'?'immersive-ar':'immersive-vr',{optionalFeatures:['local-floor','bounded-floor','hand-tracking']});
     xrMode=kind;tc.detach();if(view!=='mass'&&view!=='panels')setView('mass');placeWorld();applyTheme();menu.visible=true;placeMenu();
-    sess.addEventListener('end',()=>{ctrls.forEach(c=>{release(c);c.userData.nav=false;c.userData.push=null;c.userData.hd=null;c.userData.dot.visible=false});XR.base=null;XR.step=null;floorGrid.visible=false;menu.visible=false;showFace(null);xrMode=null;
+    /* in the headset distances are real metres: let things come right up to your eyes without being cut away */
+    camera.near=.02;camera.far=400;camera.updateProjectionMatrix();skDraw();
+    sess.addEventListener('end',()=>{ctrls.forEach(c=>{if(c.userData.stroke){c.userData.stroke=null;skLive([])}c.userData.erasing=false;release(c);c.userData.nav=false;c.userData.push=null;c.userData.hd=null;c.userData.dot.visible=false;c.userData.tip.visible=false});
+      camera.near=1;camera.far=5000;camera.updateProjectionMatrix();skMarkV.clear();skMarkE.clear();setTimeout(skDraw,0);XR.base=null;XR.step=null;floorGrid.visible=false;menu.visible=false;showFace(null);xrMode=null;
       world.scale.setScalar(1);world.position.set(0,0,0);world.quaternion.identity();applyTheme();updateSection();attachGizmo();resize()});
     await renderer.xr.setSession(sess);try{renderer.xr.setFoveation?.(1)}catch(e){}XR.base=renderer.xr.getReferenceSpace();setFloor(XR.floorH);floorStep(true);
   }catch(e){xrMode=null;toast('The headset session could not start')}}

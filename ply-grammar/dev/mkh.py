@@ -5,4 +5,4 @@ body=pre.split('\n',4)[4]
 core=s[:s.index('/* ---------------- three.js scene')]
 pm=s[s.index('/* ---------------- panel meshes'):s.index('/* ---------------- rebuild')]
 test=open(sys.argv[1]).read()
-open('h.mjs','w').write(hdr+"const V=THREE.Vector3,Q=THREE.Quaternion;\n"+body+geom+core+pm+test)
+open('h.mjs','w').write(hdr+"const V=THREE.Vector3,Q=THREE.Quaternion;\n"+body+geom+open('ew.js').read()+core+pm+test)

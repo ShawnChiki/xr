@@ -6,6 +6,23 @@ function mk(p,s,cuts){const b={cuts:[],carves:[],pivot:new THREE.Object3D(),size
 const carve=(b,p,s)=>{const o=new THREE.Object3D(),z=new THREE.Object3D();o.position.fromArray(p);z.scale.fromArray(s);o.add(z);o.userData={cid:'v'+b.carves.length,sizer:z};b.pivot.add(o);b.carves.push(o);return o};
 function rng(seed){let a=seed>>>0;return ()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return ((t^t>>>14)>>>0)/4294967296}}
 function gen(seed){const R=rng(seed*7919+13),ri=(a,b)=>Math.round(a+R()*(b-a)),pick=a=>a[Math.floor(R()*a.length)];
+  if(process.env.SK){/* sketched solids: prisms with all sorts of outlines, a block standing on a block, a few leaning shapes */
+    const kind=process.env.SK==='1'?pick(['box','ramp','L','house','step','U','T','frustum','stairs','lean']):process.env.SK,w=ri(18,60),h=ri(12,44),dp=ri(14,48);let prof=null,V_={},F_=[],nid=1,desc=kind+' ';
+    const prism=(pr,z0,z1)=>{const n=pr.length,a=[],c=[];pr.forEach(([x,y])=>{V_[nid]=[x,y,z1];a.push(nid++);V_[nid]=[x,y,z0];c.push(nid++)});F_.push({ids:a},{ids:c});for(let i=0;i<n;i++)F_.push({ids:[a[i],a[(i+1)%n],c[(i+1)%n],c[i]]})};
+    if(kind==='box')prof=[[0,0],[w,0],[w,h],[0,h]];
+    else if(kind==='ramp'){const lip=pick([0,0,4,8]);prof=lip?[[0,0],[w,0],[w,lip],[0,h]]:[[0,0],[w,0],[0,h]]}
+    else if(kind==='L'){const a=ri(6,w-8),c=ri(6,h-6);prof=[[0,0],[w,0],[w,c],[a,c],[a,h],[0,h]]}
+    else if(kind==='house'){const e=ri(6,h-5);prof=[[0,0],[w,0],[w,e],[w/2,h],[0,e]]}
+    else if(kind==='U'){const a=ri(6,Math.max(7,w/3)),c=ri(5,h-6);prof=[[0,0],[w,0],[w,h],[w-a,h],[w-a,c],[a,c],[a,h],[0,h]]}
+    else if(kind==='T'){const a=ri(5,Math.max(6,w/3)),c=ri(6,h-6);prof=[[a,0],[w-a,0],[w-a,c],[w,c],[w,h],[0,h],[0,c],[a,c]]}
+    else if(kind==='stairs'){const n=pick([2,3,3,4]),tr=w/n,rs=h/n;prof=[[0,0],[w,0]];for(let i=0;i<n;i++){prof.push([w-i*tr,(i+1)*rs]);if(i<n-1)prof.push([w-(i+1)*tr,(i+1)*rs])}prof.push([0,h]);prof=prof.filter((p,i,a)=>!i||Math.hypot(p[0]-a[i-1][0],p[1]-a[i-1][1])>1e-6)}
+    if(prof)prism(prof,-dp/2,dp/2);
+    else if(kind==='step'){prism([[0,0],[w,0],[w,h*.5],[0,h*.5]],-dp/2,dp/2);const a=ri(6,Math.max(7,w*.6)),x0=ri(1,Math.max(1,w-a-1)),d2=ri(6,Math.max(7,dp-4)),z0=-dp/2+ri(1,Math.max(1,dp-d2-1));prism([[x0,h*.5],[x0+a,h*.5],[x0+a,h],[x0,h]],z0,z0+d2);desc+=`top ${a}x${d2} `}
+    else if(kind==='frustum'){const i=ri(2,Math.max(3,w/4)),j=ri(2,Math.max(3,dp/4)),B=[[0,0,-dp/2],[w,0,-dp/2],[w,0,dp/2],[0,0,dp/2]],T_=[[i,h,-dp/2+j],[w-i,h,-dp/2+j],[w-i,h,dp/2-j],[i,h,dp/2-j]],a=[],c=[];B.forEach(p=>{V_[nid]=p;a.push(nid++)});T_.forEach(p=>{V_[nid]=p;c.push(nid++)});F_.push({ids:a},{ids:c});for(let k=0;k<4;k++)F_.push({ids:[a[k],a[(k+1)%4],c[(k+1)%4],c[k]]})}
+    else if(kind==='lean'){const sx=ri(-10,10),B=[[0,0,-dp/2],[w,0,-dp/2],[w,0,dp/2],[0,0,dp/2]],a=[],c=[];B.forEach(p=>{V_[nid]=p;a.push(nid++)});B.forEach(p=>{V_[nid]=[p[0]+sx,h,p[2]];c.push(nid++)});F_.push({ids:a},{ids:c});for(let k=0;k<4;k++)F_.push({ids:[a[k],a[(k+1)%4],c[(k+1)%4],c[k]]})}
+    const b=mk([0,h/2,0],[w,h,dp],[]);for(const k in V_){V_[k][0]-=w/2;V_[k][1]-=h/2}F_.forEach(f=>f.key=EW.faceKey(f.ids));b.sk={V:V_,F:F_};
+    if(R()<.2){const o=new THREE.Object3D(),n=new V(pick([-1,1])*.5,.8,pick([0,.3])).normalize();o.position.set(0,h*.25,0);o.quaternion.setFromUnitVectors(new V(0,0,1),n);o.userData.cid='c0';b.pivot.add(o);b.cuts.push(o);desc+='+cut '}
+    b.name='A';return {b,desc:desc+`${w}x${h}x${dp} cells ${skCells(b).length}`}}
   const EV=process.env.ROT==='2',s=[ri(14,72),ri(12,54),ri(14,60)],cuts=[],nc=EV?pick([0,1,1]):pick([0,0,1,1,1,2,2,3]);
   for(let i=0;i<nc;i++){const ax=pick([0,2]),sg=pick([-1,1]),ang=pick([15,20,30,35,45,50,60,70])*Math.PI/180,n=[0,Math.cos(ang),0];n[ax]=sg*Math.sin(ang);
     if(R()<.2){n[1]=0;n[ax]=sg*Math.cos(ang);n[2-ax]=pick([-1,1])*Math.sin(ang)}       /* a vertical chamfer now and then */
@@ -82,7 +99,7 @@ function check(seed,verbose){Object.assign(S,{scaleDen:1,...FULL_DEF});const {b,
 const N=+process.argv[2]||100,S0=+process.argv[3]||1,VS=process.argv[4];
 if(VS){const o=check(+VS,true);console.log(o.issues);process.exit(0)}
 const G={},t0=Date.now();
-for(let s=S0;s<S0+N;s++){const o=check(s);const real=o.issues.filter(([k])=>!k.includes('(explained)'));const grp=/carves \S/.test(o.desc)?'with cut-outs':/cuts \S/.test(o.desc)?'cuts only':'plain box';
+for(let s=S0;s<S0+N;s++){const o=check(s);const real=o.issues.filter(([k])=>!k.includes('(explained)'));const grp=process.env.SK?o.desc.split(' ')[0]:/carves \S/.test(o.desc)?'with cut-outs':/cuts \S/.test(o.desc)?'cuts only':'plain box';
   const g=G[grp]=G[grp]||{n:0,clean:0,tally:{}};g.n++;if(!real.length)g.clean++;
   for(const k of new Set(o.issues.map(x=>x[0]))){(g.tally[k]=g.tally[k]||[]).push(s)}}
 console.log(`${N} shapes, ${((Date.now()-t0)/1000).toFixed(0)}s`);

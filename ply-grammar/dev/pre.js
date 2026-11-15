@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
-import {TransformControls} from 'three/addons/controls/TransformControls.js';
+import {TransformControls} from 'three/addons/controls/TransformControls.js';import {XRControllerModelFactory} from 'three/addons/webxr/XRControllerModelFactory.js';
 const V=THREE.Vector3, Q=THREE.Quaternion;
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 
