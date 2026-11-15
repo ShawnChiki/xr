@@ -31,9 +31,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 import * as C from './core.js';
-import { joinSolids } from './join.js';
+import { joinSolids, trimFloor } from './join.js';
 
-const VERSION = '0.13';           // bump with every push (matches the commit's "Edgewise XR vX.Y")
+const VERSION = '0.14';           // bump with every push (matches the commit's "Edgewise XR vX.Y")
 const V3 = THREE.Vector3, $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const toV = a => new V3(a[0], a[1], a[2]), toA = v => [v.x, v.y, v.z];
@@ -42,7 +42,7 @@ const toV = a => new V3(a[0], a[1], a[2]), toA = v => [v.x, v.y, v.z];
 // Settings and the sketch
 // ======================================================================
 const SET_KEY = 'edgewise:set', SK_KEY = 'edgewise:sketch', LIB_KEY = 'edgewise:lib';
-const S = Object.assign({ floorLock: true, brush: 'level', lockPage: 'paint', lineW: 'mid', pt: 'small', tagSize: 'small', join: true, tags: true, tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
+const S = Object.assign({ floorTrim: false, floorLock: true, brush: 'level', lockPage: 'paint', lineW: 'mid', pt: 'small', tagSize: 'small', join: true, tags: true, tool: 'draw', tab: 'draw', snap: 6, square: true, sqDeg: 10, floor: true, slide: false, strokes: true, points: true, hand: 'right' },
   (() => { try { return JSON.parse(localStorage.getItem(SET_KEY)) || {}; } catch (e) { return {}; } })());
 const SIZE = { line: { thin: 0.0022, mid: 0.0035, thick: 0.0055 }, pt: { small: 0.0075, big: 0.012 }, tag: { small: [0.06, 0.0225], big: [0.1, 0.0375] } };
 const saveSet = () => { try { localStorage.setItem(SET_KEY, JSON.stringify(S)); } catch (e) {} };
@@ -131,12 +131,19 @@ const seamInst = new THREE.InstancedMesh(new THREE.CylinderGeometry(1, 1, 1, 6, 
 seamInst.count = 0; seamInst.frustumCulled = false; world.add(seamInst);
 // Join: worked out from what's on screen, at most about ten times a second while things move
 let joinCache = { F: null, at: 0, J: null };
+// what's shown and saved: solids joined (Join) and cut off at the floor (Trim below the floor)
+function shapeOf(skm, Fm, P){
+  if (!window.polygonClipping || (!S.join && !S.floorTrim)) return null;
+  let J = null;
+  try { if (S.join) J = joinSolids(skm, Fm, P, window.polygonClipping); } catch (e) { J = null; }
+  try { if (S.floorTrim) J = trimFloor(skm, Fm, P, window.polygonClipping, J); } catch (e) {}
+  return J;
+}
 function joinFor(M){
-  if (!S.join || !window.polygonClipping) return null;
+  if (!window.polygonClipping || (!S.join && !S.floorTrim)) return null;
   const now = performance.now(), moving = !!drag || !!preview || gliding;
   if (joinCache.F === M.F && (!moving || now - joinCache.at < 100)) return joinCache.J;
-  let J = null;
-  try { J = joinSolids(M.sk, M.F, M.P, window.polygonClipping); } catch (e) { J = null; }
+  const J = shapeOf(M.sk, M.F, M.P);
   joinCache = { F: M.F, at: now, J };
   return J;
 }
@@ -240,8 +247,12 @@ function drawModel(){
   const r = SIZE.line[S.lineW] * k;
   let n = 0;
   for (const e of M.sk.e){
-    const a = M.P[e.a], b = M.P[e.b]; if (!a || !b || n >= MAXI) continue;
-    const A = toV(a), B = toV(b), L = A.distanceTo(B);
+    let a = M.P[e.a], b = M.P[e.b]; if (!a || !b || n >= MAXI) continue;
+    if (S.floorTrim){
+      if (a[1] < -1e-4 && b[1] < -1e-4) continue;
+      if (a[1] < 0 || b[1] < 0){ const t = a[1] / (a[1] - b[1]), q = [a[0] + (b[0] - a[0]) * t, 0, a[2] + (b[2] - a[2]) * t]; if (a[1] < 0) a = q; else b = q; }
+    }
+    const A = toV(a), B = toV(b), L = A.distanceTo(B); if (L < 1e-6) continue;
     tmpQ.setFromUnitVectors(UP, B.clone().sub(A).normalize());
     tmpM.compose(A.add(B).multiplyScalar(0.5), tmpQ, new V3(r, L, r));
     edgeInst.setMatrixAt(n, tmpM);
@@ -261,6 +272,7 @@ function drawModel(){
     const deg = new Map(); for (const e of M.sk.e){ deg.set(e.a, (deg.get(e.a) || 0) + 1); deg.set(e.b, (deg.get(e.b) || 0) + 1); }
     for (const v of M.sk.v){
       const p = M.P[v.id]; if (!p || n >= MAXI) continue;
+      if (S.floorTrim && p[1] < -1e-3) continue;
       const hot = (drag && drag.drops && drag.drops.some(d => d.to === v.id || d.from === v.id)) || hover && ((hover.kind === 'vert' && hover.id === v.id) || (hover.kind === 'face' && hover.ids?.includes(v.id)) || (hover.kind === 'edge' && hover.ids?.includes(v.id)));
       const rr = (SIZE.pt[S.pt] || SIZE.pt.small) * (hot ? 1.45 : 1) * k;
       tmpM.compose(toV(p), tmpQ.identity(), new V3(rr, rr, rr)); cornInst.setMatrixAt(n, tmpM);
@@ -783,18 +795,17 @@ function drawMenu(){
   } else if (S.tab === 'lock'){
     seg(x0, y, W, 64, [['paint', 'Paint locks'], ['auto', 'Auto tidy']], S.lockPage, v => S.lockPage = v, 26); y += 84;
     if (S.lockPage === 'paint'){ drawBrushes(x0, y, W); return finishMenu(); }
-    label('Square up', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.square, v => { S.square = v; rebuild(); }, 28); y += 90;
-    y = para('Nearly upright, level or square lines snap exactly so.', x0, y + 22, W) - 4;
-    label('Snap when within', x0, y + 20); y += 34;
-    seg(x0, y, W, 72, [[5, '5°'], [10, '10°'], [15, '15°']], S.sqDeg, v => { S.sqDeg = v; rebuild(); }, 28); y += 90;
+    label('Square up: lines nearly straight snap, within', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[0, 'Off'], [5, '5°'], [10, '10°'], [15, '15°']], S.square ? S.sqDeg : 0, v => { if (v){ S.square = true; S.sqDeg = v; } else S.square = false; rebuild(); }, 28); y += 90;
     label('Corners near the floor sit on it', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'On'], [false, 'Off']], S.floor, v => { S.floor = v; rebuild(); }, 28); y += 90;
     button(x0, y, W, 64, 'Join points that almost touch', joinNear, false, { fs: 25 }); y += 78;
     label('Solids that overlap or touch join into one', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'Join'], [false, 'Keep apart']], S.join, v => { S.join = v; joinCache.F = null; }, 28); y += 90;
+    label('Trim everything below the floor', x0, y + 20); y += 34;
+    seg(x0, y, W, 72, [[true, 'Trim'], [false, 'Off']], S.floorTrim, v => { S.floorTrim = v; joinCache.F = null; }, 28); y += 90;
     const mm = flatMM();
-    para('All faces flat' + (mm === null ? '.' : ', within ' + (mm < 0.01 ? '0.01' : mm.toFixed(2)) + ' mm.'), x0, y + 22, W);
+    para('All faces flat' + (mm === null ? '.' : ', within ' + (mm < 0.01 ? '0.01' : mm.toFixed(2)) + ' mm.'), x0, y + 18, W, 22, '#555');
   } else if (S.tab === 'view'){
     label('Your sketch strokes', x0, y + 20); y += 34;
     seg(x0, y, W, 72, [[true, 'Show'], [false, 'Hide']], S.strokes, v => S.strokes = v, 28); y += 96;
@@ -893,7 +904,7 @@ function openLib(i){ const it = getLib()[i]; if (!it) return; pushUndo(); sk = C
 function delLib(i){ const l = getLib(); l.splice(i, 1); setLib(l); flash('Removed from the library'); }
 function exportOBJ(){
   if (!F || !F.faces.length) return flash('No faces yet to save');
-  const J = S.join && window.polygonClipping ? joinSolids(sk, F, X, window.polygonClipping) : null;
+  const J = shapeOf(sk, F, X);
   const text = J && J.faces.length ? joinedOBJ(J) : C.toOBJ(sk, F, X, 1000, f => holeTris(f.all.map(id => X[id]), f.ids.length, f.holes.map(h => h.length)).map(t => t.map(i => f.all[i])));
   const blob = new Blob([text], { type: 'text/plain' }), a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = 'edgewise-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.obj'; a.click();
@@ -1290,7 +1301,7 @@ renderer.setAnimationLoop(() => {
 
 rebuild(); for (const id in X) D[id] = X[id].slice();
 if (firstRun) loadSample();
-window.edgewise = { pickBrush, paintStart, paintAt, paintEnd, pairTap, joinNear, setLineLock, setLinePair, ekey, objText: () => joinedOBJ(joinSolids(sk, F, X, window.polygonClipping)), summary, doExtrude, deleteHeld, get drag(){ return drag; }, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
+window.edgewise = { pickBrush, paintStart, paintAt, paintEnd, pairTap, joinNear, setLineLock, setLinePair, ekey, objText: () => joinedOBJ(shapeOf(sk, F, X)), summary, doExtrude, deleteHeld, get drag(){ return drag; }, setFaceLock, setAngleLock, get sel(){ return sel; }, orbit, get sk(){ return sk; }, get F(){ return F; }, get X(){ return X; }, loadSample, rebuild, S, C, world, camera, grabStart, grabMove, grabEnd, pickFace, strokeStart, strokeMove, strokeEnd };
 </script>
 <script src="../updated.js"></script>
 </body>

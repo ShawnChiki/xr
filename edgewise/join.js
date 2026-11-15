@@ -131,3 +131,86 @@ export function joinSolids(sk, F, X, pc){
   if (!any) return { group, faces: [], replaced };
   return { group, faces: out, replaced };
 }
+
+// ---------------------------------------------------------------- trim below the floor
+// Everything under the floor (y < 0) is cut away. Faces crossing the floor are cut along it; a closed solid that
+// goes through the floor gets a flat cap there (pieces that join share one cap), so it stays closed.
+// J: a joinSolids result (or null). Returns the same shape: { group, faces, replaced }.
+export function trimFloor(sk, F, X, pc, J){
+  const group = J ? J.group : new Map(F.pieces.map(p => [p.id, p.id]));
+  const out = [], replaced = new Set(J ? J.replaced : []);
+  const area2 = r => { let a = 0; for (let i = 0; i < r.length; i++){ const p = r[i], q = r[(i + 1) % r.length]; a += p[0] * q[1] - q[0] * p[1]; } return Math.abs(a) / 2; };
+  // cut one face (rings in 3D, normal n) to the part at or above the floor; null = untouched, [] = all below
+  const cut = (rings, n) => {
+    let lo = Infinity, hi = -Infinity;
+    for (const r of rings) for (const p of r){ lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); }
+    if (lo >= -EPS) return null;
+    if (hi <= EPS) return [];
+    const o = rings[0][0], [u, w] = basis(n);
+    const to2 = p => { const q = sub(p, o); return [dot(q, u), dot(q, w)]; }, to3 = q => add(o, add(mul(u, q[0]), mul(w, q[1])));
+    const poly = rings.map(r => r.map(to2));
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (const q of poly[0]){ x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]); }
+    // the part of the face's plane above the floor: a big box clipped by the floor line
+    const above = q => o[1] + u[1] * q[0] + w[1] * q[1];
+    const box = [[x0 - 1, y0 - 1], [x1 + 1, y0 - 1], [x1 + 1, y1 + 1], [x0 - 1, y1 + 1]], half = [];
+    for (let i = 0; i < 4; i++){
+      const a = box[i], b = box[(i + 1) % 4], ha = above(a), hb = above(b);
+      if (ha >= 0) half.push(a);
+      if ((ha >= 0) !== (hb >= 0)){ const t = ha / (ha - hb); half.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]); }
+    }
+    if (half.length < 3) return [];
+    let res; try { res = pc.intersection(poly, [half]); } catch (e) { return null; }
+    return res.filter(p => area2(p[0]) > 1e-6).map(p => p.map(r => { const rr = r.slice(); const a = rr[0], z = rr[rr.length - 1]; if (a[0] === z[0] && a[1] === z[1]) rr.pop(); return rr.map(to3).map(q => [q[0], Math.max(0, q[1]), q[2]]); }));
+  };
+  let any = false;
+  // faces already reshaped by Join
+  for (const f of J ? J.faces : []){
+    const c = cut(f.rings, f.n);
+    if (c === null){ out.push(f); continue; }
+    any = true; for (const rings of c) out.push({ piece: f.piece, group: f.group, n: f.n, rings });
+  }
+  // the rest of the faces
+  const loopsOf = new Map();
+  for (const pc2 of F.pieces){
+    const fs = F.faces.filter(f => f.piece === pc2.id && !f.open);
+    if (pc2.closed && fs.length && fs.every(f => f.all.every(id => X[id]))){ const L = orient(fs, X); fs.forEach((f, i) => loopsOf.set(f.key, L[i])); }
+  }
+  for (const f of F.faces){
+    if (f.open || replaced.has(f.key) || f.all.some(id => !X[id])) continue;
+    const loop = loopsOf.get(f.key) || f.ids, n = planeOf(loop.map(id => X[id])).n;
+    const c = cut([loop.map(id => X[id]), ...f.holes.map(h => h.map(id => X[id]))], n);
+    if (c === null) continue;
+    any = true; replaced.add(f.key);
+    const g = group.get(f.piece) ?? f.piece;
+    for (const rings of c) out.push({ piece: f.piece, group: g, n, rings });
+  }
+  // caps where closed solids pass through the floor, one per joined group
+  const caps = new Map();
+  const down = [0, -1, 0], [cu, cw] = basis(down), c2 = p => [dot(p, cu), dot(p, cw)];
+  for (const pc2 of F.pieces){
+    if (!pc2.closed) continue;
+    const fs = F.faces.filter(f => f.piece === pc2.id && !f.open);
+    if (!fs.length || fs.some(f => !loopsOf.has(f.key))) continue;
+    let lo = Infinity, hi = -Infinity;
+    for (const f of fs) for (const id of f.all){ lo = Math.min(lo, X[id][1]); hi = Math.max(hi, X[id][1]); }
+    if (lo >= -EPS || hi <= EPS) continue;
+    const faces = fs.map(f => ({ key: f.key, loop: loopsOf.get(f.key), holes: f.holes, n: planeOf(loopsOf.get(f.key).map(id => X[id])).n }));
+    const sl = slice(faces, X, [0, 1, 0], EPS);
+    if (!sl || !sl.length) continue;
+    let region; try { const rings = sl.map(L => [L.map(c2)]); region = rings.length === 1 ? rings[0] : pc.xor(...rings); } catch (e) { continue; }
+    const g = group.get(pc2.id) ?? pc2.id;
+    if (!caps.has(g)) caps.set(g, { piece: pc2.id, regions: [] });
+    caps.get(g).regions.push(region);
+  }
+  for (const [g, c] of caps){
+    let reg; try { reg = c.regions.length === 1 ? (c.regions[0][0] && typeof c.regions[0][0][0][0] === 'number' ? [c.regions[0]] : c.regions[0]) : pc.union(...c.regions); } catch (e) { continue; }
+    for (const poly of reg){
+      if (!poly || area2(poly[0]) < 1e-6) continue;
+      any = true;
+      out.push({ piece: c.piece, group: g, n: down, rings: poly.map(r => { const rr = r.slice(); const a = rr[0], z = rr[rr.length - 1]; if (a[0] === z[0] && a[1] === z[1]) rr.pop(); return rr.map(q => add(mul(cu, q[0]), mul(cw, q[1]))); }) });
+    }
+  }
+  if (!any) return J;
+  return { group, faces: out, replaced };
+}
