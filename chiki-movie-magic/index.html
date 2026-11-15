@@ -52,7 +52,7 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.5';
+const VERSION = '0.6';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -69,16 +69,19 @@ const PHASES = [
   {id:'perform',    name:'PERFORM',    col:'#ff2d95'},
   {id:'shoot',      name:'SHOOT',      col:'#1e6bff'},
   {id:'edit',       name:'EDIT',       col:'#5e2bff'},
+  {id:'app',        name:'APP',        col:'#00c7be'},
 ];
-const PLANNED = { light: ['Lights','Materials','Bake'] };
+const PLANNED = {};
 const RAILS = {
-  build:      [['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['layers','Layers'],['world','World'],['scene','Scene']],
-  characters: [['chars','Characters'],['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['layers','Parts'],['scene','Scene']],
-  perform:    [['perform','Perform'],['tracks','Motion'],['scene','Scene']],
-  shoot:      [['takes','Takes'],['path','Path'],['keys','Keys'],['lens','Lens'],['scene','Scene']],
-  edit:       [['timeline','Timeline'],['export','Export'],['scene','Scene']],
+  build:      [['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['layers','Layers'],['world','World']],
+  light:      [['lights','Lights'],['materials','Materials'],['sun','Sun']],
+  characters: [['chars','Characters'],['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['layers','Parts']],
+  perform:    [['perform','Perform'],['tracks','Motion']],
+  shoot:      [['takes','Takes'],['path','Path'],['keys','Keys'],['lens','Lens']],
+  edit:       [['timeline','Timeline'],['export','Export']],
+  app:        [['files','Files'],['settings','Settings']],
 };
-const FIRST_PAGE = {build:'tools', characters:'chars', perform:'perform', shoot:'takes', edit:'timeline'};
+const FIRST_PAGE = {build:'tools', light:'lights', characters:'chars', perform:'perform', shoot:'takes', edit:'timeline', app:'files'};
 const SCULPT_PHASES = ['build','characters'];
 const SKIES = {
   day:    {name:'Day',    top:'#1e6bff', hor:'#aee9ff', low:'#3fbf5f', light:1},
@@ -101,7 +104,7 @@ const state = {
   size:0.08, strength:0.6, color:'#ff9500',
   doodle:'tube', doodleSize:0.012,
   blockMode:'stamp', blockShape:'cube', blockSize:0.1, blockSnap:true, blockMix:false,
-  flySpeed:2.0, panelOpen:true, eraseFor:'doodle', recent:[], rename:null, activeWorld:1, activePart:null, selChar:null,
+  flySpeed:2.0, panelOpen:true, appStage:'world', beeps:true, pickStyle:'wheel', matLayer:null, eraseFor:'doodle', recent:[], rename:null, activeWorld:1, activePart:null, selChar:null,
   labels:true, mic:false, mirror:true, win:{layers:true, preview:true},
   world:{sky:'day', water:true, fog:true, custom:{top:[220,0.5], hor:[195,0.8], low:[140,0.45]}},
   fov:50,
@@ -179,7 +182,7 @@ function unscaled(obj){ obj.updateMatrixWorld(true); const p=V(), q=new THREE.Qu
 function setObjMatrix(obj, m){ const p=V(), q=new THREE.Quaternion(), s=V(); m.decompose(p,q,s); obj.position.copy(p); obj.quaternion.copy(q); obj.scale.setScalar(s.x); obj.updateMatrixWorld(true); }
 const poseOfObj = o => ({p:o.position.toArray(), q:o.quaternion.toArray(), s:o.scale.x});
 function setPoseObj(o, pose){ o.position.fromArray(pose.p); o.quaternion.fromArray(pose.q); o.scale.setScalar(pose.s); }
-const inStudio = () => state.phase==='characters';
+const inStudio = () => state.phase==='characters' || (state.phase==='app' && state.appStage==='studio');
 
 /* ---------------- sky / world ---------------- */
 let skyTex = null;
@@ -201,7 +204,11 @@ function applyWorld(){
   if (skyTex) skyTex.dispose();
   skyTex = new THREE.CanvasTexture(skyCanvas);
   skyTex.mapping = THREE.EquirectangularReflectionMapping; skyTex.colorSpace = THREE.SRGBColorSpace;
-  hemi.intensity = 1.4*Sk.light; sun.intensity = 2.2*Sk.light;
+  const w = state.world;
+  hemi.intensity = 1.4*Sk.light*(w.amb ?? 1); sun.intensity = 2.2*Sk.light*(w.sun ?? 1); sun.color.set(w.sunCol || '#ffffff');
+  const el = (w.sunH ?? 55)*Math.PI/180, az = (w.sunA ?? 35)*Math.PI/180;
+  sun.position.set(Math.cos(el)*Math.sin(az)*50, Math.sin(el)*50, Math.cos(el)*Math.cos(az)*50);
+  if (window.__envReady) for (const L of layers) if (L.matProps && L.matProps.metal > 0.05){ L.mat.envMap = skyTex; L.mat.needsUpdate = true; }
 }
 let _xrFog = null;
 function xrFogObj(){ const Sk = skyColors(); if (!_xrFog) _xrFog = new THREE.Fog(Sk.hor, 60, 300); _xrFog.color.set(Sk.hor); const s = rig.scale.x; _xrFog.near = 60/s; _xrFog.far = 300/s; return _xrFog; }
@@ -214,15 +221,23 @@ function applyStage(){
   if (st){ water.visible = false; scene.background = STUDIO_BG; scene.fog = null; }
   else { water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? (renderer.xr.isPresenting ? xrFogObj() : fogObj()) : null; }
   for (const c of show.chars) c.root.visible = st ? c.id===state.selChar : c.placed;
+  lightGroup.visible = !st; bulbs.visible = state.phase==='light';
   const gc = selChar(); guides.visible = st && !!gc && gc.type==='puppet' && !!gc.guide;
   if (guides.visible){ guideHead.position.fromArray(gc.guide.head); guideHands[0].position.fromArray(gc.guide.lh); guideHands[1].position.fromArray(gc.guide.rh); }
 }
 
 /* ---------------- layers & chunks ---------------- */
 let layers = []; let layerSeq = 1;
+// per-layer clay material (LIGHT > Materials). Glow lights the clay up in its own colors.
+function makeClayMat(){
+  const m = new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.85, metalness:0, emissive:'#ffffff', emissiveIntensity:0});
+  m.onBeforeCompile = sh => { sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n#ifdef USE_COLOR\ntotalEmissiveRadiance *= vColor.rgb;\n#endif'); };
+  return m;
+}
+function setLayerMat(L, props){ L.matProps = {rough:0.85, metal:0, glow:0, ...(L.matProps||{}), ...props}; L.mat.roughness = L.matProps.rough; L.mat.metalness = L.matProps.metal; L.mat.emissiveIntensity = L.matProps.glow; L.mat.envMap = L.matProps.metal > 0.05 ? skyTex : null; L.mat.needsUpdate = true; }
 function makeLayer(name, vs, id, parent){
   const L = {id: id ?? layerSeq++, name, vs, visible:true, locked:false, char:null, part:null,
-             chunks:new Map(), group:new THREE.Group(), strokes:[], rest:{p:[0,0,0], q:[0,0,0,1], s:1}};
+             chunks:new Map(), group:new THREE.Group(), strokes:[], rest:{p:[0,0,0], q:[0,0,0,1], s:1}, mat:makeClayMat(), matProps:{rough:0.85, metal:0, glow:0}};
   layerSeq = Math.max(layerSeq, L.id+1);
   (parent || world).add(L.group); layers.push(L); return L;
 }
@@ -439,7 +454,7 @@ function meshChunk(L, ch){
   geo.setAttribute('color',    new THREE.Float32BufferAttribute(colr,3));
   geo.setIndex(pos.length/3 > 65535 ? new THREE.Uint32BufferAttribute(ind,1) : new THREE.Uint16BufferAttribute(ind,1));
   geo.computeBoundingSphere();
-  if (!ch.mesh){ ch.mesh = new THREE.Mesh(geo, clayMat); ch.mesh.userData.clay = true; L.group.add(ch.mesh); }
+  if (!ch.mesh){ ch.mesh = new THREE.Mesh(geo, L.mat || clayMat); ch.mesh.userData.clay = true; L.group.add(ch.mesh); }
   else { ch.mesh.geometry.dispose(); ch.mesh.geometry = geo; }
 }
 function dropMesh(L, ch){ if (ch.mesh){ L.group.remove(ch.mesh); ch.mesh.geometry.dispose(); ch.mesh=null; } }
@@ -1045,12 +1060,11 @@ function newCharacter(type){
     c.guide = JSON.parse(JSON.stringify(GUIDE));
     state.activePart = H.id;
   } else {
-    const B = addPart(c,'body',0.025);
-    op(B,'clay',new THREE.Vector3(0,1.0,0),0.18,col); op(B,'clay',new THREE.Vector3(0,1.2,0),0.12,col);
+    const B = addPart(c,'body',detailFor(0.025*yourScale()));   // starts empty: sculpt it from scratch
     state.activePart = B.id;
   }
   state.selChar = c.id; sceneDirty = true;
-  toast(c.name+' made — sculpt it here, then place it in Perform'); requestUI();
+  toast(c.name+(type==='prop' ? ' is empty: sculpt it from scratch here' : ' made: sculpt it here, then place it in PERFORM')); requestUI();
   return c;
 }
 function deleteChar(c){
@@ -1144,7 +1158,7 @@ function restoreShow(s){
 
 /* audio */
 let actx = null; const audioBufs = new Map(); let audioSrcs = []; let audioToken = 0;
-function beep(freq, dur=0.12, vol=0.22){ try { const a = ac(); const o = a.createOscillator(), gn = a.createGain(); o.type='square'; o.frequency.value=freq; gn.gain.setValueAtTime(vol, a.currentTime); gn.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur); o.connect(gn); gn.connect(a.destination); o.start(); o.stop(a.currentTime+dur+0.03); } catch(e){} }
+function beep(freq, dur=0.12, vol=0.22){ if (!state.beeps) return; try { const a = ac(); const o = a.createOscillator(), gn = a.createGain(); o.type='square'; o.frequency.value=freq; gn.gain.setValueAtTime(vol, a.currentTime); gn.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur); o.connect(gn); gn.connect(a.destination); o.start(); o.stop(a.currentTime+dur+0.03); } catch(e){} }
 function ac(){ if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)(); if (actx.state==='suspended') actx.resume(); return actx; }
 async function decodeClip(c){
   if (audioBufs.has(c.id)) return audioBufs.get(c.id);
@@ -1705,9 +1719,90 @@ async function exportMP4(){
   finally { if (er){ er.dispose(); er.forceContextLoss?.(); } exporting = null; requestUI(); }
 }
 
+/* ---------------- LIGHT: colored point lights you place and grab ---------------- */
+const lightGroup = new THREE.Group(); scene.add(lightGroup);
+const bulbs = new THREE.Group(); scene.add(bulbs);
+let lights = [], lightSeq = 1, selLightId = null, lightGrab = null;
+const bulbGeo = new THREE.SphereGeometry(0.05, 16, 12), bulbRingGeo = new THREE.TorusGeometry(0.085, 0.006, 6, 32);
+const lightById = id => lights.find(l=>l.id===id);
+function makeLight(d){
+  if (lights.length >= 6){ toast('Six lights is the most for now'); return null; }
+  const l = {id: d.id ?? lightSeq++, p:d.p.slice(), col:d.col || '#ffd400', bright:d.bright ?? 1, range:d.range ?? 6};
+  lightSeq = Math.max(lightSeq, l.id+1);
+  l.obj = new THREE.PointLight(l.col, 1, l.range, 2);
+  l.bulb = new THREE.Mesh(bulbGeo, new THREE.MeshBasicMaterial({color:l.col, toneMapped:false}));
+  l.ring = new THREE.Mesh(bulbRingGeo, new THREE.MeshBasicMaterial({color:'#ffffff', toneMapped:false})); l.bulb.add(l.ring);
+  l.bulb.userData.light = l;
+  lightGroup.add(l.obj); bulbs.add(l.bulb); lights.push(l); syncLight(l); return l;
+}
+function syncLight(l){
+  l.obj.color.set(l.col); l.obj.distance = l.range; l.obj.intensity = 0.25*l.range*l.range*l.bright;
+  l.obj.position.fromArray(l.p); l.bulb.position.fromArray(l.p); l.bulb.material.color.set(l.col);
+  l.bulb.scale.setScalar(clamp(l.range/6, 0.4, 6)); l.ring.visible = l.id===selLightId;
+}
+function removeLight(l){ lightGroup.remove(l.obj); bulbs.remove(l.bulb); l.bulb.material.dispose(); l.ring.material.dispose(); lights = lights.filter(x=>x!==l); if (selLightId===l.id) selLightId = null; sceneDirty = true; requestUI(); }
+function clearLights(){ for (const l of [...lights]) removeLight(l); }
+function addLightAt(p){ const l = makeLight({p:p.toArray(), col: lights.length%2 ? '#ff2d95' : '#ffd400', range: 6*yourScale()}); if (l){ selLightId = l.id; lights.forEach(syncLight); sceneDirty = true; toast('Light added: grip the bulb to move it'); requestUI(); } return l; }
+function addLightInFront(){
+  if (renderer.xr.isPresenting){ const head = V(); camera.getWorldPosition(head); const f = V(); camera.getWorldDirection(f); return addLightAt(head.addScaledVector(f, 0.7*rig.scale.x)); }
+  return addLightAt(controls.target.clone().add(new THREE.Vector3(0, 1.5, 0)));
+}
+function findLightAt(pW, rW){ let best = null, bd = 1e9; for (const l of lights){ const d = l.bulb.position.distanceTo(pW) - 0.05*l.bulb.scale.x; if (d < rW && d < bd){ bd = d; best = l; } } return best; }
+function startLightGrab(l, pW){ selLightId = l.id; lightGrab = {l, off: l.bulb.position.clone().sub(pW)}; lights.forEach(syncLight); pulse('right',0.4,25); requestUI(); }
+function moveLightGrab(pW){ if (!lightGrab) return; lightGrab.l.p = pW.clone().add(lightGrab.off).toArray(); syncLight(lightGrab.l); }
+function endLightGrab(){ if (lightGrab){ lightGrab = null; sceneDirty = true; } }
+function drawLights(X,W){
+  txt('Lights', X, 100, 26);
+  button(X,116,W,48,'+ Add a light',false,()=>addLightInFront(),'#ffd400');
+  if (!lights.length) para(['No lights yet. Lights glow colored onto','the clay around them.','','In the headset, A adds a light at your','hand and right grip on a bulb moves it.'], X, 200, 15);
+  lights.forEach((l,i)=>{ const y = 176+i*46, on = l.id===selLightId;
+    rr(X,y,W,40,10,on?'#ffd400':'#2a3060'); rr(X+8,y+8,24,24,12,l.col); txt('Light '+l.id, X+42, y+20, 16, on?'#111':'#fff');
+    hit(X,y,W,40,()=>{ selLightId = l.id; lights.forEach(syncLight); requestUI(); }); });
+  const l = lightById(selLightId); if (!l) return;
+  const y0 = 176 + lights.length*46 + 8;
+  const cols = ['#ffffff','#ffe2a8','#ffd400','#ff9500','#ff3b30','#ff2d95','#5e2bff','#1e6bff','#00c7be','#34c759'];
+  const cw = (W-9*4)/10;
+  cols.forEach((c,i)=>{ const x = X+i*(cw+4); rr(x,y0,cw,30,8,c); if (l.col===c) rr(x-2,y0-2,cw+4,34,9,null,'#ffffff'); hit(x,y0,cw,30,()=>{ l.col=c; syncLight(l); sceneDirty=true; requestUI(); }); });
+  slider(X,y0+50,W,'Brightness', l.bright, 0, 3, v=>{ l.bright=v; syncLight(l); sceneDirty=true; }, '#ffd400');
+  slider(X,y0+108,W,'Reach', Math.log(l.range), Math.log(0.2), Math.log(80), v=>{ l.range=Math.exp(v); syncLight(l); sceneDirty=true; }, '#ff9500', fmtLen(l.range));
+  const a = state.confirm==='dellight';
+  if (y0+170 < UIH-70) button(X,y0+168,W,40,a?'Tap again':'Delete light',a,()=>{ if(!a){state.confirm='dellight';requestUI();return;} state.confirm=null; removeLight(l); },'#ff3b30');
+}
+const MAT_PRESETS = [['Clay',{rough:0.85,metal:0,glow:0}],['Plastic',{rough:0.4,metal:0,glow:0}],['Glossy',{rough:0.12,metal:0,glow:0}],
+                     ['Metal',{rough:0.35,metal:1,glow:0}],['Chrome',{rough:0.04,metal:1,glow:0}],['Glow',{rough:0.6,metal:0,glow:0.7}]];
+function matLayers(){ return [...worldLayers(), ...layers.filter(L=>L.char)]; }
+function matLabel(L){ const c = L.char ? charById(L.char) : null; return c ? c.name+' · '+(PART_NAMES[L.part]||L.name) : L.name; }
+function drawMaterials(X,W){
+  txt('Materials', X, 100, 26);
+  const all = matLayers(); if (!all.length) return;
+  let L = layerById(state.matLayer); if (!L || !all.includes(L)) { L = activeLayer() || all[0]; state.matLayer = L.id; }
+  const i = all.indexOf(L), go = d => { state.matLayer = all[(i+d+all.length)%all.length].id; requestUI(); };
+  button(X,116,40,44,'◀',false,()=>go(-1),'#1e6bff'); button(X+W-40,116,40,44,'▶',false,()=>go(1),'#1e6bff');
+  rr(X+46,116,W-92,44,10,'#0d1029'); const nm = matLabel(L); txt(nm.length>22?nm.slice(0,21)+'…':nm, X+W/2, 138, 15, '#ffd400','center');
+  const tw = (W-16)/3;
+  MAT_PRESETS.forEach(([n,pr],k)=>{ const mp = L.matProps; const on = Math.abs(mp.rough-pr.rough)<0.02 && Math.abs(mp.metal-pr.metal)<0.02 && Math.abs(mp.glow-pr.glow)<0.02;
+    button(X+(k%3)*(tw+8), 176+Math.floor(k/3)*52, tw, 46, n, on, ()=>{ setLayerMat(L, pr); sceneDirty=true; requestUI(); }, '#ff9500'); });
+  slider(X,298,W,'Shiny', 1-L.matProps.rough, 0, 1, v=>{ setLayerMat(L,{rough:1-v}); sceneDirty=true; }, '#00c7be');
+  slider(X,358,W,'Metal', L.matProps.metal, 0, 1, v=>{ setLayerMat(L,{metal:v}); sceneDirty=true; }, '#9aa0a6');
+  slider(X,418,W,'Glow', L.matProps.glow, 0, 2, v=>{ setLayerMat(L,{glow:v}); sceneDirty=true; }, '#ff2d95');
+  para(['Materials change the clay on this layer.','Glow makes it shine in its own colors,','even in the dark (try the Night sky).'], X, 486, 14);
+}
+function drawSun(X,W){
+  txt('Sun', X, 100, 26);
+  const w = state.world, upd = () => { applyWorld(); sceneDirty = true; };
+  slider(X,120,W,'Sunlight', w.sun ?? 1, 0, 3, v=>{ w.sun=v; upd(); }, '#ffd400');
+  slider(X,180,W,'Sun height', w.sunH ?? 55, 3, 90, v=>{ w.sunH=v; upd(); }, '#ff9500', Math.round(w.sunH ?? 55)+'°');
+  slider(X,240,W,'Sun direction', w.sunA ?? 35, 0, 360, v=>{ w.sunA=v; upd(); }, '#ff9500', Math.round(w.sunA ?? 35)+'°');
+  slider(X,300,W,'Sky light (fill)', w.amb ?? 1, 0, 2, v=>{ w.amb=v; upd(); }, '#1e6bff');
+  txt('Sun color', X, 372, 16, '#cfd6ff','left',700);
+  const cols = ['#ffffff','#ffe2a8','#ffb066','#ff6a3d','#ff9ad5','#a8c8ff','#7affd6'], cw = (W-6*6)/7;
+  cols.forEach((c,i)=>{ const x = X+i*(cw+6); rr(x,386,cw,34,9,c); if ((w.sunCol||'#ffffff')===c) rr(x-2,384,cw+4,38,10,null,'#ffd400'); hit(x,386,cw,34,()=>{ w.sunCol=c; upd(); requestUI(); }); });
+  para(['Pick the sky itself in BUILD > World.'], X, 450, 14);
+}
+
 /* ---------------- views: the world and the studio each remember where you were ---------------- */
 const views = {world:{xr:null, desk:null}, studio:{xr:null, desk:null}};
-const stageName = ph => ph==='characters' ? 'studio' : 'world';
+const stageName = ph => ph==='characters' ? 'studio' : ph==='app' ? (state.appStage || 'world') : 'world';
 function captureView(name){
   if (renderer.xr.isPresenting) views[name].xr = {p:rig.position.toArray(), q:rig.quaternion.toArray(), s:rig.scale.x};
   else views[name].desk = {p:camera.position.toArray(), t:controls.target.toArray()};
@@ -1752,14 +1847,15 @@ function serialize(){
     app:'ChikiMovieMagic', v:5, enc:'rle', saved:new Date().toISOString(),
     settings:{color:state.color, size:state.size, strength:state.strength, tool:state.tool, doodle:state.doodle, doodleSize:state.doodleSize,
               blockMode:state.blockMode, blockShape:state.blockShape, blockSize:state.blockSize, blockSnap:state.blockSnap, blockMix:state.blockMix,
-              activeWorld:state.activeWorld, activePart:state.activePart, selChar:state.selChar, flySpeed:state.flySpeed, fov:state.fov, labels:state.labels, mirror:state.mirror, win:state.win, recent:state.recent, eraseFor:state.eraseFor},
+              activeWorld:state.activeWorld, activePart:state.activePart, selChar:state.selChar, flySpeed:state.flySpeed, fov:state.fov, labels:state.labels, mirror:state.mirror, win:state.win, recent:state.recent, eraseFor:state.eraseFor, beeps:state.beeps, pickStyle:state.pickStyle},
     world: state.world,
+    lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
     shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq},
     show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
-      id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, rest:L.rest, char:L.char, part:L.part,
+      id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, rest:L.rest, char:L.char, part:L.part, mat:L.matProps,
       chunks: [...L.chunks.values()].filter(ch => ch.d && ch.d.some(v=>v>-DMAX+0.01)).map(ch => {
         const q = new Int8Array(CN3); for (let i=0;i<CN3;i++) q[i]=Math.round(ch.d[i]/DMAX*127);
         return {k:ch.k, d:u8ToB64(rleEnc(new Uint8Array(q.buffer),1)), c:u8ToB64(rleEnc(ch.c,3))};
@@ -1784,6 +1880,7 @@ function deserialize(o){
     const L = makeLayer(ld.name, ld.vs || 0.1, ld.id, c ? c.root : world); L.visible=ld.visible; L.locked=ld.locked; L.group.visible=L.visible;
     if (c){ L.char = c.id; L.part = ld.part || 'extra'; }
     if (ld.rest) L.rest = ld.rest;
+    if (ld.mat) setLayerMat(L, ld.mat);
     for (const cd of ld.chunks){
       const [cx,cy,cz] = cd.k.split(',').map(Number);
       const ch = getChunk(L,cx,cy,cz,true);
@@ -1798,7 +1895,8 @@ function deserialize(o){
   }
   if (o.settings){ Object.assign(state, o.settings); if (o.settings.activeLayer && !o.settings.activeWorld) state.activeWorld = o.settings.activeLayer; }
   state.win = Object.assign({layers:true, preview:true}, state.win || {});
-  state.world = Object.assign({sky:'day', water:true, fog:true, custom:{top:[220,0.5], hor:[195,0.8], low:[140,0.45]}}, o.world || {});
+  state.world = Object.assign({sky:'day', water:true, fog:true, sun:1, amb:1, sunH:55, sunA:35, sunCol:'#ffffff', custom:{top:[220,0.5], hor:[195,0.8], low:[140,0.45]}}, o.world || {});
+  clearLights(); for (const ld of (o.lights||[])) makeLight(ld);
   if (!state.world.custom) state.world.custom = {top:[220,0.5], hor:[195,0.8], low:[140,0.45]};
   if (o.views){ views.world = o.views.world || {xr:null,desk:null}; views.studio = o.views.studio || {xr:null,desk:null}; }
   else if (o.xrRig) views.world.xr = o.xrRig;
@@ -1852,7 +1950,7 @@ function loadFile(){
   fileIn.click();
 }
 function newScene(kind){
-  clearScene();
+  clearScene(); clearLights(); Object.assign(state.world, {sun:1, amb:1, sunH:55, sunA:35, sunCol:'#ffffff'});
   shots.takes=[]; shots.seq=[]; shots.sel=null; shots.seqSel=null; shots.playhead=0; shots.takeSeq=1; pathDirty=true;
   if (kind==='island'){
     const L = makeLayer('Ground', 0.1); state.activeWorld = L.id; genIsland(L);
@@ -1960,25 +2058,73 @@ function updateWins(){
   layersWin.canvas.style.display = (!renderer.xr.isPresenting && winVisible(layersWin)) ? 'block' : 'none';
   updateOrb();
 }
-// the 3D color ball: hue around, vivid outward, light upward. It floats above whichever window shows Color.
+// color pickers you reach into in the headset: a flat wheel (+ light bar), a see-through ball of dots, or chips.
+// They float above whichever window shows Color.
 const orb = new THREE.Group(); orb.visible = false;
-const ORB_R = 0.05, ORB_H = 0.08;
-{
-  const list = [], one = new THREE.Vector3(0.0034,0.0034,0.0034);
-  const mk = (x,y,z,h,s2,l) => list.push({p:new THREE.Vector3(x,y,z), q:new THREE.Quaternion(), s:one, col:'#'+new THREE.Color().setHSL(h,s2,l).getHexString()});
-  for (let li=0; li<=8; li++){
-    const l = li/8, y = -ORB_H/2 + l*ORB_H; mk(0,y,0,0,0,l);
-    if (li===0 || li===8) continue;
-    for (let si=1; si<=4; si++) for (let hi=0; hi<24; hi++){ const h = hi/24, a = h*Math.PI*2, rad = si/4*ORB_R; mk(Math.cos(a)*rad, y, Math.sin(a)*rad, h, si/4, l); }
+const ORB_R = 0.05, ORB_H = 0.08, WHEEL_R = 0.055;
+const hslHex = (h,s2,l) => '#'+new THREE.Color().setHSL(h,s2,l).getHexString();
+const pickWheel = new THREE.Group(), pickDots = new THREE.Group(), pickChips = new THREE.Group();
+orb.add(pickWheel, pickDots, pickChips);
+const wheelCv = document.createElement('canvas'); wheelCv.width = wheelCv.height = 256;
+const wheelTex = new THREE.CanvasTexture(wheelCv); wheelTex.colorSpace = THREE.SRGBColorSpace;
+const barCv = document.createElement('canvas'); barCv.width = 16; barCv.height = 256;
+const barTex = new THREE.CanvasTexture(barCv); barTex.colorSpace = THREE.SRGBColorSpace;
+pickWheel.add(new THREE.Mesh(new THREE.CircleGeometry(WHEEL_R, 48), new THREE.MeshBasicMaterial({map:wheelTex, transparent:true, opacity:0.92, toneMapped:false, side:THREE.DoubleSide})));
+const barMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.014, WHEEL_R*2), new THREE.MeshBasicMaterial({map:barTex, toneMapped:false, side:THREE.DoubleSide}));
+barMesh.position.x = WHEEL_R + 0.016; pickWheel.add(barMesh);
+let wheelDrawnL = -1, barDrawnH = -1;
+function drawWheel(l){
+  const c = wheelCv.getContext('2d'), img = c.createImageData(256,256), col = new THREE.Color();
+  for (let y=0;y<256;y++) for (let x=0;x<256;x++){
+    const dx = (x-127.5)/127.5, dy = (127.5-y)/127.5, r = Math.hypot(dx,dy), i = (y*256+x)*4;
+    if (r > 1){ img.data[i+3] = 0; continue; }
+    col.setHSL(((Math.atan2(dy,dx)/(Math.PI*2))+1)%1, r, l);
+    const [R2,G2,B2] = hexRgb('#'+col.getHexString()); img.data[i]=R2; img.data[i+1]=G2; img.data[i+2]=B2; img.data[i+3]=255;
   }
-  orb.add(instancedList(new THREE.SphereGeometry(1,8,6), new THREE.MeshBasicMaterial({toneMapped:false}), list));
-  orb.add(new THREE.Mesh(new THREE.CylinderGeometry(ORB_R*1.12, ORB_R*1.12, ORB_H*1.12, 32, 1, true),
-    new THREE.MeshBasicMaterial({color:'#ffffff', transparent:true, opacity:0.07, side:THREE.DoubleSide, depthWrite:false})));
+  c.putImageData(img,0,0); wheelTex.needsUpdate = true; wheelDrawnL = l;
+}
+function drawBar(h){
+  const c = barCv.getContext('2d'), gr = c.createLinearGradient(0,256,0,0);
+  gr.addColorStop(0,'#000'); gr.addColorStop(0.5, hslHex(h,1,0.5)); gr.addColorStop(1,'#fff');
+  c.fillStyle = gr; c.fillRect(0,0,16,256); barTex.needsUpdate = true; barDrawnH = h;
+}
+{ // see-through ball: fewer, smaller dots
+  const list = [], one = new THREE.Vector3(0.0024,0.0024,0.0024);
+  const mk = (x,y,z,col) => list.push({p:new THREE.Vector3(x,y,z), q:new THREE.Quaternion(), s:one, col});
+  for (let li=0; li<=6; li++){
+    const l = li/6, y = -ORB_H/2 + l*ORB_H; mk(0,y,0,hslHex(0,0,l));
+    if (li===0 || li===6) continue;
+    for (let si=1; si<=3; si++) for (let hi=0; hi<12; hi++){ const h = hi/12, a = h*Math.PI*2, rad = si/3*ORB_R; mk(Math.cos(a)*rad, y, Math.sin(a)*rad, hslHex(h, si/3, l)); }
+  }
+  pickDots.add(instancedList(new THREE.SphereGeometry(1,8,6), new THREE.MeshBasicMaterial({toneMapped:false}), list));
+}
+const CHIP_COLS = 11, CHIP_ROWS = 5, CHIP = 0.013, CHIP_GAP = 0.003;
+{ // chips: hues across (last column grays), dark to light upward
+  const list = [], sz = new THREE.Vector3(CHIP, CHIP, 0.002);
+  for (let r=0;r<CHIP_ROWS;r++) for (let c=0;c<CHIP_COLS;c++){
+    const l = 0.18 + r*0.16, col = c===CHIP_COLS-1 ? hslHex(0,0,r/(CHIP_ROWS-1)) : hslHex(c/(CHIP_COLS-1), 0.9, l);
+    list.push({p:new THREE.Vector3((c-(CHIP_COLS-1)/2)*(CHIP+CHIP_GAP), (r-(CHIP_ROWS-1)/2)*(CHIP+CHIP_GAP), 0), q:new THREE.Quaternion(), s:sz, col});
+  }
+  pickChips.add(instancedList(new THREE.BoxGeometry(1,1,1), new THREE.MeshBasicMaterial({toneMapped:false}), list));
 }
 function orbPick(pW){
-  const p = orb.worldToLocal(pW.clone()), rad = Math.hypot(p.x, p.z);
+  const p = orb.worldToLocal(pW.clone());
+  if (state.pickStyle==='wheel'){
+    if (Math.abs(p.z) > 0.025) return null;
+    const r = Math.hypot(p.x, p.y);
+    if (r <= WHEEL_R*1.05) return hslHex(((Math.atan2(p.y,p.x)/(Math.PI*2))+1)%1, clamp(r/WHEEL_R,0,1), wheelDrawnL);
+    if (Math.abs(p.x - barMesh.position.x) < 0.012 && Math.abs(p.y) < WHEEL_R*1.05){ const o = curHSL(); return hslHex(o.h, o.s < 0.05 ? 0.85 : o.s, clamp((p.y+WHEEL_R)/(WHEEL_R*2),0,1)); }
+    return null;
+  }
+  if (state.pickStyle==='chips'){
+    if (Math.abs(p.z) > 0.02) return null;
+    const c = Math.round(p.x/(CHIP+CHIP_GAP) + (CHIP_COLS-1)/2), r = Math.round(p.y/(CHIP+CHIP_GAP) + (CHIP_ROWS-1)/2);
+    if (c<0 || c>=CHIP_COLS || r<0 || r>=CHIP_ROWS) return null;
+    return c===CHIP_COLS-1 ? hslHex(0,0,r/(CHIP_ROWS-1)) : hslHex(c/(CHIP_COLS-1), 0.9, 0.18 + r*0.16);
+  }
+  const rad = Math.hypot(p.x, p.z);
   if (rad > ORB_R*1.2 || Math.abs(p.y) > ORB_H*0.62) return null;
-  return '#'+new THREE.Color().setHSL(((Math.atan2(p.z,p.x)/(Math.PI*2))+1)%1, clamp(rad/ORB_R,0,1), clamp((p.y+ORB_H/2)/ORB_H,0,1)).getHexString();
+  return hslHex(((Math.atan2(p.z,p.x)/(Math.PI*2))+1)%1, clamp(rad/ORB_R,0,1), clamp((p.y+ORB_H/2)/ORB_H,0,1));
 }
 function updateOrb(){
   let host = null;
@@ -1986,7 +2132,10 @@ function updateOrb(){
   if (pw) host = pw; else if (menuWin.mesh.visible && state.page==='color' && !state.dialOpen) host = menuWin;
   if (!host || !renderer.xr.isPresenting){ orb.visible = false; return; }
   if (orb.parent !== host.mesh) host.mesh.add(orb);
-  orb.position.set(0, host.mesh.geometry.parameters.height/2 + 0.065, 0.03); orb.visible = true;
+  pickWheel.visible = state.pickStyle==='wheel'; pickDots.visible = state.pickStyle==='dots'; pickChips.visible = state.pickStyle==='chips';
+  if (pickWheel.visible){ const o = curHSL(), l = clamp(o.l, 0.15, 0.85); if (Math.abs(l-wheelDrawnL) > 0.03) drawWheel(l); if (Math.abs(o.h-barDrawnH) > 0.02 && o.s > 0.05) drawBar(o.h); if (barDrawnH < 0) drawBar(0); }
+  const top = host.mesh.geometry.parameters.height/2;
+  orb.position.set(0, top + (state.pickStyle==='chips' ? 0.05 : state.pickStyle==='wheel' ? 0.07 : 0.065), 0.03); orb.visible = true;
 }
 // window grabbing (rig-local so it stays put in your room)
 let winGrab = null;
@@ -2070,6 +2219,11 @@ function icon(name,cx,cy,col){
   else if (name==='chars'){ g.beginPath(); g.arc(0,-4,9,0,7); g.fill(); g.beginPath(); g.arc(-13,10,5,0,7); g.fill(); g.beginPath(); g.arc(13,10,5,0,7); g.fill(); }
   else if (name==='perform'){ g.beginPath(); g.arc(0,0,13,0,7); g.stroke(); g.beginPath(); g.arc(0,0,7,0,7); g.fillStyle='#ff3b30'; g.fill(); }
   else if (name==='tracks'){ g.beginPath(); g.moveTo(-14,8); g.bezierCurveTo(-6,-12,4,12,14,-8); g.stroke(); g.beginPath(); g.arc(14,-8,4,0,7); g.fill(); }
+  else if (name==='lights'){ g.beginPath(); g.arc(0,-4,10,0,7); g.fill(); g.fillRect(-5,7,10,4); g.fillRect(-4,12,8,3); }
+  else if (name==='materials'){ g.beginPath(); g.arc(0,0,13,0,7); g.fill(); g.beginPath(); g.arc(-5,-5,4,0,7); g.fillStyle='#ffffff'; g.fill(); }
+  else if (name==='sun'){ g.beginPath(); g.arc(0,0,7,0,7); g.fill(); for (let k=0;k<8;k++){ const a=k*Math.PI/4; g.beginPath(); g.moveTo(Math.cos(a)*10,Math.sin(a)*10); g.lineTo(Math.cos(a)*15,Math.sin(a)*15); g.stroke(); } }
+  else if (name==='files'){ g.beginPath(); g.moveTo(-14,-9); g.lineTo(-4,-9); g.lineTo(0,-5); g.lineTo(14,-5); g.lineTo(14,11); g.lineTo(-14,11); g.closePath(); g.fill(); }
+  else if (name==='settings'){ for (let k=0;k<8;k++){ g.save(); g.rotate(k*Math.PI/4); g.fillRect(-3,-15,6,8); g.restore(); } g.beginPath(); g.arc(0,0,9,0,7); g.fill(); g.beginPath(); g.arc(0,0,4,0,7); g.globalCompositeOperation='destination-out'; g.fill(); g.globalCompositeOperation='source-over'; }
   else { g.beginPath(); g.arc(0,0,11,0,7); g.stroke(); }
   g.restore();
 }
@@ -2078,6 +2232,7 @@ const KEYS_VR = {
   characters:['A separate studio: sculpt characters here at','any size, then place them from PERFORM.','Right trigger: tool   A: add↔carve   B: last tool','Grip a tab in the menu: tear it off as a window'],
   perform:['A: record (3-2-1) / cut   B: play the show','Right trigger at the ground: jump there','Grip a character: move it (stick: size)','Stepped in: your head and hands move it'],
   shoot:['Hold right trigger: film a take (3-2-1)','A: play/stop take   B: next take','Right stick ↕: zoom (records while playing)','Right grip on a dot: move that key'],
+  light:['A: add a light at your hand','Right grip on a bulb: move it','Pick colors and reach on the Lights page','X: undo   Y: redo   Left trigger: menu'],
   edit: ['A: play/stop the film','Tap the strip to jump, tap a clip to trim it','X: undo   Y: redo   Left trigger: menu','Grip: drag world   Left stick: fly'],
 };
 const KEYS_DESK = {
@@ -2086,9 +2241,11 @@ const KEYS_DESK = {
   perform:'Left-drag a character: move it · - / =: its size · R: record (3-2-1) / cut · Space: play the show<br>Right-drag: orbit · X: undo · Y: redo · Tab: menu',
   shoot:'R: record your view (3-2-1) · A / Space: play take · B: next take · - / =: zoom (records while playing)<br>Right-drag: orbit · Middle-drag: pan · Wheel: zoom · X: undo · Y: redo · Tab: menu',
   edit: 'A / Space: play / stop the film · X: undo · Y: redo · Tab: menu',
+  light: 'Left-drag a bulb: move it · + Add a light on the Lights page · Right-drag: orbit · Tab: menu',
+  app: 'Files and settings · Tab: menu',
 };
 const PAGE_DRAW = {soon:drawSoon, tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, world:drawWorld, sky:drawSky,
-  scene:drawScene, takes:drawTakes, path:drawPath, keys:drawKeysPage, lens:drawLens, timeline:drawTimeline, export:drawExport,
+  scene:drawSettings, files:drawFiles, settings:drawSettings, lights:drawLights, materials:drawMaterials, sun:drawSun, fromlayer:drawFromLayer, takes:drawTakes, path:drawPath, keys:drawKeysPage, lens:drawLens, timeline:drawTimeline, export:drawExport,
   chars:drawChars, perform:drawPerform, tracks:drawTracks, rename:drawRename};
 function drawPageWin(win){
   const W = win.cw; g = win.ctx; hits = [];
@@ -2235,6 +2392,7 @@ function drawChip(){
     t = rec ? (rec.phase==='rec' ? 'REC '+fmtTime(rec.t) : 'READY…') : play ? 'PLAYING' : (selTake()?.name || 'NO TAKES').toUpperCase();
     tc = rec ? '#ff3b30' : '#1e6bff';
   } else if (state.phase==='edit'){ t = 'FILM '+fmtTime(filmLength()); tc = '#5e2bff'; }
+  else if (state.phase==='light'){ t = lights.length+' LIGHT'+(lights.length===1?'':'S'); tc = '#ffd400'; }
   else if (state.phase==='perform'){ t = show.rec ? (show.rec.phase==='rec' ? 'REC '+fmtTime(show.rec.t) : 'READY…') : show.playing ? 'PLAYING' : show.embodied ? 'IN '+show.embodied.c.name.toUpperCase() : 'SHOW '+fmtTime(showLength()); tc = show.rec ? '#ff3b30' : '#ff2d95'; }
   else return;
   rr(UIW-160,16,146,42,21,'#0d1029'); g.beginPath(); g.arc(UIW-138,37,10,0,7); g.fillStyle=tc; g.fill();
@@ -2283,7 +2441,11 @@ function drawColor(X,W){
   const rec = state.recent || [];
   if (rec.length){ txt('Used lately', X, 456, 16, '#cfd6ff','left',700);
     const rw = (W-9*6)/10; rec.slice(0,10).forEach((c,i)=>{ const x = X+i*(rw+6); rr(x,470,rw,30,8,c); hit(x,470,rw,30,()=>{ state.color = c; requestUI(); }); }); }
-  if (renderer.xr.isPresenting) para(['Or reach into the color ball above this','window and squeeze the trigger.'], X, 530, 14);
+  if (renderer.xr.isPresenting){
+    txt('Pick in the air with:', X, 520, 15, '#cfd6ff','left',700);
+    const tw=(W-16)/3;
+    [['wheel','Wheel'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),532,tw,40,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
+  }
 }
 const DOODLES = [['tube','Tube'],['ribbon','Ribbon'],['neon','Neon'],['coil','Coil'],['chain','Chain'],['beads','Beads'],['cubes','Cubes'],['dashes','Dashes'],['fuzz','Fuzz'],['stars','Stars'],['dots','Confetti']];
 function drawDoodle(X,W){
@@ -2435,23 +2597,33 @@ function drawSky(X,W){
   });
   button(X, UIH-130, W, 44, '◀ Back to World', false, ()=>{ state.page='world'; requestUI(); }, '#1e6bff');
 }
-function drawScene(X,W){
-  txt('Scene', X, 100, 26);
+function drawFiles(X,W){
+  txt('Files', X, 100, 26);
   const hw=(W-8)/2;
-  button(X,124,hw,50,'Save',false,()=>saveLocal(false),'#34c759');
-  button(X+hw+8,124,hw,50,'Download',false,downloadFile,'#1e6bff');
-  button(X,182,hw,50,'Load file',false,loadFile,'#1e6bff');
-  button(X+hw+8,182,hw,50,'Back to 1×',false,()=>resetScale(),'#ff9500');
+  button(X,124,hw,52,'Save',false,()=>saveLocal(false),'#34c759');
+  button(X+hw+8,124,hw,52,'Download',false,downloadFile,'#1e6bff');
+  button(X,184,W,52,'Load a scene file',false,loadFile,'#1e6bff');
+  txt('Start over', X, 270, 16, '#cfd6ff','left',700);
   const a1 = state.confirm==='newisland', a2 = state.confirm==='newempty';
-  button(X,240,hw,50,a1?'Tap to confirm':'New island',a1,()=>{ if(!a1){state.confirm='newisland';requestUI();return;} state.confirm=null; newScene('island'); },'#ff3b30');
-  button(X+hw+8,240,hw,50,a2?'Tap to confirm':'New empty sky',a2,()=>{ if(!a2){state.confirm='newempty';requestUI();return;} state.confirm=null; newScene('empty'); },'#ff3b30');
-  slider(X,318,W,'Fly speed (left stick)', state.flySpeed, 0.5, 8, v=>state.flySpeed=v, '#00c7be');
-  toggle(X,370,W,44,'Button labels on controllers',state.labels,()=>{ state.labels=!state.labels; requestUI(); },'#ffd400');
-  if (renderer.xr.isPresenting) button(X,422,W,40,'Dock all windows to my hand',false,()=>{ for (const w of [...WINS]) dockWin(w); },'#00c7be');
+  button(X,284,hw,52,a1?'Tap to confirm':'New island',a1,()=>{ if(!a1){state.confirm='newisland';requestUI();return;} state.confirm=null; newScene('island'); },'#ff3b30');
+  button(X+hw+8,284,hw,52,a2?'Tap to confirm':'New empty sky',a2,()=>{ if(!a2){state.confirm='newempty';requestUI();return;} state.confirm=null; newScene('empty'); },'#ff3b30');
+  para(['Your scene also saves itself on this','device every 20 seconds.','','Download makes a file you can open on','the desktop (Load) to edit and export.'], X, 380, 14);
+  txt('ChikiMovieMagic v'+VERSION, X, UIH-40, 15, '#4a5080','left',700);
+}
+function drawSettings(X,W){
+  txt('Settings', X, 100, 26);
+  slider(X,136,W,'Fly speed (left stick)', state.flySpeed, 0.5, 8, v=>state.flySpeed=v, '#00c7be');
+  toggle(X,190,W,44,'Button labels on controllers',state.labels,()=>{ state.labels=!state.labels; requestUI(); },'#ffd400');
+  toggle(X,240,W,44,'Countdown beeps',state.beeps,()=>{ state.beeps=!state.beeps; requestUI(); },'#ff9500');
+  const hw=(W-8)/2;
+  button(X,292,hw,48,'Back to 1×',false,()=>resetScale(),'#ff9500');
+  if (renderer.xr.isPresenting) button(X+hw+8,292,hw,48,'Dock windows',false,()=>{ for (const w of [...WINS]) dockWin(w); },'#00c7be');
   const ys = yourScale();
-  txt('Your size  '+(ys<1 ? '1/'+(+(1/ys).toFixed(1)) : (+ys.toFixed(1)))+'×', X, 482, 16, '#cfd6ff','left',700);
-  para(KEYS_VR[state.phase] || KEYS_VR.build, X, 512, 13, '#8f97c7', 21);
-  txt('v'+VERSION, X+W, UIH-24, 13, '#4a5080','right',600);
+  txt('Your size  '+(ys<1 ? '1/'+(+(1/ys).toFixed(1)) : (+ys.toFixed(1)))+'×', X, 370, 16, '#cfd6ff','left',700);
+  txt('Color picker in the headset', X, 410, 16, '#cfd6ff','left',700);
+  const tw=(W-16)/3;
+  [['wheel','Wheel'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),424,tw,44,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
+  txt('ChikiMovieMagic v'+VERSION, X, UIH-40, 15, '#4a5080','left',700);
 }
 function drawTakes(X,W){
   txt('Takes', X, 100, 26);
@@ -2461,7 +2633,7 @@ function drawTakes(X,W){
   button(X,180,hw,48, play?.mode==='take' ? '■ Stop' : '▶ Play take', play?.mode==='take', ()=>{ play ? stopPlay() : startPlay('take'); }, '#34c759');
   button(X+hw+8,180,hw,48,'Next take',false,()=>nextTake(),'#1e6bff');
   const list = shots.takes.slice(-6);
-  if (!list.length) para(['No takes yet.','In this phase your right hand is a','camera; its screen shows the shot.','The show plays while you film.'], X, 268, 15);
+  if (!list.length) para(['No shots yet. Your right hand is a','camera: hold the trigger to film.','Each take is one camera on the show.','Film from lots of spots, then cut','them together in EDIT.'], X, 262, 15);
   list.forEach((tk,i)=>{ const y=238+i*48, on=tk.id===shots.sel;
     rr(X,y,W,42,10,on?'#1e6bff':'#2a3060'); txt(tk.name, X+12, y+21, 17, '#fff');
     txt(clipLen(tk).toFixed(1)+' s'+(tk.edited?' · edited':'')+(tk.fovTrack?' · zoom':''), X+W-12, y+21, 14, on?'#fff':'#8f97c7','right',700);
@@ -2569,11 +2741,21 @@ function drawExport(X,W){
   } else button(X,410,W,56,'Export MP4',false,exportMP4,'#ff3b30');
   para(['Renders every frame cleanly, so it runs','best in desktop Chrome: open the same','scene there (Scene → Download / Load).','Picture only for now — voices come next.'], X, 500, 14);
 }
+function drawFromLayer(X,W){
+  txt('Prop from a layer', X, 100, 24);
+  para(['Pick a BUILD layer. It leaves the scenery','and becomes a prop you can grab and move.'], X, 132, 14);
+  const list = worldLayers();
+  list.slice(0,8).forEach((L,i)=>{ const y = 172+i*48;
+    button(X,y,W,42,L.name,false,()=>{ if (worldLayers().length<=1){ toast('Keep at least one world layer: make a new one in BUILD first'); return; } layerToProp(L); state.page='chars'; requestUI(); },'#ff2d95'); });
+  button(X,UIH-118,W,44,'◀ Back',false,()=>{ state.page='chars'; requestUI(); },'#1e6bff');
+}
 function drawChars(X,W){
   txt('Characters', X, 100, 26);
   const hw=(W-8)/2;
-  button(X,122,hw,50,'+ Puppet',false,()=>newCharacter('puppet'),'#34c759');
-  button(X+hw+8,122,hw,50,'+ Prop',false,()=>newCharacter('prop'),'#00c7be');
+  const tw3=(W-16)/3;
+  button(X,122,tw3,50,'+ Puppet',false,()=>newCharacter('puppet'),'#34c759');
+  button(X+tw3+8,122,tw3,50,'+ Empty prop',false,()=>newCharacter('prop'),'#00c7be');
+  button(X+2*(tw3+8),122,tw3,50,'Prop from layer',false,()=>{ state.page='fromlayer'; requestUI(); },'#ff2d95');
   const list = show.chars.slice(-5);
   if (!list.length) para(['This is your character studio: it has','its own space and your own size here,','separate from the world.','','Puppet: a head and two hands you can','step inside. Prop: one piece you grab','and move around.'], X, 200, 14);
   list.forEach((c,i)=>{ const y=182+i*46, on=c.id===state.selChar;
@@ -2594,33 +2776,40 @@ function drawChars(X,W){
   }
   if (c.type==='puppet' && c.guide && yb+130 < UIH-70) para(['The see-through headset and controllers','show where your head and hands go','when you step in.'], X, yb+72, 13);
 }
+function cycleTake(d){ const n = shots.takes.length; if (!n) return; const i = shots.takes.findIndex(t=>t.id===shots.sel); shots.sel = shots.takes[((i<0?0:i)+d+n)%n].id; shots.keySel=-1; pathDirty=true; requestUI(); }
 function drawPerform(X,W){
   txt('Perform', X, 100, 26);
   const hw = (W-8)/2;
   button(X,116,hw,50, show.rec ? '■ Cut  (A)' : '● Record  (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
   button(X+hw+8,116,hw,50, show.playing ? '■ Stop  (B)' : '▶ Play  (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
   const len = Math.max(showLength(), 0.1);
-  slider(X,182,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
-  txt('Characters', X, 248, 16, '#cfd6ff','left',700);
-  const list = show.chars.slice(-4);
-  if (!list.length) para(['Make one in CHARACTERS first.'], X, 276, 15);
-  list.forEach((c,i)=>{ const y = 262 + i*48, on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c;
+  slider(X,180,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
+  // which camera shot you're looking through
+  txt('Camera shot', X, 244, 16, '#cfd6ff','left',700);
+  const tk = selTake();
+  button(X,256,40,42,'◀',false,()=>cycleTake(-1),'#1e6bff');
+  rr(X+46,256,W-46-46-112,42,10,'#0d1029');
+  txt(tk ? tk.name+' · '+clipLen(tk).toFixed(1)+'s' : 'none yet', X+46+(W-204)/2, 277, 15, tk?'#ffd400':'#8f97c7','center');
+  button(X+W-112-40,256,40,42,'▶',false,()=>cycleTake(1),'#1e6bff');
+  button(X+W-106,256,106,42,'+ New shot',false,()=>setPhase('shoot'),'#ff3b30');
+  txt('Characters', X, 320, 16, '#cfd6ff','left',700);
+  let list = show.chars.slice(-3); const sc = selChar(); if (sc && !list.includes(sc)) list = [sc, ...list.slice(-2)];
+  if (!list.length) para(['Make one in CHARACTERS first.'], X, 348, 15);
+  list.forEach((c,i)=>{ const y = 334 + i*48, on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c;
     rr(X,y,W,42,10,on?'#ff2d95':'#2a3060'); txt(c.name.length>10?c.name.slice(0,9)+'…':c.name, X+10, y+21, 16, on?'#111':'#fff');
     hit(X,y,W-176,42,()=>{ state.selChar=c.id; requestUI(); });
     if (!inside){ rr(X+W-170,y+4,80,34,10,'#1e6bff'); txt(c.placed?'Bring here':'Place', X+W-130, y+21, 13, '#fff','center'); hit(X+W-170,y+4,80,34,()=>placeChar(c)); }
     if (c.type==='puppet'){ rr(X+W-84,y+4,80,34,10,inside?'#ffd400':'#34c759'); txt(inside?'Step out':'Step in', X+W-44, y+21, 13, '#111','center'); hit(X+W-84,y+4,80,34,()=>{ inside ? stepOut() : stepIn(c); }); }
   });
-  let ty = 262 + Math.max(1,list.length)*48 + 4;
-  const c = selChar();
-  if (c && c.placed){
-    slider(X,ty+10,W,'Size of '+(c.name.length>12?c.name.slice(0,11)+'…':c.name), Math.log2(c.place.s||1), -4, 4, v=>setCharScale(c, Math.pow(2,v)), '#ff2d95', (+(c.place.s||1).toFixed(2))+'×');
-    ty += 64;
+  let ty = 334 + Math.max(1,list.length)*48 + 2;
+  if (sc && sc.placed){
+    slider(X,ty+8,W,'Size of '+(sc.name.length>12?sc.name.slice(0,11)+'…':sc.name), Math.log2(sc.place.s||1), -4, 4, v=>setCharScale(sc, Math.pow(2,v)), '#ff2d95', (+(sc.place.s||1).toFixed(2))+'×');
+    ty += 62;
   }
   const tw = (W-16)/3;
   button(X,ty,tw,42,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on: your voice records with the show'); } },'#ff9500');
   button(X+tw+8,ty,tw,42,'Mirror',state.mirror,()=>{ state.mirror=!state.mirror; if (state.mirror){ placeMirror(); state.win.preview = true; } requestUI(); },'#1e6bff');
   button(X+2*(tw+8),ty,tw,42,'Camera',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
-  if (ty+110 < UIH-70) para(['Right trigger: aim at the ground and let go','to jump there. Grip a character to move it;','right stick ↕ while holding sets its size.'], X, ty+70, 13);
 }
 function drawTracks(X,W){
   txt('Motion', X, 100, 26);
@@ -2673,6 +2862,7 @@ function setPhase(id){
   if (stroke) endStroke(true); if (rec) stopRecording(true); if (show.rec) cutShowRec(true); stopPlay(); stopShow();
   if (blockGrab) endBlockGrab(); if (show.grab) endCharGrab();
   if (id!=='perform' && show.embodied) stepOut();
+  if (id==='app' && state.phase!=='app') state.appStage = stageName(state.phase);   // APP keeps whatever stage you were on
   const from = stageName(state.phase), to = stageName(id);
   if (from !== to){ captureView(from); }
   state.phase=id; state.dialOpen=false; state.page = FIRST_PAGE[id] || 'soon'; state.confirm=null; state.rename=null;
@@ -2718,6 +2908,7 @@ function legendLines(hand){
     build: sculpt, characters: sculpt,
     shoot:  [['T','film (hold)'],['A', play?'stop':'play take'],['B','next take'],['S','zoom'],['G','key dot / window / world']],
     edit:   [['A', play?'stop':'play film'],['T','menu clicks'],['G','window / world']],
+    light:  [['A','add a light here'],['G','grab a bulb / window / world'],['T','menu clicks']],
     perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T','aim at ground: jump there'],['G', show.embodied?'window / world':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
   }[ph] || [['T','menu clicks'],['G','window / world']]);
 }
@@ -2792,6 +2983,12 @@ function desktopPoint(h){
 }
 renderer.domElement.addEventListener('pointerdown', e => {
   if (e.button!==0 || renderer.xr.isPresenting) return;
+  if (state.phase==='light'){
+    castMouse(e); const bh = ray.intersectObjects(bulbs.children, false)[0];
+    if (bh){ const l = bh.object.userData.light; const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camera.getWorldDirection(V()).negate(), bh.point);
+      startLightGrab(l, bh.point); deskGrab = {kind:'light', plane}; renderer.domElement.setPointerCapture(e.pointerId); }
+    return;
+  }
   const h = pickSurface(e);
   if (state.phase==='perform'){
     if (h && h.obj){
@@ -2831,7 +3028,7 @@ renderer.domElement.addEventListener('pointerdown', e => {
 });
 renderer.domElement.addEventListener('pointermove', e => {
   if (renderer.xr.isPresenting) return;
-  if (deskGrab){ castMouse(e); const p = ray.ray.intersectPlane(deskGrab.plane, V()); if (p){ const m = new THREE.Matrix4().makeTranslation(p.x,p.y,p.z); ({char:moveCharGrab, block:moveBlockGrab, doodle:moveDoodleGrab})[deskGrab.kind](m); } return; }
+  if (deskGrab){ castMouse(e); const p = ray.ray.intersectPlane(deskGrab.plane, V()); if (p){ const m = new THREE.Matrix4().makeTranslation(p.x,p.y,p.z); if (deskGrab.kind==='light') moveLightGrab(p); else ({char:moveCharGrab, block:moveBlockGrab, doodle:moveDoodleGrab})[deskGrab.kind](m); } return; }
   lastHover = pickSurface(e);
   if (stroke && stroke.kind==='angle'){
     castMouse(e);
@@ -2849,7 +3046,7 @@ renderer.domElement.addEventListener('pointermove', e => {
   } else if (mouseDown && lastHover) strokeTo(desktopPoint(lastHover), desktopRadius(), 0.8, lastHover.n, 0.016);
 });
 renderer.domElement.addEventListener('pointerup', e => {
-  if (deskGrab){ ({char:endCharGrab, block:endBlockGrab, doodle:endDoodleGrab})[deskGrab.kind](); deskGrab = null; return; }
+  if (deskGrab){ ({char:endCharGrab, block:endBlockGrab, doodle:endDoodleGrab, light:endLightGrab})[deskGrab.kind](); deskGrab = null; return; }
   if (!mouseDown) return; mouseDown=false;
   if (stroke && stroke.kind==='angle'){ if (stroke.stage===0){ castMouse(e); const p = stroke.plane ? ray.ray.intersectPlane(stroke.plane, V()) : null; angleUpdate(p || stroke.B || stroke.A, false); } return; }
   endStroke();
@@ -2962,22 +3159,18 @@ for (let i=0;i<2;i++){
     for (const h of ['left','right']) if (ctrl[h] && ctrl[h].ray===rayC) ctrl[h]=null;
   });
 }
-shotHidden.push(cursor, ghost, pointerDot, pathGroup, ghostCam, bigScreen, camModel, menuWin.mesh, layersWin.mesh, previewWin.mesh);
+shotHidden.push(bulbs, tpRing, tpLine, cursor, ghost, pointerDot, pathGroup, ghostCam, bigScreen, camModel, menuWin.mesh, layersWin.mesh, previewWin.mesh);
 
 // paint the real controller buttons the same colors as the labels
 const BTN_KEYS = [['a-button','A'],['b-button','B'],['x-button','X'],['y-button','Y'],['trigger','T'],['squeeze','G'],['thumbstick','S']];
 let btnColorT = 0;
 function colorButtons(grip){
-  if (grip.userData.colored) return;
-  grip.userData.colorTries = (grip.userData.colorTries||0) + 1; if (grip.userData.colorTries > 40) return;
-  let found = 0;
   grip.traverse(o => {
     if (!o.isMesh || o.userData.win || o===legMeshL || o===legMeshR) return;
     let n = o, key = null;
     while (n && n!==grip && !key){ const nm = (n.name||'').toLowerCase().replace(/_/g,'-'); for (const [k,b] of BTN_KEYS) if (nm.includes(k)){ key = b; break; } n = n.parent; }
-    if (key){ o.material = new THREE.MeshStandardMaterial({color:BADGE[key], roughness:0.45, emissive:BADGE[key], emissiveIntensity:0.3}); found++; }
+    if (key && o.material?.userData?.btn !== key){ o.material = new THREE.MeshStandardMaterial({color:BADGE[key], roughness:0.45, emissive:BADGE[key], emissiveIntensity:0.35}); o.material.userData.btn = key; }
   });
-  if (found) grip.userData.colored = true;
 }
 function pulse(hand, v, ms){ try { ctrl[hand]?.src?.gamepad?.hapticActuators?.[0]?.pulse(v, ms); } catch(e){} }
 function readPad(c){
@@ -3077,7 +3270,7 @@ let uiCapture = null, brushRW = 0.03, orbHeld = false;
 function xrUpdate(dt){
   const L = ctrl.left, R = ctrl.right;
   const pl = L ? readPad(L) : null, pr = R ? readPad(R) : null;
-  const ph = state.phase, shoot = ph==='shoot', edit = ph==='edit', sculpt = SCULPT_PHASES.includes(ph), perform = ph==='perform';
+  const ph = state.phase, shoot = ph==='shoot', edit = ph==='edit', sculpt = SCULPT_PHASES.includes(ph), perform = ph==='perform', lightPh = ph==='light';
   const embodied = !!show.embodied;
 
   if (L && pl){
@@ -3104,6 +3297,7 @@ function xrUpdate(dt){
     if (edge(R,pr,'a')){
       if (sculpt) flipCarve(); else if (shoot) (play ? stopPlay() : startPlay('take')); else if (edit) (play ? stopPlay() : startPlay('film'));
       else if (perform) (show.rec ? cutShowRec() : startShowRec());
+      else if (lightPh){ const t = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(t); addLightAt(t); }
       pulse('right',0.3,20);
     }
     if (edge(R,pr,'b')){
@@ -3136,10 +3330,11 @@ function xrUpdate(dt){
       else if (shoot && !keyGrab) tryGrabKey(R);
       else if (sculpt && !blockGrab && !doodleGrab){ const b = findBlockAt(tipW, brushRW); if (b) startBlockGrab(b, unscaled(R.grip)); else { const d = findStrokeAt(tipW, brushRW); if (d) startDoodleGrab(d, unscaled(R.grip)); } }
       else if (perform && !embodied && !show.grab){ const c = findCharAt(tipW, 0.06*rig.scale.x); if (c) startCharGrab(c, unscaled(R.grip)); }
+      else if (lightPh && !lightGrab){ const l = findLightAt(tipW, 0.08*rig.scale.x); if (l) startLightGrab(l, tipW); }
     }
     if (winGrab && pl && pl.grip) cancelWinGrab();   // both grips means you wanted to move yourself
-    if (!pr.grip){ if (winGrab) endWinGrab(); if (keyGrab) endKeyGrab(); if (blockGrab) endBlockGrab(); if (doodleGrab) endDoodleGrab(); if (show.grab) endCharGrab(); }
-    rightGripUsed = !!(winGrab || keyGrab || blockGrab || doodleGrab || show.grab);
+    if (!pr.grip){ if (winGrab) endWinGrab(); if (keyGrab) endKeyGrab(); if (blockGrab) endBlockGrab(); if (doodleGrab) endDoodleGrab(); if (show.grab) endCharGrab(); if (lightGrab) endLightGrab(); }
+    rightGripUsed = !!(winGrab || keyGrab || blockGrab || doodleGrab || show.grab || lightGrab);
   }
   if (!embodied) navUpdate(pl?.grip, pr?.grip && !rightGripUsed); else nav = null;
   rig.updateMatrixWorld(true);
@@ -3147,6 +3342,7 @@ function xrUpdate(dt){
   if (keyGrab && R) updateKeyGrab(R);
   if (blockGrab && R) moveBlockGrab(unscaled(R.grip));
   if (doodleGrab && R) moveDoodleGrab(unscaled(R.grip));
+  if (lightGrab && R){ const t = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(t); moveLightGrab(t); }
   if (show.grab && R) moveCharGrab(unscaled(R.grip));
   updateEmbodied();
 
@@ -3273,7 +3469,7 @@ renderer.setAnimationLoop(() => {
   const tdt = Math.min(raw, 0.25);
   if (state.toastT > 0){ state.toastT -= tdt; if (state.toastT <= 0) requestUI(); }
   const xr = renderer.xr.isPresenting;
-  if (xr){ xrCameraUpdate(); xrUpdate(dt); btnColorT += raw; if (btnColorT > 1){ btnColorT = 0; for (const h of ['left','right']) if (ctrl[h]) colorButtons(ctrl[h].grip); } } else desktopUpdate(dt);
+  if (xr){ xrCameraUpdate(); xrUpdate(dt); btnColorT += raw; if (btnColorT > 0.5){ btnColorT = 0; for (const h of ['left','right']) if (ctrl[h]) colorButtons(ctrl[h].grip); } } else desktopUpdate(dt);
   updateRecording(tdt); updatePlay(tdt);
   applyShowPose(currentShowTime());
   updateShow(tdt);
@@ -3330,11 +3526,12 @@ function desktopRender(){
   let loaded = false;
   try { const s = await idbGet('scene'); if (s){ deserialize(JSON.parse(s)); loaded = true; } } catch(e){ console.warn('no saved scene', e); }
   if (!loaded){ const L = makeLayer('Ground', 0.1); state.activeWorld = L.id; genIsland(L); setAspect('16:9'); }
-  requestUI();
+  requestUI(); window.__envReady = true;
   window.__cmm = {state, shots, show, views, layers:()=>layers, applyOp, dirty, serialize, deserialize, rig, camera, scene, undo, redo, controls,
     setPhase, openPage, startRecording, stopRecording, startPlay, stopPlay, exportMP4, filmLength, newScene, setAspect,
     newCharacter, placeChar, deleteChar, startShowRec, cutShowRec, playShow, stopShow, startCharGrab, moveCharGrab, endCharGrab, findCharAt,
     layerById, charById, addKeyAt, deleteKey, lensNudge, findBlockAt, startBlockGrab, moveBlockGrab, endBlockGrab, beginStroke, setTool, activeLayer,
+    lights, get lightsArr(){return lights;}, addLightAt, makeLight, setLayerMat, cycleTake, drawFiles, colorButtons2:colorButtons,
     tearOff, closePageWin, pageWins, changeDetail, layerToProp, setCharScale, flipCarve, orbPick, colorButtons, findStrokeAt, startDoodleGrab, moveDoodleGrab, endDoodleGrab, guides, openRename, drawUI, ghostCam,
     ctrl, WINS, dockWin, roomWin, startWinGrab, moveWinGrab, endWinGrab, get winGrab(){return winGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
