@@ -52,7 +52,7 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.6';
+const VERSION = '0.7';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -104,13 +104,13 @@ const state = {
   size:0.08, strength:0.6, color:'#ff9500',
   doodle:'tube', doodleSize:0.012,
   blockMode:'stamp', blockShape:'cube', blockSize:0.1, blockSnap:true, blockMix:false,
-  flySpeed:2.0, panelOpen:true, appStage:'world', beeps:true, pickStyle:'wheel', matLayer:null, eraseFor:'doodle', recent:[], rename:null, activeWorld:1, activePart:null, selChar:null,
+  flySpeed:2.0, panelOpen:true, doodleGrip:'move', bendReach:0.15, worldId:1, autoSmooth:0.4, micGain:2.5, motionSel:null, updateTo:null, appStage:'world', beeps:true, pickStyle:'wheel', matLayer:null, eraseFor:'doodle', recent:[], rename:null, activeWorld:1, activePart:null, selChar:null,
   labels:true, mic:false, mirror:true, win:{layers:true, preview:true},
   world:{sky:'day', water:true, fog:true, custom:{top:[220,0.5], hor:[195,0.8], low:[140,0.45]}},
   fov:50,
   confirm:null, toastMsg:'', toastT:0,
 };
-const shots = {takes:[], seq:[], sel:null, seqSel:null, aspect:'16:9', res:1080, fps:30, blackRoom:true, showAll:false, playhead:0, takeSeq:1, keyT:0, keySel:-1};
+const shots = {takes:[], seq:[], sel:null, seqSel:null, aspect:'1:1', res:1080, fps:30, blackRoom:true, showAll:false, playhead:0, takeSeq:1, keyT:0, keySel:-1};
 const show = {tracks:{}, audio:[], chars:[], t:0, playing:false, rec:null, grab:null, embodied:null, charSeq:1, audioSeq:1};
 
 /* ---------------- renderer / scene ---------------- */
@@ -349,6 +349,15 @@ function applyOp(op, undoMap){
             const w = clamp(field/Math.max(1,rv*0.5),0,1)*s;
             if (Math.abs(avg-old) < 1e-3) continue;
             writes.push(ch, i, old + (avg-old)*w);
+          } else if (op.t==='spray'){
+            if (field <= 0 || old < -1.2) continue;
+            const gx=bx+lx, gy=by+ly, gz=bz+lz, f = clamp(field/rv,0,1);
+            const rnd = Math.abs(Math.sin(gx*12.9898 + gy*78.233 + gz*37.719 + (op.seed||0))*43758.5453) % 1;
+            if (rnd > f*(0.35+0.65*s)) continue;
+            const w = 0.85, i3=i*3;
+            if (undoMap && !undoMap.has(ch.k)) undoMap.set(ch.k, {d:ch.d.slice(), c:ch.c.slice()});
+            ch.c[i3]  += (col[0]-ch.c[i3])*w; ch.c[i3+1]+= (col[1]-ch.c[i3+1])*w; ch.c[i3+2]+= (col[2]-ch.c[i3+2])*w;
+            changed = true;
           } else if (op.t==='paint'){
             if (field <= 0 || old < -1.2) continue;
             const w = clamp(field/Math.max(1,rv*0.5),0,1)*s*0.8, i3=i*3;
@@ -712,9 +721,9 @@ function strokeTo(pW, rWorld, pressure, upW, dt, qW){
 }
 function stamp(p, r, pressure){
   const t = state.tool==='clay' ? (state.carve ? 'carve' : 'clay') : state.tool;
-  applyOp({t, L:stroke.L.id, p:[p.x,p.y,p.z], r, s:clamp(state.strength*(0.35+0.65*pressure),0.02,1), col:hexRgb(state.color)}, stroke.map);
+  applyOp({t, L:stroke.L.id, p:[p.x,p.y,p.z], r: t==='spray' ? r*1.4 : r, s:clamp(state.strength*(0.35+0.65*pressure),0.02,1), col:hexRgb(state.color), seed: t==='spray' ? Math.random()*1000 : 0}, stroke.map);
   if (t==='carve' && eraseInside(stroke.L, p, r)) stroke.strokesChanged = true;
-  if (t==='paint' && recolorAt(stroke.L, p, r)) stroke.strokesChanged = true;
+  if ((t==='paint' || t==='spray') && recolorAt(stroke.L, p, r)) stroke.strokesChanged = true;
 }
 function endStroke(cancel){
   if (!stroke) return;
@@ -900,17 +909,34 @@ let doodleGrab = null;
 function startDoodleGrab(d, ctrlM){
   d.L.group.updateMatrixWorld(true);
   const Linv = d.L.group.matrixWorld.clone().invert();
+  if (state.doodleGrip==='bend'){   // bend: pull the doodle near your hand, the rest follows softly
+    const before = snapStrokes(d.L), s0 = d.s, ns = {type:s0.type, r:s0.r, col:s0.col, seed:s0.seed, pts:s0.pts.slice(), ups:(s0.ups||[]).slice()};
+    dropStroke(d.L, s0); d.L.strokes.push(ns); rebuildStroke(d.L, ns);
+    const p0 = V().setFromMatrixPosition(ctrlM).applyMatrix4(Linv), v = V(); let i0 = 0, bd = 1e9;
+    const n = ns.pts.length/3, arc = [0];
+    for (let i=0;i<n;i++){ v.set(ns.pts[i*3],ns.pts[i*3+1],ns.pts[i*3+2]); const dd = v.distanceTo(p0); if (dd<bd){ bd=dd; i0=i; } if (i) arc.push(arc[i-1] + v.distanceTo(V().set(ns.pts[i*3-3],ns.pts[i*3-2],ns.pts[i*3-1]))); }
+    const sig = rToL(d.L, state.bendReach*yourScale());
+    const wts = arc.map(a=>Math.exp(-((a-arc[i0])**2)/(2*sig*sig)));
+    doodleGrab = {L:d.L, s:ns, before, bend:true, Linv, p0, orig:ns.pts.slice(), wts, last:0};
+    pulse('right',0.5,30); return;
+  }
   doodleGrab = {...d, before:snapStrokes(d.L), Linv, M0inv: Linv.clone().multiply(ctrlM).invert(), T:null};
   if (d.s._mesh) d.s._mesh.matrixAutoUpdate = false;
   pulse('right',0.5,30);
 }
 function moveDoodleGrab(ctrlM){
   const d = doodleGrab; if (!d) return;
+  if (d.bend){
+    const dl = V().setFromMatrixPosition(ctrlM).applyMatrix4(d.Linv).sub(d.p0), P = d.s.pts;
+    for (let i=0;i<d.wts.length;i++){ const w = d.wts[i]; P[i*3] = d.orig[i*3]+dl.x*w; P[i*3+1] = d.orig[i*3+1]+dl.y*w; P[i*3+2] = d.orig[i*3+2]+dl.z*w; }
+    const now = performance.now(); if (now - d.last > 60){ d.last = now; rebuildStroke(d.L, d.s); } d.moved = true; return;
+  }
   d.T = d.Linv.clone().multiply(ctrlM).multiply(d.M0inv);
   if (d.s._mesh){ d.s._mesh.matrix.copy(d.T); d.s._mesh.matrixWorldNeedsUpdate = true; }
 }
 function endDoodleGrab(){
   const d = doodleGrab; if (!d) return; doodleGrab = null;
+  if (d.bend){ rebuildStroke(d.L, d.s); pushUndo({type:'strokes', L:d.L.id, snap:d.before}); sceneDirty = true; return; }
   const s = d.s, L = d.L;
   if (!d.T){ if (s._mesh){ s._mesh.matrixAutoUpdate = true; s._mesh.matrix.identity(); } return; }
   const ns = {type:s.type, r:s.r, col:s.col, seed:s.seed, pts:[], ups:[]}, v = V(), nm = new THREE.Matrix3().getNormalMatrix(d.T);
@@ -993,10 +1019,10 @@ function redo(){
 function setTool(t){
   if (stroke) endStroke(true);
   if (t!==state.tool){ state.lastTool=state.tool; state.tool=t; }
-  if (['clay','smooth','paint'].includes(t)) state.lastSculpt = t;
+  if (['clay','smooth','paint','spray'].includes(t)) state.lastSculpt = t;
   requestUI();
 }
-function toolFamily(){ if (state.tool==='erase') return state.eraseFor || 'doodle'; if (['clay','smooth','paint'].includes(state.tool)) return 'sculpt'; return state.tool; }
+function toolFamily(){ if (state.tool==='erase') return state.eraseFor || 'doodle'; if (['clay','smooth','paint','spray'].includes(state.tool)) return 'sculpt'; return state.tool; }
 function pageFamily(){ return {tools:'sculpt', doodle:'doodle', blocks:'blocks'}[state.page] || toolFamily(); }
 // A flips inside the tab you're on: Sculpt add<->carve, Doodle draw<->erase, Blocks build<->erase
 function flipCarve(){
@@ -1051,7 +1077,9 @@ function newCharacter(type){
   const col = hexRgb(PALETTE[(n*3)%8]), white=[255,255,255], black=[30,30,30];
   const op = (L, t, p, r, cl) => applyOp({t, L:L.id, p:[p.x,p.y,p.z], r, s:1, col:cl});
   if (type==='puppet'){
-    const H = addPart(c,'head',0.0125), LH = addPart(c,'lh',0.0125), RH = addPart(c,'rh',0.0125);
+    const H = addPart(c,'head',0.0125), LH = addPart(c,'lh',0.0125), RH = addPart(c,'rh',0.0125), BD = addPart(c,'body',0.025);
+    const col2 = hexRgb(PALETTE[(n*3+2)%8]);
+    op(BD,'clay',new THREE.Vector3(0,1.12,0),0.12,col2); op(BD,'clay',new THREE.Vector3(0,0.95,0),0.15,col2); op(BD,'clay',new THREE.Vector3(0,0.78,0),0.13,col2);
     const h = new THREE.Vector3(0,1.5,0), front = new THREE.Vector3(0,0,1);
     op(H,'clay',h,0.12,col);
     for (const sx of [-1,1]){ const e = h.clone().addScaledVector(front,0.1).add(new THREE.Vector3(sx*0.045,0.03,0)); op(H,'clay',e,0.032,white); op(H,'clay',e.clone().addScaledVector(front,0.022),0.016,black); }
@@ -1081,16 +1109,17 @@ function placeChar(c){
   const s = yourScale(); let p, yaw = 0;
   if (renderer.xr.isPresenting){
     const head = V(); camera.getWorldPosition(head); const fwd = V(); camera.getWorldDirection(fwd); fwd.y=0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
-    p = head.clone().addScaledVector(fwd, 1.2*s); p.y = rig.position.y;
+    p = head.clone().addScaledVector(fwd, 0.6*s); p.y = head.y;
     yaw = Math.atan2(-fwd.x, -fwd.z);
   } else {
     p = controls.target.clone(); const d = V().subVectors(camera.position, p); yaw = Math.atan2(d.x, d.z);
   }
   const k = renderer.xr.isPresenting ? s : 1;
   // stand it on the ground under that spot
-  const down = new THREE.Raycaster(new THREE.Vector3(p.x, p.y + 3*k, p.z), new THREE.Vector3(0,-1,0), 0, 30*k);
+  const vr = renderer.xr.isPresenting;
+  const down = new THREE.Raycaster(new THREE.Vector3(p.x, p.y + (vr ? 0 : 3*k), p.z), new THREE.Vector3(0,-1,0), 0, (vr ? 3 : 30)*k);
   const hitG = down.intersectObjects(worldLayers().filter(L=>L.visible).map(L=>L.group), true)[0];
-  if (hitG) p.y = hitG.point.y; else if (state.world.water && p.y < 0) p.y = 0;
+  if (hitG) p.y = hitG.point.y; else if (vr) p.y = rig.position.y; else if (state.world.water && p.y < 0) p.y = 0;
   c.place = {p:p.toArray(), q:new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), yaw).toArray(), s:k};
   c.placed = true; pushUndo({type:'show', snap:before}); sceneDirty = true;
   toast(c.name+' is in the scene'); requestUI();
@@ -1176,6 +1205,13 @@ async function audioPlayFrom(t, rate=1){
   }
 }
 let micStream = null;
+function micRecorder(){
+  const a = ac();
+  if (a.state !== 'running') return new MediaRecorder(micStream);
+  const src = a.createMediaStreamSource(micStream), gn = a.createGain(), dst = a.createMediaStreamDestination();
+  gn.gain.value = state.micGain || 2.5; src.connect(gn); gn.connect(dst);
+  return new MediaRecorder(dst.stream);
+}
 async function ensureMic(){
   if (micStream) return micStream;
   try { micStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:true}}); }
@@ -1214,6 +1250,8 @@ function stepIn(c){
       if (!Lh || !cc) continue;
       parts.push({L:Lh, tracker:cc.grip, off: idealInv(c.root.localToWorld(new THREE.Vector3(...c.guide[key]))).multiply(Lh.group.matrixWorld.clone())});
     }
+    const BD = partLayer(c,'body');   // the body hangs under your head and turns with you, but doesn't tilt
+    if (BD){ updateBodyFollow(true); parts.push({L:BD, tracker:bodyFollow, off: idealInv(headW).multiply(BD.group.matrixWorld.clone())}); }
   } else {
     if (H){ const hc = layerCenter(H), cw = V(); camera.getWorldPosition(cw); rig.position.add(hc.sub(cw)); rig.updateMatrixWorld(true); }
     if (H) parts.push({L:H, tracker:camera, off: unscaled(camera).invert().multiply(H.group.matrixWorld.clone())});
@@ -1225,15 +1263,32 @@ function stepIn(c){
       parts.push({L:Lh, tracker:cc.grip, off: unscaled(cc.grip).invert().multiply(wantW)});
     }
   }
-  show.embodied = {c, parts};
+  rig.updateMatrixWorld(true); c.root.updateMatrixWorld(true);
+  show.embodied = {c, parts, rigRel: c.root.matrixWorld.clone().invert().multiply(rig.matrix.clone())};
   placeMirror(); toast('You are '+c.name+' — A records, B plays'); requestUI();
 }
 function stepOut(){
   if (!show.embodied || show.rec) return;
   show.embodied = null; toast('Stepped out'); requestUI();
 }
+const bodyFollow = new THREE.Object3D(); scene.add(bodyFollow);
+function updateBodyFollow(snap){
+  const p = V(), f = V(); camera.getWorldPosition(p); camera.getWorldDirection(f); f.y = 0; if (f.lengthSq() < 1e-6) f.set(0,0,-1); f.normalize();
+  const q = new THREE.Quaternion().setFromAxisAngle(_y, Math.atan2(-f.x, -f.z));
+  if (snap){ bodyFollow.position.copy(p); bodyFollow.quaternion.copy(q); } else { bodyFollow.position.lerp(p, 0.5); bodyFollow.quaternion.slerp(q, 0.15); }
+  bodyFollow.updateMatrixWorld(true);
+}
+// when a puppet has recorded moves, your view rides along with it (smoothed so it's gentle)
+function followRoot(dt){
+  const e = show.embodied; if (!e || !e.rigRel || !show.tracks['r'+e.c.id]) return;
+  e.c.root.updateMatrixWorld(true);
+  const m = e.c.root.matrixWorld.clone().multiply(e.rigRel), p = V(), q = new THREE.Quaternion(), sc = V(); m.decompose(p,q,sc);
+  const k = 1 - Math.exp(-dt*6);
+  rig.position.lerp(p, k); rig.quaternion.slerp(q, k); rig.updateMatrixWorld(true);
+}
 function updateEmbodied(){
   if (!show.embodied) return;
+  updateBodyFollow(false);
   const root = show.embodied.c.root; root.updateMatrixWorld(true);
   const inv = root.matrixWorld.clone().invert();
   for (const part of show.embodied.parts) setObjMatrix(part.L.group, inv.clone().multiply(unscaled(part.tracker).multiply(part.off)));
@@ -1272,6 +1327,7 @@ function teleportAim(o, d){
   return null;
 }
 function doTeleport(p){
+  if (show.embodied && show.tracks['r'+show.embodied.c.id]){ toast(show.embodied.c.name+' follows its recorded moves, so you ride along'); return; }
   rig.updateMatrixWorld(true);
   const feet = rig.localToWorld(new THREE.Vector3(camera.position.x, 0, camera.position.z));
   const d = V().subVectors(p, feet);
@@ -1337,7 +1393,7 @@ function updateShow(dt){
       if (r.t <= 0){
         r.phase='rec'; r.t=0; show.t=0; pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(0);
         if (state.mic && micStream && window.MediaRecorder){
-          try { r.mr = new MediaRecorder(micStream); r.mr.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); }; r.mr.start(250); } catch(e){ toast('Mic recording failed'); }
+          try { r.mr = micRecorder(); r.mr.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); }; r.mr.start(250); } catch(e){ toast('Mic recording failed'); }
         }
       }
       return;
@@ -1368,6 +1424,32 @@ function updateShow(dt){
 /* ============================================================
    SHOOT: camera takes (path time u; the show plays at u)
    ============================================================ */
+let scenes = [{id:1, name:'Scene 1', tracks:null, audio:null, places:null}], curScene = 1, sceneSeq = 2;
+const sceneById = id => scenes.find(x=>x.id===id);
+const sceneTakes = () => shots.takes.filter(t=>(t.sceneId ?? 1)===curScene);
+function stashScene(){ const sc = sceneById(curScene); if (!sc) return; sc.tracks = show.tracks; sc.audio = show.audio; sc.places = Object.fromEntries(show.chars.map(c=>[c.id, {place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}])); }
+function loadScene(id){
+  const sc = sceneById(id); if (!sc) return;
+  show.tracks = sc.tracks || {}; show.audio = sc.audio || [];
+  for (const c of show.chars){ const pl = sc.places && sc.places[c.id]; if (pl){ c.place = JSON.parse(JSON.stringify(pl.place)); c.placed = pl.placed; } }
+  curScene = id;
+}
+function activateScene(id){ id = id ?? 1; if (id===curScene || !sceneById(id)) return; stashScene(); loadScene(id); audioStop(); motionDirty = true; requestUI(); }
+function dropShowUndo(){ const keep = r => r.type!=='show'; const u = undoStack.filter(keep), rd = redoStack.filter(keep); undoStack.length = 0; undoStack.push(...u); redoStack.length = 0; redoStack.push(...rd); }
+function goScene(id){
+  if (show.rec || rec || show.embodied){ if (show.embodied) toast('Step out of the puppet first'); return; }
+  stopShow(); stopPlay(); activateScene(id); dropShowUndo(); show.t = 0;
+  const T = sceneTakes(); shots.sel = T.length ? T[T.length-1].id : null; pathDirty = true;
+  toast(sceneById(curScene).name); requestUI();
+}
+function newSceneTimeline(){
+  if (show.rec || rec || show.embodied) return;
+  stashScene();
+  const sc = {id:sceneSeq++, name:'Scene '+(scenes.length+1), tracks:{}, audio:[], places:JSON.parse(JSON.stringify(sceneById(curScene).places||{}))};
+  scenes.push(sc); goScene(sc.id); sceneDirty = true;
+  toast(sc.name+': a fresh timeline. Characters start where they were.');
+}
+function cycleScene(d){ const i = scenes.findIndex(x=>x.id===curScene); goScene(scenes[(i+d+scenes.length)%scenes.length].id); }
 const shotCam = new THREE.PerspectiveCamera(50, 16/9, 0.01, 5000);
 const ASPECTS = {'16:9':16/9, '1:1':1, '9:16':9/16};
 const takeById = id => shots.takes.find(t=>t.id===id);
@@ -1423,9 +1505,11 @@ function fovAt(tk, u){
   let i=0; while (i<n-2 && f[(i+1)*2] < u) i++;
   const a=i*2, b=a+2, k=(u-f[a])/Math.max(1e-6, f[b]-f[a]); return f[a+1] + (f[b+1]-f[a+1])*k;
 }
+// the zoom is set for a square frame; wide shows more at the sides, vertical shows more above and below
+function vfov(f, aspect){ return aspect < 1 ? 2*Math.atan(Math.tan(f*Math.PI/360)/aspect)*180/Math.PI : f; }
 function poseShotCam(tk, u){
   evalTake(tk, u, shotCam.position, shotCam.quaternion);
-  shotCam.fov = fovAt(tk, u); const s = tk.scale || 1;
+  shotCam.fov = vfov(fovAt(tk, u), ASPECTS[shots.aspect]); const s = tk.scale || 1;
   shotCam.near = 0.01*s; shotCam.far = 5000*s;
   shotCam.aspect = ASPECTS[shots.aspect]; shotCam.updateProjectionMatrix(); shotCam.updateMatrixWorld();
 }
@@ -1457,7 +1541,7 @@ function stopRecording(cancel){
   if (r.phase!=='rec' || cancel || r.samples.length/8 < 3 || r.t < 0.4){ if (!cancel) toast('Too short — hold longer'); requestUI(); return; }
   const before = snapShots();
   const dur = r.samples[r.samples.length-8];
-  const tk = {id:shots.takeSeq++, name:'Take '+(shots.takeSeq-1), samples:r.samples, dur, smooth:0.4, every:1.0, sharp:0, speed:1, fov:state.fov, fovTrack:null,
+  const tk = {id:shots.takeSeq++, name:'Take '+(shots.takeSeq-1), samples:r.samples, dur, smooth:state.autoSmooth, every:+(0.05 + state.autoSmooth*1.2).toFixed(2), sharp:0, sceneId:curScene, speed:1, fov:state.fov, fovTrack:null,
               keys:[], edited:false, inT:0, outT:dur, scale:r.scale};
   makeKeys(tk);
   shots.takes.push(tk); shots.seq.push(tk.id); shots.sel = tk.id;
@@ -1483,7 +1567,7 @@ function updateRecording(dt){
 function startPlay(mode){
   if (rec || show.rec) return;
   stopShow();
-  if (mode==='take'){ const tk = selTake(); if (!tk){ toast('Film a take first'); return; } play = {mode, t:tk.inT, tk}; audioPlayFrom(tk.inT, spd(tk)); }
+  if (mode==='take'){ const tk = selTake(); if (!tk){ toast('Film a take first'); return; } activateScene(tk.sceneId); play = {mode, t:tk.inT, tk}; audioPlayFrom(tk.inT, spd(tk)); }
   else { if (!filmClips().length){ toast('No clips on the timeline'); return; } play = {mode, t: shots.playhead >= filmLength()-0.05 ? 0 : shots.playhead, clipId:null}; }
   if (state.phase==='edit') placeBigScreen();
   requestUI();
@@ -1517,13 +1601,13 @@ function updatePlay(dt){
     if (play.lens){
       const ls = play.lens.samples;
       if (play.t - ls[ls.length-2] > 1/30) ls.push(+play.t.toFixed(3), +state.fov.toFixed(2));
-      shotCam.fov = state.fov; shotCam.updateProjectionMatrix();
+      shotCam.fov = vfov(state.fov, ASPECTS[shots.aspect]); shotCam.updateProjectionMatrix();
     }
   } else {
     play.t += dt;
     const L = filmLength(); if (play.t >= L){ shots.playhead = L; stopPlay(); return; }
     shots.playhead = play.t; const f = filmAt(play.t);
-    if (f){ poseShotCam(f.tk, f.u); if (play.clipId !== f.tk.id){ play.clipId = f.tk.id; audioPlayFrom(f.u, spd(f.tk)); } }
+    if (f){ poseShotCam(f.tk, f.u); if (play.clipId !== f.tk.id){ play.clipId = f.tk.id; activateScene(f.tk.sceneId); audioPlayFrom(f.u, spd(f.tk)); } }
     uiTick += dt; if (uiTick > 0.1){ uiTick = 0; requestUI(); }
   }
 }
@@ -1531,7 +1615,7 @@ function lensNudge(delta){
   state.fov = clamp(state.fov + delta, 15, 90);
   if (play && play.mode==='take' && play.tk){
     if (!play.lens){ play.lens = {samples:[+play.t.toFixed(3), +state.fov.toFixed(2)], before:snapShots()}; toast('Recording zoom…'); }
-    shotCam.fov = state.fov; shotCam.updateProjectionMatrix();
+    shotCam.fov = vfov(state.fov, ASPECTS[shots.aspect]); shotCam.updateProjectionMatrix();
   } else { const tk = selTake(); if (tk && !rec && !(tk.fovTrack && tk.fovTrack.length)) tk.fov = state.fov; }
   requestUI();
 }
@@ -1671,7 +1755,7 @@ async function exportMP4(){
   if (renderer.xr.isPresenting){ toast('Export from the desktop (exit VR first)'); return; }
   if (!('VideoEncoder' in window)){ toast('This browser can’t make MP4s — try desktop Chrome'); return; }
   const clips = filmClips(); if (!clips.length){ toast('No clips on the timeline yet'); return; }
-  stopPlay(); stopShow();
+  stopPlay(); stopShow(); const startScene = curScene;
   const [W,H] = exportSize(), fps = shots.fps, total = filmLength();
   const frames = Math.max(1, Math.round(total*fps));
   exporting = {i:0, frames}; requestUI();
@@ -1696,9 +1780,9 @@ async function exportMP4(){
     const cam = new THREE.PerspectiveCamera(50, W/H, 0.01, 5000);
     for (let i=0;i<frames;i++){
       if (encErr) throw encErr;
-      const f = filmAt(i/fps); if (!f) break;
+      const f = filmAt(i/fps); if (!f) break; activateScene(f.tk.sceneId);
       evalTake(f.tk, f.u, cam.position, cam.quaternion);
-      cam.fov = fovAt(f.tk, f.u); cam.aspect = W/H; const s=f.tk.scale||1; cam.near=0.01*s; cam.far=5000*s; cam.updateProjectionMatrix(); cam.updateMatrixWorld();
+      cam.fov = vfov(fovAt(f.tk, f.u), W/H); cam.aspect = W/H; const s=f.tk.scale||1; cam.near=0.01*s; cam.far=5000*s; cam.updateProjectionMatrix(); cam.updateMatrixWorld();
       applyShowPose(f.u);
       withShotView(() => er.render(scene, cam));
       const vf = new VideoFrame(er.domElement, {timestamp: Math.round(i*1e6/fps), duration: Math.round(1e6/fps)});
@@ -1716,7 +1800,7 @@ async function exportMP4(){
     window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec};
     toast('MP4 saved · '+W+'×'+H);
   } catch(e){ console.error(e); toast('Export failed: '+(e.message||e)); window.__lastExport = {error:String(e)}; }
-  finally { if (er){ er.dispose(); er.forceContextLoss?.(); } exporting = null; requestUI(); }
+  finally { activateScene(startScene); if (er){ er.dispose(); er.forceContextLoss?.(); } exporting = null; requestUI(); }
 }
 
 /* ---------------- LIGHT: colored point lights you place and grab ---------------- */
@@ -1800,6 +1884,22 @@ function drawSun(X,W){
   para(['Pick the sky itself in BUILD > World.'], X, 450, 14);
 }
 
+/* ---------------- motion path of the picked Motion row ---------------- */
+const motionLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color:'#ff2d95', depthTest:false, transparent:true}));
+motionLine.renderOrder = 14; motionLine.frustumCulled = false; motionLine.visible = false; scene.add(motionLine);
+let motionDirty = true, motionT = 0;
+function updateMotionLine(dt){
+  motionT += dt; const key = state.motionSel, tr = key ? show.tracks[key] : null;
+  motionLine.visible = !!tr && state.phase==='perform' && state.page==='tracks';
+  if (!motionLine.visible || (!motionDirty && motionT < 0.5)) return;
+  motionDirty = false; motionT = 0;
+  const S9 = tr.samples, pts = [], v = V();
+  let M = null;
+  if (key[0]!=='r'){ const L = layerById(+key), c = L ? charById(L.char) : null; if (c){ c.root.updateMatrixWorld(true); M = c.root.matrixWorld; } }
+  for (let i=0;i<S9.length;i+=9){ v.set(S9[i+1],S9[i+2],S9[i+3]); if (M) v.applyMatrix4(M); pts.push(v.clone()); }
+  motionLine.geometry.dispose(); motionLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+}
+
 /* ---------------- views: the world and the studio each remember where you were ---------------- */
 const views = {world:{xr:null, desk:null}, studio:{xr:null, desk:null}};
 const stageName = ph => ph==='characters' ? 'studio' : ph==='app' ? (state.appStage || 'world') : 'world';
@@ -1852,6 +1952,7 @@ function serialize(){
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
     shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq},
+    scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}]))}))), curScene, sceneSeq,
     show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
@@ -1870,6 +1971,7 @@ function clearScene(){
   layers = []; dirty.clear(); undoStack.length=0; redoStack.length=0;
   show.tracks = {}; show.audio = []; show.chars = []; show.embodied = null; show.grab = null; show.t = 0; audioBufs.clear();
   state.selChar = null; state.activePart = null;
+  scenes = [{id:1, name:'Scene 1', tracks:null, audio:null, places:null}]; curScene = 1; sceneSeq = 2;
 }
 function deserialize(o){
   clearScene();
@@ -1903,6 +2005,8 @@ function deserialize(o){
   if (o.shots){ Object.assign(shots, o.shots); shots.takes = (shots.takes || []).map(copyTake); shots.seq = shots.seq || []; }
   else { shots.takes=[]; shots.seq=[]; shots.sel=null; }
   show.tracks = sh.tracks||{}; show.audio = sh.audio||[]; show.charSeq = Math.max(show.charSeq, sh.charSeq||1); show.audioSeq = sh.audioSeq||1;
+  if (o.scenes && o.scenes.length){ scenes = o.scenes.map(x=>({...x})); sceneSeq = o.sceneSeq || (Math.max(...scenes.map(x=>x.id))+1); curScene = -1; loadScene(o.curScene ?? scenes[0].id); }
+  else { scenes = [{id:1, name:'Scene 1', tracks:show.tracks, audio:show.audio, places:null}]; curScene = 1; sceneSeq = 2; }
   // v0.3 saves: puppets made of world layers, and moving world layers, become characters
   if (!sh.chars && (o.v||0) < 5){
     for (const L of worldLayers()) if (/^ground/i.test(L.name)) L.rest = {p:[0,0,0], q:[0,0,0,1], s:1};
@@ -1926,9 +2030,27 @@ function idb(){ return new Promise((res,rej)=>{ const r=indexedDB.open('chikimov
   r.onupgradeneeded=()=>r.result.createObjectStore('kv'); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
 async function idbSet(k,v){ const db=await idb(); return new Promise((res,rej)=>{ const tx=db.transaction('kv','readwrite'); tx.objectStore('kv').put(v,k); tx.oncomplete=res; tx.onerror=()=>rej(tx.error); }); }
 async function idbGet(k){ const db=await idb(); return new Promise((res,rej)=>{ const tx=db.transaction('kv','readonly'); const r=tx.objectStore('kv').get(k); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
+let worldList = [];
+function worldName(){ return (worldList.find(w=>w.id===state.worldId) || {}).name || 'My world'; }
 async function saveLocal(quiet){
-  try { await idbSet('scene', JSON.stringify(serialize())); sceneDirty=false; if (!quiet) toast('Saved on this device'); }
+  try {
+    await idbSet('world:'+state.worldId, JSON.stringify(serialize()));
+    let w = worldList.find(x=>x.id===state.worldId); if (!w){ w = {id:state.worldId, name:'World '+state.worldId}; worldList.push(w); }
+    w.saved = Date.now(); await idbSet('worlds', JSON.stringify(worldList)); await idbSet('cur', state.worldId);
+    sceneDirty=false; if (!quiet) toast('Saved "'+w.name+'" on this device');
+  }
   catch(e){ console.error(e); toast('Save failed'); }
+}
+async function openWorld(id){
+  if (id===state.worldId) return;
+  await saveLocal(true);
+  const s2 = await idbGet('world:'+id); if (!s2){ toast('That world is empty'); return; }
+  deserialize(JSON.parse(s2)); state.worldId = id; await idbSet('cur', id); applyView(stageName(state.phase)); toast('Opened "'+worldName()+'"'); requestUI();
+}
+async function newWorld(kind){
+  await saveLocal(true);
+  state.worldId = Math.max(0, ...worldList.map(w=>w.id)) + 1; worldList.push({id:state.worldId, name:'World '+state.worldId, saved:Date.now()});
+  newScene(kind); await saveLocal(true); requestUI();
 }
 function downloadFile(){
   const blob = new Blob([JSON.stringify(serialize())], {type:'application/json'});
@@ -2030,6 +2152,14 @@ function tearOff(page){
   w.mesh.translateZ(0.02);
   pageWins.push(w); WINS.push(w); requestUI(); drawUI();
   return {win:w, isNew:true};
+}
+// pop the current tab out as its own window beside the menu, so you can see several at once
+function popOut(page){
+  const t = tearOff(page); if (!t) return;
+  if (t.isNew){ const k = pageWins.length-1; t.win.mesh.translateX(0.2 + 0.18*(k%3)); t.win.mesh.translateY(Math.floor(k/3)*0.3); }
+  const rail = (RAILS[state.phase]||[]).map(([id])=>id).filter(id=>id!=='layers' && !pageWins.some(w=>w.page===id));
+  if (rail.length) state.page = rail[0];
+  toast('Popped out. Grip it to move it; bring it to your left hand to put it back.'); requestUI();
 }
 function closePageWin(w){
   w.mesh.parent?.remove(w.mesh); w.tex.dispose(); w.mesh.geometry.dispose(); w.mesh.material.dispose();
@@ -2144,7 +2274,7 @@ function startWinGrab(win, R, torn){
   if (torn) toast('Let go anywhere. Right stick ↕ resizes it. Bring it back to your left hand to put it back in the menu.');
   else if (win.dock==='hand') toast('Let go in the room to leave it there. Right stick ↕ resizes it.');
   rig.attach(win.mesh); win.mesh.updateMatrix(); R.grip.updateMatrix();
-  winGrab = {win, orig, rel: R.grip.matrix.clone().invert().multiply(win.mesh.matrix.clone())};
+  winGrab = {win, orig, t0:performance.now(), rel: R.grip.matrix.clone().invert().multiply(win.mesh.matrix.clone())};
   pulse('right',0.4,25);
 }
 function cancelWinGrab(){
@@ -2224,6 +2354,7 @@ function icon(name,cx,cy,col){
   else if (name==='sun'){ g.beginPath(); g.arc(0,0,7,0,7); g.fill(); for (let k=0;k<8;k++){ const a=k*Math.PI/4; g.beginPath(); g.moveTo(Math.cos(a)*10,Math.sin(a)*10); g.lineTo(Math.cos(a)*15,Math.sin(a)*15); g.stroke(); } }
   else if (name==='files'){ g.beginPath(); g.moveTo(-14,-9); g.lineTo(-4,-9); g.lineTo(0,-5); g.lineTo(14,-5); g.lineTo(14,11); g.lineTo(-14,11); g.closePath(); g.fill(); }
   else if (name==='settings'){ for (let k=0;k<8;k++){ g.save(); g.rotate(k*Math.PI/4); g.fillRect(-3,-15,6,8); g.restore(); } g.beginPath(); g.arc(0,0,9,0,7); g.fill(); g.beginPath(); g.arc(0,0,4,0,7); g.globalCompositeOperation='destination-out'; g.fill(); g.globalCompositeOperation='source-over'; }
+  else if (name==='popout'){ g.lineWidth=3; g.strokeRect(-14,-6,18,18); g.beginPath(); g.moveTo(-2,-14); g.lineTo(14,-14); g.lineTo(14,2); g.stroke(); g.beginPath(); g.moveTo(-4,4); g.lineTo(13,-13); g.stroke(); }
   else { g.beginPath(); g.arc(0,0,11,0,7); g.stroke(); }
   g.restore();
 }
@@ -2264,6 +2395,7 @@ function drawUI(){
   rr(12,12,214,50,25,ph.col); txt(ph.name+' ▾', 26, 38, ph.name.length>8?19:24, '#111');
   hit(12,12,214,50,()=>{ state.dialOpen=!state.dialOpen; requestUI(); });
   drawChip();
+  txt('v'+VERSION, UIW-20, 68, 11, '#5a6090','right',700);
   rr(10,76,84,UIH-88,18,'#0d1029');
   const rail = RAILS[state.phase] || [...(PLANNED[state.phase]||[]).map(n=>['soon',n]), ['scene','Scene']];
   rail.forEach(([id,label],i) => {
@@ -2275,6 +2407,10 @@ function drawUI(){
     txt(label.length>8?label.slice(0,8)+'…':label, 52, y+57, 13, on?'#111':disabled?'#4a5080':'#cfd6ff','center',700);
     if (!disabled) hit(16,y,72,72,()=>openPage(id));
   });
+  if (renderer.xr.isPresenting && (RAILS[state.phase]||[]).some(([id])=>id===state.page)){
+    const y = UIH-96; rr(16,y,72,72,14,'#00c7be'); icon('popout', 52, y+26, '#111'); txt('Pop out', 52, y+57, 13, '#111','center',700);
+    hit(16,y,72,72,()=>popOut(state.page));
+  }
   const X=110, W=UIW-X-16;
   (PAGE_DRAW[state.page] || drawSoon)(X,W,ph);
   if (state.toastT>0){
@@ -2353,11 +2489,11 @@ function drawPreviewHead(){
   win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
 }
 function openRename(kind, id){
-  const obj = kind==='layer' ? layerById(id) : charById(id); if (!obj) return;
+  const obj = kind==='layer' ? layerById(id) : kind==='scene' ? sceneById(id) : kind==='world' ? worldList.find(w=>w.id===id) : charById(id); if (!obj) return;
   if (!renderer.xr.isPresenting){ const n = prompt('New name', obj.name); if (n && n.trim()) applyName(kind, id, n.trim().slice(0,28)); return; }
   state.rename = {kind, id, text:obj.name, caps:false, back:state.page}; state.page = 'rename'; state.panelOpen = true; requestUI();
 }
-function applyName(kind, id, name){ const obj = kind==='layer' ? layerById(id) : charById(id); if (!obj) return; obj.name = name; sceneDirty = true; requestUI(); }
+function applyName(kind, id, name){ const obj = kind==='layer' ? layerById(id) : kind==='scene' ? sceneById(id) : kind==='world' ? worldList.find(w=>w.id===id) : charById(id); if (kind==='world' && obj){ obj.name = name; idbSet('worlds', JSON.stringify(worldList)); requestUI(); return; } if (!obj) return; obj.name = name; sceneDirty = true; requestUI(); }
 function drawRename(X,W){
   const R0 = state.rename; if (!R0){ state.page = FIRST_PAGE[state.phase] || 'scene'; return; }
   txt('Name', X, 100, 26);
@@ -2379,7 +2515,7 @@ function openPage(id){
   state.page=id; state.confirm=null;
   if (SCULPT_PHASES.includes(state.phase)){
     if (id==='blocks' || id==='doodle'){ if (state.tool==='erase') state.eraseFor = id; else if (state.tool!==id) setTool(id); }
-    else if (id==='tools' && !['clay','smooth','paint'].includes(state.tool)) setTool(state.lastSculpt||'clay');
+    else if (id==='tools' && !['clay','smooth','paint','spray'].includes(state.tool)) setTool(state.lastSculpt||'clay');
   }
   requestUI();
 }
@@ -2405,9 +2541,9 @@ function drawSoon(X,W,ph){
 }
 function drawTools(X,W){
   txt('Sculpt', X, 100, 26);
-  const bw=(W-16)/3;
-  [['clay','Clay'],['smooth','Smooth'],['paint','Paint']].forEach(([id,l],i)=>
-    button(X+i*(bw+8),124,bw,56,l,state.tool===id,()=>setTool(id), id==='paint'?'#ff2d95':id==='smooth'?'#1e6bff':'#ff9500'));
+  const bw=(W-24)/4;
+  [['clay','Clay'],['smooth','Smooth'],['paint','Paint'],['spray','Spray']].forEach(([id,l],i)=>
+    button(X+i*(bw+8),124,bw,56,l,state.tool===id,()=>setTool(id), id==='paint'||id==='spray'?'#ff2d95':id==='smooth'?'#1e6bff':'#ff9500'));
   txt('Clay mode  (A flips)', X, 206, 17, '#cfd6ff','left',700);
   const hw=(W-8)/2;
   button(X,222,hw,52,'+ ADD', state.tool==='clay'&&!state.carve, ()=>{setTool('clay'); state.carve=false;}, '#34c759');
@@ -2457,9 +2593,11 @@ function drawDoodle(X,W){
   const hw=(W-8)/2;
   button(X,348,hw,48,'Draw',state.tool==='doodle',()=>setTool('doodle'),'#34c759');
   button(X+hw+8,348,hw,48,'Erase bits',state.tool==='erase',()=>{ setTool('erase'); state.eraseFor='doodle'; requestUI(); },'#ff3b30');
-  para(['A flips draw ↔ erase. The eraser only takes','the part it touches. Right grip on a doodle','moves it. Paint (Sculpt tab) recolors it.'], X, 424, 14);
-  rr(X,494,52,52,12,state.color); txt('Color', X+64, 520, 18, '#cfd6ff','left',700);
-  hit(X,494,W,52,()=>{state.page='color'; requestUI();});
+  txt('Right grip on a doodle', X, 418, 15, '#cfd6ff','left',700);
+  button(X,430,hw,40,'Moves it',state.doodleGrip==='move',()=>{ state.doodleGrip='move'; requestUI(); },'#1e6bff');
+  button(X+hw+8,430,hw,40,'Bends it',state.doodleGrip==='bend',()=>{ state.doodleGrip='bend'; requestUI(); },'#1e6bff');
+  if (state.doodleGrip==='bend') slider(X,486,W,'How much bends', state.bendReach, 0.03, 0.6, v=>state.bendReach=v, '#1e6bff', fmtLen(state.bendReach*yourScale()));
+  else para(['A flips draw ↔ erase. The eraser only takes','the part it touches. Paint recolors doodles.'], X, 494, 13);
 }
 const BLOCK_HINTS = {
   stamp:['Tap to place one block, drag for a trail.','Snap off: blocks follow your hand’s angle.'],
@@ -2597,17 +2735,28 @@ function drawSky(X,W){
   });
   button(X, UIH-130, W, 44, '◀ Back to World', false, ()=>{ state.page='world'; requestUI(); }, '#1e6bff');
 }
+async function checkUpdate(){
+  try { const t = await (await fetch(location.pathname+'?check='+Date.now(), {cache:'no-store'})).text();
+    const m = t.match(/const VERSION = '([\d.]+)'/);
+    if (m && m[1] !== VERSION && state.updateTo !== m[1]){ state.updateTo = m[1]; toast('Version '+m[1]+' is out: APP > Files > Update'); requestUI(); } } catch(e){}
+}
+async function updateNow(){ await saveLocal(true); location.replace(location.pathname+'?v='+Date.now()); }
 function drawFiles(X,W){
   txt('Files', X, 100, 26);
+  button(X,UIH-150,W,46, state.updateTo ? 'Update to v'+state.updateTo : 'Reload the newest version', !!state.updateTo, updateNow, '#34c759');
   const hw=(W-8)/2;
   button(X,124,hw,52,'Save',false,()=>saveLocal(false),'#34c759');
   button(X+hw+8,124,hw,52,'Download',false,downloadFile,'#1e6bff');
-  button(X,184,W,52,'Load a scene file',false,loadFile,'#1e6bff');
-  txt('Start over', X, 270, 16, '#cfd6ff','left',700);
-  const a1 = state.confirm==='newisland', a2 = state.confirm==='newempty';
-  button(X,284,hw,52,a1?'Tap to confirm':'New island',a1,()=>{ if(!a1){state.confirm='newisland';requestUI();return;} state.confirm=null; newScene('island'); },'#ff3b30');
-  button(X+hw+8,284,hw,52,a2?'Tap to confirm':'New empty sky',a2,()=>{ if(!a2){state.confirm='newempty';requestUI();return;} state.confirm=null; newScene('empty'); },'#ff3b30');
-  para(['Your scene also saves itself on this','device every 20 seconds.','','Download makes a file you can open on','the desktop (Load) to edit and export.'], X, 380, 14);
+  button(X,184,W,48,'Load a scene file',false,loadFile,'#1e6bff');
+  txt('Worlds on this device', X, 256, 16, '#cfd6ff','left',700);
+  const ws = worldList.slice().sort((a,b)=>(b.saved||0)-(a.saved||0)).slice(0,4);
+  ws.forEach((w,i)=>{ const y = 270+i*44, on = w.id===state.worldId;
+    rr(X,y,W,38,10,on?'#00c7be':'#2a3060'); txt((w.name.length>18?w.name.slice(0,17)+'…':w.name)+(on?'  (open)':''), X+12, y+19, 15, on?'#111':'#fff');
+    hit(X,y,W,38,()=>{ if (on) openRename('world', w.id); else openWorld(w.id); }); });
+  const yb = 270+Math.max(1,ws.length)*44+4;
+  button(X,yb,hw,42,'+ Island world',false,()=>newWorld('island'),'#ff9500');
+  button(X+hw+8,yb,hw,42,'+ Empty world',false,()=>newWorld('empty'),'#ff9500');
+  para(['Saves itself every 20 s. Tap the open world','to rename it. Download → Load moves it','to your computer.'], X, yb+66, 13);
   txt('ChikiMovieMagic v'+VERSION, X, UIH-40, 15, '#4a5080','left',700);
 }
 function drawSettings(X,W){
@@ -2620,9 +2769,12 @@ function drawSettings(X,W){
   if (renderer.xr.isPresenting) button(X+hw+8,292,hw,48,'Dock windows',false,()=>{ for (const w of [...WINS]) dockWin(w); },'#00c7be');
   const ys = yourScale();
   txt('Your size  '+(ys<1 ? '1/'+(+(1/ys).toFixed(1)) : (+ys.toFixed(1)))+'×', X, 370, 16, '#cfd6ff','left',700);
-  txt('Color picker in the headset', X, 410, 16, '#cfd6ff','left',700);
+  slider(X,382,W,'Mic boost', state.micGain||2.5, 1, 6, v=>state.micGain=+v.toFixed(1), '#ff9500', (state.micGain||2.5).toFixed(1)+'×');
+  const bc = h => ctrl[h]?.grip?.userData?.btnCount ?? '–';
+  txt('Painted controller buttons: L '+bc('left')+' · R '+bc('right'), X, 492, 13, '#8f97c7','left',700);
+  txt('Color picker in the headset', X, 520, 16, '#cfd6ff','left',700);
   const tw=(W-16)/3;
-  [['wheel','Wheel'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),424,tw,44,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
+  [['wheel','Wheel'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),532,tw,40,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
   txt('ChikiMovieMagic v'+VERSION, X, UIH-40, 15, '#4a5080','left',700);
 }
 function drawTakes(X,W){
@@ -2632,8 +2784,10 @@ function drawTakes(X,W){
   else button(X,122,W,50, rec ? '■ Stop recording' : '● Record my view  (R)', !!rec, ()=>{ rec ? stopRecording() : startRecording(); }, '#ff3b30');
   button(X,180,hw,48, play?.mode==='take' ? '■ Stop' : '▶ Play take', play?.mode==='take', ()=>{ play ? stopPlay() : startPlay('take'); }, '#34c759');
   button(X+hw+8,180,hw,48,'Next take',false,()=>nextTake(),'#1e6bff');
-  const list = shots.takes.slice(-6);
-  if (!list.length) para(['No shots yet. Your right hand is a','camera: hold the trigger to film.','Each take is one camera on the show.','Film from lots of spots, then cut','them together in EDIT.'], X, 262, 15);
+  const list = sceneTakes().slice(-4);
+  txt(sceneById(curScene)?.name || '', X+W, 100, 15, '#ffd400','right',700);
+  if (!list.length) para(['No shots of this scene yet. Your right','hand is a camera: hold the trigger.','Each take is one camera on the scene.','Film from lots of spots, then cut','them together in EDIT.'], X, 262, 15);
+  slider(X,440,W,'Smoothing for new takes', state.autoSmooth, 0, 1, v=>state.autoSmooth=+v.toFixed(2), '#34c759', state.autoSmooth < 0.05 ? 'keeps the shake' : Math.round(state.autoSmooth*100)+'%');
   list.forEach((tk,i)=>{ const y=238+i*48, on=tk.id===shots.sel;
     rr(X,y,W,42,10,on?'#1e6bff':'#2a3060'); txt(tk.name, X+12, y+21, 17, '#fff');
     txt(clipLen(tk).toFixed(1)+' s'+(tk.edited?' · edited':'')+(tk.fovTrack?' · zoom':''), X+W-12, y+21, 14, on?'#fff':'#8f97c7','right',700);
@@ -2645,7 +2799,7 @@ function drawTakes(X,W){
     const before=snapShots(); const id=shots.sel; shots.takes=shots.takes.filter(t=>t.id!==id); shots.seq=shots.seq.filter(x=>x!==id);
     shots.sel = shots.takes.length ? shots.takes[shots.takes.length-1].id : null; pushShotsUndo(before); stopPlay(); pathDirty=true; sceneDirty=true; requestUI(); },'#ff3b30');
 }
-function nextTake(){ if (!shots.takes.length) return; const i = shots.takes.findIndex(t=>t.id===shots.sel); shots.sel = shots.takes[(i+1)%shots.takes.length].id; shots.keySel=-1; stopPlay(); pathDirty=true; requestUI(); }
+function nextTake(){ stopPlay(); cycleTake(1); }
 function drawPath(X,W){
   txt('Path', X, 100, 26);
   const tk = selTake();
@@ -2698,7 +2852,7 @@ function drawTimeline(X,W){
     const Lc = clipLen(tk), x = X + (acc/total)*W, w = Math.max(6, (Lc/total)*W);
     const on = tk.id===shots.seqSel;
     rr(x+2, sy+6, w-4, sh-12, 8, PALETTE[i%8]); if (on) rr(x+1, sy+4, w-2, sh-8, 9, null, '#ffffff');
-    if (w > 40) txt(tk.name.replace('Take ','T'), x+w/2, sy+sh/2, 14, '#111','center');
+    if (w > 40) txt((scenes.length>1 ? 'S'+(scenes.findIndex(x=>x.id===(tk.sceneId??1))+1)+' ' : '')+tk.name.replace('Take ','T'), x+w/2, sy+sh/2, 14, '#111','center');
     const st = acc;
     hit(x, sy, w, sh, (px)=>{ shots.seqSel = tk.id; shots.playhead = clamp(st + (px-x)/w*Lc, 0, total); stopPlay(); requestUI(); },
                       (px)=>{ shots.playhead = clamp((px-X)/W*total, 0, total); requestUI(); });
@@ -2741,6 +2895,14 @@ function drawExport(X,W){
   } else button(X,410,W,56,'Export MP4',false,exportMP4,'#ff3b30');
   para(['Renders every frame cleanly, so it runs','best in desktop Chrome: open the same','scene there (Scene → Download / Load).','Picture only for now — voices come next.'], X, 500, 14);
 }
+function clearPart(L){
+  if (!L) return;
+  const map = new Map();
+  for (const ch of L.chunks.values()) if (ch.d){ map.set(ch.k, {d:ch.d, c:ch.c}); ch.d = null; ch.c = null; dropMesh(L, ch); }
+  const snap = snapStrokes(L); for (const st of [...L.strokes]) dropStroke(L, st);
+  pushUndo({type:'multi', parts:[{type:'vox', L:L.id, map}, {type:'strokes', L:L.id, snap}]});
+  sceneDirty = true; toast('Cleared: sculpt it fresh (X undoes)'); requestUI();
+}
 function drawFromLayer(X,W){
   txt('Prop from a layer', X, 100, 24);
   para(['Pick a BUILD layer. It leaves the scenery','and becomes a prop you can grab and move.'], X, 132, 14);
@@ -2769,47 +2931,59 @@ function drawChars(X,W){
   parts.slice(0,6).forEach((L,i)=>{ const x = X+(i%3)*(pw+8), y = y0+22+Math.floor(i/3)*50;
     button(x,y,pw,44,PART_NAMES[L.part]||L.part, activeLayer()===L, ()=>setActive(L),'#ff9500'); });
   const yb = y0 + 22 + Math.ceil(Math.min(6,parts.length)/3)*50 + 8;
+  const ac2 = state.confirm==='clearpart';
+  if (yb+100 < UIH-70) button(X,yb+52,W,40,ac2?'Tap again to clear it':'Clear '+(PART_NAMES[activeLayer()?.part]||'this part'),ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(activeLayer()); },'#ff9500');
   const a = state.confirm==='delchar';
   if (yb+46 < UIH-70){
     button(X,yb,hw,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
     button(X+hw+8,yb,hw,42,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
   }
-  if (c.type==='puppet' && c.guide && yb+130 < UIH-70) para(['The see-through headset and controllers','show where your head and hands go','when you step in.'], X, yb+72, 13);
+  if (c.type==='puppet' && c.guide && yb+170 < UIH-70) para(['The see-through headset and controllers','show where your head and hands go','when you step in.'], X, yb+112, 13);
 }
-function cycleTake(d){ const n = shots.takes.length; if (!n) return; const i = shots.takes.findIndex(t=>t.id===shots.sel); shots.sel = shots.takes[((i<0?0:i)+d+n)%n].id; shots.keySel=-1; pathDirty=true; requestUI(); }
+function cycleTake(d){ const T = sceneTakes(), n = T.length; if (!n) return; const i = T.findIndex(t=>t.id===shots.sel); shots.sel = T[((i<0?0:i)+d+n)%n].id; shots.keySel=-1; pathDirty=true; requestUI(); }
 function drawPerform(X,W){
   txt('Perform', X, 100, 26);
-  const hw = (W-8)/2;
-  button(X,116,hw,50, show.rec ? '■ Cut  (A)' : '● Record  (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
-  button(X+hw+8,116,hw,50, show.playing ? '■ Stop  (B)' : '▶ Play  (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
+  const hw = (W-8)/2, scn = sceneById(curScene);
+  button(X,116,40,42,'◀',false,()=>cycleScene(-1),'#ff2d95');
+  rr(X+46,116,W-46-46-96,42,10,'#0d1029'); txt(scn ? scn.name : '', X+46+(W-188)/2, 137, 16, '#fff','center'); hit(X+46,116,W-188,42,()=>openRename('scene', curScene));
+  button(X+W-96-40,116,40,42,'▶',false,()=>cycleScene(1),'#ff2d95');
+  button(X+W-90,116,90,42,'+ Scene',false,()=>newSceneTimeline(),'#ff2d95');
+  button(X,166,hw,46, show.rec ? '■ Cut  (A)' : '● Record  (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
+  button(X+hw+8,166,hw,46, show.playing ? '■ Stop  (B)' : '▶ Play  (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
   const len = Math.max(showLength(), 0.1);
-  slider(X,180,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
+  slider(X,226,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
   // which camera shot you're looking through
-  txt('Camera shot', X, 244, 16, '#cfd6ff','left',700);
+  txt('Camera shot', X, 290, 16, '#cfd6ff','left',700);
   const tk = selTake();
-  button(X,256,40,42,'◀',false,()=>cycleTake(-1),'#1e6bff');
-  rr(X+46,256,W-46-46-112,42,10,'#0d1029');
-  txt(tk ? tk.name+' · '+clipLen(tk).toFixed(1)+'s' : 'none yet', X+46+(W-204)/2, 277, 15, tk?'#ffd400':'#8f97c7','center');
-  button(X+W-112-40,256,40,42,'▶',false,()=>cycleTake(1),'#1e6bff');
-  button(X+W-106,256,106,42,'+ New shot',false,()=>setPhase('shoot'),'#ff3b30');
-  txt('Characters', X, 320, 16, '#cfd6ff','left',700);
-  let list = show.chars.slice(-3); const sc = selChar(); if (sc && !list.includes(sc)) list = [sc, ...list.slice(-2)];
-  if (!list.length) para(['Make one in CHARACTERS first.'], X, 348, 15);
-  list.forEach((c,i)=>{ const y = 334 + i*48, on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c;
+  button(X,302,40,42,'◀',false,()=>cycleTake(-1),'#1e6bff');
+  rr(X+46,302,W-46-46-112,42,10,'#0d1029');
+  txt(tk ? tk.name+' · '+clipLen(tk).toFixed(1)+'s' : 'none yet', X+46+(W-204)/2, 323, 15, tk?'#ffd400':'#8f97c7','center');
+  button(X+W-112-40,302,40,42,'▶',false,()=>cycleTake(1),'#1e6bff');
+  button(X+W-106,302,106,42,'+ New shot',false,()=>setPhase('shoot'),'#ff3b30');
+  txt('Characters', X, 364, 16, '#cfd6ff','left',700);
+  let list = show.chars.slice(-2); const sc = selChar(); if (sc && !list.includes(sc)) list = [sc, ...list.slice(-1)];
+  if (!list.length) para(['Make one in CHARACTERS first.'], X, 392, 15);
+  list.forEach((c,i)=>{ const y = 378 + i*48, on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c;
     rr(X,y,W,42,10,on?'#ff2d95':'#2a3060'); txt(c.name.length>10?c.name.slice(0,9)+'…':c.name, X+10, y+21, 16, on?'#111':'#fff');
     hit(X,y,W-176,42,()=>{ state.selChar=c.id; requestUI(); });
     if (!inside){ rr(X+W-170,y+4,80,34,10,'#1e6bff'); txt(c.placed?'Bring here':'Place', X+W-130, y+21, 13, '#fff','center'); hit(X+W-170,y+4,80,34,()=>placeChar(c)); }
     if (c.type==='puppet'){ rr(X+W-84,y+4,80,34,10,inside?'#ffd400':'#34c759'); txt(inside?'Step out':'Step in', X+W-44, y+21, 13, '#111','center'); hit(X+W-84,y+4,80,34,()=>{ inside ? stepOut() : stepIn(c); }); }
   });
-  let ty = 334 + Math.max(1,list.length)*48 + 2;
-  if (sc && sc.placed){
-    slider(X,ty+8,W,'Size of '+(sc.name.length>12?sc.name.slice(0,11)+'…':sc.name), Math.log2(sc.place.s||1), -4, 4, v=>setCharScale(sc, Math.pow(2,v)), '#ff2d95', (+(sc.place.s||1).toFixed(2))+'×');
-    ty += 62;
-  }
+  let ty = 378 + Math.max(1,list.length)*48 + 2;
+
   const tw = (W-16)/3;
   button(X,ty,tw,42,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on: your voice records with the show'); } },'#ff9500');
   button(X+tw+8,ty,tw,42,'Mirror',state.mirror,()=>{ state.mirror=!state.mirror; if (state.mirror){ placeMirror(); state.win.preview = true; } requestUI(); },'#1e6bff');
   button(X+2*(tw+8),ty,tw,42,'Camera',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
+  if (ty+80 < UIH-60) para(['Grip a character to move it; add the left grip to','stretch and turn it. Right stick: ↕ size, ↔ turn.'], X, ty+62, 13);
+}
+function drawWave(clip, x, y, w, h){
+  const buf = audioBufs.get(clip.id);
+  if (!buf){ if (clip.b64 && !clip._decoding){ clip._decoding = true; decodeClip(clip).then(()=>requestUI()).catch(()=>{}); } return; }
+  if (!clip._peaks){ const d = buf.getChannelData(0), n = 60, step = Math.floor(d.length/n) || 1; clip._peaks = [];
+    for (let i=0;i<n;i++){ let m = 0; for (let k=i*step; k<Math.min(d.length,(i+1)*step); k+=8) m = Math.max(m, Math.abs(d[k])); clip._peaks.push(m); } }
+  const pk = clip._peaks, mx = Math.max(0.05, ...pk), bw = w/pk.length;
+  g.fillStyle = '#ffd400'; pk.forEach((v,i)=>{ const bh = Math.max(2, v/mx*h); g.fillRect(x+i*bw, y+h/2-bh/2, Math.max(1,bw-1), bh); });
 }
 function drawTracks(X,W){
   txt('Motion', X, 100, 26);
@@ -2822,15 +2996,16 @@ function drawTracks(X,W){
   }
   for (const a of show.audio) rows.push({kind:'a', a, name:'Voice '+a.id, len:a.dur||0});
   if (!rows.length) para(['Nothing recorded yet.','Go to Perform and press Record.'], X, 140, 15);
-  else para(['Tap a row to pick it and play the show.'], X, UIH-150, 14);
+  else para(['Tap a row to see its path and play the show.'], X, UIH-150, 14);
   rows.slice(0,9).forEach((r,i)=>{ const y=124+i*48;
-    const cid = r.kind==='t' ? (r.key[0]==='r' ? +r.key.slice(1) : layerById(+r.key)?.char) : null, on = cid!=null && cid===state.selChar;
+    const cid = r.kind==='t' ? (r.key[0]==='r' ? +r.key.slice(1) : layerById(+r.key)?.char) : null, on = r.kind==='t' ? state.motionSel===r.key : false;
     rr(X,y,W,42,10,on?'#ff2d95':'#2a3060');
-    hit(X,y,W-52,42,()=>{ if (cid!=null) state.selChar = cid; show.t = 0; stopShow(); playShow(); });
+    hit(X,y,W-52,42,()=>{ if (cid!=null) state.selChar = cid; if (r.kind==='t'){ state.motionSel = r.key; motionDirty = true; } show.t = 0; stopShow(); playShow(); });
+    if (r.kind==='a') drawWave(r.a, X+96, y+6, W-96-112, 30);
     txt((r.kind==='a'?'🎤 ':'')+(r.name.length>20?r.name.slice(0,19)+'…':r.name), X+12, y+21, 15, '#fff');
     txt(r.len.toFixed(1)+' s', X+W-60, y+21, 14, '#8f97c7','right',700);
     rr(X+W-46,y+4,40,34,10,'#ff3b30'); txt('✕', X+W-26, y+21, 16, '#fff','center');
-    hit(X+W-46,y+4,40,34,()=>{ const b=snapShow(); if (r.kind==='t') delete show.tracks[r.key]; else show.audio=show.audio.filter(x=>x!==r.a); pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); });
+    hit(X+W-46,y+4,40,34,()=>{ const b=snapShow(); if (r.kind==='t') delete show.tracks[r.key]; else { show.audio=show.audio.filter(x=>x!==r.a); if (show.playing) audioPlayFrom(show.t); else audioStop(); } pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); });
   });
   const a = state.confirm==='clearshow';
   if (rows.length) button(X,UIH-118,W,44,a?'Tap to confirm':'Clear all motion and voices',a,()=>{ if(!a){state.confirm='clearshow';requestUI();return;} state.confirm=null; const b=snapShow(); show.tracks={}; show.audio=[]; pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); },'#ff3b30');
@@ -2899,14 +3074,14 @@ legMeshL.position.set(-0.085, 0.01, 0.03); legMeshL.rotation.set(-1.1, 0.35, 0);
 legMeshR.position.set(0.085, 0.01, 0.03); legMeshR.rotation.set(-1.1, -0.35, 0);
 const BADGE = {A:'#34c759', B:'#ff3b30', X:'#1e6bff', Y:'#ffd400', T:'#ff9500', G:'#5e2bff', S:'#00c7be'};
 function legendLines(hand){
-  const ph = state.phase, toolName = {clay: state.carve?'carve':'add clay', smooth:'smooth', paint:'paint', doodle:'doodle', blocks:'blocks', erase:'erase'}[state.tool];
+  const ph = state.phase, toolName = {clay: state.carve?'carve':'add clay', smooth:'smooth', paint:'paint', spray:'spray paint', doodle:'doodle', blocks:'blocks', erase:'erase'}[state.tool];
   if (hand==='L') return [['T','open / close menu'],['X','undo'],['Y','redo'],['S','fly'],['G','move / scale world']];
   const fam = pageFamily();
   const aLbl = fam==='sculpt' ? (state.tool==='clay' ? (state.carve?'switch to add':'switch to carve') : 'clay add / carve') : state.tool==='erase' ? 'back to '+fam : 'eraser';
   const sculpt = [['T', toolName],['A', aLbl],['B','last tool'],['S','size ↕  strength ↔'],['G','grab thing / window / world']];
   return ({
     build: sculpt, characters: sculpt,
-    shoot:  [['T','film (hold)'],['A', play?'stop':'play take'],['B','next take'],['S','zoom'],['G','key dot / window / world']],
+    shoot:  [['T','film (hold)'],['A', play?'stop':'play take'],['B', keyGrab?'delete this key':'next take'],['S','↕ zoom  ↔ lens steps'],['G','key dot / window / world']],
     edit:   [['A', play?'stop':'play film'],['T','menu clicks'],['G','window / world']],
     light:  [['A','add a light here'],['G','grab a bulb / window / world'],['T','menu clicks']],
     perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T','aim at ground: jump there'],['G', show.embodied?'window / world':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
@@ -3083,22 +3258,22 @@ function desktopUpdate(dt){
   if (SCULPT_PHASES.includes(state.phase) && lastHover && !deskGrab){
     const p = desktopPoint(lastHover);
     if (state.tool==='blocks'){ if (!stroke) showBlockGhost(p); }
-    else { const L = activeLayer(); const vox = ['clay','smooth','paint'].includes(state.tool);
+    else { const L = activeLayer(); const vox = ['clay','smooth','paint','spray'].includes(state.tool);
       cursor.visible = true; cursor.position.copy(p);
       cursor.scale.setScalar(vox && L ? clamp(rToL(L,desktopRadius()), L.vs*0.7, L.vs*MAXVOX)*L.group.getWorldScale(V()).x : desktopRadius()); styleCursor(); }
   }
   if (state.phase==='shoot'){
     camera.getWorldPosition(camPoseP); camera.getWorldQuaternion(camPoseQ);
-    if (!play){ shotCam.position.copy(camPoseP); shotCam.quaternion.copy(camPoseQ); shotCam.fov = state.fov; shotCam.near=0.02; shotCam.far=5000; shotCam.aspect=ASPECTS[shots.aspect]; shotCam.updateProjectionMatrix(); shotCam.updateMatrixWorld(); }
+    if (!play){ shotCam.position.copy(camPoseP); shotCam.quaternion.copy(camPoseQ); shotCam.fov = vfov(state.fov, ASPECTS[shots.aspect]); shotCam.near=0.02; shotCam.far=5000; shotCam.aspect=ASPECTS[shots.aspect]; shotCam.updateProjectionMatrix(); shotCam.updateMatrixWorld(); }
   }
-  if (state.phase==='edit' && !play){ const f = filmAt(shots.playhead); if (f) poseShotCam(f.tk, f.u); }
+  if (state.phase==='edit' && !play){ const f = filmAt(shots.playhead); if (f){ activateScene(f.tk.sceneId); poseShotCam(f.tk, f.u); } }
   updateGhostCam(2);
 }
 function updateGhostCam(mult){
   const tk = selTake();
   if (state.phase==='shoot' && play?.mode==='take'){ ghostCam.visible = true; ghostCam.position.copy(shotCam.position); ghostCam.quaternion.copy(shotCam.quaternion); ghostCam.scale.setScalar(mult*(play.tk.scale||1)); }
   else if (state.phase==='shoot' && state.page==='keys' && tk){ ghostCam.visible = true; evalTake(tk, shots.keyT, ghostCam.position, ghostCam.quaternion); ghostCam.scale.setScalar(mult*(tk.scale||1)); }
-  else if (state.phase==='perform' && tk){ poseShotCam(tk, clamp(show.t, 0, tk.dur)); ghostCam.visible = true; ghostCam.position.copy(shotCam.position); ghostCam.quaternion.copy(shotCam.quaternion); ghostCam.scale.setScalar(mult*(tk.scale||1)); }
+  else if (state.phase==='perform' && tk){ poseShotCam(tk, clamp(show.t, 0, tk.dur)); ghostCam.visible = true; ghostCam.position.copy(shotCam.position); ghostCam.quaternion.copy(shotCam.quaternion); ghostCam.scale.setScalar(mult*0.5*(tk.scale||1)); }
   else ghostCam.visible = false;
 }
 
@@ -3111,6 +3286,7 @@ if (navigator.xr){
   });
 } else { vrBtn.textContent = 'VR not available here'; }
 vrBtn.onclick = async () => {
+  try { ac(); } catch(e){}   // a real tap: lets voices and beeps play in the headset
   if (renderer.xr.isPresenting){ renderer.xr.getSession().end(); return; }
   try {
     if (state.mic) ensureMic();
@@ -3119,6 +3295,8 @@ vrBtn.onclick = async () => {
   } catch(e){ console.error(e); toast('Could not start VR'); }
 };
 renderer.xr.addEventListener('sessionstart', () => {
+  const ses = renderer.xr.getSession(); const unlock = () => { try { ac(); } catch(e){} };
+  if (ses){ ses.addEventListener('selectstart', unlock); ses.addEventListener('squeezestart', unlock); }
   captureView(stageName(state.phase));     // remembers the desktop view
   deskCam = {p:camera.position.clone(), q:camera.quaternion.clone()};
   camera.position.set(0,0,0); camera.quaternion.identity();
@@ -3159,18 +3337,20 @@ for (let i=0;i<2;i++){
     for (const h of ['left','right']) if (ctrl[h] && ctrl[h].ray===rayC) ctrl[h]=null;
   });
 }
-shotHidden.push(bulbs, tpRing, tpLine, cursor, ghost, pointerDot, pathGroup, ghostCam, bigScreen, camModel, menuWin.mesh, layersWin.mesh, previewWin.mesh);
+shotHidden.push(motionLine, bulbs, tpRing, tpLine, cursor, ghost, pointerDot, pathGroup, ghostCam, bigScreen, camModel, menuWin.mesh, layersWin.mesh, previewWin.mesh);
 
 // paint the real controller buttons the same colors as the labels
 const BTN_KEYS = [['a-button','A'],['b-button','B'],['x-button','X'],['y-button','Y'],['trigger','T'],['squeeze','G'],['thumbstick','S']];
 let btnColorT = 0;
 function colorButtons(grip){
+  let n2 = 0;
   grip.traverse(o => {
     if (!o.isMesh || o.userData.win || o===legMeshL || o===legMeshR) return;
     let n = o, key = null;
     while (n && n!==grip && !key){ const nm = (n.name||'').toLowerCase().replace(/_/g,'-'); for (const [k,b] of BTN_KEYS) if (nm.includes(k)){ key = b; break; } n = n.parent; }
-    if (key && o.material?.userData?.btn !== key){ o.material = new THREE.MeshStandardMaterial({color:BADGE[key], roughness:0.45, emissive:BADGE[key], emissiveIntensity:0.35}); o.material.userData.btn = key; }
+    if (key){ n2++; if (o.material?.userData?.btn !== key){ o.material = new THREE.MeshBasicMaterial({color:BADGE[key], toneMapped:false}); o.material.userData.btn = key; } }
   });
+  grip.userData.btnCount = n2;
 }
 function pulse(hand, v, ms){ try { ctrl[hand]?.src?.gamepad?.hapticActuators?.[0]?.pulse(v, ms); } catch(e){} }
 function readPad(c){
@@ -3180,7 +3360,26 @@ function readPad(c){
 }
 const edge = (c, pad, k) => pad[k] && !c.prev[k];
 
-let nav = null;
+let nav = null, two = null;
+function twoStart(obj, noTurn){
+  const a = V(), b = V(); ctrl.left.grip.getWorldPosition(a); ctrl.right.grip.getWorldPosition(b); obj.updateMatrixWorld(true);
+  two = {obj, noTurn, d0: Math.max(0.02, a.distanceTo(b)), mid0: a.clone().add(b).multiplyScalar(0.5), ang0: Math.atan2(b.x-a.x, b.z-a.z), M0: obj.matrixWorld.clone()};
+}
+function twoMove(){
+  const a = V(), b = V(); ctrl.left.grip.getWorldPosition(a); ctrl.right.grip.getWorldPosition(b);
+  const k = clamp(a.distanceTo(b)/two.d0, 0.05, 30), mid = a.clone().add(b).multiplyScalar(0.5), dA = two.noTurn ? 0 : Math.atan2(b.x-a.x, b.z-a.z) - two.ang0;
+  const M = new THREE.Matrix4().makeTranslation(mid.x,mid.y,mid.z).multiply(new THREE.Matrix4().makeRotationY(dA)).multiply(new THREE.Matrix4().makeScale(k,k,k))
+    .multiply(new THREE.Matrix4().makeTranslation(-two.mid0.x,-two.mid0.y,-two.mid0.z)).multiply(two.M0);
+  two.obj.parent.updateMatrixWorld(true);
+  two.obj.parent.matrixWorld.clone().invert().multiply(M).decompose(two.obj.position, two.obj.quaternion, two.obj.scale);
+  if (!two.noTurn){ const s1 = two.obj.scale.x; two.obj.scale.setScalar(s1); }
+  two.obj.updateMatrixWorld(true);
+}
+function twoEnd(Rc){
+  two = null; if (!Rc) return;
+  if (show.grab){ show.grab.c.root.updateMatrixWorld(true); show.grab.rel = unscaled(Rc.grip).invert().multiply(show.grab.c.root.matrixWorld.clone()); }
+  if (winGrab){ winGrab.win.mesh.updateMatrix(); Rc.grip.updateMatrix(); winGrab.rel = Rc.grip.matrix.clone().invert().multiply(winGrab.win.mesh.matrix.clone()); }
+}
 const _w1=V(), _l=V(), _m=V(), _q=new THREE.Quaternion(), _y=new THREE.Vector3(0,1,0);
 let scaleUITick = 0;
 function navUpdate(gl, gr){
@@ -3253,6 +3452,11 @@ function updateKeyGrab(R){
   const k = keyGrab.tk.keys[keyGrab.i]; k.p = kp.toArray(); k.q = kq.toArray();
   keyGrab.tk.edited = true; pathDirty = true;
 }
+function deleteHeldKey(){
+  const kg = keyGrab; keyGrab = null; if (!kg) return;
+  if (kg.tk.keys.length <= 2){ toast('A path needs at least 2 keys'); pushShotsUndo(kg.before); return; }
+  pushShotsUndo(kg.before); kg.tk.keys.splice(kg.i, 1); shots.keySel = -1; kg.tk.edited = true; pathDirty = true; sceneDirty = true; toast('Key deleted'); requestUI();
+}
 function endKeyGrab(){ if (!keyGrab) return; pushShotsUndo(keyGrab.before); keyGrab = null; sceneDirty = true; requestUI(); }
 
 // the window under the right controller's ray, if any
@@ -3301,11 +3505,14 @@ function xrUpdate(dt){
       pulse('right',0.3,20);
     }
     if (edge(R,pr,'b')){
-      if (shoot) nextTake(); else if (sculpt){ if (stroke && stroke.kind==='angle') endStroke(true); else swapTool(); } else if (perform) (show.playing ? stopShow() : playShow());
+      if (shoot){ if (keyGrab) deleteHeldKey(); else nextTake(); } else if (sculpt){ if (stroke && stroke.kind==='angle') endStroke(true); else swapTool(); } else if (perform) (show.playing ? stopShow() : playShow());
       pulse('right',0.3,20);
     }
     if (winGrab && Math.abs(pr.sy) > 0.2){ const m = winGrab.win.mesh; m.scale.setScalar(clamp(m.scale.x*Math.exp(-pr.sy*dt*1.5), 0.25, 6)); }
-    else if (show.grab && Math.abs(pr.sy) > 0.2){ const f = Math.exp(-pr.sy*dt*1.5), sc = show.grab.c.root.scale.x*f; if (sc > 0.02 && sc < 50) show.grab.rel.premultiply(new THREE.Matrix4().makeScale(f,f,f)); }
+    else if (show.grab){
+      if (Math.abs(pr.sy) > 0.2){ const f = Math.exp(-pr.sy*dt*1.5), sc = show.grab.c.root.scale.x*f; if (sc > 0.02 && sc < 50) show.grab.rel.premultiply(new THREE.Matrix4().makeScale(f,f,f)); }
+      if (Math.abs(pr.sx) > 0.3) show.grab.rel.multiply(new THREE.Matrix4().makeRotationY(-pr.sx*dt*2.5));
+    }
     else if (sculpt){
       if (Math.abs(pr.sy) > 0.2){
         if (state.tool==='blocks') state.blockSize = clamp(state.blockSize*Math.exp(-pr.sy*dt*1.6), 0.02, 0.5);
@@ -3315,7 +3522,12 @@ function xrUpdate(dt){
       }
       if (Math.abs(pr.sx) > 0.3){ state.strength = clamp(state.strength + pr.sx*dt*0.7, 0.05, 1); requestUI(); }
     }
-    if (shoot && !winGrab && Math.abs(pr.sy) > 0.3) lensNudge(pr.sy*dt*30);
+    if (shoot && !winGrab && Math.abs(pr.sy) > 0.3) lensNudge(pr.sy*dt*75);
+    if (shoot && !winGrab){
+      const fl = Math.abs(pr.sx) > 0.7 ? Math.sign(pr.sx) : 0;
+      if (fl && fl !== R.flick){ const P = [16,24,32,42,55,70,90]; let i = P.findIndex(v=>v >= state.fov-0.5); if (i<0) i = P.length-1; i = clamp(i - fl, 0, P.length-1); lensNudge(P[i]-state.fov); toast('Lens '+P[i]+'°'); }
+      R.flick = fl;
+    }
     // right grip: a window you point at, else the thing under your hand, else the world
     if (edge(R,pr,'grip')){
       const tipW = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(tipW);
@@ -3332,18 +3544,23 @@ function xrUpdate(dt){
       else if (perform && !embodied && !show.grab){ const c = findCharAt(tipW, 0.06*rig.scale.x); if (c) startCharGrab(c, unscaled(R.grip)); }
       else if (lightPh && !lightGrab){ const l = findLightAt(tipW, 0.08*rig.scale.x); if (l) startLightGrab(l, tipW); }
     }
-    if (winGrab && pl && pl.grip) cancelWinGrab();   // both grips means you wanted to move yourself
+    if (winGrab && pl && pl.grip && performance.now() - winGrab.t0 < 250) cancelWinGrab();   // both grips at once means you wanted to move yourself
     if (!pr.grip){ if (winGrab) endWinGrab(); if (keyGrab) endKeyGrab(); if (blockGrab) endBlockGrab(); if (doodleGrab) endDoodleGrab(); if (show.grab) endCharGrab(); if (lightGrab) endLightGrab(); }
     rightGripUsed = !!(winGrab || keyGrab || blockGrab || doodleGrab || show.grab || lightGrab);
   }
-  if (!embodied) navUpdate(pl?.grip, pr?.grip && !rightGripUsed); else nav = null;
+  // holding something in your right hand + left grip = stretch / turn it with both hands
+  const twoOn = !!(L && R && pl?.grip && pr?.grip && (show.grab || winGrab));
+  if (twoOn && !two) twoStart(show.grab ? show.grab.c.root : winGrab.win.mesh, !show.grab);
+  else if (!twoOn && two) twoEnd(R);
+  if (!embodied) navUpdate(pl?.grip && !(show.grab || winGrab), pr?.grip && !rightGripUsed); else nav = null;
   rig.updateMatrixWorld(true);
-  if (winGrab && R) moveWinGrab(R);
+  if (two) twoMove();
+  else if (winGrab && R) moveWinGrab(R);
   if (keyGrab && R) updateKeyGrab(R);
   if (blockGrab && R) moveBlockGrab(unscaled(R.grip));
   if (doodleGrab && R) moveDoodleGrab(unscaled(R.grip));
   if (lightGrab && R){ const t = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(t); moveLightGrab(t); }
-  if (show.grab && R) moveCharGrab(unscaled(R.grip));
+  if (show.grab && R && !two) moveCharGrab(unscaled(R.grip));
   updateEmbodied();
 
   let onPanel = false;
@@ -3353,7 +3570,7 @@ function xrUpdate(dt){
     _d.set(0,0,-1).transformDirection(R.ray.matrixWorld);
     hover = winGrab ? null : rayWindow(R);
     if (hover){
-      onPanel = true; const h = hover.h;
+      onPanel = !hover.screen; const h = hover.h;
       pointerDot.visible = true; pointerDot.position.copy(h.point); pointerDot.scale.setScalar(rig.scale.x);
       pointer.visible = true; pointer.scale.z = h.distance / rig.scale.x;
       if (!hover.screen){
@@ -3370,7 +3587,7 @@ function xrUpdate(dt){
     _up.set(0,1,0).transformDirection(R.grip.matrixWorld);
     R.grip.getWorldQuaternion(_tq);
     const L2 = activeLayer();
-    const isVox = ['clay','smooth','paint'].includes(state.tool);
+    const isVox = ['clay','smooth','paint','spray'].includes(state.tool);
     const base = (state.tool==='doodle' ? state.doodleSize : state.size) * rig.scale.x;
     const rShown = isVox && L2 ? clamp(rToL(L2,base), L2.vs*0.7, L2.vs*MAXVOX)*L2.group.getWorldScale(V()).x : base;
     brushRW = state.tool==='blocks' ? Math.max(0.03*rig.scale.x, blockSizeWorld()*0.5) : Math.max(0.02*rig.scale.x, rShown);
@@ -3417,10 +3634,10 @@ function xrUpdate(dt){
         if (pressEdge && !rec) startRecording();
         if (rec && !pr.trigP) stopRecording();
       }
-      if (!play){ shotCam.position.copy(camPoseP); shotCam.quaternion.copy(camPoseQ); shotCam.fov=state.fov; shotCam.near=0.01*rig.scale.x; shotCam.far=5000*rig.scale.x; shotCam.aspect=ASPECTS[shots.aspect]; shotCam.updateProjectionMatrix(); shotCam.updateMatrixWorld(); }
+      if (!play){ shotCam.position.copy(camPoseP); shotCam.quaternion.copy(camPoseQ); shotCam.fov=vfov(state.fov, ASPECTS[shots.aspect]); shotCam.near=0.01*rig.scale.x; shotCam.far=5000*rig.scale.x; shotCam.aspect=ASPECTS[shots.aspect]; shotCam.updateProjectionMatrix(); shotCam.updateMatrixWorld(); }
     }
   }
-  if (edit && !play){ const f = filmAt(shots.playhead); if (f) poseShotCam(f.tk, f.u); }
+  if (edit && !play){ const f = filmAt(shots.playhead); if (f){ activateScene(f.tk.sceneId); poseShotCam(f.tk, f.u); } }
   updateGhostCam(1);
   bigScreen.visible = edit;
   hudLabel.visible = !!(show.rec || (rec && !camModel.visible));
@@ -3472,13 +3689,14 @@ renderer.setAnimationLoop(() => {
   if (xr){ xrCameraUpdate(); xrUpdate(dt); btnColorT += raw; if (btnColorT > 0.5){ btnColorT = 0; for (const h of ['left','right']) if (ctrl[h]) colorButtons(ctrl[h].grip); } } else desktopUpdate(dt);
   updateRecording(tdt); updatePlay(tdt);
   applyShowPose(currentShowTime());
+  if (xr && show.embodied){ followRoot(tdt); updateEmbodied(); }
   updateShow(tdt);
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
   if (uiNeeds) drawUI();
   updateWins();
-  autosaveTick(dt);
+  autosaveTick(dt); updateMotionLine(tdt);
   applyStage();
   if (xr){
     if (state.phase==='shoot' || state.phase==='edit') renderPreview(shotCam);
@@ -3524,13 +3742,20 @@ function desktopRender(){
 /* ---------------- start ---------------- */
 (async () => {
   let loaded = false;
-  try { const s = await idbGet('scene'); if (s){ deserialize(JSON.parse(s)); loaded = true; } } catch(e){ console.warn('no saved scene', e); }
-  if (!loaded){ const L = makeLayer('Ground', 0.1); state.activeWorld = L.id; genIsland(L); setAspect('16:9'); }
-  requestUI(); window.__envReady = true;
+  try {
+    worldList = JSON.parse(await idbGet('worlds') || '[]');
+    if (!worldList.length){ const old = await idbGet('scene'); if (old){ await idbSet('world:1', old); worldList = [{id:1, name:'My world', saved:Date.now()}]; await idbSet('worlds', JSON.stringify(worldList)); } }
+    const cur = (await idbGet('cur')) || worldList[0]?.id || 1;
+    const s = await idbGet('world:'+cur);
+    if (s){ deserialize(JSON.parse(s)); state.worldId = cur; loaded = true; } else state.worldId = cur;
+  } catch(e){ console.warn('no saved scene', e); }
+  if (!loaded){ const L = makeLayer('Ground', 0.1); state.activeWorld = L.id; genIsland(L); setAspect('1:1'); }
+  requestUI(); window.__envReady = true; checkUpdate(); setInterval(checkUpdate, 5*60*1000);
   window.__cmm = {state, shots, show, views, layers:()=>layers, applyOp, dirty, serialize, deserialize, rig, camera, scene, undo, redo, controls,
     setPhase, openPage, startRecording, stopRecording, startPlay, stopPlay, exportMP4, filmLength, newScene, setAspect,
     newCharacter, placeChar, deleteChar, startShowRec, cutShowRec, playShow, stopShow, startCharGrab, moveCharGrab, endCharGrab, findCharAt,
     layerById, charById, addKeyAt, deleteKey, lensNudge, findBlockAt, startBlockGrab, moveBlockGrab, endBlockGrab, beginStroke, setTool, activeLayer,
+    goScene, newSceneTimeline, get scenes(){return scenes;}, get curScene(){return curScene;}, clearPart, newWorld, openWorld, get worldList(){return worldList;}, popOut, vfov,
     lights, get lightsArr(){return lights;}, addLightAt, makeLight, setLayerMat, cycleTake, drawFiles, colorButtons2:colorButtons,
     tearOff, closePageWin, pageWins, changeDetail, layerToProp, setCharScale, flipCarve, orbPick, colorButtons, findStrokeAt, startDoodleGrab, moveDoodleGrab, endDoodleGrab, guides, openRename, drawUI, ghostCam,
     ctrl, WINS, dockWin, roomWin, startWinGrab, moveWinGrab, endWinGrab, get winGrab(){return winGrab;},
