@@ -38,6 +38,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 /* ============================================================
    ChikiMovieMagic v0.4 — BUILD, CHARACTERS, PERFORM, SHOOT, EDIT
@@ -53,7 +54,7 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.10';
+const VERSION = '0.11';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -80,7 +81,7 @@ const RAILS = {
   perform:    [['perform','Perform'],['cast','On stage'],['tracks','Motion']],
   shoot:      [['takes','Takes'],['path','Path'],['keys','Keys'],['lens','Lens']],
   edit:       [['timeline','Timeline'],['export','Export']],
-  app:        [['files','Files'],['settings','Settings']],
+  app:        [['files','Files'],['together','Together'],['settings','Settings']],
 };
 const FIRST_PAGE = {build:'tools', light:'lights', characters:'chars', perform:'perform', shoot:'takes', edit:'timeline', app:'files'};
 const SCULPT_PHASES = ['build','characters'];
@@ -98,6 +99,527 @@ const SKIES = {
 };
 const SHAPES = {cube:[1,1,1], brick:[1,0.5,0.5], plank:[2,0.125,0.5], pillar:[0.5,2,0.5]};
 const PART_NAMES = {head:'Head', lh:'Left hand', rh:'Right hand', body:'Body', eye:'Eye', mouth:'Mouth', extra:'Extra'};
+/* ============================================================
+   PLAY TOGETHER: a room with a 4-digit code (PeerJS, like the other Chiki XR apps)
+   The host runs every menu. Players sculpt, doodle and build with their own color and size,
+   ride along at the host's size, and can be handed a puppet to play (body, eyes, mouth, voice).
+   Clay travels as the sculpt ops themselves; undo / detail changes travel as whole chunks.
+   ?nettest swaps PeerJS for a BroadcastChannel so two tabs on one computer can try it.
+   ============================================================ */
+const NET = {on:false, host:false, guest:false, synced:false, code:'', peer:null, conns:{}, conn:null, me:'host', n:1, status:'',
+             test:/[?&]nettest/.test(location.search), peers:new Map(), assign:new Map(), hostRig:null, off:[0,0,0], typed:'', snapParts:null, lightSig:''};
+const NET_PREFIX = 'chiki-moviemagic-', MAX_GUESTS = 3, PLAYER_COL = ['#ff2d95','#00c7be','#ffd400','#5e2bff'];
+const netTag = Math.random().toString(36).slice(2,6);
+let netMute = 0, netInOp = 0, uidSeq = 0, netChain = Promise.resolve(), netRecvChain = Promise.resolve();
+let netOps = [], netMetaSig = '', netMetaT = 0, netTickT = 0, netStT = 0, netPoseT = 0, netPoseFullT = 0, netMeT = 0, guestRec = null;
+const netSettle = new Map(), netVox = new Map(), netStTouch = new Map(), netStDrop = new Map(), netStFull = new Set(), netHash = new Map(), netPose = new Map(), netLastPose = new Map(), netRemote = new Map();
+const netQuiet = () => !NET.on || netMute > 0;
+const playerName = n => n===1 ? 'Host' : 'Player '+n;
+function Em(){ this._h = {}; } Em.prototype.on = function(k,f){ (this._h[k] = this._h[k] || []).push(f); return this; }; Em.prototype.emit = function(k,...a){ (this._h[k] || []).forEach(f => f(...a)); };
+function BCConn(o, r){ Em.call(this); this.o = o; this.peer = r; this.open = false; } BCConn.prototype = Object.create(Em.prototype);
+BCConn.prototype.ready = function(){ if (this.open) return; this.open = true; setTimeout(() => this.emit('open'), 0); };
+BCConn.prototype.send = function(d){ this.o.bc.postMessage({to:this.peer, from:this.o.id, k:'data', d}); };
+BCConn.prototype.close = function(){ this.o.bc.postMessage({to:this.peer, from:this.o.id, k:'close'}); };
+function BCPeer(id){ Em.call(this); this.id = id || 'g'+Math.random().toString(36).slice(2,9); this.conns = {}; this.bc = new BroadcastChannel('cmm-net');
+  this.bc.onmessage = e => { const m = e.data; if (m.to !== this.id) return; const c = this.conns[m.from];
+    if (m.k==='conn'){ const n = new BCConn(this, m.from); this.conns[m.from] = n; this.emit('connection', n); n.ready(); this.bc.postMessage({to:m.from, from:this.id, k:'ok'}); }
+    else if (m.k==='ok') c && c.ready(); else if (m.k==='data') c && c.emit('data', m.d); else if (m.k==='close') c && c.emit('close'); };
+  setTimeout(() => this.emit('open', this.id), 10); }
+BCPeer.prototype = Object.create(Em.prototype);
+BCPeer.prototype.connect = function(id){ const c = new BCConn(this, id); this.conns[id] = c; this.bc.postMessage({to:id, from:this.id, k:'conn'}); setTimeout(() => { if (!c.open) this.emit('error', {type:'peer-unavailable'}); }, 1500); return c; };
+BCPeer.prototype.destroy = function(){ try { this.bc.close(); } catch(e){} };
+async function makeIce(){
+  const stun = [{urls:'stun:stun.l.google.com:19302'}, {urls:'stun:stun1.l.google.com:19302'}];
+  try { const user = Math.floor(Date.now()/1000 + 24*3600)+':cmm';
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('openrelayprojectsecret'), {name:'HMAC', hash:'SHA-1'}, false, ['sign']);
+    const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(user))), H = 'staticauth.openrelay.metered.ca';
+    return stun.concat([{urls:['turn:'+H+':80', 'turn:'+H+':80?transport=tcp', 'turn:'+H+':443', 'turns:'+H+':443?transport=tcp'], username:user, credential:btoa(String.fromCharCode(...sig))}]);
+  } catch(e){ return stun; } }
+async function loadPeer(){ if (NET.test) return; if (!NET.ice) NET.ice = await makeIce(); if (window.Peer) return;
+  await new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'; sc.onload = res; sc.onerror = () => rej(new Error('load')); document.head.append(sc); }); }
+function makePeer(id){ if (NET.test) return new BCPeer(id); const o = {debug:1, config:{iceServers:NET.ice}}; return id ? new window.Peer(id, o) : new window.Peer(o); }
+function netErrText(e){ return e.type==='peer-unavailable' ? 'No room with that code. Check it and try again.' : (e.type==='network' || e.type==='server-error' || e.type==='socket-error') ? "Can't reach the internet matchmaker. Try again." : 'Something went wrong ('+e.type+'). Try again.'; }
+function netStatus(t){ NET.status = t; requestUI(); }
+async function zipU8(u8, unzip){
+  if (typeof CompressionStream === 'undefined') return u8;
+  const s = new Blob([u8]).stream().pipeThrough(unzip ? new DecompressionStream('deflate') : new CompressionStream('deflate'));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+// every send goes through one queue so things arrive in the order they happened
+function rawSend(m, to){ const send = c => { try { c.send(m); } catch(e){} };
+  if (NET.host){ if (to) { if (NET.conns[to]) send(NET.conns[to]); } else for (const id in NET.conns) if (id !== m.via) send(NET.conns[id]); }
+  else if (NET.conn) send(NET.conn); }
+function netSend(m, to){ netChain = netChain.then(async () => { const mm = typeof m === 'function' ? await m() : m; if (mm) rawSend(mm, to); }).catch(e => console.warn(e)); }
+
+function netReset(){
+  for (const id in NET.conns) try { NET.conns[id].close(); } catch(e){}
+  try { NET.conn && NET.conn.close(); } catch(e){} try { NET.peer && NET.peer.destroy(); } catch(e){}
+  for (const p of NET.peers.values()) dropAvatar(p);
+  Object.assign(NET, {on:false, host:false, guest:false, synced:false, code:'', peer:null, conns:{}, conn:null, me:'host', n:1, hostRig:null, snapParts:null});
+  NET.peers.clear(); NET.assign.clear(); netRemote.clear(); netPose.clear(); netLastPose.clear(); netHash.clear();
+  netOps = []; netVox.clear(); netSettle.clear(); netStTouch.clear(); netStDrop.clear(); netStFull.clear(); netMetaSig = '';
+  requestUI();
+}
+async function netHost(){
+  netReset(); netStatus('Opening a room…');
+  try { await loadPeer(); } catch(e){ return netStatus("Couldn't load the together part. Check the internet."); }
+  const go = () => { const code = NET.test ? '1234' : String(1000 + Math.floor(Math.random()*9000)), peer = makePeer(NET_PREFIX+code); NET.peer = peer;
+    peer.on('open', () => { Object.assign(NET, {host:true, on:true, synced:true, code, me:'host', n:1}); netStatus(''); toast('Room '+code+' is open. Type it in on her headset (APP → Together).'); });
+    peer.on('connection', c => {
+      c.on('open', () => { if (Object.keys(NET.conns).length >= MAX_GUESTS){ try { c.send({t:'full'}); } catch(e){} setTimeout(() => c.close(), 400); return; } hostWelcome(c); });
+      c.on('data', m => { netRecvChain = netRecvChain.then(() => onNet(m, c.peer)).catch(e => console.warn(e)); });
+      const drop = () => { if (!NET.conns[c.peer]) return; delete NET.conns[c.peer]; const p = NET.peers.get(c.peer);
+        for (const [cid, pid] of [...NET.assign]) if (pid === c.peer){ NET.assign.delete(cid); netRemote.delete(cid); }
+        if (p){ dropAvatar(p); NET.peers.delete(c.peer); toast(playerName(p.n)+' left'); }
+        rawSend({t:'bye', from:c.peer}); requestUI(); };
+      c.on('close', drop); c.on('error', drop);
+    });
+    peer.on('error', e => { if (e.type==='unavailable-id'){ try { peer.destroy(); } catch(_){} go(); return; } if (!NET.on) netStatus(netErrText(e)); });
+    peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} }); };
+  go();
+}
+async function netJoin(code){
+  code = String(code||'').trim(); if (!/^\d{4}$/.test(code)) return netStatus('Type the 4-digit room code.');
+  state.mic = true; ensureMic();   // asked now, while the button press counts as a tap
+  try { await saveLocal(true); } catch(e){}
+  netReset(); NET.code = code; netStatus('Joining '+code+'…');
+  try { await loadPeer(); } catch(e){ return netStatus("Couldn't load the together part. Check the internet."); }
+  const peer = makePeer(); NET.peer = peer; let done = false;
+  peer.on('open', () => { const c = peer.connect(NET_PREFIX+code, {reliable:true}); NET.conn = c;
+    c.on('open', () => { done = true; NET.on = true; NET.guest = true; NET.me = peer.id; netStatus('Getting the world…'); });
+    c.on('data', m => { netRecvChain = netRecvChain.then(() => onNet(m, null)).catch(e => console.warn(e)); });
+    const gone = () => { if (!NET.on) return; netLeave(true); };
+    c.on('close', gone); c.on('error', gone); });
+  peer.on('error', e => { if (!done) netStatus(netErrText(e)); });
+  setTimeout(() => { if (!done && NET.code === code) netStatus("Couldn't connect. Check the code and the internet, then try again."); }, 20000);
+}
+async function netLeave(lost){
+  const wasGuest = NET.guest, was = NET.on;
+  if (show.embodied && wasGuest){ show.embodied = null; }
+  netReset(); netStatus('');
+  if (wasGuest){ const id = state.worldId; state.worldId = -1; try { const s2 = await idbGet('world:'+id); if (s2) deserialize(JSON.parse(s2)); } catch(e){} state.worldId = id; setPhase('build'); }
+  if (was) toast(lost ? 'The room closed' : 'Left the room');
+}
+
+// ---- host → a new player: who they are, then the whole world
+function hostWelcome(c){
+  netTick(true);   // anything not sent yet goes out first, so nothing is applied twice
+  const used = new Set([...NET.peers.values()].map(p=>p.n)); let n = 2; while (used.has(n)) n++;
+  NET.conns[c.peer] = c; NET.peers.set(c.peer, {id:c.peer, n, av:null});
+  const json = JSON.stringify(serialize());
+  netSend({t:'welcome', n, code:NET.code}, c.peer);
+  netSend(async () => {
+    const d = u8ToB64(await zipU8(new TextEncoder().encode(json))), parts = Math.max(1, Math.ceil(d.length/120000));
+    for (let i=0;i<parts;i++) rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, c.peer);
+    return null; }, c.peer);
+  netMetaSig = ''; netLastPose.clear();
+  toast(playerName(n)+' joined'); requestUI();
+}
+function netResync(){   // the host opened another world: everybody gets it
+  if (!NET.host) return; netLastPose.clear(); netMetaSig = '';
+  const json = JSON.stringify(serialize());
+  for (const id in NET.conns) netSend(async () => { const d = u8ToB64(await zipU8(new TextEncoder().encode(json))), parts = Math.max(1, Math.ceil(d.length/120000));
+    for (let i=0;i<parts;i++) rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, id); return null; }, id);
+}
+
+// ---- what gets sent
+function netTouchSt(L, s){ let set = netStTouch.get(L.id); if (!set) netStTouch.set(L.id, set = new Set()); set.add(s); }
+function netDropSt(L, uid){ let set = netStDrop.get(L.id); if (!set) netStDrop.set(L.id, set = new Set()); set.add(uid); }
+const strokeData = s => s.type==='blocks' ? {uid:s.uid, type:'blocks', items:s.items} : {uid:s.uid, type:s.type, pts:s.pts, ups:s.ups, r:s.r, col:s.col, seed:s.seed, anim:s.anim||null};
+function chunkHash(ch){
+  if (!ch || !ch.d) return 0;
+  let h = 2166136261; for (let i=0;i<CN3;i++){ h ^= Math.round(ch.d[i]/DMAX*32767); h = Math.imul(h, 16777619); }
+  for (let i=0;i<CN3*3;i+=3){ h ^= ch.c[i] | ch.c[i+1]<<8 | ch.c[i+2]<<16; h = Math.imul(h, 16777619); }
+  return h >>> 0 || 1;
+}
+function voxMsg(L, keys){
+  const ks = [], blobs = [];
+  for (const k of keys){ const ch = L.chunks.get(k), h = chunkHash(ch), hk = L.id+'|'+k;
+    if (netHash.get(hk) === h) continue; netHash.set(hk, h);
+    if (ch && ch.d){ const q = new Int16Array(CN3); for (let i=0;i<CN3;i++) q[i] = Math.round(clamp(ch.d[i],-DMAX,DMAX)/DMAX*32767); blobs.push(new Uint8Array(q.buffer), ch.c.slice()); ks.push([k,1]); }
+    else ks.push([k,0]); }
+  if (!ks.length) return null;
+  const tot = blobs.reduce((a,b)=>a+b.length,0), u8 = new Uint8Array(tot); let o = 0; for (const b of blobs){ u8.set(b, o); o += b.length; }
+  return {L:L.id, vs:L.vs, ks, u8};
+}
+function metaNow(){
+  return {phase:state.phase, selChar:state.selChar, aw:state.activeWorld, ap:state.activePart, world:state.world,
+    lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
+    chars: show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked})),
+    layers: layers.map(L=>({id:L.id, name:L.name, vs:L.vs, vis:L.visible, lk:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps}))};
+}
+const r4 = v => Math.round(v*1e4)/1e4;
+const poseArr = o => [r4(o.position.x), r4(o.position.y), r4(o.position.z), r4(o.quaternion.x), r4(o.quaternion.y), r4(o.quaternion.z), r4(o.quaternion.w), r4(o.scale.x)];
+function setPoseArr(o, a){ o.position.set(a[0],a[1],a[2]); o.quaternion.set(a[3],a[4],a[5],a[6]); o.scale.setScalar(a[7]); }
+function netTick(force){
+  if (!NET.on || !NET.synced) return;
+  const now = performance.now();
+  if (!force && now - netTickT < 90) return; netTickT = now;
+  if (NET.host && (force || now - netMetaT > 250)){ netMetaT = now; const m = metaNow(), sg = JSON.stringify(m); if (sg !== netMetaSig){ netMetaSig = sg; netSend({t:'meta', ...m}); } }
+  if (netOps.length){ const ops = netOps; netOps = []; for (let i=0;i<ops.length;i+=300) netSend({t:'op', from:NET.me, ops:ops.slice(i, i+300)}); }
+  if (force || now - netStT > 240){ netStT = now;
+    for (const id of netStFull){ const L = layerById(id); if (L) netSend({t:'sl', from:NET.me, L:id, list:L.strokes.map(strokeData)}); netStTouch.delete(id); netStDrop.delete(id); }
+    netStFull.clear();
+    const ids = new Set([...netStTouch.keys(), ...netStDrop.keys()]);
+    for (const id of ids){ const L = layerById(id); if (!L) continue;
+      const up = [...(netStTouch.get(id)||[])].filter(s => L.strokes.includes(s)).map(strokeData), rm = [...(netStDrop.get(id)||[])].filter(u => !L.strokes.some(s=>s.uid===u));
+      if (up.length || rm.length) netSend({t:'st', from:NET.me, L:id, up, rm}); }
+    netStTouch.clear(); netStDrop.clear();
+  }
+  // the host's copy settles everyone's clay once a spot goes quiet (two people sculpting the same spot can drift apart a little)
+  if (NET.host && netSettle.size) for (const [hk, t] of netSettle) if (force || now - t > 800){ netSettle.delete(hk); const i = hk.indexOf('|'), id = +hk.slice(0,i);
+    let st = netVox.get(id); if (!st) netVox.set(id, st = new Set()); st.add(hk.slice(i+1)); }
+  for (const [id, keys] of netVox){ const L = layerById(id); if (!L) continue; const v = voxMsg(L, keys);
+    if (v) netSend(async () => ({t:'vox', from:NET.me, L:v.L, vs:v.vs, ks:v.ks, d:u8ToB64(await zipU8(v.u8))})); }
+  netVox.clear();
+}
+// poses: the host sends where every part is (after faces and recorded moves); a player in a puppet sends that puppet
+function netPoses(){
+  if (!NET.on || !NET.synced) return;
+  const now = performance.now();
+  if (now - netMeT > 50){ netMeT = now; sendPresence(); }
+  if (NET.host){
+    if (now - netPoseT < 66) return; netPoseT = now;
+    const full = now - netPoseFullT > 2000; if (full) netPoseFullT = now;
+    const k = {};
+    const put = (key, o) => { const a = poseArr(o), s2 = a.join(','); if (full || netLastPose.get(key) !== s2){ netLastPose.set(key, s2); k[key] = a; } };
+    for (const L of layers) put('L'+L.id, L.group);
+    for (const c of show.chars) put('r'+c.id, c.root);
+    if (Object.keys(k).length) netSend({t:'pose', k, st:show.t});
+  } else if (show.embodied){
+    if (now - netPoseT < 50) return; netPoseT = now;
+    const c = show.embodied.c, k = {};
+    for (const [key, a] of netLastPose) if (key[0]==='L') k[key] = a;
+    netSend({t:'pose', c:c.id, k, f:[r4(c.look.position.x), r4(c.look.position.y), r4(c.mouthO.position.x)]});
+  }
+}
+function netCaptureOwn(){   // a player's own puppet parts, before faces are added (the host adds those again)
+  if (!NET.guest || !show.embodied) return;
+  netLastPose.clear(); for (const L of partsOf(show.embodied.c)) netLastPose.set('L'+L.id, poseArr(L.group));
+}
+function netApplyPoses(){
+  if (NET.guest){
+    const own = show.embodied ? show.embodied.c.id : -1;
+    for (const [key, a] of netPose){
+      if (key[0]==='L'){ const L = layerById(+key.slice(1)); if (L && L.char !== own) setPoseArr(L.group, a); }
+      else { const c = charById(+key.slice(1)); if (c) setPoseArr(c.root, a); }
+    }
+  } else if (NET.host){
+    for (const [cid, r] of netRemote){ const c = charById(cid); if (!c || NET.assign.get(cid) !== r.peer) continue;
+      for (const key in r.k){ const L = layerById(+key.slice(1)); if (L && L.char===cid) setPoseArr(L.group, r.k[key]); }
+      if (r.f){ c.look.position.set(r.f[0], r.f[1], 0); c.mouthO.position.x = r.f[2]; } }
+  }
+}
+function netControlled(set){   // the host leaves puppets that players are in alone, and records them
+  if (!NET.host) return;
+  for (const [cid] of NET.assign){ const c = charById(cid); if (!c) continue; for (const L of partsOf(c)) set.add(String(L.id)); set.add('e'+cid); set.add('m'+cid); }
+}
+
+// ---- what arrives
+async function onNet(m, from){
+  if (NET.host && from){ m.via = from; const p = NET.peers.get(from); if (!p) return; }
+  switch (m.t){
+    case 'welcome': NET.n = m.n; NET.code = m.code; return;
+    case 'full': netStatus('That room is full.'); netLeave(true); return;
+    case 'snap': {
+      if (!NET.snapParts || m.i===0) NET.snapParts = [];
+      NET.snapParts[m.i] = m.d; if (NET.snapParts.filter(Boolean).length < m.n) return;
+      const json = new TextDecoder().decode(await zipU8(b64ToU8(NET.snapParts.join('')), true)); NET.snapParts = null;
+      netMute++; try { if (show.embodied) show.embodied = null; deserialize(JSON.parse(json)); } finally { netMute--; }
+      NET.synced = true; netPose.clear(); netHash.clear(); state.page = SCULPT_PHASES.includes(state.phase) ? 'tools' : 'together';
+      netStatus(''); toast("You're in! "+playerName(NET.n)+': pick a color, then draw with the trigger.'); return; }
+    case 'meta': if (NET.synced) applyMeta(m); return;
+    case 'op': { netMute++; try { for (const op of m.ops) applyOp(op); } finally { netMute--; } if (NET.host) rawSend(m); return; }
+    case 'vox': await applyVox(m); if (NET.host) rawSend(m); return;
+    case 'st': applySt(m); if (NET.host) rawSend(m); return;
+    case 'sl': applySl(m); if (NET.host) rawSend(m); return;
+    case 'pose':
+      if (NET.guest){ for (const key in m.k) netPose.set(key, m.k[key]); }
+      else if (m.c != null && NET.assign.get(m.c) === from) netRemote.set(m.c, {peer:from, k:m.k, f:m.f});
+      return;
+    case 'me': {
+      const id = NET.host ? from : m.from; if (NET.host) rawSend({...m, from});
+      if (!NET.host && m.from==='host' && m.rig) NET.hostRig = m.rig;
+      if (!NET.host && m.from===NET.me) return;
+      let p = NET.peers.get(id); if (!p){ p = {id, n:m.n, av:null}; NET.peers.set(id, p); }
+      p.n = m.n; p.vr = m.vr; p.e = m.e; p.tgt = m; return; }
+    case 'bye': { const p = NET.peers.get(m.from); if (p){ dropAvatar(p); NET.peers.delete(m.from); } return; }
+    case 'assign': {
+      if (m.c == null){ if (show.embodied) stepOut(); return; }
+      const c = charById(m.c); if (!c) return;
+      if (!renderer.xr.isPresenting){ toast('Put the headset on to play '+c.name); return; }
+      if (show.embodied) show.embodied = null;
+      stepIn(c); if (show.embodied) toast('You are '+c.name+'! Move your head and hands. Talk to move the mouth.'); return; }
+    case 'off': NET.off = m.o; return;
+    case 'out': for (const [cid, pid] of [...NET.assign]) if (pid===from){ NET.assign.delete(cid); netRemote.delete(cid); } requestUI(); return;
+    case 'rec':
+      if (m.on) guestRecStart(); else guestRecStop(m.keep);
+      return;
+    case 'voice': {
+      const p = NET.peers.get(from);
+      const clip = {id:show.audioSeq++, b64:m.b64, mime:m.mime, dur:m.dur, at:0, vol:1, fx:'none', name:(m.who ? m.who+' · ' : '')+playerName(p ? p.n : 2)};
+      show.audio.push(clip); try { await decodeClip(clip); } catch(e){}
+      sceneDirty = true; toast(playerName(p ? p.n : 2)+"'s voice is in the show"); requestUI(); return; }
+  }
+}
+function clearLayerVox(L, vs){
+  for (const ch of L.chunks.values()) dropMesh(L, ch);
+  for (const k of [...dirty.keys()]) if (k.startsWith(L.id+'|')) dirty.delete(k);
+  for (const k of [...netHash.keys()]) if (k.startsWith(L.id+'|')) netHash.delete(k);
+  L.chunks = new Map(); L.vs = vs;
+}
+function applyMeta(m){
+  netMute++;
+  try {
+    const cids = new Set(m.chars.map(c=>c.id));
+    for (const c of [...show.chars]) if (!cids.has(c.id)){ if (show.embodied && show.embodied.c===c) show.embodied = null; actors.remove(c.root); show.chars = show.chars.filter(x=>x!==c); }
+    for (const cd of m.chars){ const c = charById(cd.id) || makeChar(cd.type, cd.name, cd.id); Object.assign(c, {name:cd.name, type:cd.type, place:cd.place, placed:cd.placed, guide:cd.guide, locked:cd.locked}); }
+    const lids = new Set(m.layers.map(l=>l.id));
+    for (const L of [...layers]) if (!lids.has(L.id)) removeLayer(L);
+    for (const ld of m.layers){
+      const c = ld.char != null ? charById(ld.char) : null, parent = c ? c.root : world;
+      let L = layerById(ld.id); if (!L) L = makeLayer(ld.name, ld.vs, ld.id, parent);
+      if (L.group.parent !== parent) parent.add(L.group);
+      L.char = c ? c.id : null; L.part = c ? (ld.part || 'extra') : null;
+      L.name = ld.name; L.visible = ld.vis; L.group.visible = ld.vis; L.locked = ld.lk; L.anim = ld.anim; L.rest = ld.rest;
+      if (ld.vs !== L.vs) clearLayerVox(L, ld.vs);
+      if (JSON.stringify(ld.mat) !== JSON.stringify(L.matProps)) setLayerMat(L, ld.mat);
+    }
+    const order = new Map(m.layers.map((l,i)=>[l.id,i])); layers.sort((a,b)=>order.get(a.id)-order.get(b.id));
+    if (JSON.stringify(m.world) !== JSON.stringify(state.world)){ state.world = m.world; applyWorld(); }
+    const ls = JSON.stringify(m.lights); if (ls !== NET.lightSig){ NET.lightSig = ls; clearLights(); for (const ld of m.lights) makeLight(ld); }
+    state.selChar = m.selChar; state.activeWorld = m.aw; state.activePart = m.ap;
+    if (m.phase !== state.phase) setPhase(m.phase);
+  } finally { netMute--; }
+  requestUI();
+}
+async function applyVox(m){
+  const L = layerById(m.L); if (!L) return;
+  if (m.vs !== L.vs) clearLayerVox(L, m.vs);
+  const buf = await zipU8(b64ToU8(m.d), true);
+  netMute++;
+  try {
+    let o = 0; const done = [];
+    for (const [k, has] of m.ks){ const [cx,cy,cz] = k.split(',').map(Number), ch = getChunk(L,cx,cy,cz,true);
+      if (has){ if (!ch.d){ ch.d = new Float32Array(CN3); ch.c = new Uint8Array(CN3*3); }
+        const q = new Int16Array(buf.slice(o, o+CN3*2).buffer); o += CN3*2; for (let i=0;i<CN3;i++) ch.d[i] = q[i]/32767*DMAX;
+        ch.c.set(buf.subarray(o, o+CN3*3)); o += CN3*3; }
+      else { ch.d = null; ch.c = null; }
+      markAround(L, cx-1,cy-1,cz-1, cx+1,cy+1,cz+1); done.push([k, ch]); }
+    for (const [k, ch] of done) netHash.set(L.id+'|'+k, chunkHash(ch));
+    sceneDirty = true;
+  } finally { netMute--; }
+}
+function letGoOf(s){
+  if (blockGrab && blockGrab.s===s){ blockGrab = null; two = null; }
+  if (doodleGrab && doodleGrab.s===s){ doodleGrab = null; two = null; }
+  if (lastDoodle && lastDoodle.s===s) lastDoodle = null;
+}
+function applySt(m){
+  const L = layerById(m.L); if (!L) return;
+  netMute++;
+  try {
+    for (const d of m.up){ let s = L.strokes.find(x=>x.uid===d.uid);
+      if (s){ if (s._mesh && s._mesh.userData.anim) s._mesh.userData.anim = null; Object.assign(s, d); if (s.type!=='blocks' && s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh = null; } }
+      else { s = {...d}; L.strokes.push(s); }
+      rebuildStroke(L, s); }
+    for (const u of m.rm){ const s = L.strokes.find(x=>x.uid===u); if (s){ letGoOf(s); dropStroke(L, s); } }
+    sceneDirty = true;
+  } finally { netMute--; }
+}
+function applySl(m){
+  const L = layerById(m.L); if (!L) return;
+  netMute++;
+  try {
+    const keep = new Map(L.strokes.map(s=>[s.uid, s]));
+    for (const s of L.strokes){ letGoOf(s); if (s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh = null; } }
+    L.strokes = m.list.map(d => { const s = keep.get(d.uid); return s ? Object.assign(s, d) : {...d}; });
+    for (const s of L.strokes) rebuildStroke(L, s);
+    sceneDirty = true;
+  } finally { netMute--; }
+}
+
+// ---- puppets handed to players
+function netAssign(c, pid){
+  if (!NET.host || !c) return;
+  for (const [cid, p] of [...NET.assign]) if (cid===c.id || p===pid){ NET.assign.delete(cid); netRemote.delete(cid); if (p !== pid) netSend({t:'assign', c:null}, p); }
+  if (!pid){ requestUI(); return; }
+  if (show.embodied && show.embodied.c===c) stepOut();
+  if (!c.placed) placeChar(c);
+  NET.assign.set(c.id, pid); netTick(true); netSend({t:'assign', c:c.id}, pid);
+  const p = NET.peers.get(pid); toast(playerName(p ? p.n : 2)+' is now '+c.name); requestUI();
+}
+function netUnassign(pid){ for (const [cid, p] of [...NET.assign]) if (p===pid){ NET.assign.delete(cid); netRemote.delete(cid); } netSend({t:'assign', c:null}, pid); requestUI(); }
+const assignedTo = c => NET.host ? NET.assign.get(c.id) : null;
+
+// ---- a player's voice records with the host's takes, on its own track
+function guestRecStart(){
+  if (!micStream || !window.MediaRecorder || guestRec) return;
+  try { const mr = micRecorder(), chunks = []; mr.ondataavailable = e => { if (e.data.size) chunks.push(e.data); }; mr.start(250); guestRec = {mr, chunks, t0:performance.now()}; } catch(e){ guestRec = null; }
+}
+function guestRecStop(keep){
+  const g2 = guestRec; guestRec = null; if (!g2) return;
+  const dur = (performance.now() - g2.t0)/1000, who = show.embodied ? show.embodied.c.name : null;
+  g2.mr.onstop = async () => { if (!keep || !g2.chunks.length) return; const blob = new Blob(g2.chunks, {type:g2.mr.mimeType || 'audio/webm'});
+    netSend({t:'voice', b64:u8ToB64(new Uint8Array(await blob.arrayBuffer())), mime:g2.mr.mimeType, dur, who}); };
+  if (g2.mr.state !== 'inactive') g2.mr.stop();
+}
+
+// ---- seeing each other: a headset and two controllers per person
+function sendPresence(){
+  if (!renderer.xr.isPresenting){ netSend({t:'me', from:NET.me, n:NET.n, vr:false}); return; }
+  const pk = o => { o.updateMatrixWorld(true); const p = V(), q = new THREE.Quaternion(), s = V(); o.matrixWorld.decompose(p,q,s); return [r4(p.x),r4(p.y),r4(p.z),r4(q.x),r4(q.y),r4(q.z),r4(q.w),r4(s.x)]; };
+  const m = {t:'me', from:NET.me, n:NET.n, vr:true, h:pk(camera), l:ctrl.left ? pk(ctrl.left.grip) : null, r:ctrl.right ? pk(ctrl.right.grip) : null, e: show.embodied ? show.embodied.c.id : -1};
+  if (NET.host) m.rig = [...rig.position.toArray().map(r4), ...rig.quaternion.toArray().map(r4), r4(rig.scale.x)];
+  netSend(m);
+}
+let avatarGLB = null;
+function loadAvatarGLB(){
+  if (avatarGLB) return avatarGLB;
+  const base = 'https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/meta-quest-touch-plus/', ld = new GLTFLoader();
+  avatarGLB = {left:ld.loadAsync(base+'left.glb').then(g=>g.scene).catch(()=>null), right:ld.loadAsync(base+'right.glb').then(g=>g.scene).catch(()=>null)};
+  return avatarGLB;
+}
+function headsetModel(col){
+  const g2 = new THREE.Group(), white = new THREE.MeshStandardMaterial({color:'#f4f4f4', roughness:0.45}), black = new THREE.MeshStandardMaterial({color:'#151515', roughness:0.6}), accent = new THREE.MeshStandardMaterial({color:col, roughness:0.5});
+  const front = new THREE.Mesh(new THREE.BoxGeometry(0.19, 0.105, 0.065), white); front.position.z = -0.075; g2.add(front);
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.085, 0.004), black); plate.position.z = -0.109; g2.add(plate);
+  for (const [x,y] of [[-0.05,0.012],[0.05,0.012],[0,-0.02]]){ const cam = new THREE.Mesh(new THREE.CylinderGeometry(0.008,0.008,0.004,16), new THREE.MeshStandardMaterial({color:'#000', roughness:0.2})); cam.rotation.x = Math.PI/2; cam.position.set(x,y,-0.112); g2.add(cam); }
+  const pad = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.08, 0.02), black); pad.position.z = -0.035; g2.add(pad);
+  const strap = new THREE.Mesh(new THREE.TorusGeometry(0.1, 0.012, 8, 32), accent); strap.rotation.x = Math.PI/2; strap.scale.set(0.95, 1.15, 1); strap.position.z = 0.03; g2.add(strap);
+  const top = new THREE.Mesh(new THREE.TorusGeometry(0.1, 0.01, 8, 24, Math.PI), accent); top.position.z = 0.03; top.scale.set(0.95, 0.7, 1); g2.add(top);
+  return g2;
+}
+function makeAvatar(p){
+  const col = PLAYER_COL[(p.n-1) % PLAYER_COL.length], grp = new THREE.Group();
+  const head = headsetModel(col), lc = new THREE.Group(), rc = new THREE.Group();
+  grp.add(head, lc, rc); scene.add(grp);
+  const G = loadAvatarGLB();
+  for (const [side, holder] of [['left', lc], ['right', rc]]) G[side].then(sc => {
+    if (sc) holder.add(sc.clone(true));
+    else holder.add(new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), new THREE.MeshStandardMaterial({color:col}))); });
+  grp.traverse(o => o.frustumCulled = false);
+  p.av = {grp, head, lc, rc}; return p.av;
+}
+function dropAvatar(p){ if (p.av){ scene.remove(p.av.grp); disposeMesh(p.av.grp); p.av = null; } }
+function updateAvatars(dt){
+  if (!NET.on) return;
+  const k = 1 - Math.exp(-dt*18);
+  for (const p of NET.peers.values()){
+    const m = p.tgt; if (!m) continue;
+    const av = p.av || makeAvatar(p);
+    av.grp.visible = !!m.vr;
+    if (!m.vr) continue;
+    av.head.visible = m.e < 0;   // in a puppet, the puppet is them
+    for (const [o, a] of [[av.head, m.h], [av.lc, m.l], [av.rc, m.r]]){
+      if (!a){ o.visible = false; continue; } if (o !== av.head) o.visible = m.e < 0;
+      const tp = new THREE.Vector3(a[0],a[1],a[2]), tq = new THREE.Quaternion(a[3],a[4],a[5],a[6]);
+      if (!o.userData.seen){ o.position.copy(tp); o.quaternion.copy(tq); o.userData.seen = true; } else { o.position.lerp(tp, k); o.quaternion.slerp(tq, k); }
+      o.scale.setScalar(a[7]);
+    }
+  }
+}
+// players ride along with the host: same size, same place (plus a nudge so you don't stand inside each other)
+function netFollowHost(){
+  if (!NET.guest || !NET.hostRig || show.embodied || !renderer.xr.isPresenting) return;
+  const h = NET.hostRig; rig.quaternion.set(h[3],h[4],h[5],h[6]); rig.scale.setScalar(h[7]);
+  rig.position.set(h[0],h[1],h[2]).add(new THREE.Vector3(...NET.off).applyQuaternion(rig.quaternion).multiplyScalar(h[7]));
+  rig.updateMatrixWorld(true);
+}
+function netLineUp(pid){   // put that player's headset a step to your right, facing the same way
+  const p = NET.peers.get(pid); if (!p || !p.tgt || !p.tgt.h){ toast('Their headset needs to be on'); return; }
+  const s = rig.scale.x, myH = V(); camera.getWorldPosition(myH);
+  const fwd = V(); camera.getWorldDirection(fwd); fwd.y = 0; if (fwd.lengthSq() < 1e-6) fwd.set(0,0,-1); fwd.normalize();
+  const right = V().crossVectors(fwd, _y).normalize(), want = myH.clone().addScaledVector(right, 0.8*s);
+  const herH = new THREE.Vector3(p.tgt.h[0], p.tgt.h[1], p.tgt.h[2]);
+  const cur = new THREE.Vector3(...(p.off||[0,0,0]));
+  const dW = want.sub(herH); dW.y = 0;
+  const dL = dW.applyQuaternion(rig.quaternion.clone().invert()).divideScalar(s);
+  p.off = cur.add(dL).toArray().map(r4); netSend({t:'off', o:p.off}, pid); toast(playerName(p.n)+' is now next to you');
+}
+
+// ---- the Together page
+function drawTogether(X,W){
+  txt('Play together', X, 100, 26);
+  const hw = (W-8)/2;
+  if (NET.guest){
+    txt(NET.synced ? 'In room '+NET.code : 'Joining '+NET.code+'…', X, 140, 20, '#00c7be');
+    txt('You are '+playerName(NET.n), X, 174, 18, PLAYER_COL[(NET.n-1)%4]);
+    para(['The host picks what you are making and','where you are. Your color and size are yours.', 'Trigger draws. Grip grabs a doodle or block.'], X, 204, 14);
+    if (show.embodied){ rr(X,286,W,52,14,'#ff2d95'); txt('You are '+show.embodied.c.name, X+W/2, 312, 19, '#111','center');
+      para(['Your head and hands move it. Talk and its mouth','moves. Right stick: where its eyes look.'], X, 358, 14); }
+    button(X,420,W,46,'Mic '+(state.mic && micStream ? 'on' : 'off'),!!(state.mic && micStream),async ()=>{ state.mic = !state.mic; if (state.mic) await ensureMic(); requestUI(); },'#ff9500');
+    button(X,UIH-150,W,46,'Leave the room',false,()=>netLeave(false),'#ff3b30');
+    if (NET.status) para([NET.status], X, UIH-190, 14, '#ffd400');
+    return;
+  }
+  if (NET.host){
+    rr(X,118,W,74,16,'#00c7be'); txt('Room', X+18, 140, 15, '#111','left',700); txt(NET.code, X+W/2, 160, 44, '#111','center',900);
+    para(['On her headset: APP → Together → type this code.'], X, 214, 14);
+    const ps = [...NET.peers.values()].sort((a,b)=>a.n-b.n);
+    if (!ps.length) para(['Waiting for someone to join…'], X, 250, 15, '#cfd6ff');
+    const puppets = show.chars.filter(c=>c.type==='puppet');
+    ps.forEach((p,i)=>{ const y = 244 + i*112, col = PLAYER_COL[(p.n-1)%4];
+      rr(X,y,W,104,14,'#2a3060'); rr(X,y,10,104,5,col);
+      txt(playerName(p.n)+(p.tgt && p.tgt.vr ? '' : ' (headset off)'), X+22, y+22, 17, '#fff');
+      const cur = [...NET.assign].find(([,pid])=>pid===p.id), cc = cur ? charById(cur[0]) : null;
+      button(X+22,y+46,(W-38)/2,44,'Line up next to me',false,()=>netLineUp(p.id),'#1e6bff');
+      const lbl = cc ? 'In '+cc.name+' · tap: out' : puppets.length ? 'Put in a puppet ▸' : 'No puppets yet';
+      button(X+22+(W-38)/2+8,y+46,(W-38)/2,44,lbl,!!cc,()=>{
+        if (cc){ netUnassign(p.id); return; }
+        if (!puppets.length) return;
+        const free = puppets.filter(c=>!NET.assign.has(c.id)); const c = free.find(c=>c.id===state.selChar) || free[0];
+        if (!c){ toast('Every puppet already has someone in it'); return; }
+        if (state.phase!=='perform') setPhase('perform');
+        netAssign(c, p.id); },'#ff2d95');
+    });
+    button(X,UIH-150,W,46,'Close the room',false,()=>{ netLeave(false); },'#ff3b30');
+    return;
+  }
+  para(['Two Quest headsets in one world. You host:','you run the menus; she sculpts with you and','plays the puppets you hand her.'], X, 128, 14);
+  button(X,200,W,52,'Host a room',false,()=>netHost(),'#34c759');
+  txt('Join a room', X, 290, 18, '#cfd6ff','left',700);
+  rr(X,304,W,56,14,'#0d1029'); txt(NET.typed ? NET.typed.split('').join(' ') : '_ _ _ _', X+W/2, 333, 32, NET.typed ? '#ffd400' : '#4a5080','center',900);
+  const kw = (W-16)/3;
+  ['1','2','3','4','5','6','7','8','9','⌫','0','Join'].forEach((k,i)=>{ const x = X+(i%3)*(kw+8), y = 370+Math.floor(i/3)*52;
+    button(x,y,kw,46,k,false,()=>{ if (k==='⌫') NET.typed = NET.typed.slice(0,-1); else if (k==='Join') netJoin(NET.typed); else if (NET.typed.length < 4) NET.typed += k; requestUI(); }, k==='Join' ? '#34c759' : k==='⌫' ? '#ff3b30' : '#1e6bff'); });
+  if (NET.status) para(wrap(NET.status, W, 14), X, UIH-40, 14, '#ffd400');
+}
+// a player only gets the making tools, and a Together tab
+function railNow(){
+  if (!NET.guest) return RAILS[state.phase] || [];
+  return SCULPT_PHASES.includes(state.phase) ? [['tools','Sculpt'],['color','Color'],['doodle','Doodle'],['blocks','Blocks'],['together','Together']] : [['together','Together']];
+}
+
+/* voice pitch: stretch the sound in time without changing its pitch (WSOLA), then play it back faster or slower */
+const pitchCache = new Map();
+function wsola(x, f){
+  const W = 1024, Hs = 512, Ha = Hs/f, tol = 192, n = x.length, outLen = Math.floor(n*f) + W;
+  const y = new Float32Array(outLen), ws = new Float32Array(outLen), win = new Float32Array(W);
+  for (let i=0;i<W;i++) win[i] = 0.5 - 0.5*Math.cos(2*Math.PI*i/W);
+  let prev = 0;
+  for (let k=0;;k++){
+    const outPos = k*Hs, nom = Math.round(k*Ha); if (nom + W >= n || outPos + W >= outLen) break;
+    let best = nom;
+    if (k > 0){ const tgt = prev + Hs; if (tgt + W < n){ let bc = -Infinity;
+      for (let d=-tol; d<=tol; d+=4){ const p = nom + d; if (p < 0 || p + W >= n) continue; let c = 0; for (let i=0;i<W;i+=8) c += x[p+i]*x[tgt+i]; if (c > bc){ bc = c; best = p; } } } }
+    for (let i=0;i<W;i++){ y[outPos+i] += x[best+i]*win[i]; ws[outPos+i] += win[i]; }
+    prev = best;
+  }
+  for (let i=0;i<outLen;i++) if (ws[i] > 1e-3) y[i] /= ws[i];
+  return y;
+}
+function playBuf(c, buf){
+  if (!buf || !c.pitch) return buf;
+  const key = c.id+'|'+c.pitch+'|'+buf.length; if (pitchCache.has(key)) return pitchCache.get(key);
+  const r = Math.pow(2, c.pitch/12), n = buf.length, out = new AudioBuffer({length:n, numberOfChannels:buf.numberOfChannels, sampleRate:buf.sampleRate});
+  for (let ch=0; ch<buf.numberOfChannels; ch++){
+    const st = wsola(buf.getChannelData(ch), r), o = out.getChannelData(ch);
+    for (let i=0;i<n;i++){ const p = i*r, i0 = Math.floor(p), fr = p - i0; o[i] = i0+1 < st.length ? st[i0]*(1-fr) + st[i0+1]*fr : 0; }
+  }
+  pitchCache.set(key, out); return out;
+}
+
 
 const state = {
   phase:'build', page:'tools', dialOpen:false,
@@ -276,7 +798,8 @@ function alloc(ch){
   ch.c = new Uint8Array(CN3*3).fill(200);
 }
 const dirty = new Map();
-function markDirty(L, ch){ dirty.set(L.id+'|'+ch.k, {L, ch}); }
+function markDirty(L, ch){ dirty.set(L.id+'|'+ch.k, {L, ch});
+  if (NET.on){ if (netInOp){ netHash.delete(L.id+'|'+ch.k); if (NET.host) netSettle.set(L.id+'|'+ch.k, performance.now()); } else if (!netMute){ let st = netVox.get(L.id); if (!st) netVox.set(L.id, st = new Set()); st.add(ch.k); } } }
 function markAround(L, cx0,cy0,cz0, cx1,cy1,cz1){
   for (let cz=cz0; cz<=cz1; cz++) for (let cy=cy0; cy<=cy1; cy++) for (let cx=cx0; cx<=cx1; cx++)
     markDirty(L, getChunk(L, cx,cy,cz, true));
@@ -293,6 +816,10 @@ function sampleD(L, gx, gy, gz){
   return ch.d[(gx-cx*CN) + CN*((gy-cy*CN) + CN*(gz-cz*CN))];
 }
 function applyOp(op, undoMap){
+  if (!netQuiet() && layerById(op.L)) netOps.push(op);
+  netInOp++; try { applyOp0(op, undoMap); } finally { netInOp--; }
+}
+function applyOp0(op, undoMap){
   const L = layerById(op.L); if (!L) return;
   const VS = L.vs;
   _cache.k = null;
@@ -692,7 +1219,7 @@ function restoreAnim(m){ const A = m.userData.anim; if (!A) return; if (A.inst){
   for (const gg of A.geos){ gg.o.geometry.attributes.position.array.set(gg.base); gg.o.geometry.attributes.position.needsUpdate = true; if (gg.nb && gg.o.geometry.attributes.normal){ gg.o.geometry.attributes.normal.array.set(gg.nb); gg.o.geometry.attributes.normal.needsUpdate = true; } } }
 function setDoodleAnim(patch){
   Object.assign(state.dAnim, patch);
-  if (lastDoodle && lastDoodle.L.strokes.includes(lastDoodle.s)) lastDoodle.s.anim = state.dAnim.mode ? {...state.dAnim} : null;
+  if (lastDoodle && lastDoodle.L.strokes.includes(lastDoodle.s)){ lastDoodle.s.anim = state.dAnim.mode ? {...state.dAnim} : null; if (!netQuiet()) netTouchSt(lastDoodle.L, lastDoodle.s); }
   sceneDirty = true; requestUI();
 }
 function drawDMotion(X,W){
@@ -709,6 +1236,8 @@ function drawDMotion(X,W){
 }
 function disposeMesh(m){ m.traverse(o => { if (o.geometry && o.geometry!==boxGeo) o.geometry.dispose(); if (o.material && o.material!==clayMat) o.material.dispose?.(); }); }
 function rebuildStroke(L, s){
+  if (!s.uid) s.uid = netTag + (++uidSeq);
+  if (!netQuiet()) netTouchSt(L, s);
   if (s.type==='blocks' && s._mesh && s._mesh.isInstancedMesh && s.items.length && s._mesh.count === s.items.length/13){ updateBlockMesh(s); return; }
   if (s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh=null; }
   const m = buildStrokeMesh(s); if (m){ s._mesh=m; L.group.add(m); }
@@ -721,13 +1250,14 @@ function updateBlockMesh(s){
   }
   im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; im.computeBoundingSphere();
 }
-function dropStroke(L, s){ if (s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh=null; } L.strokes = L.strokes.filter(x=>x!==s); }
+function dropStroke(L, s){ if (!netQuiet() && s.uid) netDropSt(L, s.uid); if (s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh=null; } L.strokes = L.strokes.filter(x=>x!==s); }
 function snapStrokes(L){ return {list:L.strokes.slice(), items:new Map(L.strokes.filter(s=>s.type==='blocks').map(s=>[s, s.items.slice()]))}; }
 function restoreStrokes(L, snap){
   for (const s of L.strokes) if (s._mesh){ L.group.remove(s._mesh); disposeMesh(s._mesh); s._mesh=null; }
   L.strokes = snap.list.slice();
   for (const [s, it] of snap.items) s.items = it.slice();
-  for (const s of L.strokes) rebuildStroke(L, s);
+  netMute++; try { for (const s of L.strokes) rebuildStroke(L, s); } finally { netMute--; }
+  if (!netQuiet()) netStFull.add(L.id);
 }
 function eraseInside(L, p, r){
   let any = false; const tmp = V();
@@ -1258,6 +1788,7 @@ function controlledKeys(){
   if (show.grab) set.add(show.grab.c ? 'r'+show.grab.c.id : String(show.grab.L.id));
   if (show.embodied){ for (const part of show.embodied.parts) set.add(String(part.L.id)); if (show.embodied.rootMoved) set.add('r'+show.embodied.c.id); set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
   if (show.rec && show.rec.voiceFor) set.add('m'+show.rec.voiceFor);
+  netControlled(set);
   return set;
 }
 const ZERO_POSE = {p:[0,0,0], q:[0,0,0,1], s:1};
@@ -1326,7 +1857,7 @@ function buildFx(ctx, c, src){
 async function audioPlayFrom(t, rate=1, only){
   audioStop(); const token = audioToken;
   for (const c of (only ? [only] : show.audio)){
-    let buf = null; try { buf = await decodeClip(c); } catch(e){}
+    let buf = null; try { buf = playBuf(c, await decodeClip(c)); } catch(e){}
     const at = c.at || 0;
     if (!buf || token!==audioToken || t >= at + buf.duration) continue;
     const a = ac(), src = a.createBufferSource(); src.buffer = buf; src.playbackRate.value = rate;
@@ -1342,7 +1873,7 @@ async function renderFilmAudio(total){
   for (const tk of filmClips()){
     const Lc = clipLen(tk), sc = sceneById(tk.sceneId ?? 1), rate = spd(tk);
     for (const c of ((sc && sc.audio) || [])){
-      let buf = null; try { buf = await decodeClip(c); } catch(e){} if (!buf) continue;
+      let buf = null; try { buf = playBuf(c, await decodeClip(c)); } catch(e){} if (!buf) continue;
       const at = c.at || 0, s0 = Math.max(tk.inT, at), s1 = Math.min(tk.outT, at + buf.duration);
       if (s1 <= s0) continue;
       const src = oac.createBufferSource(); src.buffer = buf; src.playbackRate.value = rate;
@@ -1396,7 +1927,7 @@ function copyEye(L){
   const E = addPart(c, 'eye', L.vs);
   for (const ch of L.chunks.values()) if (ch.d){ const nc = getChunk(E, ch.cx, ch.cy, ch.cz, true); nc.d = ch.d.slice(); nc.c = ch.c.slice(); }
   for (const ch of [...E.chunks.values()]) markAround(E, ch.cx-1,ch.cy-1,ch.cz-1, ch.cx+1,ch.cy+1,ch.cz+1);
-  for (const st of L.strokes){ const ns = st.type==='blocks' ? {type:'blocks', items:st.items.slice()} : {...st, _mesh:null, pts:st.pts.slice(), ups:(st.ups||[]).slice()}; E.strokes.push(ns); rebuildStroke(E, ns); }
+  for (const st of L.strokes){ const ns = st.type==='blocks' ? {type:'blocks', items:st.items.slice()} : {...st, _mesh:null, uid:undefined, pts:st.pts.slice(), ups:(st.ups||[]).slice()}; E.strokes.push(ns); rebuildStroke(E, ns); }
   const ctr = partCenter(L), x = ctr ? L.rest.p[0] + ctr.x : 0;
   E.rest = JSON.parse(JSON.stringify(L.rest)); E.rest.p[0] = L.rest.p[0] - 2*x;   // mirrored across the middle of the face
   state.activePart = E.id; sceneDirty = true; toast('Copied the eye to the other side: ✥ Move it if you want it elsewhere'); requestUI();
@@ -1418,6 +1949,7 @@ async function ensureMic(){
 /* step into a puppet */
 function stepIn(c){
   if (!c || c.type!=='puppet') return;
+  if (NET.host && NET.assign.has(c.id)){ toast(c.name+' has a player in it. Tap it again to take it back.'); return; }
   if (!renderer.xr.isPresenting){ toast('Step in from the headset'); return; }
   if (show.rec) return;
   if (!c.placed) placeChar(c);
@@ -1468,7 +2000,7 @@ function stepIn(c){
 }
 function stepOut(){
   if (!show.embodied || show.rec) return;
-  show.embodied = null; toast('Stepped out'); requestUI();
+  show.embodied = null; if (NET.guest) netSend({t:'out'}); toast('Stepped out'); requestUI();
 }
 const bodyFollow = new THREE.Object3D(); scene.add(bodyFollow);
 function updateBodyFollow(snap){
@@ -1479,7 +2011,7 @@ function updateBodyFollow(snap){
 }
 // when a puppet has recorded moves, your view rides along with it (smoothed so it's gentle)
 function followRoot(dt){
-  const e = show.embodied; if (!e || !e.rigRel || !show.tracks['r'+e.c.id]) return;
+  const e = show.embodied; if (!e || !e.rigRel || (!show.tracks['r'+e.c.id] && !NET.guest)) return;
   e.c.root.updateMatrixWorld(true);
   const m = e.c.root.matrixWorld.clone().multiply(e.rigRel), p = V(), q = new THREE.Quaternion(), sc = V(); m.decompose(p,q,sc);
   const k = 1 - Math.exp(-dt*6);
@@ -1588,6 +2120,7 @@ function startShowRec(){
 function cutShowRec(cancel){
   const r = show.rec; if (!r) return;
   show.rec = null; setRecLabel(''); audioStop();
+  if (NET.host) netSend({t:'rec', on:0, keep: r.phase==='rec' && !cancel});
   if (r.phase!=='rec' || cancel){ if (r.mr && r.mr.state!=='inactive') r.mr.stop(); requestUI(); return; }
   let n = 0;
   for (const [key, samples] of r.keys){ if (samples.length >= 18){ show.tracks[key] = {samples}; n++; } }
@@ -1614,7 +2147,7 @@ function updateShow(dt){
     if (r.phase==='count'){
       r.t -= dt; const n = Math.ceil(r.t); if (n>0){ setRecLabel(String(n)); if (n!==r.lastN){ r.lastN = n; beep(660); } }
       if (r.t <= 0){
-        r.phase='rec'; r.t=0; show.t=0; pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(0);
+        r.phase='rec'; r.t=0; show.t=0; pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(0); if (NET.host) netSend({t:'rec', on:1});
         if (state.mic && micStream && window.MediaRecorder){
           try { r.mr = micRecorder(); r.mr.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); }; r.mr.start(250); } catch(e){ toast('Mic recording failed'); }
         }
@@ -2215,8 +2748,8 @@ function serialize(){
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
     shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq},
-    scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', name:a.name})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}]))}))), curScene, sceneSeq,
-    show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', name:a.name})),
+    scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', pitch:a.pitch||0, name:a.name})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}]))}))), curScene, sceneSeq,
+    show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', pitch:a.pitch||0, name:a.name})),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
       id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps,
@@ -2224,7 +2757,7 @@ function serialize(){
         const q = new Int8Array(CN3); for (let i=0;i<CN3;i++) q[i]=Math.round(ch.d[i]/DMAX*127);
         return {k:ch.k, d:u8ToB64(rleEnc(new Uint8Array(q.buffer),1)), c:u8ToB64(rleEnc(ch.c,3))};
       }),
-      strokes: L.strokes.map(s => s.type==='blocks' ? {type:'blocks', items:s.items} : ({type:s.type, pts:s.pts, ups:s.ups, r:s.r, col:s.col, seed:s.seed, anim:s.anim||null})),
+      strokes: L.strokes.map(s => s.type==='blocks' ? {uid:s.uid, type:'blocks', items:s.items} : ({uid:s.uid, type:s.type, pts:s.pts, ups:s.ups, r:s.r, col:s.col, seed:s.seed, anim:s.anim||null})),
     })),
   };
 }
@@ -2295,6 +2828,7 @@ function deserialize(o){
   if (!layerById(state.activeWorld) || layerById(state.activeWorld).char) state.activeWorld = worldLayers()[0]?.id;
   if (!charById(state.selChar)) state.selChar = show.chars[0]?.id ?? null;
   applyWorld(); setAspect(shots.aspect||'16:9'); applyShowPose(0); pathDirty = true; requestUI();
+  if (NET.host && !netMute) netResync();
 }
 function idb(){ return new Promise((res,rej)=>{ const r=indexedDB.open('chikimoviemagic',1);
   r.onupgradeneeded=()=>r.result.createObjectStore('kv'); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
@@ -2303,6 +2837,7 @@ async function idbGet(k){ const db=await idb(); return new Promise((res,rej)=>{ 
 let worldList = [];
 function worldName(){ return (worldList.find(w=>w.id===state.worldId) || {}).name || 'My world'; }
 async function saveLocal(quiet){
+  if (NET.guest) return;
   try {
     await idbSet('world:'+state.worldId, JSON.stringify(serialize()));
     let w = worldList.find(x=>x.id===state.worldId); if (!w){ w = {id:state.worldId, name:'World '+state.worldId}; worldList.push(w); }
@@ -2352,9 +2887,10 @@ function newScene(kind){
     Object.assign(state.world, {sky:'day', water:false, fog:false});
   }
   applyWorld(); sceneDirty = true; toast(kind==='island' ? 'New island' : 'New empty sky'); requestUI();
+  if (NET.host) netResync();
 }
 let autosaveT = 0;
-function autosaveTick(dt){ autosaveT += dt; if (autosaveT > 20){ autosaveT = 0; if (sceneDirty && !stroke && !rec && !show.rec && !exporting) saveLocal(true); } }
+function autosaveTick(dt){ if (NET.guest) return; autosaveT += dt; if (autosaveT > 20){ autosaveT = 0; if (sceneDirty && !stroke && !rec && !show.rec && !exporting) saveLocal(true); } }
 addEventListener('visibilitychange', () => { if (document.hidden && sceneDirty) saveLocal(true); });
 
 /* ============================================================
@@ -2389,9 +2925,10 @@ const panelMesh = menuWin.mesh;
 const WINS = [menuWin, layersWin, previewWin];
 function winVisible(win){
   if (win===menuWin) return state.panelOpen;
+  if (NET.guest && (win===layersWin || win===previewWin)) return false;
   if (win===layersWin) return state.win.layers && SCULPT_PHASES.includes(state.phase);
   if (win===previewWin) return state.win.preview && (state.phase==='shoot' || (state.phase==='perform' && ((state.mirrorOn && !!show.embodied) || !!selTake())));
-  if (win.isPage) return win.page!=='layers' && (RAILS[state.phase]||[]).some(([id])=>id===win.page);
+  if (win.isPage) return win.page!=='layers' && railNow().some(([id])=>id===win.page);
   return false;
 }
 function dockWin(win){
@@ -2427,7 +2964,7 @@ function tearOff(page){
 function popOut(page){
   const t = tearOff(page); if (!t) return;
   if (t.isNew){ const k = pageWins.length-1; t.win.mesh.translateX(0.2 + 0.18*(k%3)); t.win.mesh.translateY(Math.floor(k/3)*0.3); }
-  const rail = (RAILS[state.phase]||[]).map(([id])=>id).filter(id=>id!=='layers' && !pageWins.some(w=>w.page===id));
+  const rail = railNow().map(([id])=>id).filter(id=>id!=='layers' && !pageWins.some(w=>w.page===id));
   if (rail.length) state.page = rail[0];
   toast('Popped out. Grip it to move it; bring it to your left hand to put it back.'); requestUI();
 }
@@ -2633,6 +3170,7 @@ function icon(name,cx,cy,col){
   else if (name==='files'){ g.beginPath(); g.moveTo(-14,-9); g.lineTo(-4,-9); g.lineTo(0,-5); g.lineTo(14,-5); g.lineTo(14,11); g.lineTo(-14,11); g.closePath(); g.fill(); }
   else if (name==='settings'){ for (let k=0;k<8;k++){ g.save(); g.rotate(k*Math.PI/4); g.fillRect(-3,-15,6,8); g.restore(); } g.beginPath(); g.arc(0,0,9,0,7); g.fill(); g.beginPath(); g.arc(0,0,4,0,7); g.globalCompositeOperation='destination-out'; g.fill(); g.globalCompositeOperation='source-over'; }
   else if (name==='cast'){ for (const [x,r] of [[-8,7],[8,6]]){ g.beginPath(); g.arc(x,-6,r*0.7,0,7); g.fill(); g.fillRect(x-r*0.8,3,r*1.6,10); } }
+  else if (name==='together'){ for (const x of [-8,8]){ g.beginPath(); g.arc(x,-6,6,0,7); g.fill(); g.beginPath(); g.roundRect(x-7,3,14,11,4); g.fill(); } }
   else if (name==='popout'){ g.lineWidth=3; g.strokeRect(-14,-6,18,18); g.beginPath(); g.moveTo(-2,-14); g.lineTo(14,-14); g.lineTo(14,2); g.stroke(); g.beginPath(); g.moveTo(-4,4); g.lineTo(13,-13); g.stroke(); }
   else { g.beginPath(); g.arc(0,0,11,0,7); g.stroke(); }
   g.restore();
@@ -2654,13 +3192,13 @@ const KEYS_DESK = {
   light: 'Left-drag a bulb: move it · + Add a light on the Lights page · Right-drag: orbit · Tab: menu',
   app: 'Files and settings · Tab: menu',
 };
-const PAGE_DRAW = {soon:drawSoon, tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, world:drawWorld, sky:drawSky,
+const PAGE_DRAW = {together:drawTogether, soon:drawSoon, tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, world:drawWorld, sky:drawSky,
   scene:drawSettings, dmotion:drawDMotion, cast:drawCast, files:drawFiles, settings:drawSettings, lights:drawLights, materials:drawMaterials, sun:drawSun, fromlayer:drawFromLayer, takes:drawTakes, path:drawPath, keys:drawKeysPage, lens:drawLens, timeline:drawTimeline, export:drawExport,
   chars:drawChars, perform:drawPerform, tracks:drawTracks, rename:drawRename};
 function drawPageWin(win){
   const W = win.cw; g = win.ctx; hits = [];
   g.clearRect(0,0,W,win.ch); rr(0,0,W,win.ch,22,'#151935');
-  win.title = (RAILS[state.phase]||[]).find(([id])=>id===win.page)?.[1] || win.page;
+  win.title = railNow().find(([id])=>id===win.page)?.[1] || win.page;
   winHeader(win, W);
   if (winVisible(win)) (PAGE_DRAW[win.page] || drawSoon)(16, W-32, PHASES.find(p=>p.id===state.phase));
   win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
@@ -2671,12 +3209,12 @@ function drawUI(){
   const ph = PHASES.find(p=>p.id===state.phase);
   g.clearRect(0,0,UIW,UIH);
   rr(0,0,UIW,UIH,26,'#151935');
-  rr(12,12,214,50,25,ph.col); txt(ph.name+' ▾', 26, 38, ph.name.length>8?19:24, '#111');
-  hit(12,12,214,50,()=>{ state.dialOpen=!state.dialOpen; requestUI(); });
+  rr(12,12,214,50,25,ph.col); txt(ph.name+(NET.guest?'':' ▾'), 26, 38, ph.name.length>8?19:24, '#111');
+  if (!NET.guest) hit(12,12,214,50,()=>{ state.dialOpen=!state.dialOpen; requestUI(); });
   drawChip();
   txt('v'+VERSION, UIW-20, 68, 11, '#5a6090','right',700);
   rr(10,76,84,UIH-88,18,'#0d1029');
-  const rail = RAILS[state.phase] || [...(PLANNED[state.phase]||[]).map(n=>['soon',n]), ['scene','Scene']];
+  const rail = (railNow().length ? railNow() : null) || [...(PLANNED[state.phase]||[]).map(n=>['soon',n]), ['scene','Scene']];
   rail.forEach(([id,label],i) => {
     const y = 84 + i*80;
     const on = id==='layers' ? state.win.layers : state.page===id;
@@ -2686,7 +3224,7 @@ function drawUI(){
     txt(label.length>8?label.slice(0,8)+'…':label, 52, y+57, 13, on?'#111':disabled?'#4a5080':'#cfd6ff','center',700);
     if (!disabled) hit(16,y,72,72,()=>openPage(id));
   });
-  if (renderer.xr.isPresenting && (RAILS[state.phase]||[]).some(([id])=>id===state.page)){
+  if (renderer.xr.isPresenting && railNow().some(([id])=>id===state.page)){
     const y = UIH-96; rr(16,y,72,72,14,'#00c7be'); icon('popout', 52, y+26, '#111'); txt('Pop out', 52, y+57, 13, '#111','center',700);
     hit(16,y,72,72,()=>popOut(state.page));
   }
@@ -3295,7 +3833,9 @@ function charRow(c, x, y, w){
   txt((c.name.length>10?c.name.slice(0,9)+'…':c.name), x+10, y+15, 15, on?'#111':'#fff'); txt(c.type, x+10, y+32, 11, on?'#3a0020':'#8f97c7','left',700);
   hit(x,y,w-bw-80,42,()=>{ state.selChar=c.id; requestUI(); });
   if (!inside){ rr(x+w-bw-78,y+4,74,34,10,'#1e6bff'); txt(c.placed?'Bring here':'Place', x+w-bw-41, y+21, 12, '#fff','center'); hit(x+w-bw-78,y+4,74,34,()=>placeChar(c)); }
-  if (c.type==='puppet'){ rr(x+w-bw,y+4,bw-4,34,10,inside?'#ffd400':'#34c759'); txt(inside?'Step out':'Step in', x+w-bw/2-2, y+21, 12, '#111','center'); hit(x+w-bw,y+4,bw-4,34,()=>{ inside ? stepOut() : stepIn(c); }); }
+  const asg = assignedTo(c);
+  if (c.type==='puppet' && asg){ rr(x+w-bw,y+4,bw-4,34,10,'#00c7be'); txt(playerName(NET.peers.get(asg)?.n||2).replace('Player ','P')+' in it', x+w-bw/2-2, y+21, 12, '#111','center'); hit(x+w-bw,y+4,bw-4,34,()=>netUnassign(asg)); }
+  else if (c.type==='puppet'){ rr(x+w-bw,y+4,bw-4,34,10,inside?'#ffd400':'#34c759'); txt(inside?'Step out':'Step in', x+w-bw/2-2, y+21, 12, '#111','center'); hit(x+w-bw,y+4,bw-4,34,()=>{ inside ? stepOut() : stepIn(c); }); }
 }
 function drawCast(X,W){
   txt('On stage', X, 100, 26);
@@ -3331,7 +3871,10 @@ function drawPerform(X,W){
   button(X,ty,tw,42,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on: your voice records with the show'); } },'#ff9500');
   button(X+tw+8,ty,tw,42,'Mirror',state.mirrorOn,()=>{ state.mirrorOn=!state.mirrorOn; if (state.mirrorOn){ placeMirror(); state.win.preview = true; } requestUI(); },'#1e6bff');
   button(X+2*(tw+8),ty,tw,42,'Camera',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
-  if (ty+80 < UIH-60) para(['Grip a character to move it; add the left grip to','stretch and turn it. Right stick: ↕ size, ↔ turn.'], X, ty+62, 13);
+  const gp = NET.host ? [...NET.peers.values()].sort((a,b)=>a.n-b.n)[0] : null;
+  if (gp && sc0 && sc0.type==='puppet'){ const who = assignedTo(sc0);
+    button(X, ty+54, W, 44, who ? 'Take '+sc0.name+' back from '+playerName(NET.peers.get(who)?.n||2) : 'Put '+playerName(gp.n)+' in '+sc0.name, !!who, ()=>{ who ? netUnassign(who) : netAssign(sc0, gp.id); }, '#00c7be'); }
+  else if (ty+80 < UIH-60) para(['Grip a character to move it; add the left grip to','stretch and turn it. Right stick: ↕ size, ↔ turn.'], X, ty+62, 13);
 }
 function drawWave(clip, x, y, w, h){
   const buf = audioBufs.get(clip.id);
@@ -3369,11 +3912,12 @@ function drawTracks(X,W){
     txt('Editing '+(vs.name||'Voice '+vs.id), X, y0+8, 14, '#ffd400','left',700);
     slider(X,y0+28,W,'Volume', vs.vol ?? 1, 0, 3, v=>{ vs.vol = +v.toFixed(2); sceneDirty=true; }, '#ff9500', Math.round((vs.vol??1)*100)+'%');
     slider(X,y0+86,W,'Starts at', vs.at || 0, 0, Math.max(5, showLength()), v=>{ vs.at = +v.toFixed(2); sceneDirty=true; }, '#ff2d95', fmtTime(vs.at||0)+'.'+String(Math.floor(((vs.at||0)%1)*10)));
+    slider(X,y0+144,W,'Pitch (lower ↔ higher)', vs.pitch||0, -12, 12, v=>{ vs.pitch = Math.round(v); sceneDirty=true; }, '#00c7be', ((vs.pitch||0)>0?'+':'')+(vs.pitch||0)+(vs.pitch ? ' notes' : ' · normal'));
     const fw = (W-32)/5;
-    VOICE_FX.forEach(([id,l],i)=> button(X+i*(fw+8), y0+146, fw, 40, l, (vs.fx||'none')===id, ()=>{ vs.fx = id; sceneDirty=true; audioPlayFrom(vs.at||0, 1, vs); requestUI(); }, '#5e2bff'));
+    VOICE_FX.forEach(([id,l],i)=> button(X+i*(fw+8), y0+204, fw, 40, l, (vs.fx||'none')===id, ()=>{ vs.fx = id; sceneDirty=true; audioPlayFrom(vs.at||0, 1, vs); requestUI(); }, '#5e2bff'));
     const hw2 = (W-8)/2;
-    button(X, y0+194, hw2, 40, '▶ Hear it', false, ()=>audioPlayFrom(vs.at||0, 1, vs), '#34c759');
-    button(X+hw2+8, y0+194, hw2, 40, '✕ Close', false, ()=>{ state.voiceSel = null; audioStop(); requestUI(); }, '#ff3b30');
+    button(X, y0+252, hw2, 40, '▶ Hear it', false, ()=>audioPlayFrom(vs.at||0, 1, vs), '#34c759');
+    button(X+hw2+8, y0+252, hw2, 40, '✕ Close', false, ()=>{ state.voiceSel = null; audioStop(); requestUI(); }, '#ff3b30');
     return;
   }
   const a = state.confirm==='clearshow';
@@ -3410,6 +3954,7 @@ function setPhase(id){
   const from = stageName(state.phase), to = stageName(id);
   if (from !== to){ captureView(from); }
   state.phase=id; state.dialOpen=false; state.page = FIRST_PAGE[id] || 'soon'; state.confirm=null; state.rename=null;
+  if (NET.guest) state.page = SCULPT_PHASES.includes(id) ? 'tools' : 'together';
   if (from !== to){ applyView(to); if (to==='studio' && !selChar() && show.chars.length) state.selChar = show.chars[0].id; }
   pathDirty = true; if (id==='edit') placeBigScreen();
   if (id==='perform' && state.mirrorOn) placeMirror();
@@ -3443,6 +3988,10 @@ legMeshL.position.set(-0.085, 0.01, 0.03); legMeshL.rotation.set(-1.1, 0.35, 0);
 legMeshR.position.set(0.085, 0.01, 0.03); legMeshR.rotation.set(-1.1, -0.35, 0);
 const BADGE = {A:'#34c759', B:'#ff3b30', X:'#1e6bff', Y:'#ffd400', T:'#ff9500', G:'#5e2bff', S:'#00c7be'};
 function legendLines(hand){
+  if (NET.guest){
+    if (hand==='L') return SCULPT_PHASES.includes(state.phase) ? [['T','open / close menu'],['X','undo'],['Y','redo']] : [['T','open / close menu']];
+    if (!SCULPT_PHASES.includes(state.phase)) return show.embodied ? [['S','where its eyes look'],['T','menu clicks']] : [['T','menu clicks'],['G','move a window']];
+  }
   const ph = state.phase, toolName = {clay: state.carve?'carve':'add clay', smooth:'smooth', paint:'paint', spray:'spray paint', doodle:'doodle', blocks:'blocks', erase:'erase'}[state.tool];
   if (hand==='L') return [['T','open / close menu'],['X','undo'],['Y','redo'],['S','fly'],['G','move / scale world']];
   const fam = pageFamily();
@@ -3890,15 +4439,15 @@ let uiCapture = null, brushRW = 0.03, orbHeld = false;
 function xrUpdate(dt){
   const L = ctrl.left, R = ctrl.right;
   const pl = L ? readPad(L) : null, pr = R ? readPad(R) : null;
-  const ph = state.phase, shoot = ph==='shoot', edit = ph==='edit', sculpt = SCULPT_PHASES.includes(ph), perform = ph==='perform', lightPh = ph==='light';
+  const ph = state.phase, guest = NET.guest, shoot = ph==='shoot' && !guest, edit = ph==='edit' && !guest, sculpt = SCULPT_PHASES.includes(ph), perform = ph==='perform' && !guest, lightPh = ph==='light' && !guest;
   const embodied = !!show.embodied;
 
   if (L && pl){
     if (edge(L,pl,'trigP')){ state.panelOpen = !state.panelOpen; pulse('left',0.2,20); }
-    if (edge(L,pl,'a')) undo();
-    if (edge(L,pl,'b')) redo();
+    if (edge(L,pl,'a') && (!guest || sculpt)) undo();
+    if (edge(L,pl,'b') && (!guest || sculpt)) redo();
     const dz = Math.abs(pl.sy) > 0.15 ? pl.sy : 0, dx = Math.abs(pl.sx) > 0.15 ? pl.sx : 0;
-    if (dz || dx){
+    if ((dz || dx) && !guest){
       camera.getWorldDirection(_d); const right = V().crossVectors(_d, _y).normalize();
       const sp = state.flySpeed * rig.scale.x * dt;
       rig.position.addScaledVector(_d, -dz*sp).addScaledVector(right, dx*sp);
@@ -3973,7 +4522,7 @@ function xrUpdate(dt){
     else twoStart(show.grab ? grabObj(show.grab) : layerGrab ? layerGrab.L.group : winGrab.win.mesh, !show.grab && !layerGrab);
   }
   else if (!twoOn && two) twoEnd(R);
-  if (!embodied) navUpdate(pl?.grip && !(show.grab || winGrab || layerGrab || blockGrab || doodleGrab), pr?.grip && !rightGripUsed); else nav = null;
+  if (!embodied && !guest) navUpdate(pl?.grip && !(show.grab || winGrab || layerGrab || blockGrab || doodleGrab), pr?.grip && !rightGripUsed); else nav = null;
   rig.updateMatrixWorld(true);
   if (two){ twoMove(); if (layerGrab) layerGrab.L.rest = poseOfObj(layerGrab.L.group); }
   else if (layerGrab && R) moveLayerGrab(unscaled(R.grip));
@@ -4109,13 +4658,17 @@ renderer.setAnimationLoop(() => {
   const tdt = Math.min(raw, 0.25);
   if (state.toastT > 0){ state.toastT -= tdt; if (state.toastT <= 0) requestUI(); }
   const xr = renderer.xr.isPresenting;
-  if (xr){ xrCameraUpdate(); xrUpdate(dt); btnColorT += raw; if (btnColorT > 0.5){ btnColorT = 0; for (const h of ['left','right']) if (ctrl[h]) colorButtons(ctrl[h].grip); } } else desktopUpdate(dt);
+  if (xr){ netFollowHost(); xrCameraUpdate(); xrUpdate(dt); btnColorT += raw; if (btnColorT > 0.5){ btnColorT = 0; for (const h of ['left','right']) if (ctrl[h]) colorButtons(ctrl[h].grip); } } else desktopUpdate(dt);
   updateRecording(tdt); updatePlay(tdt);
   applyShowPose(currentShowTime());
+  netApplyPoses();
   if (xr && show.embodied){ followRoot(tdt); updateEmbodied(); }
+  netCaptureOwn();
   updateShow(tdt);
   applyFace(tdt);
+  if (NET.guest) netApplyPoses();
   animTime += tdt; animateDoodles(animTime);
+  netTick(); netPoses(); updateAvatars(dt);
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
@@ -4186,6 +4739,8 @@ function desktopRender(){
     lights, get lightsArr(){return lights;}, addLightAt, makeLight, setLayerMat, cycleTake, drawFiles, colorButtons2:colorButtons,
     tearOff, closePageWin, pageWins, changeDetail, layerToProp, setCharScale, flipCarve, orbPick, colorButtons, findStrokeAt, startDoodleGrab, moveDoodleGrab, endDoodleGrab, guides, openRename, drawUI, ghostCam,
     ctrl, WINS, dockWin, roomWin, startWinGrab, moveWinGrab, endWinGrab, get winGrab(){return winGrab;},
+    netSend, chunkHash, netRemote, netApplyPoses, partsOf, pushUndo, rebuildStroke, makeLayer, decodeClip, applyRec, setPoseArr, poseArr, makeAvatar, updateAvatars,
+    NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
