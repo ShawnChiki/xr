@@ -54,7 +54,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.11';
+const VERSION = '0.12';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2286,6 +2286,21 @@ function poseShotCam(tk, u){
 }
 const spd = tk => tk.speed || 1;
 function filmClips(){ return shots.seq.map(id=>takeById(id)).filter(t=>t && t.keys.length); }
+// a take holds its last camera spot until the last recorded move or voice in its scene, unless you set its End yourself
+const sceneShowLen = id => { if (id===curScene || id==null) return showLength(); const sc = scenes.find(x=>x.id===id); if (!sc) return 0;
+  let L = 0; for (const k in sc.tracks||{}){ const sm = sc.tracks[k].samples; if (sm && sm.length) L = Math.max(L, sm[sm.length-9]); } for (const a of sc.audio||[]) L = Math.max(L, (a.at||0)+(a.dur||0)); return L; };
+let takeEndT = 0;
+function syncTakeEnds(force){
+  const now = performance.now(); if (!force && now - takeEndT < 400) return; takeEndT = now;
+  let ch = false;
+  for (const tk of shots.takes){
+    if (tk.autoEnd === undefined) tk.autoEnd = tk.outT <= tk.dur + 1e-3;
+    if (!tk.autoEnd) continue;
+    const want = Math.max(tk.dur, sceneShowLen(tk.sceneId));
+    if (Math.abs(want - tk.outT) > 1e-3 && want > tk.inT + 0.2){ tk.outT = want; ch = true; }
+  }
+  if (ch){ pathDirty = true; requestUI(); }
+}
 function clipLen(tk){ return Math.max(0, tk.outT - tk.inT) / spd(tk); }
 function filmLength(){ return filmClips().reduce((a,t)=>a+clipLen(t),0); }
 function filmAt(t){
@@ -2313,7 +2328,7 @@ function stopRecording(cancel){
   const before = snapShots();
   const dur = r.samples[r.samples.length-8];
   const tk = {id:shots.takeSeq++, name:'Take '+(shots.takeSeq-1), samples:r.samples, dur, smooth:state.autoSmooth, every:+(0.05 + state.autoSmooth*1.2).toFixed(2), sharp:0, sceneId:curScene, speed:1, fov:state.fov, fovTrack:null,
-              keys:[], edited:false, inT:0, outT:dur, scale:r.scale, shiftX:state.shiftX, shiftY:state.shiftY, straight:state.straight};
+              keys:[], edited:false, inT:0, outT:Math.max(dur, showLength()), autoEnd:true, scale:r.scale, shiftX:state.shiftX, shiftY:state.shiftY, straight:state.straight};
   { const fs = r.fovS; let mn = 1e9, mx = -1e9; for (let i=1;i<fs.length;i+=2){ mn = Math.min(mn, fs[i]); mx = Math.max(mx, fs[i]); }
     if (fs.length >= 4 && mx-mn > 0.5){ tk.fov = fs[1]; tk.fovTrack = [0, fs[1], ...fs.slice(2), dur, fs[fs.length-1]]; } }   // zoom you did while filming
   makeKeys(tk);
@@ -3745,15 +3760,16 @@ function drawTimeline(X,W){
     txt('Clip: '+tk.name, X, 312, 18, '#fff');
     const maxEnd = Math.max(tk.dur, showLength()) + 10;
     slider(X,330,W,'Start', tk.inT, 0, maxEnd, v=>{ tk.inT = Math.min(v, tk.outT-0.2); stopPlay(); shots.playhead = clipStart(tk); sceneDirty=true; pathDirty=true; }, '#34c759', tk.inT.toFixed(1)+' s');
-    slider(X,390,W,'End (past the camera = it holds still)', tk.outT, 0, maxEnd, v=>{ tk.outT = Math.max(v, tk.inT+0.2); stopPlay(); shots.playhead = Math.max(0, clipStart(tk) + clipLen(tk) - 0.001); sceneDirty=true; pathDirty=true; }, '#ff3b30', tk.outT.toFixed(1)+' s');
+    slider(X,390,W,'End (past the camera = it holds still)', tk.outT, 0, maxEnd, v=>{ tk.outT = Math.max(v, tk.inT+0.2); tk.autoEnd = false; stopPlay(); shots.playhead = Math.max(0, clipStart(tk) + clipLen(tk) - 0.001); sceneDirty=true; pathDirty=true; }, '#ff3b30', tk.outT.toFixed(1)+' s');
     const tw=(W-16)/3;
+    toggle(X,504,W,42,'End follows the puppets & voices',tk.autoEnd!==false,()=>{ tk.autoEnd = tk.autoEnd===false; if (tk.autoEnd) syncTakeEnds(true); sceneDirty=true; requestUI(); },'#00c7be');
     const idx = shots.seq.indexOf(tk.id);
     button(X,450,tw,44,'◀ Move',false,()=>{ if(idx>0){ const b=snapShots(); shots.seq.splice(idx,1); shots.seq.splice(idx-1,0,tk.id); pushShotsUndo(b); sceneDirty=true; requestUI(); } },'#1e6bff');
     button(X+tw+8,450,tw,44,'Move ▶',false,()=>{ if(idx<shots.seq.length-1){ const b=snapShots(); shots.seq.splice(idx,1); shots.seq.splice(idx+1,0,tk.id); pushShotsUndo(b); sceneDirty=true; requestUI(); } },'#1e6bff');
     button(X+2*(tw+8),450,tw,44,'Remove',false,()=>{ const b=snapShots(); shots.seq=shots.seq.filter(x=>x!==tk.id); shots.seqSel=null; pushShotsUndo(b); sceneDirty=true; requestUI(); },'#ff3b30');
   } else para(['Tap a clip to trim, extend or move it.'], X, 316, 15);
   const missing = shots.takes.filter(t=>!shots.seq.includes(t.id));
-  if (missing.length) button(X,504,W,42,'Add back '+missing.length+' removed take'+(missing.length>1?'s':''),false,()=>{ const b=snapShots(); for (const t of missing) shots.seq.push(t.id); pushShotsUndo(b); sceneDirty=true; requestUI(); },'#5e2bff');
+  if (missing.length) button(X,556,W,42,'Add back '+missing.length+' removed take'+(missing.length>1?'s':''),false,()=>{ const b=snapShots(); for (const t of missing) shots.seq.push(t.id); pushShotsUndo(b); sceneDirty=true; requestUI(); },'#5e2bff');
 }
 function drawExport(X,W){
   txt('Export', X, 100, 26);
@@ -3896,8 +3912,20 @@ function drawTracks(X,W){
   for (const a of show.audio) rows.push({kind:'a', a, name:(a.name||'Voice '+a.id), len:a.dur||0});
   const vs = show.audio.find(x=>x.id===state.voiceSel);
   if (!rows.length) para(['Nothing recorded yet.','Go to Perform and press Record.'], X, 140, 15);
-  else para(['Tap a row to see its path and play the show.'], X, UIH-150, 14);
-  (vs ? rows.filter(r=>r.a===vs) : rows.slice(0,9)).forEach((r,i)=>{ const y=124+i*48;
+  else para(['Tap a row to see its path and play the show.'], X, UIH-154, 14);
+  const fit = Math.floor((UIH-176-124)/48), scrolls = !vs && rows.length > fit, maxS = Math.max(0, rows.length-fit);
+  state.motionScroll = clamp(state.motionScroll||0, 0, maxS);
+  const sc = scrolls ? state.motionScroll : 0, RW = scrolls ? W-44 : W;
+  if (scrolls){   // ▲ ▼ and a bar you can drag
+    const bx = X+W-36, top = 124, bot = 124+fit*48-6, trackT = top+46, trackB = bot-46, th = Math.max(30, (trackB-trackT)*fit/rows.length), ty = trackT + (trackB-trackT-th)*(sc/maxS);
+    button(bx,top,36,40,'▲',false,()=>{ state.motionScroll = Math.max(0, sc-3); requestUI(); },'#1e6bff');
+    button(bx,bot-40,36,40,'▼',false,()=>{ state.motionScroll = Math.min(maxS, sc+3); requestUI(); },'#1e6bff');
+    rr(bx+8,trackT,20,trackB-trackT,10,'#2a3060'); rr(bx+4,ty,28,th,12,'#ffd400');
+    const setS = (px,py)=>{ state.motionScroll = Math.round(clamp((py-trackT-th/2)/Math.max(1,trackB-trackT-th),0,1)*maxS); requestUI(); };
+    hit(bx-6,trackT,48,trackB-trackT,setS,setS);
+    txt((sc+1)+'–'+Math.min(rows.length, sc+fit)+' of '+rows.length, X+W, UIH-170, 13, '#8f97c7','right',700);
+  }
+  (vs ? rows.filter(r=>r.a===vs) : rows.slice(sc, sc+fit)).forEach((r,i)=>{ const y=124+i*48, W = RW;
     const cid = r.kind==='t' ? ('rem'.includes(r.key[0]) ? +r.key.slice(1) : layerById(+r.key)?.char) : null, on = r.kind==='t' ? state.motionSel===r.key : state.voiceSel===r.a.id;
     rr(X,y,W,42,10,on?'#ff2d95':'#2a3060');
     hit(X,y,W-52,42,()=>{ if (r.kind==='a'){ state.voiceSel = state.voiceSel===r.a.id ? null : r.a.id; requestUI(); return; } if (cid!=null) state.selChar = cid; state.motionSel = r.key; motionDirty = true; show.t = 0; stopShow(); playShow(); });
@@ -4668,7 +4696,7 @@ renderer.setAnimationLoop(() => {
   applyFace(tdt);
   if (NET.guest) netApplyPoses();
   animTime += tdt; animateDoodles(animTime);
-  netTick(); netPoses(); updateAvatars(dt);
+  netTick(); netPoses(); updateAvatars(dt); syncTakeEnds();
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
@@ -4739,6 +4767,7 @@ function desktopRender(){
     lights, get lightsArr(){return lights;}, addLightAt, makeLight, setLayerMat, cycleTake, drawFiles, colorButtons2:colorButtons,
     tearOff, closePageWin, pageWins, changeDetail, layerToProp, setCharScale, flipCarve, orbPick, colorButtons, findStrokeAt, startDoodleGrab, moveDoodleGrab, endDoodleGrab, guides, openRename, drawUI, ghostCam,
     ctrl, WINS, dockWin, roomWin, startWinGrab, moveWinGrab, endWinGrab, get winGrab(){return winGrab;},
+    syncTakeEnds, clipLen, stopRecording, get recObj(){return rec;}, snapShow,
     netSend, chunkHash, netRemote, netApplyPoses, partsOf, pushUndo, rebuildStroke, makeLayer, decodeClip, applyRec, setPoseArr, poseArr, makeAvatar, updateAvatars,
     NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
