@@ -54,7 +54,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.13';
+const VERSION = '0.13.1';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -118,7 +118,7 @@ const playerName = n => n===1 ? 'Host' : 'Player '+n;
 function Em(){ this._h = {}; } Em.prototype.on = function(k,f){ (this._h[k] = this._h[k] || []).push(f); return this; }; Em.prototype.emit = function(k,...a){ (this._h[k] || []).forEach(f => f(...a)); };
 function BCConn(o, r){ Em.call(this); this.o = o; this.peer = r; this.open = false; } BCConn.prototype = Object.create(Em.prototype);
 BCConn.prototype.ready = function(){ if (this.open) return; this.open = true; setTimeout(() => this.emit('open'), 0); };
-BCConn.prototype.send = function(d){ this.o.bc.postMessage({to:this.peer, from:this.o.id, k:'data', d}); };
+BCConn.prototype.send = function(d){ if (typeof d !== 'string' || d.length > 16000) console.error('net: message too big for PeerJS', typeof d === 'string' ? d.length : typeof d); this.o.bc.postMessage({to:this.peer, from:this.o.id, k:'data', d}); };
 BCConn.prototype.close = function(){ this.o.bc.postMessage({to:this.peer, from:this.o.id, k:'close'}); };
 function BCPeer(id){ Em.call(this); this.id = id || 'g'+Math.random().toString(36).slice(2,9); this.conns = {}; this.bc = new BroadcastChannel('cmm-net');
   this.bc.onmessage = e => { const m = e.data; if (m.to !== this.id) return; const c = this.conns[m.from];
@@ -146,10 +146,32 @@ async function zipU8(u8, unzip){
   return new Uint8Array(await new Response(s).arrayBuffer());
 }
 // every send goes through one queue so things arrive in the order they happened
-function rawSend(m, to){ const send = c => { try { c.send(m); } catch(e){} };
-  if (NET.host){ if (to) { if (NET.conns[to]) send(NET.conns[to]); } else for (const id in NET.conns) if (id !== m.via) send(NET.conns[id]); }
-  else if (NET.conn) send(NET.conn); }
-function netSend(m, to){ netChain = netChain.then(async () => { const mm = typeof m === 'function' ? await m() : m; if (mm) rawSend(mm, to); }).catch(e => console.warn(e)); }
+// PeerJS drops the whole connection if one message is 16 KB or more, so everything goes as small text pieces,
+// and we wait whenever the line is backed up so a big world never floods it
+const PIECE = 4000;
+let pieceSeq = 0; const pieceBuf = new Map();
+async function sendStr(c, str){
+  const pace = async () => { const dc = c.dataChannel; let n = 0; while (dc && dc.bufferedAmount > 256*1024 && n++ < 500) await new Promise(r => setTimeout(r, 20)); };
+  if (str.length <= PIECE){ await pace(); try { c.send(str); } catch(e){} return; }
+  const id = netTag + (++pieceSeq), n = Math.ceil(str.length/PIECE);
+  for (let i=0;i<n;i++){ await pace(); if (!c.open && !NET.test) return; try { c.send('\u0001'+id+'|'+i+'|'+n+'|'+str.slice(i*PIECE, (i+1)*PIECE)); } catch(e){} }
+}
+function netDecode(d, key){
+  if (typeof d !== 'string') return d;
+  if (d.charCodeAt(0) === 1){
+    const a = d.indexOf('|'), b = d.indexOf('|', a+1), c2 = d.indexOf('|', b+1), id = key+':'+d.slice(1,a), i = +d.slice(a+1,b), n = +d.slice(b+1,c2);
+    let e = pieceBuf.get(id); if (!e){ e = {parts:new Array(n), got:0}; pieceBuf.set(id, e); }
+    if (e.parts[i] == null){ e.parts[i] = d.slice(c2+1); e.got++; }
+    if (e.got < n) return null; pieceBuf.delete(id); d = e.parts.join('');
+  }
+  try { return JSON.parse(d); } catch(e){ return null; }
+}
+async function rawSend(m, to){
+  const str = JSON.stringify(m);
+  const targets = NET.host ? (to ? [NET.conns[to]] : Object.keys(NET.conns).filter(id => id !== m.via).map(id => NET.conns[id])) : [NET.conn];
+  for (const c of targets) if (c) await sendStr(c, str);
+}
+function netSend(m, to){ netChain = netChain.then(async () => { const mm = typeof m === 'function' ? await m() : m; if (mm) await rawSend(mm, to); }).catch(e => console.warn(e)); }
 
 function netReset(){
   for (const id in NET.conns) try { NET.conns[id].close(); } catch(e){}
@@ -166,30 +188,32 @@ async function netHost(){
   const go = () => { const code = NET.test ? '1234' : String(1000 + Math.floor(Math.random()*9000)), peer = makePeer(NET_PREFIX+code); NET.peer = peer;
     peer.on('open', () => { Object.assign(NET, {host:true, on:true, synced:true, code, me:'host', n:1}); netStatus(''); toast('Room '+code+' is open. Type it in on her headset (APP → Together).'); });
     peer.on('connection', c => {
-      c.on('open', () => { if (Object.keys(NET.conns).length >= MAX_GUESTS){ try { c.send({t:'full'}); } catch(e){} setTimeout(() => c.close(), 400); return; } hostWelcome(c); });
-      c.on('data', m => { netRecvChain = netRecvChain.then(() => onNet(m, c.peer)).catch(e => console.warn(e)); });
+      c.on('open', () => { if (Object.keys(NET.conns).length >= MAX_GUESTS){ try { c.send(JSON.stringify({t:'full'})); } catch(e){} setTimeout(() => c.close(), 400); return; } hostWelcome(c); });
+      c.on('data', d => { const m = netDecode(d, c.peer); if (m) netRecvChain = netRecvChain.then(() => onNet(m, c.peer)).catch(e => console.warn(e)); });
       const drop = () => { if (!NET.conns[c.peer]) return; delete NET.conns[c.peer]; const p = NET.peers.get(c.peer);
         for (const [cid, pid] of [...NET.assign]) if (pid === c.peer){ NET.assign.delete(cid); netRemote.delete(cid); }
         if (p){ dropAvatar(p); NET.peers.delete(c.peer); toast(playerName(p.n)+' left'); }
-        rawSend({t:'bye', from:c.peer}); requestUI(); };
-      c.on('close', drop); c.on('error', drop);
+        netSend({t:'bye', from:c.peer}); requestUI(); };
+      c.on('close', drop); c.on('error', e => console.warn('net', e));   // a refused message is not someone leaving
     });
     peer.on('error', e => { if (e.type==='unavailable-id'){ try { peer.destroy(); } catch(_){} go(); return; } if (!NET.on) netStatus(netErrText(e)); });
     peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} }); };
   go();
 }
-async function netJoin(code){
+async function netJoin(code, retry){
   code = String(code||'').trim(); if (!/^\d{4}$/.test(code)) return netStatus('Type the 4-digit room code.');
-  state.mic = true; ensureMic();   // asked now, while the button press counts as a tap
-  try { await saveLocal(true); } catch(e){}
-  netReset(); NET.code = code; netStatus('Joining '+code+'…');
+  if (!retry){ state.mic = true; ensureMic(); }   // asked now, while the button press counts as a tap
+  if (!retry) try { await saveLocal(true); } catch(e){}
+  netReset(); NET.code = code; NET.retry = retry || 0; netStatus('Joining '+code+'…');
   try { await loadPeer(); } catch(e){ return netStatus("Couldn't load the together part. Check the internet."); }
   const peer = makePeer(); NET.peer = peer; let done = false;
   peer.on('open', () => { const c = peer.connect(NET_PREFIX+code, {reliable:true}); NET.conn = c;
     c.on('open', () => { done = true; NET.on = true; NET.guest = true; NET.me = peer.id; netStatus('Getting the world…'); });
-    c.on('data', m => { netRecvChain = netRecvChain.then(() => onNet(m, null)).catch(e => console.warn(e)); });
-    const gone = () => { if (!NET.on) return; netLeave(true); };
-    c.on('close', gone); c.on('error', gone); });
+    c.on('data', d => { const m = netDecode(d, 'host'); if (m) netRecvChain = netRecvChain.then(() => onNet(m, null)).catch(e => console.warn(e)); });
+    const gone = () => { if (!NET.on) return;
+      if (!NET.synced && (NET.retry||0) < 2){ const r2 = (NET.retry||0) + 1; netStatus('Connection hiccup, trying again…'); setTimeout(() => netJoin(code, r2), 1200); return; }   // dropped while loading: try again by itself
+      netLeave(true); };
+    c.on('close', gone); c.on('error', e => console.warn('net', e)); });
   peer.on('error', e => { if (!done) netStatus(netErrText(e)); });
   setTimeout(() => { if (!done && NET.code === code) netStatus("Couldn't connect. Check the code and the internet, then try again."); }, 20000);
 }
@@ -210,7 +234,7 @@ function hostWelcome(c){
   netSend({t:'welcome', n, code:NET.code}, c.peer);
   netSend(async () => {
     const d = u8ToB64(await zipU8(new TextEncoder().encode(json))), parts = Math.max(1, Math.ceil(d.length/120000));
-    for (let i=0;i<parts;i++) rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, c.peer);
+    for (let i=0;i<parts;i++) await rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, c.peer);
     return null; }, c.peer);
   netMetaSig = ''; netLastPose.clear();
   toast(playerName(n)+' joined'); requestUI();
@@ -219,7 +243,7 @@ function netResync(){   // the host opened another world: everybody gets it
   if (!NET.host) return; netLastPose.clear(); netMetaSig = '';
   const json = JSON.stringify(serialize());
   for (const id in NET.conns) netSend(async () => { const d = u8ToB64(await zipU8(new TextEncoder().encode(json))), parts = Math.max(1, Math.ceil(d.length/120000));
-    for (let i=0;i<parts;i++) rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, id); return null; }, id);
+    for (let i=0;i<parts;i++) await rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, id); return null; }, id);
 }
 
 // ---- what gets sent
@@ -323,22 +347,23 @@ async function onNet(m, from){
     case 'full': netStatus('That room is full.'); netLeave(true); return;
     case 'snap': {
       if (!NET.snapParts || m.i===0) NET.snapParts = [];
-      NET.snapParts[m.i] = m.d; if (NET.snapParts.filter(Boolean).length < m.n) return;
+      NET.snapParts[m.i] = m.d; const got = NET.snapParts.filter(Boolean).length; if (got < m.n){ netStatus('Getting the world… '+Math.round(got/m.n*100)+'%'); return; }
+      netStatus('Building the world…'); await new Promise(r => setTimeout(r, 30));
       const json = new TextDecoder().decode(await zipU8(b64ToU8(NET.snapParts.join('')), true)); NET.snapParts = null;
       netMute++; try { if (show.embodied) show.embodied = null; deserialize(JSON.parse(json)); } finally { netMute--; }
       NET.synced = true; netPose.clear(); netHash.clear(); state.page = SCULPT_PHASES.includes(state.phase) ? 'tools' : 'together';
       netStatus(''); toast("You're in! "+playerName(NET.n)+': pick a color, then draw with the trigger.'); return; }
     case 'meta': if (NET.synced) applyMeta(m); return;
-    case 'op': { netMute++; try { for (const op of m.ops) applyOp(op); } finally { netMute--; } if (NET.host) rawSend(m); return; }
-    case 'vox': await applyVox(m); if (NET.host) rawSend(m); return;
-    case 'st': applySt(m); if (NET.host) rawSend(m); return;
-    case 'sl': applySl(m); if (NET.host) rawSend(m); return;
+    case 'op': { netMute++; try { for (const op of m.ops) applyOp(op); } finally { netMute--; } if (NET.host) netSend(m); return; }
+    case 'vox': await applyVox(m); if (NET.host) netSend(m); return;
+    case 'st': applySt(m); if (NET.host) netSend(m); return;
+    case 'sl': applySl(m); if (NET.host) netSend(m); return;
     case 'pose':
       if (NET.guest){ for (const key in m.k) netPose.set(key, m.k[key]); }
       else if (m.c != null && NET.assign.get(m.c) === from) netRemote.set(m.c, {peer:from, k:m.k, f:m.f});
       return;
     case 'me': {
-      const id = NET.host ? from : m.from; if (NET.host) rawSend({...m, from});
+      const id = NET.host ? from : m.from; if (NET.host) netSend({...m, from});
       if (!NET.host && m.from==='host' && m.rig) NET.hostRig = m.rig;
       if (!NET.host && m.from===NET.me) return;
       let p = NET.peers.get(id); if (!p){ p = {id, n:m.n, av:null}; NET.peers.set(id, p); }
@@ -743,8 +768,7 @@ function applyStage(){
   const st = inStudio();
   world.visible = !st; studio.visible = st;
   if (st){ water.visible = false; scene.background = STUDIO_BG; scene.fog = null; sun.position.set(10, 26, 46); }   // the studio is lit from the front, where you stand
-  else if (sun.userData.wp) sun.position.copy(sun.userData.wp);
-  else { water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? (renderer.xr.isPresenting ? xrFogObj() : fogObj()) : null; }
+  else { water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? (renderer.xr.isPresenting ? xrFogObj() : fogObj()) : null; if (sun.userData.wp) sun.position.copy(sun.userData.wp); }
   for (const c of show.chars) c.root.visible = st ? c.id===state.selChar : c.placed;
   lightGroup.visible = !st; bulbs.visible = state.phase==='light';
   const gc = selChar(); guides.visible = st && state.showGuides && !!gc && gc.type==='puppet' && !!gc.guide;
