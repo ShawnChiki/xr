@@ -57,7 +57,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.17';
+const VERSION = '0.18';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -274,7 +274,7 @@ function metaNow(){
   return {phase:state.phase, selChar:state.selChar, aw:state.activeWorld, ap:state.activePart, world:state.world,
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     chars: show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx, voicePitch:c.voicePitch, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null})),
-    layers: layers.map(L=>({id:L.id, name:L.name, vs:L.vs, vis:L.visible, lk:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps}))};
+    layers: layers.map(L=>({id:L.id, name:L.name, vs:L.vs, vis:L.visible, lk:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps, pivot:L.pivot||null, light:!!L.light}))};
 }
 const r4 = v => Math.round(v*1e4)/1e4;
 const poseArr = o => [r4(o.position.x), r4(o.position.y), r4(o.position.z), r4(o.quaternion.x), r4(o.quaternion.y), r4(o.quaternion.z), r4(o.quaternion.w), r4(o.scale.x)];
@@ -423,7 +423,7 @@ function applyMeta(m){
       let L = layerById(ld.id); if (!L) L = makeLayer(ld.name, ld.vs, ld.id, parent);
       if (L.group.parent !== parent) parent.add(L.group);
       L.char = c ? c.id : null; L.part = c ? (ld.part || 'extra') : null;
-      L.name = ld.name; L.visible = ld.vis; L.group.visible = ld.vis; L.locked = ld.lk; L.anim = ld.anim; L.rest = ld.rest;
+      L.name = ld.name; L.visible = ld.vis; L.group.visible = ld.vis; L.locked = ld.lk; L.anim = ld.anim; L.rest = ld.rest; L.pivot = ld.pivot || null; L._ctr = null; if (!!ld.light !== !!L.light){ L.light = !!ld.light; if (!L.light) unlight(L); }
       if (ld.vs !== L.vs) clearLayerVox(L, ld.vs);
       if (JSON.stringify(ld.mat) !== JSON.stringify(L.matProps)) setLayerMat(L, ld.mat);
     }
@@ -1039,6 +1039,7 @@ const EDGES = []; for (let n=0;n<8;n++) for (const b of [1,2,4]) if(!(n&b)) EDGE
 const cd = new Float32Array(8);
 function srgb2lin(c){ return c<=0.04045 ? c/12.92 : Math.pow((c+0.055)/1.055, 2.4); }
 function meshChunk(L, ch){
+  if (L.lightMesh){ unlight(L); L._lightAt = performance.now() + 1500; }
   const VS = L.vs;
   const nbs = new Array(27);
   for (let z=-1;z<=1;z++) for (let y=-1;y<=1;y++) for (let x=-1;x<=1;x++)
@@ -1109,9 +1110,9 @@ function meshChunk(L, ch){
   geo.setIndex(pos.length/3 > 65535 ? new THREE.Uint32BufferAttribute(ind,1) : new THREE.Uint16BufferAttribute(ind,1));
   geo.computeBoundingSphere();
   if (!ch.mesh){ ch.mesh = new THREE.Mesh(geo, L.mat || clayMat); ch.mesh.userData.clay = true; L.group.add(ch.mesh); }
-  else { ch.mesh.geometry.dispose(); ch.mesh.geometry = geo; }
+  else { ch.mesh.geometry.dispose(); ch.mesh.geometry = geo; ch.mesh.visible = true; }
 }
-function dropMesh(L, ch){ if (ch.mesh){ L.group.remove(ch.mesh); ch.mesh.geometry.dispose(); ch.mesh=null; } }
+function dropMesh(L, ch){ if (L.lightMesh){ unlight(L); L._lightAt = performance.now() + 1500; } if (ch.mesh){ L.group.remove(ch.mesh); ch.mesh.geometry.dispose(); ch.mesh=null; } }
 function processRemesh(budgetMs){
   if (!dirty.size) return;
   const t0 = performance.now();
@@ -1925,7 +1926,7 @@ function newCharacter(type){
   const col = hexRgb(PALETTE[(n*3)%8]), white=[255,255,255], black=[30,30,30];
   const op = (L, t, p, r, cl) => applyOp({t, L:L.id, p:[p.x,p.y,p.z], r, s:1, col:cl});
   if (type==='puppet'){
-    const H = addPart(c,'head',0.0125); addPart(c,'lh',0.0125); addPart(c,'rh',0.0125); addPart(c,'body',0.025);   // empty: sculpt each part where the see-through guides are
+    const H = addPart(c,'head',0.0125); addPart(c,'lh',0.0125); addPart(c,'rh',0.0125); addPart(c,'body',0.025); addPart(c,'eye',0.00625);   // empty: sculpt each part where the see-through guides are
     c.guide = JSON.parse(JSON.stringify(GUIDE));
     state.activePart = H.id;
   } else {
@@ -2128,7 +2129,7 @@ function micLevel(){
 }
 // eyes turn around their own center to look (at you by default, or where you steer / recorded); mouths open with your voice
 const _fc = V();
-function partCenter(L){ const now = performance.now(); if (!L._ctr || now - L._ctrT > 1000){ L._ctrT = now; const b = new THREE.Box3(); for (const ch of L.chunks.values()) if (ch.mesh){ ch.mesh.geometry.computeBoundingBox(); b.union(ch.mesh.geometry.boundingBox); } for (const st of L.strokes) if (st._mesh){ const bb = new THREE.Box3().setFromObject(st._mesh); L.group.updateMatrixWorld(true); bb.applyMatrix4(L.group.matrixWorld.clone().invert()); b.union(bb); } L._ctr = b.isEmpty() ? null : b.getCenter(V()); } return L._ctr; }
+function partCenter(L){ if (L.pivot){ if (L._pvk !== L.pivot){ L._pvk = L.pivot; L._pv = new THREE.Vector3(...L.pivot); } return L._pv; } const now = performance.now(); if (!L._ctr || now - L._ctrT > 1000){ L._ctrT = now; const b = new THREE.Box3(); for (const ch of L.chunks.values()) if (ch.mesh){ ch.mesh.geometry.computeBoundingBox(); b.union(ch.mesh.geometry.boundingBox); } for (const st of L.strokes) if (st._mesh){ const bb = new THREE.Box3().setFromObject(st._mesh); L.group.updateMatrixWorld(true); bb.applyMatrix4(L.group.matrixWorld.clone().invert()); b.union(bb); } L._ctr = b.isEmpty() ? null : b.getCenter(V()); } return L._ctr; }
 function applyFace(dt, tPlay){
   const cam = V(); camera.getWorldPosition(cam);
   for (const c of show.chars){
@@ -2379,7 +2380,9 @@ function stopShow(){ showClock._wall = 0; if (show.playing){ show.playing = fals
 function startShowRec(){
   if (show.rec || rec) return;
   stopShow();
-  show.rec = {phase:'count', t:3, keys:new Map(), last:-1, before:snapShow(), mr:null, chunks:[]};
+  const len0 = showLength(), pa = state.punchAt, t0 = (pa != null && pa > 0.05 && pa < len0 - 0.05) ? +pa.toFixed(3) : 0; state.punchAt = null;
+  if (t0){ show.t = t0; applyShowPose(t0); }
+  show.rec = {phase:'count', t:3, t0, keys:new Map(), last:-1, before:snapShow(), mr:null, chunks:[]};
   setRecLabel('3'); pulse('right',0.4,40); requestUI();
   if (state.mic) ensureMic();
 }
@@ -2389,10 +2392,10 @@ function cutShowRec(cancel){
   if (NET.host) netSend({t:'rec', on:0, keep: r.phase==='rec' && !cancel});
   if (r.phase!=='rec' || cancel){ if (r.mr && r.mr.state!=='inactive') r.mr.stop(); requestUI(); return; }
   let n = 0;
-  for (const [key, samples] of r.keys){ if (samples.length >= 18){ show.tracks[key] = {samples}; n++; } }
+  for (const [key, samples] of r.keys){ if (samples.length >= 18){ const old = show.tracks[key]; show.tracks[key] = {samples: r.t0 > 0 && old && old.samples.length ? punchSplice(old.samples, samples, r.t0, r.t) : samples}; n++; } }
   let clip = null;
   if (r.mr){
-    clip = {id: show.audioSeq++, b64:null, mime:r.mr.mimeType, dur:r.t}; voiceFromChar(clip, r.who);
+    clip = {id: show.audioSeq++, b64:null, mime:r.mr.mimeType, dur:r.t - (r.t0||0), at:r.t0||0}; voiceFromChar(clip, r.who);
     show.audio.push(clip);
     r.mr.onstop = async () => {
       const blob = new Blob(r.chunks, {type: r.mr.mimeType || 'audio/webm'});
@@ -2405,7 +2408,7 @@ function cutShowRec(cancel){
   if (!n && !clip){ toast('Nothing moved or spoken: grab a character, step into a puppet, or use Voice only'); requestUI(); return; }
   if (show.grab) show.grab.before = snapShow();
   pushUndo({type:'show', snap:r.before}); sceneDirty = true;
-  toast('Recorded '+fmtTime(r.t)+(n?' · '+n+' moving part'+(n>1?'s':''):'')+(clip?' · voice':'')); requestUI();
+  toast((r.t0 > 0 ? 'Redid '+fmtTime(r.t0)+'–'+fmtTime(r.t) : 'Recorded '+fmtTime(r.t))+(n?' · '+n+' moving part'+(n>1?'s':''):'')+(clip?' · voice':'')); requestUI();
 }
 function realDt(o){ const now = performance.now(), d = o._wall ? Math.min(2, (now - o._wall)/1000) : 0; o._wall = now; return d; }
 const showClock = {};
@@ -2415,7 +2418,7 @@ function updateShow(dt){
     if (r.phase==='count'){
       r.t -= dt; const n = Math.ceil(r.t); if (n>0){ setRecLabel(String(n)); if (n!==r.lastN){ r.lastN = n; beep(660); } }
       if (r.t <= 0){
-        r.phase='rec'; r.t=0; show.t=0; r._wall = performance.now(); pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(0); if (NET.host) netSend({t:'rec', on:1});
+        r.phase='rec'; r.t=r.t0||0; show.t=r.t; r._wall = performance.now(); pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(r.t); if (NET.host) netSend({t:'rec', on:1});
         if (state.mic && micStream && window.MediaRecorder){
           try { r.mr = micRecorder(); r.mr.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); }; r.mr.start(250); } catch(e){ toast('Mic recording failed'); }
         }
@@ -2431,7 +2434,8 @@ function updateShow(dt){
         const o = objForKey(key); if (!o) continue;
         let arr = r.keys.get(key);
         if (!arr){ arr = []; r.keys.set(key, arr);
-          if (r.t > 0.05){ const tr = show.tracks[key]; let p0;
+          if (r.t0 > 0 && !(show.tracks[key] && show.tracks[key].samples.length)){ const p0 = [...o.rest.p, ...o.rest.q, o.rest.s]; arr.push(0, ...p0, Math.max(0, +(r.t-0.02).toFixed(4)), ...p0); }
+          else if (!r.t0 && r.t > 0.05){ const tr = show.tracks[key]; let p0;
             if (tr && tr.samples.length){ const s = trackAt(tr, 0, _tp, _tq2); p0 = [_tp.x,_tp.y,_tp.z,_tq2.x,_tq2.y,_tq2.z,_tq2.w,s]; }
             else p0 = [...o.rest.p, ...o.rest.q, o.rest.s];
             arr.push(0, ...p0); } }
@@ -3181,7 +3185,7 @@ function serialize(){
     show: {music:show.music, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null})),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx||'none', voicePitch:c.voicePitch||0, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
-      id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps,
+      id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps, pivot:L.pivot||null, light:!!L.light,
       chunks: [...L.chunks.values()].filter(ch => ch.d && ch.d.some(v=>v>-DMAX+0.01)).map(ch => {
         const q = new Int8Array(CN3); for (let i=0;i<CN3;i++) q[i]=Math.round(ch.d[i]/DMAX*127);
         return {k:ch.k, d:u8ToB64(rleEnc(new Uint8Array(q.buffer),1)), c:u8ToB64(rleEnc(ch.c,3))};
@@ -3207,7 +3211,7 @@ function deserialize(o){
     const L = makeLayer(ld.name, ld.vs || 0.1, ld.id, c ? c.root : world); L.visible=ld.visible; L.locked=ld.locked; L.group.visible=L.visible;
     if (c){ L.char = c.id; L.part = ld.part || 'extra'; }
     if (ld.rest) L.rest = ld.rest;
-    L.anim = !!ld.anim;
+    L.anim = !!ld.anim; L.pivot = ld.pivot || null; L.light = !!ld.light;
     if (ld.mat) setLayerMat(L, ld.mat);
     for (const cd of ld.chunks){
       const [cx,cy,cz] = cd.k.split(',').map(Number);
@@ -3574,11 +3578,12 @@ function orbPick(pW){ const r0 = orbPick0(pW); if (r0) orbHitL.copy(orb.worldToL
 const orbHitL = new THREE.Vector3();
 function orbPick0(pW){
   const p = orb.worldToLocal(pW.clone());
+  const p18 = orbPickV18(p); if (p18 !== undefined) return p18;
   if (state.pickStyle==='wheel'){
     if (Math.abs(p.z) > 0.025) return null;
     const r = Math.hypot(p.x, p.y);
     if (r <= WHEEL_R*1.05) return hslHex(((Math.atan2(p.y,p.x)/(Math.PI*2))+1)%1, clamp(r/WHEEL_R,0,1), wheelDrawnL);
-    if (Math.abs(p.x - barMesh.position.x) < 0.012 && Math.abs(p.y) < WHEEL_R*1.05){ const o = curHSL(); return hslHex(o.h, o.s < 0.05 ? 0.85 : o.s, clamp((p.y+WHEEL_R)/(WHEEL_R*2),0,1)); }
+    if (Math.abs(p.x - barMesh.position.x) < 0.018 && Math.abs(p.y) < WHEEL_R*1.05){ const o = curHSL(); return hslHex(o.h, o.s < 0.05 ? 0.85 : o.s, clamp((p.y+WHEEL_R)/(WHEEL_R*2),0,1)); }
     return null;
   }
   if (state.pickStyle==='chips'){
@@ -3594,7 +3599,7 @@ function orbPick0(pW){
 function orbPickRay(o, d){
   orb.updateMatrixWorld(true);
   const inv = orb.matrixWorld.clone().invert(), lo = o.clone().applyMatrix4(inv), ld = d.clone().transformDirection(inv);
-  if (state.pickStyle==='dots'){ const t = -lo.dot(ld); if (t <= 0) return null; const pL = lo.clone().addScaledVector(ld, t); return orbPick(pL.applyMatrix4(orb.matrixWorld)); }
+  if (state.pickStyle==='dots'){ const t = -lo.dot(ld); if (t <= 0) return null; const pL = lo.clone().addScaledVector(ld, t); const r0 = orbPick(pL.applyMatrix4(orb.matrixWorld)); if (r0) return r0; }
   if (Math.abs(ld.z) < 1e-4) return null; const t = -lo.z/ld.z; if (t <= 0) return null;
   return orbPick(lo.clone().addScaledVector(ld, t).applyMatrix4(orb.matrixWorld));
 }
@@ -3604,10 +3609,11 @@ function updateOrb(){
   if (pw) host = pw; else if (menuWin.mesh.visible && !state.dialOpen && (state.page==='color' || SCULPT_PHASES.includes(state.phase))) host = menuWin;
   if (!host || !renderer.xr.isPresenting || state.orbPos==='off'){ orb.visible = false; return; }
   if (orb.parent !== host.mesh) host.mesh.add(orb);
-  pickWheel.visible = state.pickStyle==='wheel'; pickDots.visible = state.pickStyle==='dots'; pickChips.visible = state.pickStyle==='chips';
+  pickWheel.visible = state.pickStyle==='wheel'; pickDots.visible = state.pickStyle==='dots'; pickChips.visible = state.pickStyle==='chips'; pickHSV.visible = state.pickStyle==='hsv';
+  if (pickHSV.visible) drawHSV(); diceMesh.position.set(dicePos(), 0, 0.002); if (diceDrawn === null) drawDice(!!state.randColor, false);
   if (pickWheel.visible){ const o = curHSL(), l = clamp(o.l, 0.15, 0.85); if (Math.abs(l-wheelDrawnL) > 0.03) drawWheel(l); if (Math.abs(o.h-barDrawnH) > 0.02 && o.s > 0.05) drawBar(o.h); if (barDrawnH < 0) drawBar(0); }
   const top = host.mesh.geometry.parameters.height/2;
-  const off = state.pickStyle==='chips' ? 0.05 : state.pickStyle==='wheel' ? 0.07 : 0.065;
+  const off = state.pickStyle==='chips' ? 0.05 : state.pickStyle==='wheel' ? 0.07 : state.pickStyle==='hsv' ? 0.05 : 0.065;
   orb.position.set(0, state.orbPos==='above' ? top + off : -(top + off), 0.03); orb.visible = true;
 }
 // window grabbing (rig-local so it stays put in your room)
@@ -3768,7 +3774,7 @@ function drawUI(){
   if (state.dialOpen) drawDial();
   menuWin.hits = hits; menuWin.tex.needsUpdate = true;
   document.getElementById('keys').innerHTML = KEYS_DESK[state.phase] || KEYS_DESK.build;
-  drawLayersWin(); drawPreviewHead(); for (const w of pageWins) drawPageWin(w); drawLegends();
+  if (winVisible(layersWin)) drawLayersWin(); drawPreviewHead(); for (const w of pageWins) if (winVisible(w)) drawPageWin(w); drawLegends();
   if (window.__edReady && state.phase==='edit') drawEditorWin();
 }
 function winHeader(win, W){
@@ -3798,7 +3804,11 @@ function drawLayersWin(){
     if (pu.length){ E.push({h:'CHARACTERS'}); for (const c of pu) E.push({c}); }
   }
   if (studioMode && !sc) para(['Make a character first','on the Characters page.'], 16, 80, 16);
-  const top = 54, bottom = H - 4*48 - 12, rowH = e => e.h ? 24 : 46;
+  const pup = studioMode && sc && sc.type==='puppet', diag = pup && state.partView !== 'list';
+  const top = pup ? 92 : 54, bottom = H - 5*48 - 12, rowH = e => e.h ? 24 : 46;
+  if (pup){ const tw = (W-32)/2; button(12,52,tw,32,'Drawing',diag,()=>{ state.partView='body'; requestUI(); },'#ff9500'); button(20+tw,52,tw,32,'List',!diag,()=>{ state.partView='list'; requestUI(); },'#ff9500'); }
+  if (diag){ E.length = 0; drawPartsDiagram(sc, 12, top, W-24, bottom-top-6); }
+  const dupName = L => { const same = E.filter(e=>e.L && e.L.part===L.part); return same.length > 1 ? ' '+(same.findIndex(e=>e.L===L)+1) : ''; };
   const fits = E.reduce((a,e)=>a+rowH(e),0) <= bottom-top;
   state.layScroll = fits ? 0 : clamp(state.layScroll||0, 0, Math.max(0, E.length-2));
   if (!fits){ rr(118,8,34,32,10,'#2a3060'); txt('▲',135,25,15,'#fff','center'); hit(118,8,34,32,()=>{ state.layScroll = Math.max(0,state.layScroll-3); requestUI(); });
@@ -3811,8 +3821,8 @@ function drawLayersWin(){
     else if (e.L){
       const L = e.L, on = activeLayer()===L;
       rr(12,y,W-24,42,10,on?'#ff9500':'#2a3060');
-      txt(tr(studioMode ? (PART_NAMES[L.part]||L.name) : L.name, 15), 22, y+15, 16, on?'#111':'#fff');
-      txt('detail '+fmtLen(L.vs), 22, y+32, 11, on?'#3a2000':'#8f97c7','left',700);
+      txt(tr(studioMode ? (PART_NAMES[L.part]||L.name)+dupName(L) : L.name, 15), 22, y+15, 16, on?'#111':'#fff');
+      txt('detail '+fmtLen(L.vs)+(L.light ? ' · light' : ''), 22, y+32, 11, on?'#3a2000':'#8f97c7','left',700);
       hit(12,y,W-120,42,()=>{ setActive(L); L.flashT = 0.7; });
       rr(W-104,y+4,42,34,10,L.visible?'#1e6bff':'#0d1029'); txt(L.visible?'👁':'—', W-83, y+21, 16,'#fff','center');
       hit(W-104,y+4,42,34,()=>{ L.visible=!L.visible; L.group.visible=L.visible; sceneDirty=true; requestUI(); });
@@ -3852,6 +3862,9 @@ function drawLayersWin(){
     if (studioMode) button(12+hw+8,yb+96,hw,42,'Guides '+(state.showGuides?'on':'off'),state.showGuides,()=>{ state.showGuides=!state.showGuides; requestUI(); },'#00c7be');
     else button(12+hw+8,yb+96,hw,42,'Make it a prop',false,()=>layerToProp(activeLayer()),'#ff2d95');
     button(12,yb+144,hw,42,'✥ Move '+(state.moveLayer?'on':'off'),state.moveLayer,()=>{ state.moveLayer=!state.moveLayer; if (state.moveLayer) toast('Touch the picked layer with your brush and grip to move it (add left grip to stretch)'); requestUI(); },'#ff9500');
+    const AL = activeLayer();
+    button(12,yb+192,hw,42,'Smooth all',false,()=>smoothLayer(AL),'#00c7be');
+    button(12+hw+8,yb+192,hw,42,'Lighten '+(AL && AL.light ? 'on' : 'off'),!!(AL && AL.light),()=>toggleLight(AL),'#34c759');
     if (studioMode) button(12+hw+8,yb+144,hw,42,'Center it',false,()=>centerPart(activeLayer()),'#ff9500');
     else { const L = activeLayer(); button(12+hw+8,yb+144,hw,42,'Animates '+(L?.anim?'on':'off'),!!L?.anim,()=>{ if (!L) return; L.anim=!L.anim; if (!L.anim){ delete show.tracks[String(L.id)]; } sceneDirty=true; toast(L.anim ? '"'+L.name+'" can now be grabbed and recorded in PERFORM' : '"'+L.name+'" stays still'); requestUI(); },'#ff2d95'); }
   }
@@ -3954,7 +3967,7 @@ function cycleFamily(d){
   toast({sculpt:'Sculpt', doodle:'Doodle', blocks:'Blocks'}[nx]); pulse('right',0.35,25); requestUI();
 }
 function curHSL(){ const o = {}; new THREE.Color(state.color).getHSL(o); return o; }
-function pickColor(c){ state.color = c; if (state.randColor){ state.randColor = false; toast('Random colors off: you picked one'); } }
+function pickColor(c){ state.color = c; if (hsvCand && hsvCand.hex===c) hsvMem = hsvCand; if (state.randColor){ state.randColor = false; toast('Random colors off: you picked one'); } }
 function setHSL(h,s2,l){ pickColor('#'+new THREE.Color().setHSL(h,s2,l).getHexString()); requestUI(); }
 function addRecent(hex){ state.recent = [hex, ...(state.recent||[]).filter(c=>c!==hex)].slice(0,10); }
 function drawColor(X,W){
@@ -3969,18 +3982,19 @@ function drawColor(X,W){
   const hy = 270; txt('Hue', X, hy-6, 16, '#cfd6ff','left',700);
   const gr = g.createLinearGradient(X,0,X+W,0); for (let h=0; h<=360; h+=30) gr.addColorStop(h/360, hsl(h,0.5));
   g.beginPath(); g.roundRect(X,hy+8,W,26,13); g.fillStyle = gr; g.fill();
-  g.beginPath(); g.arc(clamp(X+o.h*W,X+13,X+W-13), hy+21, 14, 0, 7); g.strokeStyle = '#fff'; g.lineWidth = 4; g.stroke();
-  const setH = px => setHSL(clamp((px-X)/W,0,1), o.s<0.05 ? 0.85 : o.s, (o.l<0.05||o.l>0.95) ? 0.5 : o.l);
+  g.beginPath(); g.arc(clamp(X+curHSV().h*W,X+13,X+W-13), hy+21, 14, 0, 7); g.strokeStyle = '#fff'; g.lineWidth = 4; g.stroke();
+  const setH = px => { const hv0 = curHSV(), h = clamp((px-X)/W,0,1), s2 = hv0.s < 0.05 ? 0.85 : hv0.s, v = hv0.v < 0.1 ? 0.9 : hv0.v, hex = hsvHex(h, s2, v); hsvCand = {h, s:s2, v, hex}; pickColor(hex); requestUI(); };
   hit(X-10,hy-2,W+20,46,setH,setH);
-  slider(X,326,W,'Vivid ↔ gray', o.s, 0, 1, v=>setHSL(o.h, v, o.l), state.color);
-  slider(X,388,W,'Dark ↔ light', o.l, 0, 1, v=>setHSL(o.h, o.s, v), state.color);
+  const hv = curHSV(), setV = (h,s2,v) => { const hex = hsvHex(h,s2,v); hsvCand = {h, s:s2, v, hex}; pickColor(hex); requestUI(); };
+  slider(X,326,W,'Saturation', hv.s, 0, 1, v=>setV(hv.h, v, hv.v), state.color);
+  slider(X,388,W,'Value (dark ↔ bright)', hv.v, 0, 1, v=>setV(hv.h, hv.s, v), state.color);
   const rec = state.recent || [];
   if (rec.length){ txt('Used lately', X, 456, 16, '#cfd6ff','left',700);
     const rw = (W-9*6)/10; rec.slice(0,10).forEach((c,i)=>{ const x = X+i*(rw+6); rr(x,470,rw,30,8,c); hit(x,470,rw,30,()=>{ pickColor(c); requestUI(); }); }); }
   if (renderer.xr.isPresenting){
     txt('Pick in the air with:', X, 520, 15, '#cfd6ff','left',700);
-    const tw=(W-16)/3;
-    [['wheel','Wheel'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),532,tw,40,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
+    const tw=(W-24)/4;
+    [['wheel','Wheel'],['hsv','Sliders'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),532,tw,40,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
   }
 }
 const DOODLES = [['slide','Slide'],['tube','Tube'],['ribbon','Ribbon'],['neon','Neon'],['coil','Coil'],['chain','Chain'],['beads','Beads'],['cubes','Cubes'],['dashes','Dashes'],['fuzz','Fuzz'],['stars','Stars'],['dots','Balls'],['confetti','Confetti'],['flames','Flames'],['snow','Snow'],['crystal','Crystal'],['holes','Black holes']];
@@ -4306,59 +4320,49 @@ function drawFromLayer(X,W){
 }
 function drawChars(X,W){
   txt('Characters', X, 100, 26);
-  const hw=(W-8)/2, tw4=(W-24)/4;
+  const hw=(W-8)/2, tw4=(W-24)/4, t3=(W-16)/3;
   button(X,122,tw4,46,'+ Puppet',false,()=>newCharacter('puppet'),'#34c759');
   button(X+tw4+8,122,tw4,46,'+ Prop',false,()=>newCharacter('prop'),'#00c7be');
   button(X+2*(tw4+8),122,tw4,46,'From layer',false,()=>{ state.page='fromlayer'; requestUI(); },'#ff2d95');
   button(X+3*(tw4+8),122,tw4,46,'Other worlds',false,()=>{ state.impWorld = null; state.page='charimport'; requestUI(); },'#5e2bff');
-  if (!show.chars.length){ para(['This is your character studio: it has','its own space and your own size here,','separate from the world.','','Puppet: a head and two hands you can','step inside. Prop: one piece you grab','and move around. From layer: turn a world','layer into a prop. Other worlds: bring in','characters you made before.'], X, 196, 14); return; }
+  if (!show.chars.length){ para(['This is your character studio: it has','its own space and your own size here,','separate from the world.','','Puppet: a head, an eye and two hands you','can step inside. Prop: one piece you grab','and move around. From layer: turn a world','layer into a prop. Other worlds: bring in','characters you made before.'], X, 196, 14); return; }
   let c = selChar(); if (!c){ state.selChar = show.chars[show.chars.length-1].id; c = selChar(); }
-  const pick = d => { cycleChar(d); const c2 = selChar(); state.activePart = c2 ? (partsOf(c2)[0]?.id ?? null) : null; state.partPage = 0; requestUI(); };
-  button(X,176,40,44,'◀',false,()=>pick(-1),'#34c759');
+  const pickC = d => { cycleChar(d); const c2 = selChar(); state.activePart = c2 ? (partsOf(c2)[0]?.id ?? null) : null; requestUI(); };
+  button(X,176,40,44,'◀',false,()=>pickC(-1),'#34c759');
   rr(X+46,176,W-92,44,10,'#34c759'); txt(c.name.length>16 ? c.name.slice(0,15)+'…' : c.name, X+58, 198, 17, '#111'); hit(X+46,176,W-92,44,()=>openRename('char', c.id));
   txt((show.chars.indexOf(c)+1)+'/'+show.chars.length, X+W-56, 198, 12, '#0b3a17','right',700);
-  button(X+W-40,176,40,44,'▶',false,()=>pick(1),'#34c759');
-  const parts = partsOf(c), list = state.partView === 'list' || c.type !== 'puppet';
-  if (c.type==='puppet'){ button(X+W-150,228,72,26,'Body',!list,()=>{ state.partView='body'; requestUI(); },'#ff9500'); button(X+W-72,228,72,26,'List',list,()=>{ state.partView='list'; requestUI(); },'#ff9500'); }
-  txt('Sculpt which part?', X, 242, 15, '#cfd6ff','left',700);
-  let yb;
-  if (!list){
-    drawBodyDiagram(c, X, 260, W, 232);
+  button(X+W-40,176,40,44,'▶',false,()=>pickC(1),'#34c759');
+  const aL = activeLayer(); let y = 230;
+  if (!state.win.layers){ button(X,y,W,40,'Show the parts drawing (Layers window)',false,()=>{ state.win.layers = true; requestUI(); },'#ff9500'); y += 48; }
+  else { txt('Pick a part to sculpt in the Layers window drawing.', X, y+12, 13, '#8f97c7','left',700); y += 30; }
+  if (c.type==='puppet'){
+    button(X,y,t3,40,'+ Eye',false,()=>{ const E = addPart(c,'eye',0.00625); state.activePart = E.id; toast('New eye: sculpt it on the face, or use Copy eye'); requestUI(); },'#00c7be');
+    button(X+t3+8,y,t3,40,'+ Mouth',false,()=>{ const M2 = addPart(c,'mouth',0.00625); state.activePart = M2.id; toast('Sculpt a mouth. It opens with your voice when you step in.'); requestUI(); },'#00c7be');
+    button(X+2*(t3+8),y,t3,40,'Copy eye ↔',false,()=>{ if (aL && aL.part==='eye') copyEye(aL); else toast('Pick an eye first'); },'#1e6bff');
+    y += 48;
+    button(X,y,hw,40,'Mirror R hand → L',false,()=>mirrorHand('rh'),'#5e2bff');
+    button(X+hw+8,y,hw,40,'Mirror L hand → R',false,()=>mirrorHand('lh'),'#5e2bff');
+    y += 48;
+    const fp = aL && (aL.part==='eye' || aL.part==='mouth'), pn = fp ? PART_NAMES[aL.part].toLowerCase() : 'eye/mouth';
+    button(X,y,hw,40, state.pivotFor ? 'Brush: tap its center…' : 'Set '+pn+' center', !!state.pivotFor, ()=>{ if (!fp){ toast('Pick an eye or a mouth first'); return; } if (!renderer.xr.isPresenting){ toast('Do this in the headset'); return; } state.pivotFor = state.pivotFor ? null : aL.id; if (state.pivotFor) toast('Pull the trigger where the '+pn+' should turn around (pink dot)'); requestUI(); },'#ff2d95');
+    button(X+hw+8,y,hw,40,'Auto center'+(fp && aL.pivot ? '' : ' ✓'),false,()=>{ if (fp && aL.pivot){ aL.pivot = null; aL._ctr = null; sceneDirty = true; toast('The '+pn+' turns around its middle again'); requestUI(); } },'#2a3060');
+    y += 52;
     const A = armsOf(c), aw = (W-46-24)/4;
-    txt('Arms', X, 515, 14, '#cfd6ff','left',800);
-    ARM_STYLES.forEach(([id,l],i)=> button(X+46+i*(aw+8), 500, aw, 30, l, A.style===id, ()=>{ A.style = id; sceneDirty = true; requestUI(); }, '#ffd400'));
-    yb = 538;
-    if (A.style !== 'none'){ slider(X,yb,(W-8)*0.55,'Thickness', A.thick, 0.005, 0.08, v=>{ A.thick = +v.toFixed(4); sceneDirty = true; }, '#ffd400', fmtLen(A.thick*2));
-      button(X+(W-8)*0.55+8,yb+6,(W-8)*0.45,34,'Color = brush',false,()=>{ A.col = state.color; sceneDirty = true; requestUI(); },'#ff2d95');
-      button(X,yb+50,W,34,'Set shoulders (hold controllers there)',false,()=>startSetShoulders(),'#5e2bff'); yb += 92; }
-    const aL = activeLayer(), ac2 = state.confirm==='clearpart', t4 = (W-24)/4, a = state.confirm==='delchar';
-    button(X,yb,t4,38,ac2?'Tap again':'Clear part',ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(aL); },'#ff9500');
-    button(X+t4+8,yb,t4,38,'Copy eye',false,()=>{ if (aL && aL.part==='eye') copyEye(aL); else toast('Pick an eye in the drawing first'); },'#1e6bff');
-    button(X+2*(t4+8),yb,t4,38,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
-    button(X+3*(t4+8),yb,t4,38,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
-    return;
+    txt('Arms', X, y+15, 14, '#cfd6ff','left',800);
+    ARM_STYLES.forEach(([id,l],i)=> button(X+46+i*(aw+8), y, aw, 30, l, A.style===id, ()=>{ A.style = id; sceneDirty = true; requestUI(); }, '#ffd400'));
+    y += 38;
+    if (A.style !== 'none'){ slider(X,y,(W-8)*0.55,'Thickness', A.thick, 0.005, 0.08, v=>{ A.thick = +v.toFixed(4); sceneDirty = true; }, '#ffd400', fmtLen(A.thick*2));
+      button(X+(W-8)*0.55+8,y+6,(W-8)*0.45,34,'Color = brush',false,()=>{ A.col = state.color; sceneDirty = true; requestUI(); },'#ff2d95');
+      button(X,y+50,W,34,'Set shoulders (hold controllers there)',false,()=>startSetShoulders(),'#5e2bff'); y += 92; }
   }
-  const per = 8, pages = Math.max(1, Math.ceil(parts.length/per)); state.partPage = clamp(state.partPage||0, 0, pages-1);
-  if (pages > 1){ button(X+W-236,228,34,26,'◀',false,()=>{ state.partPage--; requestUI(); },'#ff9500'); button(X+W-196,228,34,26,'▶',false,()=>{ state.partPage++; requestUI(); },'#ff9500'); }
-  const nm = L => { const same = parts.filter(P=>P.part===L.part); const base = PART_NAMES[L.part]||L.part; return same.length > 1 ? base+' '+(same.indexOf(L)+1) : base; };
-  const pw = (W-24)/4;
-  parts.slice(state.partPage*per, state.partPage*per+per).forEach((L,i)=>{ const x = X+(i%4)*(pw+8), y = 262+Math.floor(i/4)*44;
-    button(x,y,pw,38,nm(L), activeLayer()===L, ()=>{ setActive(L); L.flashT = 0.7; },'#ff9500'); });
-  yb = 354;
-  const t3c = (W-16)/3, aL = activeLayer();
-  button(X,yb,t3c,38,'+ Eye',false,()=>{ const E = addPart(c,'eye',0.00625); state.activePart = E.id; state.partPage = 99; toast('Sculpt one eye on the face. Then "Copy eye" puts one on the other side.'); requestUI(); },'#00c7be');
-  button(X+t3c+8,yb,t3c,38,'+ Mouth',false,()=>{ const M2 = addPart(c,'mouth',0.00625); state.activePart = M2.id; state.partPage = 99; toast('Sculpt a mouth. It opens with your voice when you step in.'); requestUI(); },'#00c7be');
-  button(X+2*(t3c+8),yb,t3c,38,'Copy eye',false,()=>{ if (aL && aL.part==='eye'){ copyEye(aL); state.partPage = 99; } else toast('Pick an eye part first'); },'#1e6bff');
-  yb += 48;
-  const ac2 = state.confirm==='clearpart';
-  button(X,yb,W,40,ac2?'Tap again to clear it':'Clear '+(aL ? nm(aL) : 'this part'),ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(activeLayer()); },'#ff9500');
-  yb += 48;
-  const a = state.confirm==='delchar';
-  button(X,yb,hw,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
-  button(X+hw+8,yb,hw,42,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
+  drawWeight(X, y+4, W, c);
+  const ac2 = state.confirm==='clearpart', a = state.confirm==='delchar';
+  button(X,UIH-56,t3,42,ac2?'Tap again':'Clear part',ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(activeLayer()); },'#ff9500');
+  button(X+t3+8,UIH-56,t3,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
+  button(X+2*(t3+8),UIH-56,t3,42,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
 }
 function cycleTake(d){ const T = sceneTakes(), n = T.length; if (!n) return; const i = T.findIndex(t=>t.id===shots.sel); shots.sel = T[((i<0?0:i)+d+n)%n].id; shots.keySel=-1; pathDirty=true; requestUI(); }
-function cycleChar(d){ const n = show.chars.length; if (!n) return; const i = show.chars.findIndex(c=>c.id===state.selChar); state.selChar = show.chars[((i<0?0:i)+d+n)%n].id; requestUI(); }
+function cycleChar(d){ const n = show.chars.length; if (!n) return; const i = show.chars.findIndex(c=>c.id===state.selChar); const c = show.chars[((i<0?0:i)+d+n)%n]; state.selChar = c.id; for (const P of partsOf(c)) P.flashT = 0.9; requestUI(); }
 function charRow(c, x, y, w){
   const on = c.id===state.selChar, inside = show.embodied && show.embodied.c===c, bw = c.type==='puppet' ? 70 : 0;
   rr(x,y,w,42,10,on?'#ff2d95':'#2a3060');
@@ -4381,11 +4385,14 @@ function drawPerform(X,W){
   const hw = (W-8)/2;
   sceneRow(X,W,116);
   const t3 = (W-16)/3;
-  button(X,166,t3,46, show.rec ? '■ Cut (A)' : '● Record (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
+  const punch = !show.rec && state.punchAt != null && state.punchAt > 0.05 && state.punchAt < showLength() - 0.05;
+  button(X,166,t3,46, show.rec ? '■ Cut (A)' : punch ? '● Redo from '+fmtTime(state.punchAt) : '● Record (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
   button(X+t3+8,166,t3,46, '🎤 Voice only', false, async ()=>{ if (show.rec) return; state.mic = true; const m = await ensureMic(); if (m){ startShowRec(); const sc0 = selChar(); if (show.rec && sc0 && partsOf(sc0).some(L=>L.part==='mouth')){ show.rec.voiceFor = sc0.id; toast(sc0.name+"'s mouth moves with your voice"); } else toast('Just your voice: the show plays while you talk'); } }, '#ff9500');
   button(X+2*(t3+8),166,t3,46, show.playing ? '■ Stop (B)' : '▶ Play (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
   const len = Math.max(showLength(), 0.1);
-  slider(X,226,W,'Show time', show.t, 0, len, v=>{ if (!show.rec){ show.t=v; stopShow(); } }, '#ff2d95', fmtTime(show.t)+' / '+fmtTime(showLength()));
+  txt(punch ? 'Record redoes from the red mark on' : 'Show time · tap to pick a redo spot', X, 232, 14, '#cfd6ff','left',700); txt(fmtTime(show.t)+' / '+fmtTime(showLength()), X+W-48, 232, 14, '#ffd400','right',700);
+  drawPerformTimeline(X, 246, W-48);
+  button(X+W-40,244,40,38,'⏮',false,()=>{ if (!show.rec){ show.t = 0; state.punchAt = null; stopShow(); requestUI(); } },'#2a3060');
   // which camera shot you're looking through
   txt('Camera shot', X, 290, 16, '#cfd6ff','left',700);
   const tk = selTake();
@@ -4410,7 +4417,9 @@ function drawPerform(X,W){
     if (cc) button(X+96,y,W-96,42,'In '+cc.name+' · take out',true,()=>netUnassign(p.id),'#00c7be');
     else if (sc0 && sc0.type==='puppet' && !assignedTo(sc0)) button(X+96,y,W-96,42,'Put in '+sc0.name,false,()=>netAssign(sc0, p.id),'#00c7be');
     else txt(sc0 && sc0.type==='puppet' ? 'pick a free puppet ◀ ▶' : 'pick a puppet ◀ ▶', X+96, y+21, 13, '#8f97c7','left',700); });
-  else if (ty+80 < UIH-60) para(['Grip a character to move it; add the left grip to','stretch and turn it. Right stick: ↕ size, ↔ turn.'], X, ty+62, 13);
+  const cy2 = ty + 52 + gps.length*48;
+  if (cy2 + 40 < UIH-12) toggle(X, cy2, W, 40, 'In a puppet, grip on nothing climbs', !!state.climb, ()=>{ state.climb = !state.climb; toast(state.climb ? 'Climbing on: grip where nothing is and pull yourself along' : 'Climbing off'); requestUI(); }, '#34c759');
+  if (!gps.length && cy2+110 < UIH-10) para(['Grip a character to move it; add the left grip to','stretch and turn it. Right stick: ↕ size, ↔ turn.'], X, cy2+60, 13);
 }
 function drawWave(clip, x, y, w, h){
   const buf = audioBufs.get(clip.id);
@@ -4810,7 +4819,7 @@ scene.add(pointerDot); pointerDot.visible = false;
 for (let i=0;i<2;i++){
   const rayC = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
   rig.add(rayC); rig.add(grip); shotHidden.push(rayC, grip);
-  grip.add(factory.createControllerModel(grip));
+  { const cm = factory.createControllerModel(grip); grip.add(cm); (window.__ctrlModels ||= []).push(cm); }
   rayC.addEventListener('connected', e => {
     const hand = e.data.handedness; if (hand!=='left' && hand!=='right') return;
     ctrl[hand] = {ray:rayC, grip, src:e.data, prev:{}};
@@ -5138,6 +5147,9 @@ function xrUpdate(dt){
     brushRW = state.tool==='blocks' ? Math.max(0.03*rig.scale.x, blockSizeWorld()*0.5) : Math.max(0.02*rig.scale.x, rShown);
     // the 3D color ball
     let orbHex = (!onPanel && orb.visible) ? (orbPick(_tip) || orbPickRay(_o, _d)) : null;
+    const diceHover = orbHex==='DICE';
+    if (diceHover){ orbHex = null; if (pr && edge(R,pr,'trigP')){ state.randColor = !state.randColor; toast(state.randColor ? '🎲 A new color every stroke' : 'Random colors off'); pulse('right',0.4,25); requestUI(); } }
+    if (orb.visible) drawDice(!!state.randColor, diceHover);
     if (state.pickStyle==='wheel' && orb.visible && pr && pr.trigP){
       const pL = orb.worldToLocal(_tip.clone());
       if (!orbDrag && orbHex && Math.abs(pL.z) < 0.03 && edge(R,pr,'trigP')) orbDrag = {L0: wheelDrawnL < 0 ? 0.5 : wheelDrawnL, z0: pL.z};
@@ -5146,7 +5158,7 @@ function xrUpdate(dt){
     } else orbDrag = null;
     if (orbHex && pr && pr.trigP){ if (state.color!==orbHex){ pickColor(orbHex); if (state.editStroke){ state.editStroke.s.col = orbHex; editChanged(); } requestUI(); } orbHeld = true; }
     else if (orbHeld && !(pr && pr.trigP)){ orbHeld = false; addRecent(state.color); requestUI(); }
-    const showTool = sculpt && !onPanel && !uiCapture && !blockGrab && !doodleGrab && !winGrab && !orbHex && !orbHeld && !ptGrab;
+    const showTool = sculpt && !onPanel && !uiCapture && !blockGrab && !doodleGrab && !winGrab && !orbHex && !orbHeld && !ptGrab && !diceHover;
     cursor.visible = showTool && state.tool!=='blocks' && state.tool!=='doodle';
     penTip.visible = showTool && state.tool==='doodle';
     ghost.visible = false;
@@ -5166,7 +5178,8 @@ function xrUpdate(dt){
     }
     const pressEdge = pr && edge(R,pr,'trigP');
     if (pressEdge && !onPanel && (blockGrab || (doodleGrab && !doodleGrab.bend))) duplicateHeld();
-    if (sculpt && state.tool==='blocks' && state.blockMode==='angle'){
+    if (state.pivotFor && sculpt && !onPanel){ if (pressEdge) setPivotAt(_tip); }
+    else if (sculpt && state.tool==='blocks' && state.blockMode==='angle'){
       const held = !!(pr && pr.trig > 0.12);
       if (showTool && pressEdge){ if (!stroke) { if (beginStroke(base)) { stroke.A = _tip.clone(); } } else angleClick(); }
       if (stroke && stroke.kind==='angle'){ const side = V().set(1,0,0).transformDirection(R.grip.matrixWorld); angleUpdate(_tip, stroke.stage===0 && held, side); }
@@ -5386,7 +5399,7 @@ function armMesh(c, side){
   c._arms = c._arms || {};
   if (!c._arms[side]){
     const geo = new THREE.BufferGeometry(), pos = new Float32Array(ARM_N*ARM_K*3), idx = [];
-    for (let i=0;i<ARM_N-1;i++) for (let k=0;k<ARM_K;k++){ const a = i*ARM_K+k, b = i*ARM_K+(k+1)%ARM_K, c2 = a+ARM_K, d = b+ARM_K; idx.push(a,c2,b, b,c2,d); }
+    for (let i=0;i<ARM_N-1;i++) for (let k=0;k<ARM_K;k++){ const a = i*ARM_K+k, b = i*ARM_K+(k+1)%ARM_K, c2 = a+ARM_K, d = b+ARM_K; idx.push(a,b,c2, b,d,c2); }
     geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setIndex(idx);
     const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color:c.arms.col, roughness:0.55})); m.frustumCulled = false; c.root.add(m); c._arms[side] = m;
   }
@@ -5484,7 +5497,7 @@ function embGripStart(side){
   const pr = findPropNear(tip, r);
   if (pr){ pr.root.updateMatrixWorld(true); embGrab[side] = {c:pr, rel: unscaled(cc.grip).invert().multiply(pr.root.matrixWorld.clone())}; pulse(side,0.5,30); return; }
   if (side==='right' && !blockGrab && !doodleGrab){ const b = findBlockAt(tip, r); if (b){ startBlockGrab(b, unscaled(cc.grip)); return; } const d = findStrokeAt(tip, r); if (d){ startDoodleGrab(d, unscaled(cc.grip)); return; } }
-  climb[side] = {anchor: tip.clone()}; pulse(side,0.25,15);   // nothing to hold: grab the world and pull yourself
+  if (state.climb){ climb[side] = {anchor: tip.clone()}; pulse(side,0.25,15); }   // nothing to hold: grab the world and pull yourself (when climbing is on)
 }
 function embGripEnd(side){
   const g0 = embGrab[side];
@@ -5563,7 +5576,7 @@ function importChar(o, cd){
   if (cd.arms) c.arms = {...cd.arms}; if (cd.shoulders) c.shoulders = JSON.parse(JSON.stringify(cd.shoulders));
   let first = null;
   for (const ld of o.layers.filter(l=>l.char===cd.id)){
-    const L = makeLayer(ld.name, ld.vs || 0.1, undefined, c.root); L.char = c.id; L.part = ld.part || 'extra'; if (ld.rest) L.rest = JSON.parse(JSON.stringify(ld.rest)); if (ld.mat) setLayerMat(L, ld.mat);
+    const L = makeLayer(ld.name, ld.vs || 0.1, undefined, c.root); L.char = c.id; L.part = ld.part || 'extra'; if (ld.rest) L.rest = JSON.parse(JSON.stringify(ld.rest)); if (ld.mat) setLayerMat(L, ld.mat); L.pivot = ld.pivot || null; L.light = !!ld.light;
     L.visible = ld.visible !== false; L.group.visible = L.visible; loadLayerData(ld, o.enc, L); if (!first) first = L;
   }
   state.selChar = c.id; if (first) state.activePart = first.id; sceneDirty = true; toast(nm+' moved in from another world'); requestUI();
@@ -5873,6 +5886,261 @@ for (const [type] of [['x']]){ let down = false; const win = editorWin;
   win.canvas.addEventListener('pointerup', e => { down = false; uiPointer(win,'up', ...xy(e)); }); }
 window.__edReady = true;
 
+/* ============ v0.18: smooth a whole layer, make clay lighter, parts in the Layers window, color bar, mirror hands, redo part of a performance ============ */
+
+// ---- smooth a whole layer of clay (thin bits stay)
+function smoothLayer(L){
+  if (!L || L.locked){ toast(L ? 'That layer is locked' : 'Pick a layer first'); return; }
+  const P = CN+2, pad = new Float32Array(P*P*P), news = [], map = new Map(), t0 = performance.now();
+  for (const ch of L.chunks.values()){
+    if (!ch.d) continue;
+    let any = false;   // skip chunks with no surface in or next to them
+    for (let i=0;i<CN3;i++) if (ch.d[i] > -DMAX+1e-3 && ch.d[i] < DMAX-1e-3){ any = true; break; }
+    if (!any) continue;
+    for (let z=0;z<P;z++) for (let y=0;y<P;y++) for (let x=0;x<P;x++){
+      const gx = ch.cx*CN + x-1, gy = ch.cy*CN + y-1, gz = ch.cz*CN + z-1;
+      let nb = ch, lx = x-1, ly = y-1, lz = z-1;
+      if (lx<0 || ly<0 || lz<0 || lx>=CN || ly>=CN || lz>=CN){ const cx = Math.floor(gx/CN), cy = Math.floor(gy/CN), cz = Math.floor(gz/CN); nb = L.chunks.get(ckey(cx,cy,cz)); lx = gx-cx*CN; ly = gy-cy*CN; lz = gz-cz*CN; }
+      pad[x + P*(y + P*z)] = nb && nb.d ? nb.d[lx + CN*(ly + CN*lz)] : -DMAX;
+    }
+    const nd = new Float32Array(CN3);
+    for (let z=0;z<CN;z++) for (let y=0;y<CN;y++) for (let x=0;x<CN;x++){
+      const pi = (x+1) + P*((y+1) + P*(z+1)), c = pad[pi];
+      const xm = pad[pi-1], xp = pad[pi+1], ym = pad[pi-P], yp = pad[pi+P], zm = pad[pi-P*P], zp = pad[pi+P*P];
+      let v = (2*c + xm + xp + ym + yp + zm + zp)/8;
+      if (c > 0 && ((xm<=0 && xp<=0) || (ym<=0 && yp<=0) || (zm<=0 && zp<=0))) v = Math.max(v, Math.min(c, 0.6));   // a skinny bit: keep it
+      nd[x + CN*(y + CN*z)] = v;
+    }
+    news.push([ch, nd]);
+  }
+  if (!news.length){ toast('No clay on this layer to smooth'); return; }
+  for (const [ch, nd] of news){ map.set(ch.k, {d:ch.d, c:ch.c.slice()}); ch.d = nd; markAround(L, ch.cx-1,ch.cy-1,ch.cz-1, ch.cx+1,ch.cy+1,ch.cz+1); }
+  pushUndo({type:'vox', L:L.id, map}); sceneDirty = true;
+  toast('Smoothed "'+layerLabel(L)+'" · tap again for more (X undoes)'); requestUI();
+}
+const layerLabel = L => L.char != null ? (PART_NAMES[L.part]||L.name) : L.name;
+
+// ---- lighter clay: the same look with far fewer triangles (sculpting brings full detail back, then it lightens again)
+let meshoptP = null;
+function meshopt(){ if (!meshoptP) meshoptP = import(MESHOPT_URL).then(async m => { await m.MeshoptSimplifier.ready; m.MeshoptSimplifier.useExperimentalFeatures = true; return m.MeshoptSimplifier; }).catch(e => { console.warn(e); return null; }); return meshoptP; }
+const MESHOPT_URL = 'https://cdn.jsdelivr.net/npm/meshoptimizer@0.22.0/meshopt_simplifier.module.js';
+function layerTris(L){ let n = 0; for (const ch of L.chunks.values()) if (ch.mesh && ch.mesh.geometry.index) n += ch.mesh.geometry.index.count/3;
+  for (const s of L.strokes) if (s._mesh) s._mesh.traverse(o => { if (o.isMesh && o.geometry){ const k = o.geometry.index ? o.geometry.index.count/3 : (o.geometry.attributes.position?.count||0)/3; n += o.isInstancedMesh ? k*o.count : k; } });
+  return Math.round(n); }
+function shownTris(L){ return L.lightMesh ? L.lightTris + layerTris(L) - L.fullTris : layerTris(L); }
+function unlight(L){ if (!L.lightMesh) return; L.group.remove(L.lightMesh); L.lightMesh.geometry.dispose(); L.lightMesh = null; for (const ch of L.chunks.values()) if (ch.mesh) ch.mesh.visible = true; }
+async function buildLight(L){
+  const MS = await meshopt(); if (!MS || !L.light || L.lightMesh || L._lighting) return;
+  for (const k of dirty.keys()) if (k.startsWith(L.id+'|')) return;   // still remeshing: try later
+  L._lighting = true;
+  try {
+    const pos = [], nor = [], col = [], idx = [], weld = new Map(); let full = 0;
+    const q = 1/(L.vs*0.01);
+    for (const ch of L.chunks.values()){
+      const m = ch.mesh; if (!m) continue; const gp = m.geometry.attributes.position.array, gn = m.geometry.attributes.normal.array, gc = m.geometry.attributes.color.array, gi = m.geometry.index.array;
+      full += gi.length/3; const remap = new Int32Array(gp.length/3);
+      for (let v=0; v<remap.length; v++){ const x = gp[v*3], y = gp[v*3+1], z = gp[v*3+2], key = Math.round(x*q)+','+Math.round(y*q)+','+Math.round(z*q);
+        let id = weld.get(key); if (id === undefined){ id = pos.length/3; weld.set(key, id); pos.push(x,y,z); nor.push(gn[v*3],gn[v*3+1],gn[v*3+2]); col.push(gc[v*3],gc[v*3+1],gc[v*3+2]); } remap[v] = id; }
+      for (let i=0;i<gi.length;i+=3){ const a = remap[gi[i]], b = remap[gi[i+1]], c = remap[gi[i+2]]; if (a!==b && b!==c && a!==c) idx.push(a,b,c); }
+    }
+    if (idx.length < 600 || !L.light){ L._lighting = false; return; }
+    const P = new Float32Array(pos), N = new Float32Array(nor), C = new Float32Array(col), I = new Uint32Array(idx), attr = new Float32Array(pos.length/3*6);
+    for (let v=0; v<pos.length/3; v++){ attr.set(N.subarray(v*3, v*3+3), v*6); attr.set(C.subarray(v*3, v*3+3), v*6+3); }
+    const target = Math.max(300, Math.floor(I.length*0.25/3)*3);
+    const [out] = MS.simplifyWithAttributes(I, P, 3, attr, 6, [0.6,0.6,0.6, 0.4,0.4,0.4], null, target, 0.006, []);
+    const map2 = new Int32Array(P.length/3).fill(-1), np = [], nn = [], nc = [], ni = new Uint32Array(out.length);
+    for (let i=0;i<out.length;i++){ const v = out[i]; if (map2[v] < 0){ map2[v] = np.length/3; np.push(P[v*3],P[v*3+1],P[v*3+2]); nn.push(N[v*3],N[v*3+1],N[v*3+2]); nc.push(C[v*3],C[v*3+1],C[v*3+2]); } ni[i] = map2[v]; }
+    if (!L.light || L.lightMesh){ L._lighting = false; return; }
+    for (const k of dirty.keys()) if (k.startsWith(L.id+'|')){ L._lighting = false; return; }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(np,3)); geo.setAttribute('normal', new THREE.Float32BufferAttribute(nn,3)); geo.setAttribute('color', new THREE.Float32BufferAttribute(nc,3));
+    geo.setIndex(new THREE.BufferAttribute(ni,1)); geo.computeBoundingSphere();
+    const mesh = new THREE.Mesh(geo, L.mat || clayMat); mesh.userData.clay = true; mesh.userData.light = true;
+    L.group.add(mesh); L.lightMesh = mesh; L.lightTris = ni.length/3; L.fullTris = full;
+    for (const ch of L.chunks.values()) if (ch.mesh) ch.mesh.visible = false;
+    if (L._lightToast){ L._lightToast = false; toast('"'+layerLabel(L)+'" is lighter: '+fmtK(full)+' → '+fmtK(L.lightTris)+' triangles'); }
+    requestUI();
+  } catch(e){ console.warn('lighten', e); }
+  L._lighting = false;
+}
+const fmtK = n => n >= 1000 ? (n/1000).toFixed(n >= 10000 ? 0 : 1)+'k' : String(n);
+function toggleLight(L){
+  if (!L) return; L.light = !L.light;
+  if (L.light){ L._lightToast = true; L._lightAt = 0; toast('Making "'+layerLabel(L)+'" lighter…'); }
+  else { unlight(L); toast('"'+layerLabel(L)+'" back to full detail'); }
+  sceneDirty = true; requestUI();
+}
+let lightTick = 0;
+function tickLight(dt){
+  lightTick -= dt; if (lightTick > 0) return; lightTick = 0.5; const now = performance.now();
+  for (const L of layers){ if (L.lightMesh){ let edited = false; for (const ch of L.chunks.values()) if (ch.mesh && ch.mesh.visible){ edited = true; break; }
+      if (edited){ unlight(L); L._lightAt = now + 1500; } }   // you sculpted it: full detail while you work
+    if (L.light && !L.lightMesh && !L._lighting && now > (L._lightAt||0)) buildLight(L); }
+}
+
+// ---- how heavy a character is (a gentle guide, not a rule)
+const CHAR_BUDGET = 150000;
+function charTris(c){ let n = 0; for (const L of partsOf(c)) n += shownTris(L); return n; }
+function drawWeight(X, y, W, c){
+  const n = charTris(c), f = n / CHAR_BUDGET, col = f < 0.5 ? '#34c759' : f < 1 ? '#ffd400' : '#ff3b30';
+  rr(X, y, W, 12, 6, '#2a3060'); rr(X, y, Math.max(12, W*Math.min(1, f)), 12, 6, col);
+  txt(fmtK(n)+' triangles · '+(f < 0.5 ? 'light' : f < 1 ? 'OK' : 'heavy: Lighten its parts'), X, y+28, 12, col,'left',800);
+}
+
+// ---- the parts drawing: plain until you pick one, then that part lights up
+function drawPartsDiagram(c, X, y, W, h){
+  const parts = partsOf(c), act = activeLayer(), P = id => parts.find(L=>L.part===id);
+  const sel = L => L && act===L, line = '#5a6290', fillOff = '#1d2246', fillOn = '#ffd400';
+  const pick = (L, mk) => { if (L){ setActive(L); L.flashT = 0.7; } else if (mk){ const N = mk(); state.activePart = N.id; N.flashT = 0.7; } requestUI(); };
+  const shape = (L, draw) => { g.beginPath(); draw(); g.fillStyle = sel(L) ? fillOn : fillOff; g.fill(); g.lineWidth = 3; g.strokeStyle = sel(L) ? '#fff' : line; if (!L) g.setLineDash([5,5]); g.stroke(); g.setLineDash([]); };
+  const label = (L, t, x, yy) => txt(t, x, yy, 12, sel(L) ? '#111' : L ? '#cfd6ff' : '#6b73a6','center',800);
+  const cx = X + W/2, R = Math.min(W*0.18, h*0.24), hy = y + R + 6;
+  const BD = P('body'), H = P('head'), LH = P('lh'), RH = P('rh');
+  // body
+  const by0 = hy + R + 6, bh = Math.max(40, h*0.3);
+  shape(BD, ()=>g.roundRect(cx-R*0.8, by0, R*1.6, bh, 20)); label(BD, 'Body', cx, by0+bh/2); hit(cx-R*0.8, by0, R*1.6, bh, ()=>pick(BD, ()=>addPart(c,'body',0.025)));
+  // arms and hands (the puppet faces you: its left hand is on your right)
+  const A = c.arms || {style:'none'}, hy2 = by0 + bh*0.75, hs = Math.min(46, R*0.95);
+  for (const [Lh, hx, id, lab, sgn] of [[RH, X+hs/2+6, 'rh', 'R hand', -1], [LH, X+W-hs/2-6, 'lh', 'L hand', 1]]){
+    g.strokeStyle = line; g.lineWidth = A.style==='string' ? 2 : 6; g.lineCap = 'round'; if (A.style==='accordion') g.setLineDash([5,4]);
+    g.beginPath(); g.moveTo(cx + sgn*R*0.8, by0+14); if (A.style==='elbow') g.lineTo((cx+sgn*R*0.8 + hx)/2, by0 + bh*0.95); g.lineTo(hx, hy2); g.stroke(); g.setLineDash([]);
+    shape(Lh, ()=>g.roundRect(hx-hs/2, hy2-hs/2, hs, hs, 12)); label(Lh, lab, hx, hy2+hs/2+12);
+    hit(hx-hs/2-4, hy2-hs/2-4, hs+8, hs+20, ()=>pick(Lh, ()=>addPart(c, id, 0.0125)));
+  }
+  // head, then eyes and mouth on top of it
+  shape(H, ()=>g.arc(cx, hy, R, 0, 7)); hit(cx-R, hy-R, R*2, R*2, ()=>pick(H, ()=>addPart(c,'head',0.0125)));
+  if (!H) label(H, 'Head', cx, hy+R*0.55);
+  const eyes = parts.filter(L=>L.part==='eye').sort((a,b)=>(a.rest.p[0]+(partCenter(a)?.x||0)) - (b.rest.p[0]+(partCenter(b)?.x||0)));
+  const ne = eyes.length + 1, er = Math.max(8, Math.min(13, R*0.22)), span = Math.min(R*1.3, (ne-1)*er*2.6);
+  for (let i=0;i<ne;i++){ const E = eyes[i], ex = cx - span/2 + (ne>1 ? i*span/(ne-1) : 0), ey = hy - R*0.22;
+    if (E){ shape(E, ()=>g.arc(ex, ey, er, 0, 7)); g.fillStyle = sel(E) ? '#111' : line; g.beginPath(); g.arc(ex, ey+1, er*0.35, 0, 7); g.fill(); hit(ex-er-2, ey-er-2, er*2+4, er*2+4, ()=>pick(E)); }
+    else { g.beginPath(); g.arc(ex, ey, er*0.8, 0, 7); g.setLineDash([3,3]); g.strokeStyle = line; g.lineWidth = 2; g.stroke(); g.setLineDash([]); txt('+', ex, ey, 14, '#6b73a6','center',800);
+      hit(ex-er-2, ey-er-2, er*2+4, er*2+4, ()=>pick(null, ()=>{ const N = addPart(c,'eye',0.00625); toast('New eye: sculpt it on the face'); return N; })); }
+  }
+  const M = parts.find(L=>L.part==='mouth'), mw = R*0.9, my = hy + R*0.35;
+  g.beginPath(); g.ellipse(cx, my, mw/2, Math.max(6, R*0.16), 0, 0, 7); g.fillStyle = sel(M) ? fillOn : fillOff; g.fill(); g.lineWidth = 3; g.strokeStyle = sel(M) ? '#fff' : line; if (!M) g.setLineDash([4,4]); g.stroke(); g.setLineDash([]);
+  if (!M) txt('+ mouth', cx, my, 10, '#6b73a6','center',800);
+  hit(cx-mw/2, my-12, mw, 24, ()=>pick(M, ()=>{ const N = addPart(c,'mouth',0.00625); toast('New mouth: sculpt it on the face. It opens when you talk.'); return N; }));
+  // anything extra
+  const ex = parts.filter(L=>!['head','body','lh','rh','eye','mouth'].includes(L.part));
+  if (ex.length){ const ew = Math.min(90, (W-8*(ex.length-1))/ex.length);
+    ex.slice(0,4).forEach((L,i)=>{ const x = X+i*(ew+8), yy = y+h-26; shape(L, ()=>g.roundRect(x, yy, ew, 24, 8)); label(L, (L.name.split(' ').pop()||'Extra').slice(0,9), x+ew/2, yy+12); hit(x, yy, ew, 24, ()=>pick(L)); }); }
+}
+
+// ---- copy a hand to the other side, mirrored
+function mirrorHand(fromKey){
+  const c = selChar(); if (!c) return; const A = partLayer(c, fromKey), toKey = fromKey==='lh' ? 'rh' : 'lh', B = partLayer(c, toKey) || addPart(c, toKey, A ? A.vs : 0.0125);
+  if (!A || (!layerHasClay(A) && !A.strokes.length)){ toast('Sculpt the '+(fromKey==='lh' ? 'left' : 'right')+' hand first'); return; }
+  unlight(B);
+  const det = {type:'detail', L:B.id, vs:B.vs, chunks:B.chunks}, str = {type:'strokes', L:B.id, snap:snapStrokes(B)}, rst = {type:'rest', L:B.id, rest:B.rest};
+  for (const ch of B.chunks.values()) dropMesh(B, ch);
+  for (const k of [...dirty.keys()]) if (k.startsWith(B.id+'|')) dirty.delete(k);
+  B.chunks = new Map(); B.vs = A.vs;
+  for (const ch of A.chunks.values()){ if (!ch.d) continue;
+    for (let z=0;z<CN;z++) for (let y=0;y<CN;y++) for (let x=0;x<CN;x++){
+      const i = x + CN*(y + CN*z), v = ch.d[i]; if (v <= -DMAX+1e-4) continue;
+      const mx = -(ch.cx*CN + x), ncx = Math.floor(mx/CN), nx = mx - ncx*CN, nc = getChunk(B, ncx, ch.cy, ch.cz, true);
+      if (!nc.d){ nc.d = new Float32Array(CN3).fill(-DMAX); nc.c = new Uint8Array(CN3*3); }
+      const j = nx + CN*(y + CN*z); nc.d[j] = v; nc.c[j*3] = ch.c[i*3]; nc.c[j*3+1] = ch.c[i*3+1]; nc.c[j*3+2] = ch.c[i*3+2];
+    } }
+  for (const ch of [...B.chunks.values()]) markAround(B, ch.cx-1,ch.cy-1,ch.cz-1, ch.cx+1,ch.cy+1,ch.cz+1);
+  for (const st of [...B.strokes]) dropStroke(B, st);
+  for (const st of A.strokes){
+    let ns;
+    if (st.type==='blocks'){ const it = st.items.slice(); for (let k=0;k<it.length;k+=13){ it[k] = -it[k]; it[k+4] = -it[k+4]; it[k+5] = -it[k+5]; } ns = {type:'blocks', form:st.form, items:it}; }
+    else { const pts = st.pts.slice(), ups = (st.ups||[]).slice(); for (let k=0;k<pts.length;k+=3) pts[k] = -pts[k]; for (let k=0;k<ups.length;k+=3) ups[k] = -ups[k]; ns = {...st, _mesh:null, uid:undefined, pts, ups}; }
+    B.strokes.push(ns); rebuildStroke(B, ns);
+  }
+  B.rest = {p:[-A.rest.p[0], A.rest.p[1], A.rest.p[2]], q:[A.rest.q[0], -A.rest.q[1], -A.rest.q[2], A.rest.q[3]], s:A.rest.s};
+  B.light = A.light; if (B.light) B._lightAt = 0;
+  pushUndo({type:'multi', parts:[det, str, rst]}); state.activePart = B.id; B.flashT = 0.8; sceneDirty = true;
+  toast('Mirrored the '+(fromKey==='lh' ? 'left' : 'right')+' hand onto the '+(toKey==='lh' ? 'left' : 'right')+' (X undoes)'); requestUI();
+}
+
+// ---- where an eye turns around, or where a mouth opens from: you can place it
+const pivotDot = new THREE.Mesh(new THREE.SphereGeometry(1, 14, 10), new THREE.MeshBasicMaterial({color:'#ff2d95', depthTest:false, transparent:true, opacity:0.9}));
+pivotDot.renderOrder = 40; pivotDot.visible = false; scene.add(pivotDot); shotHidden.push(pivotDot);
+function setPivotAt(pW){
+  const L = layerById(state.pivotFor); state.pivotFor = null; if (!L) return;
+  L.group.updateMatrixWorld(true); const p = L.group.worldToLocal(pW.clone());
+  L.pivot = [r4(p.x), r4(p.y), r4(p.z)]; L._ctr = null; sceneDirty = true; beep(1320, 0.08);
+  toast((PART_NAMES[L.part]||'Part')+' center set'); requestUI();
+}
+function updatePivotDot(){
+  const L = activeLayer(), show2 = inStudio() && L && (L.part==='eye' || L.part==='mouth');
+  pivotDot.visible = !!show2; if (!show2) return;
+  const ctr = partCenter(L); if (!ctr){ pivotDot.visible = false; return; }
+  L.group.updateMatrixWorld(true); pivotDot.position.copy(L.group.localToWorld(ctr.clone()));
+  pivotDot.scale.setScalar(0.006*rig.scale.x*(state.pivotFor===L.id ? 1.6 : 1)); pivotDot.material.color.set(L.pivot ? '#ff2d95' : '#ffffff');
+}
+
+// ---- the color picker in the air: a dice for random colors, a wider light bar, and hue / saturation / value sliders
+const diceCv = document.createElement('canvas'); diceCv.width = diceCv.height = 64;
+const diceTex = new THREE.CanvasTexture(diceCv); diceTex.colorSpace = THREE.SRGBColorSpace;
+const diceMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.026, 0.026), new THREE.MeshBasicMaterial({map:diceTex, transparent:true, toneMapped:false, side:THREE.DoubleSide}));
+orb.add(diceMesh); let diceDrawn = null;
+function drawDice(on, hover){ const k = (on?1:0) + (hover?2:0); if (diceDrawn === k) return; diceDrawn = k; const c = diceCv.getContext('2d'); c.clearRect(0,0,64,64);
+  c.fillStyle = on ? '#ff2d95' : '#2a3060'; c.beginPath(); c.roundRect(2,2,60,60,14); c.fill(); if (hover){ c.lineWidth = 5; c.strokeStyle = '#ffd400'; c.stroke(); }
+  c.font = '40px system-ui'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('🎲', 32, 35); diceTex.needsUpdate = true; }
+barMesh.geometry.dispose(); barMesh.geometry = new THREE.PlaneGeometry(0.03, WHEEL_R*2); barMesh.position.x = WHEEL_R + 0.026;
+const HSV_W = WHEEL_R*2, HSV_H = 0.02, HSV_Y = [0.028, 0, -0.028];
+const pickHSV = new THREE.Group(); orb.add(pickHSV);
+const hsvCv = [0,1,2].map(()=>{ const cv = document.createElement('canvas'); cv.width = 256; cv.height = 24; return cv; });
+const hsvTex = hsvCv.map(cv => { const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; return t; });
+hsvTex.forEach((t,i)=>{ const m = new THREE.Mesh(new THREE.PlaneGeometry(HSV_W, HSV_H), new THREE.MeshBasicMaterial({map:t, toneMapped:false, side:THREE.DoubleSide})); m.position.y = HSV_Y[i]; pickHSV.add(m); });
+function hsvHex(h,s,v){ const f = n => { const k = (n + h*6) % 6; return v - v*s*Math.max(0, Math.min(k, 4-k, 1)); }; return '#'+[f(5), f(3), f(1)].map(x=>Math.round(clamp(x,0,1)*255).toString(16).padStart(2,'0')).join(''); }
+function hexHsv(hex){ const [r,g2,b] = hexRgb(hex).map(x=>x/255), mx = Math.max(r,g2,b), mn = Math.min(r,g2,b), d = mx-mn; let h = 0;
+  if (d){ h = mx===r ? ((g2-b)/d)%6 : mx===g2 ? (b-r)/d+2 : (r-g2)/d+4; h /= 6; if (h < 0) h += 1; } return {h, s: mx ? d/mx : 0, v: mx}; }
+let hsvMem = null, hsvCand = null, hsvDrawn = '';
+function curHSV(){ return hsvMem && hsvMem.hex===state.color ? hsvMem : hexHsv(state.color); }
+function drawHSV(){
+  const o = curHSV(), key = state.color+'|'+o.h.toFixed(3); if (key===hsvDrawn) return; hsvDrawn = key;
+  hsvCv.forEach((cv,i)=>{ const c = cv.getContext('2d'), gr = c.createLinearGradient(0,0,256,0);
+    for (let k=0;k<=12;k++){ const t = k/12; gr.addColorStop(t, i===0 ? hsvHex(t,1,1) : i===1 ? hsvHex(o.h,t,Math.max(o.v,0.35)) : hsvHex(o.h,o.s,t)); }
+    c.clearRect(0,0,256,24); c.fillStyle = gr; c.beginPath(); c.roundRect(0,0,256,24,8); c.fill();
+    const x = [o.h, o.s, o.v][i]*252+2; c.lineWidth = 4; c.strokeStyle = '#fff'; c.strokeRect(x-4, 1, 8, 22); c.strokeStyle = '#111'; c.lineWidth = 1.5; c.strokeRect(x-6, 0, 12, 24);
+    hsvTex[i].needsUpdate = true; });
+}
+function dicePos(){ return state.pickStyle==='chips' ? -((CHIP_COLS-1)/2*(CHIP+CHIP_GAP) + 0.03) : state.pickStyle==='dots' ? -(ORB_R + 0.03) : -(WHEEL_R + 0.03); }
+function orbPickV18(p){   // p in orb space; returns 'DICE', a color, or undefined (let the old picker answer)
+  if (Math.abs(p.z) < 0.025 && Math.abs(p.x - diceMesh.position.x) < 0.016 && Math.abs(p.y - diceMesh.position.y) < 0.016) return 'DICE';
+  if (state.pickStyle !== 'hsv') return undefined;
+  if (Math.abs(p.z) > 0.025 || Math.abs(p.x) > HSV_W/2 + 0.006) return null;
+  const i = HSV_Y.findIndex(y => Math.abs(p.y - y) < HSV_H/2 + 0.004); if (i < 0) return null;
+  const t = clamp((p.x + HSV_W/2)/HSV_W, 0, 1), o = curHSV(), n = {h:o.h, s:o.s, v:o.v}; if (i===0){ n.h = t; if (n.s < 0.05) n.s = 0.85; if (n.v < 0.1) n.v = 0.9; } else if (i===1) n.s = t; else n.v = t;
+  n.hex = hsvHex(n.h, n.s, n.v); hsvCand = n; return n.hex;
+}
+
+// ---- PERFORM: redo just part of a performance
+function punchSplice(old, nw, t0, t1){
+  const out = [];
+  for (let i=0;i<old.length;i+=9) if (old[i] < t0 - 1e-4) out.push(...old.slice(i, i+9));
+  for (let i=0;i<nw.length;i+=9) if (nw[i] >= t0 - 1e-4) out.push(...nw.slice(i, i+9));
+  for (let i=0;i<old.length;i+=9) if (old[i] > t1 + 1e-4) out.push(...old.slice(i, i+9));
+  return out;
+}
+function drawPerformTimeline(X, y, W){
+  const L = Math.max(showLength(), 1), tx = t => X + t/L*W, t0 = show.rec && show.rec.t0 ? show.rec.t0 : null;
+  rr(X, y, W, 34, 10, '#0d1029');
+  for (const key in show.tracks){ const s = show.tracks[key].samples; if (!s.length) continue; const a = tx(s[0]), b = tx(s[s.length-9]); g.globalAlpha = 0.18; rr(a, y+6, Math.max(3,b-a), 22, 6, '#ff2d95'); g.globalAlpha = 1; }
+  for (const a of show.audio){ const a0 = tx(a.at||0), a1 = tx((a.at||0)+(a.dur||0)); g.globalAlpha = 0.5; rr(a0, y+26, Math.max(3,a1-a0), 6, 3, '#ffd400'); g.globalAlpha = 1; }
+  if (t0 != null){ g.globalAlpha = 0.35; rr(tx(t0), y, Math.max(3, tx(show.t)-tx(t0)), 34, 8, '#ff3b30'); g.globalAlpha = 1; }
+  const px = tx(show.t); g.fillStyle = '#ffd400'; g.fillRect(px-2, y-3, 4, 40);
+  for (let s=0; s<=L; s += L > 60 ? 15 : L > 20 ? 5 : 1){ g.fillStyle = '#4a5080'; g.fillRect(tx(s)-1, y+30, 2, 4); }
+  const set = (pxx) => { if (show.rec) return; show.t = clamp((pxx-X)/W*L, 0, showLength()); state.punchAt = show.t > 0.05 ? show.t : null; stopShow(); requestUI(); };
+  if (state.punchAt != null && !show.rec){ const qx = tx(state.punchAt); g.fillStyle = '#ff3b30'; g.beginPath(); g.moveTo(qx-7, y-6); g.lineTo(qx+7, y-6); g.lineTo(qx, y+3); g.fill(); }
+  hit(X, y-4, W, 44, set, set);
+}
+
+// ---- the real controllers hide inside a puppet's hands
+const ctrlModels = (window.__ctrlModels ||= []);
+function updateCtrlModels(){
+  for (const m of ctrlModels){ const side = ctrl.left && ctrl.left.grip===m.parent ? 'lh' : ctrl.right && ctrl.right.grip===m.parent ? 'rh' : null;
+    const e = show.embodied, hand = e && side ? partLayer(e.c, side) : null;
+    m.visible = !(hand && (layerHasClayCached(hand) || hand.strokes.length)); }
+}
+function layerHasClayCached(L){ const now = performance.now(); if (L._hcT && now - L._hcT < 2000) return L._hc; L._hcT = now; return (L._hc = layerHasClay(L)); }
+
 /* ---------------- main loop ---------------- */
 const BLACK = new THREE.Color('#000');
 const clock = new THREE.Clock();
@@ -5890,6 +6158,7 @@ function setAspect(a){
   const w = 0.09; handMonitor.scale.set(r>=1? w : w*r, r>=1 ? w/r : w, 1);
   sizeBigScreen(); sizePreview(); requestUI();
 }
+let previewFlip = false;
 renderer.setAnimationLoop(() => {
   const raw = clock.getDelta();
   const dt = Math.min(raw, 0.05);
@@ -5906,7 +6175,7 @@ renderer.setAnimationLoop(() => {
   applyFace(tdt);
   if (NET.guest) netApplyPoses();
   animTime += tdt; animateDoodles(animTime);
-  netTick(); netPoses(); netShots(); netLiveStroke(); netCamGuest(dt); netCamHost(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum(); updateArms(); tickShoulders(tdt); updateMonitor(tdt);
+  netTick(); netPoses(); netShots(); netLiveStroke(); netCamGuest(dt); netCamHost(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum(); updateArms(); tickShoulders(tdt); updateMonitor(tdt); tickLight(tdt); if (xr){ updatePivotDot(); updateCtrlModels(); }
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
@@ -5916,7 +6185,8 @@ renderer.setAnimationLoop(() => {
   for (const L of layers) if (L.flashT > 0){ L.flashT -= tdt; L.group.visible = L.visible && (L.flashT <= 0 || Math.floor(L.flashT*10)%2===0); }
   applyStage();
   if (xr){
-    if (state.phase==='shoot' || state.phase==='edit' || state.camOn || NET.camPeer) renderPreview(shotCam);
+    previewFlip = !previewFlip;
+    if (state.phase==='shoot' || state.phase==='edit' || state.camOn || NET.camPeer){ if (previewFlip || (play && play.mode==='film')) renderPreview(shotCam); }
     else if (state.phase==='perform' && state.mirrorOn && show.embodied) renderPreview(mirrorCam);
     else if (state.phase==='perform' && selTake() && state.win.preview) renderPreview(shotCam);
     const dark = state.phase==='edit' && shots.blackRoom;
@@ -5984,6 +6254,7 @@ function desktopRender(){
     addPart, spatialAt, ensureCuts, newCut, switchCut, deleteCut, nudgeGuest, setPeerUI, sendUIPic, GHS, drawGHWorlds, tryVoice, get avGrab(){return avGrab;},
     syncTakeEnds, clipLen, stopRecording, get recObj(){return rec;}, snapShow,
     netSend, chunkHash, netRemote, netApplyPoses, partsOf, pushUndo, rebuildStroke, makeLayer, decodeClip, applyRec, setPoseArr, poseArr, makeAvatar, updateAvatars,
+    smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
     NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
