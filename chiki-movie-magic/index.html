@@ -55,7 +55,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.15';
+const VERSION = '0.16';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -270,7 +270,7 @@ function voxMsg(L, keys){
 function metaNow(){
   return {phase:state.phase, selChar:state.selChar, aw:state.activeWorld, ap:state.activePart, world:state.world,
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
-    chars: show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx, voicePitch:c.voicePitch})),
+    chars: show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx, voicePitch:c.voicePitch, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null})),
     layers: layers.map(L=>({id:L.id, name:L.name, vs:L.vs, vis:L.visible, lk:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps}))};
 }
 const r4 = v => Math.round(v*1e4)/1e4;
@@ -314,30 +314,31 @@ function netPoses(){
   } else if (show.embodied){
     if (now - netPoseT < 50) return; netPoseT = now;
     const c = show.embodied.c, k = {};
-    for (const [key, a] of netLastPose) if (key[0]==='L') k[key] = a;
+    for (const [key, a] of netLastPose) if (key[0]==='L' || key[0]==='r') k[key] = a;
     netSend({t:'pose', c:c.id, k, f:[r4(c.look.position.x), r4(c.look.position.y), r4(c.mouthO.position.x)]});
   }
 }
 function netCaptureOwn(){   // a player's own puppet parts, before faces are added (the host adds those again)
   if (!NET.guest || !show.embodied) return;
   netLastPose.clear(); for (const L of partsOf(show.embodied.c)) netLastPose.set('L'+L.id, poseArr(L.group));
+  for (const sd of ['left','right']) if (embGrab[sd]) netLastPose.set('r'+embGrab[sd].c.id, poseArr(embGrab[sd].c.root));
 }
 function netApplyPoses(){
   if (NET.guest){
     const own = show.embodied ? show.embodied.c.id : -1;
     for (const [key, a] of netPose){
       if (key[0]==='L'){ const L = layerById(+key.slice(1)); if (L && L.char !== own) setPoseArr(L.group, a); }
-      else { const c = charById(+key.slice(1)); if (c) setPoseArr(c.root, a); }
+      else { const c = charById(+key.slice(1)); if (c && !(embGrab.left && embGrab.left.c===c) && !(embGrab.right && embGrab.right.c===c)) setPoseArr(c.root, a); }
     }
   } else if (NET.host){
     for (const [cid, r] of netRemote){ const c = charById(cid); if (!c || NET.assign.get(cid) !== r.peer) continue;
-      for (const key in r.k){ const L = layerById(+key.slice(1)); if (L && L.char===cid) setPoseArr(L.group, r.k[key]); }
+      for (const key in r.k){ if (key[0]==='r'){ const pc = charById(+key.slice(1)); if (pc && pc.type==='prop') setPoseArr(pc.root, r.k[key]); continue; } const L = layerById(+key.slice(1)); if (L && L.char===cid) setPoseArr(L.group, r.k[key]); }
       if (r.f){ c.look.position.set(r.f[0], r.f[1], 0); c.mouthO.position.x = r.f[2]; } }
   }
 }
 function netControlled(set){   // the host leaves puppets that players are in alone, and records them
   if (!NET.host) return;
-  for (const [cid] of NET.assign){ const c = charById(cid); if (!c) continue; for (const L of partsOf(c)) set.add(String(L.id)); set.add('e'+cid); set.add('m'+cid); }
+  for (const [cid] of NET.assign){ const c = charById(cid); if (!c) continue; for (const L of partsOf(c)) set.add(String(L.id)); set.add('e'+cid); set.add('m'+cid); const rr2 = netRemote.get(cid); if (rr2) for (const key in rr2.k) if (key[0]==='r') set.add(key); }
 }
 
 // ---- what arrives
@@ -378,6 +379,7 @@ async function onNet(m, from){
       stepIn(c); if (show.embodied) toast('You are '+c.name+'! Move your head and hands. Talk to move the mouth.'); return; }
     case 'off': NET.off = m.o; return;
     case 'doundo': if (NET.guest){ m.redo ? redo() : undo(); } return;
+    case 'eaten': if (NET.host){ const ce = charById(m.c); if (ce){ const b = snapShow(); ce.place = {...ce.place, s:1e-4}; ce.placed = true; pushUndo({type:'show', snap:b}); sceneDirty = true; nom(); } } return;
     case 'ui': { const p2 = NET.peers.get(NET.host ? from : m.from); if (NET.host) netSend({...m, from}); if (p2) setPeerUI(p2, m.img); return; }
     case 'out': for (const [cid, pid] of [...NET.assign]) if (pid===from){ NET.assign.delete(cid); netRemote.delete(cid); } requestUI(); return;
     case 'rec':
@@ -402,7 +404,7 @@ function applyMeta(m){
   try {
     const cids = new Set(m.chars.map(c=>c.id));
     for (const c of [...show.chars]) if (!cids.has(c.id)){ if (show.embodied && show.embodied.c===c) show.embodied = null; actors.remove(c.root); show.chars = show.chars.filter(x=>x!==c); }
-    for (const cd of m.chars){ const c = charById(cd.id) || makeChar(cd.type, cd.name, cd.id); Object.assign(c, {name:cd.name, type:cd.type, place:cd.place, placed:cd.placed, guide:cd.guide, locked:cd.locked, voiceFx:cd.voiceFx, voicePitch:cd.voicePitch}); }
+    for (const cd of m.chars){ const c = charById(cd.id) || makeChar(cd.type, cd.name, cd.id); Object.assign(c, {name:cd.name, type:cd.type, place:cd.place, placed:cd.placed, guide:cd.guide, locked:cd.locked, voiceFx:cd.voiceFx, voicePitch:cd.voicePitch, voiceFxp:cd.voiceFxp, arms:cd.arms||c.arms, shoulders:cd.shoulders||c.shoulders}); }
     const lids = new Set(m.layers.map(l=>l.id));
     for (const L of [...layers]) if (!lids.has(L.id)) removeLayer(L);
     for (const ld of m.layers){
@@ -731,7 +733,7 @@ const state = {
   confirm:null, toastMsg:'', toastT:0,
 };
 const shots = {takes:[], seq:[], sel:null, seqSel:null, aspect:'1:1', res:1080, fps:30, blackRoom:true, showAll:false, playhead:0, takeSeq:1, keyT:0, keySel:-1};
-const show = {tracks:{}, audio:[], chars:[], t:0, playing:false, rec:null, grab:null, embodied:null, charSeq:1, audioSeq:1};
+const show = {music:{song:-1, speed:1, vol:0.5}, tracks:{}, audio:[], chars:[], t:0, playing:false, rec:null, grab:null, embodied:null, charSeq:1, audioSeq:1};
 
 /* ---------------- renderer / scene ---------------- */
 const renderer = new THREE.WebGLRenderer({antialias:true});
@@ -1975,6 +1977,7 @@ function controlledKeys(){
   if (show.grab) set.add(show.grab.c ? 'r'+show.grab.c.id : String(show.grab.L.id));
   if (show.embodied){ for (const part of show.embodied.parts) set.add(String(part.L.id)); if (show.embodied.rootMoved) set.add('r'+show.embodied.c.id); set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
   if (show.rec && show.rec.voiceFor) set.add('m'+show.rec.voiceFor);
+  for (const sd of ['left','right']) if (embGrab[sd]) set.add('r'+embGrab[sd].c.id);
   netControlled(set);
   return set;
 }
@@ -2027,7 +2030,7 @@ async function decodeClip(c){
   c._norm = pk > 0.01 ? clamp(0.7/pk, 0.4, 6) : 1;   // every voice comes out about as loud, with room to spare
   return buf;
 }
-function audioStop(){ audioToken++; for (const s of audioSrcs){ try{ s.stop(); }catch(e){} } audioSrcs = []; }
+function audioStop(){ musicSrc = null; audioToken++; for (const s of audioSrcs){ try{ s.stop(); }catch(e){} } audioSrcs = []; }
 const VOICE_FX = [['none','Plain'],['echo','Echo'],['robot','Robot'],['radio','Radio'],['cave','Cave']];
 let _caveIR = null;
 function caveIR(ctx){
@@ -2037,16 +2040,11 @@ function caveIR(ctx){
 }
 // a voice clip's sound chain: volume + effect, then gently squeezed and made louder. Works for live playback and for the MP4 render.
 function buildFx(ctx, c, src){
-  const out = ctx.createGain(); out.gain.value = c.vol ?? 1;
-  const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -14; comp.knee.value = 12; comp.ratio.value = 1.8; comp.attack.value = 0.012; comp.release.value = 0.25;
-  const loud = ctx.createGain(); loud.gain.value = c._norm || 1; out.connect(comp); comp.connect(loud);
-  const fx = c.fx || 'none';
-  if (fx==='echo'){ const d = ctx.createDelay(1); d.delayTime.value = 0.28; const fb = ctx.createGain(); fb.gain.value = 0.42; src.connect(out); src.connect(d); d.connect(fb); fb.connect(d); d.connect(out); }
-  else if (fx==='robot'){ const rm = ctx.createGain(); rm.gain.value = 0; const osc = ctx.createOscillator(); osc.frequency.value = 55; osc.connect(rm.gain); osc.start(); src.addEventListener('ended', ()=>{ try{ osc.stop(); }catch(e){} }); src.connect(rm); rm.connect(out); const dry = ctx.createGain(); dry.gain.value = 0.25; src.connect(dry); dry.connect(out); }
-  else if (fx==='radio'){ const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1600; bp.Q.value = 0.9; const ws = ctx.createWaveShaper(); const cv = new Float32Array(256); for (let i=0;i<256;i++){ const x = i/128-1; cv[i] = Math.tanh(x*3); } ws.curve = cv; src.connect(bp); bp.connect(ws); ws.connect(out); }
-  else if (fx==='cave'){ const cv = ctx.createConvolver(); cv.buffer = caveIR(ctx); const wet = ctx.createGain(); wet.gain.value = 0.6; src.connect(out); src.connect(cv); cv.connect(wet); wet.connect(out); }
-  else src.connect(out);
-  return loud;
+  const out = ctx.createGain(); out.gain.value = (c.vol ?? 1) * (c._norm || 1);
+  const oscs = []; src.connect(out);
+  const end = fxChain(ctx, fxOf(c), out, oscs);
+  if (oscs.length) src.addEventListener('ended', ()=>{ for (const o of oscs) try { o.stop(); } catch(e){} });
+  return end;
 }
 function spatialAt(c, tk, u){
   const amt = shots.spatial ?? 1; if (c.cid == null || amt <= 0.001 || !tk) return null;
@@ -2072,6 +2070,7 @@ function spatialNode(ctx, node, c, tk, u0, u1, timeOf){
 }
 async function audioPlayFrom(t, rate=1, only, tk){
   audioStop(); const token = audioToken;
+  if (!only) musicPlayFrom(t, rate);
   for (const c of (only ? [only] : show.audio)){
     let buf = null; try { buf = playBuf(c, await decodeClip(c)); } catch(e){}
     const at = c.at || 0;
@@ -2096,6 +2095,9 @@ async function renderFilmAudio(total){
       const acc0 = acc; spatialNode(oac, buildFx(oac, c, src), c, tk, s0, s1, u => acc0 + (u - tk.inT)/rate).connect(oac.destination);
       src.start(acc + (s0 - tk.inT)/rate, s0 - at, s1 - s0); any = true;
     }
+    const mu = tk.sceneId===curScene ? show.music : (sc && sc.music);
+    if (mu && mu.song >= 0){ const mb = await songBuf(mu.song), ms = oac.createBufferSource(), mg = oac.createGain(); ms.buffer = mb; ms.loop = true; ms.playbackRate.value = rate*(mu.speed||1); mg.gain.value = mu.vol ?? 0.5;
+      ms.connect(mg); mg.connect(oac.destination); ms.start(acc, ((tk.inT*(mu.speed||1)) % mb.duration + mb.duration) % mb.duration, Lc*rate*(mu.speed||1)); ms.stop(acc + Lc); any = true; }
     acc += Lc;
   }
   return any ? await oac.startRendering() : null;
@@ -2169,7 +2171,7 @@ function micRecorder(){
   const a = ac();
   if (a.state !== 'running') return new MediaRecorder(micStream);
   const src = a.createMediaStreamSource(micStream), gn = a.createGain(), dst = a.createMediaStreamDestination();
-  gn.gain.value = state.micGain || 2.5; src.connect(gn); gn.connect(dst);
+  gn.gain.value = 1; src.connect(gn); gn.connect(dst);   // recorded clean; loudness is evened out on playback
   return new MediaRecorder(dst.stream);
 }
 async function ensureMic(){
@@ -2433,10 +2435,10 @@ function updateShow(dt){
 let scenes = [{id:1, name:'Scene 1', tracks:null, audio:null, places:null}], curScene = 1, sceneSeq = 2;
 const sceneById = id => scenes.find(x=>x.id===id);
 const sceneTakes = () => shots.takes.filter(t=>(t.sceneId ?? 1)===curScene);
-function stashScene(){ const sc = sceneById(curScene); if (!sc) return; sc.tracks = show.tracks; sc.audio = show.audio; sc.places = Object.fromEntries(show.chars.map(c=>[c.id, {place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}])); }
+function stashScene(){ const sc = sceneById(curScene); if (!sc) return; sc.tracks = show.tracks; sc.audio = show.audio; sc.music = show.music; sc.places = Object.fromEntries(show.chars.map(c=>[c.id, {place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}])); }
 function loadScene(id){
   const sc = sceneById(id); if (!sc) return;
-  show.tracks = sc.tracks || {}; show.audio = sc.audio || [];
+  show.tracks = sc.tracks || {}; show.audio = sc.audio || []; show.music = sc.music || {song:-1, speed:1, vol:0.5};
   for (const c of show.chars){ const pl = sc.places && sc.places[c.id]; if (pl){ c.place = JSON.parse(JSON.stringify(pl.place)); c.placed = pl.placed; } }
   curScene = id;
 }
@@ -2884,18 +2886,18 @@ function charVoiceRow(X,W,y){
   txt('Voice for '+c.name, X, y+14, 16, '#ffd400','left',700);
   if (show.chars.length > 1){ button(X+W-84,y,38,30,'◀',false,()=>{ state.selChar = show.chars[(i-1+show.chars.length)%show.chars.length].id; requestUI(); },'#ff2d95');
     button(X+W-40,y,38,30,'▶',false,()=>{ state.selChar = show.chars[(i+1)%show.chars.length].id; requestUI(); },'#ff2d95'); }
-  const fw = (W-32)/5;
-  VOICE_FX.forEach(([id,l],k)=> button(X+k*(fw+8), y+36, fw, 36, l, (c.voiceFx||'none')===id, ()=>{ c.voiceFx = id; sceneDirty = true; requestUI(); }, '#5e2bff'));
-  slider(X,y+86,W,'Pitch', c.voicePitch||0, -12, 12, v=>{ c.voicePitch = Math.round(v); sceneDirty = true; }, '#00c7be', ((c.voicePitch||0)>0?'+':'')+(c.voicePitch||0)+(c.voicePitch ? ' notes' : ' · normal'));
-  para(['New takes recorded as '+c.name+' get this sound.'], X, y+140, 13, '#8f97c7');
-  return y+160;
+  return y+40;
 }
 function drawCVoice(X,W){
   txt('Voice', X, 100, 26);
   if (!show.chars.length){ para(['Make a puppet first.'], X, 136, 15); return; }
-  const y = charVoiceRow(X,W,116), c = selChar() || show.chars[0];
-  button(X,y+6,W,50, voiceTry ? 'Listening… say something' : '🎤 Try it: say something', !!voiceTry, ()=>tryVoice(c), '#ff9500');
-  para(['Hear yourself as '+c.name+' before you record.','Stepping into a puppet turns your mic on.'], X, y+80, 13, '#8f97c7');
+  const c = selChar() || show.chars[0]; let y = charVoiceRow(X,W,116);
+  y = drawFxRack(X, y, W, fxOf(c,'voiceFxp','voiceFx'), ()=>c.voicePitch||0, v=>{ c.voicePitch = v; }, ()=>{ sceneDirty = true; monT = 0; });
+  const hw = (W-8)/2;
+  button(X,y+6,hw,46,state.monitor ? '🔊 Hearing myself' : '🔈 Hear myself live',!!state.monitor,async ()=>{ state.monitor = !state.monitor; if (state.monitor){ state.mic = true; await ensureMic(); } monT = 0; requestUI(); },'#34c759');
+  button(X+hw+8,y+6,hw,46, voiceTry ? 'Listening…' : '🎤 Try 3 s', !!voiceTry, ()=>tryVoice(c), '#ff9500');
+  if (state.monitor) slider(X,y+62,W,'Live volume', state.monVol ?? 0.8, 0, 1.5, v=>{ state.monVol = +v.toFixed(2); monT = 0; }, '#34c759', Math.round((state.monVol??0.8)*100)+'%');
+  para(['Live: wear headphones or keep it low so it doesn\'t howl.','New takes as '+c.name+' get this sound.'], X, y+(state.monitor ? 124 : 70), 12, '#8f97c7');
 }
 let voiceTry = null;
 async function tryVoice(c){
@@ -2903,11 +2905,11 @@ async function tryVoice(c){
   const mr = micRecorder(), ch = []; voiceTry = mr; requestUI();
   mr.ondataavailable = e => { if (e.data.size) ch.push(e.data); };
   mr.onstop = async () => { voiceTry = null; requestUI();
-    const blob = new Blob(ch, {type: mr.mimeType || 'audio/webm'}), clip = {id:'try'+Date.now(), b64:u8ToB64(new Uint8Array(await blob.arrayBuffer())), mime:mr.mimeType, fx:c.voiceFx||'none', pitch:c.voicePitch||0, vol:1, at:0};
+    const blob = new Blob(ch, {type: mr.mimeType || 'audio/webm'}), clip = {id:'try'+Date.now(), b64:u8ToB64(new Uint8Array(await blob.arrayBuffer())), mime:mr.mimeType, fxp:JSON.parse(JSON.stringify(fxOf(c,'voiceFxp','voiceFx'))), pitch:c.voicePitch||0, vol:1, at:0};
     try { await decodeClip(clip); audioPlayFrom(0, 1, clip); } catch(e){ toast("Couldn't play it back"); } };
   mr.start(); toast('Talk now (3 seconds)…'); setTimeout(() => { if (mr.state !== 'inactive') mr.stop(); }, 3000);
 }
-function voiceFromChar(clip, cid){ const c = cid != null ? charById(cid) : null; if (!c) return; clip.cid = c.id; clip.fx = c.voiceFx || 'none'; clip.pitch = c.voicePitch || 0; if (!clip.name) clip.name = c.name+"'s voice"; }
+function voiceFromChar(clip, cid){ const c = cid != null ? charById(cid) : null; if (!c) return; clip.cid = c.id; clip.fxp = JSON.parse(JSON.stringify(fxOf(c,'voiceFxp','voiceFx'))); clip.pitch = c.voicePitch || 0; if (!clip.name) clip.name = c.name+"'s voice"; }
 function withShotView(fn){
   const vis = shotHidden.map(o=>o.visible); shotHidden.forEach(o=>o.visible=false);
   const wv = world.visible, wa = water.visible, bg = scene.background, fg = scene.fog, sv = studio.visible;
@@ -3158,9 +3160,9 @@ function serialize(){
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
     shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, seq:c.seq.slice()}))), cut:shots.cut},
-    scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', pitch:a.pitch||0, name:a.name, cid:a.cid ?? null})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}]))}))), curScene, sceneSeq,
-    show: {tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', pitch:a.pitch||0, name:a.name, cid:a.cid ?? null})),
-           chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx||'none', voicePitch:c.voicePitch||0})), charSeq:show.charSeq, audioSeq:show.audioSeq},
+    scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, music:sc.music||null, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}]))}))), curScene, sceneSeq,
+    show: {music:show.music, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null})),
+           chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx||'none', voicePitch:c.voicePitch||0, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
       id:L.id, name:L.name, vs:L.vs, visible:L.visible, locked:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps,
       chunks: [...L.chunks.values()].filter(ch => ch.d && ch.d.some(v=>v>-DMAX+0.01)).map(ch => {
@@ -3182,7 +3184,7 @@ function clearScene(){
 function deserialize(o){
   clearScene();
   const sh = o.show || {};
-  for (const cd of (sh.chars||[])){ const c = makeChar(cd.type, cd.name, cd.id); c.place = cd.place; c.placed = cd.placed; c.guide = cd.guide || null; c.locked = !!cd.locked; c.voiceFx = cd.voiceFx || 'none'; c.voicePitch = cd.voicePitch || 0; }
+  for (const cd of (sh.chars||[])){ const c = makeChar(cd.type, cd.name, cd.id); c.place = cd.place; c.placed = cd.placed; c.guide = cd.guide || null; c.locked = !!cd.locked; c.voiceFx = cd.voiceFx || 'none'; c.voicePitch = cd.voicePitch || 0; if (cd.voiceFxp) c.voiceFxp = cd.voiceFxp; if (cd.arms) c.arms = cd.arms; if (cd.shoulders) c.shoulders = cd.shoulders; }
   for (const ld of o.layers){
     const c = ld.char ? charById(ld.char) : null;
     const L = makeLayer(ld.name, ld.vs || 0.1, ld.id, c ? c.root : world); L.visible=ld.visible; L.locked=ld.locked; L.group.visible=L.visible;
@@ -3213,7 +3215,7 @@ function deserialize(o){
   if (o.shots){ Object.assign(shots, o.shots); shots.takes = (shots.takes || []).map(copyTake); shots.seq = shots.seq || [];
     if (!o.shots.cuts){ shots.cuts = null; shots.cut = null; } else { const cc = shots.cuts.find(c=>c.id===shots.cut) || shots.cuts[0]; shots.cut = cc.id; shots.seq = cc.seq; } ensureCuts(); }
   else { shots.takes=[]; shots.seq=[]; shots.sel=null; }
-  show.tracks = sh.tracks||{}; show.audio = sh.audio||[]; show.charSeq = Math.max(show.charSeq, sh.charSeq||1); show.audioSeq = sh.audioSeq||1;
+  show.tracks = sh.tracks||{}; show.audio = sh.audio||[]; show.music = sh.music || {song:-1, speed:1, vol:0.5}; show.charSeq = Math.max(show.charSeq, sh.charSeq||1); show.audioSeq = sh.audioSeq||1;
   for (const a of show.audio){ delete a._decoding; delete a._peaks; }
   if (o.scenes && o.scenes.length){ scenes = o.scenes.map(x=>({...x})); for (const x of scenes) for (const a of (x.audio||[])){ delete a._decoding; delete a._peaks; } sceneSeq = o.sceneSeq || (Math.max(...scenes.map(x=>x.id))+1); curScene = -1; loadScene(o.curScene ?? scenes[0].id); }
   else { scenes = [{id:1, name:'Scene 1', tracks:show.tracks, audio:show.audio, places:null}]; curScene = 1; sceneSeq = 2; }
@@ -3701,7 +3703,7 @@ const KEYS_DESK = {
 };
 const PAGE_DRAW = {together:drawTogether, soon:drawSoon, tools:drawTools, color:drawColor, doodle:drawDoodle, blocks:drawBlocks, world:drawWorld, sky:drawSky,
   scene:drawSettings, dmotion:drawDMotion, cast:drawCast, files:drawFiles, settings:drawSettings, lights:drawLights, materials:drawMaterials, sun:drawSun, fromlayer:drawFromLayer, takes:drawTakes, path:drawPath, keys:drawKeysPage, lens:drawLens, timeline:drawTimeline, export:drawExport,
-  chars:drawChars, perform:drawPerform, tracks:drawTracks, audio:drawAudio, cvoice:drawCVoice, ghworlds:drawGHWorlds, dedit:drawDEdit, rename:drawRename};
+  chars:drawChars, perform:drawPerform, tracks:drawTracks, audio:drawAudio, cvoice:drawCVoice, charimport:drawCharImport, ghworlds:drawGHWorlds, dedit:drawDEdit, rename:drawRename};
 function drawPageWin(win){
   const W = win.cw; g = win.ctx; hits = [];
   g.clearRect(0,0,W,win.ch); rr(0,0,W,win.ch,22,'#151935');
@@ -4337,27 +4339,47 @@ function drawFromLayer(X,W){
 }
 function drawChars(X,W){
   txt('Characters', X, 100, 26);
-  const hw=(W-8)/2, tw3=(W-16)/3;
-  button(X,122,tw3,50,'+ Puppet',false,()=>newCharacter('puppet'),'#34c759');
-  button(X+tw3+8,122,tw3,50,'+ Empty prop',false,()=>newCharacter('prop'),'#00c7be');
-  button(X+2*(tw3+8),122,tw3,50,'Prop from layer',false,()=>{ state.page='fromlayer'; requestUI(); },'#ff2d95');
-  if (!show.chars.length){ para(['This is your character studio: it has','its own space and your own size here,','separate from the world.','','Puppet: a head and two hands you can','step inside. Prop: one piece you grab','and move around.'], X, 200, 14); return; }
+  const hw=(W-8)/2, tw4=(W-24)/4;
+  button(X,122,tw4,46,'+ Puppet',false,()=>newCharacter('puppet'),'#34c759');
+  button(X+tw4+8,122,tw4,46,'+ Prop',false,()=>newCharacter('prop'),'#00c7be');
+  button(X+2*(tw4+8),122,tw4,46,'From layer',false,()=>{ state.page='fromlayer'; requestUI(); },'#ff2d95');
+  button(X+3*(tw4+8),122,tw4,46,'Other worlds',false,()=>{ state.impWorld = null; state.page='charimport'; requestUI(); },'#5e2bff');
+  if (!show.chars.length){ para(['This is your character studio: it has','its own space and your own size here,','separate from the world.','','Puppet: a head and two hands you can','step inside. Prop: one piece you grab','and move around. From layer: turn a world','layer into a prop. Other worlds: bring in','characters you made before.'], X, 196, 14); return; }
   let c = selChar(); if (!c){ state.selChar = show.chars[show.chars.length-1].id; c = selChar(); }
   const pick = d => { cycleChar(d); const c2 = selChar(); state.activePart = c2 ? (partsOf(c2)[0]?.id ?? null) : null; state.partPage = 0; requestUI(); };
-  button(X,182,40,46,'◀',false,()=>pick(-1),'#34c759');
-  rr(X+46,182,W-92,46,10,'#34c759'); txt(c.name.length>14 ? c.name.slice(0,13)+'…' : c.name, X+58, 205, 18, '#111');
-  txt(c.type+' · '+(show.chars.indexOf(c)+1)+'/'+show.chars.length, X+W-56, 205, 12, '#0b3a17','right',700);
-  button(X+W-40,182,40,46,'▶',false,()=>pick(1),'#34c759');
-  const parts = partsOf(c), per = 8, pages = Math.max(1, Math.ceil(parts.length/per)); state.partPage = clamp(state.partPage||0, 0, pages-1);
-  txt('Sculpt which part?', X, 252, 15, '#cfd6ff','left',700);
-  if (pages > 1){ button(X+W-86,238,40,28,'◀',false,()=>{ state.partPage--; requestUI(); },'#ff9500'); button(X+W-40,238,40,28,'▶',false,()=>{ state.partPage++; requestUI(); },'#ff9500'); txt((state.partPage+1)+'/'+pages, X+W-94, 252, 12, '#8f97c7','right',700); }
-  const cnt = {}, nm = L => { const same = parts.filter(P=>P.part===L.part); const base = PART_NAMES[L.part]||L.part; return same.length > 1 ? base+' '+(same.indexOf(L)+1) : base; };
+  button(X,176,40,44,'◀',false,()=>pick(-1),'#34c759');
+  rr(X+46,176,W-92,44,10,'#34c759'); txt(c.name.length>16 ? c.name.slice(0,15)+'…' : c.name, X+58, 198, 17, '#111'); hit(X+46,176,W-92,44,()=>openRename('char', c.id));
+  txt((show.chars.indexOf(c)+1)+'/'+show.chars.length, X+W-56, 198, 12, '#0b3a17','right',700);
+  button(X+W-40,176,40,44,'▶',false,()=>pick(1),'#34c759');
+  const parts = partsOf(c), list = state.partView === 'list' || c.type !== 'puppet';
+  if (c.type==='puppet'){ button(X+W-150,228,72,26,'Body',!list,()=>{ state.partView='body'; requestUI(); },'#ff9500'); button(X+W-72,228,72,26,'List',list,()=>{ state.partView='list'; requestUI(); },'#ff9500'); }
+  txt('Sculpt which part?', X, 242, 15, '#cfd6ff','left',700);
+  let yb;
+  if (!list){
+    drawBodyDiagram(c, X, 260, W, 232);
+    const A = armsOf(c), aw = (W-46-24)/4;
+    txt('Arms', X, 515, 14, '#cfd6ff','left',800);
+    ARM_STYLES.forEach(([id,l],i)=> button(X+46+i*(aw+8), 500, aw, 30, l, A.style===id, ()=>{ A.style = id; sceneDirty = true; requestUI(); }, '#ffd400'));
+    yb = 538;
+    if (A.style !== 'none'){ slider(X,yb,(W-8)*0.55,'Thickness', A.thick, 0.005, 0.08, v=>{ A.thick = +v.toFixed(4); sceneDirty = true; }, '#ffd400', fmtLen(A.thick*2));
+      button(X+(W-8)*0.55+8,yb+6,(W-8)*0.45,34,'Color = brush',false,()=>{ A.col = state.color; sceneDirty = true; requestUI(); },'#ff2d95');
+      button(X,yb+50,W,34,'Set shoulders (hold controllers there)',false,()=>startSetShoulders(),'#5e2bff'); yb += 92; }
+    const aL = activeLayer(), ac2 = state.confirm==='clearpart', t4 = (W-24)/4, a = state.confirm==='delchar';
+    button(X,yb,t4,38,ac2?'Tap again':'Clear part',ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(aL); },'#ff9500');
+    button(X+t4+8,yb,t4,38,'Copy eye',false,()=>{ if (aL && aL.part==='eye') copyEye(aL); else toast('Pick an eye in the drawing first'); },'#1e6bff');
+    button(X+2*(t4+8),yb,t4,38,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
+    button(X+3*(t4+8),yb,t4,38,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
+    return;
+  }
+  const per = 8, pages = Math.max(1, Math.ceil(parts.length/per)); state.partPage = clamp(state.partPage||0, 0, pages-1);
+  if (pages > 1){ button(X+W-236,228,34,26,'◀',false,()=>{ state.partPage--; requestUI(); },'#ff9500'); button(X+W-196,228,34,26,'▶',false,()=>{ state.partPage++; requestUI(); },'#ff9500'); }
+  const nm = L => { const same = parts.filter(P=>P.part===L.part); const base = PART_NAMES[L.part]||L.part; return same.length > 1 ? base+' '+(same.indexOf(L)+1) : base; };
   const pw = (W-24)/4;
-  parts.slice(state.partPage*per, state.partPage*per+per).forEach((L,i)=>{ const x = X+(i%4)*(pw+8), y = 270+Math.floor(i/4)*44;
+  parts.slice(state.partPage*per, state.partPage*per+per).forEach((L,i)=>{ const x = X+(i%4)*(pw+8), y = 262+Math.floor(i/4)*44;
     button(x,y,pw,38,nm(L), activeLayer()===L, ()=>{ setActive(L); L.flashT = 0.7; },'#ff9500'); });
-  let yb = 362;
+  yb = 354;
   const t3c = (W-16)/3, aL = activeLayer();
-  button(X,yb,t3c,38,'+ Eye',false,()=>{ const E = addPart(c,'eye',0.00625); state.activePart = E.id; state.partPage = 99; toast('Sculpt one eye on the face. Then "Copy eye" puts one on the other side. Eyes look at you, or where you steer them.'); requestUI(); },'#00c7be');
+  button(X,yb,t3c,38,'+ Eye',false,()=>{ const E = addPart(c,'eye',0.00625); state.activePart = E.id; state.partPage = 99; toast('Sculpt one eye on the face. Then "Copy eye" puts one on the other side.'); requestUI(); },'#00c7be');
   button(X+t3c+8,yb,t3c,38,'+ Mouth',false,()=>{ const M2 = addPart(c,'mouth',0.00625); state.activePart = M2.id; state.partPage = 99; toast('Sculpt a mouth. It opens with your voice when you step in.'); requestUI(); },'#00c7be');
   button(X+2*(t3c+8),yb,t3c,38,'Copy eye',false,()=>{ if (aL && aL.part==='eye'){ copyEye(aL); state.partPage = 99; } else toast('Pick an eye part first'); },'#1e6bff');
   yb += 48;
@@ -4367,7 +4389,6 @@ function drawChars(X,W){
   const a = state.confirm==='delchar';
   button(X,yb,hw,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
   button(X+hw+8,yb,hw,42,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
-  if (c.type==='puppet') para(['Voice tab: how '+c.name+' sounds.'], X, yb+66, 13, '#8f97c7');
 }
 function cycleTake(d){ const T = sceneTakes(), n = T.length; if (!n) return; const i = T.findIndex(t=>t.id===shots.sel); shots.sel = T[((i<0?0:i)+d+n)%n].id; shots.keySel=-1; pathDirty=true; requestUI(); }
 function cycleChar(d){ const n = show.chars.length; if (!n) return; const i = show.chars.findIndex(c=>c.id===state.selChar); state.selChar = show.chars[((i<0?0:i)+d+n)%n].id; requestUI(); }
@@ -4411,10 +4432,11 @@ function drawPerform(X,W){
   if (!sc0) para(['Make one in CHARACTERS first.'], X, 392, 15);
   else { button(X,378,34,42,'◀',false,()=>cycleChar(-1),'#ff2d95'); charRow(sc0, X+40, 378, W-80); button(X+W-34,378,34,42,'▶',false,()=>cycleChar(1),'#ff2d95'); }
   let ty = 378 + 48 + 2;
-  const tw = (W-16)/3;
+  const tw = (W-24)/4;
   button(X,ty,tw,42,'Mic',state.mic,async ()=>{ state.mic=!state.mic; requestUI(); if (state.mic){ const m = await ensureMic(); if (m) toast('Mic on: your voice records with the show'); } },'#ff9500');
-  button(X+tw+8,ty,tw,42,'Mirror',state.mirrorOn,()=>{ state.mirrorOn=!state.mirrorOn; if (state.mirrorOn){ placeMirror(); state.win.preview = true; } requestUI(); },'#1e6bff');
-  button(X+2*(tw+8),ty,tw,42,'Camera',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
+  button(X+tw+8,ty,tw,42,'Hear me',!!state.monitor,async ()=>{ state.monitor = !state.monitor; if (state.monitor){ state.mic = true; await ensureMic(); toast('You hear your puppet voice live (use headphones or keep it low)'); } monT = 0; requestUI(); },'#34c759');
+  button(X+2*(tw+8),ty,tw,42,'Mirror',state.mirrorOn,()=>{ state.mirrorOn=!state.mirrorOn; if (state.mirrorOn){ placeMirror(); state.win.preview = true; } requestUI(); },'#1e6bff');
+  button(X+3*(tw+8),ty,tw,42,'Camera',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
   const gps = NET.host ? [...NET.peers.values()].sort((a,b)=>a.n-b.n) : [];
   if (gps.length) gps.forEach((p,i)=>{ const y = ty+52+i*48, cur = [...NET.assign].find(([,pid])=>pid===p.id), cc = cur ? charById(cur[0]) : null, col = PLAYER_COL[(p.n-1)%4];
     rr(X,y,10,42,5,col); txt(playerName(p.n), X+18, y+21, 15, '#fff');
@@ -4444,7 +4466,7 @@ function drawShowRows(X,W,aud){
   }
   if (aud) for (const a of show.audio) rows.push({kind:'a', a, name:(a.name||'Voice '+a.id), len:a.dur||0});
   const vs = aud ? show.audio.find(x=>x.id===state.voiceSel) : null, SK = aud ? 'audioScroll' : 'motionScroll';
-  const top = aud && !vs ? charVoiceRow(X,W,116) : 124;
+  const top = aud && !vs ? drawMusicRow(X,116,W) + 6 : 124;
   if (!rows.length) para(aud ? ['No voices yet. Turn the mic on in Perform','and record, or use Voice only.'] : ['Nothing recorded yet.','Go to Perform and press Record.'], X, top+16, 15);
   else if (!vs) para([aud ? 'Tap a voice to change how it sounds.' : 'Tap a row to see its path and play the show.'], X, UIH-154, 14);
   const fit = Math.max(1, Math.floor((UIH-176-top)/48)), scrolls = !vs && rows.length > fit, maxS = Math.max(0, rows.length-fit);
@@ -4472,14 +4494,12 @@ function drawShowRows(X,W,aud){
   if (vs){
     const y0 = 124 + 48 + 6;
     txt('Editing '+(vs.name||'Voice '+vs.id), X, y0+8, 14, '#ffd400','left',700);
-    slider(X,y0+28,W,'Volume', vs.vol ?? 1, 0, 3, v=>{ vs.vol = +v.toFixed(2); sceneDirty=true; }, '#ff9500', Math.round((vs.vol??1)*100)+'%');
-    slider(X,y0+86,W,'Starts at', vs.at || 0, 0, Math.max(5, showLength()), v=>{ vs.at = +v.toFixed(2); sceneDirty=true; }, '#ff2d95', fmtTime(vs.at||0)+'.'+String(Math.floor(((vs.at||0)%1)*10)));
-    slider(X,y0+144,W,'Pitch (lower ↔ higher)', vs.pitch||0, -12, 12, v=>{ vs.pitch = Math.round(v); sceneDirty=true; }, '#00c7be', ((vs.pitch||0)>0?'+':'')+(vs.pitch||0)+(vs.pitch ? ' notes' : ' · normal'));
-    const fw = (W-32)/5;
-    VOICE_FX.forEach(([id,l],i)=> button(X+i*(fw+8), y0+204, fw, 40, l, (vs.fx||'none')===id, ()=>{ vs.fx = id; sceneDirty=true; audioPlayFrom(vs.at||0, 1, vs); requestUI(); }, '#5e2bff'));
+    slider(X,y0+28,(W-10)/2,'Volume', vs.vol ?? 1, 0, 3, v=>{ vs.vol = +v.toFixed(2); sceneDirty=true; }, '#ff9500', Math.round((vs.vol??1)*100)+'%');
+    slider(X+(W+10)/2,y0+28,(W-10)/2,'Starts at', vs.at || 0, 0, Math.max(5, showLength()), v=>{ vs.at = +v.toFixed(2); sceneDirty=true; }, '#ff2d95', fmtTime(vs.at||0)+'.'+String(Math.floor(((vs.at||0)%1)*10)));
+    const yb = drawFxRack(X, y0+88, W, fxOf(vs), ()=>vs.pitch||0, v=>{ vs.pitch = v; }, ()=>{ sceneDirty = true; });
     const hw2 = (W-8)/2;
-    button(X, y0+252, hw2, 40, '▶ Hear it', false, ()=>audioPlayFrom(vs.at||0, 1, vs), '#34c759');
-    button(X+hw2+8, y0+252, hw2, 40, '✕ Close', false, ()=>{ state.voiceSel = null; audioStop(); requestUI(); }, '#ff3b30');
+    button(X, yb+6, hw2, 40, '▶ Hear it', false, ()=>audioPlayFrom(vs.at||0, 1, vs), '#34c759');
+    button(X+hw2+8, yb+6, hw2, 40, '✕ Close', false, ()=>{ state.voiceSel = null; audioStop(); requestUI(); }, '#ff3b30');
     return;
   }
   const a = state.confirm==='clearshow';
@@ -4564,7 +4584,7 @@ function legendLines(hand){
     shoot:  [['T','film (hold)'],['A', play?'stop':'play take'],['B', keyGrab?'delete this key':'next take'],['S','↕ zoom (records)'],['G','key dot / window / world']],
     edit:   [['A', play?'stop':'play film'],['T','menu clicks'],['G','window / world']],
     light:  [['A','add a light here'],['G','grab a bulb / window / world'],['T','menu clicks']],
-    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T', show.grab ? 'hold: re-grip your hand' : 'aim at ground: jump there'],['G', show.embodied?'window / world':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
+    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T', show.grab ? 'hold: re-grip your hand' : 'aim at ground: jump there'],['G', show.embodied?'hold a prop · eat it · climb':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
   }[ph] || [['T','menu clicks'],['G','window / world']]);
 }
 function drawLegend(cv, lines){
@@ -5111,6 +5131,7 @@ function xrUpdate(dt){
   if (keyGrab && R) updateKeyGrab(R);
   if (blockGrab && R && !two) moveBlockGrab(unscaled(R.grip));
   if (doodleGrab && R && !two) moveDoodleGrab(unscaled(R.grip));
+  if (show.embodied) updateEmbodiedHands(pl, pr, dt);
   if (avGrab && R) moveAvGrab(R.grip, dt);
   if (ptGrab && R){ const t = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(t); movePtGrab(t); }
   if (lightGrab && R){ const t = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(t); moveLightGrab(t); }
@@ -5232,6 +5253,368 @@ function xrCameraUpdate(){
   for (const c of [cx, ...cx.cameras]){ c.matrixWorld.premultiply(_xrMs); c.matrixWorldInverse.copy(c.matrixWorld).invert(); c.matrixWorld.decompose(c.position, c.quaternion, c.scale); }
 }
 
+/* ============ v0.16: voice effects you can shape, hearing yourself live, songs, arms, grabbing props ============ */
+
+// ---- voice effects: each one on/off with its own knobs
+const FX_DEF = {echo:{on:false, time:0.25, fb:0.25, mix:0.25}, robot:{on:false, tone:55, mix:0.75}, radio:{on:false, tone:1600, crunch:0.4},
+  cave:{on:false, mix:0.3}, squeeze:{on:true, thr:-14, ratio:1.8, att:12, rel:250}};
+const FX_LIST = [['echo','Echo','#1e6bff'],['robot','Robot','#5e2bff'],['radio','Radio','#ff9500'],['cave','Cave','#00c7be'],['squeeze','Squeeze','#ff2d95']];
+const FX_KNOBS = {
+  echo:[['time','Delay',0.05,1,v=>Math.round(v*1000)+' ms'],['fb','Feedback',0,0.9,v=>Math.round(v*100)+'%'],['mix','Wet',0,1,v=>Math.round(v*100)+'%']],
+  robot:[['tone','Buzz',20,200,v=>Math.round(v)+' Hz'],['mix','Wet',0,1,v=>Math.round(v*100)+'%']],
+  radio:[['tone','Tone',400,3000,v=>Math.round(v)+' Hz'],['crunch','Crunch',0,1,v=>Math.round(v*100)+'%']],
+  cave:[['mix','Wet',0,1,v=>Math.round(v*100)+'%']],
+  squeeze:[['thr','Threshold',-40,0,v=>Math.round(v)+' dB'],['ratio','Ratio',1,12,v=>v.toFixed(1)+':1'],['att','Attack',1,100,v=>Math.round(v)+' ms'],['rel','Release',50,1000,v=>Math.round(v)+' ms']]};
+function fxOf(o, key='fxp', legacy='fx'){
+  if (!o[key]){ const f = JSON.parse(JSON.stringify(FX_DEF)); const l = o[legacy]; if (l && f[l]) f[l].on = true; o[key] = f; }
+  for (const k in FX_DEF) if (!o[key][k]) o[key][k] = JSON.parse(JSON.stringify(FX_DEF[k]));
+  return o[key];
+}
+// input → effects in order → returned node. oscs collects oscillators to stop later.
+function fxChain(ctx, f, input, oscs){
+  let node = input;
+  const mixer = (dryAmt, wetNode, wetAmt) => { const out = ctx.createGain(), dry = ctx.createGain(), wet = ctx.createGain(); dry.gain.value = dryAmt; wet.gain.value = wetAmt; node.connect(dry); dry.connect(out); wetNode.connect(wet); wet.connect(out); return out; };
+  if (f.robot.on){ const rm = ctx.createGain(); rm.gain.value = 0; const osc = ctx.createOscillator(); osc.frequency.value = f.robot.tone; osc.connect(rm.gain); osc.start(); oscs.push(osc); node.connect(rm); node = mixer(1 - f.robot.mix, rm, f.robot.mix*1.6); }
+  if (f.radio.on){ const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f.radio.tone; bp.Q.value = 0.9; const ws = ctx.createWaveShaper(), cv = new Float32Array(256), k = 1 + f.radio.crunch*6;
+    for (let i=0;i<256;i++){ const x = i/128-1; cv[i] = Math.tanh(x*k)/Math.tanh(k); } ws.curve = cv; node.connect(bp); bp.connect(ws); node = ws; }
+  if (f.echo.on){ const d = ctx.createDelay(1.2); d.delayTime.value = f.echo.time; const fb = ctx.createGain(); fb.gain.value = f.echo.fb; node.connect(d); d.connect(fb); fb.connect(d); node = mixer(1, d, f.echo.mix); }
+  if (f.cave.on){ const cv = ctx.createConvolver(); cv.buffer = caveIR(ctx); node.connect(cv); node = mixer(1, cv, f.cave.mix*1.4); }
+  if (f.squeeze.on){ const comp = ctx.createDynamicsCompressor(); comp.threshold.value = f.squeeze.thr; comp.knee.value = 10; comp.ratio.value = f.squeeze.ratio; comp.attack.value = f.squeeze.att/1000; comp.release.value = f.squeeze.rel/1000;
+    const mk = ctx.createGain(); mk.gain.value = Math.min(2, 1 + Math.max(0, -f.squeeze.thr - 12)/40*(1 - 1/f.squeeze.ratio)); node.connect(comp); comp.connect(mk); node = mk; }
+  return node;
+}
+// the effects rack: pitch, five effect chips (tap = on/off, the lit one shows its knobs)
+function drawFxRack(X, y, W, f, pitchGet, pitchSet, onChange){
+  slider(X,y,W,'Pitch', pitchGet(), -12, 12, v=>{ pitchSet(Math.round(v)); onChange(); }, '#00c7be', (pitchGet()>0?'+':'')+pitchGet()+(pitchGet() ? ' notes' : ' · normal'));
+  const fw = (W-32)/5, sel = state.fxSel || 'echo';
+  FX_LIST.forEach(([id,l,col],i)=>{ const x = X+i*(fw+8), on = f[id].on;
+    rr(x,y+56,fw,36,10,on?col:'#2a3060'); if (sel===id) rr(x-2,y+54,fw+4,40,12,null,'#ffd400');
+    txt(l, x+fw/2, y+74, 13, on?'#111':'#cfd6ff','center',800);
+    hit(x,y+56,fw,36,()=>{ if (state.fxSel===id || !f[id].on){ f[id].on = !f[id].on || state.fxSel!==id; } state.fxSel = id; onChange(); requestUI(); }); });
+  const knobs = FX_KNOBS[sel] || [];
+  if (!f[sel].on) para(['Tap '+FX_LIST.find(x=>x[0]===sel)[1]+' again to turn it on.'], X, y+116, 13, '#8f97c7');
+  else knobs.forEach(([k,l,mn,mx,fmt],i)=> slider(X,y+112+i*50,W,l,f[sel][k],mn,mx,v=>{ f[sel][k] = +v.toFixed(3); onChange(); }, FX_LIST.find(x=>x[0]===sel)[2], fmt(f[sel][k])));
+  return y + 112 + Math.max(1, knobs.length)*50;
+}
+
+// ---- hearing yourself live (with the puppet's pitch and effects)
+let monitor = null, pitchReady = null;
+function loadPitchWorklet(a){
+  if (pitchReady || !a.audioWorklet) return pitchReady;
+  const code = `class P extends AudioWorkletProcessor{static get parameterDescriptors(){return [{name:'ratio',defaultValue:1,minValue:0.25,maxValue:4}]}
+  constructor(){super();this.N=8192;this.b=new Float32Array(this.N);this.w=0;this.ph=0;this.W=2400;}
+  rd(p){const N=this.N;p=((p%N)+N)%N;const i=Math.floor(p),f=p-i;return this.b[i]*(1-f)+this.b[(i+1)%N]*f;}
+  process(I,O,par){const inp=I[0]&&I[0][0],out=O[0][0];if(!out)return true;const r=par.ratio[0],W=this.W;
+   for(let i=0;i<out.length;i++){this.b[this.w]=inp?inp[i]:0;this.ph=(this.ph+(1-r)+W)%W;const d1=this.ph,d2=(this.ph+W/2)%W;
+    out[i]=this.rd(this.w-d1)*Math.sin(Math.PI*d1/W)+this.rd(this.w-d2)*Math.sin(Math.PI*d2/W);this.w=(this.w+1)%this.N;}
+   for(let c=1;c<O[0].length;c++)O[0][c].set(out);return true;}}
+  registerProcessor('cmm-pitch',P);`;
+  pitchReady = a.audioWorklet.addModule(URL.createObjectURL(new Blob([code], {type:'application/javascript'}))).then(()=>true).catch(()=>false);
+  return pitchReady;
+}
+function monitorChar(){ return show.embodied ? show.embodied.c : (selChar() || null); }
+let monT = 0;
+async function updateMonitor(dt){
+  monT -= dt; if (monT > 0) return; monT = 0.4;
+  const want = !!(state.monitor && state.mic && micStream);
+  const c = monitorChar(), f = c ? fxOf(c,'voiceFxp','voiceFx') : null, pitch = c ? (c.voicePitch||0) : 0;
+  const sig = want ? JSON.stringify([c && c.id, f, pitch, state.monVol]) : '';
+  if (monitor && monitor.sig === sig) return;
+  if (monitor){ try { monitor.src.disconnect(); } catch(e){} for (const o of monitor.oscs) try { o.stop(); } catch(e){} try { monitor.out.disconnect(); } catch(e){} monitor = null; }
+  if (!want) return;
+  const a = ac(); if (a.state !== 'running') return;
+  const mon = {sig, oscs:[], src:a.createMediaStreamSource(micStream)}; monitor = mon;
+  let node = mon.src;
+  if (pitch && await loadPitchWorklet(a) && monitor === mon){ const pn = new AudioWorkletNode(a, 'cmm-pitch'); pn.parameters.get('ratio').value = Math.pow(2, pitch/12); node.connect(pn); node = pn; }
+  if (monitor !== mon) return;
+  node = f ? fxChain(a, f, node, mon.oscs) : node;
+  mon.out = a.createGain(); mon.out.gain.value = state.monVol ?? 0.8; node.connect(mon.out); mon.out.connect(a.destination);
+}
+
+// ---- background songs: ten little tunes made right here, loopable, with speed
+const SONGS = [
+  {name:'Bouncy Pop', bpm:118, root:60, scale:[0,2,4,5,7,9,11], lead:'square', bass:'triangle', drums:'four', seed:3},
+  {name:'Sneaky Spy', bpm:96, root:57, scale:[0,2,3,5,7,8,10], lead:'triangle', bass:'sawtooth', drums:'swing', seed:7},
+  {name:'Spooky Night', bpm:80, root:62, scale:[0,1,4,5,7,8,11], lead:'sine', bass:'triangle', drums:'slow', seed:11},
+  {name:'Chase!', bpm:150, root:52, scale:[0,2,3,5,7,8,10], lead:'sawtooth', bass:'sawtooth', drums:'fast', seed:5},
+  {name:'Lullaby', bpm:70, root:65, scale:[0,2,4,5,7,9,11], lead:'triangle', bass:'sine', drums:'none', seed:2},
+  {name:'Circus', bpm:130, root:55, scale:[0,2,4,5,7,9,11], lead:'square', bass:'triangle', drums:'oompah', seed:13},
+  {name:'Lo-fi Nap', bpm:76, root:58, scale:[0,2,4,7,9], lead:'sine', bass:'triangle', drums:'lazy', seed:17},
+  {name:'Chip Quest', bpm:140, root:48, scale:[0,2,3,5,7,8,10], lead:'square', bass:'square', drums:'fast', seed:19},
+  {name:'Snack March', bpm:112, root:62, scale:[0,2,4,5,7,9,11], lead:'triangle', bass:'square', drums:'march', seed:23},
+  {name:'Space Float', bpm:90, root:60, scale:[0,2,4,6,7,9,11], lead:'sine', bass:'sine', drums:'slow', seed:29}];
+const songBufs = new Map();
+function songBuf(i){
+  if (songBufs.has(i)) return songBufs.get(i);
+  const p = (async () => {
+    const S = SONGS[i], sr = 44100, beat = 60/S.bpm, bars = 8, len = bars*4*beat, oac = new OfflineAudioContext(2, Math.ceil(len*sr), sr);
+    let seed = S.seed; const rnd = () => (seed = (seed*16807) % 2147483647) / 2147483647;
+    const hz = m => 440*Math.pow(2, (m-69)/12), deg = d => S.root + S.scale[((d%S.scale.length)+S.scale.length)%S.scale.length] + 12*Math.floor(d/S.scale.length);
+    const master = oac.createGain(); master.gain.value = 0.55; master.connect(oac.destination);
+    const note = (t, m, dur, type, vol, cut=4000) => { const o = oac.createOscillator(), g = oac.createGain(), lp = oac.createBiquadFilter(); o.type = type; o.frequency.value = hz(m); lp.type = 'lowpass'; lp.frequency.value = cut;
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(vol, t+0.01); g.gain.exponentialRampToValueAtTime(0.001, t+dur); o.connect(lp); lp.connect(g); g.connect(master); o.start(t); o.stop(t+dur+0.05); };
+    const noise = oac.createBuffer(1, sr, sr); { const d = noise.getChannelData(0); for (let k=0;k<d.length;k++) d[k] = Math.random()*2-1; }
+    const hit = (t, type) => { if (type==='kick'){ const o = oac.createOscillator(), g = oac.createGain(); o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(40, t+0.15); g.gain.setValueAtTime(0.9, t); g.gain.exponentialRampToValueAtTime(0.001, t+0.25); o.connect(g); g.connect(master); o.start(t); o.stop(t+0.3); return; }
+      const n = oac.createBufferSource(), f = oac.createBiquadFilter(), g = oac.createGain(); n.buffer = noise; f.type = type==='hat' ? 'highpass' : 'bandpass'; f.frequency.value = type==='hat' ? 7000 : 1800; const dur = type==='hat' ? 0.05 : 0.14;
+      g.gain.setValueAtTime(type==='hat' ? 0.18 : 0.45, t); g.gain.exponentialRampToValueAtTime(0.001, t+dur); n.connect(f); f.connect(g); g.connect(master); n.start(t, rnd()*0.5); n.stop(t+dur+0.02); };
+    const prog = [0, 5, 3, 4, 0, 5, 3, 4].map(x => x + (rnd() < 0.3 ? 2 : 0));
+    let d = 7;
+    for (let b=0;b<bars;b++){
+      const t0 = b*4*beat, ch = prog[b];
+      for (let q=0;q<4;q++){ const bt = t0 + q*beat;   // bass
+        if (S.drums==='oompah') note(bt, deg(ch + (q%2 ? 4 : 0)) - 12, beat*0.5, S.bass, 0.35, 900);
+        else if (S.drums==='swing') note(bt, deg(ch + q*2) - 12, beat*0.8, S.bass, 0.3, 800);
+        else { note(bt, deg(ch) - 12, beat*0.9, S.bass, 0.32, 700); if (S.bpm > 120) note(bt + beat/2, deg(ch) - 12, beat*0.4, S.bass, 0.25, 700); } }
+      if (S.drums !== 'lullaby') for (const k of [0,2,4]) note(t0, deg(ch+k), 4*beat*0.95, 'triangle', S.drums==='none' ? 0.05 : 0.04, 1200);   // soft chord pad
+      for (let e=0;e<8;e++){ const et = t0 + e*beat/2, sw = S.drums==='swing' && e%2 ? beat*0.16 : 0;   // melody in eighths
+        if (rnd() < (S.drums==='none' || S.bpm < 85 ? 0.45 : 0.62)){ d += Math.round((rnd()-0.5)*4); d = clamp(d, 3, 13); if (e===0) d = 7 + ch; note(et + sw, deg(d) + 12, beat*(rnd()<0.3 ? 0.9 : 0.45), S.lead, S.lead==='square' || S.lead==='sawtooth' ? 0.09 : 0.16, 3200); } }
+      for (let q=0;q<4;q++){ const bt = t0 + q*beat;   // drums
+        switch (S.drums){
+          case 'four': hit(bt,'kick'); if (q%2) hit(bt,'snare'); hit(bt+beat/2,'hat'); break;
+          case 'fast': hit(bt,'kick'); if (q%2) hit(bt,'snare'); hit(bt,'hat'); hit(bt+beat/2,'hat'); break;
+          case 'swing': if (!(q%2)) hit(bt,'kick'); else hit(bt,'snare'); hit(bt+beat*0.66,'hat'); break;
+          case 'slow': if (q===0) hit(bt,'kick'); if (q===2) hit(bt,'snare'); break;
+          case 'lazy': if (q===0 || q===2.5) hit(bt,'kick'); if (q===2) hit(bt+beat*0.05,'snare'); hit(bt+beat/2,'hat'); break;
+          case 'oompah': hit(bt, q%2 ? 'snare' : 'kick'); break;
+          case 'march': hit(bt,'kick'); hit(bt+beat/2,'snare'); if (q===3){ hit(bt+beat*0.75,'snare'); } break;
+        } }
+    }
+    return await oac.startRendering();
+  })();
+  songBufs.set(i, p); return p;
+}
+const musicOf = sc => (sc ? sc.music : show.music) || {song:-1, speed:1, vol:0.5};
+let musicSrc = null;
+async function musicPlayFrom(t, rate=1){
+  musicStop(); const m = show.music; if (!m || m.song < 0) return; const token = audioToken;
+  const buf = await songBuf(m.song); if (token !== audioToken) return;
+  const a = ac(), src = a.createBufferSource(), g = a.createGain(); src.buffer = buf; src.loop = true; src.playbackRate.value = rate*(m.speed||1); g.gain.value = m.vol ?? 0.5;
+  src.connect(g); g.connect(a.destination); src.start(0, ((t*(m.speed||1)) % buf.duration + buf.duration) % buf.duration); musicSrc = src; audioSrcs.push(src);
+}
+function musicStop(){ if (musicSrc){ try { musicSrc.stop(); } catch(e){} musicSrc = null; } }
+function drawMusicRow(X, y, W){
+  const m = show.music || (show.music = {song:-1, speed:1, vol:0.5}), n = SONGS.length;
+  txt('Music', X, y+14, 16, '#ffd400','left',800);
+  button(X+70,y,40,32,'◀',false,()=>{ m.song = m.song <= -1 ? n-1 : m.song-1; sceneDirty = true; if (show.playing) audioPlayFrom(show.t); requestUI(); },'#ffd400');
+  rr(X+116,y,W-116-90,32,10,'#0d1029'); txt(m.song < 0 ? 'None' : SONGS[m.song].name, X+116+(W-206)/2, y+16, 15, m.song < 0 ? '#8f97c7' : '#ffd400','center',800);
+  button(X+W-86,y,40,32,'▶',false,()=>{ m.song = m.song >= n-1 ? -1 : m.song+1; sceneDirty = true; if (show.playing) audioPlayFrom(show.t); requestUI(); },'#ffd400');
+  button(X+W-40,y,40,32,musicSrc ? '■' : '♪',!!musicSrc,()=>{ if (musicSrc){ audioStop(); musicStop(); } else if (m.song >= 0) musicPlayFrom(show.t || 0); requestUI(); },'#34c759');
+  if (m.song < 0) return y + 44;
+  slider(X,y+40,(W-8)/2,'Speed', m.speed||1, 0.5, 2, v=>{ m.speed = +v.toFixed(2); sceneDirty = true; if (musicSrc) musicSrc.playbackRate.value = m.speed; }, '#ffd400', (m.speed||1).toFixed(2)+'×');
+  slider(X+(W+8)/2,y+40,(W-8)/2,'Volume', m.vol ?? 0.5, 0, 1, v=>{ m.vol = +v.toFixed(2); sceneDirty = true; }, '#ffd400', Math.round((m.vol??0.5)*100)+'%');
+  return y + 98;
+}
+
+// ---- arms that join the hands to the body: string, elbow, or bellows
+const ARM_STYLES = [['none','None'],['string','String'],['elbow','Elbow'],['accordion','Bellows']];
+function armsOf(c){
+  if (!c.arms) c.arms = {style:'none', thick:0.025, col:'#ffd400'};
+  if (!c.shoulders){ const h = (c.guide || GUIDE).head; c.shoulders = {l:[h[0]+0.16, h[1]-0.27, h[2]-0.02], r:[h[0]-0.16, h[1]-0.27, h[2]-0.02]}; }
+  return c.arms;
+}
+const restMat = L => new THREE.Matrix4().compose(new THREE.Vector3(...L.rest.p), new THREE.Quaternion(...L.rest.q), new THREE.Vector3().setScalar(L.rest.s));
+function ridePoint(L, p){ return p.clone().applyMatrix4(restMat(L).invert()).applyMatrix4(new THREE.Matrix4().compose(L.group.position, L.group.quaternion, L.group.scale)); }
+const ARM_N = 41, ARM_K = 8;
+function armMesh(c, side){
+  c._arms = c._arms || {};
+  if (!c._arms[side]){
+    const geo = new THREE.BufferGeometry(), pos = new Float32Array(ARM_N*ARM_K*3), idx = [];
+    for (let i=0;i<ARM_N-1;i++) for (let k=0;k<ARM_K;k++){ const a = i*ARM_K+k, b = i*ARM_K+(k+1)%ARM_K, c2 = a+ARM_K, d = b+ARM_K; idx.push(a,c2,b, b,c2,d); }
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setIndex(idx);
+    const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({color:c.arms.col, roughness:0.55})); m.frustumCulled = false; c.root.add(m); c._arms[side] = m;
+  }
+  return c._arms[side];
+}
+function tubeInto(mesh, pts, rad){
+  const pa = mesh.geometry.attributes.position, n = pts.length, up = new THREE.Vector3(0,1,0), T = V(), N = V(), B = V(), p = V();
+  for (let i=0;i<ARM_N;i++){
+    const j = Math.min(n-1, i), a = pts[Math.max(0,j-1)], b = pts[Math.min(n-1,j+1)];
+    T.subVectors(b, a); if (T.lengthSq() < 1e-12) T.set(0,0,1); T.normalize();
+    N.copy(Math.abs(T.dot(up)) > 0.95 ? new THREE.Vector3(1,0,0) : up).addScaledVector(T, -T.dot(Math.abs(T.dot(up)) > 0.95 ? new THREE.Vector3(1,0,0) : up)).normalize(); B.crossVectors(T, N);
+    const r = rad(Math.min(1, j/(n-1)), j);
+    for (let k=0;k<ARM_K;k++){ const an = k/ARM_K*Math.PI*2; p.copy(pts[j]).addScaledVector(N, Math.cos(an)*r).addScaledVector(B, Math.sin(an)*r); pa.setXYZ(i*ARM_K+k, p.x, p.y, p.z); }
+  }
+  pa.needsUpdate = true; mesh.geometry.computeVertexNormals(); mesh.geometry.computeBoundingSphere();
+}
+function updateArms(){
+  for (const c of show.chars){
+    if (c.type !== 'puppet'){ continue; }
+    const A = armsOf(c), on = A.style !== 'none' && c.root.visible;
+    for (const side of ['l','r']){
+      const H = partLayer(c, side==='l' ? 'lh' : 'rh');
+      if (!on || !H || !H.visible){ if (c._arms && c._arms[side]) c._arms[side].visible = false; continue; }
+      const m = armMesh(c, side); m.visible = true; m.material.color.set(A.col);
+      const BD = partLayer(c,'body') || partLayer(c,'head'), sRest = new THREE.Vector3(...c.shoulders[side]), wRest = new THREE.Vector3(...(c.guide || GUIDE)[side==='l' ? 'lh' : 'rh']);
+      const s0 = BD ? ridePoint(BD, sRest) : sRest, w = ridePoint(H, wRest), restLen = sRest.distanceTo(wRest), d = s0.distanceTo(w), th = A.thick || 0.025, pts = [];
+      if (A.style==='string'){ const mid = s0.clone().add(w).multiplyScalar(0.5); mid.y -= Math.max(0, restLen*1.05 - d)*0.6 + 0.02;
+        for (let i=0;i<ARM_N;i++){ const t = i/(ARM_N-1), u = 1-t; pts.push(new THREE.Vector3().addScaledVector(s0, u*u).addScaledVector(mid, 2*u*t).addScaledVector(w, t*t)); }
+        tubeInto(m, pts, () => th*0.3); }
+      else if (A.style==='elbow'){ const seg = restLen*0.55, half = d/2, dir = w.clone().sub(s0).normalize(), mid = s0.clone().add(w).multiplyScalar(0.5);
+        let pole = new THREE.Vector3(side==='l' ? 0.6 : -0.6, -1, -0.2); pole.addScaledVector(dir, -pole.dot(dir)).normalize();
+        const elbow = mid.clone().addScaledVector(pole, half < seg ? Math.sqrt(seg*seg - half*half) : 0), h = (ARM_N-1)/2;
+        for (let i=0;i<ARM_N;i++){ pts.push(i <= h ? s0.clone().lerp(elbow, i/h) : elbow.clone().lerp(w, (i-h)/h)); }
+        tubeInto(m, pts, (t) => th*(1.05 - 0.25*t)); }
+      else { for (let i=0;i<ARM_N;i++) pts.push(s0.clone().lerp(w, i/(ARM_N-1)));
+        tubeInto(m, pts, (t, i) => th*(i%2 ? 1.45 : 0.75)); }
+    }
+  }
+}
+let shoulderSet = 0;
+function startSetShoulders(){ if (!renderer.xr.isPresenting){ toast('Do this in the headset'); return; } shoulderSet = 3.2; toast('Put your controllers where its shoulders are… 3'); }
+function tickShoulders(dt){
+  if (shoulderSet <= 0) return; const before = Math.ceil(shoulderSet); shoulderSet -= dt; const now = Math.ceil(shoulderSet);
+  if (now !== before && now > 0){ toast(String(now)); beep(660); }
+  if (shoulderSet > 0) return; shoulderSet = 0;
+  const c = selChar(); if (!c || !ctrl.left || !ctrl.right){ toast('Both controllers are needed'); return; }
+  c.root.updateMatrixWorld(true); const inv = c.root.matrixWorld.clone().invert(), a = V(), b = V(); ctrl.left.grip.getWorldPosition(a); ctrl.right.grip.getWorldPosition(b); a.applyMatrix4(inv); b.applyMatrix4(inv);
+  armsOf(c); const [L2, R2] = a.x > b.x ? [a, b] : [b, a];   // the puppet's left is on its +x side
+  c.shoulders = {l:L2.toArray().map(r4), r:R2.toArray().map(r4)}; beep(1320, 0.2); sceneDirty = true; toast('Shoulders set'); requestUI();
+}
+
+// ---- the body diagram: tap a part of the drawing to sculpt that part
+function drawBodyDiagram(c, X, y, W, h){
+  rr(X,y,W,h,16,'#0d1029');
+  const cx = X+W/2, hy = y+62, parts = partsOf(c), act = activeLayer(), eyes = parts.filter(L=>L.part==='eye'), mouths = parts.filter(L=>L.part==='mouth');
+  const P = id => parts.find(L=>L.part===id), sel = L => L && act===L;
+  const pick = (L, mk) => { if (L){ setActive(L); L.flashT = 0.7; } else if (mk){ const N = mk(); state.activePart = N.id; } requestUI(); };
+  const A = armsOf(c), BD = P('body'), H = P('head'), LH = P('lh'), RH = P('rh');
+  // body
+  g.fillStyle = sel(BD) ? '#ffd400' : BD ? '#ff9500' : '#3a4280'; g.beginPath(); g.roundRect(cx-42, hy+54, 84, 80, 26); g.fill(); hit(cx-42, hy+54, 84, 80, ()=>pick(BD, ()=>addPart(c,'body',0.025)));
+  txt('Body', cx, hy+96, 13, '#111','center',800);
+  // arms from the shoulders to the hands (the puppet's left hand is on your right)
+  const hands = [[RH, X+34, 'rh', 'Right hand', -1], [LH, X+W-34, 'lh', 'Left hand', 1]];
+  for (const [Lh, hx, id, label, sgn] of hands){
+    const sx = cx + sgn*36, sy = hy+68, hy2 = hy+118;
+    g.strokeStyle = A.style==='none' ? '#4a5080' : A.col; g.lineWidth = A.style==='accordion' ? 12 : A.style==='string' ? 3 : 9; g.lineCap = 'round';
+    if (A.style==='accordion') g.setLineDash([6,5]); else g.setLineDash([]);
+    g.beginPath(); g.moveTo(sx, sy); if (A.style==='elbow') g.lineTo((sx+hx)/2 + sgn*12, sy+44); else if (A.style==='string') g.quadraticCurveTo((sx+hx)/2, hy2+20, hx, hy2); g.lineTo(hx, hy2); g.stroke(); g.setLineDash([]);
+    g.fillStyle = sel(Lh) ? '#ffd400' : Lh ? '#ff2d95' : '#3a4280'; g.beginPath(); g.roundRect(hx-26, hy2-24, 52, 52, 14); g.fill();
+    g.fillStyle = '#111'; g.beginPath(); g.arc(hx, hy2, 9, 0, 7); g.fill();   // a controller ring
+    txt(label, hx, hy2+40, 12, '#cfd6ff','center',700); hit(hx-30, hy2-30, 60, 64, ()=>pick(Lh, ()=>addPart(c, id, 0.0125)));
+  }
+  // head, eyes, mouth
+  g.fillStyle = sel(H) ? '#ffd400' : H ? '#34c759' : '#3a4280'; g.beginPath(); g.arc(cx, hy, 54, 0, 7); g.fill(); hit(cx-54, hy-54, 108, 108, ()=>pick(H, ()=>addPart(c,'head',0.0125)));
+  const ne = Math.max(2, eyes.length), span = Math.min(70, 26*ne);
+  for (let i=0;i<ne;i++){ const ex = cx - span/2 + (ne>1 ? i*span/(ne-1) : span/2), ey = hy-14, E = eyes[i];
+    g.fillStyle = E ? (sel(E) ? '#ffd400' : '#ffffff') : 'rgba(255,255,255,0.25)'; g.beginPath(); g.arc(ex, ey, 11, 0, 7); g.fill(); g.fillStyle = '#111'; g.beginPath(); g.arc(ex, ey+1, 4, 0, 7); g.fill();
+    hit(ex-13, ey-13, 26, 26, ()=>pick(E, ()=>addPart(c,'eye',0.00625))); }
+  const M = mouths[0]; g.strokeStyle = M ? (sel(M) ? '#ffd400' : '#ff3b30') : 'rgba(255,255,255,0.3)'; g.lineWidth = 7; g.beginPath(); g.arc(cx, hy+12, 20, 0.15*Math.PI, 0.85*Math.PI); g.stroke();
+  hit(cx-24, hy+14, 48, 26, ()=>pick(M, ()=>addPart(c,'mouth',0.00625)));
+  txt('tap a part to sculpt it', X+12, y+16, 11, '#8f97c7','left',700); txt('faded = make it', X+W-12, y+16, 11, '#8f97c7','right',700);
+}
+
+// ---- grabbing things while you are a puppet: props come along in your hand, the world lets you climb, and food goes in your mouth
+const embGrab = {left:null, right:null}, climb = {left:null, right:null};
+function embTip(cc){ const t = V().set(0,-0.01,-0.07); cc.grip.updateMatrixWorld(true); return cc.grip.localToWorld(t); }
+function findPropNear(pW, rW){
+  let best = null, bd = rW;
+  for (const c of show.chars){ if (c.type!=='prop' || !c.root.visible || (show.embodied && show.embodied.c===c) || Object.values(embGrab).some(g=>g && g.c===c)) continue;
+    const bx = new THREE.Box3().setFromObject(c.root); if (bx.isEmpty()) continue; const d = bx.distanceToPoint(pW); if (d < bd){ bd = d; best = c; } }
+  return best;
+}
+function embGripStart(side){
+  const cc = ctrl[side]; if (!cc) return; const tip = embTip(cc), r = 0.09*rig.scale.x;
+  const pr = findPropNear(tip, r);
+  if (pr){ pr.root.updateMatrixWorld(true); embGrab[side] = {c:pr, rel: unscaled(cc.grip).invert().multiply(pr.root.matrixWorld.clone())}; pulse(side,0.5,30); return; }
+  if (side==='right' && !blockGrab && !doodleGrab){ const b = findBlockAt(tip, r); if (b){ startBlockGrab(b, unscaled(cc.grip)); return; } const d = findStrokeAt(tip, r); if (d){ startDoodleGrab(d, unscaled(cc.grip)); return; } }
+  climb[side] = {anchor: tip.clone()}; pulse(side,0.25,15);   // nothing to hold: grab the world and pull yourself
+}
+function embGripEnd(side){
+  const g0 = embGrab[side];
+  if (g0){ embGrab[side] = null; const c = g0.c;
+    if (!show.rec && !NET.guest){ const b = snapShow(); c.place = poseOfObj(c.root); c.placed = true; pushUndo({type:'show', snap:b}); sceneDirty = true; } }
+  climb[side] = null;
+}
+function updateEmbodiedHands(pl, pr, dt){
+  const e = show.embodied; if (!e) return;
+  for (const [side, p] of [['left', pl], ['right', pr]]){
+    const cc = ctrl[side]; if (!cc || !p) continue;
+    if (p.grip && !p._embG){ p._embG = true; if (!(side==='right' && (winGrab || avGrab))) embGripStart(side); }
+    else if (!p.grip && p._embG){ p._embG = false; embGripEnd(side); if (side==='right'){ if (doodleGrab) endDoodleGrab(); if (blockGrab) endBlockGrab(); } }
+    const g0 = embGrab[side];
+    if (g0 && !eating.has(g0.c)){ const W = unscaled(cc.grip).multiply(g0.rel); g0.c.root.parent.updateMatrixWorld(true); setObjMatrix(g0.c.root, g0.c.root.parent.matrixWorld.clone().invert().multiply(W)); tryEat(g0.c, side); }
+  }
+  if (doodleGrab && ctrl.right && !two){ moveDoodleGrab(unscaled(ctrl.right.grip)); tryEatStroke(); }
+  if (blockGrab && ctrl.right && !two){ moveBlockGrab(unscaled(ctrl.right.grip)); tryEatStroke(); }
+  // climbing: the hand stays where it grabbed, so you move instead
+  const moves = []; for (const side of ['left','right']){ const cl = climb[side]; if (cl && ctrl[side]) moves.push(cl.anchor.clone().sub(embTip(ctrl[side]))); }
+  if (moves.length && !(show.tracks['r'+e.c.id] && !show.rec)){ const d = moves.reduce((a,b)=>a.add(b), V()).divideScalar(moves.length); rig.position.add(d); rig.updateMatrixWorld(true);
+    e.c.root.position.add(d); e.c.root.updateMatrixWorld(true); e.rootMoved = true; if (!show.rec){ e.c.place.p = e.c.root.position.toArray(); sceneDirty = true; } }
+}
+function mouthWorld(){
+  const e = show.embodied; if (!e) return null; const M = partsOf(e.c).find(L=>L.part==='mouth');
+  if (M){ const ctr = partCenter(M); if (ctr){ M.group.updateMatrixWorld(true); return M.group.localToWorld(ctr.clone()); } }
+  const p = V(); camera.getWorldPosition(p); return p.addScaledVector(upVec(), -0.07*rig.scale.x);
+}
+function nom(){ const a = ac(), t = a.currentTime;
+  for (let k=0;k<3;k++){ const n = a.createBufferSource(), f = a.createBiquadFilter(), g2 = a.createGain(), len = 0.09; const b = a.createBuffer(1, Math.ceil(a.sampleRate*len), a.sampleRate), d = b.getChannelData(0);
+    for (let i=0;i<d.length;i++) d[i] = (Math.random()*2-1)*(1-i/d.length); n.buffer = b; f.type = 'lowpass'; f.frequency.value = 900 - k*150; g2.gain.value = 0.7; n.connect(f); f.connect(g2); g2.connect(a.destination); n.start(t + k*0.13); }
+  const o = a.createOscillator(), og = a.createGain(); o.frequency.setValueAtTime(180, t+0.36); o.frequency.exponentialRampToValueAtTime(60, t+0.55); og.gain.setValueAtTime(0.5, t+0.36); og.gain.exponentialRampToValueAtTime(0.001, t+0.6); o.connect(og); og.connect(a.destination); o.start(t+0.36); o.stop(t+0.62);
+}
+const eating = new Set();
+function tryEat(c, side){
+  if (eating.has(c)) return; const mw = mouthWorld(); if (!mw) return;
+  const bx = new THREE.Box3().setFromObject(c.root); if (bx.isEmpty()) return;
+  const reach = 0.11*rig.scale.x; if (bx.distanceToPoint(mw) > reach) return;
+  eating.add(c); nom(); pulse(side, 0.9, 120); if (show.embodied) show.embodied.c.mouthO.position.x = 1;
+  const s0 = c.root.scale.x, t0 = performance.now(), b = (!show.rec && !NET.guest) ? snapShow() : null;
+  const step = () => { const k = Math.min(1, (performance.now()-t0)/350); c.root.scale.setScalar(s0*(1-k)+1e-4);
+    if (k < 1) return requestAnimationFrame(step);
+    if (embGrab[side] && embGrab[side].c===c){ embGrab[side] = null; }
+    eating.delete(c); c.place = {...poseOfObj(c.root), s:1e-4}; c.placed = true;
+    if (b){ pushUndo({type:'show', snap:b}); sceneDirty = true; }
+    if (NET.guest) netSend({t:'eaten', c:c.id});
+    toast('Nom! (X undoes it)'); };
+  requestAnimationFrame(step);
+}
+function tryEatStroke(){
+  const mw = mouthWorld(); if (!mw) return; const reach = 0.11*rig.scale.x;
+  const m = doodleGrab ? doodleGrab.s._mesh : blockGrab ? blockGrab.s._mesh : null; if (!m) return;
+  let near = false;
+  if (blockGrab){ const p = V().setFromMatrixPosition(blockMatrixW(blockGrab)); near = p.distanceTo(mw) < reach + blockSizeWorld()*0.5; }
+  else { const bx = new THREE.Box3().setFromObject(m); near = !bx.isEmpty() && bx.distanceToPoint(mw) < reach; }
+  if (!near) return; nom(); if (show.embodied) show.embodied.c.mouthO.position.x = 1; deleteHeld(); toast('Nom! (X undoes it)');
+}
+
+// ---- characters from your other worlds on this device
+async function importListWorld(id){
+  state.impWorld = {id, loading:true, chars:[]}; requestUI();
+  try { const t = await idbGet('world:'+id); const o = JSON.parse(t); state.impWorld = {id, o, chars:(o.show && o.show.chars) || []}; } catch(e){ state.impWorld = {id, chars:[], err:true}; }
+  requestUI();
+}
+function loadLayerData(ld, enc, L){
+  for (const cd of ld.chunks){ const [cx,cy,cz] = cd.k.split(',').map(Number), ch = getChunk(L,cx,cy,cz,true), rle = enc==='rle';
+    const dq = rle ? rleDec(b64ToU8(cd.d),1,CN3) : b64ToU8(cd.d), q = new Int8Array(dq.buffer, dq.byteOffset, CN3); ch.d = new Float32Array(CN3);
+    for (let i=0;i<CN3;i++) ch.d[i] = q[i]/127*DMAX; ch.c = rle ? rleDec(b64ToU8(cd.c),3,CN3*3) : b64ToU8(cd.c); }
+  for (const ch of [...L.chunks.values()]) markAround(L, ch.cx-1,ch.cy-1,ch.cz-1, ch.cx+1,ch.cy+1,ch.cz+1);
+  for (const s2 of (ld.strokes||[])){ const s3 = {...s2, uid:undefined, _mesh:null}; L.strokes.push(s3); rebuildStroke(L, s3); }
+}
+function importChar(o, cd){
+  const nm = show.chars.some(c=>c.name===cd.name) ? cd.name+' 2' : cd.name;
+  const c = makeChar(cd.type, nm); c.guide = cd.guide ? JSON.parse(JSON.stringify(cd.guide)) : (cd.type==='puppet' ? JSON.parse(JSON.stringify(GUIDE)) : null);
+  c.place = {p:[0,0,0], q:[0,0,0,1], s:1}; c.placed = false; c.voiceFx = cd.voiceFx; c.voicePitch = cd.voicePitch||0; if (cd.voiceFxp) c.voiceFxp = JSON.parse(JSON.stringify(cd.voiceFxp));
+  if (cd.arms) c.arms = {...cd.arms}; if (cd.shoulders) c.shoulders = JSON.parse(JSON.stringify(cd.shoulders));
+  let first = null;
+  for (const ld of o.layers.filter(l=>l.char===cd.id)){
+    const L = makeLayer(ld.name, ld.vs || 0.1, undefined, c.root); L.char = c.id; L.part = ld.part || 'extra'; if (ld.rest) L.rest = JSON.parse(JSON.stringify(ld.rest)); if (ld.mat) setLayerMat(L, ld.mat);
+    L.visible = ld.visible !== false; L.group.visible = L.visible; loadLayerData(ld, o.enc, L); if (!first) first = L;
+  }
+  state.selChar = c.id; if (first) state.activePart = first.id; sceneDirty = true; toast(nm+' moved in from another world'); requestUI();
+}
+function drawCharImport(X,W){
+  txt('From your other worlds', X, 100, 22);
+  const others = worldList.filter(w=>w.id!==state.worldId);
+  if (!others.length){ para(['No other worlds on this device yet.'], X, 136, 15); }
+  const iw = state.impWorld;
+  if (!iw){ others.slice(0,9).forEach((w,i)=>{ const y = 122+i*48; rr(X,y,W,42,10,'#2a3060'); txt(w.name, X+12, y+21, 16, '#fff'); txt('▸', X+W-16, y+21, 18, '#ffd400','right'); hit(X,y,W,42,()=>importListWorld(w.id)); }); }
+  else { const w = worldList.find(x=>x.id===iw.id); txt(w ? w.name : '', X, 136, 16, '#ffd400','left',800);
+    if (iw.loading) para(['Opening…'], X, 160, 15);
+    else if (!iw.chars.length) para(['No characters in that world.'], X, 160, 15);
+    else iw.chars.slice(0,7).forEach((cd,i)=>{ const y = 152+i*48; rr(X,y,W,42,10,'#2a3060'); txt((cd.type==='puppet'?'🙂 ':'📦 ')+cd.name, X+12, y+21, 16, '#fff'); txt('+ Bring in', X+W-12, y+21, 13, '#34c759','right',800); hit(X,y,W,42,()=>importChar(iw.o, cd)); });
+    button(X,UIH-170,W,42,'◀ Other worlds',false,()=>{ state.impWorld = null; requestUI(); },'#5e2bff'); }
+  button(X,UIH-118,W,44,'◀ Back to Characters',false,()=>{ state.impWorld = null; state.page='chars'; requestUI(); },'#1e6bff');
+}
+
 /* ---------------- main loop ---------------- */
 const BLACK = new THREE.Color('#000');
 const clock = new THREE.Clock();
@@ -5265,7 +5648,7 @@ renderer.setAnimationLoop(() => {
   applyFace(tdt);
   if (NET.guest) netApplyPoses();
   animTime += tdt; animateDoodles(animTime);
-  netTick(); netPoses(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum();
+  netTick(); netPoses(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum(); updateArms(); tickShoulders(tdt); updateMonitor(tdt);
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
@@ -5342,6 +5725,7 @@ function desktopRender(){
     addPart, spatialAt, ensureCuts, newCut, switchCut, deleteCut, nudgeGuest, setPeerUI, sendUIPic, GHS, drawGHWorlds, tryVoice, get avGrab(){return avGrab;},
     syncTakeEnds, clipLen, stopRecording, get recObj(){return rec;}, snapShow,
     netSend, chunkHash, netRemote, netApplyPoses, partsOf, pushUndo, rebuildStroke, makeLayer, decodeClip, applyRec, setPoseArr, poseArr, makeAvatar, updateAvatars,
+    fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
     NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
