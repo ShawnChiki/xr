@@ -57,7 +57,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.18';
+const VERSION = '0.19';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2486,7 +2486,7 @@ const selTake = () => takeById(shots.sel);
 function makeKeys(tk){
   const Sm = tk.samples, n = Sm.length/8; tk.keys = [];
   if (!n) return;
-  const h = tk.smooth*1.5, every = Math.max(0.1, tk.every);
+  const zb = clamp(Math.sqrt(40/(tk.fov||50)), 1, 2.5), h = tk.smooth*1.5*zb, every = Math.max(0.1, tk.every*Math.min(zb, 1.6));
   const times = []; for (let t=0; t<tk.dur - every*0.35; t+=every) times.push(t); times.push(tk.dur);
   const q0 = new THREE.Quaternion(), qa = new THREE.Quaternion();
   for (const t of times){
@@ -2689,7 +2689,7 @@ function updatePlay(dt){
   }
 }
 function lensNudge(delta){
-  state.fov = clamp(state.fov + delta, 15, 90);
+  state.fov = clamp(state.fov * Math.exp(delta/45), 4, 90);
   if (play && play.mode==='take' && play.tk){
     if (!play.lens){ play.lens = {samples:[+play.t.toFixed(3), +state.fov.toFixed(2)], before:snapShots()}; toast('Recording zoom…'); }
     refov(shotCam, vfov(state.fov, ASPECTS[shots.aspect]));
@@ -2933,12 +2933,20 @@ async function tryVoice(c){
 function voiceFromChar(clip, cid){ const c = cid != null ? charById(cid) : null; if (!c) return; clip.cid = c.id; clip.fxp = JSON.parse(JSON.stringify(fxOf(c,'voiceFxp','voiceFx'))); clip.pitch = c.voicePitch || 0; if (!clip.name) clip.name = c.name+"'s voice"; }
 function withShotView(fn){
   const vis = shotHidden.map(o=>o.visible); shotHidden.forEach(o=>o.visible=false);
+  const wvis = WINS.map(w=>w.mesh.visible); WINS.forEach(w=>w.mesh.visible=false);
   const wv = world.visible, wa = water.visible, bg = scene.background, fg = scene.fog, sv = studio.visible;
   world.visible = true; studio.visible = false; water.visible = state.world.water; scene.background = skyTex; scene.fog = state.world.fog ? fogObj() : null;
   fn();
-  world.visible = wv; studio.visible = sv; water.visible = wa; scene.background = bg; scene.fog = fg; shotHidden.forEach((o,i)=>o.visible=vis[i]);
+  world.visible = wv; studio.visible = sv; water.visible = wa; scene.background = bg; scene.fog = fg; shotHidden.forEach((o,i)=>o.visible=vis[i]); WINS.forEach((w,i)=>w.mesh.visible=wvis[i]);
 }
 function renderPreview(cam){
+  if (state.phase==='edit'){
+    const G = gridState(); ovMesh.visible = !!G; drawOverlay(G);
+    if (G){ renderGridRT(G); return; }
+    gridKey = '';
+    withShotView(() => { const xr = renderer.xr.enabled; renderer.xr.enabled = false; const old = renderer.getRenderTarget(); renderer.setRenderTarget(bigRT); renderer.render(scene, cam); renderer.setRenderTarget(old); renderer.xr.enabled = xr; });
+    return;
+  }
   withShotView(() => {
     const xr = renderer.xr.enabled; renderer.xr.enabled = false;
     const old = renderer.getRenderTarget();
@@ -3431,7 +3439,7 @@ const menuCtx = uiCanvas.getContext('2d');
 let g = menuCtx;
 let hits = [], uiNeeds = true, drag = null;
 function requestUI(){ uiNeeds = true; }
-const hit = (x,y,w,h,fn,dragFn) => hits.push({x,y,w,h,fn,drag:dragFn});
+const hit = (x,y,w,h,fn,dragFn,upFn) => hits.push({x,y,w,h,fn,drag:dragFn,up:upFn});
 function makeWin(id, canvas, metersW, slot, title){
   const ctx = canvas.getContext('2d');
   const tex = new THREE.CanvasTexture(canvas); tex.colorSpace = THREE.SRGBColorSpace;
@@ -4265,8 +4273,8 @@ function drawKeysPage(X,W){
 function drawLens(X,W){
   txt('Lens', X, 100, 26);
   const tk = selTake();
-  const z = (90 - state.fov)/75;
-  slider(X,130,W,'Zoom: wide ↔ close  (right stick ↕)', z, 0, 1, v=>{ state.fov = Math.round(90 - v*75); if (tk && !(tk.fovTrack && tk.fovTrack.length)){ tk.fov = state.fov; sceneDirty=true; } }, '#1e6bff', Math.round(state.fov)+'°');
+  const z = zoomOf(state.fov);
+  slider(X,130,W,'Zoom: wide ↔ close  (right stick ↕)', z, 0, 1, v=>{ state.fov = +fovOfZoom(v).toFixed(2); if (tk && !(tk.fovTrack && tk.fovTrack.length)){ tk.fov = state.fov; sceneDirty=true; } }, '#1e6bff', zoomX(state.fov)+(state.fov < 20 ? ' · steadier' : ''));
   txt('Frame shape (whole film)', X, 206, 16, '#cfd6ff','left',700);
   const bw=(W-16)/3;
   [['16:9','Wide'],['1:1','Square'],['9:16','Vertical']].forEach(([a,l],i)=>
@@ -4524,7 +4532,7 @@ function uiPointer(win, type, x, y){
     for (let i=hs.length-1;i>=0;i--){ const h=hs[i];
       if (x>=h.x && x<=h.x+h.w && y>=h.y && y<=h.y+h.h){ drag=h; h.fn && h.fn(x,y); pulse('right',0.25,15); break; } }
   } else if (type==='move'){ if (drag && drag.drag) drag.drag(x,y); }
-  else drag=null;
+  else { if (drag && drag.up) drag.up(x,y); drag=null; }
   requestUI();
 }
 for (const win of [menuWin, layersWin]){
@@ -5199,7 +5207,7 @@ function xrUpdate(dt){
     camModel.visible = shoot;
     if (shoot){
       lensTip.updateMatrixWorld(true);
-      lensTip.getWorldPosition(camPoseP); lensTip.getWorldQuaternion(camPoseQ);
+      lensTip.getWorldPosition(camPoseP); lensTip.getWorldQuaternion(camPoseQ); steadyCam(dt);
       if (!onPanel && !uiCapture && pr){
         if (guest){ if (pressEdge){ netSend({t:'crec', on:1}); state.camRecHeld = true; } if (state.camRecHeld && !pr.trigP){ state.camRecHeld = false; netSend({t:'crec', on:0}); } }
         else { if (pressEdge && !rec) startRecording(); if (rec && !pr.trigP) stopRecording(); }
@@ -5208,6 +5216,7 @@ function xrUpdate(dt){
     }
   }
   if (ph==='edit' && !play){ const f = filmAt(shots.playhead); if (f){ activateScene(f.tk.sceneId); poseShotCam(f.tk, f.u); } }
+  if (ph==='edit' && R && pr && !onPanel && !uiCapture) gridPointer(_o, _d, edge(R,pr,'trigP')); else if (gridHover !== -1) gridHover = -1;
   updateGhostCam(1);
   bigScreen.visible = ph==='edit';
   hudLabel.visible = !!(show.rec || (rec && !camModel.visible));
@@ -5633,7 +5642,7 @@ function addTakeToFilm(tk){
   ensureCuts();
   if (state.stackTakes !== false){
     for (let i=shots.seq.length-1;i>=0;i--){ const c = shots.seq[i], t0 = takeById(c.takes[0]);
-      if (t0 && (t0.sceneId ?? 1) === (tk.sceneId ?? 1) && c.takes.length < 6){ c.takes.push(tk.id); return true; } }
+      if (t0 && (t0.sceneId ?? 1) === (tk.sceneId ?? 1) && c.takes.length < 12){ c.takes.push(tk.id); return true; } }
   }
   shots.seq.push(newClip([tk.id])); return false;
 }
@@ -5651,12 +5660,12 @@ const laneKey = a => a.cid != null ? 'v'+a.cid : 'vx';
 function laneGain(key){ const m = (ensureCuts().mix || {})[key]; return m ? (m.mute ? 0 : (m.vol ?? 1)) : 1; }
 function laneNode(ctx, a){ const g2 = ctx.createGain(); g2.gain.value = laneGain(laneKey(a)); g2.connect(ctx.destination); return g2; }
 function audioLanes(){
-  const lanes = new Map(), add = (key, name, col, t0, t1) => { let l = lanes.get(key); if (!l) lanes.set(key, l = {key, name, col, blocks:[]}); if (t1 > t0) l.blocks.push([t0, t1]); };
+  const lanes = new Map(), add = (key, name, col, t0, t1, a, sid) => { let l = lanes.get(key); if (!l) lanes.set(key, l = {key, name, col, blocks:[]}); if (t1 > t0) l.blocks.push([t0, t1, a, sid]); };
   for (const seg of filmClips()){
     const sc = sceneById(seg.sceneId ?? 1), cur = (seg.sceneId ?? 1) === curScene, aud = (cur ? show.audio : sc && sc.audio) || [], mu = cur ? show.music : sc && sc.music, sp = spd(seg);
     for (const a of aud){ const at = a.at || 0, s0 = Math.max(seg.inT, at), s1 = Math.min(seg.outT, at + (a.dur || 0)); const ch = a.cid != null ? charById(a.cid) : null;
-      add(laneKey(a), ch ? ch.name : 'Other sounds', ch ? PALETTE[show.chars.indexOf(ch)%8] : '#8f97c7', seg._start + (s0-seg.inT)/sp, seg._start + (s1-seg.inT)/sp); }
-    if (mu && mu.song >= 0) add('music', 'Music', '#ffd400', seg._start, seg._start + (seg.outT-seg.inT)/sp);
+      add(laneKey(a), ch ? ch.name : 'Other sounds', ch ? PALETTE[show.chars.indexOf(ch)%8] : '#8f97c7', seg._start + (s0-seg.inT)/sp, seg._start + (s1-seg.inT)/sp, a, seg.sceneId ?? 1); }
+    if (mu && mu.song >= 0) add('music', 'Music', '#ffd400', seg._start, seg._start + (seg.outT-seg.inT)/sp, mu, seg.sceneId ?? 1);
   }
   return [...lanes.values()].sort((a,b)=> a.key==='music' ? 1 : b.key==='music' ? -1 : a.name.localeCompare(b.name));
 }
@@ -5688,9 +5697,16 @@ function drawEditor(X, Y, W, big){
   g.restore(); hit(TX, Y, TW, rh, scrub, scrub);
   let y = Y + rh + 6;
   // video lanes
-  const nl = clamp(Math.max(1, ...shots.seq.map(c=>c.takes.length)), 1, big ? 6 : 4), lh = big ? 44 : 30;
+  const nl = clamp(Math.max(1, ...shots.seq.map(c=>c.takes.length)), 1, big ? 9 : 6), lh = big ? (nl > 6 ? 30 : 44) : (nl > 4 ? 22 : 30);
   const clips = filmClips();
-  for (let j=0;j<nl;j++){ rr(X, y+j*lh, lab-6, lh-4, 8, '#2a3060'); txt(big ? 'Take lane '+(j+1) : 'V'+(j+1), X+8, y+j*lh+lh/2-2, big ? 14 : 12, '#cfd6ff','left',800); }
+  const curF = clipAt(play && play.mode==='film' ? play.t : shots.playhead), LD = state.laneDrag;
+  for (let j=0;j<nl;j++){ const ty = y+j*lh, tkj = curF ? takeById(curF.c.takes[j]) : null, dragging = LD && LD.from===j;
+    rr(X, ty, lab-6, lh-4, 8, dragging ? '#ffd400' : j===0 ? '#3a4280' : '#2a3060');
+    txt((big ? '≡ ' : '')+(tkj ? tkj.name.replace('Take ', big ? 'Take ' : 'T') : (big ? 'Lane ' : 'V')+(j+1))+(j===0 && big ? ' (top)' : ''), X+8, ty+lh/2-2, big ? (lh < 40 ? 12 : 14) : 11, dragging ? '#111' : '#cfd6ff','left',800);
+    hit(X, ty, lab-6, lh-4, ()=>{ if (curF && j < curF.c.takes.length){ state.laneDrag = {from:j, to:j, y0:y, lh}; requestUI(); } },
+      (px, py)=>{ if (state.laneDrag){ state.laneDrag.to = clamp(Math.floor((py - y)/lh), 0, (curF ? curF.c.takes.length : 1)-1); requestUI(); } },
+      ()=>{ const d = state.laneDrag; state.laneDrag = null; if (d && curF && d.to !== d.from) moveLane(curF.c, d.from, d.to); else requestUI(); }); }
+  if (LD && LD.to !== LD.from){ g.fillStyle = '#ffd400'; g.fillRect(X, y + LD.to*lh + (LD.to > LD.from ? lh-4 : -3), W, 4); }
   g.save(); g.beginPath(); g.rect(TX, y-2, TW, nl*lh+4); g.clip();
   rr(TX, y, TW, nl*lh-4, 8, '#0d1029');
   let acc = 0;
@@ -5728,6 +5744,9 @@ function drawEditor(X, Y, W, big){
     if (big){ const vx = TX+TW-110; rr(vx, y+5, 100, ah-14, 6, '#2a3060'); rr(vx, y+5, 100*Math.min(1, m.vol/2), ah-14, 6, ln.col); txt(Math.round(m.vol*100)+'%', vx+50, y+ah/2-2, 11, '#111','center',800);
       const setV = px => { m.vol = +clamp((px-vx)/100*2, 0, 2).toFixed(2); sceneDirty = true; requestUI(); }; hit(vx, y, 100, ah-4, setV, setV); }
     else hit(TX, y, TW, ah-4, scrub, scrub);
+    for (const [t0,t1,a,sid] of ln.blocks){ const a0 = Math.max(TX, tx(t0)), a1 = Math.min(TX+TW-(big ? 116 : 0), tx(t1)); if (a1 <= a0 || !a) continue;   // tap a sound to change its effects
+      const selA = state.edAud && state.edAud.a === a; if (selA) rr(a0, y+1, a1-a0, ah-6, 6, null, '#ffffff');
+      hit(a0, y, a1-a0, ah-4, ()=>{ state.edAud = {a, key:ln.key, name:ln.name, sid}; shots.playhead = clamp(t0, 0, filmLength()); if (renderer.xr.isPresenting){ state.panelOpen = true; } state.page = 'timeline'; toast('Its effects are in the menu'); requestUI(); }, scrub); }
     y += ah;
   }
   // playhead
@@ -5745,6 +5764,7 @@ function editorButtons(X, y, W, big){
     ['Move ▶', ()=>{ const i = shots.seq.indexOf(c); if (c && i < shots.seq.length-1){ const b = editSnap(); shots.seq.splice(i,1); shots.seq.splice(i+1,0,c); pushShotsUndo(b); sceneDirty = true; requestUI(); } }, '#1e6bff'],
     ['Drop lane', ()=>{ if (!c || c.takes.length < 2){ toast('Pick a lane in a clip with more than one take'); return; } const b = editSnap(); c.takes.splice(j,1); c.sw = c.sw.filter(s=>s.k!==j).map(s=>({t:s.t, k:s.k>j?s.k-1:s.k})); shots.laneSel = 0; pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#ff3b30'],
     ['Drop clip', ()=>{ if (!c) return; const b = editSnap(); shots.seq.splice(shots.seq.indexOf(c),1); shots.clipSel = null; pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#ff3b30'],
+    ['▦ Grid', ()=>{ state.multi = !state.multi; toast(state.multi ? 'Grid: every take of this moment side by side. Point and pull the trigger (or tap) to cut to one.' : 'Grid off'); requestUI(); }, '#00c7be', !!state.multi],
     ['− zoom', ()=>{ state.tlZoom = Math.max(1, (state.tlZoom||1)/2); requestUI(); }, '#2a3060'],
     ['+ zoom', ()=>{ state.tlZoom = Math.min(64, (state.tlZoom||1)*2); requestUI(); }, '#2a3060']];
   const per = big ? items.length : 4, bw = (W - (per-1)*8)/per, bh = big ? 44 : 38;
@@ -5767,6 +5787,7 @@ function cutChooser(X, y, W){
   if (n>1){ const ad = state.confirm==='delcut'; button(X+W-44,y,44,40,ad?'?':'✕',ad,()=>{ if(!ad){ state.confirm='delcut'; requestUI(); return; } state.confirm=null; deleteCut(); },'#ff3b30'); }
 }
 function drawTimeline(X,W){
+  if (state.edAud){ drawAudEdit(X,W); return; }
   txt('Edit', X, 100, 26); txt(fmtTime(shots.playhead)+' / '+fmtTime(filmLength()), X+W, 100, 16, '#ffd400','right');
   if (!filmClips().length){ para(['Film takes in SHOOT first.','Takes of the same scene stack up here','so you can cut between them.'], X, 136, 15); return; }
   let y = drawEditor(X, 118, W, false) + 8;
@@ -5793,6 +5814,22 @@ function placeEditor(){
   editorWin.mesh.position.copy(head).addScaledVector(fwd, 0.7*s); editorWin.mesh.position.y = head.y - 0.45*s;
   editorWin.mesh.lookAt(head); editorWin.mesh.scale.setScalar(s);
   rig.attach(editorWin.mesh); editorWin.dock = 'room'; editorWin.placedOnce = true;
+}
+function drawAudEdit(X, W){
+  const ea = state.edAud, a = ea.a, back = () => { state.edAud = null; audioStop(); requestUI(); };
+  txt('Edit · '+(ea.key==='music' ? 'music' : 'voice'), X, 100, 26);
+  if (ea.key==='music'){ const keep = show.music; show.music = a; drawMusicRow(X, 130, W); show.music = keep; }
+  else {
+    txt(ea.name+(a.name ? ' · '+a.name : ''), X, 132, 16, '#ffd400','left',800);
+    slider(X, 160, W, 'Volume', a.vol ?? 1, 0, 2, v=>{ a.vol = +v.toFixed(2); sceneDirty = true; }, '#34c759', Math.round((a.vol??1)*100)+'%');
+    const yb = drawFxRack(X, 218, W, fxOf(a), ()=>a.pitch||0, v=>{ a.pitch = v; }, ()=>{ sceneDirty = true; });
+    const hw = (W-8)/2;
+    button(X, yb+6, hw, 40, '▶ Hear it', false, ()=>{ activateScene(ea.sid); audioPlayFrom(a.at||0, 1, a); }, '#34c759');
+    if (a.cid != null) button(X+hw+8, yb+6, hw, 40, 'Same for all its lines', false, ()=>{ let n = 0; const f = JSON.stringify(fxOf(a));
+      for (const sc of scenes) for (const b of (sc.id===curScene ? show.audio : sc.audio)||[]) if (b !== a && b.cid === a.cid){ b.fxp = JSON.parse(f); b.pitch = a.pitch||0; n++; }
+      const ch = charById(a.cid); if (ch){ ch.voiceFxp = JSON.parse(f); ch.voicePitch = a.pitch||0; } sceneDirty = true; toast(n ? 'Copied to '+n+' more line'+(n>1?'s':'')+' and its voice' : 'Set as its voice'); }, '#ff2d95');
+  }
+  button(X, UIH-56, W, 42, '◀ Back to the edit', false, back, '#5e2bff');
 }
 function drawEditorWin(){
   const win = editorWin, W = win.cw; g = win.ctx; hits = [];
@@ -6141,6 +6178,120 @@ function updateCtrlModels(){
 }
 function layerHasClayCached(L){ const now = performance.now(); if (L._hcT && now - L._hcT < 2000) return L._hc; L._hcT = now; return (L._hc = layerHasClay(L)); }
 
+/* ============ v0.19: a sharper film screen, a switcher grid of takes, dragging lanes, and a longer zoom ============ */
+
+// ---- the big screen in Edit gets its own sharper picture
+const bigRT = new THREE.WebGLRenderTarget(1280, 720, {samples:4});
+const bigMat = new THREE.MeshBasicMaterial({map:bigRT.texture, toneMapped:false});
+bigScreen.material = bigMat;
+function sizeBigRT(){ const r = ASPECTS[shots.aspect]; const w = r>=1 ? 1280 : Math.round(1280*r), h = r>=1 ? Math.round(1280/r) : 1280; if (bigRT.width!==w || bigRT.height!==h) bigRT.setSize(w, h); }
+sizeBigRT();
+
+// ---- the switcher grid: every take of the clip under the playhead, side by side
+const gridCam = new THREE.PerspectiveCamera(50, 16/9, 0.01, 5000);
+const ovCv = document.createElement('canvas'); ovCv.width = 1280; ovCv.height = 720; ovCv.id = 'mvov';
+ovCv.style.cssText = 'position:fixed;display:none;z-index:3;cursor:pointer;';
+document.body.appendChild(ovCv);
+const ovTex = new THREE.CanvasTexture(ovCv); ovTex.colorSpace = THREE.SRGBColorSpace;
+const ovMesh = new THREE.Mesh(new THREE.PlaneGeometry(1,1), new THREE.MeshBasicMaterial({map:ovTex, transparent:true, toneMapped:false, depthWrite:false}));
+ovMesh.position.z = 0.002; ovMesh.visible = false; bigScreen.add(ovMesh);
+let gridNext = 0, gridKey = '', gridHover = -1;
+function gridLayout(n){ return n <= 1 ? [1,1] : n <= 4 ? [2,2] : n <= 6 ? [3,2] : [3,3]; }
+function gridState(){
+  if (!state.multi || state.phase!=='edit') return null;
+  const t = play && play.mode==='film' ? play.t : shots.playhead, f = clipAt(t); if (!f) return null;
+  const lanes = f.c.takes.map(takeById).slice(0, 9);
+  if (lanes.filter(Boolean).length < 2) return null;
+  const [cols, rows] = gridLayout(lanes.length);
+  return {f, lanes, cols, rows, prog: visibleK(f.c, f.u)};
+}
+function cellRect(i, cols, rows, W, H, r){
+  const cw = W/cols, ch = H/rows, cx = (i%cols)*cw, cy = Math.floor(i/cols)*ch;
+  let w = cw - 8, h = w/r; if (h > ch - 8){ h = ch - 8; w = h*r; }
+  return {x: cx + (cw-w)/2, y: cy + (ch-h)/2, w, h};
+}
+function renderGridCell(G, i, target, W, H, flipY){
+  const tk = G.lanes[i]; if (!tk) return; const r = ASPECTS[shots.aspect], c = cellRect(i, G.cols, G.rows, W, H, r);
+  evalTake(tk, G.f.u, gridCam.position, gridCam.quaternion);
+  finishShotCam(gridCam, vfov(fovAt(tk, G.f.u), r), r, tk.shiftX, tk.shiftY, tk.straight, tk.scale);
+  const y = flipY ? H - c.y - c.h : c.y;
+  if (target){ target.viewport.set(c.x, y, c.w, c.h); target.scissor.set(c.x, y, c.w, c.h); target.scissorTest = true; renderer.setRenderTarget(target); }
+  else { renderer.setViewport(c.x, y, c.w, c.h); renderer.setScissor(c.x, y, c.w, c.h); renderer.setScissorTest(true); }
+  renderer.render(scene, gridCam);
+}
+function renderGridRT(G, all){
+  const W = bigRT.width, H = bigRT.height, n = G.lanes.length;
+  withShotView(() => {
+    const xr = renderer.xr.enabled; renderer.xr.enabled = false; const old = renderer.getRenderTarget();
+    const key = G.cols+'x'+G.rows+'|'+n;
+    if (key !== gridKey){ gridKey = key; bigRT.scissorTest = false; bigRT.viewport.set(0,0,W,H); renderer.setRenderTarget(bigRT); renderer.setClearColor('#000'); renderer.clear(); all = true; }
+    const k = all ? n : Math.min(n, 2);
+    for (let j=0;j<k;j++){ const i = (gridNext + j) % n; renderGridCell(G, i, bigRT, W, H, true); }
+    gridNext = (gridNext + k) % n;
+    bigRT.scissorTest = false; bigRT.viewport.set(0,0,W,H); bigRT.scissor.set(0,0,W,H);
+    renderer.setRenderTarget(old); renderer.xr.enabled = xr;
+  });
+}
+let ovDrawn = '';
+function drawOverlay(G){
+  const key = G ? [G.cols, G.rows, G.prog, gridHover, G.lanes.map(t=>t && t.name).join(','), ASPECTS[shots.aspect]].join('|') : 'none';
+  if (key === ovDrawn) return; ovDrawn = key;
+  const c = ovCv.getContext('2d'), W = ovCv.width, H = ovCv.height; c.clearRect(0,0,W,H); if (!G) { ovTex.needsUpdate = true; return; }
+  const r = ASPECTS[shots.aspect];
+  G.lanes.forEach((tk, i) => { if (!tk) return; const b = cellRect(i, G.cols, G.rows, W, H, r), prog = i===G.prog, hov = i===gridHover;
+    c.lineWidth = prog ? 10 : hov ? 8 : 3; c.strokeStyle = prog ? '#ff3b30' : hov ? '#ffd400' : 'rgba(255,255,255,0.5)'; c.strokeRect(b.x+c.lineWidth/2, b.y+c.lineWidth/2, b.w-c.lineWidth, b.h-c.lineWidth);
+    const lab = (i+1)+' · '+tk.name+(prog ? '  ● showing' : ''); c.font = '800 '+Math.round(Math.max(18, b.h*0.09))+'px system-ui'; const tw = c.measureText(lab).width;
+    c.fillStyle = prog ? '#ff3b30' : 'rgba(0,0,0,0.6)'; c.beginPath(); c.roundRect(b.x+10, b.y+10, tw+20, Math.max(28, b.h*0.12), 8); c.fill();
+    c.fillStyle = '#fff'; c.textBaseline = 'middle'; c.fillText(lab, b.x+20, b.y+10+Math.max(28, b.h*0.12)/2); });
+  ovTex.needsUpdate = true;
+}
+function gridCellAt(G, u, v){   // u,v in 0..1 from the top-left
+  const r = ASPECTS[shots.aspect], W = ovCv.width, H = ovCv.height, x = u*W, y = v*H;
+  for (let i=0;i<G.lanes.length;i++){ const b = cellRect(i, G.cols, G.rows, W, H, r); if (x>=b.x && x<=b.x+b.w && y>=b.y && y<=b.y+b.h) return G.lanes[i] ? i : -1; }
+  return -1;
+}
+function pickGridCell(G, i){
+  if (i < 0) return; const c = G.f.c;
+  if (NET.guest){ toast('The host does the cutting'); return; }
+  const b = snapShots(); setSwitch(c, G.f.u, i); pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null;
+  shots.clipSel = c.id; shots.laneSel = i; beep(1180, 0.05); requestUI();
+}
+const gridRay = new THREE.Raycaster();
+function gridPointer(o, d, press){
+  const G = gridState(); if (!G || !bigScreen.visible){ if (gridHover !== -1){ gridHover = -1; } return false; }
+  gridRay.set(o, d); const hit2 = gridRay.intersectObject(bigScreen, false)[0];
+  const i = hit2 && hit2.uv ? gridCellAt(G, hit2.uv.x, 1 - hit2.uv.y) : -1;
+  if (i !== gridHover){ gridHover = i; }
+  if (press && i >= 0){ pickGridCell(G, i); return true; }
+  return i >= 0;
+}
+// desktop: click a cell on the overlay
+ovCv.addEventListener('pointerdown', e => { const G = gridState(); if (!G) return; const r = ovCv.getBoundingClientRect(); pickGridCell(G, gridCellAt(G, (e.clientX-r.left)/r.width, (e.clientY-r.top)/r.height)); e.preventDefault(); });
+
+// ---- drag a lane up or down (in the clip under the playhead); the top lane is the one that shows
+function moveLane(c, from, to){
+  if (!c || from===to || from<0 || to<0 || from>=c.takes.length || to>=c.takes.length) return;
+  const b = snapShots(), order = c.takes.map((_,i)=>i); const [m] = order.splice(from,1); order.splice(to,0,m);
+  const newIdx = order.map((_,i)=>i); const inv = []; order.forEach((old, nw) => inv[old] = nw);
+  c.takes = order.map(i=>c.takes[i]);
+  if (to === 0){ c.sw = []; toast(takeById(c.takes[0]).name+' is on top: it shows for this whole clip'); }
+  else c.sw = c.sw.map(s=>({t:s.t, k:inv[s.k]}));
+  pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null; shots.laneSel = to; requestUI();
+}
+
+// ---- a steadier camera when zoomed in close
+const camSmP = V(), camSmQ = new THREE.Quaternion(); let camSmOn = false;
+function steadyCam(dt){
+  const zf = Math.max(1, 40/state.fov);
+  if (!camSmOn || zf <= 1.001 || camSmP.distanceTo(camPoseP) > 0.5*rig.scale.x){ camSmP.copy(camPoseP); camSmQ.copy(camPoseQ); camSmOn = true; return; }
+  const a = 1 - Math.exp(-dt * 25 / Math.pow(zf, 1.3));
+  camSmP.lerp(camPoseP, Math.min(1, a*1.6)); camSmQ.slerp(camPoseQ, a);
+  camPoseP.copy(camSmP); camPoseQ.copy(camSmQ);
+}
+const zoomOf = fov => Math.log(90/fov)/Math.log(90/4);
+const fovOfZoom = z => 90/Math.pow(90/4, z);
+const zoomX = fov => (50/fov).toFixed(fov > 25 ? 1 : 0)+'×';
+
 /* ---------------- main loop ---------------- */
 const BLACK = new THREE.Color('#000');
 const clock = new THREE.Clock();
@@ -6154,11 +6305,11 @@ function currentShowTime(){
 function setAspect(a){
   shots.aspect = a; const r = ASPECTS[a];
   rtW = r>=1 ? 512 : Math.round(512*r); rtH = r>=1 ? Math.round(512/r) : 512;
-  rt.setSize(rtW, rtH);
+  rt.setSize(rtW, rtH); sizeBigRT(); ovCv.width = bigRT.width; ovCv.height = bigRT.height; ovDrawn = ''; gridKey = '';
   const w = 0.09; handMonitor.scale.set(r>=1? w : w*r, r>=1 ? w/r : w, 1);
   sizeBigScreen(); sizePreview(); requestUI();
 }
-let previewFlip = false;
+let previewFlip = false, lastUIDraw = 0;
 renderer.setAnimationLoop(() => {
   const raw = clock.getDelta();
   const dt = Math.min(raw, 0.05);
@@ -6179,7 +6330,7 @@ renderer.setAnimationLoop(() => {
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
-  if (uiNeeds) drawUI();
+  if (uiNeeds && (!play || performance.now() - lastUIDraw > 120)){ lastUIDraw = performance.now(); drawUI(); }
   updateWins();
   autosaveTick(dt); updateMotionLine(tdt);
   for (const L of layers) if (L.flashT > 0){ L.flashT -= tdt; L.group.visible = L.visible && (L.flashT <= 0 || Math.floor(L.flashT*10)%2===0); }
@@ -6204,15 +6355,25 @@ renderer.setAnimationLoop(() => {
 });
 function desktopRender(){
   const W = innerWidth, H = innerHeight;
+  if (state.phase!=='edit') ovCv.style.display = 'none';
   if (state.phase==='edit'){
     renderer.setScissorTest(false); renderer.setViewport(0,0,W,H);
     renderer.setClearColor('#000'); renderer.clear();
     const edH = editorCanvas.style.display==='block' ? editorCanvas.getBoundingClientRect().height + 12 : 0;
     const r = ASPECTS[shots.aspect]; const availW = W - 370, availH = H - 140 - edH;
     let vw = availW, vh = vw / r; if (vh > availH){ vh = availH; vw = vh*r; }
-    const vx = 355 + (availW - vw)/2, vy = 70 + (availH - vh)/2;
-    renderer.setScissorTest(true); renderer.setScissor(vx,vy,vw,vh); renderer.setViewport(vx,vy,vw,vh);
-    withShotView(() => renderer.render(scene, shotCam));
+    const vx = 355 + (availW - vw)/2, vy = 70 + edH + (availH - vh)/2;
+    const G = gridState(); drawOverlay(G);
+    if (G){
+      withShotView(() => { for (let i=0;i<G.lanes.length;i++){ const tk = G.lanes[i]; if (!tk) continue; const c = cellRect(i, G.cols, G.rows, vw, vh, r);
+        evalTake(tk, G.f.u, gridCam.position, gridCam.quaternion); finishShotCam(gridCam, vfov(fovAt(tk, G.f.u), r), r, tk.shiftX, tk.shiftY, tk.straight, tk.scale);
+        renderer.setScissorTest(true); renderer.setScissor(vx+c.x, vy+vh-c.y-c.h, c.w, c.h); renderer.setViewport(vx+c.x, vy+vh-c.y-c.h, c.w, c.h); renderer.render(scene, gridCam); } });
+      Object.assign(ovCv.style, {display:'block', left:vx+'px', top:(H-vy-vh)+'px', width:vw+'px', height:vh+'px'});
+    } else {
+      ovCv.style.display = 'none';
+      renderer.setScissorTest(true); renderer.setScissor(vx,vy,vw,vh); renderer.setViewport(vx,vy,vw,vh);
+      withShotView(() => renderer.render(scene, shotCam));
+    }
     renderer.setScissorTest(false); renderer.setViewport(0,0,W,H);
     return;
   }
@@ -6254,6 +6415,7 @@ function desktopRender(){
     addPart, spatialAt, ensureCuts, newCut, switchCut, deleteCut, nudgeGuest, setPeerUI, sendUIPic, GHS, drawGHWorlds, tryVoice, get avGrab(){return avGrab;},
     syncTakeEnds, clipLen, stopRecording, get recObj(){return rec;}, snapShow,
     netSend, chunkHash, netRemote, netApplyPoses, partsOf, pushUndo, rebuildStroke, makeLayer, decodeClip, applyRec, setPoseArr, poseArr, makeAvatar, updateAvatars,
+    gridState, gridCellAt, pickGridCell, moveLane, bigRT, ovMesh, renderGridRT, steadyCam, zoomOf, fovOfZoom, get gridHover(){return gridHover;},
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
