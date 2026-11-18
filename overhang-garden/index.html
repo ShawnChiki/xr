@@ -3496,7 +3496,7 @@ function trailsDraw() {
   let n = 0;
   for (const i of TRAIL.cells) {
     const v = trailS(i); if (v < 0.02) { TRAIL.cells.delete(i); continue; } if (v < 0.1 || n >= 4000) continue;
-    const arr = navCell(i); if (!arr.length) continue; const nd = arr.length > 1 && arr[1].n.y > arr[0].n.y ? arr[1] : arr[0];
+    const arr = navCell(i); if (!arr.length) continue; let nd = arr[0]; for (const q of arr) if (q.n.y > nd.n.y) nd = q;
     _tp.copy(nd.p).addScaledVector(nd.n, 0.25); _tq.setFromUnitVectors(_tz, nd.n); _sc.setScalar(CELL * 0.5 * Math.sqrt(v));
     _m4.compose(_tp, _tq, _sc); trMesh.setMatrixAt(n++, _m4);
   }
@@ -3637,14 +3637,14 @@ function keepOnMat(p, H) { const m = matIn(H); p.x = clamp(p.x, -m, m); p.z = cl
 // ───── the walkable map: the clay's surface as spots in 6.4 mm cells (one or two per cell: floor and ceiling, or both sides
 // of a thin wall), worked out only where climbers look and forgotten wherever you edit. Climbers search it for routes
 // instead of trying pretend walks, so planning is quicker and finds the way round, over and under things.
-const NG = N / 4, CELL = VS * 4, NAV = { cells: new Map(), id: 1, sig: '' };
+const NG = N / 4, CELL = VS * 4, NAV = { cells: new Map(), id: 1, sig: '', todo: new Set(), cur: null, places: [], placesDirty: false, scanned: false, editT: 0, list: [], deadN: 0 };
 const ncKey = (a, b, c) => a + NG * (b + NG * c);
 const navCellOf = (p) => {
   const a = Math.floor((ix(p.x) + 0.5) / 4), b = Math.floor((iy(p.y) + 0.5) / 4), c = Math.floor((iz(p.z) + 0.5) / 4);
   return a < 0 || b < 0 || c < 0 || a >= NG || b >= NG || c >= NG ? -1 : ncKey(a, b, c);
 };
-function navForget(key) { const arr = NAV.cells.get(key); if (arr) { for (const nd of arr) nd.dead = true; NAV.cells.delete(key); } }
-function navReset() { for (const arr of NAV.cells.values()) for (const nd of arr) nd.dead = true; NAV.cells.clear(); }
+function navForget(key) { const arr = NAV.cells.get(key); if (arr) { for (const nd of arr) nd.dead = true; NAV.deadN += arr.length; NAV.cells.delete(key); } }
+function navReset() { for (const arr of NAV.cells.values()) for (const nd of arr) nd.dead = true; NAV.cells.clear(); NAV.list.length = 0; NAV.deadN = 0; }
 function navSig() {
   let s = USE_ON ? 'u' : '';
   for (const L of layers) { s += L.id + (L.visible ? 'v' : 'h'); if (L.bridge) { let h = 0; for (const b of L.beams) h += b.ax * 1.3 + b.az * 1.7 + b.bx * 2.1 + b.bz * 2.9 + b.ay + b.hw + b.hh; s += h.toFixed(2); } s += ','; }
@@ -3652,14 +3652,34 @@ function navSig() {
 }
 // keep the map honest: a layer shown/hidden, bridges moved, or chunks remeshed since last time
 function navSync() {
-  const sg = navSig(); if (sg !== NAV.sig) { NAV.sig = sg; navReset(); NAVQ.clear(); return; }
-  if (!NAVQ.size) return;
-  if (NAV.cells.size) for (const key of NAVQ) {
-    const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
-    for (let c = Math.max(0, cz * 4 - 2); c <= Math.min(NG - 1, cz * 4 + 5); c++) for (let b = Math.max(0, cy * 4 - 2); b <= Math.min(NG - 1, cy * 4 + 5); b++)
-      for (let a = Math.max(0, cx * 4 - 2); a <= Math.min(NG - 1, cx * 4 + 5); a++) navForget(ncKey(a, b, c));
+  const sg = navSig(); if (sg !== NAV.sig) {
+    NAV.sig = sg; navReset(); NAVQ.clear(); NAV.todo.clear(); NAV.cur = null; NAV.scanned = false; NAV.placesDirty = true; NAV.editT = CLM.time;
+    for (const L of layers) if (L.visible && !L.bridge) for (const key of L.chunks.keys()) NAV.todo.add(key);
+    return;
   }
-  NAVQ.clear();
+  if (!NAVQ.size) return;
+  for (const key of NAVQ) {
+    if (NAV.cells.size) { const cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+      for (let c = Math.max(0, cz * 4 - 2); c <= Math.min(NG - 1, cz * 4 + 5); c++) for (let b = Math.max(0, cy * 4 - 2); b <= Math.min(NG - 1, cy * 4 + 5); b++)
+        for (let a = Math.max(0, cx * 4 - 2); a <= Math.min(NG - 1, cx * 4 + 5); a++) navForget(ncKey(a, b, c)); }
+    NAV.todo.add(key);
+  }
+  NAVQ.clear(); NAV.placesDirty = true; NAV.editT = CLM.time;
+}
+// fill in the whole map a sliver at a time (so climbers know the sculpture, not just where they've been), then note its places
+function navWarm(ms) {
+  const t0 = performance.now();
+  for (;;) {
+    if (!NAV.cur) { const it = NAV.todo.values().next(); if (it.done) break; NAV.todo.delete(it.value); NAV.cur = { key: it.value, i: 0 }; }
+    const key = NAV.cur.key, cx = key % NC, cy = ((key / NC) | 0) % NC, cz = (key / (NC * NC)) | 0;
+    while (NAV.cur.i < 216) {
+      const i = NAV.cur.i++, a = cx * 4 - 1 + i % 6, b = cy * 4 - 1 + ((i / 6) | 0) % 6, c = cz * 4 - 1 + ((i / 36) | 0);
+      if (a >= 0 && b >= 0 && c >= 0 && a < NG && b < NG && c < NG) { const k = ncKey(a, b, c); if (!NAV.cells.has(k)) navCell(k); }
+      if ((i & 7) === 7 && performance.now() - t0 > ms) return;
+    }
+    NAV.cur = null;
+  }
+  if (NAV.placesDirty && CLM.time - NAV.editT > 0.6) placesScan();
 }
 const _blk = new Float32Array(216), _skin = [], _nv = new THREE.Vector3();
 function navBuild(a, b, c) {
@@ -3669,6 +3689,11 @@ function navBuild(a, b, c) {
   for (const L of layers) if (L.visible && L.bridge) for (const bm of L.beams) {
     const R = Math.hypot(Math.hypot(bm.bx - bm.ax, bm.bz - bm.az) / 2 + bext(bm), bm.hw, bm.hh) + CELL * 1.2;
     if (Math.hypot((bm.ax + bm.bx) / 2 - cxw, bm.ay - cyw, (bm.az + bm.bz) / 2 - czw) < R) (bl || (bl = [])).push(bm);
+  }
+  if (!bl && j0 > 2) {   // nothing here at all? (well above the bed, no clay chunk under these voxels, no bridge)
+    let any = false; const ca = Math.max(0, i0) >> 4, cb = Math.max(0, j0) >> 4, cc = Math.max(0, k0) >> 4, da = (i0 + 5) >> 4, db = (j0 + 5) >> 4, dc = (k0 + 5) >> 4;
+    for (const L of Ls) { for (let z = cc; z <= dc && !any; z++) for (let y = cb; y <= db && !any; y++) for (let x = ca; x <= da; x++) if (L.chunks.has(x + NC * (y + NC * z))) { any = true; break; } if (any) break; }
+    if (!any) return [];
   }
   let mn = 1, mx = 0;
   for (let z = 0; z < 6; z++) for (let y = 0; y < 6; y++) for (let x = 0; x < 6; x++) {
@@ -3687,21 +3712,23 @@ function navBuild(a, b, c) {
     if (!m) continue;
     _nv.set(_blk[id - 1] - _blk[id + 1], _blk[id - 6] - _blk[id + 6], _blk[id - 36] - _blk[id + 36]);
     if (_nv.lengthSq() < 1e-6) continue; _nv.normalize();
-    let g = G.find(g => g.n.dot(_nv) > 0);
-    if (!g) { if (G.length < 2) { g = { n: _nv.clone(), sn: new THREE.Vector3(), x: 0, y: 0, z: 0, m: 0, smax: 0 }; G.push(g); } else g = G[0].n.dot(_nv) >= G[1].n.dot(_nv) ? G[0] : G[1]; }
+    // faces that point much the same way share a spot; a floor meeting a wall (or a top meeting a side) gets one each
+    let g = null, gd = 0.55; for (const q of G) { const d = q.n.dot(_nv); if (d > gd) { gd = d; g = q; } }
+    if (!g) { if (G.length < 3) { g = { n: _nv.clone(), sn: new THREE.Vector3(), x: 0, y: 0, z: 0, m: 0, smax: 0 }; G.push(g); } else { gd = -2; for (const q of G) { const d = q.n.dot(_nv); if (d > gd) { gd = d; g = q; } } } }
     g.sn.add(_nv); g.smax = Math.max(g.smax, slopeOf(_nv)); g.x += sx / m; g.y += sy / m; g.z += sz / m; g.m++;
   }
   const key = ncKey(a, b, c), out = [];
   for (const g of G) {
     if (g.sn.lengthSq() < 1e-6) continue;
     const p = new THREE.Vector3(vx(i0 + g.x / g.m), vy(j0 + g.y / g.m), vz(k0 + g.z / g.m)), n = g.sn.normalize();
+    _lp.copy(p).addScaledVector(n, VS * 0.6); if (toSurface(_lp, _ln) && _ln.dot(n) > 0.5 && _lp.distanceTo(p) < CELL) p.copy(_lp);
     if (p.y < 0) p.y = 0;
     const sl = slopeOf(n); out.push({ id: NAV.id++, p, n, sl, sm: Math.max(sl, Math.min(g.smax, sl + 25)), u: useAt(p, n), ci: key, adj: null, asl: null, dead: false });
   }
   return out;
 }
 const NB6 = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
-function navCell(key) { let arr = NAV.cells.get(key); if (!arr) { const a = key % NG, b = ((key / NG) | 0) % NG, c = (key / (NG * NG)) | 0; arr = navBuild(a, b, c); NAV.cells.set(key, arr); } return arr; }
+function navCell(key) { let arr = NAV.cells.get(key); if (!arr) { const a = key % NG, b = ((key / NG) | 0) % NG, c = (key / (NG * NG)) | 0; arr = navBuild(a, b, c); NAV.cells.set(key, arr); for (const nd of arr) NAV.list.push(nd); if (NAV.deadN > 500 && NAV.deadN > NAV.list.length / 2) { NAV.list = NAV.list.filter(n => !n.dead); NAV.deadN = 0; } } return arr; }
 // can you walk straight from one spot to the next without leaving the surface or going through clay?
 const _lq = new THREE.Vector3(), _lm = new THREE.Vector3(), _lp = new THREE.Vector3(), _ln = new THREE.Vector3();
 function navLink(A, B) {
@@ -3744,6 +3771,152 @@ const trailW = (i) => { const v = TRAIL.w[i]; return v ? v * Math.exp(-(CLM.time
 function trailScent(p, amt) { const i = navCellOf(p); if (i < 0) return; TRAIL.s[i] = Math.min(1, trailS(i) + amt); TRAIL.st[i] = CLM.time; TRAIL.cells.add(i); }
 function trailWarn(p, amt) { const i = navCellOf(p); if (i < 0) return; TRAIL.w[i] = Math.min(1, trailW(i) + amt); TRAIL.wt[i] = CLM.time; }
 function trailClear() { TRAIL.s.fill(0); TRAIL.w.fill(0); TRAIL.cells.clear(); }
+// ───── places: what's worth going to on the sculpture, read off the map whenever it settles after an edit.
+// tops (the highest spot around), slides (where to get on, and where they end), hideouts (flat with a roof over it)
+// and ledges (flat and high with a drop beside it). Climbers pick between these and plain wandering by who they are.
+const TILE = CELL * 4, tileOf = (p) => Math.floor((p.x + HALF) / TILE) + 16 * Math.floor((p.z + HALF) / TILE);
+let PLID = 1;
+const REG = new Map(); let REGID = 1;
+const classKey = (c) => Math.round(limitOf(c) / 10) + (c.energy > 0.8 ? 32 : 0) + (c.bold > 1 ? 64 : 0);
+const failKey = (c) => Math.round(limitOf(c) / 10) + (c.energy > 0.8 ? 32 : 0) + 64 * (tileOf(c.p) + 256 * Math.floor(Math.max(0, c.p.y) / 25));
+function navAround(nd, out) {
+  const a = nd.ci % NG, b = ((nd.ci / NG) | 0) % NG, c = (nd.ci / (NG * NG)) | 0; out.length = 0;
+  for (let dc = -1; dc <= 1; dc++) for (let db = -1; db <= 1; db++) for (let da = -1; da <= 1; da++) {
+    const aa = a + da, bb = b + db, cc = c + dc; if (aa < 0 || bb < 0 || cc < 0 || aa >= NG || bb >= NG || cc >= NG) continue;
+    const arr = NAV.cells.get(ncKey(aa, bb, cc)); if (arr) for (const B of arr) if (B !== nd) out.push(B);
+  }
+  return out;
+}
+function placesScan() {
+  NAV.placesDirty = false; const first = !NAV.scanned; NAV.scanned = true;
+  const H = CLM.size, tops = new Map(), flats = new Map(), slideCells = new Map(), found = [], tmp = []; let topY = 0;
+  for (const arr of NAV.cells.values()) for (const nd of arr) {
+    if (nd.u === 3 || nd.p.y < CELL || !onMat(nd.p, H)) continue;
+    if (nd.u === 2) { let a = slideCells.get(nd.ci); if (!a) slideCells.set(nd.ci, a = []); a.push(nd); if (nd.sl > 12) continue; }
+    const tk = tileOf(nd.p);
+    if (nd.sl <= 40) { const t = tops.get(tk); if (!t || nd.p.y > t.p.y) tops.set(tk, nd); if (nd.p.y > topY) topY = nd.p.y; }
+    if (nd.sl <= 22 && nd.p.y > CELL * 2 && nd.u !== 2) { let a = flats.get(tk); if (!a) flats.set(tk, a = []); a.push(nd); }
+  }
+  for (const [tk, nd] of tops) {
+    if (nd.p.y < Math.max(12, topY * 0.3)) continue; const tx = tk & 15, tz = tk >> 4; let peak = true;
+    for (let dz = -1; dz <= 1 && peak; dz++) for (let dx = -1; dx <= 1; dx++) { if (!dx && !dz) continue; const o = tops.get((tx + dx) + 16 * (tz + dz)); if (o && o.p.y > nd.p.y) { peak = false; break; } }
+    if (peak) found.push({ kind: 'top', p: nd.p, n: nd.n, h: nd.p.y / topY });
+  }
+  const seenC = new Set();
+  for (const ck of slideCells.keys()) {
+    if (seenC.has(ck)) continue; const cl = [], st = [ck]; seenC.add(ck);
+    while (st.length) {
+      const k = st.pop(), a = k % NG, b = ((k / NG) | 0) % NG, c = (k / (NG * NG)) | 0; for (const nd of slideCells.get(k)) cl.push(nd);
+      for (let dc = -1; dc <= 1; dc++) for (let db = -1; db <= 1; db++) for (let da = -1; da <= 1; da++) {
+        const aa = a + da, bb = b + db, cc = c + dc; if (aa < 0 || bb < 0 || cc < 0 || aa >= NG || bb >= NG || cc >= NG) continue;
+        const k2 = ncKey(aa, bb, cc); if (slideCells.has(k2) && !seenC.has(k2)) { seenC.add(k2); st.push(k2); }
+      }
+    }
+    if (cl.length < 3) continue; cl.sort((x, y) => y.p.y - x.p.y); const bot = cl[cl.length - 1]; if (cl[0].p.y - bot.p.y < CELL * 1.5) continue;
+    // where you get on: a spot just above the highest bit of slide you can step down onto
+    let entry = null, on = null, es = -1;
+    for (const S of cl.slice(0, 12)) for (const B of navAround(S, tmp)) {
+      if (B.u === 3 || B.sl > 50 || (B.u === 2 && B.sl > 12) || B.p.y < S.p.y + 0.4 || B.p.distanceTo(S.p) > CELL * 1.9) continue;
+      const sc = S.p.y + (B.u === 2 ? 0 : CELL); if (sc > es) { es = sc; entry = B; on = S; }
+    }
+    if (entry) found.push({ kind: 'slide', p: entry.p, n: entry.n, on: on.p, onN: on.n });
+  }
+  for (const arr of flats.values()) {
+    let nook = null, hi = arr[0];
+    for (const nd of arr) { const p = nd.p; if (nd.p.y > hi.p.y) hi = nd;
+      if (!nook && climbDens(p.x, p.y + H * 0.8, p.z) < ISO && (climbDens(p.x, p.y + H * 1.3, p.z) >= ISO || climbDens(p.x, p.y + H * 2, p.z) >= ISO || climbDens(p.x, p.y + H * 3, p.z) >= ISO)) nook = nd; }
+    if (nook) found.push({ kind: 'nook', p: nook.p, n: nook.n });
+    if (hi !== nook && hi.p.y > Math.max(15, topY * 0.25) && hi.p.y - H * 1.5 > 0 && !found.some(f => f.kind === 'top' && f.p.distanceTo(hi.p) < CELL * 2.5))
+      for (let a = 0; a < 8; a++) {
+        const dx = Math.cos(a * 0.7854), dz = Math.sin(a * 0.7854), x = hi.p.x + dx * CELL * 1.7, z = hi.p.z + dz * CELL * 1.7;
+        if (climbDens(x, hi.p.y + 1, z) < ISO && climbDens(x, hi.p.y - H * 0.7, z) < ISO && climbDens(x, hi.p.y - H * 1.5, z) < ISO) { found.push({ kind: 'perch', p: hi.p, n: hi.n, face: new THREE.Vector3(dx, 0, dz) }); break; }
+      }
+  }
+  // keep who's who across scans, so climbers remember where they've been, and can tell what's new
+  const old = NAV.places;
+  NAV.places = found.map(f => { const o = old.find(o => !o.used && o.kind === f.kind && o.p.distanceTo(f.p) < CELL * 2.5); if (o) o.used = true; f.id = o ? o.id : PLID++; f.born = o ? o.born : first ? -999 : CLM.time; f.fail = new Map(); return f; });
+  for (const o of old) if (!o.used) o.gone = true;
+}
+// what to do next: one of the places, or (returning null) a wander. Each place is scored by who's asking.
+function pickPurpose(c) {
+  const H = climberH(c), bucket = failKey(c); let best = null, bs = 0.5 + 0.55 * c.curious + Math.random() * 0.8, bestTag = false;
+  const s0 = navNear(c.p, c.n), rid = s0 && s0.rg ? s0.rg.get(classKey(c)) : 0, rg = rid ? REG.get(rid) : null, out = rg && CLM.time - rg.t < 90 ? rg.out : null;
+  for (const pl of NAV.places) {
+    if (out && out.has(pl.id)) continue;   // someone like it already looked: no way there from this part
+    const ft = pl.fail.get(bucket); if (ft !== undefined && CLM.time - ft < 45) continue;
+    const d = pl.p.distanceTo(c.p); if (d < H * 2.5) continue;
+    let s = Math.random() * 0.9 - d / 300;
+    const seen = c.mem && c.mem.get(pl.id); if (seen !== undefined) s -= 1.4 * Math.max(0, 1 - (CLM.time - seen) / 70);
+    let going = 0, there = 0, tag = false;
+    for (const o of CLM.list) if (o !== c) {
+      if (o.route && o.purpose && o.purpose.pl && o.purpose.pl.id === pl.id) { going++; if (o.p.distanceTo(c.p) < H * 8) tag = true; }
+      if (o.rest > 0 && o.p.distanceTo(pl.p) < H * 3) there++;
+    }
+    tag = tag && c.social > 0.3;
+    if (pl.kind === 'top') s += 0.45 + 0.6 * Math.min(c.pref, 90) / 90 + 0.4 * pl.h;
+    else if (pl.kind === 'slide') s += 1.0 + 0.3 * c.bold + (c.again === pl.id ? 1.0 : 0);
+    else if (pl.kind === 'nook') s += 0.15 + (1 - c.energy) * 1.3 - 0.25 * c.social;
+    else s += 0.25 + (1 - c.energy) * 0.9;
+    if (pl.kind === 'slide') s += tag ? 0.4 * c.social : 0;
+    else s += (tag ? 0.7 * c.social : -0.3 * going) + there * (c.social > 0 ? 0.35 * c.social : -0.6);
+    const fresh = CLM.time - pl.born < 45; if (fresh) s += 0.5 + 0.9 * c.curious;   // something you just made
+    if (c.nextPl === pl.id) s += 2.5;   // what it was on its way to before it needed a rest
+    if (s > bs) { bs = s; best = pl; bestTag = tag; }
+  }
+  c.nextPl = 0;
+  let pu = best ? { kind: best.kind, pl: best, p: best.p, n: best.n, tag: bestTag, fresh: CLM.time - best.born < 45 } : null;
+  if (c.social > 0.3 && Math.random() < 0.5) for (const o of CLM.list) {   // friendly ones go and sit with someone
+    if (o === c || !(o.rest > 2) || !o.sit) continue; const d = o.p.distanceTo(c.p); if (d < H * 2.5 || d > H * 25) continue;
+    const sc = 0.5 + 0.9 * c.social - d / 300 + Math.random() * 0.6; if (sc > bs) { bs = sc; pu = { kind: 'friend', who: o, p: o.p.clone(), n: o.n.clone() }; }
+  }
+  return pu;
+}
+// just wandering: a handful of spots picked at random off the map, scored by its own taste (the slope it likes, how high,
+// somewhere nobody's been lately if it's curious, near the others if it's friendly); it heads for the best
+function pickSpot(c, P) {
+  const L = NAV.list; if (L.length < 30) return null;
+  const H = climberH(c), lim = limitOf(c), ck = classKey(c), s0 = navNear(c.p, c.n), rid = s0 && s0.rg ? s0.rg.get(ck) : 0, rg = rid ? REG.get(rid) : null, tagged = !!rg && CLM.time - rg.t < 90;
+  let best = null, bs = P.bv;
+  for (let k = 0; k < 12; k++) {
+    const nd = L[(Math.random() * L.length) | 0]; if (nd.dead || nd.u === 3 || !onMat(nd.p, H)) continue;
+    if (nd.p.y < 1 && Math.random() > (c.pref < 30 ? 0.5 : 0.2)) continue;   // the bare bed isn't very interesting
+    if (tagged && (!nd.rg || nd.rg.get(ck) !== rid)) continue;   // known to be out of reach from this part
+    if (nd.sl > lim && !(nd.u === 1 && nd.sl <= WALL_LIM)) continue;
+    const d = nd.p.distanceTo(c.p); if (d < H * 3) continue;
+    const v = planValue(c, P, nd.p, nd.n) - Math.max(0, d - H * 25) / (H * 20) + Math.random() * 0.5;
+    if (v > bs) { bs = v; best = nd; }
+  }
+  return best ? { kind: 'go', p: best.p, n: best.n } : null;
+}
+// the link of the map a climber just failed on gets remembered for a minute (for climbers no stronger than it)
+function navBad(c) {
+  const r = c.route, ch = r && r.chain; if (!ch || !r.length) return; const lim = limitOf(c), k1 = r[Math.min(c.ri, r.length - 1)].k, k0 = c.ri > 0 ? r[c.ri - 1].k : 0;
+  let bk = -1, bd = Infinity;
+  for (let k = k0; k < k1; k++) { const d = _lq.addVectors(ch[k].p, ch[k + 1].p).multiplyScalar(0.5).distanceTo(c.p); if (d < bd) { bd = d; bk = k; } }
+  if (bk < 0) return; const A = ch[bk], B = ch[bk + 1];
+  (A.bad || (A.bad = new Map())).set(B.id, [lim, CLM.time]); (B.bad || (B.bad = new Map())).set(A.id, [lim, CLM.time]);
+}
+// made it to the end of a route: what happens there depends on why it came
+function climberArrive(c, H, sl) {
+  c.route = null; c.arrived = (c.arrived || 0) + 1; c.repairs = 0;
+  const pu = c.purpose, hop = () => { c.state = 'fall'; c.v.set(0, H * 2.2, 0); c.air = 0; c.hop = true; sndClimber('yay', c); };
+  if (c.tired) { c.rest = 99; c.sit = sl < 40; return; }
+  if (pu && pu.partial) { c.replan = true; c.goalWait = 0; return; }   // as far as it could see the way: carry on from here
+  if (!pu || pu.kind === 'go') { c.purpose = null; c.rest = 0.3 + Math.random() * 1.4 / c.pace; if (c.goalTop) hop(); return; }
+  c.purpose = null; const k = pu.kind; c.spot = k; (c.did || (c.did = {}))[k] = (c.did[k] || 0) + 1;
+  const mem = c.mem || (c.mem = new Map());
+  if (k === 'top') { mem.set(pu.pl.id, CLM.time); c.rest = 2 + Math.random() * 3; hop(); }
+  else if (k === 'slide') { c.rest = 0.15 + Math.random() * 0.5; c.ride = pu.pl; }
+  else if (k === 'ride') { c.rideGo = pu.pl; c.rideT = 0; c.rideAll = 0; c.did.ride--; }   // on the slide: off it goes
+  else if (k === 'friend') {
+    const o = pu.who;
+    if (CLM.list.includes(o) && o.rest > 0 && o.p.distanceTo(c.p) < H * 3.5) { c.rest = 4 + Math.random() * 5; c.sit = sl < 40; c.buddy = o; if (!o.buddy || !(o.buddy.rest > 0)) o.buddy = c; o.rest = Math.max(o.rest, Math.min(c.rest, 4)); }
+    else c.rest = 0.5;
+  } else {
+    mem.set(pu.pl.id, CLM.time); c.rest = 5 + Math.random() * 7; c.sit = sl < 40;
+    if (pu.pl.face) { c.head.copy(pu.pl.face).addScaledVector(c.n, -c.n.dot(pu.pl.face)); if (c.head.lengthSq() > 1e-4) c.head.normalize(); else c.head.set(1, 0, 0); }
+  }
+}
 // a tiny binary heap for the route search
 function hpush(h, x) { h.push(x); let i = h.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (h[p].f <= x.f) break; h[i] = h[p]; i = p; } h[i] = x; }
 function hpop(h) { const top = h[0], x = h.pop(); if (h.length) { let i = 0; for (;;) { let l = 2 * i + 1; if (l >= h.length) break; if (l + 1 < h.length && h[l + 1].f < h[l].f) l++; if (h[l].f >= x.f) break; h[i] = h[l]; i = l; } h[i] = x; } return top; }
@@ -3772,46 +3945,136 @@ function planStart(c, mode) {
   const H = climberH(c), R = H * 20; P.others = CLM.list.filter(o => o !== c && (o.p.distanceTo(c.p) < R || (o.dest && o.dest.distanceTo(c.p) < R)));
   P.bv = planValue(c, P, c.p, c.n) + (mode ? 0 : 0.3);
   c.plan = P;
-  if (!CLM.noNav && (P.flee || P.tired || Math.random() > c.bold * 0.3)) {
-    const s = navNear(c.p, c.n);
-    if (s) { P.G = { heap: [], lab: new Map(), exp: 0, best: null, bv: P.bv }; const L0 = { node: s, g: 0, f: 0, fun: 0, par: null }; P.G.lab.set(s.id, L0); hpush(P.G.heap, L0); }
+  let pu = !mode && c.replan ? c.purpose : null; c.replan = false; c.purpose = null;
+  if (mode) { c.ride = null; c.rideGo = false; c.prep = false; c.buddy = null; }
+  else if (!CLM.noNav && !CLM.noPurpose) {
+    if (!pu && c.ride) pu = { kind: 'ride', pl: c.ride, p: c.ride.on, n: c.ride.onN };
+    c.ride = null;
+    if (!pu && !c.skipPurpose) { pu = pickPurpose(c) || pickSpot(c, P); c.repairs = 0; }
+    c.skipPurpose = false;
+    if (pu) {
+      // a big climb ahead and not much puff left: sit down first
+      if (!pu.partial && pu.pl && pu.kind !== 'ride' && c.energy < 0.55 && pu.p.y - c.p.y > H * 3 && slopeOf(c.n) < 30) { c.plan = null; c.nextPl = pu.pl.id; c.prep = true; c.rest = 99; c.sit = true; return; }
+      const s = navNear(c.p, c.n), gn = navNear(pu.p, pu.n);
+      if (s && gn) {
+        c.purpose = pu; P.goal = pu; P.summit = false;
+        P.G = { heap: [], lab: new Map(), exp: 0, best: null, bh: Infinity, d0: c.p.distanceTo(pu.p), gn };
+        const L0 = { node: s, g: 0, f: 0, fun: 0, e: c.energy, par: null }; P.G.lab.set(s.id, L0); hpush(P.G.heap, L0); return;
+      }
+      if (pu.pl) pu.pl.fail.set(failKey(c), CLM.time);
+    }
   }
+  if (!CLM.noNav) {
+    const s = navNear(c.p, c.n);
+    if (s) { P.G = { heap: [], lab: new Map(), exp: 0, best: null, bv: P.bv }; const L0 = { node: s, g: 0, f: 0, fun: 0, e: c.energy, par: null }; P.G.lab.set(s.id, L0); hpush(P.G.heap, L0); }
+  }
+}
+// ───── hops: besides walking, a spot on the map links to spots a jump away: across a gap, or down off a ledge. Worked out
+// once per spot (the nearest landing in each of 8 directions), so routes can include jumps, and nobody is stranded on a
+// top they could simply hop down from. How far and how far down each climber dares depends on how bold it is.
+const HOPD = [[1, 0], [0.7071, 0.7071], [0, 1], [-0.7071, 0.7071], [-1, 0], [-0.7071, -0.7071], [0, -1], [0.7071, -0.7071]];
+function navHops(A) {
+  const H = CLM.size;
+  if (A.hops && A.hopH === H && !A.hops.some(h => h.B.dead)) return A.hops;
+  const out = [];
+  if (NAV.todo.size || NAV.cur) return out;   // the map is still being filled in: ask again later
+  A.hopH = H; A.hops = out;
+  if (A.sl > 65 || A.p.y < H * 0.3 || A.u === 3) return out;
+  const adj = navAdj(A), bTop = Math.min(NG - 1, Math.floor((iy(A.p.y + H * 0.3) + 0.5) / 4)), bBot = Math.max(0, Math.floor((iy(Math.max(0, A.p.y - H * 4.5)) + 0.5) / 4));
+  for (const [dx, dz] of HOPD) for (const dist of [1.1, 1.9, 2.8, 3.5]) {
+    const x = A.p.x + dx * dist * H, z = A.p.z + dz * dist * H; if (Math.abs(x) > MAT - 2 || Math.abs(z) > MAT - 2) break;
+    const a = Math.floor((ix(x) + 0.5) / 4), c = Math.floor((iz(z) + 0.5) / 4); if (a < 0 || c < 0 || a >= NG || c >= NG) break;
+    let B = null;
+    for (let b = bTop; b >= bBot && !B; b--) { const arr = b === 0 ? navCell(ncKey(a, 0, c)) : NAV.cells.get(ncKey(a, b, c)); if (arr) for (const nd of arr) if (nd.sl <= 50 && nd.u !== 3 && nd.p.y <= A.p.y + H * 0.3 && (!B || nd.p.y > B.p.y)) B = nd; }
+    if (!B) continue;
+    const hd = Math.hypot(B.p.x - A.p.x, B.p.z - A.p.z), dy = B.p.y - A.p.y; if (hd < H * 0.9 || adj.includes(B)) continue;
+    // level ground all the way there is a walk, not a jump
+    if (dy > -H * 0.6 && climbDens((A.p.x + B.p.x) / 2, (A.p.y + B.p.y) / 2 - H * 0.35, (A.p.z + B.p.z) / 2) >= ISO) continue;
+    const h = arcH(A.p.y, B.p.y, H); let clear = true;
+    for (let s2 = 2; s2 < 9 && clear; s2++) { const u = s2 / 10; if (climbDens(A.p.x + (B.p.x - A.p.x) * u, arcY(A.p.y, B.p.y, h, u) + H * 0.35, A.p.z + (B.p.z - A.p.z) * u) >= ISO * 0.7) clear = false; }
+    if (clear) { out.push({ B, hd, drop: -dy }); break; }
+  }
+  return out;
 }
 // one slice of the route search: spread out from where it stands along the map, cheapest first (steep bits cost more,
 // worn trails less, warned spots more), scoring every spot it reaches the same way the pretend walks do
 function navProbe(c) {
-  const P = c.plan, G = P.G, H = climberH(c), lim = limitOf(c), cap = P.flee ? 220 : P.tired ? 300 : 650, follow = 1 - 0.6 * c.curious;
+  const P = c.plan, G = P.G, goal = P.goal, H = climberH(c), lim = limitOf(c), cap = P.flee ? 220 : P.tired ? 300 : goal ? 2200 : 650, follow = 1 - 0.6 * c.curious, careful = !P.tired && !P.flee;
   const t0 = performance.now(), tb = Math.max(0.35, Math.min(0.8, CLM.planUntil - t0));   // never more than a sliver of a frame
+  let found = null;
   for (let s = 0; s < 60 && G.heap.length && G.exp < cap && (s < 1 || performance.now() - t0 < tb); s++) {
     const L = hpop(G.heap); if (L.done) continue; L.done = true; const A = L.node; if (A.dead) continue;
     G.exp++;
-    if (L.par) { const v = planValue(c, P, A.p, A.n) + L.fun - L.g * 0.05; if (v > G.bv) { G.bv = v; G.best = L; } }
-    if (L.g > 18) continue;
+    if (goal) {   // heading somewhere in particular: stop when it's reached
+      const hd = A.p.distanceTo(goal.p); if (hd < G.bh) { G.bh = hd; G.best = L; }
+      if (A === G.gn || (hd < CELL * 0.8 && A.n.dot(goal.n) > 0.3)) { found = L; break; }
+    } else {
+      if (L.par) { const v = planValue(c, P, A.p, A.n) + L.fun - L.g * 0.05; if (v > G.bv) { G.bv = v; G.best = L; } }
+      if (L.g > 18) continue;
+    }
     const adj = navAdj(A), asl = A.asl;
     for (let e = 0; e < adj.length; e++) {
       const B = adj[e], esl = asl[e];
       if (B.u === 3 || !onMat(B.p, H)) continue;
       const dy = B.p.y - A.p.y, len = A.p.distanceTo(B.p) / H;
-      if ((B.u === 2 || A.u === 2) && dy > -0.02 * H) continue;   // slides: only down
+      // slides: only down (the level bits at the top and bottom can be walked on)
+      if ((B.u === 2 || A.u === 2) && dy > -0.02 * H && !((B.u !== 2 || B.sl <= 12) && (A.u !== 2 || A.sl <= 12) && dy < len * H * 0.2)) continue;
       if (esl > lim + 4 && !(B.u === 1 && esl <= WALL_LIM + 4) && !(B.u === 2 && esl <= 86)) continue;   // the steepest bit on the way, not the average
+      if (A.bad) { const bl = A.bad.get(B.id); if (bl && lim <= bl[0] + 15 && CLM.time - bl[1] < 60) continue; }   // someone like it failed here just now
       const wall = clamp((B.sl - 35) / 45, 0, 1);
-      const cost = len * (1 + wall * (P.tired ? 2 : 0.6) / c.grit) * (1 - 0.5 * follow * trailS(B.ci)) + trailW(B.ci) * 1.2;
+      // puff: walls and roofs use it up, so only take on a climb it can finish with some to spare
+      let en = L.e;
+      if (B.u !== 2) {
+        const spd = (1.25 - 0.8 * wall) * c.pace * (0.5 + 0.5 * Math.min(1, en * 1.6)) * 0.8;
+        en = Math.min(1, en - (wall < 0.1 ? -0.005 : (wall * 0.03 + (B.sl > 100 ? 0.06 : 0)) / c.grit * 1.15) * len / spd);
+        if (careful && en < 0.34 && wall >= 0.15) continue;
+      }
+      const cost = len * (1 + wall * (P.tired ? 2 : 0.6) / c.grit) * (B.u === 2 ? 0.5 : 1) * (1 - 0.5 * follow * trailS(B.ci)) + trailW(B.ci) * 1.2;
       let fun = 0;
-      if (!P.tired && !P.flee) { if (B.u === 2) fun = len / 0.8 * 0.55; else if (B.u === 1 && dy > len * H * 0.2) fun = len / 0.8 * (0.2 + 0.3 * Math.min(c.pref, 90) / 90); }
+      if (careful) { if (B.u === 2) fun = len / 0.8 * 0.55; else if (B.u === 1 && dy > len * H * 0.2) fun = len / 0.8 * (0.2 + 0.3 * Math.min(c.pref, 90) / 90); }
       const g = L.g + cost, ex = G.lab.get(B.id); if (ex && ex.g <= g) continue;
       if (ex) ex.done = true;
-      const NL = { node: B, g, f: g, fun: L.fun + fun, par: L }; G.lab.set(B.id, NL); hpush(G.heap, NL);
+      const NL = { node: B, g, f: goal ? g + B.p.distanceTo(goal.p) / H * 1.2 : g, fun: L.fun + fun, e: en, par: L }; G.lab.set(B.id, NL); hpush(G.heap, NL);
+    }
+    if (!P.tired && !CLM.noHops) for (const hp of navHops(A)) {   // or jump
+      const B = hp.B; if (B.dead || hp.hd > H * (1.3 + 1.5 * c.bold) || hp.drop > H * (1.2 + 2.2 * c.bold) || B.sl > Math.min(lim, 50)) continue;
+      const g = L.g + 1.3 + hp.hd / H * 0.6 + (1.6 - c.bold) * 0.9, ex = G.lab.get(B.id); if (ex && ex.g <= g) continue;
+      if (ex) ex.done = true;
+      const NL = { node: B, g, f: goal ? g + B.p.distanceTo(goal.p) / H * 1.2 : g, fun: L.fun, e: L.e, par: L, jump: true }; G.lab.set(B.id, NL); hpush(G.heap, NL);
     }
   }
-  if (G.heap.length && G.exp < cap) return;
-  if (!G.best) { P.G = null; P.bv -= 0.3; return; }   // nowhere better on the map from here: try a few pretend walks (maybe a jump)
-  const chain = []; let ts = 0; for (let L = G.best; L; L = L.par) { chain.push(L.node.p); ts += trailS(L.node.ci); } chain.reverse();
-  c.onTrail = ts / chain.length > 0.35;
-  const route = []; let last = chain[0];
-  for (let i = 1; i < chain.length; i++) if (i === chain.length - 1 || chain[i].distanceTo(last) >= H * 0.55) { route.push(chain[i].clone()); last = chain[i]; }
-  c.plan = null; c.route = route; c.ri = 0; c.goalT = 0; c.dest = route[route.length - 1]; c.goalWait = 0; c.byMap = (c.byMap || 0) + 1;
+  if (!found && G.heap.length && G.exp < cap) return;
+  if (goal) {
+    let end = found;
+    if (end) goal.partial = 0;
+    else if (G.best && G.best.par && G.bh < G.d0 * 0.6 && (goal.partial || 0) < 2) { end = G.best; goal.partial = (goal.partial || 0) + 1; }   // can't see the whole way: go as far as it can
+    else {   // no way there for someone like it: remember that for a while, and do something else
+      const fk = failKey(c); if (goal.pl) goal.pl.fail.set(fk, CLM.time);
+      if (!G.heap.length) {   // it looked everywhere it can get to: note what else is out of reach from this part, for everyone like it
+        const ck = classKey(c), id = REGID++, out = new Set(); if (REG.size > 400) REG.clear();
+        for (const pl of NAV.places) { const gn = navNear(pl.p, pl.n); if (!gn || !G.lab.has(gn.id)) out.add(pl.id); }
+        REG.set(id, { t: CLM.time, out }); for (const L of G.lab.values()) (L.node.rg || (L.node.rg = new Map())).set(ck, id);
+      }
+      c.purpose = null; c.plan = null; c.skipPurpose = true; c.goalWait = 0.05; c.noWay = (c.noWay || 0) + 1; return;
+    }
+    navRoute(c, end); c.goalTop = false; c.routeNew = goal.kind === 'go' && c.curious > 0.9 && novelty(goal.p) > 0.8;
+    if (!c.route) climberArrive(c, H, slopeOf(c.n));   // already there
+    return;
+  }
+  if (!G.best) { P.G = null; P.bv -= 0.3; P.probes = Math.min(P.probes, 2); return; }   // nowhere better on the map from here: try a couple of pretend walks
+  navRoute(c, G.best);
+  if (!c.route) { c.goalWait = 0.3; return; }
   c.goalTop = P.summit && c.dest.y > P.top * 0.72;
-  c.routeNew = !P.tired && !P.flee && c.curious > 0.9 && novelty(c.dest) > 0.8;
+  c.routeNew = careful && c.curious > 0.9 && novelty(c.dest) > 0.8;
+}
+// turn the end of a search into a route: waypoints about half a body apart, remembering the map spots under them
+function navRoute(c, end) {
+  const H = climberH(c), nodes = [], jm = []; let ts = 0; for (let L = end; L; L = L.par) { nodes.push(L.node); jm.push(!!L.jump); ts += trailS(L.node.ci); } nodes.reverse(); jm.reverse();
+  c.onTrail = ts / nodes.length > 0.35;
+  const route = []; let last = nodes[0].p;
+  for (let i = 1; i < nodes.length; i++) if (i === nodes.length - 1 || jm[i] || jm[i + 1] || nodes[i].p.distanceTo(last) >= H * 0.55) { const w = nodes[i].p.clone(); w.k = i; if (jm[i]) { w.jump = true; w.nn = nodes[i].n; } route.push(w); last = nodes[i].p; }
+  route.chain = nodes; c.plan = null; c.ri = 0; c.goalT = 0; c.goalWait = 0; c.byMap = (c.byMap || 0) + 1;
+  c.route = route.length ? route : null; c.dest = route.length ? route[route.length - 1] : null;
 }
 function planProbe(c) { if (c.plan.G) navProbe(c); else walkProbe(c); }
 // a hop over a gap or down off a ledge: somewhere it can land (not too steep), with nothing in the way of the arc
@@ -3892,7 +4155,7 @@ function walkProbe(c) {
 function planRoute(c) { planStart(c); while (c.plan) planProbe(c); }   // all at once (tests)
 function startJump(c, to, H) {
   c.state = 'jump'; c.speed = 0; sndClimber('hop', c);
-  c.j = { from: c.p.clone(), to: to.clone(), t: -0.16, h: arcH(c.p.y, to.y, H), dur: 0.3 + c.p.distanceTo(to) / (H * 6) };
+  c.j = { from: c.p.clone(), to: to.clone(), nn: to.nn || null, t: -0.16, h: arcH(c.p.y, to.y, H), dur: 0.3 + c.p.distanceTo(to) / (H * 6) };
   c.head.set(to.x - c.p.x, 0, to.z - c.p.z); if (c.head.lengthSq() < 1e-6) c.head.set(1, 0, 0); c.head.normalize();
 }
 const _q = new THREE.Vector3(), _nq = new THREE.Vector3(), _t = new THREE.Vector3(), _h = new THREE.Vector3(), _w = new THREE.Vector3(), _qt2 = new THREE.Quaternion(), _qt3 = new THREE.Quaternion();
@@ -3929,7 +4192,7 @@ function climberThink(c, H) {
 function climbersSim(dt) {
   const g = 25 * CLM.size; CLM.planFree = 1; CLM.planUntil = performance.now() + 1.2;   // a little planning time per step, so it never causes a hitch
   CLM.time += dt; if (SEEN.size > 60000) SEEN.clear();
-  navSync(); CLM.frame = (CLM.frame || 0) + 1;
+  navSync(); navWarm(0.3); CLM.frame = (CLM.frame || 0) + 1;
   for (const c of CLM.list) {
     // far away or out of view: step it every 2nd or 3rd time, with the time saved up (see climbersTick)
     const k = c.state === 'held' ? 1 : c.lod || 1;
@@ -3944,6 +4207,22 @@ function climbersSim(dt) {
     const H = (climberH(A) + climberH(B)) / 2, d = A.p.distanceTo(B.p); if (d > H * 0.45 || d < 1e-4) continue;
     const push = _q.copy(A.p).sub(B.p).multiplyScalar((H * 0.45 - d) / d * 0.25); keepOnMat(A.p.add(push), climberH(A)); keepOnMat(B.p.sub(push), climberH(B));
   }
+}
+const _bp = new THREE.Vector3(), _bn = new THREE.Vector3(), _bs = new THREE.Vector3(), _b1 = new THREE.Vector3(), _b2 = new THREE.Vector3();
+// the slope as its whole body meets it, not just the spot under one toe: small bumps and voxel steps get stepped over
+function bodySlope(p, n, H) {
+  _b1.set(1, 0, 0); if (Math.abs(n.x) > 0.8) _b1.set(0, 0, 1); _b1.addScaledVector(n, -n.dot(_b1)).normalize(); _b2.crossVectors(n, _b1);
+  _bs.copy(n); const r = H * 0.25;
+  for (let k = 0; k < 4; k++) { _bp.copy(p).addScaledVector(k < 2 ? _b1 : _b2, k & 1 ? -r : r); if (toSurface(_bp, _bn) && _bp.distanceTo(p) < r * 2.5) _bs.add(_bn); }
+  return slopeOf(_bs.normalize());
+}
+// is the next waypoint one of those it can't simply walk to? (it has been trying and getting no nearer, or the waypoint is
+// straight "up" from where it stands, on another face)
+function scrNeeded(c, wp, H) {
+  const d = c.p.distanceTo(wp); if (d > CELL * 2.2 + H * 0.3 || d < 1e-3) return false;
+  if (c.wpT > 0.3) return true;
+  const dn = (wp.x - c.p.x) * c.n.x + (wp.y - c.p.y) * c.n.y + (wp.z - c.p.z) * c.n.z;
+  return dn > 0 && d * d - dn * dn < d * d * 0.12;
 }
 function simOne(c, dt, g) {
   const H = climberH(c);
@@ -3991,9 +4270,10 @@ function simOne(c, dt, g) {
     if (u < 0.9 && climbDens(x, y + H * 0.35, z) >= ISO) { c.state = 'fall'; c.v.set((J.to.x - J.from.x) / J.dur * 0.3, 0, (J.to.z - J.from.z) / J.dur * 0.3); return; }   // clay in the way now
     c.p.set(x, y, z);
     if (u >= 1) {
+      if (J.nn) c.p.addScaledVector(J.nn, VS * 0.6);
       const n = toSurface(c.p, _nq); if (!n) { c.state = 'fall'; c.v.set(0, 0, 0); return; }
       c.n.copy(n); c.state = 'walk'; c.squash = 0.2; c.goalT = 0; c.jumps = (c.jumps || 0) + 1; sndClimber('land', c);
-      if (c.route && ++c.ri >= c.route.length) { c.route = null; c.rest = 0.6 + Math.random(); c.arrived = (c.arrived || 0) + 1; }
+      if (c.route && ++c.ri >= c.route.length) climberArrive(c, H, slopeOf(c.n));
     }
     return;
   }
@@ -4007,11 +4287,11 @@ function simOne(c, dt, g) {
   // your brush coming at them: drop everything and get out of the way
   if (c.flee > 0) c.flee -= dt;
   if (CLM.time - CLM.brushT < 0.25 && c.p.distanceTo(CLM.brushP) < CLM.brushR + H * 1.8 && !(c.flee > 1)) {
-    c.flee = 1.6; c.rest = 0; c.sit = false; c.route = c.dest = null; planStart(c, 'flee');
+    c.flee = 1.6; c.rest = 0; c.sit = false; c.spot = null; c.route = c.dest = null; planStart(c, 'flee');
   }
   // worn out: find somewhere flat to sit for a bit
   if (!c.tired && c.energy < 0.3 && !(c.flee > 0)) {
-    c.tired = true; c.route = c.dest = c.plan = null;
+    c.tired = true; if (c.purpose && c.purpose.pl) c.nextPl = c.purpose.pl.id; c.route = c.dest = c.plan = null;
     if (sl < 25) { c.rest = 99; c.sit = true; } else planStart(c, 'tired');
   }
   if (c.rest > 0 && climbDens(c.p.x - c.n.x * VS * 1.5, c.p.y - c.n.y * VS * 1.5, c.p.z - c.n.z * VS * 1.5) < ISO * 0.8) c.rest = 0;   // the clay under them got carved away
@@ -4020,11 +4300,19 @@ function simOne(c, dt, g) {
   if (c.rest > 0) {
     c.rest -= dt; c.speed = Math.max(0, c.speed - H * 6 * dt);
     if (c.tired && c.energy > 0.92) { c.tired = false; c.rest = Math.min(c.rest, 0.5); }
-    if (c.rest <= 0) c.sit = false;
+    if (c.prep && c.energy > 0.9) { c.prep = false; c.rest = Math.min(c.rest, 0.4); }
+    if (c.rest <= 0) { c.sit = false; c.prep = false; c.buddy = null; c.spot = null; }
+    else if (c.rest < 1.2 && !c.tired && !c.prep && !c.route) {   // nearly done looking around: work out where to go next, so it sets off knowing
+      if (!c.plan) { c.goalWait = (c.goalWait || 0) - dt; if (c.goalWait <= 0) planStart(c, null); }
+      else if (CLM.planFree > 0 || performance.now() < CLM.planUntil) { CLM.planFree--; planProbe(c); }
+    }
     return;
   }
-  if (!c.route) {
-    if (!c.plan) { c.goalWait = (c.goalWait || 0) - dt; if (c.goalWait <= 0) planStart(c, c.tired ? 'tired' : null); }
+  // you changed the sculpture: the place it was heading for is gone, or the way ahead isn't what it was
+  if (c.route && c.purpose && c.purpose.pl && c.purpose.pl.gone) { c.route = c.dest = null; c.purpose = null; c.rest = 0.7; c.goalWait = 0; return; }
+  if (c.route && c.route.chain && CLM.time - (c.reT || 0) > 1) { const wn = c.route.chain[c.route[c.ri].k]; if (wn && wn.dead) { c.reT = CLM.time; c.route = null; c.replan = !!c.purpose; c.goalWait = 0.05; c.rerouted = (c.rerouted || 0) + 1; } }
+  if (!c.route && !c.rideGo) {
+    if (!c.plan) { c.goalWait = (c.goalWait || 0) - dt; if (c.goalWait <= 0) { if (!c.tired && c.energy < 0.42 && wall > 0.15 && !(c.flee > 0)) c.tired = true; planStart(c, c.tired ? 'tired' : null); } }
     else if (CLM.planFree > 0 || performance.now() < CLM.planUntil) { CLM.planFree--; planProbe(c); }
   }
   let want = null, last = false, wpDist = 0;
@@ -4034,24 +4322,60 @@ function simOne(c, dt, g) {
     while (c.ri + 1 < c.route.length && !c.route[c.ri + 1].jump && c.p.distanceTo(c.route[c.ri + 1]) < c.p.distanceTo(wp)) wp = c.route[++c.ri];   // cut corners
     if (!wp.jump && c.p.distanceTo(wp) < H * 0.6) {
       c.ri++; c.goalT = 0;
-      if (c.ri >= c.route.length) {
-        // made it: rest (sit down if worn out; a little hop if it climbed to the top), then plan somewhere new
-        c.route = null; c.arrived = (c.arrived || 0) + 1;
-        if (c.tired) { c.rest = 99; c.sit = sl < 40; }
-        else { c.rest = 0.6 + Math.random() * 2.2 / c.pace; if (c.goalTop) { c.state = 'fall'; c.v.set(0, H * 2.2, 0); c.air = 0; c.hop = true; sndClimber('yay', c); } }
-        return;
-      }
+      if (c.ri >= c.route.length) { climberArrive(c, H, sl); return; }   // made it
       wp = c.route[c.ri];
       if (wp.jump) { startJump(c, wp, H); return; }
     }
-    if ((c.goalT += dt) > 8 || c.stuck > 2) { trailWarn(c.p, 0.5); if (c.route) trailWarn(c.route[Math.min(c.ri, c.route.length - 1)], 0.5); c.route = null; c.dest = null; c.stuck = 0; c.goalWait = 0.2; c.gaveUp = (c.gaveUp || 0) + 1; }   // lost the way: plan again
+    // heading for a slide and already on it near the top: just go
+    if (c.purpose && c.purpose.pl && c.purpose.pl.on && c.p.distanceTo(c.purpose.pl.on) < H * 2.5 && sl > 12 && useAt(c.p, c.n) === 2) {
+      const pl = c.purpose.pl; if (c.purpose.kind === 'slide') { c.did = c.did || {}; c.did.slide = (c.did.slide || 0) + 1; }
+      c.route = null; c.purpose = null; c.rideGo = pl; c.rideT = 0; c.rideAll = 0; return;
+    }
+    { const dw = c.p.distanceTo(wp); if (c.wpRef !== wp || dw < c.wpD - H * 0.05) { c.wpRef = wp; c.wpD = dw; c.wpT = 0; } else c.wpT += dt; }   // getting any nearer?
+    if ((c.goalT += dt) > 8 || c.stuck > 2 || c.wpT > 2.5) {   // can't get through here: remember that, and if it was heading somewhere, find another way round
+      trailWarn(c.p, 0.5); trailWarn(c.route[Math.min(c.ri, c.route.length - 1)], 0.5); navBad(c);
+      const again = !!c.purpose && (c.repairs = (c.repairs || 0) + 1) <= 2;
+      c.route = null; c.dest = null; c.stuck = 0;
+      if (again) { c.replan = true; c.goalWait = 0.1; c.detours = (c.detours || 0) + 1; c.detourT = CLM.time; }
+      else { c.purpose = null; c.goalWait = 0.2; c.gaveUp = (c.gaveUp || 0) + 1; }
+    }
+    else if (c.route.chain && !wp.jump && c.route.chain[wp.k] && (c.scr === wp || scrNeeded(c, wp, H))) {
+      // the next spot is close, but ordinary walking isn't getting there (it's up a little step, across a crease, round a
+      // thin bit): go straight to it, the way you'd put a hand up and step across
+      c.scr = wp; const B = c.route.chain[wp.k], sp = H * (0.5 + 0.3 * c.pace) * (0.5 + 0.5 * Math.min(1, c.energy * 1.6)), stp = sp * dt;
+      c.speed += clamp(sp - c.speed, -H * 6 * dt, H * 3.5 * dt); _q.subVectors(wp, c.p); const dl = _q.length(); _h.copy(c.n);
+      if (dl > stp + H * 0.1) _q.multiplyScalar(stp / dl);
+      // the same rules as walking: never onto keep-off, never up the sloped part of a slide
+      { const u1 = B.u, u0 = useAt(c.p, c.n), up = _q.y > 1e-4;
+        if (u1 === 3 || (up && ((u0 === 2 && slopeOf(c.n) > 12) || (u1 === 2 && B.sl > 12)))) { c.scr = null; c.stuck += 0.5; c.speed *= 0.5; return; } }
+      c.sliding = false;
+      if (dl <= stp + H * 0.1) { c.p.copy(wp); c.n.copy(B.n); c.scr = null; }
+      else {
+        _t.copy(c.n).lerp(B.n, 0.5).normalize();
+        if (climbDens(c.p.x + _q.x + _t.x * H * 0.22, c.p.y + _q.y + _t.y * H * 0.22, c.p.z + _q.z + _t.z * H * 0.22) >= ISO) { c.stuck += 0.5; c.speed *= 0.5; return; }   // clay in the way
+        c.p.add(_q); c.n.lerp(B.n, Math.min(1, stp / dl)).normalize();
+      }
+      c.head.applyQuaternion(_qt2.setFromUnitVectors(_h, c.n));
+      _w.copy(_q).addScaledVector(c.n, -c.n.dot(_q)); if (_w.lengthSq() > 1e-8) c.head.lerp(_w.normalize(), Math.min(1, dt * 6));
+      c.head.addScaledVector(c.n, -c.n.dot(c.head)); if (c.head.lengthSq() > 1e-8) c.head.normalize(); else c.head.set(1, 0, 0);
+      c.scrN = (c.scrN || 0) + 1; return;
+    }
     else {
       const tw = wp.jump ? c.route[c.ri - 1] : wp;   // walk to the take-off spot first
       want = _w.subVectors(tw, c.p); wpDist = want.length(); want.multiplyScalar(1 / Math.max(wpDist, 1e-6));
       last = c.ri === c.route.length - 1; c.rethink = 1;
     }
   }
-  if (!c.route) {
+  if (c.rideGo && !c.route) {
+    const fall = _t.set(0, -1, 0).addScaledVector(c.n, c.n.y);   // downhill along the surface
+    want = fall.lengthSq() > 1e-3 ? _w.copy(fall).normalize() : null;
+    c.rideT = want && useAt(c.p, c.n) === 2 ? 0 : c.rideT + dt;
+    if (c.rideT > 0.4 || c.stuck > 2 || (c.rideAll += dt) > 15) {   // off the end
+      const pl = c.rideGo; c.rideGo = false; c.stuck = 0; c.did.ride = (c.did.ride || 0) + 1; c.rest = 0.3 + Math.random() * 0.7; c.spot = null;
+      if (Math.random() < 0.4 + 0.25 * c.bold) c.again = pl.id; else { c.again = 0; (c.mem || (c.mem = new Map())).set(pl.id, CLM.time); }
+      return;
+    }
+  } else if (!c.route) {
     c.rethink -= dt; if (c.rethink <= 0) climberThink(c, H); want = c.want || null;
     if (c.flee > 0) { want = _w.subVectors(c.p, CLM.brushP); want.addScaledVector(c.n, -c.n.dot(want)); if (want.lengthSq() < 1e-6) want = null; else want.normalize(); }
   }
@@ -4083,8 +4407,12 @@ function simOne(c, dt, g) {
   else if (!onMat(c.p, H)) { c.p.copy(old); c.want = (c.want || new THREE.Vector3()).set(-c.p.x, 0, -c.p.z); if (c.want.lengthSq() > 1e-6) c.want.normalize(); else c.want.set(1, 0, 0); c.route = null; c.speed *= 0.5; return; }
   const n = toSurface(c.p, _nq);
   const uHere = useAt(c.p, n || c.n);
-  if (n && ((uHere === 2 && c.p.y > old.y + 1e-4) || uHere === 3)) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; c.route = null; return; }   // no climbing up slides, no walking on keep-off
-  if (!n || (slopeOf(n) > limitOf(c) + 10 + (c.relax || 0) && !(uHere === 1 && slopeOf(n) <= WALL_LIM + 10) && !(uHere === 2 && slopeOf(n) <= 88))) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; if (!toSurface(c.p, _nq)) { trailWarn(c.p, 0.6); c.state = 'fall'; c.v.set(0, 0, 0); } return; }
+  if (n && ((uHere === 2 && c.p.y > old.y + 1e-4 && !(slopeOf(n) <= 12 && c.p.y - old.y < 0.2 * c.p.distanceTo(old))) || uHere === 3)) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5; return; }   // no climbing up slides, no walking on keep-off
+  let sln = n ? slopeOf(n) : 999; const tol = limitOf(c) + 10 + (c.relax || 0) + (c.route && c.route.chain ? 8 : 0);
+  if (n && sln > tol && sln < tol + 70) sln = Math.min(sln, bodySlope(c.p, n, H));   // too steep underfoot: is it really, for the whole of it?
+  if (!n || (sln > tol && !(uHere === 1 && sln <= WALL_LIM + 10) && !(uHere === 2 && sln <= 88))) { c.p.copy(old); c.rethink = 0; c.stuck += 0.5; c.speed *= 0.5;
+    if (n && slopeOf(c.n) > tol + 8 && useAt(c.p, c.n) === 0) { c.state = 'fall'; c.v.copy(c.n).multiplyScalar(H * 0.5); c.air = 0; c.stuck = 0; c.slips = (c.slips || 0) + 1; return; }
+    if (!toSurface(c.p, _nq)) { trailWarn(c.p, 0.6); c.state = 'fall'; c.v.set(0, 0, 0); } return; }
   _h.copy(c.n); c.n.lerp(n, 0.5).normalize(); c.head.applyQuaternion(_qt2.setFromUnitVectors(_h, c.n));
 }
 // ---- drawing: spheres for joints and head, cylinders for limbs, all in two instanced meshes
@@ -4173,6 +4501,7 @@ function climberPose(c, dt) {
   if (jump) lookT.subVectors(c.j.to, head);
   else if (held) lookT.copy(F).addScaledVector(UPV, -0.8);
   else if (c.flee > 0) lookT.subVectors(CLM.brushP, head);
+  else if (c.rest > 0 && c.buddy && c.buddy.p.distanceTo(c.p) < H * 5) lookT.copy(c.buddy.p).addScaledVector(c.buddy.n, H * 0.6).sub(head).normalize().addScaledVector(F, 0.25 + 0.25 * Math.sin(T * 0.7 + c.hue * 20));
   else if (c.rest > 0) lookT.copy(F).applyAxisAngle(U, Math.sin(T * 0.9 + c.hue * 20) * 1.1).addScaledVector(U, sit ? 0.15 : 0);
   else if (c.route && c.route[c.ri]) lookT.subVectors(c.route[c.ri], head).normalize().add(F);
   else lookT.copy(F);
@@ -4250,7 +4579,7 @@ function climbersLOD() {
     if (c.slot === undefined) c.slot = (Math.random() * 6) | 0;
     if (i === CLM.sel || i === CLM.held || c.state === 'held') { c.lod = 1; c.vis = true; return; }
     const r = climberH(c) * ws, w = modelRoot.localToWorld(_fw.copy(c.p)), d = Math.max(w.distanceTo(_fc), 1e-4);
-    c.vis = _fr.intersectsSphere(_fs.set(w, r * 1.5));
+    c.vis = _fr.intersectsSphere(_fs.set(w, r * 2.5));
     const ang = r / d; c.lod = !c.vis || ang < 0.008 ? 3 : ang < 0.02 ? 2 : 1;
     if (ang < 0.004) c.vis = false;   // smaller than a few pixels: not worth drawing limbs for
   });
@@ -4260,7 +4589,7 @@ function climbersTick(dt) {
   if (CLM.trails && CLM.list.length && performance.now() - (CLM.trT || 0) > 500) { CLM.trT = performance.now(); trailsDraw(); }
   trMesh.visible = !!CLM.trails;
   if (!CLM.list.length && !figs.length) { if (clSph.count) { clSph.count = clCyl.count = 0; } clRing.visible = false; return; }
-  if (performance.now() - (CLM.lodT || 0) > 250) { CLM.lodT = performance.now(); climbersLOD(); }
+  climbersLOD();   // every frame, so turning your head never shows a gap
   if (!CLM.paused) {
     const steps = Math.min(4, Math.ceil(dt / 0.034)); for (let q = 0; q < steps; q++) climbersSim(Math.min(dt, 0.1) / steps);
   }
@@ -4552,8 +4881,16 @@ function climberDoing(c) {
   if (c.state === 'jump') return 'Jumping';
   if (c.state === 'fall') return 'Falling';
   if (c.flee > 0) return 'Getting out of the way of your brush';
-  if (c.rest > 0) return c.sit ? 'Sitting down for a rest' : c.tired ? 'Hanging on, catching its breath' : 'Looking around';
+  if (c.rest > 0) return c.prep ? 'Resting up before a big climb' : c.buddy ? 'Sitting with a friend' : c.sit ? (c.spot === 'nook' ? 'Tucked away in a hideout' : c.spot === 'perch' ? 'Sitting on a ledge with a view' : 'Sitting down for a rest') : c.tired ? 'Hanging on, catching its breath' : c.spot === 'top' ? 'At the top, looking around' : 'Looking around';
   if (c.tired) return 'Tired, heading somewhere flat to sit';
+  if (c.sliding || c.rideGo) return 'Riding the slide';
+  if (c.route && c.purpose && c.purpose.kind !== 'go') {
+    const pu = c.purpose;
+    if (CLM.time - (c.detourT || -9) < 5) return 'Finding another way round';
+    if (pu.fresh) return 'Checking out what you just made';
+    if (pu.tag) return 'Tagging along with a friend';
+    return { top: 'Going for the top', slide: c.again ? 'Back up for another go on the slide' : 'Off to the slide', ride: 'Getting on the slide', nook: 'Heading for a hideout', perch: 'Off to sit on a ledge', friend: 'Going to sit with a friend' }[pu.kind];
+  }
   if (c.route) return c.goalTop ? 'Going for the top' : c.routeNew ? 'Exploring somewhere new' : c.onTrail ? 'Following a worn trail' : 'Heading somewhere it likes';
   return 'Working out where to go';
 }
@@ -4854,7 +5191,7 @@ renderer.setAnimationLoop(() => {
   if (UIS.dirty && now - lastDraw > (xr ? 50 : 16)) { drawUI(); lastDraw = now; }
   renderer.render(scene, camera);
 });
-window.__og = { NAV, TRAIL, navNear, navCell, navAdj, navSync, trailS, trailsDraw, trMesh, climbersLOD, setLayerUse, useSplit, buildNoLand, noLand, allWall, setClimbMode, bakeSupportsInto, stampUse, useAt, SND, sndClimber, eraseClimber, clayLayers, LOOK, lookU, applySky, aoMarkAll, processAO, aoQ, sky, onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
+window.__og = { pickSpot, REG, navHops, navWarm, placesScan, pickPurpose, NAV, TRAIL, navNear, navCell, navAdj, navSync, trailS, trailsDraw, trMesh, climbersLOD, setLayerUse, useSplit, buildNoLand, noLand, allWall, setClimbMode, bakeSupportsInto, stampUse, useAt, SND, sndClimber, eraseClimber, clayLayers, LOOK, lookU, applySky, aoMarkAll, processAO, aoQ, sky, onPick, PL, PH, climbStart, climbEnd, climbXR, littleNear, SEENsize: () => SEEN.size, poseAll, climbersSim, planRoute, setTab, CLM, addClimbers, placeClimber, grabClimber, moveHeld, dropHeld, climberNear, climbDens, stampPaint, getP, SOLVER, SOLVEPROF, BE, beDragStart, beDragTo, beDragEnd, beExit, beDelete, bePickAt, beamCheck, beSlide, HANDLES, netHost, netJoin, netLeave, NET, SYNC, serialize, deserialize, strokeBegin, strokeApply, strokeEnd, exportZipBlob: async () => { await exportZip(); return window.__lastZip; }, mergeLayer, addLayer, keepSupportsAsClay2: () => keepSupportsAsClay(), XRS, setPassthrough, bridge, bridgeBegin, bridgeUpdate, bridgeEnd, stampTexture, newRec, pushUndo, remeshAll, setCut, CUT, THREE, updateXR, hands, panelMesh, camera, controls, UIS, layers, ST, stamp, solveGen, supStats, exportZip, get supLayer() { return supLayer; }, get supRunning() { return supRunning; }, keepSupportsAsClay, modelRoot, undo, redo, IDM, afterEdit, get activeLayer() { return activeLayer; }, processRemesh, anyDirty };
 </script>
 <script src="../updated.js"></script>
 </body>
