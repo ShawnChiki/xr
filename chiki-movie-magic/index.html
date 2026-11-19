@@ -57,7 +57,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.27';
+const VERSION = '0.28';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -1162,12 +1162,25 @@ const FORM_GEO = {box:boxGeo, ball:new THREE.SphereGeometry(0.5, 20, 14), cylind
 const BLOCK_FORMS = [['box','Box'],['ball','Ball'],['cylinder','Tube'],['cone','Cone'],['pyramid','Pyramid'],['donut','Donut']];
 // ---- v0.26 brushes: playground tube, picket / chain link / barbed wire / Victorian trim, rocks, rainbow
 const UPY = new THREE.Vector3(0,1,0);
+function smoothPath(P, r){   // wide shapes follow the gist of your hand, not every wobble (wobbles pinch a thick tube)
+  if (P.length < 3) return P; let Q = along(P, Math.max(r*0.6, 1e-4)).pts; if (Q.length < 3) return P;
+  for (let it=0; it<4; it++){ const out = [Q[0]]; for (let i=1;i<Q.length-1;i++) out.push(Q[i-1].clone().add(Q[i].clone().multiplyScalar(2)).add(Q[i+1]).multiplyScalar(0.25)); out.push(Q[Q.length-1]); Q = out; }
+  return Q;
+}
+function turnToward(up, t, target, maxA){   // spin up around the line toward target, at most maxA per step (works even when they point opposite ways)
+  const ang = Math.acos(clamp(up.dot(target), -1, 1)); if (ang < 1e-4) return; const sgn = t.dot(new THREE.Vector3().crossVectors(up, target)) >= 0 ? 1 : -1;
+  up.applyQuaternion(new THREE.Quaternion().setFromAxisAngle(t, sgn*Math.min(ang, maxA))).addScaledVector(t, -up.dot(t)).normalize();
+}
 function pathFrames(P, step, s, flat){   // points along the line with a side and an up; flat = up stays the world's up (slides open to the sky)
   const A = along(P, step), N = A.pts.length, n = P.length, fr = [];
   let up = new THREE.Vector3(s.ups?.[0] ?? 0, s.ups?.[1] ?? 1, s.ups?.[2] ?? 0);
   for (let i=0;i<N;i++){
     const t = A.tans[i];
-    if (flat){ const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02) up.copy(u2.normalize()); else up.addScaledVector(t, -up.dot(t)).normalize(); }
+    if (flat === 'carry' || flat === true){
+      if (i === 0){ const u0 = UPY.clone().addScaledVector(t, -UPY.dot(t)); up.copy(u0.lengthSq() > 0.02 ? u0.normalize() : new THREE.Vector3(1,0,0).addScaledVector(t, -t.x).normalize()); }
+      else { up.addScaledVector(t, -up.dot(t)).normalize();   // carried along without twisting
+        if (flat === true){ const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02){ u2.normalize(); turnToward(up, t, u2, 0.3); } } }
+    }
     else { const k = Math.min(n-1, Math.round(i/(N-1)*(n-1))); const want = new THREE.Vector3(s.ups?.[k*3] ?? 0, s.ups?.[k*3+1] ?? 1, s.ups?.[k*3+2] ?? 0); up.lerp(want, 0.15).addScaledVector(t, -up.dot(t)).normalize(); }
     fr.push({p:A.pts[i], t, up:up.clone(), side:new THREE.Vector3().crossVectors(t, up).normalize()});
   }
@@ -1175,7 +1188,7 @@ function pathFrames(P, step, s, flat){   // points along the line with a side an
 }
 function geoOf(pos, idx, uv){ const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos,3)); if (uv) geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv,2)); geo.setIndex(idx); geo.computeVertexNormals(); geo.computeBoundingSphere(); return geo; }
 function buildPlayTube(P, s){   // a crawl-through playground tube: thick walls you see from inside too, with round-ish windows every so often
-  const r = s.r, R2 = r, th = r*0.14, step = r*0.35, seg = 28, {fr} = pathFrames(P, step, s, true), N = fr.length;
+  const r = s.r, R2 = r, th = r*0.14, step = r*0.35, seg = 28, {fr} = pathFrames(smoothPath(P, r), step, s, 'carry'), N = fr.length;
   const ring = (f, rad) => { const out = []; for (let q=0;q<=seg;q++){ const a = q/seg*Math.PI*2; out.push(f.p.clone().addScaledVector(f.side, Math.cos(a)*rad).addScaledVector(f.up, Math.sin(a)*rad)); } return out; };
   const IN = fr.map(f=>ring(f, R2)), OUT = fr.map(f=>ring(f, R2+th)), MID = fr.map(f=>ring(f, R2+th*0.5));
   const period = r*4.5, wlen = r*1.7, wang = 0.6, ends = r*1.5;
@@ -1244,7 +1257,9 @@ function buildVictorian(P, s){   // gingerbread trim: a top board, turned spindl
   return g;
 }
 const ROCK_GEOS = [1,2,3,4].map(seed => { const R = rng(seed*977), g2 = new THREE.IcosahedronGeometry(1, 1), p = g2.attributes.position, sx = 0.75+R()*0.5, sy = 0.55+R()*0.4, sz = 0.75+R()*0.5;
-  for (let i=0;i<p.count;i++){ const k = 0.78 + R()*0.38; p.setXYZ(i, p.getX(i)*k*sx, p.getY(i)*k*sy, p.getZ(i)*k*sz); } g2.computeVertexNormals(); return g2; });
+  const bumps = new Map();
+  for (let i=0;i<p.count;i++){ const key = [p.getX(i), p.getY(i), p.getZ(i)].map(v=>Math.round(v*1000)).join(','); let k = bumps.get(key); if (k === undefined){ k = 0.78 + R()*0.38; bumps.set(key, k); } p.setXYZ(i, p.getX(i)*k*sx, p.getY(i)*k*sy, p.getZ(i)*k*sz); }
+  g2.computeVertexNormals(); return g2; });
 const STONES = ['#8a8d91','#6e6a64','#a39b8f','#5c6066','#b5aea3','#7d756b','#9b8e7e'];
 function buildRocks(P, s){
   const r = s.r, R = rng(s.seed || 1), A = along(P, r*1.9), lists = ROCK_GEOS.map(()=>[]);
@@ -1295,13 +1310,14 @@ function buildStrokeMesh(s){
       mesh.add(glow);
     }
   } else if (s.type==='slide'){   // a half-tube you could slide down, with a little thickness
-    const v2 = (s.v||1) >= 2, A = along(P, r*0.7), N = A.pts.length, R2 = v2 ? r : r*3, th = v2 ? r*0.14 : Math.max(r*0.4, R2*0.14), seg = 18, rows = [[],[],[],[],[],[]];
+    const v2 = (s.v||1) >= 2, A = along(v2 ? smoothPath(P, r) : P, r*0.7), N = A.pts.length, R2 = v2 ? r : r*3, th = v2 ? r*0.14 : Math.max(r*0.4, R2*0.14), seg = 18, rows = [[],[],[],[],[],[]];
     let up = new THREE.Vector3(s.ups?.[0] ?? 0, s.ups?.[1] ?? 1, s.ups?.[2] ?? 0), side = V();
     const inner = [], outer = [];
     for (let i=0;i<N;i++){
       const t = A.tans[i], k = Math.min(n-1, Math.round(i/(N-1)*(n-1)));
       const want = new THREE.Vector3(s.ups?.[k*3] ?? 0, s.ups?.[k*3+1] ?? 1, s.ups?.[k*3+2] ?? 0);
-      if (v2){ const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02) up.copy(u2.normalize()); else up.addScaledVector(t, -up.dot(t)).normalize(); }   // the open side always faces up
+      if (v2){ if (i === 0){ const u0 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u0.lengthSq() > 0.02) up.copy(u0.normalize()); } up.addScaledVector(t, -up.dot(t)).normalize();
+        const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02){ u2.normalize(); turnToward(up, t, u2, 0.3); } }   // turns toward open-side-up without ever flipping
       else up.lerp(want, 0.15).addScaledVector(t, -up.dot(t)).normalize();   // carried along the path, gently following your hand
       side.crossVectors(t, up).normalize();
       const ri = [], ro = [];
