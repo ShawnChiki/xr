@@ -57,7 +57,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.25';
+const VERSION = '0.26';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -253,7 +253,7 @@ function netResync(){   // the host opened another world: everybody gets it
 // ---- what gets sent
 function netTouchSt(L, s){ let set = netStTouch.get(L.id); if (!set) netStTouch.set(L.id, set = new Set()); set.add(s); }
 function netDropSt(L, uid){ let set = netStDrop.get(L.id); if (!set) netStDrop.set(L.id, set = new Set()); set.add(uid); }
-const strokeData = s => s.type==='blocks' ? {uid:s.uid, type:'blocks', form:s.form||'box', items:s.items} : {uid:s.uid, type:s.type, pts:s.pts, ups:s.ups, r:s.r, col:s.col, seed:s.seed, anim:s.anim||null};
+const strokeData = s => s.type==='blocks' ? {uid:s.uid, type:'blocks', form:s.form||'box', items:s.items} : {uid:s.uid, type:s.type, v:s.v||1, pts:s.pts, ups:s.ups, r:s.r, col:s.col, seed:s.seed, anim:s.anim||null};
 function chunkHash(ch){
   if (!ch || !ch.d) return 0;
   let h = 2166136261; for (let i=0;i<CN3;i++){ h ^= Math.round(ch.d[i]/DMAX*32767); h = Math.imul(h, 16777619); }
@@ -1160,6 +1160,107 @@ const boxGeo = new THREE.BoxGeometry(1,1,1);
 const FORM_GEO = {box:boxGeo, ball:new THREE.SphereGeometry(0.5, 20, 14), cylinder:new THREE.CylinderGeometry(0.5,0.5,1,24), cone:new THREE.ConeGeometry(0.5,1,24),
   pyramid:new THREE.ConeGeometry(Math.SQRT1_2,1,4).rotateY(Math.PI/4), donut:new THREE.TorusGeometry(0.33,0.17,12,28).rotateX(Math.PI/2)};
 const BLOCK_FORMS = [['box','Box'],['ball','Ball'],['cylinder','Tube'],['cone','Cone'],['pyramid','Pyramid'],['donut','Donut']];
+// ---- v0.26 brushes: playground tube, picket / chain link / barbed wire / Victorian trim, rocks, rainbow
+const UPY = new THREE.Vector3(0,1,0);
+function pathFrames(P, step, s, flat){   // points along the line with a side and an up; flat = up stays the world's up (slides open to the sky)
+  const A = along(P, step), N = A.pts.length, n = P.length, fr = [];
+  let up = new THREE.Vector3(s.ups?.[0] ?? 0, s.ups?.[1] ?? 1, s.ups?.[2] ?? 0);
+  for (let i=0;i<N;i++){
+    const t = A.tans[i];
+    if (flat){ const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02) up.copy(u2.normalize()); else up.addScaledVector(t, -up.dot(t)).normalize(); }
+    else { const k = Math.min(n-1, Math.round(i/(N-1)*(n-1))); const want = new THREE.Vector3(s.ups?.[k*3] ?? 0, s.ups?.[k*3+1] ?? 1, s.ups?.[k*3+2] ?? 0); up.lerp(want, 0.15).addScaledVector(t, -up.dot(t)).normalize(); }
+    fr.push({p:A.pts[i], t, up:up.clone(), side:new THREE.Vector3().crossVectors(t, up).normalize()});
+  }
+  return {A, fr};
+}
+function geoOf(pos, idx, uv){ const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos,3)); if (uv) geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv,2)); geo.setIndex(idx); geo.computeVertexNormals(); geo.computeBoundingSphere(); return geo; }
+function buildPlayTube(P, s){   // a crawl-through playground tube: thick walls you see from inside too, with round-ish windows every so often
+  const r = s.r, R2 = r, th = r*0.14, step = r*0.35, seg = 28, {fr} = pathFrames(P, step, s, true), N = fr.length;
+  const ring = (f, rad) => { const out = []; for (let q=0;q<=seg;q++){ const a = q/seg*Math.PI*2; out.push(f.p.clone().addScaledVector(f.side, Math.cos(a)*rad).addScaledVector(f.up, Math.sin(a)*rad)); } return out; };
+  const IN = fr.map(f=>ring(f, R2)), OUT = fr.map(f=>ring(f, R2+th)), MID = fr.map(f=>ring(f, R2+th*0.5));
+  const period = r*4.5, wlen = r*1.7, wang = 0.6, ends = r*1.5;
+  const winAt = (i, q) => { const d = i*step; if (d < ends || d > (N-1)*step - ends) return false; if ((d % period) > wlen) return false;
+    const a = (q+0.5)/seg*Math.PI*2, w = x => Math.abs(Math.atan2(Math.sin(x), Math.cos(x))); return w(a) < wang || w(a-Math.PI) < wang; };
+  const pos = [], idx = [], gpos = [], gidx = [];
+  const put = (G, arr) => { const b = arr.length/3; for (const row of G) for (const v of row) arr.push(v.x,v.y,v.z); return b; };
+  const bi = put(IN, pos), bo = put(OUT, pos), bm = put(MID, gpos), C = seg+1;
+  for (let i=0;i<N-1;i++) for (let q=0;q<seg;q++){
+    const a0 = i*C+q, b0 = a0+C;
+    if (winAt(i, q)){ gidx.push(bm+a0, bm+b0, bm+a0+1, bm+a0+1, bm+b0, bm+b0+1); continue; }
+    idx.push(bi+a0, bi+a0+1, bi+b0, bi+a0+1, bi+b0+1, bi+b0);   // inside faces in
+    idx.push(bo+a0, bo+b0, bo+a0+1, bo+a0+1, bo+b0, bo+b0+1);   // outside faces out
+  }
+  for (const i of [0, N-1]) for (let q=0;q<seg;q++){ const a0 = bi+i*C+q, o0 = bo+i*C+q; i ? idx.push(a0, a0+1, o0, a0+1, o0+1, o0) : idx.push(a0, o0, a0+1, a0+1, o0, o0+1); }   // rims at the ends
+  const mesh = new THREE.Mesh(geoOf(pos, idx), new THREE.MeshStandardMaterial({color:s.col, roughness:0.4, side:THREE.DoubleSide}));
+  if (gidx.length) mesh.add(new THREE.Mesh(geoOf(gpos, gidx), new THREE.MeshStandardMaterial({color:'#cfefff', transparent:true, opacity:0.28, roughness:0.05, metalness:0.1, side:THREE.DoubleSide, depthWrite:false})));
+  return mesh;
+}
+function railTube(pts, rad, mat, radial=8){ return new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), Math.min(900, pts.length*2), rad, radial, false), mat); }
+function fenceBasis(f){ const x = f.t.clone(); x.y = 0; if (x.lengthSq() < 1e-6) x.set(1,0,0); x.normalize(); const z = new THREE.Vector3().crossVectors(x, UPY); return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, UPY, z)); }
+const PICKET_GEO = (() => { const sh = new THREE.Shape(); sh.moveTo(-0.5,0); sh.lineTo(0.5,0); sh.lineTo(0.5,0.88); sh.lineTo(0,1); sh.lineTo(-0.5,0.88); sh.closePath(); return new THREE.ExtrudeGeometry(sh, {depth:1, bevelEnabled:false}).translate(0,0,-0.5); })();
+function buildPicket(P, s){   // the line you draw is the top of the fence
+  const r = s.r, h = r*9, {fr} = pathFrames(P, r*2.4, s, true), col = '#f7f6f0', list = [], mat = new THREE.MeshStandardMaterial({color:col, roughness:0.7});
+  for (const f of fr) list.push({p:f.p.clone().addScaledVector(UPY, -h), q:fenceBasis(f), s:new THREE.Vector3(r*1.3, h*1.04, r*0.35), col});
+  const g = new THREE.Group(); g.add(instancedList(PICKET_GEO, mat, list));
+  const fz = f => { const x = f.t.clone(); x.y = 0; if (x.lengthSq() < 1e-6) x.set(1,0,0); return new THREE.Vector3().crossVectors(x.normalize(), UPY); };
+  for (const k of [0.25, 0.72]) g.add(railTube(fr.map(f=>f.p.clone().addScaledVector(UPY, -h*k).addScaledVector(fz(f), -r*0.35)), r*0.3, mat, 4));
+  return g;
+}
+let chainTex = null;
+function chainLinkTex(){ if (chainTex) return chainTex; const c = document.createElement('canvas'); c.width = c.height = 64; const x = c.getContext('2d');
+  x.strokeStyle = '#fff'; x.lineWidth = 5; x.lineCap = 'round'; x.beginPath(); x.moveTo(0,32); x.lineTo(32,0); x.lineTo(64,32); x.lineTo(32,64); x.closePath(); x.moveTo(-32,32); x.lineTo(0,64); x.moveTo(64,0); x.lineTo(96,32); x.stroke();
+  chainTex = new THREE.CanvasTexture(c); chainTex.wrapS = chainTex.wrapT = THREE.RepeatWrapping; chainTex.anisotropy = 4; return chainTex; }
+function buildChainLink(P, s){
+  const r = s.r, h = r*10, cell = r*1.6, {A, fr} = pathFrames(P, r*0.8, s, true), metal = new THREE.MeshStandardMaterial({color:'#b9c0c8', metalness:0.6, roughness:0.35});
+  const pos = [], uv = [], idx = []; let d = 0;
+  fr.forEach((f,i)=>{ if (i) d += f.p.distanceTo(fr[i-1].p); const b = f.p.clone().addScaledVector(UPY, -h); pos.push(f.p.x,f.p.y,f.p.z, b.x,b.y,b.z); uv.push(d/cell, 0, d/cell, h/cell); if (i){ const a0 = (i-1)*2; idx.push(a0, a0+1, a0+2, a0+1, a0+3, a0+2); } });
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(geoOf(pos, idx, uv), new THREE.MeshStandardMaterial({color:'#c3c9d0', map:chainLinkTex(), alphaTest:0.5, metalness:0.6, roughness:0.35, side:THREE.DoubleSide})));
+  g.add(railTube(fr.map(f=>f.p), r*0.28, metal));
+  const posts = [], every = Math.max(1, Math.round(r*10/(r*0.8)));
+  fr.forEach((f,i)=>{ if (i % every === 0 || i === fr.length-1) posts.push({p:f.p.clone().addScaledVector(UPY, -h/2), q:new THREE.Quaternion(), s:new THREE.Vector3(r*0.35, h*1.02, r*0.35), col:'#9aa2ab'}); });
+  g.add(instancedList(new THREE.CylinderGeometry(1,1,1,10), metal, posts));
+  return g;
+}
+function buildBarbed(P, s){
+  const r = s.r, {fr} = pathFrames(P, r*0.25, s, false), metal = new THREE.MeshStandardMaterial({color:'#8d949c', metalness:0.75, roughness:0.3}), g = new THREE.Group(), R = rng(s.seed || 1);
+  for (const ph of [0, Math.PI]) g.add(railTube(fr.map((f,i)=>{ const a = i*0.25/2*Math.PI + ph; return f.p.clone().addScaledVector(f.side, Math.cos(a)*r*0.22).addScaledVector(f.up, Math.sin(a)*r*0.22); }), r*0.09, metal, 5));
+  const spikes = [], every = Math.max(2, Math.round(3/0.25));
+  fr.forEach((f,i)=>{ if (i % every) return; for (let k=0;k<4;k++){ const dir = f.side.clone().multiplyScalar(Math.cos(k*Math.PI/2 + 0.4)).addScaledVector(f.up, Math.sin(k*Math.PI/2 + 0.4)).addScaledVector(f.t, (R()-0.5)*0.6).normalize();
+    spikes.push({p:f.p.clone().addScaledVector(dir, r*0.45), q:new THREE.Quaternion().setFromUnitVectors(UPY, dir), s:new THREE.Vector3(r*0.08, r*0.9, r*0.08), col:'#9aa2ab'}); } });
+  g.add(instancedList(new THREE.ConeGeometry(1, 1, 5), metal, spikes));
+  return g;
+}
+const SPINDLE_GEO = new THREE.LatheGeometry([[0,0],[0.32,0],[0.32,0.08],[0.2,0.14],[0.38,0.3],[0.2,0.46],[0.16,0.6],[0.3,0.72],[0.18,0.86],[0.3,0.94],[0.3,1],[0,1]].map(([x,y])=>new THREE.Vector2(x,y)), 10);
+function buildVictorian(P, s){   // gingerbread trim: a top board, turned spindles and scallops hanging below
+  const r = s.r, h = r*4.5, sp = r*2.6, {fr} = pathFrames(P, sp/2, s, true), mat = new THREE.MeshStandardMaterial({color:s.col, roughness:0.55}), g = new THREE.Group(), spind = [], arcs = [];
+  fr.forEach((f,i)=>{ const q = fenceBasis(f);
+    if (i % 2 === 0) spind.push({p:f.p.clone().addScaledVector(UPY, -h), q, s:new THREE.Vector3(r*1.1, h, r*1.1), col:s.col});
+    else arcs.push({p:f.p.clone().addScaledVector(UPY, -h), q:q.clone().multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), Math.PI)), s:new THREE.Vector3(sp*0.5, sp*0.5, sp*0.5), col:s.col}); });
+  g.add(instancedList(SPINDLE_GEO, mat, spind));
+  g.add(instancedList(new THREE.TorusGeometry(1, 0.09, 6, 20, Math.PI), mat, arcs));
+  g.add(railTube(fr.map(f=>f.p), r*0.5, mat, 4));
+  g.add(railTube(fr.map(f=>f.p.clone().addScaledVector(UPY, -h)), r*0.22, mat, 4));
+  return g;
+}
+const ROCK_GEOS = [1,2,3,4].map(seed => { const R = rng(seed*977), g2 = new THREE.IcosahedronGeometry(1, 1), p = g2.attributes.position, sx = 0.75+R()*0.5, sy = 0.55+R()*0.4, sz = 0.75+R()*0.5;
+  for (let i=0;i<p.count;i++){ const k = 0.78 + R()*0.38; p.setXYZ(i, p.getX(i)*k*sx, p.getY(i)*k*sy, p.getZ(i)*k*sz); } g2.computeVertexNormals(); return g2; });
+const STONES = ['#8a8d91','#6e6a64','#a39b8f','#5c6066','#b5aea3','#7d756b','#9b8e7e'];
+function buildRocks(P, s){
+  const r = s.r, R = rng(s.seed || 1), A = along(P, r*1.9), lists = ROCK_GEOS.map(()=>[]);
+  for (const pp of A.pts){ const k = r*(0.7 + R()*1.6), c = new THREE.Color(STONES[Math.floor(R()*STONES.length)]).offsetHSL(0, 0, (R()-0.5)*0.12);
+    lists[Math.floor(R()*ROCK_GEOS.length)].push({p:pp.clone().add(new THREE.Vector3(R()-.5, R()-.5, R()-.5).multiplyScalar(r*1.2)), q:new THREE.Quaternion().setFromEuler(new THREE.Euler(R()*6.3, R()*6.3, R()*6.3)), s:new THREE.Vector3(k, k*(0.6+R()*0.5), k), col:'#'+c.getHexString()}); }
+  const g = new THREE.Group(), mat = new THREE.MeshStandardMaterial({roughness:0.95, flatShading:true});
+  lists.forEach((l,i)=>{ if (l.length) g.add(instancedList(ROCK_GEOS[i], mat, l)); });
+  return g;
+}
+const RAINBOW = ['#ff3b30','#ff9500','#ffd400','#34c759','#00c7be','#1e6bff','#8e44ff'];
+function buildRainbow(P, s){
+  const r = s.r, {fr} = pathFrames(P, r*0.5, s, true), g = new THREE.Group(), w = r*0.42;
+  RAINBOW.forEach((c,k)=>{ const off = (3-k)*w*1.9; g.add(railTube(fr.map(f=>f.p.clone().addScaledVector(f.up, off)), w, new THREE.MeshStandardMaterial({color:c, roughness:0.4}), 8)); });
+  return g;
+}
+
 function buildStrokeMesh(s){
   if (s.type==='blocks'){
     const n = s.items.length/13; if (!n) return null;
@@ -1174,7 +1275,14 @@ function buildStrokeMesh(s){
   const P = []; for (let i=0;i<n;i++) P.push(new THREE.Vector3(s.pts[i*3], s.pts[i*3+1], s.pts[i*3+2]));
   const R = rng(s.seed || 1), r = s.r;
   let mesh;
-  if (s.type==='tube' || s.type==='neon'){
+  if (s.type==='ptube') mesh = buildPlayTube(P, s);
+  else if (s.type==='picket') mesh = buildPicket(P, s);
+  else if (s.type==='chainlink') mesh = buildChainLink(P, s);
+  else if (s.type==='barbed') mesh = buildBarbed(P, s);
+  else if (s.type==='victorian') mesh = buildVictorian(P, s);
+  else if (s.type==='rocks') mesh = buildRocks(P, s);
+  else if (s.type==='rainbow') mesh = buildRainbow(P, s);
+  else if (s.type==='tube' || s.type==='neon'){
     const curve = new THREE.CatmullRomCurve3(P);
     const geo = new THREE.TubeGeometry(curve, Math.min(800, n*3), r, 8, false);
     const mat = s.type==='neon' ? new THREE.MeshBasicMaterial({color:s.col, toneMapped:false}) : new THREE.MeshStandardMaterial({color:s.col, roughness:0.45});
@@ -1187,13 +1295,14 @@ function buildStrokeMesh(s){
       mesh.add(glow);
     }
   } else if (s.type==='slide'){   // a half-tube you could slide down, with a little thickness
-    const A = along(P, r*0.7), N = A.pts.length, R2 = r*3, th = Math.max(r*0.4, R2*0.14), seg = 18, rows = [[],[],[],[],[],[]];
+    const v2 = (s.v||1) >= 2, A = along(P, r*0.7), N = A.pts.length, R2 = v2 ? r : r*3, th = v2 ? r*0.14 : Math.max(r*0.4, R2*0.14), seg = 18, rows = [[],[],[],[],[],[]];
     let up = new THREE.Vector3(s.ups?.[0] ?? 0, s.ups?.[1] ?? 1, s.ups?.[2] ?? 0), side = V();
     const inner = [], outer = [];
     for (let i=0;i<N;i++){
       const t = A.tans[i], k = Math.min(n-1, Math.round(i/(N-1)*(n-1)));
       const want = new THREE.Vector3(s.ups?.[k*3] ?? 0, s.ups?.[k*3+1] ?? 1, s.ups?.[k*3+2] ?? 0);
-      up.lerp(want, 0.15).addScaledVector(t, -up.dot(t)).normalize();   // carried along the path, gently following your hand
+      if (v2){ const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02) up.copy(u2.normalize()); else up.addScaledVector(t, -up.dot(t)).normalize(); }   // the open side always faces up
+      else up.lerp(want, 0.15).addScaledVector(t, -up.dot(t)).normalize();   // carried along the path, gently following your hand
       side.crossVectors(t, up).normalize();
       const ri = [], ro = [];
       for (let q=0;q<=seg;q++){ const a2 = Math.PI*q/seg, d = side.clone().multiplyScalar(Math.cos(a2)).addScaledVector(up, -Math.sin(a2));
@@ -1499,7 +1608,7 @@ function beginStroke(rWorld){
   if (['clay','paint','doodle','blocks'].includes(state.tool) && !state.carve) addRecent(state.color);
   const L = activeLayer();
   if (state.tool==='doodle'){
-    stroke = {kind:'doodle', L, snap:snapStrokes(L), s:{type:state.doodle, pts:[], ups:[], r:0, col:state.color, seed:(Math.random()*1e9)|0}, last:null, lastBuild:0};
+    stroke = {kind:'doodle', L, snap:snapStrokes(L), s:{type:state.doodle, v:2, pts:[], ups:[], r:0, col:state.color, seed:(Math.random()*1e9)|0}, last:null, lastBuild:0};
   } else if (state.tool==='blocks'){
     const s = {type:'blocks', form:state.blockForm||'box', items:[]};
     stroke = {kind: state.blockMode==='angle' ? 'angle' : 'blocks', L, snap:snapStrokes(L), s, A:null, last:null, cells:new Set(), lastBuild:0, stage:0};
@@ -2880,9 +2989,9 @@ function drawDEdit(X,W){
   txt('Edit doodle', X, 100, 26);
   if (!e){ para(['Hold a doodle with your right grip,','then press A to edit it.'], X, 136, 15); button(X,UIH-118,W,44,'◀ Back to Doodle',false,()=>{ state.page='doodle'; requestUI(); },'#1e6bff'); return; }
   const s = e.s, cols = 5, bw = (W-8*(cols-1))/cols;
-  DOODLES.forEach(([id,l],i)=>{ const x = X+(i%cols)*(bw+8), y = 116+Math.floor(i/cols)*42;
-    button(x,y,bw,36,l,s.type===id,()=>{ s.type = id; editChanged(true); requestUI(); },'#ff2d95'); });
-  const y1 = 116 + Math.ceil(DOODLES.length/cols)*42 + 4, ws = e.L.group.getWorldScale(V()).x;
+  DOODLES.forEach(([id,l],i)=>{ const x = X+(i%cols)*(bw+8), y = 114+Math.floor(i/cols)*40;
+    button(x,y,bw,34,l,s.type===id,()=>{ s.type = id; editChanged(true); requestUI(); },'#ff2d95'); });
+  const y1 = 114 + Math.ceil(DOODLES.length/cols)*40 + 4, ws = e.L.group.getWorldScale(V()).x;
   slider(X,y1,W,'Thickness', Math.log(s.r), Math.log(e.r0*0.2), Math.log(e.r0*5), v=>{ s.r = Math.exp(v); editChanged(); }, '#ff2d95', fmtLen(s.r*ws*2));
   const y2 = y1 + 58, cw = (W-8*8)/9;
   PALETTE.slice(0,8).forEach((c,i)=>{ rr(X+i*(cw+8),y2,cw,34,9,c); if (s.col===c) rr(X+i*(cw+8)-3,y2-3,cw+6,40,11,null,'#ffd400'); hit(X+i*(cw+8),y2,cw,34,()=>{ s.col = c; editChanged(true); requestUI(); }); });
@@ -4011,22 +4120,22 @@ function drawColor(X,W){
     [['wheel','Wheel'],['hsv','Sliders'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),532,tw,40,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
   }
 }
-const DOODLES = [['slide','Slide'],['tube','Tube'],['ribbon','Ribbon'],['neon','Neon'],['coil','Coil'],['chain','Chain'],['beads','Beads'],['cubes','Cubes'],['dashes','Dashes'],['fuzz','Fuzz'],['stars','Stars'],['dots','Balls'],['confetti','Confetti'],['flames','Flames'],['snow','Snow'],['crystal','Crystal'],['holes','Black holes']];
+const DOODLES = [['tube','Doodle'],['slide','Slide'],['ptube','Tube'],['picket','Picket'],['chainlink','Chain link'],['barbed','Barbed'],['victorian','Victorian'],['rocks','Rocks'],['rainbow','Rainbow'],['ribbon','Ribbon'],['neon','Neon'],['coil','Coil'],['chain','Chain'],['beads','Beads'],['cubes','Cubes'],['dashes','Dashes'],['fuzz','Fuzz'],['stars','Stars'],['dots','Balls'],['confetti','Confetti'],['flames','Flames'],['snow','Snow'],['crystal','Crystal'],['holes','Black holes']];
 function drawDoodle(X,W){
   txt('Doodle', X, 100, 26);
   const cols = 5, bw = (W-8*(cols-1))/cols;
-  DOODLES.forEach(([id,l],i)=>{ const x = X+(i%cols)*(bw+8), y = 116+Math.floor(i/cols)*42;
-    button(x,y,bw,36,l,state.tool==='doodle'&&state.doodle===id,()=>{ setTool('doodle'); state.doodle=id; requestUI(); }, '#ff2d95'); });
-  slider(X,286,W,'Thickness  (right stick ↕)', state.doodleSize, 0.002, 0.05, v=>state.doodleSize=v, '#ff2d95');
+  DOODLES.forEach(([id,l],i)=>{ const x = X+(i%cols)*(bw+8), y = 114+Math.floor(i/cols)*40;
+    button(x,y,bw,34,l,state.tool==='doodle'&&state.doodle===id,()=>{ setTool('doodle'); state.doodle=id; requestUI(); }, '#ff2d95'); });
+  slider(X,360,W,'Thickness  (right stick ↕)', state.doodleSize, 0.002, 0.12, v=>state.doodleSize=v, '#ff2d95');
   const hw=(W-8)/2;
-  button(X,348,hw,48,'Draw',state.tool==='doodle',()=>setTool('doodle'),'#34c759');
-  button(X+hw+8,348,hw,48,'Erase bits',state.tool==='erase',()=>{ setTool('erase'); state.eraseFor='doodle'; requestUI(); },'#ff3b30');
-  txt('Right grip on a doodle', X, 418, 15, '#cfd6ff','left',700);
-  button(X,430,hw,40,'Moves it',state.doodleGrip==='move',()=>{ state.doodleGrip='move'; requestUI(); },'#1e6bff');
-  button(X+hw+8,430,hw,40,'Bends it',state.doodleGrip==='bend',()=>{ state.doodleGrip='bend'; requestUI(); },'#1e6bff');
-  if (state.doodleGrip==='bend') slider(X,486,W,'How much bends', state.bendReach, 0.03, 0.6, v=>state.bendReach=v, '#1e6bff', fmtLen(state.bendReach*yourScale()));
-  else para(['Holding one: A edits it, trigger copies,','B deletes, both grips stretch it.'], X, 494, 13);
-  button(X,536,W,40,'Doodle moves (wave, spin…) ▸',!!state.dAnim.mode,()=>{ state.page='dmotion'; requestUI(); },'#5e2bff');
+  button(X,416,hw,44,'Draw',state.tool==='doodle',()=>setTool('doodle'),'#34c759');
+  button(X+hw+8,416,hw,44,'Erase bits',state.tool==='erase',()=>{ setTool('erase'); state.eraseFor='doodle'; requestUI(); },'#ff3b30');
+  txt('Right grip on a doodle', X, 480, 15, '#cfd6ff','left',700);
+  button(X,492,hw,38,'Moves it',state.doodleGrip==='move',()=>{ state.doodleGrip='move'; requestUI(); },'#1e6bff');
+  button(X+hw+8,492,hw,38,'Bends it',state.doodleGrip==='bend',()=>{ state.doodleGrip='bend'; requestUI(); },'#1e6bff');
+  if (state.doodleGrip==='bend') slider(X,540,W,'How much bends', state.bendReach, 0.03, 0.6, v=>state.bendReach=v, '#1e6bff', fmtLen(state.bendReach*yourScale()));
+  else para(['Holding one: A edits it, trigger copies,','B deletes, both grips stretch it.'], X, 550, 13);
+  button(X,600,W,40,'Doodle moves (wave, spin…) ▸',!!state.dAnim.mode,()=>{ state.page='dmotion'; requestUI(); },'#5e2bff');
 }
 const BLOCK_HINTS = {
   stamp:['Tap to place one block, drag for a trail.','Snap off: blocks follow your hand’s angle.'],
@@ -5072,7 +5181,7 @@ function xrUpdate(dt){
     else if (sculpt){
       if (Math.abs(pr.sy) > 0.2){
         if (state.tool==='blocks') state.blockSize = clamp(state.blockSize*Math.exp(-pr.sy*dt*1.6), 0.02, 0.5);
-        else if (state.tool==='doodle') state.doodleSize = clamp(state.doodleSize*Math.exp(-pr.sy*dt*1.6), 0.002, 0.05);
+        else if (state.tool==='doodle') state.doodleSize = clamp(state.doodleSize*Math.exp(-pr.sy*dt*1.6), 0.002, 0.12);
         else { const [mn, mx] = sculptSizeRange(); state.size = clamp(clamp(state.size, mn, mx)*Math.exp(-pr.sy*dt*1.6), mn, mx); }
         requestUI();
       }
@@ -5949,7 +6058,7 @@ function netLiveStroke(){
   const now = performance.now();
   if (stroke && stroke.kind==='doodle' && stroke.s.pts.length >= 6){
     const n = stroke.s.pts.length; if (n === liveN || now - liveT < (n > 3000 ? 300 : 120)) return; liveN = n; liveT = now; const s = stroke.s;
-    netSend({t:'live', from:NET.me, L:stroke.L.id, s:{type:s.type, pts:s.pts.slice(), ups:s.ups.slice(), r:s.r, col:s.col, seed:s.seed}});
+    netSend({t:'live', from:NET.me, L:stroke.L.id, s:{type:s.type, v:s.v||1, pts:s.pts.slice(), ups:s.ups.slice(), r:s.r, col:s.col, seed:s.seed}});
   } else if (liveN){ liveN = 0; netSend({t:'live', from:NET.me, end:1}); }
   for (const [k, o] of liveMap) if (now - o.t > 3000){ o.L.group.remove(o.mesh); disposeMesh(o.mesh); liveMap.delete(k); }
 }
