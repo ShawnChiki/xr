@@ -57,7 +57,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '0.29';
+const VERSION = '0.30';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -901,6 +901,14 @@ function removeLayer(L){
 // world <-> layer space (works through any parent: world, a character root, or the studio)
 function wToL(L, p){ L.group.updateMatrixWorld(true); return L.group.worldToLocal(p.clone()); }
 function rToL(L, r){ return r / L.group.getWorldScale(V()).x; }
+function autoFiner(L, rL){   // you shrank your brush past this layer's detail: make the layer finer (if it stays light), so the brush really is that small
+  if (!L || L.locked || NET.guest) return false; let n = 0;
+  while (rL < L.vs*0.7 && n < 4){ const i = DETAILS.indexOf(L.vs); if (i < 0 || i >= DETAILS.length-1) break;
+    if (layerHasClay(L) && resampleKeys(L, DETAILS[i+1]).size > 2500) break;
+    const vs0 = L.vs; changeDetail(L, -1); if (L.vs === vs0) break; n++; }
+  if (n) toast('Small brush: "'+layerLabel(L)+'" now has finer detail ('+fmtLen(L.vs)+')');
+  return rL >= L.vs*0.7;
+}
 function qToL(L, q){ return L.group.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(q); }
 function dToL(L, d){ return d.clone().applyQuaternion(L.group.getWorldQuaternion(new THREE.Quaternion()).invert()); }
 
@@ -1634,8 +1642,9 @@ function beginStroke(rWorld){
     stroke = {kind:'erase', L, snap:snapStrokes(L), changed:false};
   } else {
     const base = rToL(L, rWorld ?? 0.1);
+    if (base < L.vs*0.7) autoFiner(L, base);
     if (performance.now() - hintT > 6000){
-      if (base < L.vs*0.7){ toast('Brush is finer than this layer — tap + New layer'); hintT = performance.now(); }
+      if (base < L.vs*0.7 && !autoFiner(L, base)){ toast('Brush is finer than this layer — tap + New layer'); hintT = performance.now(); }
       else if (base > L.vs*MAXVOX){ toast('Brush is bigger than this layer allows — tap + New layer'); hintT = performance.now(); }
     }
     stroke = {kind:'vox', L, map:new Map(), last:null, t:0, snap:snapStrokes(L), strokesChanged:false};
@@ -2082,6 +2091,13 @@ function placeChar(c){
     yaw = Math.atan2(-fwd.x, -fwd.z);
   } else {
     p = controls.target.clone(); const d = V().subVectors(camera.position, p); yaw = Math.atan2(d.x, d.z);
+  }
+  if (renderer.xr.isPresenting && c.type==='puppet'){
+    const g = c.guide || GUIDE, head = V(); camera.getWorldPosition(head); const fwd = V(); camera.getWorldDirection(fwd); fwd.y = 0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
+    const eyeY = Math.max(0.6, camera.position.y), ps = rig.scale.x * eyeY / g.head[1], q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), Math.atan2(fwd.x, fwd.z));
+    const root = head.clone().sub(new THREE.Vector3(...g.head).multiplyScalar(ps).applyQuaternion(q));
+    c.place = {p:root.toArray().map(r4), q:q.toArray(), s:+ps.toFixed(4)}; c.placed = true; pushUndo({type:'show', snap:before}); sceneDirty = true;
+    toast(c.name+' is placed right where you are, your size'); requestUI(); return;
   }
   const k = renderer.xr.isPresenting ? s : 1;
   // stand it on the ground under that spot
@@ -5321,7 +5337,7 @@ function xrUpdate(dt){
     const L2 = activeLayer();
     const isVox = ['clay','smooth','paint','spray'].includes(state.tool);
     const base = (state.tool==='doodle' ? state.doodleSize : state.size) * rig.scale.x;
-    const rShown = isVox && L2 ? clamp(rToL(L2,base), L2.vs*0.7, L2.vs*MAXVOX)*L2.group.getWorldScale(V()).x : base;
+    const rShown = isVox && L2 ? clamp(rToL(L2,base), L2.vs*0.7/16, L2.vs*MAXVOX)*L2.group.getWorldScale(V()).x : base;   // the cursor shows the size you'll really get
     brushRW = state.tool==='blocks' ? Math.max(0.03*rig.scale.x, blockSizeWorld()*0.5) : Math.max(0.02*rig.scale.x, rShown);
     // the 3D color ball
     let orbHex = (!onPanel && orb.visible && !drawingNow) ? (orbPick(_tip) || orbPickRay(_o, _d)) : null;
@@ -5738,7 +5754,7 @@ function tryEatStroke(){
 // ---- characters from your other worlds on this device
 async function importListWorld(id){
   state.impWorld = {id, loading:true, chars:[]}; requestUI();
-  try { const t = await idbGet('world:'+id); const o = JSON.parse(t); state.impWorld = {id, o, chars:(o.show && o.show.chars) || []}; } catch(e){ state.impWorld = {id, chars:[], err:true}; }
+  try { const t = await idbGet('world:'+id); const o = JSON.parse(t); state.impWorld = {id, o, chars:(o.show && o.show.chars) || [], thumbs:{}, page:0}; } catch(e){ state.impWorld = {id, chars:[], err:true, thumbs:{}, page:0}; }
   requestUI();
 }
 function loadLayerData(ld, enc, L){
@@ -5760,6 +5776,40 @@ function importChar(o, cd){
   }
   state.selChar = c.id; if (first) state.activePart = first.id; sceneDirty = true; toast(nm+' moved in from another world'); requestUI();
 }
+// little pictures of characters in your other worlds, made one per frame so nothing stutters
+const thumbRT = new THREE.WebGLRenderTarget(256, 256), thumbScene = new THREE.Scene(), thumbCam = new THREE.PerspectiveCamera(32, 1, 0.005, 200);
+thumbScene.add(new THREE.HemisphereLight('#ffffff', '#5a6290', 1.3)); { const dl = new THREE.DirectionalLight('#ffffff', 1.8); dl.position.set(1.5, 2.5, 3); thumbScene.add(dl); }
+function makeThumb(o, cd){
+  const root = new THREE.Group(); thumbScene.add(root); const temps = [];
+  try {
+    for (const ld of (o.layers||[]).filter(l=>l.char===cd.id && l.visible!==false)){
+      const L = {id:-1, vs:ld.vs||0.1, chunks:new Map(), group:new THREE.Group(), strokes:[], mat:makeClayMat(), rest:ld.rest||{p:[0,0,0], q:[0,0,0,1], s:1}};
+      L.group.position.fromArray(L.rest.p); L.group.quaternion.fromArray(L.rest.q); L.group.scale.setScalar(L.rest.s||1); root.add(L.group); temps.push(L);
+      for (const cdk of (ld.chunks||[])){ const [cx,cy,cz] = cdk.k.split(',').map(Number), ch = getChunk(L,cx,cy,cz,true), rle = o.enc==='rle';
+        const dq = rle ? rleDec(b64ToU8(cdk.d),1,CN3) : b64ToU8(cdk.d), q = new Int8Array(dq.buffer, dq.byteOffset, CN3); ch.d = new Float32Array(CN3);
+        for (let i=0;i<CN3;i++) ch.d[i] = q[i]/127*DMAX; ch.c = rle ? rleDec(b64ToU8(cdk.c),3,CN3*3) : b64ToU8(cdk.c); }
+      for (const ch of L.chunks.values()) meshChunk(L, ch);
+      for (const s2 of (ld.strokes||[])){ const m = buildStrokeMesh({...s2, _mesh:null}); if (m) L.group.add(m); }
+    }
+    root.updateMatrixWorld(true); const box = new THREE.Box3().setFromObject(root); if (box.isEmpty()) return null;
+    const ctr = box.getCenter(V()), size = box.getSize(V()), R = Math.max(size.x, size.y, size.z)*0.5 || 0.1;
+    thumbCam.position.copy(ctr).add(new THREE.Vector3(0.35, 0.25, 1).normalize().multiplyScalar(R/Math.sin(THREE.MathUtils.degToRad(16))*1.05));
+    thumbCam.near = R*0.05; thumbCam.far = R*20; thumbCam.updateProjectionMatrix(); thumbCam.lookAt(ctr);
+    const xr = renderer.xr.enabled, old = renderer.getRenderTarget(), oc = renderer.getClearColor(new THREE.Color()), oa = renderer.getClearAlpha();
+    renderer.xr.enabled = false; renderer.setRenderTarget(thumbRT); renderer.setClearColor('#1d2246', 1); renderer.clear(); renderer.render(thumbScene, thumbCam);
+    const px = new Uint8Array(256*256*4); renderer.readRenderTargetPixels(thumbRT, 0, 0, 256, 256, px);
+    renderer.setRenderTarget(old); renderer.setClearColor(oc, oa); renderer.xr.enabled = xr;
+    const cv = document.createElement('canvas'); cv.width = cv.height = 256; const cx2 = cv.getContext('2d'), img = cx2.createImageData(256, 256);
+    for (let y=0;y<256;y++) img.data.set(px.subarray((255-y)*1024, (256-y)*1024), y*1024);
+    cx2.putImageData(img, 0, 0); return cv;
+  } catch(e){ console.warn('thumb', e); return null; }
+  finally { thumbScene.remove(root); root.traverse(m => { if (m.geometry) m.geometry.dispose(); if (m.material && m.material.dispose) m.material.dispose(); }); }
+}
+function tickThumbs(){
+  const iw = state.impWorld; if (state.page !== 'charimport' || !iw || !iw.o || !iw.thumbs) return;
+  const cd = iw.chars.slice(iw.page*4, iw.page*4+4).find(c => !(c.id in iw.thumbs)); if (!cd) return;
+  iw.thumbs[cd.id] = makeThumb(iw.o, cd) || false; requestUI();
+}
 function drawCharImport(X,W){
   txt('From your other worlds', X, 100, 22);
   const others = worldList.filter(w=>w.id!==state.worldId);
@@ -5767,10 +5817,19 @@ function drawCharImport(X,W){
   const iw = state.impWorld;
   if (!iw){ others.slice(0,9).forEach((w,i)=>{ const y = 122+i*48; rr(X,y,W,42,10,'#2a3060'); txt(w.name, X+12, y+21, 16, '#fff'); txt('▸', X+W-16, y+21, 18, '#ffd400','right'); hit(X,y,W,42,()=>importListWorld(w.id)); }); }
   else { const w = worldList.find(x=>x.id===iw.id); txt(w ? w.name : '', X, 136, 16, '#ffd400','left',800);
-    if (iw.loading) para(['Opening…'], X, 160, 15);
-    else if (!iw.chars.length) para(['No characters in that world.'], X, 160, 15);
-    else iw.chars.slice(0,7).forEach((cd,i)=>{ const y = 152+i*48; rr(X,y,W,42,10,'#2a3060'); txt((cd.type==='puppet'?'🙂 ':'📦 ')+cd.name, X+12, y+21, 16, '#fff'); txt('+ Bring in', X+W-12, y+21, 13, '#34c759','right',800); hit(X,y,W,42,()=>importChar(iw.o, cd)); });
-    button(X,UIH-170,W,42,'◀ Other worlds',false,()=>{ state.impWorld = null; requestUI(); },'#5e2bff'); }
+    const pages = Math.max(1, Math.ceil(iw.chars.length/4)); iw.page = clamp(iw.page||0, 0, pages-1);
+    if (pages > 1){ button(X+W-84,118,40,32,'◀',false,()=>{ iw.page--; requestUI(); },'#ff2d95'); button(X+W-40,118,40,32,'▶',false,()=>{ iw.page++; requestUI(); },'#ff2d95'); }
+    if (iw.loading) para(['Opening…'], X, 170, 15);
+    else if (!iw.chars.length) para(['No characters in that world.'], X, 170, 15);
+    else { const cw = (W-8)/2, chh = 176;
+      iw.chars.slice(iw.page*4, iw.page*4+4).forEach((cd,i)=>{ const x = X+(i%2)*(cw+8), y = 156+Math.floor(i/2)*(chh+8), th = iw.thumbs && iw.thumbs[cd.id];
+        rr(x,y,cw,chh,14,'#2a3060');
+        if (th) g.drawImage(th, x+(cw-130)/2, y+6, 130, 130); else txt(th===false ? (cd.type==='puppet'?'🙂':'📦') : '…', x+cw/2, y+70, th===false ? 40 : 22, '#8f97c7','center');
+        txt(cd.name.length > 13 ? cd.name.slice(0,12)+'…' : cd.name, x+10, y+150, 14, '#fff','left',800);
+        rr(x+cw-62, y+138, 54, 28, 8, '#34c759'); txt('+ Add', x+cw-35, y+152, 12, '#111','center',800);
+        hit(x,y,cw,chh,()=>importChar(iw.o, cd)); }); }
+    button(X,UIH-112,(W-8)/2,44,'◀ Worlds',false,()=>{ state.impWorld = null; requestUI(); },'#5e2bff');
+    button(X+(W+8)/2,UIH-112,(W-8)/2,44,'◀ Characters',false,()=>{ state.impWorld = null; state.page='chars'; requestUI(); },'#1e6bff'); return; }
   button(X,UIH-118,W,44,'◀ Back to Characters',false,()=>{ state.impWorld = null; state.page='chars'; requestUI(); },'#1e6bff');
 }
 
@@ -6562,7 +6621,7 @@ renderer.setAnimationLoop(() => {
   applyFace(tdt);
   if (NET.guest) netApplyPoses();
   animTime += tdt; animateDoodles(animTime);
-  netTick(); netPoses(); netShots(); netLiveStroke(); netCamGuest(dt); netCamHost(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum(); updateArms(); tickShoulders(tdt); tickPose(tdt); updateMonitor(tdt); tickLight(tdt); if (xr){ updatePivotDot(); updateCtrlModels(); }
+  netTick(); netPoses(); netShots(); netLiveStroke(); netCamGuest(dt); netCamHost(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum(); updateArms(); tickShoulders(tdt); tickPose(tdt); tickThumbs(); updateMonitor(tdt); tickLight(tdt); if (xr){ updatePivotDot(); updateCtrlModels(); }
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
@@ -6655,7 +6714,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
