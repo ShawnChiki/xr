@@ -60,7 +60,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '430';
+const VERSION = '439';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -650,7 +650,7 @@ function drawTogether(X,W){
     if (state.camOn){ rr(X,322,W,52,14,'#ffd400'); txt('You have the camera 🎥', X+W/2, 348, 19, '#111','center');
       para(['Trigger films, let go to stop. Right stick zooms.'], X, 392, 13); }
     else if (show.embodied){ rr(X,322,W,52,14,'#ff2d95'); txt('You are '+show.embodied.c.name, X+W/2, 348, 19, '#111','center');
-      para(['Head and hands move it. Talk: the mouth moves.','Grip: hold a prop, climb, or eat it.'], X, 392, 13); }
+      para(['Head and hands move it. Talk: the mouth moves.','Grip a prop to hold it, a wall to climb.'], X, 392, 13); }
     button(X,440,W,46,'Mic '+(state.mic && micStream ? 'on' : 'off'),!!(state.mic && micStream),async ()=>{ state.mic = !state.mic; if (state.mic) await ensureMic(); requestUI(); },'#ff9500');
     button(X,UIH-150,W,46,'Leave the room',false,()=>netLeave(false),'#ff3b30');
     if (NET.status) para([NET.status], X, UIH-190, 14, '#ffd400');
@@ -1199,19 +1199,32 @@ function turnToward(up, t, target, maxA){   // spin up around the line toward ta
   const ang = Math.acos(clamp(up.dot(target), -1, 1)); if (ang < 1e-4) return; const sgn = t.dot(new THREE.Vector3().crossVectors(up, target)) >= 0 ? 1 : -1;
   up.applyQuaternion(new THREE.Quaternion().setFromAxisAngle(t, sgn*Math.min(ang, maxA))).addScaledVector(t, -up.dot(t)).normalize();
 }
-function pathFrames(P, step, s, flat){   // points along the line with a side and an up; flat = up stays the world's up (slides open to the sky)
+function pathFrames(P, step, s, flat){   // points along the line with a side and an up; flat = up leans to the world's up (slides open to the sky)
+  // 1) carry an up along the line with no twist at all; 2) work out how far it should roll toward the wanted up at each point;
+  // 3) smooth that roll along the line (near-vertical bits borrow from their neighbours) so turning upright is a gentle spiral, never a sudden crease
   const A = along(P, step), N = A.pts.length, n = P.length, fr = [];
-  let up = new THREE.Vector3(s.ups?.[0] ?? 0, s.ups?.[1] ?? 1, s.ups?.[2] ?? 0);
-  for (let i=0;i<N;i++){
-    const t = A.tans[i];
-    if (flat === 'carry' || flat === true){
-      if (i === 0){ const u0 = UPY.clone().addScaledVector(t, -UPY.dot(t)); up.copy(u0.lengthSq() > 0.02 ? u0.normalize() : new THREE.Vector3(1,0,0).addScaledVector(t, -t.x).normalize()); }
-      else { up.addScaledVector(t, -up.dot(t)).normalize();   // carried along without twisting
-        if (flat === true){ const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02){ u2.normalize(); turnToward(up, t, u2, 0.3); } } }
-    }
-    else { const k = Math.min(n-1, Math.round(i/(N-1)*(n-1))); const want = new THREE.Vector3(s.ups?.[k*3] ?? 0, s.ups?.[k*3+1] ?? 1, s.ups?.[k*3+2] ?? 0); up.lerp(want, 0.15).addScaledVector(t, -up.dot(t)).normalize(); }
-    fr.push({p:A.pts[i], t, up:up.clone(), side:new THREE.Vector3().crossVectors(t, up).normalize()});
-  }
+  const want = i => { if (flat === true) return UPY; const k = Math.min(n-1, Math.round(i/Math.max(1, N-1)*(n-1))); return new THREE.Vector3(s.ups?.[k*3] ?? 0, s.ups?.[k*3+1] ?? 1, s.ups?.[k*3+2] ?? 0); };
+  const U = [], up = new THREE.Vector3();
+  for (let i=0;i<N;i++){ const t = A.tans[i];
+    if (i === 0){ const w0 = want(0).clone().addScaledVector(t, -want(0).dot(t)); up.copy(w0.lengthSq() > 0.02 ? w0.normalize() : new THREE.Vector3(1,0,0).addScaledVector(t, -t.x).normalize()); }
+    else up.addScaledVector(t, -up.dot(t)).normalize();
+    U.push(up.clone()); }
+  const roll = new Float32Array(N);
+  if (flat !== 'carry' && N > 1){
+    const ang = new Float32Array(N), conf = [];
+    for (let i=0;i<N;i++){ const t = A.tans[i], w2 = want(i).clone().addScaledVector(t, -want(i).dot(t));
+      if (w2.lengthSq() < 0.09) continue;   // line nearly along the wanted up: no clear answer here, borrow from neighbours
+      w2.normalize(); let a2 = Math.atan2(t.dot(new THREE.Vector3().crossVectors(U[i], w2)), U[i].dot(w2));
+      if (conf.length){ const pv = ang[conf[conf.length-1]]; while (a2 - pv > Math.PI) a2 -= Math.PI*2; while (a2 - pv < -Math.PI) a2 += Math.PI*2; }   // unwrap: never a full extra turn
+      ang[i] = a2; conf.push(i); }
+    if (conf.length){
+      for (let i=0;i<conf[0];i++) ang[i] = ang[conf[0]];
+      for (let i=conf[conf.length-1]+1;i<N;i++) ang[i] = ang[conf[conf.length-1]];
+      for (let q=0;q<conf.length-1;q++){ const i0 = conf[q], i1 = conf[q+1]; for (let i=i0+1;i<i1;i++) ang[i] = ang[i0] + (ang[i1]-ang[i0])*(i-i0)/(i1-i0); }   // spread a flip evenly across the gap
+      const K = Math.max(3, Math.round((s.r || 0.02)*4/Math.max(1e-6, step)));   // then soften over about 4 brush-widths
+      for (let i=0;i<N;i++){ let sw = 0, sa = 0; for (let j=Math.max(0,i-K); j<=Math.min(N-1,i+K); j++){ const g2 = 1 - Math.abs(j-i)/(K+1); sw += g2; sa += g2*ang[j]; } roll[i] = sa/sw; } } }
+  for (let i=0;i<N;i++){ const t = A.tans[i], u = U[i].clone().applyAxisAngle(t, roll[i]).addScaledVector(t, -U[i].dot(t)).normalize();
+    fr.push({p:A.pts[i], t, up:u, side:new THREE.Vector3().crossVectors(t, u).normalize()}); }
   return {A, fr};
 }
 function geoOf(pos, idx, uv){ const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos,3)); if (uv) geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv,2)); geo.setIndex(idx); geo.computeVertexNormals(); geo.computeBoundingSphere(); return geo; }
@@ -1338,14 +1351,13 @@ function buildStrokeMesh(s){
       mesh.add(glow);
     }
   } else if (s.type==='slide'){   // a half-tube you could slide down, with a little thickness
-    const v2 = (s.v||1) >= 2, A = along(v2 ? smoothPath(P, r) : P, r*0.7), N = A.pts.length, R2 = v2 ? r : r*3, th = v2 ? r*0.14 : Math.max(r*0.4, R2*0.14), seg = 18, rows = [[],[],[],[],[],[]];
+    const v2 = (s.v||1) >= 2, PF = v2 ? pathFrames(smoothPath(P, r), r*0.7, s, true) : null, A = v2 ? PF.A : along(P, r*0.7), N = A.pts.length, R2 = v2 ? r : r*3, th = v2 ? r*0.14 : Math.max(r*0.4, R2*0.14), seg = 18, rows = [[],[],[],[],[],[]];
     let up = new THREE.Vector3(s.ups?.[0] ?? 0, s.ups?.[1] ?? 1, s.ups?.[2] ?? 0), side = V();
     const inner = [], outer = [];
     for (let i=0;i<N;i++){
       const t = A.tans[i], k = Math.min(n-1, Math.round(i/(N-1)*(n-1)));
       const want = new THREE.Vector3(s.ups?.[k*3] ?? 0, s.ups?.[k*3+1] ?? 1, s.ups?.[k*3+2] ?? 0);
-      if (v2){ if (i === 0){ const u0 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u0.lengthSq() > 0.02) up.copy(u0.normalize()); } up.addScaledVector(t, -up.dot(t)).normalize();
-        const u2 = UPY.clone().addScaledVector(t, -UPY.dot(t)); if (u2.lengthSq() > 0.02){ u2.normalize(); turnToward(up, t, u2, 0.3); } }   // turns toward open-side-up without ever flipping
+      if (v2) up.copy(PF.fr[i].up);   // open side up, rolling smoothly (no sudden flips)
       else up.lerp(want, 0.15).addScaledVector(t, -up.dot(t)).normalize();   // carried along the path, gently following your hand
       side.crossVectors(t, up).normalize();
       const ri = [], ro = [];
@@ -2599,7 +2611,7 @@ function cutShowRec(cancel){
   let clip = null;
   if (r.mr){
     clip = {id: show.audioSeq++, b64:null, mime:r.mr.mimeType, dur:r.t - (r.t0||0), at:r.t0||0}; voiceFromChar(clip, r.who);
-    overwriteVoice(clip);
+    if (r.inside != null && r.inside === clip.cid) overwriteVoice(clip);   // only re-recording from inside the puppet replaces its voice
     show.audio.push(clip);
     r.mr.onstop = async () => {
       const blob = new Blob(r.chunks, {type: r.mr.mimeType || 'audio/webm'});
@@ -2630,7 +2642,7 @@ function updateShow(dt){
       return;
     }
     r.t += realDt(r); show.t = r.t;
-    if (show.embodied) r.who = show.embodied.c.id; else if (show.grab && show.grab.c) r.who = show.grab.c.id; else if (r.who == null && r.voiceFor) r.who = r.voiceFor;
+    if (show.embodied){ r.who = show.embodied.c.id; r.inside = show.embodied.c.id; } else if (show.grab && show.grab.c) r.who = show.grab.c.id; else if (r.who == null && r.voiceFor) r.who = r.voiceFor;
     setRecLabel('● REC '+fmtTime(r.t));
     if (r.t - r.last >= 1/45){
       r.last = r.t;
@@ -4835,7 +4847,7 @@ function drawPerform(X,W){
     else if (sc0 && sc0.type==='puppet' && !assignedTo(sc0)) button(X+96,y,W-96,42,'Put in '+sc0.name,false,()=>netAssign(sc0, p.id),'#00c7be');
     else txt(sc0 && sc0.type==='puppet' ? 'pick a free puppet ◀ ▶' : 'pick a puppet ◀ ▶', X+96, y+21, 13, '#8f97c7','left',700); });
   const cy2 = ty + 52 + gps.length*48;
-  if (cy2 + 40 < UIH-12) toggle(X, cy2, W, 40, 'In a puppet, grip on nothing climbs', !!state.climb, ()=>{ state.climb = !state.climb; toast(state.climb ? 'Climbing on: grip where nothing is and pull yourself along' : 'Climbing off'); requestUI(); }, '#34c759');
+  if (cy2 + 40 < UIH-12) toggle(X, cy2, W, 40, 'In a puppet, grip a surface to climb', state.climb !== false, ()=>{ state.climb = state.climb === false; toast(state.climb ? 'Climbing on: grip a wall, the ground or a block and pull' : 'Climbing off'); requestUI(); }, '#34c759');
   if (!gps.length && cy2+110 < UIH-10) para(['Grip a character to move it; add the left grip to','stretch and turn it. Right stick: ↕ size, ↔ turn.'], X, cy2+60, 13);
 }
 function drawWave(clip, x, y, w, h){
@@ -5072,7 +5084,7 @@ function legendLines(hand){
           : [['T','film (hold)'],['A', play?'stop':'play take'],['B', keyGrab?'delete this key':'next take'],['S','↕ zoom (records)'],['G','key dot / world · + stick: screen']],
     edit:   [['A', play && play.rec ? 'stop recording' : 'record shot changes'],['B', play ? 'stop' : 'play film'],['T','menu clicks'],['G','window / world']],
     light:  [['A','add a light here'],['G','grab a bulb / window / world'],['T','menu clicks']],
-    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T', show.grab ? 'hold: re-grip your hand' : 'aim at ground: jump there'],['G', show.embodied?'hold a prop · eat it · climb':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
+    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T', show.grab ? 'hold: re-grip your hand' : 'aim at ground: jump there'],['G', show.embodied?'grip a wall: climb · a prop: hold':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
   }[ph] || [['T','menu clicks'],['G','window / world']]);
 }
 function drawLegend(cv, lines){
@@ -6050,12 +6062,20 @@ function findPropNear(pW, rW){
     const bx = new THREE.Box3().setFromObject(c.root); if (bx.isEmpty()) continue; const d = bx.distanceToPoint(pW); if (d < bd){ bd = d; best = c; } }
   return best;
 }
+// is the hand touching the world: clay on a world layer, a block or a doodle?
+function touchesWorld(p, r){
+  for (const L of layers){ if (!L.visible || L.char) continue; const vs = L.vs || VS; L.group.updateMatrixWorld(true);
+    const lp = L.group.worldToLocal(p.clone()), rr2 = r / Math.max(1e-6, L.group.scale.x);
+    for (const o of [[0,0,0],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]]){
+      const q = lp.clone().add(new THREE.Vector3(o[0], o[1], o[2]).multiplyScalar(rr2));
+      if (sampleD(L, Math.round(q.x/vs), Math.round(q.y/vs), Math.round(q.z/vs)) > -0.4) return true; } }
+  return !!(findBlockAt(p, r) || findStrokeAt(p, r));
+}
 function embGripStart(side){
   const cc = ctrl[side]; if (!cc) return; const tip = embTip(cc), r = 0.09*rig.scale.x;
   const pr = findPropNear(tip, r);
   if (pr){ pr.root.updateMatrixWorld(true); embGrab[side] = {c:pr, rel: unscaled(cc.grip).invert().multiply(pr.root.matrixWorld.clone())}; pulse(side,0.5,30); return; }
-  if (side==='right' && !blockGrab && !doodleGrab){ const b = findBlockAt(tip, r); if (b){ startBlockGrab(b, unscaled(cc.grip)); return; } const d = findStrokeAt(tip, r); if (d){ startDoodleGrab(d, unscaled(cc.grip)); return; } }
-  if (state.climb){ climb[side] = {anchor: tip.clone()}; pulse(side,0.25,15); }   // nothing to hold: grab the world and pull yourself (when climbing is on)
+  if (state.climb !== false && !riding(show.embodied) && touchesWorld(tip, r)){ climb[side] = {anchor: tip.clone()}; pulse(side,0.35,20); }   // grip a wall, the ground, a block: pull yourself along it
 }
 function embGripEnd(side){
   const g0 = embGrab[side];
@@ -6076,7 +6096,7 @@ function updateEmbodiedHands(pl, pr, dt){
   if (blockGrab && ctrl.right && !two){ moveBlockGrab(unscaled(ctrl.right.grip)); tryEatStroke(); }
   // climbing: the hand stays where it grabbed, so you move instead
   const moves = []; for (const side of ['left','right']){ const cl = climb[side]; if (cl && ctrl[side]) moves.push(cl.anchor.clone().sub(embTip(ctrl[side]))); }
-  if (moves.length && !(show.tracks['r'+e.c.id] && !show.rec)){ const d = moves.reduce((a,b)=>a.add(b), V()).divideScalar(moves.length); rig.position.add(d); rig.updateMatrixWorld(true);
+  if (moves.length && !riding(e)){ const d = moves.reduce((a,b)=>a.add(b), V()).divideScalar(moves.length); rig.position.add(d); rig.updateMatrixWorld(true);
     e.c.root.position.add(d); e.c.root.updateMatrixWorld(true); e.rootMoved = true; if (!show.rec){ e.c.place.p = e.c.root.position.toArray(); sceneDirty = true; } }
 }
 function mouthWorld(){
@@ -7162,7 +7182,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
