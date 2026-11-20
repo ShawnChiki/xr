@@ -60,7 +60,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '439';
+const VERSION = '445';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2268,10 +2268,13 @@ function inFrame(c, tk, u){
 // gain and pan follow the camera over the clip; timeOf(u) says when show time u plays. vis: the clip on screen, for "seen only"
 function spatialNode(ctx, node, c, tk, u0, u1, timeOf, vis){
   const seen = !!(vis && vis._clip && vis._clip.camOnly && c.cid != null), sp = (shots.spatial ?? 1) > 0.001;
-  if (c.cid == null || (!sp && !seen) || !tk) return node;
+  const pv = vis && vis._prev, pvSeen = !!(pv && pv._clip && pv._clip.camOnly && c.cid != null), xf = (shots.xfade ?? 0.3) * (vis ? spd(vis) : 1);
+  if (c.cid == null || (!sp && !seen && !pvSeen) || !tk) return node;
+  const at = (k, uu) => { const z1 = sp ? spatialAt(c, k._snd || k, uu) : {g:1, pan:0}; if (!z1) return null; return k._clip && k._clip.camOnly && !inFrame(c, k, uu) ? {g:0.0001, pan:z1.pan} : z1; };
   const gn = ctx.createGain(), pn = ctx.createStereoPanner(); let first = true;
-  for (let u = u0; u <= u1 + 0.1; u += 0.1){ const uu = Math.min(u, u1), z0 = sp ? spatialAt(c, tk, uu) : {g:1, pan:0}; if (!z0) continue; const tt = Math.max(0, timeOf(uu));
-    const z = seen && !inFrame(c, vis, uu) ? {g:0.0001, pan:z0.pan} : z0;
+  for (let u = u0; u <= u1 + 0.1; u += (pv && u < (vis.inT||0) + xf ? 0.04 : 0.1)){ const uu = Math.min(u, u1), z0 = sp ? spatialAt(c, tk, uu) : {g:1, pan:0}; if (!z0) continue; const tt = Math.max(0, timeOf(uu));
+    let z = seen && !inFrame(c, vis, uu) ? {g:0.0001, pan:z0.pan} : z0;
+    if (pv && xf > 0.01 && uu < vis.inT + xf){ const zp = at(pv, uu); if (zp){ const k = clamp((uu - vis.inT)/xf, 0, 1); z = {g: zp.g + (z.g - zp.g)*k, pan: zp.pan + (z.pan - zp.pan)*k}; } }   // blend the sound across the cut
     if (first){ gn.gain.setValueAtTime(z.g, tt); pn.pan.setValueAtTime(z.pan, tt); first = false; } else { gn.gain.linearRampToValueAtTime(z.g, tt); pn.pan.linearRampToValueAtTime(z.pan, tt); } }
   node.connect(gn); gn.connect(pn); return pn;
 }
@@ -2294,7 +2297,7 @@ async function renderFilmAudio(total){
   let acc = 0, any = false;
   for (const tk of filmClips()){
     const Lc = clipLen(tk), sc = sceneById(tk.sceneId ?? 1), rate = spd(tk);
-    for (const c of ((sc && sc.audio) || [])){
+    for (const c of ((tk.sceneId===curScene ? show.audio : sc && sc.audio) || [])){   // the scene you're in: its live list
       let buf = null; try { buf = playBuf(c, await decodeClip(c)); } catch(e){} if (!buf) continue;
       const at = c.at || 0, s0 = Math.max(tk.inT, at), s1 = Math.min(tk.outT, at + buf.duration);
       if (s1 <= s0) continue;
@@ -2445,7 +2448,7 @@ function stepIn(c){
   show.embodied = {c, parts, tilted, rigRel: c.root.matrixWorld.clone().invert().multiply(rig.matrix.clone())};
   if (tilted){ c.root.quaternion.copy(q0); c.root.updateMatrixWorld(true); followRoot(1); updateEmbodied(); }   // tip it back: you tip with it
   if (!state.mic){ state.mic = true; ensureMic(); }   // in a puppet your voice is on
-  placeMirror(); toast('You are '+c.name+' — A records, B plays'); requestUI();
+  placeMirror(); toast('You are '+c.name+' — B records, A plays'); requestUI();
 }
 function stepOut(){
   if (!show.embodied || show.rec) return;
@@ -2863,7 +2866,7 @@ function startPlay(mode){
   if (rec || show.rec) return;
   stopShow();
   if (mode==='take'){ const tk = selTake(); if (!tk){ toast('Film a take first'); return; } activateScene(tk.sceneId); play = {mode, t:tk.inT, tk}; audioPlayFrom(tk.inT, spd(tk), null, tk); }
-  else { if (!filmClips().length){ toast('No clips on the timeline'); return; } play = {mode, t: shots.playhead >= filmLength()-0.05 ? 0 : shots.playhead, clipId:null}; }
+  else { if (!filmClips().length){ toast('No clips on the timeline'); return; } const [fa, fb] = filmRange(); play = {mode, t: shots.playhead >= fb-0.05 || shots.playhead < fa ? fa : shots.playhead, clipId:null}; }
   requestUI();
 }
 function stopPlay(){
@@ -2899,7 +2902,7 @@ function updatePlay(dt){
     }
   } else {
     play.t += realDt(play);
-    const L = filmLength(); if (play.t >= L){ shots.playhead = L; stopPlay(); return; }
+    const L = filmRange()[1]; if (play.t >= L){ shots.playhead = L; stopPlay(); return; }
     shots.playhead = play.t; const f = filmAt(play.t);
     if (f){ poseShotCam(f.tk, f.u); const sk = f.tk._seg ?? f.tk.id; if (play.clipId !== sk){ play.clipId = sk; activateScene(f.tk.sceneId); if (!play.silent) audioPlayFrom(f.u, spd(f.tk), null, f.tk); else audioStop(); } }
     uiTick += dt; if (uiTick > 0.1){ uiTick = 0; requestUI(); }
@@ -3275,8 +3278,8 @@ async function exportMP4(){
   if (!('VideoEncoder' in window)){ toast('This browser can’t make MP4s — try desktop Chrome'); return; }
   const clips = filmClips(); if (!clips.length){ toast('No clips on the timeline yet'); return; }
   stopPlay(); stopShow(); const startScene = curScene;
-  const [W,H] = exportSize(), fps = shots.fps, total = filmLength();
-  const frames = Math.max(1, Math.round(total*fps));
+  const [W,H] = exportSize(), fps = shots.fps, total = filmLength(), [fa, fb] = filmRange();
+  const frames = Math.max(1, Math.round((fb-fa)*fps));
   exporting = {i:0, frames, cancel:false}; workView(); requestUI();
   let er = null;
   try {
@@ -3299,7 +3302,7 @@ async function exportMP4(){
     const muxer = new Muxer({target, video:{codec:'avc', width:W, height:H, frameRate:fps}, ...(aCfg ? {audio:{codec: aCfg.codec==='opus' ? 'opus' : 'aac', numberOfChannels:2, sampleRate:48000}} : {}), fastStart:'in-memory'});
     if (aCfg){
       const aenc = new AudioEncoder({output:(c,m)=>muxer.addAudioChunk(c,m), error:e=>console.warn(e)}); aenc.configure(aCfg);
-      const N = abuf.length, L0 = abuf.getChannelData(0), R0 = abuf.numberOfChannels > 1 ? abuf.getChannelData(1) : L0;
+      const o0 = Math.min(abuf.length, Math.round(fa*48000)), N = Math.max(0, Math.min(abuf.length, Math.round(fb*48000)) - o0), L0 = abuf.getChannelData(0).subarray(o0), R0 = (abuf.numberOfChannels > 1 ? abuf.getChannelData(1) : abuf.getChannelData(0)).subarray(o0);
       for (let o=0; o<N; o+=4800){ const n = Math.min(4800, N-o), data = new Float32Array(n*2); data.set(L0.subarray(o,o+n), 0); data.set(R0.subarray(o,o+n), n);
         const ad = new AudioData({format:'f32-planar', sampleRate:48000, numberOfFrames:n, numberOfChannels:2, timestamp:Math.round(o/48000*1e6), data}); aenc.encode(ad); ad.close(); }
       await aenc.flush(); aenc.close();
@@ -3313,7 +3316,7 @@ async function exportMP4(){
     for (let i=0;i<frames;i++){
       if (encErr) throw encErr;
       if (exporting.cancel) throw new Error('cancelled');
-      const f = filmAt(i/fps); if (!f) break; activateScene(f.tk.sceneId);
+      const f = filmAt(fa + i/fps); if (!f) break; activateScene(f.tk.sceneId);
       evalTake(f.tk, f.u, cam.position, cam.quaternion);
       finishShotCam(cam, vfov(fovAt(f.tk, f.u), W/H), W/H, f.tk.shiftX, f.tk.shiftY, f.tk.straight, f.tk.scale);
       applyShowPose(f.u); applyFace(1/fps, f.u); updateArms(); animateDoodles(i/fps);
@@ -3484,7 +3487,7 @@ function serialize(){
     world: state.world,
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
-    shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, seq:c.seq.slice(), mix:c.mix||{}}))), cut:shots.cut, clipSeq:shots.clipSeq||1},
+    shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, seq:c.seq.slice(), mix:c.mix||{}, fin:c.fin||0, fout:c.fout ?? null}))), xfade:shots.xfade ?? 0.3, cut:shots.cut, clipSeq:shots.clipSeq||1},
     scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, music:sc.music||null, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}]))}))), curScene, sceneSeq,
     show: {music:show.music, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null})),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx||'none', voicePitch:c.voicePitch||0, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
@@ -4047,7 +4050,7 @@ function icon(name,cx,cy,col){
 const KEYS_VR = {
   build:['Right trigger: tool   A: add↔carve   B: last tool','X: undo   Y: redo   Left trigger: menu','Right grip on a block or doodle: move it','Grip a tab in the menu: tear it off as a window'],
   characters:['A separate studio: sculpt characters here at','any size, then place them from PERFORM.','Right trigger: tool   A: add↔carve   B: last tool','Grip a tab in the menu: tear it off as a window'],
-  perform:['A: record (3-2-1) / cut   B: play the show','Holding one + trigger: it stays, re-grip your hand','Right trigger at the ground: jump there','Grip a character: move it (stick: size)','Stepped in: your head and hands move it'],
+  perform:['A: play the show   B: record (3-2-1) / cut','Holding one + trigger: it stays, re-grip your hand','Right trigger at the ground: jump there','Grip a character: move it (stick: size)','Stepped in: your head and hands move it'],
   shoot:['Hold right trigger: film a take (3-2-1)','A: play/stop take   B: next take','Right stick ↕: zoom (records while playing)','Right grip on a dot: move that key'],
   light:['A: add a light at your hand','Right grip on a bulb: move it','Pick colors and reach on the Lights page','X: undo   Y: redo   Left trigger: menu'],
   edit: ['A: play/stop the film','Tap the strip to jump, tap a clip to trim it','X: undo   Y: redo   Left trigger: menu','Grip: drag world   Left stick: fly'],
@@ -4057,7 +4060,7 @@ const KEYS_DESK = {
   characters:'The character studio — sculpt here, it doesn’t touch the world · Left-drag: tool · Right-drag: orbit<br>A / Space: add↔carve · B: last tool · X: undo · Y: redo · [ ]: size · Tab: menu',
   perform:'Left-drag a character: move it · - / =: its size · R: record (3-2-1) / cut · Space: play the show<br>Right-drag: orbit · X: undo · Y: redo · Tab: menu',
   shoot:'R: record your view (3-2-1) · A / Space: play take · B: next take · - / =: zoom (records while playing)<br>Right-drag: orbit · Middle-drag: pan · Wheel: zoom · X: undo · Y: redo · Tab: menu',
-  edit: 'A: record shot changes · B / Space: play / stop the film · X: undo · Y: redo · Tab: menu',
+  edit: 'A / Space: play / stop the film · B: record shot changes · X: undo · Y: redo · Tab: menu',
   light: 'Left-drag a bulb: move it · + Add a light on the Lights page · Right-drag: orbit · Tab: menu',
   app: 'Files and settings · Tab: menu',
 };
@@ -4815,9 +4818,9 @@ function drawPerform(X,W){
   sceneRow(X,W,116);
   const t3 = (W-16)/3;
   const punch = !show.rec && state.punchAt != null && state.punchAt > 0.05 && state.punchAt < showLength() - 0.05;
-  button(X,166,t3,46, show.rec ? '■ Cut (A)' : punch ? '● Redo from '+fmtTime(state.punchAt) : '● Record (A)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
+  button(X,166,t3,46, show.rec ? '■ Cut (B)' : punch ? '● Redo from '+fmtTime(state.punchAt) : '● Record (B)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); }, '#ff3b30');
   button(X+t3+8,166,t3,46, '🎤 Voice only', false, async ()=>{ if (show.rec) return; state.mic = true; const m = await ensureMic(); if (m){ startShowRec(); const sc0 = selChar(); if (show.rec && sc0 && partsOf(sc0).some(L=>L.part==='mouth')){ show.rec.voiceFor = sc0.id; toast(sc0.name+"'s mouth moves with your voice"); } else toast('Just your voice: the show plays while you talk'); } }, '#ff9500');
-  button(X+2*(t3+8),166,t3,46, show.playing ? '■ Stop (B)' : '▶ Play (B)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
+  button(X+2*(t3+8),166,t3,46, show.playing ? '■ Stop (A)' : '▶ Play (A)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); }, '#34c759');
   const len = Math.max(showLength(), 0.1);
   txt(punch ? 'Record redoes from the red mark on' : 'Show time · tap to pick a redo spot', X, 232, 14, '#cfd6ff','left',700); txt(fmtTime(show.t)+' / '+fmtTime(showLength()), X+W-48, 232, 14, '#ffd400','right',700);
   drawPerformTimeline(X, 246, W-48);
@@ -5082,9 +5085,9 @@ function legendLines(hand){
     build: sculpt, characters: sculpt,
     shoot:  camAdj ? [['T','film (hold)'],['A', play?'stop':'play take'],['B','next take'],['S','↕ screen size'],['G','holding: screen mode']]
           : [['T','film (hold)'],['A', play?'stop':'play take'],['B', keyGrab?'delete this key':'next take'],['S','↕ zoom (records)'],['G','key dot / world · + stick: screen']],
-    edit:   [['A', play && play.rec ? 'stop recording' : 'record shot changes'],['B', play ? 'stop' : 'play film'],['T','menu clicks'],['G','window / world']],
+    edit:   [['A', play ? 'stop' : 'play film'],['B', play && play.rec ? 'stop recording' : 'record shot changes'],['T','menu clicks'],['G','window / world']],
     light:  [['A','add a light here'],['G','grab a bulb / window / world'],['T','menu clicks']],
-    perform:[['A', show.rec?'cut':'record'],['B', show.playing?'stop':'play show'],['T', show.grab ? 'hold: re-grip your hand' : 'aim at ground: jump there'],['G', show.embodied?'grip a wall: climb · a prop: hold':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
+    perform:[['A', show.playing?'stop':'play show'],['B', show.rec?'cut':'record'],['T', show.grab ? 'hold: re-grip your hand' : 'aim at ground: jump there'],['G', show.embodied?'grip a wall: climb · a prop: hold':'grab character'],['S', show.grab?'size of what you hold':'size of a held window']],
   }[ph] || [['T','menu clicks'],['G','window / world']]);
 }
 function drawLegend(cv, lines){
@@ -5253,10 +5256,10 @@ addEventListener('keydown', e => {
     e.preventDefault();
     if (SCULPT_PHASES.includes(state.phase)) flipCarve();
     else if (state.phase==='shoot') play ? stopPlay() : startPlay('take');
-    else if (state.phase==='edit'){ if (play) stopPlay(); else { startPlay('film'); if (play && k==='a') play.rec = true; } }
+    else if (state.phase==='edit') play ? stopPlay() : startPlay('film');
     else if (state.phase==='perform') show.playing ? stopShow() : playShow();
   }
-  else if (k==='b'){ if (state.phase==='shoot') nextTake(); else if (state.phase==='edit'){ play ? stopPlay() : startPlay('film'); } else swapTool(); }
+  else if (k==='b'){ if (state.phase==='shoot') nextTake(); else if (state.phase==='edit'){ if (play) stopPlay(); else { startPlay('film'); if (play) play.rec = true; } } else if (state.phase==='perform'){ show.rec ? cutShowRec() : startShowRec(); } else swapTool(); }
   else if (k==='r' && state.phase==='shoot'){ rec ? stopRecording() : startRecording(); }
   else if (k==='r' && state.phase==='perform'){ show.rec ? cutShowRec() : startShowRec(); }
   else if ((k==='-' || k==='=') && state.phase==='shoot'){ lensNudge(k==='-' ? 3 : -3); }
@@ -5571,13 +5574,13 @@ function xrUpdate(dt){
   let rightGripUsed = false;
   if (R && pr){
     if (edge(R,pr,'a')){
-      if (sculpt){ if (doodleGrab && !doodleGrab.bend) editHeldDoodle(); else flipCarve(); } else if (shoot) (play ? stopPlay() : startPlay('take')); else if (edit){ if (play) stopPlay(); else { startPlay('film'); if (play) play.rec = true; } }
-      else if (perform) (show.rec ? cutShowRec() : startShowRec());
+      if (sculpt){ if (doodleGrab && !doodleGrab.bend) editHeldDoodle(); else flipCarve(); } else if (shoot) (play ? stopPlay() : startPlay('take')); else if (edit) (play ? stopPlay() : startPlay('film'));
+      else if (perform) (show.playing ? stopShow() : playShow());
       else if (lightPh){ const t = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(t); addLightAt(t); }
       pulse('right',0.3,20);
     }
     if (edge(R,pr,'b')){
-      if (shoot){ if (keyGrab) deleteHeldKey(); else nextTake(); } else if (sculpt){ if (blockGrab || doodleGrab) deleteHeld(); else if (stroke && stroke.kind==='angle') endStroke(true); else swapTool(); } else if (perform) (show.playing ? stopShow() : playShow()); else if (edit) (play ? stopPlay() : startPlay('film'));
+      if (shoot){ if (keyGrab) deleteHeldKey(); else nextTake(); } else if (sculpt){ if (blockGrab || doodleGrab) deleteHeld(); else if (stroke && stroke.kind==='angle') endStroke(true); else swapTool(); } else if (perform) (show.rec ? cutShowRec() : startShowRec()); else if (edit){ if (play) stopPlay(); else { startPlay('film'); if (play) play.rec = true; } }
       pulse('right',0.3,20);
     }
     if (screenGrab) moveScreenGrab(L, R, pl);
@@ -6236,12 +6239,13 @@ function filmClips(){
     const cuts = [R.a, ...c.sw.map(s=>s.t).filter(t=>t > R.a+1e-4 && t < R.b-1e-4), R.b].sort((x,y)=>x-y);
     let u0 = R.a, k0 = visibleK(c, R.a + 1e-4), i = 0;
     const push = (u1) => { if (u1 - u0 < 1e-4) return; const tk = takeById(c.takes[k0]) || R.T[0], seg = Object.create(tk);
-      seg.inT = u0; seg.outT = u1; seg.speed = R.sp; seg.autoEnd = false; seg._clip = c; seg._k = k0; seg._snd = c.soundFrom != null ? takeById(c.soundFrom) || null : null; seg._seg = c.id+':'+(i++); seg._start = start; out.push(seg); start += (u1-u0)/R.sp; };
+      seg.inT = u0; seg.outT = u1; seg.speed = R.sp; seg.autoEnd = false; seg._clip = c; seg._k = k0; seg._snd = c.soundFrom != null ? takeById(c.soundFrom) || null : null; seg._seg = c.id+':'+(i++); seg._start = start; seg._prev = out.length ? out[out.length-1] : null; out.push(seg); start += (u1-u0)/R.sp; };
     for (let j=1;j<cuts.length;j++){ const u = cuts[j]; if (j < cuts.length-1){ const k1 = visibleK(c, u + 1e-4); if (k1 === k0) continue; push(u); u0 = u; k0 = k1; } else push(u); }
   }
   return out;
 }
 function clipFilmStart(c){ let acc = 0; for (const x of shots.seq){ if (x===c) return acc; const R = clipRange(x); if (R) acc += (R.b-R.a)/R.sp; } return acc; }
+function filmRange(){ const L = filmLength(), a = clamp(ensureCuts().fin || 0, 0, L), b = ensureCuts().fout == null ? L : clamp(ensureCuts().fout, a, L); return [a, b > a + 0.05 ? b : L]; }
 function clipAt(t){ let acc = 0; for (const c of shots.seq){ const R = clipRange(c); if (!R) continue; const L = (R.b-R.a)/R.sp; if (t < acc+L) return {c, R, start:acc, u:R.a + (t-acc)*R.sp}; acc += L; }
   const last = [...shots.seq].reverse().find(c=>clipRange(c)); if (!last) return null; const R = clipRange(last); return {c:last, R, start:acc-(R.b-R.a)/R.sp, u:R.b}; }
 const clipById = id => shots.seq.find(c=>c.id===id);
@@ -6307,20 +6311,24 @@ function drawEditor(X, Y, W, big){
   g.save(); g.beginPath(); g.rect(TX, Y-4, TW, 2000); g.clip();
   for (let t = Math.floor(vs/stepS)*stepS; t <= vs+span+stepS; t += stepS){ const x = tx(t); g.fillStyle = '#4a5080'; g.fillRect(x, Y+rh-8, 2, 8); txt(stepS < 1 ? t.toFixed(1)+'s' : fmtTime(t), x+4, Y+rh/2-1, big ? 12 : 10, '#8f97c7','left',700); }
   g.restore(); hit(TX, Y, TW, rh, scrub, scrub);
+  { const [fa, fb] = filmRange(), xa = tx(fa), xb = tx(fb);   // the film starts and ends at the yellow brackets: drag them
+    g.save(); g.beginPath(); g.rect(TX, Y-4, TW, 2000); g.clip(); g.fillStyle = 'rgba(0,0,0,0.5)';
+    if (xa > TX) g.fillRect(TX, Y, xa-TX, rh); if (xb < TX+TW) g.fillRect(xb, Y, TX+TW-xb, rh);
+    for (const [x, d] of [[xa, 1], [xb, -1]]){ g.fillStyle = '#ffd400'; g.fillRect(x-(d>0?0:3), Y-3, 3, rh+6); g.fillRect(d>0 ? x : x-12, Y-3, 12, 4); g.fillRect(d>0 ? x : x-12, Y+rh-1, 12, 4); }
+    g.restore();
+    const setA = px => { ensureCuts().fin = +clamp(tOf(px), 0, filmRange()[1] - 0.5).toFixed(2); if (ensureCuts().fin < 0.05) ensureCuts().fin = 0; sceneDirty = true; requestUI(); };
+    const setB = px => { const v = clamp(tOf(px), filmRange()[0] + 0.5, total); ensureCuts().fout = v > total - 0.05 ? null : +v.toFixed(2); sceneDirty = true; requestUI(); };
+    hit(xa-12, Y-4, 24, rh+8, setA, setA); hit(xb-12, Y-4, 24, rh+8, setB, setB); }
   let y = Y + rh + 6;
   // video lanes
   const nl = clamp(Math.max(1, ...shots.seq.map(c=>c.takes.length)), 1, big ? 9 : 6), lh = big ? (nl > 6 ? 30 : 44) : (nl > 4 ? 22 : 30);
   const clips = filmClips();
-  const curF = clipAt(play && play.mode==='film' ? play.t : shots.playhead), LD = state.laneDrag;
-  for (let j=0;j<nl;j++){ const ty = y+j*lh, tkj = curF ? takeById(curF.c.takes[j]) : null, dragging = LD && LD.from===j;
-    rr(X, ty, lab-6, lh-4, 8, dragging ? '#ffd400' : j===0 ? '#3a4280' : '#2a3060');
-    txt((tkj ? tkj.name.replace('Take ', big ? 'Take ' : 'T') : (big ? 'Lane ' : 'V')+(j+1))+(j===0 && big ? ' ★' : '')+(tkj && curF && curF.c.soundFrom === tkj.id ? ' 🔊' : ''), X+8, ty+lh/2-2, big ? (lh < 40 ? 14 : 17) : 11, dragging ? '#111' : '#cfd6ff','left',800);
-    hit(X, ty, lab-6, lh-4, ()=>{ if (curF && j < curF.c.takes.length){ state.laneDrag = {from:j, to:j, y0:y, lh}; requestUI(); } },
-      (px, py)=>{ if (state.laneDrag){ state.laneDrag.to = clamp(Math.floor((py - y)/lh), 0, (curF ? curF.c.takes.length : 1)-1); requestUI(); } },
-      ()=>{ const d = state.laneDrag; state.laneDrag = null; if (d && curF && d.to !== d.from) moveLane(curF.c, d.from, d.to); else requestUI(); });
-    if (big && curF && j < curF.c.takes.length && lh >= 28){ const bx = X+lab-6-60; 
-      button(bx, ty+3, 26, lh-10, '▲', false, ()=>moveLane(curF.c, j, j-1), '#1e6bff'); button(bx+30, ty+3, 26, lh-10, '▼', false, ()=>moveLane(curF.c, j, j+1), '#1e6bff'); } }
-  if (LD && LD.to !== LD.from){ g.fillStyle = '#ffd400'; g.fillRect(X, y + LD.to*lh + (LD.to > LD.from ? lh-4 : -3), W, 4); }
+  const curF = clipAt(play && play.mode==='film' ? play.t : shots.playhead), cutHandles = [];
+  const onK = curF ? visibleK(curF.c, curF.u) : -1;
+  for (let j=0;j<nl;j++){ const ty = y+j*lh, tkj = curF ? takeById(curF.c.takes[j]) : null, on = j===onK;   // lanes stay in order; the lit one is on now
+    rr(X, ty, lab-6, lh-4, 8, on ? PALETTE[((tkj ? tkj.id : 1)-1)%8] : '#2a3060');
+    txt((on && big ? '● ' : '')+(tkj ? tkj.name.replace('Take ', big ? 'Take ' : 'T') : (big ? 'Lane ' : 'V')+(j+1))+(tkj && curF && curF.c.soundFrom === tkj.id ? ' 🔊' : ''), X+8, ty+lh/2-2, big ? (lh < 40 ? 14 : 17) : 11, on ? '#111' : '#cfd6ff','left',800);
+    hit(X, ty, lab-6, lh-4, ()=>{ if (curF && j < curF.c.takes.length && j !== onK){ const b = editSnap(); setSwitch(curF.c, curF.u, j); pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null; } requestUI(); }); }
   g.save(); g.beginPath(); g.rect(TX, y-2, TW, nl*lh+4); g.clip();
   rr(TX, y, TW, nl*lh-4, 8, '#0d1029');
   let acc = 0;
@@ -6340,21 +6348,38 @@ function drawEditor(X, Y, W, big){
       const hx0 = Math.max(x0, TX), hx1 = Math.min(x1, TX+TW);
       hit(hx0, yy, hx1-hx0, lh-4, (px)=>{ const t = tOf(px);
         if (play && play.mode==='film' && play.rec){ const f = clipAt(play.t); if (f && f.c===c){ const b = editSnap(); setSwitch(c, f.u, j); pushShotsUndo(b); sceneDirty = true; play.clipId = null; } }   // live: tap a lane while it plays to switch to it
+        else if (!play){ shots.playhead = t; const f = clipAt(t); if (f && f.c===c && visibleK(c, f.u) !== j){ const b = editSnap(); setSwitch(c, f.u, j); pushShotsUndo(b); sceneDirty = true; } }   // tap a lane: it's on from here
         else { shots.playhead = t; }
         shots.clipSel = c.id; shots.laneSel = j; requestUI(); }, scrub);
     }
     if (selC) rr(x0, y-1, Math.max(6, x1-x0), nl*lh-2, 8, null, '#ffd400');
     g.fillStyle = '#151935'; g.fillRect(x1-1, y, 2, nl*lh-4);
+    cutHandles.push({c, R, acc, L, x0, x1});
     acc += L;
   }
   g.restore();
+  // cut handles: drag a switch inside a clip, or the join between two clips, to slide it
+  { const hY = y, hH = nl*lh-4;
+    const filmToU = (h, t) => h.R.a + (t - h.acc)*h.R.sp;
+    for (const h of cutHandles){ const c = h.c, R2 = h.R;
+      c.sw.forEach((sw, si) => { if (sw.t <= R2.a + 1e-3) return; const x = tx(h.acc + (sw.t - R2.a)/R2.sp); if (x < TX || x > TX+TW) return;
+        g.fillStyle = '#ffd400'; g.fillRect(x-2, hY, 4, hH); rr(x-7, hY-6, 14, 12, 4, '#ffd400');
+        const lo = (si > 0 ? c.sw[si-1].t : R2.a) + 0.1, hi = (si < c.sw.length-1 ? c.sw[si+1].t : R2.b) - 0.1;
+        hit(x-10, hY-8, 20, hH+8, ()=>{ state._cutDrag = editSnap(); }, (px)=>{ sw.t = +clamp(filmToU(h, tOf(px)), lo, hi).toFixed(3); sceneDirty = true; if (play) play.clipId = null; requestUI(); }, ()=>{ if (state._cutDrag){ pushShotsUndo(state._cutDrag); state._cutDrag = null; } }); }); }
+    for (let q=0; q<cutHandles.length-1; q++){ const h = cutHandles[q], h2 = cutHandles[q+1], x = h.x1; if (x < TX || x > TX+TW) continue;
+      rr(x-6, hY+hH/2-14, 12, 28, 5, '#ffffff'); g.fillStyle = '#151935'; g.fillRect(x-1, hY+hH/2-8, 2, 16);
+      hit(x-10, hY, 20, hH, ()=>{ state._cutDrag = editSnap(); state._join = {b:h.R.b, a2:h2.R.a, t0:h.acc + h.L}; },
+        (px)=>{ const J = state._join; if (!J) return; const d = tOf(px) - J.t0;   // film seconds: one clip gets longer, the next shorter
+          const nb = clamp(J.b + d*h.R.sp, h.R.a + 0.2, 1e6), na = clamp(J.a2 + d*h2.R.sp, 0, h2.R.b - 0.2); h.c.cout = +nb.toFixed(3); h2.c.cin = +na.toFixed(3);
+          sceneDirty = true; if (play) play.clipId = null; requestUI(); },
+        ()=>{ if (state._cutDrag){ pushShotsUndo(state._cutDrag); state._cutDrag = null; } state._join = null; }); } }
   y += nl*lh + 4;
   // "Seen only": per clip, voices play only while their character is in the camera's picture
   { const sh = big ? 40 : 22, anyOff = shots.seq.some(c=>!c.camOnly);
     rr(X, y, lab-6, sh-4, 8, '#2a3060'); txt(big ? '🎥 Seen only' : '🎥', X+8, y+sh/2-2, big ? 15 : 11, '#ff2d95','left',800);
     hit(X, y, lab-6, sh-4, ()=>{ const b = editSnap(); for (const c of shots.seq) c.camOnly = anyOff; pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null; toast(anyOff ? 'Every clip: only hear who the camera sees' : 'Every clip: hear everyone'); requestUI(); });
     rr(TX, y, TW, sh-4, 6, '#0d1029');
-    const endX = big ? TX+TW-116 : TX+TW;
+    const endX = big ? TX+TW-226 : TX+TW;
     g.save(); g.beginPath(); g.rect(TX, y, endX-TX, sh); g.clip();
     let a2 = 0;
     for (const c of shots.seq){ const R2 = clipRange(c); if (!R2) continue; const L2 = (R2.b-R2.a)/R2.sp, x0 = tx(a2), x1 = tx(a2+L2); a2 += L2;
@@ -6364,6 +6389,9 @@ function drawEditor(X, Y, W, big){
       const hx0 = Math.max(x0, TX), hx1 = Math.min(x1, endX);
       if (hx1 > hx0) hit(hx0, y, hx1-hx0, sh-4, ()=>{ const b = editSnap(); c.camOnly = !c.camOnly; pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null; requestUI(); }); }
     g.restore();
+    if (big){ const bx2 = TX+TW-220, xv = shots.xfade ?? 0.3; rr(bx2, y+5, 100, sh-14, 6, '#2a3060'); rr(bx2, y+5, 100*Math.min(1, xv/2), sh-14, 6, '#ff9500');
+      txt('Cut blend '+xv.toFixed(1)+'s', bx2+50, y+sh/2-2, 10, '#fff','center',800);
+      const setX = px => { shots.xfade = +clamp((px-bx2)/100*2, 0, 2).toFixed(1); sceneDirty = true; if (play) play.clipId = null; requestUI(); }; hit(bx2, y, 100, sh-4, setX, setX); }
     if (big){ const vx = TX+TW-110, sv = shots.spatial ?? 1; rr(vx, y+5, 100, sh-14, 6, '#2a3060'); rr(vx, y+5, 100*Math.min(1, sv/2), sh-14, 6, '#00c7be');
       txt('Cam hears '+Math.round(sv*100)+'%', vx+50, y+sh/2-2, 10, '#fff','center',800);
       const setS = px => { shots.spatial = +clamp((px-vx)/100*2, 0, 2).toFixed(2); sceneDirty = true; if (play) play.clipId = null; requestUI(); }; hit(vx, y, 100, sh-4, setS, setS); }
@@ -6402,8 +6430,8 @@ function drawEditor(X, Y, W, big){
 function editorButtons(X, y, W, big){
   const c = clipById(shots.clipSel), j = shots.laneSel ?? 0, tk = c ? takeById(c.takes[j]) : null;
   const items = [
-    [play?.mode==='film' && !play.rec ? '■ Stop' : '▶ Play (B)', ()=>{ play ? stopPlay() : startPlay('film'); }, '#34c759', play?.mode==='film' && !play.rec],
-    [play?.rec ? '■ Stop rec' : '● Record (A)', ()=>{ if (play) stopPlay(); else { startPlay('film'); if (play) play.rec = true; } requestUI(); }, '#ff3b30', !!play?.rec],
+    [play?.mode==='film' && !play.rec ? '■ Stop' : '▶ Play (A)', ()=>{ play ? stopPlay() : startPlay('film'); }, '#34c759', play?.mode==='film' && !play.rec],
+    [play?.rec ? '■ Stop rec' : '● Record (B)', ()=>{ if (play) stopPlay(); else { startPlay('film'); if (play) play.rec = true; } requestUI(); }, '#ff3b30', !!play?.rec],
     ['✂ Cut here', cutHere, '#ff9500'],
     [tk ? 'Show '+tk.name.replace('Take ','T')+' from here' : 'Show from here', ()=>{ if (c && tk) showLane(c, j); else toast('Tap a take lane first'); }, '#ff2d95'],
     ['Whole clip', ()=>{ if (c && tk) showLane(c, j, true); else toast('Tap a take lane first'); }, '#5e2bff'],
@@ -6440,7 +6468,7 @@ function drawTimeline(X,W){
   txt('Edit', X, 100, 26); txt(fmtTime(shots.playhead)+' / '+fmtTime(filmLength()), X+W, 100, 16, '#ffd400','right');
   if (!filmClips().length){ para(['Film takes in SHOOT first.','Takes of the same scene stack up','so you can cut between them.'], X, 136, 15); return; }
   const hw = (W-8)/2, pl = play && play.mode==='film';
-  button(X,122,W,56, pl ? '■ Stop (B)' : '▶ Play the film (B)', pl, ()=>{ pl ? stopPlay() : startPlay('film'); requestUI(); }, '#34c759');
+  button(X,122,W,56, pl ? '■ Stop (A)' : '▶ Play the film (A)', pl, ()=>{ pl ? stopPlay() : startPlay('film'); requestUI(); }, '#34c759');
   button(X,186,hw,46,'✂ Cut here',false,cutHere,'#ff9500');
   toggle(X+hw+8,186,hw,46,'▦ Grid', !!state.multi, ()=>setGrid(!state.multi), '#00c7be');
   toggle(X,240,hw,40,'Dark room', shots.blackRoom, ()=>{ shots.blackRoom = !shots.blackRoom; sceneDirty = true; requestUI(); }, '#5e2bff');
@@ -7182,7 +7210,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
