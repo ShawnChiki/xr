@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script src="../turn-config.js"></script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>ChikiMovieMagic</title>
@@ -59,7 +60,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '419';
+const VERSION = '420';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -133,14 +134,9 @@ function BCPeer(id){ Em.call(this); this.id = id || 'g'+Math.random().toString(3
 BCPeer.prototype = Object.create(Em.prototype);
 BCPeer.prototype.connect = function(id){ const c = new BCConn(this, id); this.conns[id] = c; this.bc.postMessage({to:id, from:this.id, k:'conn'}); setTimeout(() => { if (!c.open) this.emit('error', {type:'peer-unavailable'}); }, 1500); return c; };
 BCPeer.prototype.destroy = function(){ try { this.bc.close(); } catch(e){} };
-async function makeIce(){
-  const stun = [{urls:'stun:stun.l.google.com:19302'}, {urls:'stun:stun1.l.google.com:19302'}];
-  try { const user = Math.floor(Date.now()/1000 + 24*3600)+':cmm';
-    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('openrelayprojectsecret'), {name:'HMAC', hash:'SHA-1'}, false, ['sign']);
-    const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(user))), H = 'staticauth.openrelay.metered.ca';
-    return stun.concat([{urls:['turn:'+H+':80', 'turn:'+H+':80?transport=tcp', 'turn:'+H+':443', 'turns:'+H+':443?transport=tcp'], username:user, credential:btoa(String.fromCharCode(...sig))}]);
-  } catch(e){ return stun; } }
-async function loadPeer(){ if (NET.test) return; if (!NET.ice) NET.ice = await makeIce(); if (window.Peer) return;
+// the relay (TURN) servers come from the repo's shared turn-config.js, loaded in <head>
+function makeIce(){ return [{urls:'stun:stun.l.google.com:19302'}].concat(window.CHIKI_TURN || []); }
+async function loadPeer(){ if (NET.test) return; if (!NET.ice) NET.ice = makeIce(); if (window.Peer) return;
   await new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'; sc.onload = res; sc.onerror = () => rej(new Error('load')); document.head.append(sc); }); }
 function makePeer(id){ if (NET.test) return new BCPeer(id); const o = {debug:1, config:{iceServers:NET.ice}}; return id ? new window.Peer(id, o) : new window.Peer(o); }
 function netErrText(e){ return e.type==='peer-unavailable' ? 'No room with that code. Check it and try again.' : (e.type==='network' || e.type==='server-error' || e.type==='socket-error') ? "Can't reach the internet matchmaker. Try again." : 'Something went wrong ('+e.type+'). Try again.'; }
@@ -4817,6 +4813,30 @@ function drawWave(clip, x, y, w, h){
   const pk = clip._peaks, mx = Math.max(0.05, ...pk), bw = w/pk.length;
   g.fillStyle = '#ffd400'; pk.forEach((v,i)=>{ const bh = Math.max(2, v/mx*h); g.fillRect(x+i*bw, y+h/2-bh/2, Math.max(1,bw-1), bh); });
 }
+// ---- line voices back up with their puppets: slide a voice so its loudness matches the mouth that was recorded with it
+function shiftVoice(c, d){ c.at = Math.max(0, +((c.at||0) + d).toFixed(3)); if (c.mute) c.mute = c.mute.map(([a,b]) => [+(a+d).toFixed(3), +(b+d).toFixed(3)]); c._peaks = null; }
+async function autoAlignVoice(c){
+  if (c.cid == null) return null; const tr = show.tracks['m'+c.cid]; if (!tr || !tr.samples || tr.samples.length < 27) return null;
+  let buf = null; try { buf = await decodeClip(c); } catch(e){} if (!buf) return null;
+  const R0 = 50, d = buf.getChannelData(0), hop = Math.round(buf.sampleRate/R0), n = Math.floor(d.length/hop), env = new Float32Array(n);
+  for (let i=0;i<n;i++){ let s2 = 0; for (let j=i*hop, e=j+hop; j<e; j++) s2 += d[j]*d[j]; env[i] = Math.sqrt(s2/hop); }
+  const S = tr.samples, mouthAt = t => { let i = 0; while (i+9 < S.length && S[i+9] < t) i += 9; if (i+9 >= S.length || t <= S[0]) return S[t <= S[0] ? 1 : S.length-8];
+    const t0 = S[i], t1 = S[i+9], u = (t - t0)/Math.max(1e-6, t1 - t0); return S[i+1] + (S[i+10] - S[i+1])*u; };
+  const mean = a => a.reduce((x,y)=>x+y,0)/a.length, at = c.at || 0;
+  const em = mean(env); let best = 0, bestScore = -1;
+  for (let lag = -2; lag <= 2.0001; lag += 0.02){
+    const m = new Float32Array(n); for (let i=0;i<n;i++) m[i] = mouthAt(at + lag + i/R0);
+    const mm = mean(m); let num = 0, da = 0, db = 0;
+    for (let i=0;i<n;i++){ const a2 = env[i]-em, b2 = m[i]-mm; num += a2*b2; da += a2*a2; db += b2*b2; }
+    const sc = num/Math.sqrt(Math.max(1e-12, da*db)); if (sc > bestScore){ bestScore = sc; best = lag; } }
+  return bestScore > 0.15 ? {shift:+best.toFixed(2), score:bestScore} : null;
+}
+async function lineUpVoices(list){
+  const b = snapShow(); let moved = 0, tried = 0;
+  for (const c of list){ const r2 = await autoAlignVoice(c); if (r2 === null){ continue; } tried++; if (Math.abs(r2.shift) >= 0.02){ shiftVoice(c, r2.shift); moved++; } }
+  pushUndo({type:'show', snap:b}); sceneDirty = true; audioStop(); hearVoice = null;
+  toast(!tried ? 'No mouth motion to match these voices to' : moved ? 'Lined up '+moved+' voice'+(moved>1?'s':'')+' with their mouths' : 'Already lined up'); requestUI();
+}
 let hearVoice = null;   // listening to one voice from the strip
 function tickHear(){ if (!hearVoice) return; const t = hearVoice.from + (performance.now()-hearVoice.t0)/1000; if (t >= hearVoice.end){ hearVoice = null; } requestUI(); }
 function drawTracks(X,W){ drawShowRows(X,W,false); }
@@ -4888,7 +4908,11 @@ function drawShowRows(X,W,aud){
     const pick = (x)=>{ show.t = +(a0 + clamp((x-X-4)/(W-8), 0, 1)*d0).toFixed(3); if (hearVoice){ audioStop(); hearVoice = null; } stopShow(); applyShowPose(show.t); requestUI(); };
     hit(X, sy-4, W, 52, pick, pick);
     txt(fmtTime(ph-a0)+' / '+fmtTime(d0), X+W, sy+56, 12, '#ffd400','right',700);
-    const y0 = sy + 56;
+    // line it up: nudge earlier/later, or match it to the mouth
+    { const ny = sy + 62, bw2 = (W - 4*6)/5, nudge = d => { const b = snapShow(); shiftVoice(vs, d); pushUndo({type:'show', snap:b}); sceneDirty = true;
+        if (hearVoice && hearVoice.clip===vs){ audioStop(); const from = clamp(show.t, vs.at, vs.at+d0-0.05); audioPlayFrom(from, 1, vs); hearVoice = {clip:vs, from, t0:performance.now(), end:vs.at+d0}; } requestUI(); };
+      [['◀◀ .1',-0.1],['◀ .02',-0.02],['🎯 Auto',0],['.02 ▶',0.02],['.1 ▶▶',0.1]].forEach(([l,d],i)=>button(X+i*(bw2+6), ny, bw2, 36, l, false, ()=> d ? nudge(d) : lineUpVoices([vs]), d ? '#1e6bff' : '#ff2d95')); }
+    const y0 = sy + 104;
     txt('Editing '+(vs.name||'Voice '+vs.id), X, y0+8, 14, '#ffd400','left',700);
     slider(X,y0+28,(W-10)/2,'Volume', vs.vol ?? 1, 0, 3, v=>{ vs.vol = +v.toFixed(2); sceneDirty=true; }, '#ff9500', Math.round((vs.vol??1)*100)+'%');
     slider(X+(W+10)/2,y0+28,(W-10)/2,'Starts at', vs.at || 0, 0, Math.max(5, showLength()), v=>{ vs.at = +v.toFixed(2); sceneDirty=true; }, '#ff2d95', fmtTime(vs.at||0)+'.'+String(Math.floor(((vs.at||0)%1)*10)));
@@ -4902,6 +4926,7 @@ function drawShowRows(X,W,aud){
     return;
   }
   const a = state.confirm==='clearshow';
+  if (aud && rows.length) button(X,UIH-170,W,44,'🎯 Line up all voices with their mouths',false,()=>lineUpVoices(show.audio.slice()),'#ff2d95');
   if (rows.length) button(X,UIH-118,W,44,a?'Tap to confirm':(aud ? 'Clear all voices' : 'Clear all motion'),a,()=>{ if(!a){state.confirm='clearshow';requestUI();return;} state.confirm=null; const b=snapShow(); if (aud){ show.audio=[]; audioStop(); } else show.tracks={}; pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); },'#ff3b30');
 }
 function drawDial(){
@@ -7039,7 +7064,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, updateShow, inFrame, evalTake, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, updateShow, inFrame, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
