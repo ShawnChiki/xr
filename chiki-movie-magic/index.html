@@ -60,7 +60,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '428';
+const VERSION = '430';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -4848,8 +4848,10 @@ function drawWave(clip, x, y, w, h){
 }
 // ---- line voices back up with their puppets: slide a voice so its loudness matches the mouth that was recorded with it
 function shiftVoice(c, d){ c.at = Math.max(0, +((c.at||0) + d).toFixed(3)); if (c.mute) c.mute = c.mute.map(([a,b]) => [+(a+d).toFixed(3), +(b+d).toFixed(3)]); c._peaks = null; }
-async function autoAlignVoice(c){
-  if (c.cid == null) return null; const tr = show.tracks['m'+c.cid]; if (!tr || !tr.samples || tr.samples.length < 27) return null;
+async function autoAlignVoice(c){ return c.cid == null ? null : matchMouth(c, show.tracks['m'+c.cid], -2, 2); }
+// how well does this voice's loudness follow a mouth track? best slide within [lo, hi] seconds and its score (-1..1)
+async function matchMouth(c, tr, lo, hi){
+  if (!tr || !tr.samples || tr.samples.length < 27) return null;
   let buf = null; try { buf = await decodeClip(c); } catch(e){} if (!buf) return null;
   const R0 = 50, d = buf.getChannelData(0), hop = Math.round(buf.sampleRate/R0), n = Math.floor(d.length/hop), env = new Float32Array(n);
   for (let i=0;i<n;i++){ let s2 = 0; for (let j=i*hop, e=j+hop; j<e; j++) s2 += d[j]*d[j]; env[i] = Math.sqrt(s2/hop); }
@@ -4857,7 +4859,7 @@ async function autoAlignVoice(c){
     const t0 = S[i], t1 = S[i+9], u = (t - t0)/Math.max(1e-6, t1 - t0); return S[i+1] + (S[i+10] - S[i+1])*u; };
   const mean = a => a.reduce((x,y)=>x+y,0)/a.length, at = c.at || 0;
   const em = mean(env); let best = 0, bestScore = -1;
-  for (let lag = -2; lag <= 2.0001; lag += 0.02){
+  for (let lag = lo; lag <= hi + 0.0001; lag += 0.02){
     const m = new Float32Array(n); for (let i=0;i<n;i++) m[i] = mouthAt(at + lag + i/R0);
     const mm = mean(m); let num = 0, da = 0, db = 0;
     for (let i=0;i<n;i++){ const a2 = env[i]-em, b2 = m[i]-mm; num += a2*b2; da += a2*a2; db += b2*b2; }
@@ -4869,6 +4871,32 @@ async function lineUpVoices(list){
   for (const c of list){ const r2 = await autoAlignVoice(c); if (r2 === null){ continue; } tried++; if (Math.abs(r2.shift) >= 0.02){ shiftVoice(c, r2.shift); moved++; } }
   pushUndo({type:'show', snap:b}); sceneDirty = true; audioStop(); hearVoice = null;
   toast(!tried ? 'No mouth motion to match these voices to' : moved ? 'Lined up '+moved+' voice'+(moved>1?'s':'')+' with their mouths' : 'Already lined up'); requestUI();
+}
+// old worlds kept every voice as "other sounds": give each one to the character who said it (by name, else by whose mouth moved with it)
+async function sortVoices(){
+  const pups = show.chars.filter(c => c.type==='puppet'); if (!pups.length){ toast('No characters to give voices to'); return; }
+  toast('Matching voices to mouths…'); const b = snapShow(); let n = 0, left = 0;
+  for (const sc of scenes){ const cur = sc.id===curScene, list = (cur ? show.audio : sc.audio) || [], tracks = (cur ? show.tracks : sc.tracks) || {};
+    for (const a of list){ if (a.cid != null && charById(a.cid)) continue;
+      const nm = (a.name||'').toLowerCase(), byName = pups.filter(c => c.name && nm.includes(c.name.toLowerCase()));
+      let cid = byName.length===1 ? byName[0].id : null;
+      if (cid == null){ let best = null, second = -1;
+        for (const c of pups){ const r = await matchMouth(a, tracks['m'+c.id], -0.6, 0.6); if (!r) continue;
+          if (!best || r.score > best.score){ if (best) second = best.score; best = {cid:c.id, score:r.score}; } else if (r.score > second) second = r.score; }
+        if (best && best.score > 0.25 && best.score - second > 0.05) cid = best.cid; }
+      if (cid != null){ a.cid = cid; a._peaks = null; if (!a.name || /^voice/i.test(a.name)) a.name = charById(cid).name+"'s voice"; n++; } else left++; } }
+  pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; audioStop();
+  toast(n ? 'Gave '+n+' voice'+(n>1?'s':'')+' to their characters'+(left ? ' · '+left+' left to pick by hand' : '') : 'Couldn\'t tell who said them: pick "Who" on each voice'); requestUI();
+}
+// pick by hand who says a voice
+function whoRow(X, y, W, a){
+  const pups = show.chars.filter(c => c.type==='puppet'), opts = [null, ...pups.map(c => c.id)], i = Math.max(0, opts.indexOf(a.cid ?? null)), c = a.cid != null ? charById(a.cid) : null;
+  const set = d => { const b = snapShow(); a.cid = opts[(i + d + opts.length) % opts.length]; if (a.cid == null) delete a.cid; pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; requestUI(); };
+  txt('Who says it', X, y+18, 14, '#cfd6ff','left',700);
+  button(X+96, y, 40, 36, '◀', false, ()=>set(-1), '#1e6bff');
+  rr(X+142, y, W-188, 36, 10, c ? PALETTE[show.chars.indexOf(c)%8] : '#2a3060'); txt(c ? c.name : 'Nobody (other sounds)', X+142+(W-188)/2, y+18, 14, c ? '#111' : '#cfd6ff','center',800);
+  button(X+W-40, y, 40, 36, '▶', false, ()=>set(1), '#1e6bff');
+  return y + 44;
 }
 let hearVoice = null;   // listening to one voice from the strip
 function tickHear(){ if (!hearVoice) return; const t = hearVoice.from + (performance.now()-hearVoice.t0)/1000; if (t >= hearVoice.end){ hearVoice = null; } requestUI(); }
@@ -4945,7 +4973,7 @@ function drawShowRows(X,W,aud){
     { const ny = sy + 62, bw2 = (W - 4*6)/5, nudge = d => { const b = snapShow(); shiftVoice(vs, d); pushUndo({type:'show', snap:b}); sceneDirty = true;
         if (hearVoice && hearVoice.clip===vs){ audioStop(); const from = clamp(show.t, vs.at, vs.at+d0-0.05); audioPlayFrom(from, 1, vs); hearVoice = {clip:vs, from, t0:performance.now(), end:vs.at+d0}; } requestUI(); };
       [['◀◀ .1',-0.1],['◀ .02',-0.02],['🎯 Auto',0],['.02 ▶',0.02],['.1 ▶▶',0.1]].forEach(([l,d],i)=>button(X+i*(bw2+6), ny, bw2, 36, l, false, ()=> d ? nudge(d) : lineUpVoices([vs]), d ? '#1e6bff' : '#ff2d95')); }
-    const y0 = sy + 104;
+    const y0 = whoRow(X, sy + 104, W, vs);
     txt('Editing '+(vs.name||'Voice '+vs.id), X, y0+8, 14, '#ffd400','left',700);
     slider(X,y0+28,(W-10)/2,'Volume', vs.vol ?? 1, 0, 3, v=>{ vs.vol = +v.toFixed(2); sceneDirty=true; }, '#ff9500', Math.round((vs.vol??1)*100)+'%');
     slider(X+(W+10)/2,y0+28,(W-10)/2,'Starts at', vs.at || 0, 0, Math.max(5, showLength()), v=>{ vs.at = +v.toFixed(2); sceneDirty=true; }, '#ff2d95', fmtTime(vs.at||0)+'.'+String(Math.floor(((vs.at||0)%1)*10)));
@@ -4960,6 +4988,7 @@ function drawShowRows(X,W,aud){
   }
   const a = state.confirm==='clearshow';
   if (aud && rows.length) button(X,UIH-170,W,44,'🎯 Line up all voices with their mouths',false,()=>lineUpVoices(show.audio.slice()),'#ff2d95');
+  if (aud && show.audio.some(a => a.cid == null || !charById(a.cid))) button(X,UIH-222,W,44,'🎭 Give voices to their characters',false,sortVoices,'#5e2bff');
   if (rows.length) button(X,UIH-118,W,44,a?'Tap to confirm':(aud ? 'Clear all voices' : 'Clear all motion'),a,()=>{ if(!a){state.confirm='clearshow';requestUI();return;} state.confirm=null; const b=snapShow(); if (aud){ show.audio=[]; audioStop(); } else show.tracks={}; pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); },'#ff3b30');
 }
 function drawDial(){
@@ -6469,8 +6498,11 @@ function drawAudEdit(X, W){
   if (ea.key==='music'){ const keep = show.music; show.music = a; drawMusicRow(X, 130, W); show.music = keep; }
   else {
     txt(ea.name+(a.name ? ' · '+a.name : ''), X, 132, 16, '#ffd400','left',800);
-    slider(X, 160, W, 'Volume', a.vol ?? 1, 0, 2, v=>{ a.vol = +v.toFixed(2); sceneDirty = true; }, '#34c759', Math.round((a.vol??1)*100)+'%');
-    const yb = drawFxRack(X, 218, W, fxOf(a), ()=>a.pitch||0, v=>{ a.pitch = v; }, ()=>{ sceneDirty = true; });
+    const wy = whoRow(X, 146, W, a);
+    if (ea.key==='vx') button(X, wy, W, 38, '🎭 Give all "other sounds" to their characters', false, sortVoices, '#5e2bff');
+    const oy = wy + (ea.key==='vx' ? 44 : 0);
+    slider(X, oy, W, 'Volume', a.vol ?? 1, 0, 2, v=>{ a.vol = +v.toFixed(2); sceneDirty = true; }, '#34c759', Math.round((a.vol??1)*100)+'%');
+    const yb = drawFxRack(X, oy+58, W, fxOf(a), ()=>a.pitch||0, v=>{ a.pitch = v; }, ()=>{ sceneDirty = true; });
     const hw = (W-8)/2;
     button(X, yb+6, hw, 40, '▶ Hear it', false, ()=>{ activateScene(ea.sid); audioPlayFrom(a.at||0, 1, a); }, '#34c759');
     if (a.cid != null) button(X+hw+8, yb+6, hw, 40, 'Same for all its lines', false, ()=>{ let n = 0; const f = JSON.stringify(fxOf(a));
@@ -7130,7 +7162,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
