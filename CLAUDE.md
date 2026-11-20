@@ -23,6 +23,11 @@ The launcher (`index.html`) is how he sees what's new from the headset, so every
    `<script src="../updated.js"></script>` for an app in its own folder, `<script src="updated.js"></script>` for a top-level `.html`.
 4. **Times are Toronto time (ET).** `updated.js` handles this (`America/Toronto`); keep it that way.
 5. Dates and "what's new" come from git history automatically. Never hand-write dates in the launcher.
+6. **Multiplayer (PeerJS) apps load `turn-config.js` in `<head>`**, before any connection is made:
+   `<script src="../turn-config.js"></script>` (own folder) or `<script src="turn-config.js"></script>` (top-level `.html`).
+   It adds Sean's ExpressTURN relay to every WebRTC connection so players on different wifi or cellular data can connect,
+   and drops the dead Open Relay servers. Don't hand-roll TURN logins inside apps; edit `turn-config.js` instead
+   (the `games` repo has a matching copy, keep both the same).
 
 ## Launcher look
 
