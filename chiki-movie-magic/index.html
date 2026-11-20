@@ -29,7 +29,6 @@
   "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
 } }
 </script>
-<script src="../turn-config.js"></script>
 </head>
 <body>
 <div id="top"><b>Chiki<span>Movie</span>Magic</b><div class="sp"></div><button id="ghbtn">☁ GitHub</button><button id="savemp4" style="display:none">Save MP4</button><button id="vrbtn" disabled>Checking VR…</button></div>
@@ -60,7 +59,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '416';
+const VERSION = '419';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2245,11 +2244,26 @@ function spatialAt(c, tk, u){
   const view = 0.4 + 0.6*clamp((cs - c0)/Math.max(1e-3, c1 - c0), 0, 1), near = clamp(1.8*s/d, 0.12, 1.8);
   return {g: clamp(Math.pow(near*view, amt), 0.04, 3), pan: clamp(rgt.dot(dir), -1, 1)*0.7*Math.min(1, amt)};
 }
-// gain and pan follow the camera over the clip; timeOf(u) says when show time u plays
-function spatialNode(ctx, node, c, tk, u0, u1, timeOf){
-  if (c.cid == null || (shots.spatial ?? 1) <= 0.001 || !tk) return node;
+// is this voice's character inside the camera's picture at show time u? (walls don't count)
+function inFrame(c, tk, u){
+  const ch = charById(c.cid); if (!ch || !tk) return true;
+  const sc = sceneById(tk.sceneId ?? 1), tracks = (tk.sceneId === curScene ? show.tracks : (sc && sc.tracks)) || {};
+  const P = V(), Q = new THREE.Quaternion(), tr = tracks['r'+c.cid]; let s2 = ch.place.s || 1;
+  if (tr && tr.samples && tr.samples.length) s2 = trackAt(tr, u, P, Q); else P.fromArray(ch.place.p);
+  P.y += 1.3*s2;
+  const cp = V(), cq = new THREE.Quaternion(); evalTake(tk, u, cp, cq);
+  const d = P.sub(cp).applyQuaternion(cq.invert());   // in the camera's own frame: -z is forward
+  if (d.z >= -0.01) return false;
+  const tv = Math.tan(fovAt(tk, u)*Math.PI/360)*1.08, asp = ASPECTS[shots.aspect] || 16/9, z = -d.z;
+  return Math.abs(d.y/z) <= tv && Math.abs(d.x/z) <= tv*asp;
+}
+// gain and pan follow the camera over the clip; timeOf(u) says when show time u plays. vis: the clip on screen, for "seen only"
+function spatialNode(ctx, node, c, tk, u0, u1, timeOf, vis){
+  const seen = !!(vis && vis._clip && vis._clip.camOnly && c.cid != null), sp = (shots.spatial ?? 1) > 0.001;
+  if (c.cid == null || (!sp && !seen) || !tk) return node;
   const gn = ctx.createGain(), pn = ctx.createStereoPanner(); let first = true;
-  for (let u = u0; u <= u1 + 0.1; u += 0.1){ const uu = Math.min(u, u1), z = spatialAt(c, tk, uu); if (!z) continue; const tt = Math.max(0, timeOf(uu));
+  for (let u = u0; u <= u1 + 0.1; u += 0.1){ const uu = Math.min(u, u1), z0 = sp ? spatialAt(c, tk, uu) : {g:1, pan:0}; if (!z0) continue; const tt = Math.max(0, timeOf(uu));
+    const z = seen && !inFrame(c, vis, uu) ? {g:0.0001, pan:z0.pan} : z0;
     if (first){ gn.gain.setValueAtTime(z.g, tt); pn.pan.setValueAtTime(z.pan, tt); first = false; } else { gn.gain.linearRampToValueAtTime(z.g, tt); pn.pan.linearRampToValueAtTime(z.pan, tt); } }
   node.connect(gn); gn.connect(pn); return pn;
 }
@@ -2261,7 +2275,7 @@ async function audioPlayFrom(t, rate=1, only, tk){
     const at = c.at || 0;
     if (!buf || token!==audioToken || t >= at + buf.duration) continue;
     const a = ac(), src = a.createBufferSource(); src.buffer = buf; src.playbackRate.value = rate;
-    const t0 = a.currentTime; spatialNode(a, buildFx(a, c, src), c, (tk && tk._snd) || tk, Math.max(t, at), at + buf.duration, u => t0 + (u - t)/rate).connect(tk && tk._seg ? laneNode(a, c) : a.destination);
+    const t0 = a.currentTime; spatialNode(a, buildFx(a, c, src), c, (tk && tk._snd) || tk, Math.max(t, at), at + buf.duration, u => t0 + (u - t)/rate, tk).connect(tk && tk._seg ? laneNode(a, c) : a.destination);
     if (t >= at) src.start(0, t - at); else src.start(a.currentTime + (at - t)/rate, 0);
     audioSrcs.push(src);
   }
@@ -2277,7 +2291,7 @@ async function renderFilmAudio(total){
       const at = c.at || 0, s0 = Math.max(tk.inT, at), s1 = Math.min(tk.outT, at + buf.duration);
       if (s1 <= s0) continue;
       const src = oac.createBufferSource(); src.buffer = buf; src.playbackRate.value = rate;
-      const acc0 = acc; spatialNode(oac, buildFx(oac, c, src), c, tk._snd || tk, s0, s1, u => acc0 + (u - tk.inT)/rate).connect(laneNode(oac, c));
+      const acc0 = acc; spatialNode(oac, buildFx(oac, c, src), c, tk._snd || tk, s0, s1, u => acc0 + (u - tk.inT)/rate, tk).connect(laneNode(oac, c));
       src.start(acc + (s0 - tk.inT)/rate, s0 - at, s1 - s0); any = true;
     }
     const mu = tk.sceneId===curScene ? show.music : (sc && sc.music);
@@ -4642,8 +4656,6 @@ function drawExport(X,W){
     button(X,474,W,44,'Cancel export',false,()=>{ exporting.cancel = true; },'#ff3b30');
   } else button(X,410,W,56,state.confirm==='exportvr' ? 'Tap again to start' : 'Export MP4',state.confirm==='exportvr',exportMP4,'#ff3b30');
   if (!exporting) para(['Renders every frame with your voices.','Desktop Chrome is fastest; in the headset','it works too, just slower. You can cancel.'], X, 492, 13);
-  slider(X,560,W,'Camera hears the characters', shots.spatial ?? 1, 0, 2, v=>{ shots.spatial = +v.toFixed(2); sceneDirty = true; }, '#00c7be', Math.round((shots.spatial ?? 1)*100)+'%');
-  para(['0%: every voice the same. 100%: louder when the','camera is close and looking. 200%: even more.'], X, 616, 12, '#8f97c7');
   if (lastMP4 && GHS.ok && !exporting) button(X+W-150,UIH-36,150,30,'MP4 → GitHub',false,()=>ghPushMP4(),'#34c759');
 }
 function clearPart(L){
@@ -6224,6 +6236,25 @@ function drawEditor(X, Y, W, big){
   }
   g.restore();
   y += nl*lh + 4;
+  // "Seen only": per clip, voices play only while their character is in the camera's picture
+  { const sh = big ? 40 : 22, anyOff = shots.seq.some(c=>!c.camOnly);
+    rr(X, y, lab-6, sh-4, 8, '#2a3060'); txt(big ? '🎥 Seen only' : '🎥', X+8, y+sh/2-2, big ? 15 : 11, '#ff2d95','left',800);
+    hit(X, y, lab-6, sh-4, ()=>{ const b = editSnap(); for (const c of shots.seq) c.camOnly = anyOff; pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null; toast(anyOff ? 'Every clip: only hear who the camera sees' : 'Every clip: hear everyone'); requestUI(); });
+    rr(TX, y, TW, sh-4, 6, '#0d1029');
+    const endX = big ? TX+TW-116 : TX+TW;
+    g.save(); g.beginPath(); g.rect(TX, y, endX-TX, sh); g.clip();
+    let a2 = 0;
+    for (const c of shots.seq){ const R2 = clipRange(c); if (!R2) continue; const L2 = (R2.b-R2.a)/R2.sp, x0 = tx(a2), x1 = tx(a2+L2); a2 += L2;
+      if (x1 < TX || x0 > endX) continue; const on = !!c.camOnly;
+      rr(x0+2, y+3, Math.max(4, x1-x0-4), sh-10, 6, on ? '#ff2d95' : '#2a3060');
+      if (x1-x0 > 70 && big) txt(on ? 'seen only' : 'everyone', clamp(x0+10, TX+4, endX-80), y+sh/2-2, 12, on ? '#111' : '#8f97c7','left',800);
+      const hx0 = Math.max(x0, TX), hx1 = Math.min(x1, endX);
+      if (hx1 > hx0) hit(hx0, y, hx1-hx0, sh-4, ()=>{ const b = editSnap(); c.camOnly = !c.camOnly; pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null; requestUI(); }); }
+    g.restore();
+    if (big){ const vx = TX+TW-110, sv = shots.spatial ?? 1; rr(vx, y+5, 100, sh-14, 6, '#2a3060'); rr(vx, y+5, 100*Math.min(1, sv/2), sh-14, 6, '#00c7be');
+      txt('Cam hears '+Math.round(sv*100)+'%', vx+50, y+sh/2-2, 10, '#fff','center',800);
+      const setS = px => { shots.spatial = +clamp((px-vx)/100*2, 0, 2).toFixed(2); sceneDirty = true; if (play) play.clipId = null; requestUI(); }; hit(vx, y, 100, sh-4, setS, setS); }
+    y += sh; }
   // audio lanes
   const ah = big ? 46 : 24, cut = ensureCuts(); cut.mix = cut.mix || {};
   for (const ln of audioLanes()){
@@ -7008,7 +7039,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, updateShow, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, updateShow, inFrame, evalTake, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
