@@ -60,7 +60,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '452';
+const VERSION = '457';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -729,7 +729,7 @@ function overwriteVoice(clip){
   show.audio = show.audio.flatMap(a => {
     if ((a.cid ?? null) !== (clip.cid ?? null)) return [a];
     const b0 = a.at || 0, b1 = b0 + (a.dur || 0); if (b1 <= a0 || b0 >= a1) return [a];
-    if (b0 >= a0 - 0.05 && b1 <= a1 + 0.05) return [];   // fully covered: gone
+    if (b0 >= a0 - 0.05 && b1 <= a1 + 0.05) return [{...a, _peaks:null, mute: [...(a.mute || []), [+b0.toFixed(3), +b1.toFixed(3)]]}];   // fully covered: silenced (kept, can be restored)
     return [{...a, _peaks:null, mute: [...(a.mute || []), [+Math.max(a0, b0).toFixed(3), +Math.min(a1, b1).toFixed(3)]]}];
   });
 }
@@ -4932,6 +4932,23 @@ async function sortVoices(quiet){
   if (!quiet || n) toast(n ? 'Gave '+n+' older voice'+(n>1?'s':'')+' to their characters'+(left ? ' · '+left+' left: pick "Who says it" on those' : '') : 'Couldn\'t tell who said them: pick "Who says it" on each voice');
   requestUI(); return n;
 }
+// undo every split, trim, mute and piece-mute: each recording becomes one whole voice again, then gets sorted to its character
+async function restoreVoices(){
+  const b = snapShow(); let merged = 0, cleared = 0;
+  for (const sc of scenes){ const cur = sc.id===curScene, list = (cur ? show.audio : sc.audio) || [], groups = new Map(), out = [];
+    for (const a of list){ const key = a.b64 ? a.b64 : 'id:'+a.id; if (!groups.has(key)){ groups.set(key, []); out.push(key); } groups.get(key).push(a); }
+    const res = [];
+    for (const key of out){ const g2 = groups.get(key).sort((x,y)=>(x.k0 ?? x.at ?? 0) - (y.k0 ?? y.at ?? 0)), base = g2[0];
+      const cids = new Set(g2.map(x => x.cid ?? null)), one = {...base, _peaks:null};
+      delete one.k0; delete one.k1; if ((one.mute && one.mute.length) || g2.some(x => x.vol === 0)) cleared++; one.mute = null;
+      if (one.vol === 0) one.vol = one._vol || 1; delete one._vol;
+      if (g2.length > 1){ merged += g2.length - 1; if (cids.size > 1) delete one.cid; }   // pieces that went to different characters: work it out again
+      res.push(one); }
+    if (cur) show.audio = res; else sc.audio = res; }
+  pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; audioStop(); state.edAud = null; state.voiceSel = null;
+  autoSorted = null; const n = await sortVoices(true);
+  toast('Voices back as recorded'+(merged ? ' · '+merged+' pieces joined' : '')+(cleared ? ' · '+cleared+' un-muted' : '')+(n ? ' · '+n+' sorted to characters' : '')); requestUI();
+}
 // older worlds: sort their voices automatically the first time you open Edit or Action in them
 let autoSorted = null;
 function autoSortOnce(){ if (autoSorted === state.worldId) return; autoSorted = state.worldId;
@@ -5078,7 +5095,9 @@ function drawShowRows(X,W,aud){
   }
   const a = state.confirm==='clearshow';
   if (aud && rows.length) button(X,UIH-170,W,44,'🎯 Line up all voices with their mouths',false,()=>lineUpVoices(show.audio.slice()),'#ff2d95');
-  if (aud && show.audio.some(a => a.cid == null || !charById(a.cid))) button(X,UIH-222,W,44,'🎭 Give voices to their characters',false,sortVoices,'#5e2bff');
+  if (aud && show.audio.some(a => a.cid == null || !charById(a.cid))) button(X,UIH-222,W,44,'🎭 Give voices to their characters',false,()=>sortVoices(),'#5e2bff');
+  if (aud && show.audio.some(a => a.k0 != null || a.k1 != null || (a.mute && a.mute.length) || a.vol === 0)){ const armed = state.confirm==='restorev';
+    button(X,UIH-274,W,44, armed ? 'Tap again: put them all back' : '↩ Put voices back as they were recorded', armed, ()=>{ if (!armed){ state.confirm='restorev'; requestUI(); return; } state.confirm=null; restoreVoices(); }, '#ff9500'); }
   if (rows.length) button(X,UIH-118,W,44,a?'Tap to confirm':(aud ? 'Clear all voices' : 'Clear all motion'),a,()=>{ if(!a){state.confirm='clearshow';requestUI();return;} state.confirm=null; const b=snapShow(); if (aud){ show.audio=[]; audioStop(); } else show.tracks={}; pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); },'#ff3b30');
 }
 function drawDial(){
@@ -6518,19 +6537,11 @@ function editorButtons(X, y, W, big){
     [play?.mode==='film' && !play.rec ? '■ Stop' : '▶ Play (A)', ()=>{ play ? stopPlay() : startPlay('film'); }, '#34c759', play?.mode==='film' && !play.rec],
     [play?.rec ? '■ Stop rec' : '● Record (B)', ()=>{ if (play) stopPlay(); else { startPlay('film'); if (play) play.rec = true; } requestUI(); }, '#ff3b30', !!play?.rec],
     ['✂ Cut here', cutHere, '#ff9500'],
-    [tk ? 'Show '+tk.name.replace('Take ','T')+' from here' : 'Show from here', ()=>{ if (c && tk) showLane(c, j); else toast('Tap a take lane first'); }, '#ff2d95'],
-    ['Whole clip', ()=>{ if (c && tk) showLane(c, j, true); else toast('Tap a take lane first'); }, '#5e2bff'],
-    ['◀ Move', ()=>{ const i = shots.seq.indexOf(c); if (c && i > 0){ const b = editSnap(); shots.seq.splice(i,1); shots.seq.splice(i-1,0,c); pushShotsUndo(b); sceneDirty = true; requestUI(); } }, '#1e6bff'],
-    ['Move ▶', ()=>{ const i = shots.seq.indexOf(c); if (c && i < shots.seq.length-1){ const b = editSnap(); shots.seq.splice(i,1); shots.seq.splice(i+1,0,c); pushShotsUndo(b); sceneDirty = true; requestUI(); } }, '#1e6bff'],
-    [tk && c && c.soundFrom === tk.id ? '🔊 Sound: '+tk.name.replace('Take ','T')+' ✓' : tk ? '🔊 Sound from '+tk.name.replace('Take ','T') : '🔊 Sound: pick a lane', ()=>{ if (!c || !tk){ toast('Tap a take lane first'); return; } const b = editSnap();
-      if (c.soundFrom === tk.id){ c.soundFrom = null; toast('Sound follows whichever take shows again'); } else { c.soundFrom = tk.id; toast('This clip sounds like '+tk.name+' the whole time, even when you cut away'); }
-      pushShotsUndo(b); sceneDirty = true; if (play) play.clipId = null; requestUI(); }, '#ffd400', !!(c && tk && c.soundFrom === tk.id)],
-    ['Drop lane', ()=>{ if (!c || c.takes.length < 2){ toast('Pick a lane in a clip with more than one take'); return; } const b = editSnap(); c.takes.splice(j,1); c.sw = c.sw.filter(s=>s.k!==j).map(s=>({t:s.t, k:s.k>j?s.k-1:s.k})); shots.laneSel = 0; pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#ff3b30'],
-    ['Drop clip', ()=>{ if (!c) return; const b = editSnap(); shots.seq.splice(shots.seq.indexOf(c),1); shots.clipSel = null; pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#ff3b30'],
+    ['Drop clip', ()=>{ if (!c){ toast('Tap a clip first'); return; } const b = editSnap(); shots.seq.splice(shots.seq.indexOf(c),1); shots.clipSel = null; pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#ff3b30'],
     ['▦ Grid', ()=>setGrid(!state.multi), '#00c7be', !!state.multi],
     ['− zoom', ()=>{ state.tlZoom = Math.max(1, (state.tlZoom||1)/2); requestUI(); }, '#2a3060'],
     ['+ zoom', ()=>{ state.tlZoom = Math.min(64, (state.tlZoom||1)*2); requestUI(); }, '#2a3060']];
-  const per = big ? Math.ceil(items.length/2) : 4, bw = (W - (per-1)*8)/per, bh = big ? 52 : 38;
+  const per = big ? items.length : 4, bw = (W - (per-1)*8)/per, bh = big ? 52 : 38;
   items.forEach(([l, fn, col, on], i) => button(X + (i%per)*(bw+8), y + Math.floor(i/per)*(bh+8), bw, bh, l, !!on, fn, col));
   return y + Math.ceil(items.length/per)*(bh+8);
 }
@@ -6562,6 +6573,8 @@ function drawTimeline(X,W){
   if (renderer.xr.isPresenting) button(X,336,W,44, state.edHidden ? 'Show the big editor' : 'Bring the big editor here', false, ()=>{ state.edHidden = false; placeEditor(); requestUI(); }, '#ff9500');
   para(['The timeline, lanes and sounds are in the','big editor. Tap a sound name there to','change that voice.'], X, 404, 13, '#8f97c7');
   const missing = shots.takes.filter(t=>!takesInFilm().has(t.id));
+  if (scenes.some(sc => ((sc.id===curScene ? show.audio : sc.audio) || []).some(a => a.k0 != null || a.k1 != null || (a.mute && a.mute.length) || a.vol === 0))){ const armedR = state.confirm==='restorev';
+    button(X,UIH-162,W,44, armedR ? 'Tap again: put them all back' : '↩ Voices back as recorded', armedR, ()=>{ if (!armedR){ state.confirm='restorev'; requestUI(); return; } state.confirm=null; restoreVoices(); }, '#ff9500'); }
   if (shots.seq.length){ const armed = state.confirm==='emptytl'; button(X,UIH-110,W,44, armed ? 'Tap again: empty the timeline' : '🧹 Empty the timeline', armed, ()=>{ if (!armed){ state.confirm='emptytl'; requestUI(); return; } state.confirm=null; emptyTimeline(); }, '#ff3b30'); }
   if (missing.length) button(X,470,W,38,'Add back '+missing.length+' take'+(missing.length>1?'s':''),false,()=>{ const b = editSnap(); for (const t of missing) shots.seq.push(newClip([t.id])); pushShotsUndo(b); sceneDirty = true; requestUI(); },'#5e2bff');
   cutChooser(X, UIH-56, W);
@@ -6626,8 +6639,7 @@ function drawSoundPanel(X, y, W){
   button(X+940, y+10, 150, 40, '▶ Hear it', false, ()=>{ activateScene(ea.sid); audioPlayFrom(a.k0 ?? a.at ?? 0, 1, a); }, '#34c759');
   { const bw3 = 250, off = (a.vol ?? 1) === 0;
     button(X+16, y+62, bw3, 40, '✂ Split at the playhead', false, ()=>splitVoiceHere(a, ea.sid), '#ff9500');
-    button(X+16+bw3+8, y+62, bw3+40, 40, '🎭 Split by who was talking', false, ()=>splitByTalker(a, ea.sid), '#5e2bff');
-    button(X+16+2*bw3+56, y+62, 220, 40, off ? '🔇 Muted · tap to hear' : '🔈 Mute this piece', off, ()=>{ const b = snapShow(); if (off){ a.vol = a._vol || 1; } else { a._vol = a.vol ?? 1; a.vol = 0; } pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; requestUI(); }, '#ff3b30'); }
+    button(X+16+bw3+8, y+62, 220, 40, off ? '🔇 Muted · tap to hear' : '🔈 Mute this piece', off, ()=>{ const b = snapShow(); if (off){ a.vol = a._vol || 1; } else { a._vol = a.vol ?? 1; a.vol = 0; } pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; requestUI(); }, '#ff3b30'); }
   drawFxWide(X+16, y+112, W-32, fxOf(a), ()=>{ sceneDirty = true; });
 }
 function drawAudEdit(X, W){
@@ -6637,7 +6649,7 @@ function drawAudEdit(X, W){
   else {
     txt(ea.name+(a.name ? ' · '+a.name : ''), X, 132, 16, '#ffd400','left',800);
     const wy = whoRow(X, 146, W, a);
-    if (ea.key==='vx') button(X, wy, W, 38, '🎭 Give all "other sounds" to their characters', false, sortVoices, '#5e2bff');
+    if (ea.key==='vx') button(X, wy, W, 38, '🎭 Give all "other sounds" to their characters', false, ()=>sortVoices(), '#5e2bff');
     const oy = wy + (ea.key==='vx' ? 44 : 0);
     slider(X, oy, W, 'Volume', a.vol ?? 1, 0, 2, v=>{ a.vol = +v.toFixed(2); sceneDirty = true; }, '#34c759', Math.round((a.vol??1)*100)+'%');
     const yb = drawFxRack(X, oy+58, W, fxOf(a), ()=>a.pitch||0, v=>{ a.pitch = v; }, ()=>{ sceneDirty = true; });
@@ -7302,7 +7314,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
