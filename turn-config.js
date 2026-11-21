@@ -14,7 +14,11 @@
     {
       urls: [
         'turn:free.expressturn.com:3478?transport=udp',
-        'turn:free.expressturn.com:3478?transport=tcp'
+        'turn:free.expressturn.com:3478?transport=tcp',
+        // ExpressTURN's documented relay name, plus TLS on port 443 for networks that block 3478
+        'turn:relay1.expressturn.com:3478?transport=udp',
+        'turn:relay1.expressturn.com:3478?transport=tcp',
+        'turns:relay1.expressturn.com:443?transport=tcp'
       ],
       username: '000000002110650914',
       credential: 'zhSRZXeX9cnDrM9k7BQlcpLGT1I='
@@ -26,8 +30,25 @@
 
   window.CHIKI_TURN = TURN_SERVERS;
 
+  // chikiRelayCheck(): resolves true if this device can get an address on the relay within a few seconds.
+  // Apps call it after a failed join so the message can say whether the relay itself is the problem.
+  window.chikiRelayCheck = function (ms) {
+    return new Promise(function (res) {
+      var Pc = window.__chikiNativePC || window.RTCPeerConnection, done = false, pc;
+      function end(v) { if (done) return; done = true; try { pc.close(); } catch (e) {} res(v); }
+      try {
+        pc = new Pc({ iceServers: TURN_SERVERS, iceTransportPolicy: 'relay' });
+        pc.createDataChannel('check');
+        pc.onicecandidate = function (e) { if (e.candidate && / typ relay /.test(e.candidate.candidate)) end(true); else if (!e.candidate) end(false); };
+        pc.createOffer().then(function (o) { return pc.setLocalDescription(o); }).catch(function () { end(false); });
+      } catch (e) { return res(false); }
+      setTimeout(function () { end(false); }, ms || 6000);
+    });
+  };
+
   var Native = window.RTCPeerConnection;
   if (!Native || Native.__chikiTurn) return;
+  window.__chikiNativePC = Native;
 
   function urlsOf(s) { return [].concat(s && (s.urls || s.url) || []).join(' '); }
 
