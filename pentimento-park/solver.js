@@ -1240,7 +1240,7 @@ function flattenDisc(M){
   }
   return { uv, border: best, borderLen: bl };
 }
-function guideCage(Mfit, curves, guides, L, level){
+function guideCage(Mfit, curves, guides, L, level, exact){   // exact: the drawn lines are the layout, kept even when they run close together
   const M = Mfit.clone(); M.compact();
   const D = flattenDisc(M); if (!D) return null;
   const { uv } = D, T = M.T, nv = M.x.length;
@@ -1277,9 +1277,15 @@ function guideCage(Mfit, curves, guides, L, level){
   const at3 = (l, i, t) => lerp3(l.P[i], l.P[(i + 1) % l.P.length], t), atU = (l, i, t) => { const [a, b] = segU(l, i); return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; };
   // ---- loose ends reach over to the nearest line in the direction they were heading (or are trimmed off later)
   const reach = Math.max(0.35, L * 4);
-  for (const l of lines){ if (l.closed || l.kind === 0) continue;
+  const carried = [];
+  for (const l of lines.slice()){ if (l.closed || l.kind === 0) continue;
     for (const end of [0, 1]){
       const n = l.U.length, e = end ? n - 1 : 0, k = end ? Math.max(0, n - 4) : Math.min(n - 1, 3);
+      // (exact) a line drawn a little past the line it ends on: that stub is trimmed, not carried on across the next patch
+      if (exact){ let stub = false, arc = 0; const lim = Math.max(0.3, L * 1.2);
+        for (let s = 0; s < n - 1 && arc < lim && !stub; s++){ const i = end ? n - 2 - s : s, a = l.U[i], b = l.U[i + 1]; arc += Math.sqrt(d2(l.P[i], l.P[i + 1]));
+          for (const m of lines){ if (m === l) continue; for (let j = 0; j < nSeg(m) && !stub; j++){ const [c, d] = segU(m, j), x = segX(a, b, c, d); if (x && x[0] >= 0 && x[0] <= 1 && x[1] >= 0 && x[1] <= 1) stub = true; } if (stub) break; } }
+        if (stub) continue; }
       const o = l.U[e], dU = [o[0] - l.U[k][0], o[1] - l.U[k][1]], dl = Math.hypot(dU[0], dU[1]); if (dl < 1e-9) continue;
       const far = [o[0] + dU[0] / dl * 3, o[1] + dU[1] / dl * 3];
       let hit = null, ht = Infinity;
@@ -1288,9 +1294,12 @@ function guideCage(Mfit, curves, guides, L, level){
       if (!hit) continue;
       const hp = at3(hit.m, hit.i, hit.u); if (Math.sqrt(d2(hp, l.P[e])) > (hit.m.kind === 0 && l.kind === 2 ? Math.max(2.5, L * 8) : reach)) continue;   // guides are meant to run edge to edge: they reach much further for the border
       const hu = atU(hit.m, hit.i, hit.u), over = [hu[0] + dU[0] / dl * 1e-5, hu[1] + dU[1] / dl * 1e-5];
+      // (exact) a crease that stops in the open stays as long as you drew it; a plain layout line carries on from its end
+      if (exact && l.kind === 1){ const steps = Math.max(2, Math.ceil(Math.sqrt(d2(hp, l.P[e])) / (L * 0.3))), U = [o], P = [l.P[e]]; for (let q = 1; q < steps; q++){ const m = toUV(lerp3(l.P[e], hp, q / steps)); if (m){ U.push(m.uv); P.push(m.p); } } U.push(over); P.push(hp); carried.push({ kind: 2, cid: -1, closed: false, P, U, src: l, end }); continue; }
       if (end){ l.U.push(over); l.P.push(hp); } else { l.U.unshift(over); l.P.unshift(hp); }
     }
   }
+  for (const c of carried) lines.push(c);
   // ---- all crossings
   const nodes = []; // {u:[x,y], p:[x,y,z], cids:Set, corner}
   const ev = lines.map(() => []);   // per line: [param, node]
@@ -1311,9 +1320,11 @@ function guideCage(Mfit, curves, guides, L, level){
   lines.forEach((l, li) => { if (l.kind !== 1) return; const C = curves[l.cid];
     for (const cp of (C.corners || [])){ let bi = -1, bt = 0, bd = sq(L); for (let i = 0; i < nSeg(l); i++){ const a = l.P[i], b = l.P[(i + 1) % l.P.length], ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], t = Math.max(0, Math.min(1, dot([cp[0] - a[0], cp[1] - a[1], cp[2] - a[2]], ab) / (dot(ab, ab) || 1))), dd = d2(lerp3(a, b, t), cp); if (dd < bd){ bd = dd; bi = i; bt = t; } }
       if (bi < 0) continue; const ni = nodes.length; nodes.push({ u: atU(l, bi, bt), p: at3(l, bi, bt), cids: new Set([l.cid]), corner: true }); ev[li].push([bi + bt, ni]); } });
+  // a carried-on line starts at the very end of its crease: that end is a corner of the layout
+  lines.forEach((c, ci) => { if (!c.src) return; const li = lines.indexOf(c.src), ni = nodes.length; nodes.push({ u: c.U[0], p: c.P[0], cids: new Set([c.src.cid]), corner: false }); ev[li].push([c.end ? nSeg(c.src) : 0, ni]); ev[ci].push([0, ni]); });
   if (!ev[0].length){ nodes.push({ u: lines[0].U[0], p: lines[0].P[0], cids: new Set(), border: true, corner: false }); ev[0].push([0, nodes.length - 1]); }
   // ---- crossings that nearly coincide become one
-  const mtol = Math.max(0.05, L * 0.7), par = nodes.map((_, i) => i), fd = i => par[i] === i ? i : (par[i] = fd(par[i]));
+  const mtol = exact ? Math.max(0.05, L * 0.3) : Math.max(0.05, L * 0.7), par = nodes.map((_, i) => i), fd = i => par[i] === i ? i : (par[i] = fd(par[i]));
   { const NG = new Grid(mtol); nodes.forEach((n, i) => NG.add(i, n.p[0], n.p[1], n.p[2]));
     nodes.forEach((n, i) => NG.each(n.p[0], n.p[1], n.p[2], mtol, j => { if (j > i && d2(n.p, nodes[j].p) < mtol * mtol){ const a = fd(i), b = fd(j); if (a !== b) par[b] = a; } })); }
   nodes.forEach((n, i) => { const r = fd(i); if (r !== i){ const R = nodes[r]; n.cids.forEach(c => R.cids.add(c)); R.corner = R.corner || n.corner; R.border = R.border || n.border; } });
@@ -1355,7 +1366,7 @@ function guideCage(Mfit, curves, guides, L, level){
       if (!((a.a === b.a && a.b === b.b) || (a.a === b.b && a.b === b.a))) continue; if (hd(a, b) > mtol * 1.5) continue; drop.add(a.kind >= b.kind ? i : j); }
     if (drop.size){ E = E.filter((_, i) => !drop.has(i)); join(); } }
   // a stretch of guide that runs right alongside a crease or the border adds nothing but a sliver of a patch: drop it
-  { const near = Math.max(0.25, L * 1.2), LG = new Grid(near); lines.forEach((l, li) => { if (l.kind < 2) l.P.forEach((p, i) => LG.add(li * 100000 + i, p[0], p[1], p[2])); });
+  { const near = exact ? Math.max(0.08, L * 0.25) : Math.max(0.25, L * 1.2), LG = new Grid(near); lines.forEach((l, li) => { if (l.kind < 2) l.P.forEach((p, i) => LG.add(li * 100000 + i, p[0], p[1], p[2])); });
     const along = e => { let k = 0; for (const p of e.P){ let hit = false; LG.each(p[0], p[1], p[2], near, id => { if (!hit){ const q = lines[Math.floor(id / 100000)].P[id % 100000]; if (d2(p, q) < near * near) hit = true; } }); if (hit) k++; } return k / e.P.length; };
     const before = E.length; E = E.filter(e => e.kind !== 2 || along(e) < 0.7);
     if (E.length !== before){ alive = E.map(() => true); for (let ch = true; ch;){ ch = false; const dg = new Int32Array(nodes.length); E.forEach(e => { dg[e.a]++; dg[e.b]++; }); const keep = E.filter(e => dg[e.a] > 1 && dg[e.b] > 1); if (keep.length !== E.length){ E = keep; ch = true; } } join(); } }
@@ -1393,6 +1404,8 @@ function guideCage(Mfit, curves, guides, L, level){
       const a = e.P[0], b = e.P[e.P.length - 1], ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], ch = Math.hypot(...ab) || 1e-9;
       let md = 0, mi = -1; for (let i = 1; i < e.P.length - 1; i++){ const t = Math.max(0, Math.min(1, dot([e.P[i][0] - a[0], e.P[i][1] - a[1], e.P[i][2] - a[2]], ab) / (ch * ch))), dd = Math.sqrt(d2(e.P[i], lerp3(a, b, t))); if (dd > md){ md = dd; mi = i; } }
       if (e.kind !== 2 && md > (e.kind === 1 ? Math.max(0.06, ch * 0.18) : Math.max(0.12, ch * 0.2)) && mi > 1 && mi < e.P.length - 2){ const s = bestSplit(e); splitE(ei, s.turn > 0.5 ? s.i : mi, s.turn > 1.0); did = true; ei++; } }
+    // (exact) where a line you drew turns a sharp corner, that corner is a corner of the layout
+    if (exact) for (let ei = 0; ei < E.length; ei++){ const e = E[ei]; if (e.kind !== 2 || e.P.length < 7) continue; const sp = bestSplit(e); if (sp.i > 2 && sp.i < e.P.length - 3 && sp.turn > 0.75){ splitE(ei, sp.i, sp.turn > 1.0); did = true; ei++; } }
     const F = faces(), want = new Map();
     for (const cyc of F){ if (cyc.length >= 4) continue;
       const cand = cyc.map(h => { const s = bestSplit(E[h.i]); return { h, ...s, score: s.turn + (E[h.i].kind < 2 ? 0.6 : 0) + (cyc.length < 3 ? E[h.i].len : 0) }; }).filter(c => c.i > 0).sort((x, y) => y.score - x.score);
@@ -1401,6 +1414,38 @@ function guideCage(Mfit, curves, guides, L, level){
     [...want.keys()].sort((a, b) => b - a).forEach(ei => { const c = want.get(ei); splitE(ei, c.i, c.turn > 1.0); did = true; });
     if (!did) break;
   }
+  // ---- (exact) a patch is split from one point in its middle, so that point has to see the patch's whole outline.
+  // kernel: the spot that sees it best, and by how much (below zero: no spot sees it all, the patch bends round a corner)
+  const kernel = U => { let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity; for (const p of U){ x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }
+    const sc = c => { let m = Infinity; for (let i = 0; i < U.length; i++){ const a = U[i], b = U[(i + 1) % U.length], l = Math.hypot(b[0] - a[0], b[1] - a[1]); if (l < 1e-12) continue; m = Math.min(m, ((a[0] - c[0]) * (b[1] - c[1]) - (b[0] - c[0]) * (a[1] - c[1])) / l); } return m; };
+    let best = null, bs = -Infinity; const N = 22; for (let i = 1; i < N; i++) for (let j = 1; j < N; j++){ const c = [x0 + (x1 - x0) * i / N, y0 + (y1 - y0) * j / N], v = sc(c); if (v > bs){ bs = v; best = c; } }
+    for (let r = 0; r < 3 && best; r++){ const hx = (x1 - x0) / N / (2 ** r), hy = (y1 - y0) / N / (2 ** r), c0 = best; for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++){ const c = [c0[0] + hx * i / 2, c0[1] + hy * j / 2], v = sc(c); if (v > bs){ bs = v; best = c; } } }
+    return { c: best, score: bs, size: Math.hypot(x1 - x0, y1 - y0), at: sc }; };
+  // a patch is split into one quad per corner, so a corner the patch bends right round (more than about 225° inside,
+  // like the outside of a ring's corner) would get a quad folded back on itself. Such a corner gets a line carried on
+  // from it, straight across the patch to the far side: the line a modeller would draw on from that corner
+  let cuts = 0;
+  if (exact) for (let guard = 0; guard < 24; guard++){ let did = false;
+    for (const cyc of faces()){ if (cyc.length < 3) continue; const O = [], at = [];   // outline points { u, p, e, i }, and where each corner sits in it
+      for (const h of cyc){ const e = E[h.i], n = e.U.length; at.push(O.length); for (let k = 0; k < n - 1; k++){ const i = h.fwd ? k : n - 1 - k; O.push({ u: e.U[i], p: e.P[i], node: k === 0 ? (h.fwd ? e.a : e.b) : -1 }); } }
+      const n = O.length; if (n < 6) continue; let A = 0; for (let i = 0; i < n; i++){ const a = O[i].u, b = O[(i + 1) % n].u; A += a[0] * b[1] - b[0] * a[1]; } if (A <= 0) continue;
+      let pick = null;
+      for (let q = 0; q < cyc.length; q++){ const j = at[q], jn = at[(q + 1) % cyc.length], jp = at[(q - 1 + cyc.length) % cyc.length], nxt = Math.floor(((jn - j + n) % n || n) / 2), prv = Math.floor(((j - jp + n) % n || n) / 2);
+        const o = O[j], a = O[(j + nxt) % n], b = O[(j - prv + n) % n], va = [a.p[0] - o.p[0], a.p[1] - o.p[1], a.p[2] - o.p[2]], vb = [b.p[0] - o.p[0], b.p[1] - o.p[1], b.p[2] - o.p[2]];
+        const ang = Math.acos(Math.max(-1, Math.min(1, dot(va, vb) / ((Math.hypot(...va) * Math.hypot(...vb)) || 1e-12)))), ua = [a.u[0] - o.u[0], a.u[1] - o.u[1]], ub = [b.u[0] - o.u[0], b.u[1] - o.u[1]];
+        const inside = ua[0] * ub[1] - ua[1] * ub[0] >= 0 ? ang : 2 * Math.PI - ang;   // the patch runs anticlockwise on the disc
+        if (inside > 3.93 && (!pick || inside > pick.inside)){ const la = Math.hypot(...ua) || 1e-12, lb = Math.hypot(...ub) || 1e-12, d = [-(ua[0] / la + ub[0] / lb), -(ua[1] / la + ub[1] / lb)], dl = Math.hypot(...d); if (dl > 1e-6) pick = { inside, j, dir: [d[0] / dl, d[1] / dl] }; } }
+      if (!pick) continue;
+      const o = O[pick.j].u; let hj = -1, ht = Infinity;
+      for (let j = 0; j < n; j++){ if (Math.min((j - pick.j + n) % n, (pick.j - j + n) % n) <= 2 || (pick.j - (j + 1) + n) % n <= 1) continue; const x = segX(o, [o[0] + pick.dir[0], o[1] + pick.dir[1]], O[j].u, O[(j + 1) % n].u); if (x && x[0] > 1e-9 && x[1] >= 0 && x[1] <= 1 && x[0] < ht){ ht = x[0]; hj = x[1] < 0.5 ? j : (j + 1) % n; } }
+      if (hj < 0 || hj === pick.j) continue;
+      const nodeAt = o2 => { if (o2.node >= 0) return o2.node; const ei = E.findIndex(e => e.U.includes(o2.u)); if (ei < 0) return -1; const e = E[ei], i = e.U.indexOf(o2.u); if (i <= 0) return e.a; if (i >= e.U.length - 1) return e.b; if (i < 2 && e.U.length > 4) { splitE(ei, 2, false); return nodes.length - 1; } splitE(ei, i, false); return nodes.length - 1; };
+      const na = nodeAt(O[pick.j]), nb2 = nodeAt(O[hj]); if (na < 0 || nb2 < 0 || na === nb2) continue;
+      if (E.some(e => (e.a === na && e.b === nb2) || (e.a === nb2 && e.b === na))) continue;
+      const pa = nodes[na].p, pb = nodes[nb2].p, steps = Math.max(2, Math.ceil(Math.sqrt(d2(pa, pb)) / (L * 0.3))), PU = [nodes[na].u], PP = [pa]; for (let q = 1; q < steps; q++){ const m = toUV(lerp3(pa, pb, q / steps)); if (m){ PU.push(m.uv); PP.push(m.p); } } PU.push(nodes[nb2].u); PP.push(pb);
+      let len = 0; for (let i = 1; i < PP.length; i++) len += Math.sqrt(d2(PP[i - 1], PP[i]));
+      E.push({ a: na, b: nb2, P: PP, U: PU, kind: 2, cid: -1, len }); cuts++; did = true; break; }
+    if (!did) break; }
   // ---- the cage
   const F0 = faces(); if (!F0.length) return null;
   // the disc, back onto the surface: find the triangle a disc point falls in
@@ -1427,6 +1472,7 @@ function guideCage(Mfit, curves, guides, L, level){
     cyc.forEach((h, q) => { const e = E[h.i], a = f[q], b = f[(q + 1) % f.length], P = h.fwd ? e.P : e.P.slice().reverse(), U = h.fwd ? e.U : e.U.slice().reverse();
       if (!G.has(ek(a, b))) G.set(ek(a, b), { a, P, U, kind: e.kind, cid: e.cid, sharp: e.kind === 1 && !!curves[e.cid].sharp }); });
     Fs.push(f); }
+  const n0 = Vs.length;   // the corners of the layout as drawn: where lines cross, end on each other, or turn sharply
   // more detail between the guides: split every patch like one step of subdivision, with the new points on the surface
   for (let lv = 0; lv < level; lv++){
     const mid = new Map(), NG = new Map(), NF = [];
@@ -1456,6 +1502,11 @@ function guideCage(Mfit, curves, guides, L, level){
       let bd = -1; for (let i = 1; i < 16; i++) for (let j = 1; j < 16; j++){ const q = [x0 + (x1 - x0) * i / 16, y0 + (y1 - y0) * j / 16]; if (!inside(U, q)) continue; const d = segD(U, q); if (d > bd){ bd = d; best = q; } }
       return best; };
     for (const f of Fs){ const n = f.length; let u = [0, 0]; f.forEach(v => { u[0] += Vs[v].u[0] / n; u[1] += Vs[v].u[1] / n; }); const mu = middleOf(f); if (mu) u = mu;
+      if (exact){ // the middle: of the spots that see the whole outline, the one furthest from it on the real surface
+        const UO = outlineU(f), K = kernel(UO), PO = []; for (let i = 0; i < n; i++){ const a = f[i], b = f[(i + 1) % n], g = G.get(ek(a, b)); if (g && !g.straight && g.P){ const PP = g.a === a ? g.P : g.P.slice().reverse(); for (let k = 0; k < PP.length - 1; k++) PO.push(PP[k]); } else PO.push(Vs[a].p); }
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity; for (const q of UO){ x0 = Math.min(x0, q[0]); y0 = Math.min(y0, q[1]); x1 = Math.max(x1, q[0]); y1 = Math.max(y1, q[1]); }
+        let bu = null, bd = -1; const NN = 20; for (let i = 1; i < NN; i++) for (let j = 1; j < NN; j++){ const c = [x0 + (x1 - x0) * i / NN, y0 + (y1 - y0) * j / NN]; if (K.at(c) <= 0) continue; const p3 = uvTo3D(c); if (!p3) continue; let m = Infinity; for (const q of PO){ const dd = d2(p3, q); if (dd < m) m = dd; } if (m > bd){ bd = m; bu = c; } }
+        if (bu) u = bu; else if (K.c && K.score > 0) u = K.c; }
       const ms = f.map((v, i) => getMid(v, f[(i + 1) % n]));
       // the middle has to see every corner, or the pieces around it fold over: look for a spot that does
       const worst = c => { let m = Infinity; for (let i = 0; i < n; i++){ const q = [Vs[f[i]].u, Vs[ms[i]].u, c, Vs[ms[(i - 1 + n) % n]].u]; let A = 0; for (let k = 0; k < 4; k++){ const a = q[k], b = q[(k + 1) % 4]; A += a[0] * b[1] - b[0] * a[1]; } m = Math.min(m, A); } return m; };
@@ -1464,7 +1515,12 @@ function guideCage(Mfit, curves, guides, L, level){
         if (bw <= 0){ const poly = []; for (let i = 0; i < n; i++) poly.push(f[i], ms[i]); NF.push(poly); continue; } }   // no such spot: keep the patch whole (its sides split)
       let p = uvTo3D(u); if (!p){ p = [0, 0, 0]; f.forEach(v => { for (let k = 0; k < 3; k++) p[k] += Vs[v].p[k] / n; }); }
       const ci = Vs.push({ u, p, fc: -1, corner: false }) - 1;
-      for (let i = 0; i < n; i++){ NF.push([f[i], ms[i], ci, ms[(i - 1 + n) % n]]); NG.set(ek(ms[i], ci), { straight: true }); } }
+      for (let i = 0; i < n; i++){ NF.push([f[i], ms[i], ci, ms[(i - 1 + n) % n]]);
+        // (exact) the new line from a side's middle to the patch's middle is traced on the surface the way it runs on
+        // the disc, where it can't leave the patch; later subdivisions keep their points on it
+        if (exact){ const ua = Vs[ms[i]].u, pa = Vs[ms[i]].p, steps = Math.max(2, Math.ceil(Math.sqrt(d2(pa, p)) / (L * 0.3))), PU = [ua], PP = [pa]; for (let q = 1; q < steps; q++){ const uq = [ua[0] + (u[0] - ua[0]) * q / steps, ua[1] + (u[1] - ua[1]) * q / steps], pq = uvTo3D(uq); if (pq){ PU.push(uq); PP.push(pq); } } PU.push(u); PP.push(p);
+          NG.set(ek(ms[i], ci), { a: ms[i], P: PP, U: PU, kind: 3, cid: -1, sharp: false }); }
+        else NG.set(ek(ms[i], ci), { straight: true }); } }
     Fs = NF; G.clear(); for (const [k, g] of NG) G.set(k, g);
   }
   const V = [], fc = [], corner = []; Vs.forEach(v => { V.push(...v.p); fc.push(v.fc); corner.push(!!v.corner); });
@@ -1486,8 +1542,9 @@ function guideCage(Mfit, curves, guides, L, level){
       let bv = -1, bd = Infinity; VG.each(P0[0], P0[1], P0[2], L * 3, v => { const dd = d2(M.P(v), P0); if (dd < bd){ bd = dd; bv = v; } }); if (bv < 0) continue;
       const m = [0, 0, 0]; for (const t of M.vt[bv]){ const c = M.triN(t); m[0] += c[0]; m[1] += c[1]; m[2] += c[2]; } agree += Math.sign(dot(n, m)); }
     if (agree < 0) Fo.forEach(f => f.reverse()); }
-  const glines = new Map(); for (const [k, g] of G) if (g.kind === 2 && g.P && g.P.length > 1) glines.set(k, g.P);   // the guide each layout edge runs along
-  return { cage: { V, F: Fo, sharp, feat: null, corner: Uint8Array.from(corner, c => c ? 1 : 0) }, info: { fc, corner }, bad, lost, patches: F0.length, glines };
+  const glines = new Map(); for (const [k, g] of G) if ((g.kind === 0 || g.kind === 2 || g.kind === 3) && g.P && g.P.length > 1) glines.set(k, g.P);   // the guide each layout edge runs along
+  const onLine = new Set(); for (const [k, g] of G) if (!g.straight && g.kind !== undefined && g.kind !== 3) onLine.add(k);   // layout edges that lie on a line you drew (or the border)
+  return { cage: { V, F: Fo, sharp, feat: null, corner: Uint8Array.from(corner, c => c ? 1 : 0) }, info: { fc, corner }, bad, lost, patches: F0.length, glines, onLine, n0, cuts };
 }
 
 // ---------------- field-aligned quads (in the spirit of Instant Meshes)
@@ -2554,31 +2611,33 @@ function solve(strokes, prm, progress = () => {}){
   // simpler topology: rebuild at the size that gives the quad count asked for, on the fitted surface
   let Mfit = M;
   let gc = null;
-  if (prm.target < 0 && guides.length){ progress(0.9, 'Building the cage from your guides'); try { gc = guideCage(M, curves, guides, L, prm.stick ? 1 : -1 - prm.target); } catch (e){ gc = null; } }
+  if (prm.target < 0 && guides.length){ progress(0.9, 'Building the cage from your guides'); try { gc = guideCage(M, curves, guides, L, prm.stick ? 1 : -1 - prm.target, !!prm.stick); } catch (e){ gc = null; } }
   if (gc){
     let { cage, info } = gc;
     if (prm.hard > 0) autoCreases(cage, prm.hard);
     progress(0.95, 'Hugging the surface');
-    let gE = new Map(), pinOf = null;
+    let gE = new Map(), pinOf = null; const projS = prm.stick ? projector(M, L) : null;
+    // stick: every point goes straight back where it belongs. A corner of your layout or a point on a guide: its home
+    // on that line. A point on a crease: the nearest spot on the crease. Anything else: the nearest spot on the surface
+    const stickTo = (c, inf, pin) => { const V = c.V; for (let v = 0; v < V.length / 3; v++){ if (inf.corner[v]) continue; const p = [V[3 * v], V[3 * v + 1], V[3 * v + 2]], id = inf.fc[v] ?? -1, h = pin(v, p), q = h || (id >= 0 && curves[id] ? closestOnPoly(curves[id], p).p : projS(p)); if (q){ V[3 * v] = q[0]; V[3 * v + 1] = q[1]; V[3 * v + 2] = q[2]; } } };
     if (prm.stick){
-      // points on a guide stay on that guide: each layout edge along a guide carries the guide's line down to its halves
+      // the lines you drew are held where you drew them. Every corner of the layout, and every point along a guide,
+      // has a home on its line that it is pulled back to; a new point made on a guide edge gets its home on that guide
       gE = gc.glines || new Map();
-      pinOf = (c, gE) => { const at = new Map(); for (const [k, P] of gE){ for (const v of [Math.floor(k / 2097152), k % 2097152]) (at.get(v) || at.set(v, []).get(v)).push(P); }
-        return (v, p) => { const Ls = at.get(v); if (!Ls || Ls.length !== 2) return null; let best = null, bd = Infinity;
-          for (const P of Ls) for (let i = 0; i + 1 < P.length; i++){ const a = P[i], b = P[i + 1], ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], l2 = dot(ab, ab) || 1e-18, u = Math.max(0, Math.min(1, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2)), q = [a[0] + ab[0] * u, a[1] + ab[1] * u, a[2] + ab[2] * u], dd = d2(p, q); if (dd < bd){ bd = dd; best = q; } }
-          return best; }; };
+      const home = new Map(), onG = new Set(); for (const k of gE.keys()){ onG.add(Math.floor(k / 2097152)); onG.add(k % 2097152); }
+      for (let v = 0; v < cage.V.length / 3; v++) if (v < (gc.n0 || 0) || onG.has(v)) home.set(v, [cage.V[3 * v], cage.V[3 * v + 1], cage.V[3 * v + 2]]);
+      pinOf = () => v => home.get(v) || null; pinOf.home = home;
+      pinOf.onLine = (P, p) => { let best = p, bd = Infinity; for (let i = 0; i + 1 < P.length; i++){ const a = P[i], b = P[i + 1], ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], l2 = dot(ab, ab) || 1e-18, u = Math.max(0, Math.min(1, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2)), q = [a[0] + ab[0] * u, a[1] + ab[1] * u, a[2] + ab[2] * u], dd = d2(p, q); if (dd < bd){ bd = dd; best = q; } } return best; };
     }
-    hugCage(cage, info, M, curves, L, 8, prm.stick ? 0 : 0.3, pinOf && pinOf(cage, gE));
-    untangleCage(cage, info, M, curves, L, 40);
-    if (prm.stick) hugCage(cage, info, M, curves, L, 6, 0, pinOf(cage, gE));
+    if (!prm.stick){ hugCage(cage, info, M, curves, L, 8, 0.3); untangleCage(cage, info, M, curves, L, 40); }   // (stick: the layout starts on the surface, on your lines)
     // Subdivide and stick: the lines you drew are the whole base layout (one face per patch they wall off). It is then
     // subdivided again and again, and after every subdivision the new, smoother layout is pulled back onto the sculpted
     // surface (crease points onto their crease), until the quads are about the size of the fit detail
     let stuck = 0;
-    if (prm.stick){ cage.cageE = allEdges(cage.F);
+    if (prm.stick){ cage.cageE = gc.onLine && gc.onLine.size ? new Set(gc.onLine) : allEdges(cage.F);   // the thick lines of the layout are the lines you drew
       const meanEdge = c => { let s2 = 0, n = 0; for (const f of c.F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; s2 += Math.hypot(c.V[3 * a] - c.V[3 * b], c.V[3 * a + 1] - c.V[3 * b + 1], c.V[3 * a + 2] - c.V[3 * b + 2]); n++; } return n ? s2 / n : 0; };
       const maxLv = prm.stickLevels > 0 ? prm.stickLevels : 6;
-      while (stuck < maxLv && (prm.stickLevels > 0 || meanEdge(cage) > L * 1.5) && cage.F.reduce((a, f) => a + f.length, 0) <= 24000){
+      while (stuck < maxLv && (prm.stickLevels > 0 || meanEdge(cage) > L) && cage.F.reduce((a, f) => a + f.length, 0) <= 24000){
         progress(0.95 + 0.006 * stuck, 'Subdividing and sticking, level ' + (stuck + 1));
         const nv0 = cage.V.length / 3, eid = new Map(); let ne = 0; cage.F.forEach(f => { for (let i = 0; i < f.length; i++){ const k = ek(f[i], f[(i + 1) % f.length]); if (!eid.has(k)) eid.set(k, ne++); } });
         const cnt = new Map(); cage.F.forEach(f => { for (let i = 0; i < f.length; i++){ const k = ek(f[i], f[(i + 1) % f.length]); cnt.set(k, (cnt.get(k) || 0) + 1); } });
@@ -2586,8 +2645,8 @@ function solve(strokes, prm, progress = () => {}){
         for (let v = 0; v < nv0; v++){ fc[v] = info.fc[v] ?? -1; corner[v] = info.corner[v] ? 1 : 0; }
         // a new point on a crease edge belongs to that crease (the one its two ends share, or the one end that has one)
         for (const [k, e] of eid){ if (!cage.sharp.has(k) || cnt.get(k) !== 2) continue; const a = Math.floor(k / 2097152), b = k % 2097152, ia = info.fc[a] ?? -1, ib = info.fc[b] ?? -1; fc[nv0 + e] = ia >= 0 && (ia === ib || ib < 0 || info.corner[b]) ? ia : ib >= 0 && (ia < 0 || info.corner[a]) ? ib : -1; }
-        const gN = new Map(); for (const [k, P] of gE){ const e = eid.get(k); if (e === undefined) continue; const a = Math.floor(k / 2097152), b = k % 2097152; gN.set(ek(a, nv0 + e), P); gN.set(ek(nv0 + e, b), P); } gE = gN;
-        const inf = { fc, corner }; hugCage(nx, inf, M, curves, L, 6, 0, pinOf(nx, gE));
+        const gN = new Map(); for (const [k, P] of gE){ const e = eid.get(k); if (e === undefined) continue; const a = Math.floor(k / 2097152), b = k % 2097152, m = nv0 + e; gN.set(ek(a, m), P); gN.set(ek(m, b), P); pinOf.home.set(m, pinOf.onLine(P, [nx.V[3 * m], nx.V[3 * m + 1], nx.V[3 * m + 2]])); } gE = gN;
+        const inf = { fc, corner }, pin = pinOf(nx, gE); stickTo(nx, inf, pin);
         cage = nx; info = inf; stuck++; } }
     softenCreases(cage, info, curves, prm.softCrease); const lv = Math.max(1, prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
     if (!stuck) cage.cageE = allEdges(cage.F); let smooth = catmullClark(cage, curves); for (let i = 1; i < lv; i++){ applyTips(smooth, lv - i); smooth = catmullClark(smooth, curves); }
@@ -2597,7 +2656,7 @@ function solve(strokes, prm, progress = () => {}){
     return { surface: shc, quadWire: smooth.cageE ? edgeWire(smooth, smooth.cageE) : wire(cage), fineWire: wire(smooth), creases: creaseLines(smooth),
       quads: { V: new Float32Array(cage.V), F: new Int32Array(cage.F.flat()), C: new Int32Array(cage.F.map(f => f.length)) },
       curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })), ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
-      nQuads: cage.F.length, cageMode: true, stuck, cage: cageOut(cage), levels: lv, cache, warm, note: gc.lost ? 'A line no guide crosses was left out: draw a guide across it' : gc.bad ? gc.bad + ' patch' + (gc.bad > 1 ? 'es' : '') + ' left open: close them with more guides' : '' };
+      nQuads: cage.F.length, cageMode: true, stuck, cage: cageOut(cage), levels: lv, cache, warm, note: gc.lost ? 'A line no guide crosses was left out: draw a guide across it' : stuck && gc.cuts ? gc.cuts + (gc.cuts > 1 ? ' lines were' : ' line was') + ' carried on from a corner a patch bent round (draw your own there to choose where it goes)' : gc.bad ? gc.bad + ' patch' + (gc.bad > 1 ? 'es' : '') + ' left open: close them with more guides' : '' };
   }
   
   const simplify = () => { if (prm.target > 0){ const Lo = 2 * Math.sqrt(triArea(M) / prm.target);
