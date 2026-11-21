@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '471';
+const VERSION = '473';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -6417,6 +6417,7 @@ function filmRange(){ const L = filmLength(), a = clamp(ensureCuts().fin || 0, 0
 function clipAt(t){ let acc = 0; for (const c of shots.seq){ const R = clipRange(c); if (!R) continue; const L = (R.b-R.a)/R.sp; if (t < acc+L) return {c, R, start:acc, u:R.a + (t-acc)*R.sp}; acc += L; }
   const last = [...shots.seq].reverse().find(c=>clipRange(c)); if (!last) return null; const R = clipRange(last); return {c:last, R, start:acc-(R.b-R.a)/R.sp, u:R.b}; }
 const clipById = id => shots.seq.find(c=>c.id===id);
+function tidySwitches(c){ c.sw.sort((a,b)=>a.t-b.t); const keep = []; let cur = 0; for (const s of c.sw){ if (s.k !== cur){ keep.push(s); cur = s.k; } } c.sw = keep; }   // a switch to the take already showing does nothing
 function setSwitch(c, u, k){
   const R = clipRange(c); if (!R) return; u = clamp(u, R.a, R.b);
   c.sw = c.sw.filter(s=>Math.abs(s.t-u) > 0.03); c.sw.push({t:+u.toFixed(3), k}); c.sw.sort((a,b)=>a.t-b.t);
@@ -6531,16 +6532,28 @@ function drawEditor(X, Y, W, big){
     const filmToU = (h, t) => h.R.a + (t - h.acc)*h.R.sp;
     for (const h of cutHandles){ const c = h.c, R2 = h.R;
       c.sw.forEach((sw, si) => { if (sw.t <= R2.a + 1e-3) return; const x = tx(h.acc + (sw.t - R2.a)/R2.sp); if (x < TX || x > TX+TW) return;
-        g.fillStyle = '#ffd400'; g.fillRect(x-2, hY, 4, hH); rr(x-7, hY-6, 14, 12, 4, '#ffd400');
+        g.fillStyle = 'rgba(255,255,255,0.35)'; g.fillRect(x-1, hY, 2, hH); rr(x-8, hY-7, 16, 14, 4, '#ffd400'); txt('✕', x, hY, 10, '#111', 'center', 900);   // a thin mark: drag the tab to slide it, tap it to remove it
         const lo = (si > 0 ? c.sw[si-1].t : R2.a) + 0.1, hi = (si < c.sw.length-1 ? c.sw[si+1].t : R2.b) - 0.1;
-        hit(x-10, hY-8, 20, hH+8, ()=>{ state._cutDrag = editSnap(); }, (px)=>{ sw.t = +clamp(filmToU(h, tOf(px)), lo, hi).toFixed(3); sceneDirty = true; if (play) play.clipId = null; requestUI(); }, ()=>{ if (state._cutDrag){ pushShotsUndo(state._cutDrag); state._cutDrag = null; } }); }); }
+        hit(x-10, hY-8, 20, hH+8, (px)=>{ state._cutDrag = editSnap(); state._cutTap = {x:px, moved:false}; },
+          (px)=>{ const T = state._cutTap; if (T && !T.moved && Math.abs(px - T.x) < 8) return; if (T) T.moved = true; sw.t = +clamp(filmToU(h, tOf(px)), lo, hi).toFixed(3); sceneDirty = true; if (play) play.clipId = null; requestUI(); },
+          ()=>{ const T = state._cutTap; state._cutTap = null;
+            if (T && !T.moved){ c.sw.splice(c.sw.indexOf(sw), 1); tidySwitches(c); if (state._cutDrag) pushShotsUndo(state._cutDrag); state._cutDrag = null; sceneDirty = true; if (play) play.clipId = null; toast('Cut removed (X undoes)'); requestUI(); return; }
+            if (state._cutDrag){ pushShotsUndo(state._cutDrag); state._cutDrag = null; } }); }); }
     for (let q=0; q<cutHandles.length-1; q++){ const h = cutHandles[q], h2 = cutHandles[q+1], x = h.x1; if (x < TX || x > TX+TW) continue;
       rr(x-6, hY+hH/2-14, 12, 28, 5, '#ffffff'); g.fillStyle = '#151935'; g.fillRect(x-1, hY+hH/2-8, 2, 16);
-      hit(x-10, hY, 20, hH, ()=>{ state._cutDrag = editSnap(); state._join = {b:h.R.b, a2:h2.R.a, t0:h.acc + h.L}; },
-        (px)=>{ const J = state._join; if (!J) return; const d = tOf(px) - J.t0;   // film seconds: one clip gets longer, the next shorter
+      hit(x-10, hY, 20, hH, (px)=>{ state._cutDrag = editSnap(); state._join = {b:h.R.b, a2:h2.R.a, t0:h.acc + h.L, x:px, moved:false}; },
+        (px)=>{ const J = state._join; if (!J) return; if (!J.moved && Math.abs(px - J.x) < 8) return; J.moved = true; const d = tOf(px) - J.t0;   // film seconds: one clip gets longer, the next shorter
           const nb = clamp(J.b + d*h.R.sp, h.R.a + 0.2, 1e6), na = clamp(J.a2 + d*h2.R.sp, 0, h2.R.b - 0.2); h.c.cout = +nb.toFixed(3); h2.c.cin = +na.toFixed(3);
           sceneDirty = true; if (play) play.clipId = null; requestUI(); },
-        ()=>{ if (state._cutDrag){ pushShotsUndo(state._cutDrag); state._cutDrag = null; } state._join = null; }); } }
+        ()=>{ const J = state._join; state._join = null;
+          if (J && !J.moved){   // tap the join: if both sides are the same take, joined end to end, they become one clip again
+            const c1 = h.c, c2 = h2.c;
+            if (c1.takes.join() === c2.takes.join() && Math.abs(h.R.b - h2.R.a) < 0.05){
+              c1.cout = c2.cout; c1.sw = [...c1.sw, ...c2.sw]; tidySwitches(c1);
+              shots.seq.splice(shots.seq.indexOf(c2), 1); if (shots.clipSel === c2.id) shots.clipSel = c1.id;
+              if (state._cutDrag) pushShotsUndo(state._cutDrag); state._cutDrag = null; sceneDirty = true; if (play) play.clipId = null; toast('Joined back into one clip (X undoes)'); requestUI(); return; }
+            toast('These are two different clips: pick one and use Drop clip to remove it'); }
+          if (state._cutDrag && J && J.moved) pushShotsUndo(state._cutDrag); state._cutDrag = null; }); } }
   y += nl*lh + 4;
   // "Seen only": per clip, voices play only while their character is in the camera's picture
   { const sh = big ? 40 : 22, anyOff = shots.seq.some(c=>!c.camOnly);
@@ -7390,7 +7403,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
