@@ -35,6 +35,7 @@ html,body{margin:0;height:100%;background:#06020a;overflow:hidden;color:#fff;fon
 #card .row{display:flex;gap:10px;flex-wrap:wrap}
 #card button,#card label{font-family:Bungee,'Arial Black',Impact,sans-serif;font-size:17px;border:4px solid #000;border-radius:14px;padding:12px 16px;box-shadow:4px 4px 0 #000;cursor:pointer;color:#000}
 #vrBtn{background:#FFE600}
+#vrOnly{background:#FF1F9E}
 #fileBtn{background:#19E3FF}
 #card .small{font-size:12px;color:#bbb;margin:12px 0 0}
 #toast{position:fixed;left:50%;top:18px;transform:translateX(-50%);background:#FFE600;color:#000;border:4px solid #000;border-radius:14px;padding:10px 16px;font-size:16px;opacity:0;transition:opacity .25s;pointer-events:none;box-shadow:4px 4px 0 #000;max-width:80vw;text-align:center}
@@ -46,12 +47,13 @@ html,body{margin:0;height:100%;background:#06020a;overflow:hidden;color:#fff;fon
 <div id="panelWrap"></div>
 <div id="card">
   <h1>SUNSPOT XR</h1>
-  <p>Record up to a minute of voice. Every chop becomes a sun floating around you. Reach in and hold the trigger to arpeggiate the suns near your hand, or draw a path through them and reshape it with its handles.</p>
+  <p>Record up to a minute of voice. Every chop becomes a sun in a 3D cloud in your room, with similar sounds floating together. Reach in and hold the trigger to arpeggiate the suns near your hand, or draw a path through them and reshape it with its handles.</p>
   <div class="row">
-    <button id="vrBtn">Enter VR</button>
+    <button id="vrBtn">Enter XR</button>
+    <button id="vrOnly">VR instead</button>
     <label id="fileBtn">Load audio<input id="file" type="file" accept="audio/*,video/*" hidden></label>
   </div>
-  <p class="small">On a computer: hold the left mouse button near suns to play · right-drag to look around · scroll to zoom. In the Quest browser, tap REC once here first so the mic is allowed before you go into VR.</p>
+  <p class="small">On a computer: hold the left mouse button near suns to play · right-drag to look around · scroll to zoom. In the Quest browser, tap REC once here first so the mic is allowed before you go into XR.</p>
 </div>
 <div id="toast"></div>
 
@@ -72,10 +74,11 @@ const BUNGEE = 'Bungee, "Arial Black", Impact, sans-serif', SANS = 'Helvetica, A
 
 /* ================= settings ================= */
 const DEF = {sens:.55, maxLen:.25, bpm:92, div:4, pattern:'up', notes:4, gate:.6, tone:0, snap:false, key:9, scale:'minPent',
-  mix:0, wave:'glass', oct:0, cutoff:.55, echo:0, verb:0, vol:.85, twist:false, labels:true, layout:'around',
+  mix:0, wave:'glass', oct:0, cutoff:.55, echo:0, verb:0, vol:.85, twist:false, labels:true, layout:'sound',
   reach:.05, blend:true, pathDir:'fwd', pathMute:false, deskMode:'play', tab:'voice', menu:true};
 const S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem('sunspot-xr-settings') || '{}')); } catch (e) {}
+if (S.layout !== 'sound' && S.layout !== 'grid') S.layout = 'sound';
 const saveSettings = () => { try { localStorage.setItem('sunspot-xr-settings', JSON.stringify(S)); } catch (e) {} };
 
 /* ================= audio graph ================= */
@@ -175,7 +178,7 @@ function analyze(x, sr) {
     const rms = Math.sqrt(ss / len), rdb = 20 * Math.log10(rms + 1e-9);
     if (rdb < floor + 4) continue;
     const p = pitchOf(x2, Math.floor(s / 2), Math.floor(e / 2), sr2);
-    ds.push({start: s / sr, len: len / sr, rms, zcr: zc / len, pitched: !!p, midi: p ? p.midi : null, conf: p ? p.conf : 0});
+    ds.push({start: s / sr, len: len / sr, rms, zcr: zc / len, pitched: !!p, midi: p ? p.midi : null, conf: p ? p.conf : 0, spec: specFeatures(x, s, e, sr)});
   }
   if (ds.length > 256) { ds.sort((a, b) => b.rms - a.rms); ds = ds.slice(0, 256); }
   ds.sort((a, b) => a.start - b.start);
@@ -209,13 +212,127 @@ function pitchOf(x, s, e, sr) {
   fs.sort((a, b) => a - b);
   return {midi: fs[Math.floor(fs.length / 2)], conf: 1 - apSum / voiced};
 }
+/* ---- what each chop sounds like: brightness, noisiness and a timbre fingerprint ---- */
+const FN = 1024, fftRe = new Float32Array(FN), fftIm = new Float32Array(FN), HANN = new Float32Array(FN).map((_, i) => .5 - .5 * Math.cos(2 * Math.PI * i / (FN - 1)));
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+  for (let len = 2; len <= n; len <<= 1) { const a = -2 * Math.PI / len, wr = Math.cos(a), wi = Math.sin(a);
+    for (let i = 0; i < n; i += len) { let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) { const ur = re[i + k], ui = im[i + k], vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+        re[i + k] = ur + vr; im[i + k] = ui + vi; re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi; const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr; } } }
+}
+const NB = 16;
+function specFeatures(x, s, e, sr) {
+  const mag = new Float32Array(FN / 2), len = e - s, nfr = clamp(Math.floor(len / (FN / 2)), 1, 4);
+  for (let f = 0; f < nfr; f++) {
+    const off = s + Math.floor((len - Math.min(len, FN)) * (nfr === 1 ? .5 : f / (nfr - 1)));
+    for (let i = 0; i < FN; i++) { const k = off + i; fftRe[i] = k < e && k < x.length ? x[k] * HANN[i] : 0; fftIm[i] = 0; }
+    fft(fftRe, fftIm);
+    for (let i = 0; i < FN / 2; i++) mag[i] += Math.hypot(fftRe[i], fftIm[i]);
+  }
+  const hz = i => i * sr / FN, lo = 80, hi = Math.min(9000, sr / 2 - 100), bands = new Float32Array(NB);
+  let sum = 0, wsum = 0, lsum = 0, cnt = 0;
+  for (let i = 1; i < FN / 2; i++) { const f = hz(i); if (f < lo || f > hi) continue; const m = mag[i] + 1e-9;
+    sum += m; wsum += m * Math.log2(f); lsum += Math.log(m); cnt++;
+    const b = Math.min(NB - 1, Math.floor(NB * Math.log(f / lo) / Math.log(hi / lo))); bands[b] += m * m; }
+  const centroid = sum > 0 ? wsum / sum : 10, flat = cnt ? Math.exp(lsum / cnt) / (sum / cnt) : 0;
+  const lb = Array.from(bands, v => Math.log(v + 1e-10)), cep = [];
+  for (let k = 1; k <= 8; k++) { let c = 0; for (let b = 0; b < NB; b++) c += lb[b] * Math.cos(Math.PI * k * (b + .5) / NB); cep.push(c / NB); }
+  return {centroid, flat, cep};
+}
+function pca3(X) {   // top-3 principal directions by power iteration
+  const n = X.length, m = X[0].length, C = Array.from({length: m}, () => new Float64Array(m));
+  for (const r of X) for (let a = 0; a < m; a++) for (let b = 0; b < m; b++) C[a][b] += r[a] * r[b];
+  const vecs = [];
+  for (let k = 0; k < 3; k++) { let v = Array.from({length: m}, (_, i) => Math.sin(i * 1.7 + k * 2.3) + .1);
+    for (let it = 0; it < 80; it++) { const w = C.map(row => row.reduce((acc, c, j) => acc + c * v[j], 0));
+      for (const u of vecs) { const dp = w.reduce((a2, wi, i) => a2 + wi * u[i], 0); for (let i = 0; i < m; i++) w[i] -= dp * u[i]; }
+      const nn = Math.hypot(...w) || 1; v = w.map(wi => wi / nn); }
+    vecs.push(v); }
+  return X.map(r => vecs.map(v => r.reduce((a2, ri, i) => a2 + ri * v[i], 0)));
+}
+function* tsneGen(X) {   // small exact t-SNE into 3D, run a slice per frame: similar sounds end up near each other
+  const n = X.length, D = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { let s2 = 0; for (let k = 0; k < X[i].length; k++) { const q = X[i][k] - X[j][k]; s2 += q * q; } D[i * n + j] = D[j * n + i] = s2; }
+  const perp = Math.min(14, (n - 1) / 3), H = Math.log(perp), P = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) { let lo = -Infinity, hi = Infinity, beta = 1;
+    for (let it = 0; it < 50; it++) { let sp = 0, sdp = 0;
+      for (let j = 0; j < n; j++) { if (j === i) continue; const pj = Math.exp(-D[i * n + j] * beta); P[i * n + j] = pj; sp += pj; sdp += D[i * n + j] * pj; }
+      sp = sp || 1e-12; const h = Math.log(sp) + beta * sdp / sp;
+      for (let j = 0; j < n; j++) P[i * n + j] /= sp;
+      if (Math.abs(h - H) < 1e-4) break;
+      if (h > H) { lo = beta; beta = hi === Infinity ? beta * 2 : (beta + hi) / 2; } else { hi = beta; beta = lo === -Infinity ? beta / 2 : (beta + lo) / 2; } }
+    if (i % 12 === 11) yield; }
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { const v = Math.max((P[i * n + j] + P[j * n + i]) / (2 * n), 1e-12); P[i * n + j] = P[j * n + i] = v; }
+  const Y = pca3(X); let sd = 0; for (const y of Y) sd += y[0] * y[0]; sd = Math.sqrt(sd / n) || 1;
+  for (const y of Y) for (let k = 0; k < 3; k++) y[k] = y[k] / sd * 1e-2;
+  const G = Y.map(() => [0, 0, 0]), gains = Y.map(() => [1, 1, 1]), vel = Y.map(() => [0, 0, 0]), Q = new Float64Array(n * n), lr = Math.max(40, n / 4);
+  for (let it = 0; it < 450; it++) {
+    const ex = it < 100 ? 4 : 1, mom = it < 120 ? .5 : .8; let qs = 0;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { const a = Y[i], b = Y[j]; const q = 1 / (1 + (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2); Q[i * n + j] = Q[j * n + i] = q; qs += 2 * q; }
+    for (let i = 0; i < n; i++) { const g = G[i]; g[0] = g[1] = g[2] = 0;
+      for (let j = 0; j < n; j++) { if (i === j) continue; const q = Q[i * n + j], m2 = 4 * (ex * P[i * n + j] - q / qs) * q;
+        g[0] += m2 * (Y[i][0] - Y[j][0]); g[1] += m2 * (Y[i][1] - Y[j][1]); g[2] += m2 * (Y[i][2] - Y[j][2]); } }
+    for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) {
+      gains[i][k] = Math.sign(G[i][k]) !== Math.sign(vel[i][k]) ? gains[i][k] + .2 : Math.max(.01, gains[i][k] * .8);
+      vel[i][k] = mom * vel[i][k] - lr * gains[i][k] * G[i][k]; Y[i][k] += vel[i][k]; }
+    if (it % 3 === 2) yield;
+  }
+  return Y;
+}
+// fit the cloud into a box in front of you: up = higher pitch, right = brighter, spread evenly so every sun is reachable
+const BOX_C = new V3(0, 1.3, -0.55), HALF = [.38, .3, .22];
+let simJob = null;
+function simFeatures() {
+  const n = dots.length;
+  const raw = dots.map(d => [d.pm, d.spec.centroid, d.spec.flat, d.zcr * 50, 20 * Math.log10(d.rms + 1e-6), Math.log(d.len), d.pitched ? d.conf : 0, ...d.spec.cep]);
+  const W = [2.2, 1.3, 1.2, .8, .6, .5, 1, .8, .8, .7, .7, .6, .6, .5, .5];
+  const m = raw[0].length, mu = new Array(m).fill(0), sdv = new Array(m).fill(0);
+  raw.forEach(r => r.forEach((v, k) => mu[k] += v / n)); raw.forEach(r => r.forEach((v, k) => sdv[k] += (v - mu[k]) ** 2 / n));
+  return raw.map(r => r.map((v, k) => (v - mu[k]) / (Math.sqrt(sdv[k]) || 1) * W[k]));
+}
+function fitBox(Y) {
+  const n = Y.length, c = [0, 0, 0]; Y.forEach(y => { for (let k = 0; k < 3; k++) c[k] += y[k] / n; });
+  const pts = Y.map(y => new V3(y[0] - c[0], y[1] - c[1], y[2] - c[2]));
+  const regress = vals => { const mv = vals.reduce((a, b) => a + b, 0) / n, w = new V3(); pts.forEach((p, i) => w.addScaledVector(p, vals[i] - mv)); return w.lengthSq() > 1e-12 ? w.normalize() : null; };
+  const up = regress(dots.map(d => d.pm));
+  if (up) { const q = new THREE.Quaternion().setFromUnitVectors(up, new V3(0, 1, 0)); pts.forEach(p => p.applyQuaternion(q)); }
+  const br = regress(dots.map(d => d.spec.centroid));
+  if (br) { br.y = 0; if (br.lengthSq() > 1e-8) { const q = new THREE.Quaternion().setFromAxisAngle(new V3(0, 1, 0), Math.atan2(br.z, br.x)); pts.forEach(p => p.applyQuaternion(q)); } }
+  // per axis: half straight scaling, half rank, so clusters stay together but nothing flies off far away
+  for (let k = 0; k < 3; k++) {
+    const v = pts.map(p => p.getComponent(k)), lo = Math.min(...v), hi = Math.max(...v);
+    const ord = v.map((x, i) => i).sort((a, b) => v[a] - v[b]), rank = new Array(n); ord.forEach((i, r) => rank[i] = n > 1 ? r / (n - 1) : .5);
+    pts.forEach((p, i) => p.setComponent(k, ((hi > lo ? (v[i] - lo) / (hi - lo) : .5) * .5 + rank[i] * .5 - .5) * 2 * HALF[k]));
+  }
+  for (let it = 0; it < 25; it++) for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const dv = pts[i].clone().sub(pts[j]), L = dv.length(), minD = .028;
+    if (L < minD) { if (L < 1e-6) dv.set(Math.sin(i), Math.cos(j), Math.sin(i + j)); dv.normalize().multiplyScalar((minD - L) / 2); pts[i].add(dv); pts[j].sub(dv); } }
+  return pts.map(p => p.add(BOX_C));
+}
+function similarityPositions() {
+  if (!dots.length) return [];
+  const X = simFeatures(), first = fitBox(pca3(X));
+  simJob = dots.length >= 8 ? {dots, gen: tsneGen(X)} : null;
+  return first;
+}
+function runSimJob() {
+  if (!simJob) return;
+  if (simJob.dots !== dots || S.layout !== 'sound') { simJob = null; return; }
+  const t0 = performance.now();
+  while (performance.now() - t0 < 7) {
+    const r = simJob.gen.next();
+    if (r.done) { const pts = fitBox(r.value); dots.forEach((d, i) => d.tp = pts[i]); simJob = null; paths.forEach(computeSeq); break; }
+  }
+}
 function layoutDots() {
   const n = dots.length; if (!n) return;
   const pm = dots.map(d => d.pitched ? d.midi : clamp(ftom(Math.max(60, d.zcr * sample.sr / 2)) - 24, 40, 90));
   const lo = Math.min(...pm), hi = Math.max(...pm);
   const order = pm.map((v, i) => i).sort((a, b) => pm[a] - pm[b]);
   const rank = new Array(n); order.forEach((i, r) => rank[i] = n > 1 ? r / (n - 1) : .5);
-  dots.forEach((d, i) => { d.u = d.start / Math.max(.1, sample.data.length / sample.sr); const lin = hi > lo ? (pm[i] - lo) / (hi - lo) : .5; d.v = .45 * lin + .55 * rank[i]; });
+  dots.forEach((d, i) => { d.pm = pm[i]; d.u = d.start / Math.max(.1, sample.data.length / sample.sr); const lin = hi > lo ? (pm[i] - lo) / (hi - lo) : .5; d.v = .45 * lin + .55 * rank[i]; });
 }
 function scaleNotes(lo, hi) { const sc = SCALES[S.scale] || SCALES.minPent, out = []; for (let m = lo; m <= hi; m++) if (sc.includes(((m - S.key) % 12 + 12) % 12)) out.push(m); return out; }
 function nearestScale(m) { let best = Math.round(m), bd = 1e9; for (const n of scaleNotes(Math.floor(m) - 12, Math.ceil(m) + 12)) { const dd = Math.abs(n - m); if (dd < bd) { bd = dd; best = n; } } return best; }
@@ -281,7 +398,7 @@ function playDot(d, t, stepDur, sp, pan) {
 const GAP = .035;
 function blendOf(pos) {
   if (dots.length < 2) return null;
-  const near = dots.map(d => [d.lp.distanceTo(pos), d]).sort((a, b) => a[0] - b[0]).slice(0, 3);
+  const near = dots.map(d => [d.tp.distanceTo(pos), d]).sort((a, b) => a[0] - b[0]).slice(0, 3);
   let ws = near.map(([dist]) => 1 / (dist * dist + 1e-4)); const tot = ws.reduce((a, b) => a + b, 0); ws = ws.map(w => w / tot);
   let m = 0; near.forEach(([, d], i) => m += ws[i] * d.note);
   if (S.snap) m = nearestScale(m);
@@ -319,7 +436,7 @@ async function startRec() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('The mic needs the https link (GitHub Pages).'); return; }
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}}); }
-  catch (e) { toast('Mic blocked. Leave VR, tap REC on the page and allow the microphone.'); return; }
+  catch (e) { toast('Mic blocked. Leave XR, tap REC on the page and allow the microphone.'); return; }
   const src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(4096, 1, 1), mute = ctx.createGain();
   mute.gain.value = 0;
   rec = {stream, src, proc, mute, chunks: [], count: 0, level: 0, stopAsked: false};
@@ -394,7 +511,7 @@ async function idbPut(v) { try { const db = await idb(); db.transaction('s', 're
 async function idbGet() { try { const db = await idb(); return await new Promise(res => { const q = db.transaction('s').objectStore('s').get('sample'); q.onsuccess = () => res(q.result); q.onerror = () => res(null); }); } catch (e) { return null; } }
 
 /* ================= three.js scene ================= */
-const renderer = new THREE.WebGLRenderer({antialias: true});
+const renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
@@ -403,9 +520,9 @@ $('#gl').appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#06020a');
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.01, 400);
-camera.position.set(0, 2.25, 1.9); scene.add(camera);
+camera.position.set(0.25, 1.55, 0.75); scene.add(camera);
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 1.25, -0.15);
+controls.target.set(0, 1.3, -0.55);
 controls.mouseButtons = {LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE};
 controls.enableDamping = true; controls.minDistance = .3; controls.maxDistance = 12; controls.update();
 scene.add(new THREE.HemisphereLight('#ffffff', '#3a1040', 1.6));
@@ -417,6 +534,7 @@ const glowTex = canvasTex(64, 64, (g, w) => { const gr = g.createRadialGradient(
 
 // --- world: black sun, corona, stars, floor rings
 let raysSprite;
+const world = new THREE.Group(); scene.add(world);
 (function buildWorld() {
   const corona = canvasTex(512, 512, (g, w) => { const c = w / 2, gr = g.createRadialGradient(c, c, 0, c, c, c);
     gr.addColorStop(0, 'rgba(255,230,0,1)'); gr.addColorStop(.3, 'rgba(255,230,0,1)'); gr.addColorStop(.36, 'rgba(255,90,0,1)'); gr.addColorStop(.48, 'rgba(225,0,50,.75)');
@@ -426,20 +544,20 @@ let raysSprite;
     g.lineTo(c + Math.cos(a - da) * c, c + Math.sin(a - da) * c); g.lineTo(c + Math.cos(a + da) * c, c + Math.sin(a + da) * c); g.fill(); } });
   const pos = new V3(0, 9, -70);
   raysSprite = new THREE.Sprite(new THREE.SpriteMaterial({map: rays, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false}));
-  raysSprite.position.copy(pos).add(new V3(0, 0, -2)); raysSprite.scale.setScalar(78); scene.add(raysSprite);
+  raysSprite.position.copy(pos).add(new V3(0, 0, -2)); raysSprite.scale.setScalar(78); world.add(raysSprite);
   const cor = new THREE.Sprite(new THREE.SpriteMaterial({map: corona, transparent: true, depthWrite: false}));
-  cor.position.copy(pos).add(new V3(0, 0, -1)); cor.scale.setScalar(50); scene.add(cor);
-  const bs = new THREE.Mesh(new THREE.SphereGeometry(8, 48, 32), new THREE.MeshBasicMaterial({color: '#000000'})); bs.position.copy(pos); scene.add(bs);
+  cor.position.copy(pos).add(new V3(0, 0, -1)); cor.scale.setScalar(50); world.add(cor);
+  const bs = new THREE.Mesh(new THREE.SphereGeometry(8, 48, 32), new THREE.MeshBasicMaterial({color: '#000000'})); bs.position.copy(pos); world.add(bs);
   const N = 1400, sp = new Float32Array(N * 3), sc = new Float32Array(N * 3), cA = new THREE.Color();
   for (let i = 0; i < N; i++) { const u = Math.random() * 2 - 1, a = Math.random() * Math.PI * 2, r = 120, s = Math.sqrt(1 - u * u);
     sp.set([r * s * Math.cos(a), Math.abs(r * u) * .9 + 5, r * s * Math.sin(a)], i * 3);
     cA.set(['#ffffff', '#FFB300', '#FF1F9E', '#19E3FF'][i % 4]); sc.set([cA.r, cA.g, cA.b], i * 3); }
   const sg = new THREE.BufferGeometry(); sg.setAttribute('position', new THREE.BufferAttribute(sp, 3)); sg.setAttribute('color', new THREE.BufferAttribute(sc, 3));
-  scene.add(new THREE.Points(sg, new THREE.PointsMaterial({size: .7, vertexColors: true, map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending})));
-  const floor = new THREE.Mesh(new THREE.CircleGeometry(60, 64).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({color: '#0d0512'})); scene.add(floor);
+  world.add(new THREE.Points(sg, new THREE.PointsMaterial({size: .7, vertexColors: true, map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending})));
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(60, 64).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({color: '#0d0512'})); world.add(floor);
   [[.9, COL.o], [1.8, COL.p], [3.2, COL.v], [5.5, COL.amber], [9, COL.r], [15, COL.v]].forEach(([r, c]) => {
     const m = new THREE.Mesh(new THREE.RingGeometry(r, r + .025 + r * .004, 96).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({color: c, transparent: true, opacity: .55}));
-    m.position.y = .002; scene.add(m); });
+    m.position.y = .002; world.add(m); });
 })();
 
 const cloud = new THREE.Group(); scene.add(cloud);
@@ -453,18 +571,18 @@ let sunIM = null, ringIM = null, glowPts = null, timeRing = null;
 function heightCol(v) { const x = clamp(v, 0, 1) * (PALV.length - 1), i = Math.min(PALV.length - 2, Math.floor(x)); return PALV[i].clone().lerp(PALV[i + 1], x - i); }
 function place3D() {
   const dur = sample ? sample.data.length / sample.sr : 10;
-  const span = clamp(dur / 60, .4, 1) * THREE.MathUtils.degToRad(330);
-  for (const d of dots) {
-    const air = d.pitched ? clamp((1 - d.conf) * 2.5, 0, 1) : 1;
-    const jit = ((d.id * 7919) % 13) / 13 - .5;
-    const y = 0.85 + d.v * 0.95;
-    if (S.layout === 'front') d.lp = new V3((d.u - .5) * 1.4, y, -0.45 - air * 0.22 - jit * 0.04);
-    else { const th = -span / 2 + d.u * span, r = 0.5 + air * 0.2 + jit * 0.04; d.lp = new V3(r * Math.sin(th), y, -r * Math.cos(th)); }
+  let pts;
+  if (S.layout === 'grid') {   // like the phone app: left→right = time, up = pitch, depth = brightness
+    const cs = dots.map(d => d.spec.centroid), cl = Math.min(...cs), ch = Math.max(...cs);
+    pts = dots.map(d => new V3((d.u - .5) * .9, 1.3 + (d.v - .5) * .7, -.55 + (ch > cl ? (.5 - (d.spec.centroid - cl) / (ch - cl)) : 0) * .45));
+  } else pts = similarityPositions();
+  dots.forEach((d, i) => {
+    d.tp = pts[i];
+    if (!d.lp) d.lp = BOX_C.clone().add(new V3(Math.sin(i * 12.9) * .02, Math.cos(i * 7.3) * .02, Math.sin(i * 3.1) * .02));
     d.col = d.pitched ? heightCol(d.v) : RINGC.clone();
-    const m = new THREE.Matrix4().lookAt(d.lp, new V3(0, d.lp.y, S.layout === 'front' ? 0 : 0), new V3(0, 1, 0));
-    d.q = new THREE.Quaternion().setFromRotationMatrix(m);
-  }
-  rebuildDotMeshes(); buildTimeRing(dur, span);
+    d.q = new THREE.Quaternion();
+  });
+  rebuildDotMeshes(); buildTimeRing(dur);
 }
 function rebuildDotMeshes() {
   for (const m of [sunIM, ringIM, glowPts]) if (m) { m.removeFromParent(); m.material.dispose(); if (m.isPoints) m.geometry.dispose(); else m.dispose(); }
@@ -480,7 +598,7 @@ function rebuildDotMeshes() {
   dots.forEach((d, i) => gp.set([d.lp.x, d.lp.y, d.lp.z], i * 3));
   const gg = new THREE.BufferGeometry(); gg.setAttribute('position', new THREE.BufferAttribute(gp, 3)); gg.setAttribute('color', new THREE.BufferAttribute(gc, 3));
   gg.setDrawRange(0, dots.length);
-  glowPts = new THREE.Points(gg, new THREE.PointsMaterial({size: .075, vertexColors: true, map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false}));
+  glowPts = new THREE.Points(gg, new THREE.PointsMaterial({size: .04, vertexColors: true, map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false}));
   glowPts.frustumCulled = false;
   cloud.add(glowPts, sunIM, ringIM);
 }
@@ -492,28 +610,28 @@ function textSprite(text, col, h, bg) {
   const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
   const s = new THREE.Sprite(new THREE.SpriteMaterial({map: t, transparent: true, depthWrite: false})); s.scale.set(h * w / 64, h, 1); return s;
 }
-function buildTimeRing(dur, span) {
+function buildTimeRing(dur) {
   if (timeRing) { timeRing.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } }); timeRing.removeFromParent(); }
   timeRing = new THREE.Group(); cloud.add(timeRing);
-  if (!sample) return;
-  const y = .76, at = u => S.layout === 'front' ? new V3((u - .5) * 1.4, y, -.45) : new V3(.5 * Math.sin(-span / 2 + u * span), y, -.5 * Math.cos(-span / 2 + u * span));
-  const pts = []; for (let i = 0; i <= 120; i++) pts.push(at(i / 120));
-  timeRing.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({color: COL.o, transparent: true, opacity: .7})));
+  if (!sample || S.layout !== 'grid') return;
+  const y = .9, at = u => new V3((u - .5) * .9, y, -.55);
+  timeRing.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([at(0), at(1)]), new THREE.LineBasicMaterial({color: COL.o, transparent: true, opacity: .7})));
   const stepS = dur > 20 ? 10 : dur > 6 ? 2 : 1, tk = [];
-  for (let s = 0; s <= dur + 1e-6; s += stepS) { const p = at(s / dur); tk.push(p.clone(), p.clone().add(new V3(0, -.025, 0)));
-    const lab = textSprite(s + 's', '#FFB300', .022); lab.position.copy(p).add(new V3(0, -.045, 0)); timeRing.add(lab); }
+  for (let s = 0; s <= dur + 1e-6; s += stepS) { const p = at(s / dur); tk.push(p.clone(), p.clone().add(new V3(0, -.02, 0)));
+    const lab = textSprite(s + 's', '#FFB300', .02); lab.position.copy(p).add(new V3(0, -.04, 0)); timeRing.add(lab); }
   timeRing.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(tk), new THREE.LineBasicMaterial({color: COL.o})));
 }
 const _m4 = new THREE.Matrix4(), _s3 = new V3(), _c = new THREE.Color();
 function updateDots(dt) {
   if (!dots.length || !glowPts) return;
-  const ca = glowPts.geometry.attributes.color, k = Math.exp(-dt * 5);
+  const ca = glowPts.geometry.attributes.color, pa = glowPts.geometry.attributes.position, k = Math.exp(-dt * 5), mv = 1 - Math.exp(-dt * 3.5);
   dots.forEach((d, i) => {
     d.glow *= k;
-    _s3.setScalar(1 + d.glow * 1.4 + (d.sel ? .35 : 0));
+    if (d.lp.distanceToSquared(d.tp) > 1e-8) { d.lp.lerp(d.tp, mv); pa.setXYZ(i, d.lp.x, d.lp.y, d.lp.z); pa.needsUpdate = true; }
+    _s3.setScalar(1 + d.glow * .7 + (d.sel ? .3 : 0));
     _m4.compose(d.lp, d.q, _s3); d.im.setMatrixAt(d.ii, _m4);
-    _c.copy(d.col).lerp(WHITE, d.glow * .65); d.im.setColorAt(d.ii, _c);
-    const b = .22 + d.glow * 1.3 + (d.sel ? .25 : 0);
+    _c.copy(d.col).lerp(WHITE, d.glow * .45); d.im.setColorAt(d.ii, _c);
+    const b = .05 + d.glow * .4 + (d.sel ? .06 : 0);
     ca.setXYZ(i, d.col.r * b, d.col.g * b, d.col.b * b);
   });
   for (const m of [sunIM, ringIM]) { m.instanceMatrix.needsUpdate = true; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
@@ -524,7 +642,7 @@ function updateDots(dt) {
 function makePlayer(kind) { return {kind, set: [], idx: 0, nextT: 0, fresh: false, speed: 1, pt: new V3(), active: false, lastRand: -1, seq: null, bead: 0}; }
 function nearestN(pt, n) {
   if (!dots.length) return [];
-  const arr = dots.map(d => [d.lp.distanceToSquared(pt), d]); arr.sort((a, b) => a[0] - b[0]);
+  const arr = dots.map(d => [d.tp.distanceToSquared(pt), d]); arr.sort((a, b) => a[0] - b[0]);
   const set = arr.slice(0, n).map(a => a[1]);
   if (S.pattern === 'speech') set.sort((a, b) => a.start - b.start); else set.sort((a, b) => a.note - b.note || a.start - b.start);
   return set;
@@ -624,7 +742,7 @@ function buildPath(p) {
 function computeSeq(p) {
   const r2 = S.reach * S.reach; p.seq = []; let last = -1, gapRun = 0;
   p.samples.forEach((s, k) => { let bj = -1, bd = r2;
-    for (let j = 0; j < dots.length; j++) { const dd = s.distanceToSquared(dots[j].lp); if (dd < bd) { bd = dd; bj = j; } }
+    for (let j = 0; j < dots.length; j++) { const dd = s.distanceToSquared(dots[j].tp); if (dd < bd) { bd = dd; bj = j; } }
     if (k) gapRun += s.distanceTo(p.samples[k - 1]);
     if (bj >= 0) { if (bj !== last) { p.seq.push({j: bj, k}); last = bj; } gapRun = 0; }
     else if (S.blend && dots.length > 1 && (gapRun >= .045 || k === 0)) { p.seq.push({ghost: true, pos: s.clone(), k}); gapRun = 0; last = -1; } });
@@ -804,7 +922,7 @@ function drawPanel() {
   switch (S.tab) {
     case 'voice': {
       const r = !!rec;
-      button(X0, y, 400, 136, r ? `■ STOP\n${recSec().toFixed(1)}s / 60` : '● REC\nhold B in VR', r ? '#ff2a2a' : COL.r, '#fff', () => { unlock(); rec ? stopRec() : startRec(); }, 40);
+      button(X0, y, 400, 136, r ? `■ STOP\n${recSec().toFixed(1)}s / 60` : '● REC\nhold B in XR', r ? '#ff2a2a' : COL.r, '#fff', () => { unlock(); rec ? stopRec() : startRec(); }, 40);
       button(X0 + 420, y, 186, 136, 'DEMO\nVOICE', COL.v, '#fff', () => { unlock(); demoVoice(); }, 28);
       button(X0 + 626, y, 186, 136, 'RESET\nPLACE', COL.c, '#000', () => { cloud.position.set(0, 0, 0); cloud.quaternion.identity(); cloud.scale.setScalar(1); toast('Suns back around you'); }, 28);
       y += 170;
@@ -812,8 +930,8 @@ function drawPanel() {
       txt(dots.length ? `${dots.length} chops · ${p} with a clear note · ${dots.length - p} breaths + hits` : 'Hold B and talk, sing or rap for up to a minute.', X0, y, 26, '#fff'); y += 44;
       y = slider(y, 'Chop sensitivity', 'sens', 0, 1, pct, 'fewer chops', 'more chops');
       y = slider(y, 'Longest chop', 'maxLen', .08, .6, v => Math.round(v * 1000) + ' ms', 'short', 'long');
-      y = seg(y, 'Where the suns float', 'layout', [['around', 'Around you'], ['front', 'In front']]);
-      wrap('Filled suns have a clear note, cyan rings are breaths, hits and S sounds. Higher = higher pitch. Time runs clockwise from in front of you.', X0, y, WC, 22, 30, '#c9b6d6');
+      y = seg(y, 'Arrange the suns', 'layout', [['sound', 'By sound'], ['grid', 'Time · pitch']]);
+      wrap(S.layout === 'grid' ? 'Like the phone app: left to right is time, up is pitch, nearer is brighter.' : 'Similar-sounding chops float together. Up is roughly higher pitch, right is brighter. Filled suns have a note; cyan rings are breaths, hits and S sounds.', X0, y, WC, 22, 30, '#c9b6d6');
       break; }
     case 'arp':
       y = seg(y, 'Pattern', 'pattern', [['up', 'Up'], ['down', 'Down'], ['bounce', 'Bounce'], ['random', 'Random'], ['speech', 'Speech']], COL.o, 22);
@@ -883,6 +1001,7 @@ function onSet(k) {
   if (k === 'snap' || k === 'key' || k === 'scale') assignNotes();
   if (['echo', 'verb', 'vol', 'bpm'].includes(k)) applyFX();
   if (k === 'layout') { place3D(); paths.forEach(computeSeq); }
+  if (k === 'world') applyWorld();
   if (k === 'reach' || k === 'blend') paths.forEach(computeSeq);
   if (k === 'labels') hands.forEach(h => h.hints && (h.hints.grp.visible = S.labels));
   saveSettings(); panelDirty = true;
@@ -1057,7 +1176,7 @@ function screenHandle(e) {
 }
 function deskPlayPoint() {
   if (!dots.length) return null; let bd = 1e9, bp = null;
-  for (const d of dots) { const w = cloud.localToWorld(d.lp.clone()), dd = deskRay.ray.distanceSqToPoint(w); if (dd < bd) { bd = dd; bp = w; } }
+  for (const d of dots) { const w = cloud.localToWorld(d.tp.clone()), dd = deskRay.ray.distanceSqToPoint(w); if (dd < bd) { bd = dd; bp = w; } }
   const q = deskRay.ray.closestPointToPoint(bp, new V3()); return cloud.worldToLocal(q);
 }
 renderer.domElement.addEventListener('pointerdown', e => {
@@ -1092,7 +1211,7 @@ function updateSets() {
   const dp = desk.player; dp.active = false; desk.cluster.visible = false;
   if (desk.down && !desk.drag && !desk.draw && !renderer.xr.isPresenting) { const pt = deskPlayPoint(); if (pt) { dp.active = true; dp.pt.copy(pt); live.push([dp, desk.cluster]); } }
   for (const [p, cl] of live) {
-    let nd = 1e9; for (const d of dots) nd = Math.min(nd, d.lp.distanceTo(p.pt));
+    let nd = 1e9; for (const d of dots) nd = Math.min(nd, d.tp.distanceTo(p.pt));
     p.ghost = S.blend && dots.length > 1 && nd > GAP;
     p.set = nearestN(p.pt, p.ghost ? 3 : n); let r = 0;
     for (const d of p.set) { d.sel = 1; r = Math.max(r, d.lp.distanceTo(p.pt));
@@ -1116,6 +1235,7 @@ renderer.setAnimationLoop(() => {
     for (const h of hands) updateHand(h);
     updateGrab();
   }
+  runSimJob();
   updateSets();
   tick();
   processFlashes();
@@ -1140,17 +1260,31 @@ renderer.setAnimationLoop(() => {
 /* ================= start ================= */
 $('#file').addEventListener('change', e => { const f = e.target.files[0]; if (f) loadFile(f); e.target.value = ''; });
 const vrBtn = $('#vrBtn');
-if (navigator.xr && navigator.xr.isSessionSupported) navigator.xr.isSessionSupported('immersive-vr').then(ok => { if (!ok) { vrBtn.textContent = 'No VR here'; vrBtn.disabled = true; vrBtn.style.opacity = .5; } }).catch(() => {});
-else { vrBtn.textContent = 'No VR here'; vrBtn.disabled = true; vrBtn.style.opacity = .5; }
-vrBtn.addEventListener('click', async () => {
+let passthrough = false;
+const BG = new THREE.Color('#06020a');
+function applyWorld() { const pt = passthrough && renderer.xr.isPresenting; scene.background = pt ? null : BG; world.visible = !pt; }
+async function enter(mode) {
   unlock();
   try {
-    const s = await navigator.xr.requestSession('immersive-vr', {optionalFeatures: ['local-floor', 'bounded-floor']});
-    await renderer.xr.setSession(s);
+    const s = await navigator.xr.requestSession(mode, {optionalFeatures: ['local-floor', 'bounded-floor']});
+    passthrough = mode === 'immersive-ar';
+    s.addEventListener('end', () => { passthrough = false; applyWorld(); });
+    await renderer.xr.setSession(s); applyWorld();
     toast(dots.length ? 'Reach into the suns and hold the trigger. Y opens the menu.' : 'Hold B and talk or sing to make suns.');
-  } catch (e) { toast("Couldn't start VR: " + (e.message || e)); }
-});
-window.__sx = {blendOf, playBlend, tick, flashes, S, dots: () => dots, paths, hands, desk, cloud, newPath, finishStroke, computeSeq, demoVoice, drawPanel, pDown, players: allPlayers, get ctx() { return ctx; }, get voiceBus() { return voiceBus; }};
+  } catch (e) { toast("Couldn't start: " + (e.message || e)); }
+}
+let mainMode = 'immersive-ar';
+vrBtn.addEventListener('click', () => enter(mainMode));
+$('#vrOnly').addEventListener('click', () => enter('immersive-vr'));
+const off = (el, t) => { el.textContent = t; el.disabled = true; el.style.opacity = .5; };
+(async () => {
+  const sup = async m => { try { return !!(navigator.xr && await navigator.xr.isSessionSupported(m)); } catch (e) { return false; } };
+  const ar = await sup('immersive-ar'), vr = await sup('immersive-vr');
+  if (!ar && vr) { mainMode = 'immersive-vr'; vrBtn.textContent = 'Enter VR'; $('#vrOnly').style.display = 'none'; }
+  else if (!ar && !vr) { off(vrBtn, 'No headset here'); $('#vrOnly').style.display = 'none'; }
+  else if (!vr) $('#vrOnly').style.display = 'none';
+})();
+window.__sx = {setSample, blendOf, playBlend, tick, flashes, S, dots: () => dots, paths, hands, desk, cloud, newPath, finishStroke, computeSeq, demoVoice, drawPanel, pDown, players: allPlayers, get ctx() { return ctx; }, get voiceBus() { return voiceBus; }};
 (async () => {
   try { await document.fonts.load(`34px Bungee`); } catch (e) {}
   hands.forEach(writeHints); panelDirty = true;
