@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '478';
+const VERSION = '481';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2186,7 +2186,7 @@ function trackAt(tr, t, outP, outQ){
 function controlledKeys(){
   const set = new Set();
   if (show.grab) set.add(show.grab.c ? 'r'+show.grab.c.id : String(show.grab.L.id));
-  if (show.embodied){ const ride = riding(show.embodied); for (const part of show.embodied.parts) if (!(ride && part.body)) set.add(String(part.L.id)); if (show.embodied.rootMoved) set.add('r'+show.embodied.c.id); set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
+  if (show.embodied){ const ride = riding(show.embodied); for (const part of show.embodied.parts) if (!(ride && part.body)) set.add(String(part.L.id)); if (show.embodied.rootMoved || ride) set.add('r'+show.embodied.c.id); /* riding: the body's walk is re-recorded with your steps in it */ set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
   if (show.rec && show.rec.voiceFor) set.add('m'+show.rec.voiceFor);
   for (const sd of ['left','right']) if (embGrab[sd]) set.add('r'+embGrab[sd].c.id);
   netControlled(set);
@@ -2498,11 +2498,17 @@ function updateBodyFollow(snap){
 // RIDE: the puppet was already moved from outside (it has a whole-character track). Its body stays locked to that
 // motion, your head and hands act relative to it (they tilt and turn with it), and you ride along, eyes in its head, view kept level.
 function riding(e){ return !!(e && e.rigRel && ((show.tracks['r'+e.c.id] && !e.rootMoved) || e.tilted)); }
+// where the recorded walk puts the puppet right now (never the take being recorded, so your walking can't feed back into it)
+const _rbP = V(), _rbQ = new THREE.Quaternion();
+function ridingBase(e){
+  const par = e.c.root.parent; par.updateMatrixWorld(true); const tr = show.tracks['r'+e.c.id];
+  if (tr && tr.samples && tr.samples.length){ const s = trackAt(tr, show.t || 0, _rbP, _rbQ); return par.matrixWorld.clone().multiply(new THREE.Matrix4().compose(_rbP, _rbQ, new THREE.Vector3(s, s, s))); }
+  if (!e.base0){ e.c.root.updateMatrixWorld(true); e.base0 = e.c.root.matrixWorld.clone(); } return e.base0;
+}
 function followRoot(dt){
   const e = show.embodied;
   if (riding(e)){
-    e.c.root.updateMatrixWorld(true);
-    const Mv = e.c.root.matrixWorld.clone().multiply(e.rigRel), vp = V(), vq = new THREE.Quaternion(), vs = V(); Mv.decompose(vp, vq, vs);
+    const Mv = ridingBase(e).multiply(e.rigRel), vp = V(), vq = new THREE.Quaternion(), vs = V(); Mv.decompose(vp, vq, vs);
     let qT = vq;
     if (!state.freeTurn){ const f = new THREE.Vector3(0,0,-1).applyQuaternion(vq); f.y = 0;
       qT = f.lengthSq() > 1e-4 ? new THREE.Quaternion().setFromAxisAngle(_y, Math.atan2(-f.x, -f.z)) : rig.quaternion.clone(); }
@@ -2526,7 +2532,18 @@ function updateEmbodied(){
   const ride = riding(show.embodied);
   rig.updateMatrixWorld(true);
   const inv = ride ? show.embodied.rigRel.clone().multiply(rig.matrixWorld.clone().invert()) : root.matrixWorld.clone().invert();   // riding: you move in the puppet's own frame
-  for (const part of show.embodied.parts){ if (ride && part.body) continue; const tr = part.side ? ctrl[part.side]?.grip : part.tracker; if (!tr){ if (!part.warned){ part.warned = true; toast('Your '+part.side+' controller is asleep: press any of its buttons'); } continue; } part.warned = false; setObjMatrix(part.L.group, inv.clone().multiply(unscaled(tr).multiply(part.off))); }
+  let undrift = null;
+  if (ride){   // the body keeps its recorded walk, plus a smoothed step toward wherever your head (and a little of your hands) went
+    const e = show.embodied, Bm = ridingBase(e), tgt = V(); let ws = 0; e.drift = e.drift || V();
+    for (const part of e.parts){ if (part.body) continue; const w = part.L.part==='head' ? 0.75 : part.side ? 0.125 : 0; if (!w) continue;
+      const tr = part.side ? ctrl[part.side]?.grip : part.tracker; if (!tr) continue;
+      const p = V().setFromMatrixPosition(inv.clone().multiply(unscaled(tr).multiply(part.off))); tgt.addScaledVector(p.sub(V().fromArray(part.L.rest.p)), w); ws += w; }
+    if (ws){ tgt.divideScalar(ws); tgt.y = 0; e.drift.lerp(tgt, 0.07); }
+    root.parent.updateMatrixWorld(true); setObjMatrix(root, root.parent.matrixWorld.clone().invert().multiply(Bm).multiply(new THREE.Matrix4().makeTranslation(e.drift.x, 0, e.drift.z))); root.updateMatrixWorld(true);
+    undrift = new THREE.Matrix4().makeTranslation(-e.drift.x, 0, -e.drift.z);
+  }
+  for (const part of show.embodied.parts){ if (ride && part.body) continue; const tr = part.side ? ctrl[part.side]?.grip : part.tracker; if (!tr){ if (!part.warned){ part.warned = true; toast('Your '+part.side+' controller is asleep: press any of its buttons'); } continue; } part.warned = false;
+    const M = inv.clone().multiply(unscaled(tr).multiply(part.off)); setObjMatrix(part.L.group, undrift ? undrift.clone().multiply(M) : M); }
 }
 
 /* grab whole characters (PERFORM). Scenery never moves. */
@@ -7899,7 +7916,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
