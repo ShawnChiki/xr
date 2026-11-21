@@ -138,7 +138,8 @@ function sliceLoops(P, tol, minArc){
   const out = [], t2 = tol * tol; let start = 0;
   for (let i = start + 1; i < n; i++){
     for (let j = start; j < i && arc[i] - arc[j] > minArc; j++){
-      if (d2(P[i], P[j]) < t2){ out.push(P.slice(start, i + 1)); start = i; break; }
+      if (d2(P[i], P[j]) < t2){ if (arc[n - 1] - arc[i] < Math.max(tol * 2, minArc * 0.25)){ out.push(P.slice(start)); return out.filter(q => q.length >= 3); }   // the last bit past where a loop closes belongs to the loop
+        out.push(P.slice(start, i + 1)); start = i; break; }
     }
   }
   out.push(P.slice(start));
@@ -146,9 +147,11 @@ function sliceLoops(P, tol, minArc){
 }
 // strict lines are used exactly as drawn: no grouping, no averaging
 function strictCurves(strokes, L, sharp, tag){
-  return strokes.map(s => {
-    const closed = s.length > 8 && d2(s[0], s[s.length - 1]) < sq(L * 0.6) && polyLen(s) > 4 * L;
-    const C = makeCurve(resample(closed ? s.slice(0, -1) : s, L * 0.25, closed), closed, sharp, tag); C.strict = true; C.user = s.corners || []; return C;
+  return strokes.map(s => { const corners0 = s.corners;
+    // a loop closed by hand: its ends meet, or the end runs on a little past the start (closed where it comes back)
+    let closed = s.length > 8 && d2(s[0], s[s.length - 1]) < sq(L * 0.6) && polyLen(s) > 4 * L;
+    if (!closed && s.length > 12 && polyLen(s) > 6 * L){ const tol2 = sq(Math.max(L * 0.6, 0.2)); let acc = 0, cut = -1; for (let i = s.length - 1; i > s.length * 0.6 && acc < Math.max(L * 3, 0.9); i--){ if (d2(s[i], s[0]) < tol2){ cut = i; break; } acc += Math.sqrt(d2(s[i], s[i - 1])); } if (cut > 0){ s = s.slice(0, cut + 1); closed = true; } }
+    const C = makeCurve(resample(closed ? s.slice(0, -1) : s, L * 0.25, closed), closed, sharp, tag); C.strict = true; C.user = corners0 || []; return C;
   }).filter(C => C.pts.length >= 2 && C.len > L * 0.5);
 }
 function principalCurve(grp, g, ds){
@@ -798,6 +801,8 @@ function unfold(M, iters){
 // ---------------------------------------------------------------- cutting a curve into the mesh
 function embedCurve(M, C, id, L, cross){
   const S = resample(C.pts, L * 0.35, C.closed); if (S.length < 2) return 0;
+  // a guide goes straight through any line it crosses, sharing a vertex with it there (a corner of the quad layout)
+  const thru = !!C.guideEdge, curvesAll = M.curvesRef || null;
   // an edge that jumps straight from one line to another (across an inside corner, say) blocks the way for the
   // next line; give it a middle vertex the new line can pass through
   if (!cross){ const E = M.edges(); for (let i = 0; i < E.length; i += 2){ const a = E[i], b = E[i + 1]; if (M.fc[a] >= 0 && M.fc[b] >= 0 && !M.fe.has(M.ek(a, b)) && M.edgeTris(a, b).length) M.split(a, b); } }
@@ -832,13 +837,14 @@ function embedCurve(M, C, id, L, cross){
     const paths = []; let path = [run[0]];
     for (let i = 1; i < run.length; i++){
       const u = path[path.length - 1], w = run[i]; if (u === w) continue;
-      const sp = shortestPath(M, u, w, L * (cross ? 10 : 4), cross);
+      const sp = shortestPath(M, u, w, L * (cross ? 10 : 4), cross || thru);
       if (!sp){ if (path.length > 1) paths.push(path); path = [w]; continue; }   // a line that can't get through picks up again past the gap
       for (let k = 1; k < sp.length; k++) path.push(sp[k]);
     }
     paths.push(path);
     for (const path of paths){
-      const closed = C.closed && path.length > 3 && path[0] === path[path.length - 1];
+      const wrapOpen = !C.closed && path.length > 8 && path[0] === path[path.length - 1];
+      const closed = (C.closed && path.length > 3 && path[0] === path[path.length - 1]) || wrapOpen;
       // cut out any loops the walk made
       const seen = new Map(), clean = [];
       for (let i = 0; i < path.length; i++){ const v = path[i];
@@ -855,10 +861,16 @@ function embedCurve(M, C, id, L, cross){
         chains.push(clean.slice(a)); }
       for (const clean of chains){
       if (clean.length < 2) continue;
+      // a guide that stops just short of another line reaches over and ends on it (a T)
+      if (thru && !closed) for (const end of [0, 1]){ const e = end ? clean[clean.length - 1] : clean[0]; if (M.fc[e] >= 0 && M.fc[e] !== id) continue;
+        const tip = end ? C.pts[C.pts.length - 1] : C.pts[0]; if (d2(M.P(e), tip) > sq(L * 1.6)) continue; let bw = -1, bd = sq(L * 1.6);
+        for (const w of M.nbrs(e)){ if (M.fc[w] < 0 || M.fc[w] === id || M.fe.has(M.ek(e, w)) || clean.includes(w)) continue; const dd = d2(M.P(w), tip); if (dd < bd){ bd = dd; bw = w; } }
+        if (bw >= 0){ if (end) clean.push(bw); else clean.unshift(bw); } }
       // spread the chain evenly along the stretch of curve it covers
       const s0 = closestOnPoly(C, M.P(clean[0])).s, s1 = closestOnPoly(C, M.P(clean[clean.length - 1])).s;
       let a0 = s0, a1 = s1;
-      if (closed){
+      if (wrapOpen){ const sm = closestOnPoly(C, M.P(clean[Math.floor(clean.length / 3)])).s; if (sm > C.len / 2){ const f = clean[0]; clean.reverse(); clean.pop(); clean.unshift(f); } a0 = 0; a1 = C.len; }
+      else if (closed){
         // which way round the loop the chain runs (laid out the wrong way, every vertex lands across the loop and
         // the inside of a bowl's coping flattens into a lid)
         const sm = closestOnPoly(C, M.P(clean[Math.floor(clean.length / 3)])).s, dm = ((sm - s0) % C.len + C.len) % C.len;
@@ -870,7 +882,11 @@ function embedCurve(M, C, id, L, cross){
       const n = clean.length, denom = closed ? n : n - 1;
       for (let i = 0; i < n; i++){
         const v = clean[i], q = pointAt(C, a0 + (a1 - a0) * i / denom);
-        if (M.fc[v] >= 0 && M.fc[v] !== id && C.row) continue;   // a row never takes over a crease's vertex
+        if (M.fc[v] >= 0 && M.fc[v] !== id && C.row){   // a row never takes over a crease's vertex
+          if (thru){ M.corner[v] = true; const A = curvesAll && curvesAll[M.fc[v]];
+            // two guides crossing (or one ending on another): the shared vertex sits where they actually meet
+            if (A && A.guideEdge){ let p = M.P(v); for (let k = 0; k < 3; k++){ p = pointAt(C, closestOnPoly(C, p).s); p = pointAt(A, closestOnPoly(A, p).s); } if (d2(p, M.P(v)) < sq(L * 1.5)) M.setP(v, p); } }
+          continue; }
         if (M.fc[v] >= 0 && M.fc[v] !== id){ if (cross) (M.cross || (M.cross = new Set())).add(v); else M.corner[v] = true; continue; }
         M.setP(v, q); M.fc[v] = id;
       }
@@ -919,6 +935,33 @@ function shortestPath(M, src, dst, maxLen, cross){
   return path.reverse();
 }
 
+// An edge line drawn across the surface usually stops a little short of the sheet's border (the sheet reaches out past
+// your lines), and a cut that doesn't get all the way across cuts nothing. So an open edge line carries straight on
+// from each loose end, over the sheet, until it leaves it or meets another crease or edge. Only a short way: an end
+// left far from any border stays where it is.
+function extendEdges(M, curves, L, maxExt){
+  const VG = new Grid(L); for (let v = 0; v < M.x.length; v++) if (M.vt[v].length) VG.add(v, M.x[v], M.y[v], M.z[v]);
+  const bv = new Uint8Array(M.x.length); for (let v = 0; v < M.x.length; v++) if (M.vt[v].length && M.isBV(v)) bv[v] = 1;
+  const nearV = (p, r) => { let b = -1, bd = r * r; VG.each(p[0], p[1], p[2], r, v => { const dd = d2(M.P(v), p); if (dd < bd){ bd = dd; b = v; } }); return b; };
+  let n = 0;
+  curves.forEach((C, ci) => { if (!C.edge || C.closed || C.len < L * 2) return; let pts = C.pts.slice(), changed = false, loop = false;
+    for (const end of [0, 1]){ if (loop) break; const other = end ? pts[0] : pts[pts.length - 1];
+      const tip = end ? pts[pts.length - 1] : pts[0], back = pointAt(C, end ? C.len - Math.min(C.len / 3, 0.6) : Math.min(C.len / 3, 0.6));
+      const d = [tip[0] - back[0], 0, tip[2] - back[2]], dl = Math.hypot(d[0], d[2]); if (dl < 1e-6) continue; d[0] /= dl; d[2] /= dl;
+      const v0 = nearV(tip, L * 1.6); if (v0 < 0 || bv[v0]) continue;                      // off the sheet, or already at its border
+      if (curves.some((O, oi) => oi !== ci && closestOnPoly(O, tip).d2 < sq(L * 0.8))) continue;   // already ends on another line
+      const add = []; let y = tip[1], done = false, lim = Math.max(maxExt, C.len * 0.2);
+      for (let k = 1; k * L * 0.5 <= lim + L; k++){ const p = [tip[0] + d[0] * k * L * 0.5, y, tip[2] + d[2] * k * L * 0.5], c = closestOnMesh(M, VG, p, L * 1.5);
+        if (!c){ add.push(p); done = true; break; }
+        y = c.p[1]; p[1] = y; add.push(p);
+        if (C.len > L * 6 && d2(p, other) < sq(L * 0.7)){ done = true; loop = true; break; }      // it comes round to its own other end: a loop left a little open
+        if (curves.some((O, oi) => oi !== ci && closestOnPoly(O, p).d2 < sq(L * 0.5))){ done = true; break; } }
+      if (!done || !add.length) continue;
+      if (end) pts = pts.concat(add); else pts = add.reverse().concat(pts); changed = true; n++;
+    }
+    if (changed){ const N2 = makeCurve(resample(pts, L * 0.25, loop), loop, C.sharp, C.tag); C.pts = N2.pts; C.cum = N2.cum; C.len = N2.len; C.closed = loop; } });
+  return n;
+}
 // ---------------- edges (green lines): where the surface ends
 // The sheet is cut along every edge line; pieces on the far side (where few loose lines are) are removed.
 function cutAtEdges(M, curves, samples, h){
@@ -2439,6 +2482,7 @@ function solve(strokes, prm, progress = () => {}){
   const guides = layGuides(M, guides0, L, h);
   let flow = guides.length ? flowField(M, [...guides.map(C => ({ C, w: 1 })), ...curves.map(C => ({ C, w: 0.35 }))], h) : null;
   M.strictIds = new Set(curves.map((C, i) => C.strict ? i : -1).filter(i => i >= 0)); M.strictLen = strictLenFn(curves, prm.creaseMin ?? 0.45);
+  if (prm.extendEdges !== false) extendEdges(M, curves, L, Math.max(1.5, (prm.reach || 0) * 2 + h * 2 + L * 3));
   curves.forEach((C, i) => embedCurve(M, C, i, L));
   if (cutAtEdges(M, curves, samples, h)) progress(0.56, 'Trimming at the edges');
   untangle(M, 4);
@@ -2499,6 +2543,7 @@ function solve(strokes, prm, progress = () => {}){
   if (guides.length && prm.guideEdges !== false && !(prm.target < 0)){
     const M0 = M.clone(), a0 = triArea(M), base1 = curves.length;
     try {
+      M.curvesRef = curves;
       guides.forEach((G, i) => { const C = Object.assign(G, { row: true, level: 1, guideEdge: true }); curves.push(C); embedCurve(M, C, base1 + i, L); });
       remesh(M, L, 0.8); unfold(M, 2); M.compact(); const ar = triArea(M) / a0; if (!(ar > 0.95 && ar < 1.05)) throw new Error('area');
     } catch (e){ M = M0.clone(); curves.length = base1; guides.forEach(G => { delete G.row; delete G.level; delete G.guideEdge; }); }

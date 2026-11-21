@@ -93,8 +93,8 @@
 <div id="tipsWrap" class="menuwrap tipswrap" hidden></div>
 <button id="menuBtn" class="slab menubtn" hidden>Menu</button>
 
-<script src="demo.js?v=p4.3"></script>
-<script src="solver.js?v=p4.3"></script>
+<script src="demo.js?v=p4.4"></script>
+<script src="solver.js?v=p4.4"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -108,7 +108,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
 // bump this with every change, and add a line to README.md
-const VERSION = '4.3';
+const VERSION = '4.4';
 const $ = s => document.querySelector(s);
 $('#ver').textContent = 'v' + VERSION;
 const V3 = THREE.Vector3;
@@ -284,7 +284,7 @@ function smoothed(raw, lv){
 function makeStroke(tag, raw, pts){ pts = pts || smoothed(raw, S.smooth); return { id: nextId++, tag, raw, pts, box: boxOf(pts), layer: curLayer }; }
 function nearBox(s, p, r){ const b = s.box; return p.x > b[0] - r && p.x < b[3] + r && p.y > b[1] - r && p.y < b[4] + r && p.z > b[2] - r && p.z < b[5] + r; }
 function touches(s, p, r){ if (!nearBox(s, p, r)) return false; const a = s.pts, r2 = r * r; for (let i = 0; i < a.length; i += 3) if ((a[i] - p.x) ** 2 + (a[i + 1] - p.y) ** 2 + (a[i + 2] - p.z) ** 2 < r2) return true; return false; }
-function changed(){ linesDirty = true; menuDirty = true; scheduleSave(); placeGrid(); ensureLayers();
+function changed(){ stackT = 0.8; linesDirty = true; menuDirty = true; scheduleSave(); placeGrid(); ensureLayers();
   // only the layer whose lines changed rebuilds (the others are caught up in the background)
   { const L = layerById(curLayer); if (!L || L.sig !== layerSig(curLayer) || !surfMesh) scheduleBuild(); }
   // a blank layer has no surface: clear the old build straight away
@@ -1009,6 +1009,62 @@ function setLayer(id){
   if (B.sig !== layerSig(id) && !B.cage) scheduleBuild();
   linesDirty = true; rebuildHandles(); hiKey = '#'; setHighlight([]); menuDirty = true; scheduleSave(); try { PLAY.rebuild(); } catch (e){}
   flash('Drawing on ' + B.name + (activeStrokes().length ? '' : ' (empty: start drawing)'));
+}
+// ---------- lines over lines (a tunnel, a bridge, a roof): one layer builds one sheet, seen from above, so it can't be
+// both the floor and the roof over it. This finds where this layer's lines sit in two levels, and can move the upper
+// level to a layer of its own (splitting any line that runs from one level up into the other, where it's steepest).
+let stackHint = 0, stackT = 0;
+function stackScan(){
+  const sq = x => x * x, mine = activeStrokes(), h = QUAD[S.quad] * 1.6, cell = Math.max(h * 0.6, 0.3), GAP = Math.max(0.8 * h, 0.4);
+  const smp = [], per = mine.map(() => []);      // [x, y, z, stroke, label]  label: 0 unknown, 1 lower, 2 upper
+  mine.forEach((st, si) => { for (let i = 0; i + 2 < st.pts.length; i += 3){ per[si].push(smp.length); smp.push([st.pts[i], st.pts[i + 1], st.pts[i + 2], si, 0]); } });
+  const cells = new Map(); smp.forEach((q, i) => { if (mine[q[3]].tag !== 0) return; const k = Math.floor(q[0] / cell) + ',' + Math.floor(q[2] / cell); (cells.get(k) || cells.set(k, []).get(k)).push(i); });
+  // spots where the lines sit at two levels with a clear gap between, the upper ones over the lower ones
+  const cand = new Map();
+  for (const [k, ids] of cells){ if (ids.length < 4) continue; const srt = ids.slice().sort((a, b) => smp[a][1] - smp[b][1]); let gi = -1, gap = GAP;
+    for (let i = 2; i + 1 < srt.length; i++){ const d = smp[srt[i]][1] - smp[srt[i - 1]][1]; if (d > gap){ gap = d; gi = i; } }
+    if (gi < 0 || srt.length - gi < 2) continue;
+    const lo = srt.slice(0, gi), up = srt.slice(gi), r2 = sq(cell * 0.15); let over = 0; for (const u of up){ for (const l of lo) if (sq(smp[u][0] - smp[l][0]) + sq(smp[u][2] - smp[l][2]) < r2){ over++; break; } } if (over < 2) continue;
+    cand.set(k, { srt, gi }); }
+  // a ledge or a steep wall also shows two levels where its edge runs, but only along a thin line of spots. A roof
+  // over a floor covers an area: it needs spots surrounded by other such spots, and takes in the ones joined to them
+  const nbK = k => { const [i, j] = k.split(',').map(Number), o = []; for (let a = -1; a <= 1; a++) for (let b2 = -1; b2 <= 1; b2++) if (a || b2) o.push((i + a) + ',' + (j + b2)); return o; };
+  const core = [...cand.keys()].filter(k => nbK(k).filter(q => cand.has(q)).length >= 6), take = new Set(core), qu = core.slice();
+  while (qu.length){ const k = qu.pop(); for (const q of nbK(k)) if (cand.has(q) && !take.has(q)){ take.add(q); qu.push(q); } }
+  let stacked = core.length >= 2 ? take.size : 0;
+  for (const k of take){ const { srt, gi } = cand.get(k); srt.forEach((id, i) => { smp[id][4] = i < gi ? 1 : 2; }); }
+  if (stacked < 4) return { stacked: 0 };
+  // along each line: fill the stretches between known points; a stretch that goes from the lower level to the upper is
+  // split where the line is steepest
+  const G3 = new Map(), gk = (x, y, z) => Math.floor(x / cell) + ',' + Math.floor(y / cell) + ',' + Math.floor(z / cell);
+  smp.forEach((q, i) => { if (q[4]) (G3.get(gk(q[0], q[1], q[2])) || G3.set(gk(q[0], q[1], q[2]), []).get(gk(q[0], q[1], q[2]))).push(i); });
+  const nearLabel = q => { let b = 0, bd = sq(cell * 1.2); const i0 = Math.floor(q[0] / cell), j0 = Math.floor(q[1] / cell), k0 = Math.floor(q[2] / cell);
+    for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++){ const a = G3.get((i0 + i) + ',' + (j0 + j) + ',' + (k0 + k)); if (a) for (const id of a){ const o = smp[id], dd = sq(o[0] - q[0]) + sq(o[1] - q[1]) + sq(o[2] - q[2]); if (dd < bd){ bd = dd; b = o[4]; } } } return b; };
+  const plan = mine.map((st, si) => { const ids = per[si], lab = ids.map(i => smp[i][4]), n = lab.length; if (!n) return lab;
+    if (!lab.some(Boolean)){ let u = 0, l = 0; for (const i of ids){ const x = nearLabel(smp[i]); if (x === 2) u++; else if (x === 1) l++; } return lab.fill(u > l && u > n * 0.3 ? 2 : 1); }
+    let i = 0; while (i < n){ if (lab[i]){ i++; continue; } let j = i; while (j < n && !lab[j]) j++; const a = i > 0 ? lab[i - 1] : 0, b = j < n ? lab[j] : 0;
+      if (a && b && a !== b){ let cut = i, best = -1; for (let k = Math.max(1, i); k <= Math.min(n - 1, j); k++){ const p = smp[ids[k - 1]], q = smp[ids[k]], st2 = Math.abs(q[1] - p[1]) / (Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]) || 1); if (st2 > best){ best = st2; cut = k; } }
+        for (let k = i; k < j; k++) lab[k] = k < cut ? a : b; }
+      else for (let k = i; k < j; k++) lab[k] = a || b;
+      i = j; }
+    return lab; });
+  let upper = 0; plan.forEach(l => l.forEach(x => { if (x === 2) upper++; }));
+  return { stacked, plan, mine, upper };
+}
+function stackSplit(){
+  const sc = stackScan(); if (!sc.stacked || sc.upper < 12) return flash('No lines over other lines found on this layer');
+  if (layers.length >= 8) return flash('Eight layers is the most: delete one first');
+  const id = layers.reduce((m, L) => Math.max(m, L.id), 0) + 1; layers.push({ id, name: 'Layer ' + id + ' · over', show: 1 });
+  const out = strokes.filter(st => layerOf(st) !== curLayer); let moved = 0, cutN = 0;
+  sc.mine.forEach((st, si) => { const lab = sc.plan[si];
+    if (!lab.includes(2)){ out.push(st); return; }
+    if (!lab.includes(1)){ out.push(Object.assign({}, st, { layer: id })); moved++; return; }
+    // runs of one level each become their own line (a short run joins its neighbour)
+    let a = 0; const runs = []; for (let i = 1; i <= lab.length; i++) if (i === lab.length || lab[i] !== lab[a]){ runs.push([a, i, lab[a]]); a = i; }
+    for (const [i0, i1, l] of runs){ const j0 = Math.max(0, i0 - (i0 > 0 ? 1 : 0)), raw = st.pts.slice(3 * j0, 3 * i1); if (raw.length < 9) continue; const ns = makeStroke(st.tag, Float32Array.from(raw)); ns.layer = l === 2 ? id : curLayer; out.push(ns); }
+    cutN++; });
+  commit(out); stackHint = 0; menuDirty = true; try { NET.layersChanged(); } catch (e){}
+  flash('The upper lines are on ' + layerById(id).name + ' now (' + moved + ' moved' + (cutN ? ', ' + cutN + ' split where they climb from one level to the other' : '') + '). It builds its own surface. Undo puts them back.', 7);
 }
 function newLayer(){ const id = layers.reduce((m, L) => Math.max(m, L.id), 0) + 1; if (layers.length >= 8) return flash('Eight layers is the most'); layers.push({ id, name: 'Layer ' + id, show: 1 }); setLayer(id); try { NET.layersChanged(); } catch (e){} }
 let layerDelArmed = 0;
@@ -4428,6 +4484,8 @@ function setStep(st, quiet){
   head('sketch');
   section('sketch', 'SURFACE');
   buildCard('sketch', 96);
+  note('sketch', 'Some lines here sit over other lines (a tunnel, a bridge, a roof). One layer builds one sheet seen from above, so it can\'t be the floor and the roof at once: the surface gets pulled between them.', { vis: () => stackHint > 0 });
+  row('sketch', 72, [{ id: 'stack-split-sk', style: 'lock', on: () => true, label: () => 'Put the upper lines on their own layer', sub: () => 'it builds its own surface · Undo puts them back', act: stackSplit }], { vis: () => stackHint > 0 });
   row('sketch', 72, [{ id: 'rad-on-sk', style: 'lock', label: () => S.radCheck !== 0 ? 'Radius check: on' + (hasSurface() ? ' · ' + (RADIUS.count ? RADIUS.count + ' tight' : 'all clear') : '') : 'Radius check: off', sub: () => S.radCheck !== 0 ? 'inside curves under ' + fabLen(radMM()) : '', on: () => S.radCheck !== 0, act: () => { S.radCheck = S.radCheck === 0 ? 1 : 0; scheduleSave(); } }]);
   section('sketch', () => 'LAYERS · EACH BUILDS ITS OWN SURFACE');
   for (let i = 0; i < 8; i++){ const h = 64, bw = 170, L = () => layers[i];
@@ -4472,6 +4530,8 @@ function setStep(st, quiet){
   // ===== 3 SURFACE
   head('surface');
   note('surface', () => 'Building ' + layerById(curLayer).name + '. Other layers keep theirs (switch in Sketch → Layers).', { vis: () => layers.length > 1 });
+  note('surface', 'Some lines here sit over other lines (a tunnel, a bridge, a roof). One layer builds one sheet seen from above, so it can\'t be the floor and the roof at once: the surface gets pulled between them.', { vis: () => stackHint > 0 });
+  row('surface', 72, [{ id: 'stack-split-sf', style: 'lock', on: () => true, label: () => 'Put the upper lines on their own layer', sub: () => 'it builds its own surface · Undo puts them back', act: stackSplit }], { vis: () => stackHint > 0 });
   section('surface', 'BUILD');
   buildCard('surface', 116);
   const setTarget = v => setParam(() => { const was = (S.target || 0) < 0; S.target = v; if (v < 0 && !was){ if (S.edges === 'off') setEdges('quads'); if (!S.onSurf) S.onSurf = 1; flash('Quads follow your guides: draw blue guides on the surface where the edges should run', 6); } });
@@ -5659,6 +5719,7 @@ renderer.setAnimationLoop(now => {
   if (buildTimer > 0){ buildTimer -= real; if (buildTimer <= 0){ if (drawing()) buildTimer = 0.25; else startBuild(); } }
   if (saveT > 0){ saveT -= real; if (saveT <= 0) save(); }
   if (clearArmed > 0){ clearArmed -= real; if (clearArmed <= 0) menuDirty = true; }
+  if (stackT > 0){ stackT -= real; if (stackT <= 0){ let n = 0; try { n = stackScan().stacked || 0; } catch (e){} if (n !== stackHint){ stackHint = n; menuDirty = true; } } }
   if (layerDelArmed > 0){ layerDelArmed -= real; if (layerDelArmed <= 0) menuDirty = true; }
   if (libDelT > 0){ libDelT -= real; if (libDelT <= 0){ libDel = null; menuDirty = true; } }
   if (linesDirty && (!editOpen || now - lastLines > 120)){ rebuildLines(); lastLines = now; }
