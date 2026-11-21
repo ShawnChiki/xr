@@ -60,7 +60,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '450';
+const VERSION = '452';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -4908,9 +4908,9 @@ async function lineUpVoices(list){
   toast(!tried ? 'No mouth motion to match these voices to' : moved ? 'Lined up '+moved+' voice'+(moved>1?'s':'')+' with their mouths' : 'Already lined up'); requestUI();
 }
 // old worlds kept every voice as "other sounds": give each one to the character who said it (by name, else by whose mouth moved with it)
-async function sortVoices(){
-  const pups = show.chars.filter(c => c.type==='puppet'); if (!pups.length){ toast('No characters to give voices to'); return; }
-  toast('Matching voices to mouths…'); const b = snapShow(); let n = 0, left = 0;
+async function sortVoices(quiet){
+  const pups = show.chars.filter(c => c.type==='puppet'); if (!pups.length){ if (!quiet) toast('No characters to give voices to'); return 0; }
+  if (!quiet) toast('Matching voices to characters…'); const b = snapShow(); let n = 0, left = 0;
   for (const sc of scenes){ const cur = sc.id===curScene, list = (cur ? show.audio : sc.audio) || [], tracks = (cur ? show.tracks : sc.tracks) || {};
     for (const a of list){ if (a.cid != null && charById(a.cid)) continue;
       const nm = (a.name||'').toLowerCase(), byName = pups.filter(c => c.name && nm.includes(c.name.toLowerCase()));
@@ -4919,9 +4919,31 @@ async function sortVoices(){
         for (const c of pups){ const r = await matchMouth(a, tracks['m'+c.id], -0.6, 0.6); if (!r) continue;
           if (!best || r.score > best.score){ if (best) second = best.score; best = {cid:c.id, score:r.score}; } else if (r.score > second) second = r.score; }
         if (best && best.score > 0.25 && best.score - second > 0.05) cid = best.cid; }
+      if (cid == null){   // older takes: the character recorded in the same take has motion that starts and ends with this voice
+        const at = a.at || 0, end = at + (a.dur || 0), hits2 = [];
+        for (const c of pups){ const keys = ['h'+c.id, 'm'+c.id, 'e'+c.id, ...partsOf(c).map(L => String(L.id))];
+          let bestD = 1e9; for (const k of keys){ const S = tracks[k] && tracks[k].samples; if (!S || S.length < 18) continue;
+            const t0 = S.find((v,i)=>i%9===0 && i+9<S.length && (S[i+1]!==S[i+10] || S[i+2]!==S[i+11] || S[i+3]!==S[i+12])), t1 = S[S.length-9];
+            const dd = Math.abs(t1 - end) + (t0 != null ? Math.abs(t0 - at)*0.5 : 0); if (dd < bestD) bestD = dd; }
+          if (bestD < 0.6) hits2.push({cid:c.id, d:bestD}); }
+        hits2.sort((x,y)=>x.d-y.d); if (hits2.length && (hits2.length === 1 || hits2[1].d - hits2[0].d > 0.25)) cid = hits2[0].cid; }
       if (cid != null){ a.cid = cid; a._peaks = null; if (!a.name || /^voice/i.test(a.name)) a.name = charById(cid).name+"'s voice"; n++; } else left++; } }
-  pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; audioStop();
-  toast(n ? 'Gave '+n+' voice'+(n>1?'s':'')+' to their characters'+(left ? ' · '+left+' left to pick by hand' : '') : 'Couldn\'t tell who said them: pick "Who" on each voice'); requestUI();
+  if (n){ pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; audioStop(); }
+  if (!quiet || n) toast(n ? 'Gave '+n+' older voice'+(n>1?'s':'')+' to their characters'+(left ? ' · '+left+' left: pick "Who says it" on those' : '') : 'Couldn\'t tell who said them: pick "Who says it" on each voice');
+  requestUI(); return n;
+}
+// older worlds: sort their voices automatically the first time you open Edit or Action in them
+let autoSorted = null;
+function autoSortOnce(){ if (autoSorted === state.worldId) return; autoSorted = state.worldId;
+  const any = scenes.some(sc => ((sc.id===curScene ? show.audio : sc.audio) || []).some(a => !(a.cid != null && charById(a.cid))));
+  if (any) setTimeout(() => sortVoices(true), 300); }
+// start the edit over: no clips on the timeline; puppets, their motion and voices all stay
+function emptyTimeline(){
+  const b = editSnap(); if (play) stopPlay();
+  shots.seq.length = 0; shots.playhead = 0;   // this cut's clips go…
+  const used = new Set(); for (const c of (shots.cuts || [])) for (const cl of c.seq) for (const id of cl.takes) used.add(id);
+  shots.takes = shots.takes.filter(t => used.has(t.id)); shots.sel = shots.takes.length ? shots.takes[shots.takes.length-1].id : null;   // …and so do their camera takes (unless another cut uses them)
+  pathDirty = true; pushShotsUndo(b); sceneDirty = true; toast('Timeline emptied · puppets, motion and voices kept · new camera takes land here'); requestUI();
 }
 // cut one recording into pieces (each keeps its own part), so pieces can go to different characters or be muted
 function voiceList(sid){ return sid === curScene ? show.audio : (sceneById(sid)?.audio || []); }
@@ -5084,6 +5106,7 @@ function drawDial(){
   }});
 }
 function setPhase(id){
+  if (id==='edit' || id==='perform') autoSortOnce();
   if (stroke) endStroke(true); if (rec) stopRecording(true); if (show.rec) cutShowRec(true); stopPlay(); stopShow();
   if (blockGrab) endBlockGrab(); if (show.grab) endCharGrab();
   if (id!=='perform' && show.embodied && !(NET.guest && id==='shoot')) stepOut();   // a player can stay in a puppet while you film
@@ -6326,7 +6349,7 @@ function removeTakeEverywhere(id){
 }
 function takesInFilm(){ const s = new Set(); for (const c of shots.seq) for (const id of c.takes) s.add(id); return s; }
 // what the cut's audio lanes hold, in film time
-const laneKey = a => a.cid != null ? 'v'+a.cid : 'vx';
+const laneKey = a => a.cid != null && charById(a.cid) ? 'v'+a.cid : 'vx';
 function laneGain(key){ const m = (ensureCuts().mix || {})[key]; return m ? (m.mute ? 0 : (m.vol ?? 1)) : 1; }
 function laneNode(ctx, a){ const g2 = ctx.createGain(); g2.gain.value = laneGain(laneKey(a)); g2.connect(ctx.destination); return g2; }
 function audioLanes(){
@@ -6539,6 +6562,7 @@ function drawTimeline(X,W){
   if (renderer.xr.isPresenting) button(X,336,W,44, state.edHidden ? 'Show the big editor' : 'Bring the big editor here', false, ()=>{ state.edHidden = false; placeEditor(); requestUI(); }, '#ff9500');
   para(['The timeline, lanes and sounds are in the','big editor. Tap a sound name there to','change that voice.'], X, 404, 13, '#8f97c7');
   const missing = shots.takes.filter(t=>!takesInFilm().has(t.id));
+  if (shots.seq.length){ const armed = state.confirm==='emptytl'; button(X,UIH-110,W,44, armed ? 'Tap again: empty the timeline' : '🧹 Empty the timeline', armed, ()=>{ if (!armed){ state.confirm='emptytl'; requestUI(); return; } state.confirm=null; emptyTimeline(); }, '#ff3b30'); }
   if (missing.length) button(X,470,W,38,'Add back '+missing.length+' take'+(missing.length>1?'s':''),false,()=>{ const b = editSnap(); for (const t of missing) shots.seq.push(newClip([t.id])); pushShotsUndo(b); sceneDirty = true; requestUI(); },'#5e2bff');
   cutChooser(X, UIH-56, W);
 }
@@ -6637,6 +6661,8 @@ function drawEditorWin(){
     if (state.edAud){ drawSoundPanel(16, y, W-32); win.hits = hits; win.tex.needsUpdate = true; g = menuCtx; if (NET.guest) win.hits = hits.filter(h=>h.y < 48); return; }
     const c = clipById(shots.clipSel);
     if (c && y < win.ch-70){ clipTrim(16, y, (W-32)*0.55); }
+    if (!c && y < win.ch-60 && shots.seq.length){ const armed = state.confirm==='emptytl';   // start the edit over, keep everything recorded
+      button(16, y+10, 360, 40, armed ? 'Tap again: empty the timeline' : '🧹 Empty the timeline (keeps puppets + voices)', armed, ()=>{ if (!armed){ state.confirm='emptytl'; requestUI(); return; } state.confirm=null; emptyTimeline(); }, '#ff3b30'); }
     const bx = 16 + (W-32)*0.55 + 16, bw2 = ((W-32)*0.45 - 16 - 16)/3;
     if (y < win.ch-60){ toggle(bx, y+10, bw2, 40, 'Dark room', shots.blackRoom, ()=>{ shots.blackRoom = !shots.blackRoom; sceneDirty = true; requestUI(); }, '#5e2bff');
       toggle(bx+bw2+8, y+10, bw2, 40, 'Stack new takes', state.stackTakes !== false, ()=>{ state.stackTakes = state.stackTakes === false; requestUI(); }, '#00c7be');
@@ -7276,7 +7302,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
