@@ -1,0 +1,1165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Sunspot XR</title>
+<!-- NO-ZOOM GUARD: keep this in every instrument -->
+<style>button,a,[role=button]{touch-action:manipulation}*{-webkit-touch-callout:none}html{-webkit-text-size-adjust:100%;text-size-adjust:100%}</style>
+<script>
+(()=>{
+  const stop=e=>e.preventDefault(), o={passive:false};
+  ['gesturestart','gesturechange','gestureend'].forEach(t=>document.addEventListener(t,stop,o));
+  document.addEventListener('touchmove',e=>{ if(e.touches.length>1||(e.scale&&e.scale!==1)) e.preventDefault(); },o);
+  document.addEventListener('dblclick',stop,o);
+  let last=0;
+  document.addEventListener('touchend',e=>{ const n=Date.now(), t=e.target;
+    if(n-last<350&&!(t.closest&&t.closest('button,a,input,select,textarea,label'))) e.preventDefault(); last=n; },o);
+  addEventListener('wheel',e=>{ if(e.ctrlKey||e.metaKey) e.preventDefault(); },o);
+  addEventListener('keydown',e=>{ if((e.ctrlKey||e.metaKey)&&['+','-','=','_','0'].includes(e.key)) e.preventDefault(); });
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bungee&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+html,body{margin:0;height:100%;background:#06020a;overflow:hidden;color:#fff;font-family:Helvetica,Arial,sans-serif;font-weight:800;touch-action:none;overscroll-behavior:none}
+#gl{position:fixed;inset:0}
+#gl canvas{display:block;touch-action:none}
+#panelWrap{position:fixed;left:14px;top:14px;width:min(440px,46vw);border:4px solid #000;border-radius:20px;overflow:hidden;box-shadow:7px 7px 0 #FF5A00;background:#120818}
+#panelWrap canvas{width:100%;display:block;touch-action:none}
+#card{position:fixed;right:14px;bottom:14px;width:min(400px,46vw);background:#120818;border:4px solid #000;border-radius:20px;box-shadow:7px 7px 0 #E10032;padding:16px 18px}
+#card h1{font-family:Bungee,'Arial Black',Impact,sans-serif;font-weight:400;margin:0 0 6px;font-size:30px;color:#FFB300;letter-spacing:.5px}
+#card p{margin:0 0 12px;font-size:14px;line-height:1.35;color:#eee;font-weight:700}
+#card .row{display:flex;gap:10px;flex-wrap:wrap}
+#card button,#card label{font-family:Bungee,'Arial Black',Impact,sans-serif;font-size:17px;border:4px solid #000;border-radius:14px;padding:12px 16px;box-shadow:4px 4px 0 #000;cursor:pointer;color:#000}
+#vrBtn{background:#FFE600}
+#fileBtn{background:#19E3FF}
+#card .small{font-size:12px;color:#bbb;margin:12px 0 0}
+#toast{position:fixed;left:50%;top:18px;transform:translateX(-50%);background:#FFE600;color:#000;border:4px solid #000;border-radius:14px;padding:10px 16px;font-size:16px;opacity:0;transition:opacity .25s;pointer-events:none;box-shadow:4px 4px 0 #000;max-width:80vw;text-align:center}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div id="gl"></div>
+<div id="panelWrap"></div>
+<div id="card">
+  <h1>SUNSPOT XR</h1>
+  <p>Record up to a minute of voice. Every chop becomes a sun floating around you. Reach in and hold the trigger to arpeggiate the suns near your hand, or draw a path through them and reshape it with its handles.</p>
+  <div class="row">
+    <button id="vrBtn">Enter VR</button>
+    <label id="fileBtn">Load audio<input id="file" type="file" accept="audio/*,video/*" hidden></label>
+  </div>
+  <p class="small">On a computer: hold the left mouse button near suns to play · right-drag to look around · scroll to zoom. In the Quest browser, tap REC once here first so the mic is allowed before you go into VR.</p>
+</div>
+<div id="toast"></div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+const V3 = THREE.Vector3;
+const $ = s => document.querySelector(s);
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+const ftom = f => 69 + 12 * Math.log2(f / 440);
+const NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const SCALES = {minPent:[0,3,5,7,10], majPent:[0,2,4,7,9], minor:[0,2,3,5,7,8,10], dorian:[0,2,3,5,7,9,10], phrygian:[0,1,3,5,7,8,10], hijaz:[0,1,4,5,7,8,10]};
+const MAXREC = 60;
+const COL = {y:'#FFE600', amber:'#FFB300', o:'#FF5A00', r:'#E10032', p:'#FF1F9E', v:'#7A00FF', c:'#19E3FF', g:'#7CFF00', w:'#ffffff', dark:'#2a1636', bg:'#120818'};
+const BUNGEE = 'Bungee, "Arial Black", Impact, sans-serif', SANS = 'Helvetica, Arial, sans-serif';
+
+/* ================= settings ================= */
+const DEF = {sens:.55, maxLen:.25, bpm:92, div:4, pattern:'up', notes:4, gate:.6, tone:0, snap:false, key:9, scale:'minPent',
+  mix:0, wave:'glass', oct:0, cutoff:.55, echo:0, verb:0, vol:.85, twist:false, labels:true, layout:'around',
+  reach:.05, blend:true, pathDir:'fwd', pathMute:false, deskMode:'play', tab:'voice', menu:true};
+const S = Object.assign({}, DEF);
+try { Object.assign(S, JSON.parse(localStorage.getItem('sunspot-xr-settings') || '{}')); } catch (e) {}
+const saveSettings = () => { try { localStorage.setItem('sunspot-xr-settings', JSON.stringify(S)); } catch (e) {} };
+
+/* ================= audio graph ================= */
+let ctx, master, comp, voiceBus, echoSend, verbSend, delay, fb, delayLP, verb;
+function initAudio() {
+  if (ctx) return;
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  master = ctx.createGain();
+  comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 8; comp.ratio.value = 5; comp.attack.value = .003; comp.release.value = .2;
+  master.connect(comp); comp.connect(ctx.destination);
+  voiceBus = ctx.createGain(); voiceBus.gain.value = .9; voiceBus.connect(master);
+  echoSend = ctx.createGain(); verbSend = ctx.createGain();
+  voiceBus.connect(echoSend); voiceBus.connect(verbSend);
+  delay = ctx.createDelay(3); fb = ctx.createGain(); delayLP = ctx.createBiquadFilter();
+  delayLP.type = 'lowpass'; delayLP.frequency.value = 3000;
+  echoSend.connect(delay); delay.connect(delayLP); delayLP.connect(fb); fb.connect(delay); delayLP.connect(master);
+  verb = ctx.createConvolver(); verb.buffer = makeIR(2.6); verbSend.connect(verb); verb.connect(master);
+  applyFX();
+}
+function makeIR(sec) {
+  const n = Math.floor(ctx.sampleRate * sec), b = ctx.createBuffer(2, n, ctx.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c); let lp = 0;
+    for (let i = 0; i < n; i++) { lp += (Math.random() * 2 - 1 - lp) * .35; d[i] = lp * Math.pow(1 - i / n, 3.2); } }
+  return b;
+}
+function applyFX() {
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  delay.delayTime.setTargetAtTime(Math.min(2.9, 60 / S.bpm * .75), t, .05);
+  fb.gain.setTargetAtTime(.12 + S.echo * .6, t, .05);
+  echoSend.gain.setTargetAtTime(S.echo * .7, t, .05);
+  verbSend.gain.setTargetAtTime(S.verb * .9, t, .05);
+  master.gain.setTargetAtTime(S.vol * 1.1, t, .05);
+}
+function unlock() { initAudio(); if (ctx.state !== 'running') ctx.resume(); }
+
+/* ================= sample + analysis (same ears as Sunspot) ================= */
+let sample = null, sampleBuf = null, dots = [], reTimer = 0;
+function setSample(data, sr, save, autoKey) {
+  initAudio();
+  let pk = 0; for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > pk) pk = a; }
+  if (pk > 1e-4) { const k = .92 / pk; for (let i = 0; i < data.length; i++) data[i] *= k; }
+  sample = {data, sr};
+  sampleBuf = ctx.createBuffer(1, data.length, sr);
+  if (sampleBuf.copyToChannel) sampleBuf.copyToChannel(data, 0); else sampleBuf.getChannelData(0).set(data);
+  runAnalysis(autoKey !== false);
+  if (save) idbPut({data, sr});
+}
+function runAnalysis(autoKey) {
+  if (!sample) return;
+  dots = analyze(sample.data, sample.sr);
+  layoutDots();
+  if (autoKey === true && dots.some(d => d.pitched)) findKey(true);
+  assignNotes();
+  place3D();
+  paths.forEach(computeSeq);
+  panelDirty = true;
+  if (!dots.length) toast("Didn't hear much. Try again closer to the mic.");
+}
+function analyze(x, sr) {
+  const hop = Math.max(64, Math.round(sr * .005)), win = hop * 4;
+  const nF = Math.max(0, Math.floor((x.length - win) / hop));
+  if (nF < 4) return [];
+  const db = new Float32Array(nF); let peak = -200;
+  for (let i = 0; i < nF; i++) { let e = 0; const o = i * hop;
+    for (let j = 0; j < win; j++) { const v = x[o + j]; e += v * v; }
+    db[i] = 10 * Math.log10(e / win + 1e-12); if (db[i] > peak) peak = db[i]; }
+  const floor = Math.max(peak - 42, -72);
+  const of = new Float32Array(nF);
+  for (let i = 3; i < nF; i++) of[i] = Math.max(0, db[i] - Math.min(db[i - 1], db[i - 2], db[i - 3]));
+  const delta = 11 - S.sens * 8, minGap = Math.round(.045 * sr / hop);
+  const on = []; let last = -1e9, wasQuiet = true;
+  for (let i = 1; i < nF - 1; i++) {
+    const loud = db[i] > floor;
+    if (loud && wasQuiet && db[i] > floor + 6 && i - last >= minGap) { on.push(Math.max(0, i - 2)); last = i; }
+    else if (loud && of[i] >= delta && of[i] >= of[i - 1] && of[i] >= of[i + 1] && i - last >= minGap) { on.push(Math.max(0, i - 3)); last = i; }
+    if (db[i] < floor + 2) wasQuiet = true; else if (db[i] > floor + 6) wasQuiet = false;
+  }
+  const L = Math.round(S.maxLen * sr), minLen = Math.round(.03 * sr), out = [];
+  for (let k = 0; k < on.length; k++) {
+    const fi = on[k], nextF = k + 1 < on.length ? on[k + 1] : nF;
+    let pl = -200; for (let j = fi; j < Math.min(nF, fi + 12); j++) pl = Math.max(pl, db[j]);
+    const thr = Math.max(floor, pl - 30);
+    let j = fi + 3; while (j < nextF && db[j] > thr) j++;
+    let s = fi * hop; const end = Math.min(x.length, Math.min(j * hop + win, nextF * hop));
+    while (end - s > L * 1.4) { out.push([s, s + L]); s += L; }
+    out.push([s, end]);
+  }
+  const sr2 = sr / 2, x2 = new Float32Array(Math.floor(x.length / 2));
+  for (let i = 0; i < x2.length; i++) x2[i] = (x[2 * i] + x[2 * i + 1]) * .5;
+  let ds = [];
+  for (const [s, e] of out) {
+    const len = e - s; if (len < minLen) continue;
+    let ss = 0, zc = 0;
+    for (let i = s; i < e; i++) { ss += x[i] * x[i]; if (i > s && (x[i] >= 0) !== (x[i - 1] >= 0)) zc++; }
+    const rms = Math.sqrt(ss / len), rdb = 20 * Math.log10(rms + 1e-9);
+    if (rdb < floor + 4) continue;
+    const p = pitchOf(x2, Math.floor(s / 2), Math.floor(e / 2), sr2);
+    ds.push({start: s / sr, len: len / sr, rms, zcr: zc / len, pitched: !!p, midi: p ? p.midi : null, conf: p ? p.conf : 0});
+  }
+  if (ds.length > 256) { ds.sort((a, b) => b.rms - a.rms); ds = ds.slice(0, 256); }
+  ds.sort((a, b) => a.start - b.start);
+  const lmax = Math.max(...ds.map(d => d.rms), 1e-6);
+  ds.forEach((d, i) => { d.id = i; d.loud = d.rms / lmax; d.gn = clamp(.14 / d.rms, .4, 3); d.glow = 0; d.sel = 0; });
+  return ds;
+}
+function yinAt(x, off, W, sr, tMin, tMax) {
+  const d = new Float32Array(tMax + 1);
+  for (let tau = 1; tau <= tMax; tau++) { let s = 0; for (let j = 0; j < W; j++) { const v = x[off + j] - x[off + j + tau]; s += v * v; } d[tau] = s; }
+  let run = 0, best = -1, bestV = 1; const cm = new Float32Array(tMax + 1); cm[0] = 1;
+  for (let tau = 1; tau <= tMax; tau++) { run += d[tau]; cm[tau] = run > 0 ? d[tau] * tau / run : 1; }
+  for (let tau = tMin; tau <= tMax; tau++) { if (cm[tau] < .16) { while (tau + 1 <= tMax && cm[tau + 1] < cm[tau]) tau++; best = tau; bestV = cm[tau]; break; } }
+  if (best < 0) { for (let tau = tMin; tau <= tMax; tau++) if (cm[tau] < bestV) { bestV = cm[tau]; best = tau; } if (bestV > .3) return null; }
+  let t = best;
+  if (best > 1 && best < tMax) { const a = cm[best - 1], b = cm[best], c = cm[best + 1], den = a - 2 * b + c; if (Math.abs(den) > 1e-9) t = best + .5 * (a - c) / den; }
+  return {f: sr / t, ap: bestV};
+}
+function pitchOf(x, s, e, sr) {
+  const tMin = Math.floor(sr / 1100); let W = 512, tMax = Math.floor(sr / 70); const len = e - s;
+  if (len < W + tMax) { W = 256; tMax = Math.min(tMax, len - W - 1); }
+  if (tMax <= tMin + 4 || s + W + tMax >= x.length) return null;
+  const span = len - W - tMax, nW = clamp(Math.floor(span / (W / 2)) + 1, 1, 6);
+  const fs = []; let voiced = 0, apSum = 0;
+  for (let k = 0; k < nW; k++) {
+    const off = s + Math.floor(span * (nW === 1 ? .5 : (.1 + .8 * k / (nW - 1))));
+    const r = yinAt(x, off, W, sr, tMin, tMax);
+    if (r && r.f > 65 && r.f < 1100) { fs.push(ftom(r.f)); voiced++; apSum += r.ap; }
+  }
+  if (voiced < Math.max(1, Math.ceil(nW * .5))) return null;
+  fs.sort((a, b) => a - b);
+  return {midi: fs[Math.floor(fs.length / 2)], conf: 1 - apSum / voiced};
+}
+function layoutDots() {
+  const n = dots.length; if (!n) return;
+  const pm = dots.map(d => d.pitched ? d.midi : clamp(ftom(Math.max(60, d.zcr * sample.sr / 2)) - 24, 40, 90));
+  const lo = Math.min(...pm), hi = Math.max(...pm);
+  const order = pm.map((v, i) => i).sort((a, b) => pm[a] - pm[b]);
+  const rank = new Array(n); order.forEach((i, r) => rank[i] = n > 1 ? r / (n - 1) : .5);
+  dots.forEach((d, i) => { d.u = d.start / Math.max(.1, sample.data.length / sample.sr); const lin = hi > lo ? (pm[i] - lo) / (hi - lo) : .5; d.v = .45 * lin + .55 * rank[i]; });
+}
+function scaleNotes(lo, hi) { const sc = SCALES[S.scale] || SCALES.minPent, out = []; for (let m = lo; m <= hi; m++) if (sc.includes(((m - S.key) % 12 + 12) % 12)) out.push(m); return out; }
+function nearestScale(m) { let best = Math.round(m), bd = 1e9; for (const n of scaleNotes(Math.floor(m) - 12, Math.ceil(m) + 12)) { const dd = Math.abs(n - m); if (dd < bd) { bd = dd; best = n; } } return best; }
+function assignNotes() {
+  const pitched = dots.filter(d => d.pitched).map(d => d.midi).sort((a, b) => a - b);
+  const center = pitched.length ? pitched[Math.floor(pitched.length / 2)] : 57;
+  const base = Math.round(center) - 12, pool = scaleNotes(base, base + 24);
+  for (const d of dots) {
+    if (d.pitched) d.note = S.snap ? nearestScale(d.midi) : Math.round(d.midi);
+    else d.note = pool[clamp(Math.round(d.v * (pool.length - 1)), 0, pool.length - 1)];
+    d.f = mtof(d.note);
+  }
+}
+function findKey(quiet) {
+  const ps = dots.filter(d => d.pitched); if (!ps.length) { if (!quiet) toast('No clear notes found. Try singing.'); return; }
+  const sc = SCALES[S.scale] || SCALES.minPent; let best = S.key, bs = -1;
+  for (let k = 0; k < 12; k++) { let s2 = 0;
+    for (const d of ps) { const pc = ((Math.round(d.midi) - k) % 12 + 12) % 12; if (sc.includes(pc)) s2 += d.loud * d.len * (pc === 0 ? 1.4 : 1); }
+    if (s2 > bs + 1e-9) { bs = s2; best = k; } }
+  S.key = best; assignNotes(); saveSettings(); panelDirty = true;
+  if (!quiet) toast('Key: ' + NAMES[best]);
+}
+
+/* ================= playing a chop ================= */
+// one voice = one or more chops (parts) through the same tone + synth chain
+function voice(t, stepDur, pan, parts, fr, tone) {
+  if (!sampleBuf) return;
+  const out = ctx.createStereoPanner ? ctx.createStereoPanner() : ctx.createGain();
+  if (out.pan) out.pan.value = clamp(pan || 0, -.85, .85);
+  out.connect(voiceBus);
+  const mixIn = ctx.createGain(), vlAll = Math.min(1, 2 * (1 - S.mix));
+  let maxLen = .03;
+  for (const pt of parts) {
+    const d = pt.d, rate = clamp(pt.rate, .25, 4), full = d.len / rate;
+    const len = S.gate >= .97 ? full : Math.min(full, Math.max(.018, .018 + S.gate / .97 * stepDur * 2.2));
+    maxLen = Math.max(maxLen, len);
+    const vl = vlAll * d.gn * pt.gain; if (vl < .01) continue;
+    const src = ctx.createBufferSource(); src.buffer = sampleBuf; src.playbackRate.value = rate;
+    const env = ctx.createGain(), g = env.gain, a = pt.soft ? Math.min(.04, len * .3) : .004;
+    g.setValueAtTime(0, t); g.linearRampToValueAtTime(vl, t + a);
+    g.setValueAtTime(vl, t + Math.max(a + .002, len - (pt.soft ? Math.min(.05, len * .35) : .014))); g.linearRampToValueAtTime(0, t + len);
+    src.connect(env); env.connect(mixIn);
+    src.start(t, d.start, Math.min(d.len, len * rate + .01)); src.stop(t + len + .02);
+  }
+  if (tone < .99) { const raw = ctx.createGain(); raw.gain.value = 1 - tone; mixIn.connect(raw); raw.connect(out); }
+  if (tone > .01) {
+    const res = ctx.createGain(); res.gain.value = tone * (1.15 + tone * .5);
+    const Q = 8 + tone * 55;
+    for (let k = 1; k <= 5; k++) { const fk = fr * k; if (fk > 11000) break;
+      const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = fk; bp.Q.value = Q;
+      const hg = ctx.createGain(); hg.gain.value = 1 / k; mixIn.connect(bp); bp.connect(hg); hg.connect(res); }
+    res.connect(out);
+  }
+  const sl = Math.min(1, 2 * S.mix) * .2;
+  if (sl > .005) synthNote(fr * Math.pow(2, S.oct), t, maxLen, sl, out);
+  setTimeout(() => { try { out.disconnect(); mixIn.disconnect(); } catch (e) {} }, (t - ctx.currentTime + maxLen + 1.2) * 1000);
+}
+function playDot(d, t, stepDur, sp, pan) {
+  const rate = ((S.snap && d.pitched) ? clamp(Math.pow(2, (d.note - d.midi) / 12), .5, 2) : 1) * sp;
+  voice(t, stepDur, pan, [{d, rate, gain: 1}], d.f * sp, S.tone);
+}
+// a ghost note in an empty gap: the 3 nearest suns, retuned to a pitch in between and fused
+const GAP = .035;
+function blendOf(pos) {
+  if (dots.length < 2) return null;
+  const near = dots.map(d => [d.lp.distanceTo(pos), d]).sort((a, b) => a[0] - b[0]).slice(0, 3);
+  let ws = near.map(([dist]) => 1 / (dist * dist + 1e-4)); const tot = ws.reduce((a, b) => a + b, 0); ws = ws.map(w => w / tot);
+  let m = 0; near.forEach(([, d], i) => m += ws[i] * d.note);
+  if (S.snap) m = nearestScale(m);
+  const col = new THREE.Color(0, 0, 0); near.forEach(([, d], i) => col.r += d.col.r * ws[i]);
+  near.forEach(([, d], i) => { col.g += d.col.g * ws[i]; col.b += d.col.b * ws[i]; });
+  return {near: near.map(a => a[1]), ws, midi: m, col};
+}
+function playBlend(pos, t, stepDur, sp, pan) {
+  const b = blendOf(pos); if (!b) return null;
+  const parts = b.near.map((d, i) => ({d, gain: Math.pow(b.ws[i], .6) * 1.6, soft: true,
+    rate: clamp(Math.pow(2, (b.midi - (d.pitched ? d.midi : d.note)) / 12), .5, 2) * sp}));
+  voice(t, stepDur, pan, parts, mtof(b.midi) * sp, Math.max(S.tone, .45));
+  return b;
+}
+function synthNote(f, t, len, lvl, dest) {
+  const vg = ctx.createGain(), g = vg.gain, lp = ctx.createBiquadFilter();
+  const rel = .08 + S.gate * .35, end = t + len;
+  g.setValueAtTime(0, t); g.linearRampToValueAtTime(lvl, t + .006); g.setTargetAtTime(lvl * .65, t + .01, .09); g.setTargetAtTime(0, end, rel / 3);
+  const co = 180 * Math.pow(70, S.cutoff);
+  lp.type = 'lowpass'; lp.Q.value = 5;
+  lp.frequency.setValueAtTime(Math.min(16000, co * 3), t); lp.frequency.exponentialRampToValueAtTime(Math.max(60, co), t + .18);
+  lp.connect(vg); vg.connect(dest);
+  const osc = (type, fr, det, gain) => { const o = ctx.createOscillator(); o.type = type; o.frequency.value = fr; o.detune.value = det;
+    const og = ctx.createGain(); og.gain.value = gain; o.connect(og); og.connect(lp); o.start(t); o.stop(end + rel + .05); };
+  if (S.wave === 'glass') { osc('sine', f, 0, 1); osc('triangle', f * 2, 3, .35); osc('sine', f * 3, -4, .18); }
+  else if (S.wave === 'saw') { osc('sawtooth', f, -9, .55); osc('sawtooth', f, 9, .55); }
+  else { osc('square', f / 2, 0, .5); osc('sawtooth', f, 0, .3); }
+}
+
+/* ================= recording (up to 60 s) ================= */
+let rec = null;
+async function startRec() {
+  if (rec) return;
+  unlock(); await ctx.resume();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('The mic needs the https link (GitHub Pages).'); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}}); }
+  catch (e) { toast('Mic blocked. Leave VR, tap REC on the page and allow the microphone.'); return; }
+  const src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(4096, 1, 1), mute = ctx.createGain();
+  mute.gain.value = 0;
+  rec = {stream, src, proc, mute, chunks: [], count: 0, level: 0, stopAsked: false};
+  const max = MAXREC * ctx.sampleRate;
+  proc.onaudioprocess = e => {
+    if (!rec) return;
+    const d = e.inputBuffer.getChannelData(0);
+    rec.chunks.push(new Float32Array(d)); rec.count += d.length;
+    let s = 0; for (let i = 0; i < d.length; i += 4) s += d[i] * d[i];
+    rec.level = Math.sqrt(s / (d.length / 4));
+    if (rec.count >= max) stopRec();
+  };
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  panelDirty = true;
+  toast('Recording. Talk, sing or rap. Up to 60 seconds.');
+  if (pendingStop) { pendingStop = false; stopRec(); }
+}
+let pendingStop = false;
+function stopRec() {
+  if (!rec) { pendingStop = true; setTimeout(() => pendingStop = false, 1500); return; }
+  const r = rec; rec = null;
+  r.proc.onaudioprocess = null;
+  try { r.src.disconnect(); r.proc.disconnect(); r.mute.disconnect(); } catch (e) {}
+  r.stream.getTracks().forEach(t => t.stop());
+  panelDirty = true;
+  const max = Math.min(r.count, MAXREC * ctx.sampleRate), data = new Float32Array(max);
+  let o = 0; for (const c of r.chunks) { if (o >= max) break; data.set(c.subarray(0, Math.min(c.length, max - o)), o); o += c.length; }
+  if (max < ctx.sampleRate * .3) { toast('Too short. Hold the button a little longer.'); return; }
+  toast('Chopping…');
+  setTimeout(() => { setSample(data, ctx.sampleRate, true); if (dots.length) toast(`${dots.length} suns. Reach in and hold the trigger.`); }, 40);
+}
+const recSec = () => rec && ctx ? rec.count / ctx.sampleRate : 0;
+
+function demoVoice(quiet) {
+  initAudio();
+  const sr = ctx.sampleRate, out = [];
+  const F = {a: [730, 1090, 2440], e: [530, 1840, 2480], i: [300, 2250, 3000], o: [570, 840, 2410], u: [320, 870, 2240]};
+  const syl = [['k','a',57,.32],['','o',60,.28],['t','i',62,.22],['s','a',64,.4],['','u',62,.25],['d','e',60,.3],['',null,0,.18],
+    ['m','a',67,.5],['k','i',64,.22],['t','a',62,.22],['s','o',60,.45],['',null,0,.15],['b','a',55,.3],['','e',57,.6],['t',null,0,.12],['s','i',69,.35],['','a',67,.3],['k','u',64,.55],
+    ['',null,0,.2],['l','o',72,.3],['','a',69,.26],['s','i',67,.3],['t','u',64,.4],['',null,0,.1],['m','e',62,.35],['k','o',60,.3],['s','a',57,.6]];
+  for (const [c, v, m, dur] of syl) {
+    if (c === 's' || c === 't' || c === 'k') { const n = Math.floor(sr * (c === 's' ? .09 : .03)); let hp = 0, prev = 0;
+      for (let i = 0; i < n; i++) { const w = Math.random() * 2 - 1; hp = .7 * (hp + w - prev); prev = w; out.push(hp * (c === 's' ? .35 : .7) * Math.sin(Math.PI * i / n)); } }
+    const n = Math.floor(sr * dur);
+    if (!v) { for (let i = 0; i < n; i++) out.push(0); continue; }
+    const f0 = mtof(m), fm = F[v], st = fm.map(() => [0, 0]); let ph = 0;
+    for (let i = 0; i < n; i++) {
+      const vib = 1 + .006 * Math.sin(2 * Math.PI * 5.5 * i / sr) * Math.min(1, i / (sr * .15));
+      ph += f0 * vib / sr; if (ph >= 1) ph -= 1;
+      const src = (1 - 2 * ph) + (Math.random() - .5) * .05; let y = 0;
+      fm.forEach((F0, k) => { const bw = 80 + k * 40, r = Math.exp(-Math.PI * bw / sr), th = 2 * Math.PI * F0 / sr;
+        const s2 = st[k], o2 = src * (1 - r) * 4 + 2 * r * Math.cos(th) * s2[0] - r * r * s2[1]; s2[1] = s2[0]; s2[0] = o2; y += o2 * [1, .55, .28][k]; });
+      out.push(y * Math.min(1, i / (sr * .012)) * Math.min(1, (n - i) / (sr * .04)) * .25);
+    }
+    for (let i = 0; i < sr * .025; i++) out.push(0);
+  }
+  setSample(Float32Array.from(out), sr, !quiet);
+  if (!quiet) toast(`Demo voice: ${dots.length} suns.`);
+}
+async function loadFile(f) {
+  unlock();
+  try {
+    const b = await ctx.decodeAudioData(await f.arrayBuffer());
+    const n = Math.min(b.length, MAXREC * b.sampleRate), data = new Float32Array(n);
+    for (let c = 0; c < b.numberOfChannels; c++) { const ch = b.getChannelData(c); for (let i = 0; i < n; i++) data[i] += ch[i] / b.numberOfChannels; }
+    setSample(data, b.sampleRate, true);
+    toast(`${dots.length} suns from ${f.name}` + (b.length > n ? ' (first minute)' : ''));
+  } catch (e) { toast("Couldn't read that file."); }
+}
+function idb() { return new Promise((res, rej) => { const r = indexedDB.open('sunspot-xr', 1); r.onupgradeneeded = () => r.result.createObjectStore('s'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+async function idbPut(v) { try { const db = await idb(); db.transaction('s', 'readwrite').objectStore('s').put(v, 'sample'); } catch (e) {} }
+async function idbGet() { try { const db = await idb(); return await new Promise(res => { const q = db.transaction('s').objectStore('s').get('sample'); q.onsuccess = () => res(q.result); q.onerror = () => res(null); }); } catch (e) { return null; } }
+
+/* ================= three.js scene ================= */
+const renderer = new THREE.WebGLRenderer({antialias: true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+$('#gl').appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#06020a');
+const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.01, 400);
+camera.position.set(0, 2.25, 1.9); scene.add(camera);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.25, -0.15);
+controls.mouseButtons = {LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE};
+controls.enableDamping = true; controls.minDistance = .3; controls.maxDistance = 12; controls.update();
+scene.add(new THREE.HemisphereLight('#ffffff', '#3a1040', 1.6));
+const sunL = new THREE.DirectionalLight('#ffe9c0', 1.4); sunL.position.set(1, 3, 2); scene.add(sunL);
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+function canvasTex(w, h, draw) { const cv = document.createElement('canvas'); cv.width = w; cv.height = h; draw(cv.getContext('2d'), w, h); const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace; return t; }
+const glowTex = canvasTex(64, 64, (g, w) => { const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32); gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(.25, 'rgba(255,255,255,.55)'); gr.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, w); });
+
+// --- world: black sun, corona, stars, floor rings
+let raysSprite;
+(function buildWorld() {
+  const corona = canvasTex(512, 512, (g, w) => { const c = w / 2, gr = g.createRadialGradient(c, c, 0, c, c, c);
+    gr.addColorStop(0, 'rgba(255,230,0,1)'); gr.addColorStop(.3, 'rgba(255,230,0,1)'); gr.addColorStop(.36, 'rgba(255,90,0,1)'); gr.addColorStop(.48, 'rgba(225,0,50,.75)');
+    gr.addColorStop(.68, 'rgba(122,0,255,.28)'); gr.addColorStop(1, 'rgba(122,0,255,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, w); });
+  const rays = canvasTex(512, 512, (g, w) => { const c = w / 2; for (let i = 0; i < 28; i++) { const a = i / 28 * Math.PI * 2, da = .045 + (i % 3) * .02;
+    g.fillStyle = ['rgba(255,179,0,.35)', 'rgba(255,31,158,.3)', 'rgba(255,90,0,.32)'][i % 3]; g.beginPath(); g.moveTo(c, c);
+    g.lineTo(c + Math.cos(a - da) * c, c + Math.sin(a - da) * c); g.lineTo(c + Math.cos(a + da) * c, c + Math.sin(a + da) * c); g.fill(); } });
+  const pos = new V3(0, 9, -70);
+  raysSprite = new THREE.Sprite(new THREE.SpriteMaterial({map: rays, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false}));
+  raysSprite.position.copy(pos).add(new V3(0, 0, -2)); raysSprite.scale.setScalar(78); scene.add(raysSprite);
+  const cor = new THREE.Sprite(new THREE.SpriteMaterial({map: corona, transparent: true, depthWrite: false}));
+  cor.position.copy(pos).add(new V3(0, 0, -1)); cor.scale.setScalar(50); scene.add(cor);
+  const bs = new THREE.Mesh(new THREE.SphereGeometry(8, 48, 32), new THREE.MeshBasicMaterial({color: '#000000'})); bs.position.copy(pos); scene.add(bs);
+  const N = 1400, sp = new Float32Array(N * 3), sc = new Float32Array(N * 3), cA = new THREE.Color();
+  for (let i = 0; i < N; i++) { const u = Math.random() * 2 - 1, a = Math.random() * Math.PI * 2, r = 120, s = Math.sqrt(1 - u * u);
+    sp.set([r * s * Math.cos(a), Math.abs(r * u) * .9 + 5, r * s * Math.sin(a)], i * 3);
+    cA.set(['#ffffff', '#FFB300', '#FF1F9E', '#19E3FF'][i % 4]); sc.set([cA.r, cA.g, cA.b], i * 3); }
+  const sg = new THREE.BufferGeometry(); sg.setAttribute('position', new THREE.BufferAttribute(sp, 3)); sg.setAttribute('color', new THREE.BufferAttribute(sc, 3));
+  scene.add(new THREE.Points(sg, new THREE.PointsMaterial({size: .7, vertexColors: true, map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending})));
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(60, 64).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({color: '#0d0512'})); scene.add(floor);
+  [[.9, COL.o], [1.8, COL.p], [3.2, COL.v], [5.5, COL.amber], [9, COL.r], [15, COL.v]].forEach(([r, c]) => {
+    const m = new THREE.Mesh(new THREE.RingGeometry(r, r + .025 + r * .004, 96).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({color: c, transparent: true, opacity: .55}));
+    m.position.y = .002; scene.add(m); });
+})();
+
+const cloud = new THREE.Group(); scene.add(cloud);
+
+/* ================= suns (one per chop) ================= */
+const sunGeo = new THREE.IcosahedronGeometry(0.0125, 1);
+const ringGeo = new THREE.TorusGeometry(0.0115, 0.0034, 8, 22);
+const PALV = ['#7A00FF', '#FF1F9E', '#E10032', '#FF5A00', '#FFB300'].map(c => new THREE.Color(c));
+const RINGC = new THREE.Color(COL.c), WHITE = new THREE.Color('#fff');
+let sunIM = null, ringIM = null, glowPts = null, timeRing = null;
+function heightCol(v) { const x = clamp(v, 0, 1) * (PALV.length - 1), i = Math.min(PALV.length - 2, Math.floor(x)); return PALV[i].clone().lerp(PALV[i + 1], x - i); }
+function place3D() {
+  const dur = sample ? sample.data.length / sample.sr : 10;
+  const span = clamp(dur / 60, .4, 1) * THREE.MathUtils.degToRad(330);
+  for (const d of dots) {
+    const air = d.pitched ? clamp((1 - d.conf) * 2.5, 0, 1) : 1;
+    const jit = ((d.id * 7919) % 13) / 13 - .5;
+    const y = 0.85 + d.v * 0.95;
+    if (S.layout === 'front') d.lp = new V3((d.u - .5) * 1.4, y, -0.45 - air * 0.22 - jit * 0.04);
+    else { const th = -span / 2 + d.u * span, r = 0.5 + air * 0.2 + jit * 0.04; d.lp = new V3(r * Math.sin(th), y, -r * Math.cos(th)); }
+    d.col = d.pitched ? heightCol(d.v) : RINGC.clone();
+    const m = new THREE.Matrix4().lookAt(d.lp, new V3(0, d.lp.y, S.layout === 'front' ? 0 : 0), new V3(0, 1, 0));
+    d.q = new THREE.Quaternion().setFromRotationMatrix(m);
+  }
+  rebuildDotMeshes(); buildTimeRing(dur, span);
+}
+function rebuildDotMeshes() {
+  for (const m of [sunIM, ringIM, glowPts]) if (m) { m.removeFromParent(); m.material.dispose(); if (m.isPoints) m.geometry.dispose(); else m.dispose(); }
+  const P = dots.filter(d => d.pitched), U = dots.filter(d => !d.pitched);
+  sunIM = new THREE.InstancedMesh(sunGeo, new THREE.MeshBasicMaterial({toneMapped: false}), Math.max(1, P.length)); sunIM.count = P.length;
+  ringIM = new THREE.InstancedMesh(ringGeo, new THREE.MeshBasicMaterial({toneMapped: false}), Math.max(1, U.length)); ringIM.count = U.length;
+  P.forEach((d, i) => { d.im = sunIM; d.ii = i; sunIM.setColorAt(i, d.col); });
+  U.forEach((d, i) => { d.im = ringIM; d.ii = i; ringIM.setColorAt(i, d.col); });
+  if (!P.length) sunIM.setColorAt(0, WHITE);
+  if (!U.length) ringIM.setColorAt(0, WHITE);
+  sunIM.frustumCulled = ringIM.frustumCulled = false;
+  const n = Math.max(1, dots.length), gp = new Float32Array(n * 3), gc = new Float32Array(n * 3);
+  dots.forEach((d, i) => gp.set([d.lp.x, d.lp.y, d.lp.z], i * 3));
+  const gg = new THREE.BufferGeometry(); gg.setAttribute('position', new THREE.BufferAttribute(gp, 3)); gg.setAttribute('color', new THREE.BufferAttribute(gc, 3));
+  gg.setDrawRange(0, dots.length);
+  glowPts = new THREE.Points(gg, new THREE.PointsMaterial({size: .075, vertexColors: true, map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false}));
+  glowPts.frustumCulled = false;
+  cloud.add(glowPts, sunIM, ringIM);
+}
+function textSprite(text, col, h, bg) {
+  const cv = document.createElement('canvas'), g = cv.getContext('2d'); g.font = `800 44px ${SANS}`;
+  const w = Math.ceil(g.measureText(text).width) + 24; cv.width = w; cv.height = 64;
+  if (bg) { g.fillStyle = bg; g.beginPath(); g.roundRect(0, 0, w, 64, 18); g.fill(); }
+  g.font = `800 44px ${SANS}`; g.fillStyle = col; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, w / 2, 34);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({map: t, transparent: true, depthWrite: false})); s.scale.set(h * w / 64, h, 1); return s;
+}
+function buildTimeRing(dur, span) {
+  if (timeRing) { timeRing.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } }); timeRing.removeFromParent(); }
+  timeRing = new THREE.Group(); cloud.add(timeRing);
+  if (!sample) return;
+  const y = .76, at = u => S.layout === 'front' ? new V3((u - .5) * 1.4, y, -.45) : new V3(.5 * Math.sin(-span / 2 + u * span), y, -.5 * Math.cos(-span / 2 + u * span));
+  const pts = []; for (let i = 0; i <= 120; i++) pts.push(at(i / 120));
+  timeRing.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({color: COL.o, transparent: true, opacity: .7})));
+  const stepS = dur > 20 ? 10 : dur > 6 ? 2 : 1, tk = [];
+  for (let s = 0; s <= dur + 1e-6; s += stepS) { const p = at(s / dur); tk.push(p.clone(), p.clone().add(new V3(0, -.025, 0)));
+    const lab = textSprite(s + 's', '#FFB300', .022); lab.position.copy(p).add(new V3(0, -.045, 0)); timeRing.add(lab); }
+  timeRing.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(tk), new THREE.LineBasicMaterial({color: COL.o})));
+}
+const _m4 = new THREE.Matrix4(), _s3 = new V3(), _c = new THREE.Color();
+function updateDots(dt) {
+  if (!dots.length || !glowPts) return;
+  const ca = glowPts.geometry.attributes.color, k = Math.exp(-dt * 5);
+  dots.forEach((d, i) => {
+    d.glow *= k;
+    _s3.setScalar(1 + d.glow * 1.4 + (d.sel ? .35 : 0));
+    _m4.compose(d.lp, d.q, _s3); d.im.setMatrixAt(d.ii, _m4);
+    _c.copy(d.col).lerp(WHITE, d.glow * .65); d.im.setColorAt(d.ii, _c);
+    const b = .22 + d.glow * 1.3 + (d.sel ? .25 : 0);
+    ca.setXYZ(i, d.col.r * b, d.col.g * b, d.col.b * b);
+  });
+  for (const m of [sunIM, ringIM]) { m.instanceMatrix.needsUpdate = true; if (m.instanceColor) m.instanceColor.needsUpdate = true; }
+  ca.needsUpdate = true;
+}
+
+/* ================= players (hands, held spots, desktop mouse, paths) ================= */
+function makePlayer(kind) { return {kind, set: [], idx: 0, nextT: 0, fresh: false, speed: 1, pt: new V3(), active: false, lastRand: -1, seq: null, bead: 0}; }
+function nearestN(pt, n) {
+  if (!dots.length) return [];
+  const arr = dots.map(d => [d.lp.distanceToSquared(pt), d]); arr.sort((a, b) => a[0] - b[0]);
+  const set = arr.slice(0, n).map(a => a[1]);
+  if (S.pattern === 'speech') set.sort((a, b) => a.start - b.start); else set.sort((a, b) => a.note - b.note || a.start - b.start);
+  return set;
+}
+function pickStep(p) {
+  if (p.kind === 'path') {
+    const n = p.seq.length; if (!n) return null; let i;
+    if (S.pathDir === 'bounce' && n > 2) { const per = 2 * n - 2, k = p.idx % per; i = k < n ? k : per - k; } else i = p.idx % n;
+    const e = p.seq[i]; return e.ghost ? {ghost: true, pos: e.pos, k: e.k} : {d: dots[e.j], k: e.k};
+  }
+  if (p.ghost) return {ghost: true, pos: p.pt.clone()};
+  const set = p.set, n = set.length; if (!n) return null; const i = p.idx;
+  switch (S.pattern) {
+    case 'down': return {d: set[n - 1 - i % n]};
+    case 'bounce': { if (n < 3) return {d: set[i % n]}; const per = 2 * n - 2, k = i % per; return {d: set[k < n ? k : per - k]}; }
+    case 'random': { let r = Math.floor(Math.random() * n); if (n > 1 && r === p.lastRand) r = (r + 1) % n; p.lastRand = r; return {d: set[r]}; }
+    default: return {d: set[i % n]};
+  }
+}
+const flashes = [];
+const headPos = new V3(), headRight = new V3(1, 0, 0), _wp = new V3();
+function panFor(d) { return panAt(d.lp); }
+function panAt(lp) { _wp.copy(lp); cloud.localToWorld(_wp); _wp.sub(headPos); _wp.y = 0; const l = _wp.length(); return l < 1e-4 ? 0 : _wp.dot(headRight) / l; }
+function allPlayers() {
+  const out = [];
+  for (const h of hands) { out.push(h.player); if (h.latch) out.push(h.latch.player); }
+  out.push(desk.player); for (const p of paths) out.push(p.player);
+  return out;
+}
+function tick() {
+  if (!ctx || ctx.state !== 'running' || !dots.length) return;
+  const now = ctx.currentTime, stepDur = 60 / S.bpm / S.div;
+  for (const p of allPlayers()) {
+    const has = p.kind === 'path' ? p.active && p.seq && p.seq.length : p.active && p.set.length;
+    if (!has) { p.nextT = 0; continue; }
+    if (!p.nextT || p.nextT < now - .05) {
+      if (p.kind === 'path') { p.nextT = Math.ceil((now + .015) / stepDur) * stepDur; p.fresh = false; }
+      else { p.nextT = now + .012; p.fresh = true; }
+    }
+    let guard = 0;
+    while (p.nextT < now + .12 && guard++ < 16) {
+      const st = pickStep(p);
+      if (st && st.ghost) { const b = playBlend(st.pos, p.nextT, stepDur, p.speed, panAt(st.pos)); if (b) flashes.push({b, pos: st.pos, t: p.nextT, p, k: st.k}); }
+      else if (st && st.d) { playDot(st.d, p.nextT, stepDur, p.speed, panFor(st.d)); flashes.push({d: st.d, t: p.nextT, p, k: st.k}); }
+      p.idx++;
+      if (p.fresh) { p.fresh = false; p.nextT = Math.ceil((p.nextT + stepDur * .5) / stepDur) * stepDur; } else p.nextT += stepDur;
+    }
+  }
+}
+setInterval(tick, 20);
+const ghostGeo = new THREE.IcosahedronGeometry(.014, 2);
+function ghostFlash(p, pos, col) {
+  if (!p.gm) { p.gm = new THREE.Mesh(ghostGeo, new THREE.MeshBasicMaterial({color: '#fff', transparent: true, opacity: 0, depthWrite: false, toneMapped: false}));
+    p.gh = new THREE.Sprite(new THREE.SpriteMaterial({map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0}));
+    p.gh.scale.setScalar(.09); p.gm.add(p.gh); p.gm.renderOrder = 5; cloud.add(p.gm); p.gv = 0; }
+  p.gm.position.copy(pos); p.gm.material.color.copy(col).lerp(WHITE, .25); p.gh.material.color.copy(col); p.gv = 1;
+}
+function fadeGhosts(dt) {
+  for (const p of allPlayers()) if (p.gm) { p.gv *= Math.exp(-dt * 4); const v = p.gv;
+    if (p.kind !== 'path' && p.ghost && p.active) p.gm.position.copy(p.pt);
+    p.gm.visible = v > .02; p.gm.material.opacity = .25 + .5 * v; p.gh.material.opacity = v; p.gm.scale.setScalar(1 + v * .6); }
+}
+function processFlashes() {
+  if (!ctx) return; const now = ctx.currentTime;
+  for (let i = flashes.length - 1; i >= 0; i--) { const f = flashes[i];
+    if (f.t <= now) { if (f.b) { f.b.near.forEach((d, j) => d.glow = Math.max(d.glow, .3 + .7 * f.b.ws[j])); ghostFlash(f.p, f.pos, f.b.col); } else f.d.glow = 1; if (f.p.kind === 'path' && f.k != null) f.p.bead = f.k; flashes.splice(i, 1); } }
+  if (flashes.length > 400) flashes.splice(0, flashes.length - 400);
+}
+
+/* ================= paths (splines with handles) ================= */
+const paths = [];
+const PATHCOL = [COL.y, COL.c, COL.g, COL.p, COL.o, '#B36BFF'];
+const handleGeo = new THREE.SphereGeometry(.016, 18, 12), handleOutGeo = new THREE.SphereGeometry(.0205, 18, 12);
+const outlineMat = new THREE.MeshBasicMaterial({color: '#000', side: THREE.BackSide});
+function newPath(pts, col) {
+  const used = new Set(paths.map(p => p.col));
+  col = col || PATHCOL.find(c => !used.has(c)) || PATHCOL[paths.length % PATHCOL.length];
+  const p = {pts, col, grp: new THREE.Group(), tube: null, handles: [], seq: [], samples: [], player: makePlayer('path')};
+  p.player.path = p; p.player.active = true;
+  p.mat = new THREE.MeshBasicMaterial({color: col, toneMapped: false, transparent: true, opacity: 1});
+  p.bead = new THREE.Mesh(new THREE.SphereGeometry(.013, 16, 12), new THREE.MeshBasicMaterial({color: '#fff', toneMapped: false}));
+  p.beadPos = new V3(); p.grp.add(p.bead);
+  cloud.add(p.grp); paths.push(p);
+  if (paths.length > 6) removePath(paths[0], true);
+  buildPath(p); return p;
+}
+function buildPath(p) {
+  const curve = new THREE.CatmullRomCurve3(p.pts, false, 'centripetal');
+  if (p.tube) { p.tube.geometry.dispose(); p.tube.geometry = new THREE.TubeGeometry(curve, 150, .0036, 6, false); }
+  else { p.tube = new THREE.Mesh(new THREE.TubeGeometry(curve, 150, .0036, 6, false), p.mat); p.grp.add(p.tube); }
+  while (p.handles.length < p.pts.length) { const h = new THREE.Mesh(handleGeo, new THREE.MeshBasicMaterial({color: p.col, toneMapped: false})); h.add(new THREE.Mesh(handleOutGeo, outlineMat)); p.grp.add(h); p.handles.push(h); }
+  while (p.handles.length > p.pts.length) p.handles.pop().removeFromParent();
+  p.handles.forEach((h, i) => h.position.copy(p.pts[i]));
+  p.samples = curve.getSpacedPoints(160);
+  computeSeq(p);
+}
+function computeSeq(p) {
+  const r2 = S.reach * S.reach; p.seq = []; let last = -1, gapRun = 0;
+  p.samples.forEach((s, k) => { let bj = -1, bd = r2;
+    for (let j = 0; j < dots.length; j++) { const dd = s.distanceToSquared(dots[j].lp); if (dd < bd) { bd = dd; bj = j; } }
+    if (k) gapRun += s.distanceTo(p.samples[k - 1]);
+    if (bj >= 0) { if (bj !== last) { p.seq.push({j: bj, k}); last = bj; } gapRun = 0; }
+    else if (S.blend && dots.length > 1 && (gapRun >= .045 || k === 0)) { p.seq.push({ghost: true, pos: s.clone(), k}); gapRun = 0; last = -1; } });
+  p.mat.opacity = p.seq.length ? 1 : .35;
+  p.player.seq = p.seq;
+  p.nSuns = p.seq.filter(e => !e.ghost).length; p.nGhost = p.seq.length - p.nSuns;
+  panelDirty = true;
+}
+function removePath(p, quiet) {
+  const i = paths.indexOf(p); if (i < 0) return;
+  paths.splice(i, 1); p.grp.traverse(o => { if (o.geometry && o.geometry !== handleGeo && o.geometry !== handleOutGeo) o.geometry.dispose(); });
+  p.grp.removeFromParent(); if (p.player.gm) p.player.gm.removeFromParent(); savePaths(); panelDirty = true;
+  if (!quiet) toast('Path deleted');
+}
+function resample(pts) {
+  const cum = [0]; for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + pts[i].distanceTo(pts[i - 1]));
+  const L = cum[cum.length - 1], K = clamp(Math.round(L / .09) + 1, 3, 9), out = [];
+  let j = 0;
+  for (let k = 0; k < K; k++) { const t = L * k / (K - 1); while (j < pts.length - 2 && cum[j + 1] < t) j++;
+    const seg = cum[j + 1] - cum[j], f = seg > 1e-9 ? (t - cum[j]) / seg : 0; out.push(pts[j].clone().lerp(pts[j + 1], clamp(f, 0, 1))); }
+  return out;
+}
+function finishStroke(pts) {
+  let L = 0; for (let i = 1; i < pts.length; i++) L += pts[i].distanceTo(pts[i - 1]);
+  if (pts.length < 3 || L < .06) { toast('Path too short. Hold the trigger and draw a longer line.'); return null; }
+  const p = newPath(resample(pts)); savePaths();
+  toast(p.seq.length ? `Path plays ${p.nSuns} suns` + (p.nGhost ? ` and ${p.nGhost} blends` : '') + '. Drag its handles to reshape.' : 'No suns near that path. Drag a handle closer or raise Reach.');
+  return p;
+}
+function savePaths() { try { localStorage.setItem('sunspot-xr-paths', JSON.stringify(paths.map(p => ({col: p.col, pts: p.pts.map(v => [+v.x.toFixed(4), +v.y.toFixed(4), +v.z.toFixed(4)])})))); } catch (e) {} }
+function loadPaths() { try { const a = JSON.parse(localStorage.getItem('sunspot-xr-paths') || '[]'); for (const o of a) if (o.pts && o.pts.length >= 2) newPath(o.pts.map(q => new V3(q[0], q[1], q[2])), o.col); } catch (e) {} }
+function nearestHandle(world, maxD) {
+  let best = null, bd = maxD;
+  for (const p of paths) p.pts.forEach((pt, i) => { const w = cloud.localToWorld(pt.clone()), d = w.distanceTo(world); if (d < bd) { bd = d; best = {path: p, i}; } });
+  return best;
+}
+function nearestPath(local) {
+  let best = null, bd = 1e9;
+  for (const p of paths) for (const s of p.samples) { const d = s.distanceTo(local); if (d < bd) { bd = d; best = p; } }
+  return best ? {p: best, d: bd * cloud.scale.x} : null;
+}
+const strokeLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: '#fff'}));
+strokeLine.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3 * 3000), 3)); strokeLine.frustumCulled = false; strokeLine.visible = false; cloud.add(strokeLine);
+function showStroke(pts) { const a = strokeLine.geometry.attributes.position, n = Math.min(3000, pts.length); for (let i = 0; i < n; i++) a.setXYZ(i, pts[i].x, pts[i].y, pts[i].z); a.needsUpdate = true; strokeLine.geometry.setDrawRange(0, n); strokeLine.visible = n > 1; }
+
+/* ================= Quest controllers (labelled) ================= */
+const CTRL_W = new THREE.MeshStandardMaterial({color: '#f4f2ff', roughness: .32, metalness: 0});
+const CTRL_B = new THREE.MeshStandardMaterial({color: '#121219', roughness: .45, metalness: 0});
+function makeController(side) {
+  const s = side, g = new THREE.Group(), own = () => CTRL_B.clone();
+  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.031, 0.033, 0.022, 32), CTRL_W); head.position.set(0, -0.008, 0.045); head.rotation.x = 0.3; g.add(head);
+  const face = new THREE.Mesh(new THREE.CylinderGeometry(0.027, 0.027, 0.004, 32), CTRL_B); face.position.y = 0.0115; head.add(face);
+  const stick = new THREE.Group(); stick.position.set(-s * 0.010, 0.002, -0.004); face.add(stick);
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.0025, 0.0025, 0.008, 10), CTRL_B); stem.position.y = 0.004; stick.add(stem);
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.0078, 0.0078, 0.004, 22), CTRL_W.clone()); cap.position.y = 0.009; stick.add(cap);
+  const bA = new THREE.Mesh(new THREE.CylinderGeometry(0.0055, 0.0055, 0.005, 20), own()); bA.position.set(s * 0.012, 0.003, 0.008); face.add(bA);
+  const bB = new THREE.Mesh(new THREE.CylinderGeometry(0.0055, 0.0055, 0.005, 20), own()); bB.position.set(s * 0.0105, 0.003, -0.010); face.add(bB);
+  const trig = new THREE.Mesh(new THREE.CapsuleGeometry(0.0065, 0.012, 4, 10), own()); trig.position.set(0, -0.019, -0.022); trig.rotation.x = 0.9; head.add(trig);
+  const handle = new THREE.Mesh(new THREE.CapsuleGeometry(0.0175, 0.07, 6, 16), CTRL_W); handle.position.set(0, -0.05, 0.072); handle.rotation.x = -0.55; g.add(handle);
+  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.032, 0.018), own()); grip.position.set(-s * 0.016, 0.012, 0); handle.add(grip);
+  const band = new THREE.Mesh(new THREE.TorusGeometry(0.0175, 0.0022, 6, 24), CTRL_B); band.rotation.x = Math.PI / 2; band.position.y = 0.03; handle.add(band);
+  g.updateMatrixWorld(true);
+  const at = m => g.worldToLocal(m.getWorldPosition(new V3()));
+  return {g, trig, grip, bA, bB, cap, anchors: {stick: at(cap), b: at(bB), a: at(bA), trig: at(trig), grip: at(grip)}};
+}
+function hintSprite() {
+  const cv = document.createElement('canvas'); cv.width = 640; cv.height = 112; const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, depthTest: false, transparent: true})); sp.scale.set(0.11, 0.01925, 1); sp.renderOrder = 70; return {sp, cv, tex};
+}
+function drawHint(H, key, txt, keyBg) {
+  const g = H.cv.getContext('2d'); g.clearRect(0, 0, 640, 112);
+  g.fillStyle = '#0b0b12'; g.beginPath(); g.roundRect(8, 10, 624, 90, 26); g.fill(); g.fillStyle = '#ffffff'; g.beginPath(); g.roundRect(4, 6, 622, 88, 26); g.fill(); g.lineWidth = 6; g.strokeStyle = '#0b0b12'; g.stroke();
+  g.font = `34px ${BUNGEE}`; const kw = Math.max(70, g.measureText(key).width + 30);
+  g.fillStyle = keyBg || '#0b0b12'; g.beginPath(); g.roundRect(14, 16, kw, 68, 18); g.fill(); g.fillStyle = keyBg ? '#ffffff' : '#f7f20a'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(key, 14 + kw / 2, 52);
+  g.fillStyle = '#0b0b12'; g.textAlign = 'left'; let fs = 34; g.font = `800 ${fs}px ${SANS}`; while (g.measureText(txt).width > 596 - kw && fs > 18) { fs -= 2; g.font = `800 ${fs}px ${SANS}`; }
+  g.fillText(txt, 30 + kw, 52); H.tex.needsUpdate = true;
+}
+const HINT_SLOTS = {stick: [0.082, 0.054, 0.020], b: [0.090, 0.032, 0.040], a: [0.096, 0.010, 0.058], trig: [0.088, -0.046, -0.018], grip: [0.084, -0.064, 0.092]};
+function buildHints(model, s) {
+  const grp = new THREE.Group(), pts = [], items = {};
+  for (const k of Object.keys(HINT_SLOTS)) { const H = hintSprite(), [x, y, z] = HINT_SLOTS[k]; H.sp.position.set(s * x, y, z); grp.add(H.sp); items[k] = H;
+    pts.push(model.anchors[k].clone(), new V3(s * (x - 0.054), y, z)); }
+  const lines = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({color: '#0b0b12', transparent: true, opacity: .85, depthTest: false}));
+  lines.renderOrder = 69; lines.frustumCulled = false; grp.add(lines); grp.visible = S.labels;
+  return {grp, items};
+}
+const RED = new THREE.Color(COL.r), ORANGE = new THREE.Color(COL.o), DARKB = new THREE.Color('#121219'), REC_RED = new THREE.Color('#ff2a2a');
+function writeHints(h) {
+  if (!h.hints) return;
+  const L = h.side === 'left', I = h.hints.items, path = h.mode === 'path';
+  drawHint(I.trig, 'TRIGGER', path ? 'draw a path · on a handle = drag it' : 'play the suns near your hand · on a handle = drag');
+  drawHint(I.grip, 'GRIP', 'grab the suns · both grips = stretch + turn');
+  if (path) drawHint(I.a, '✕ ' + (L ? 'X' : 'A'), 'delete the nearest path', COL.r);
+  else drawHint(I.a, L ? 'X' : 'A', h.hold ? 'hold is ON: let go and it keeps playing' : 'hold: let go and it keeps playing');
+  drawHint(I.b, L ? 'Y' : 'B', L ? 'menu on / off' : 'hold to record your voice (60s)');
+  drawHint(I.stick, 'STICK', (path ? 'click = play mode · ↕ reach' : 'click = path mode · ↕ suns') + ' · ↔ tempo');
+  const m = h.model; if (m) { m.bA.material.color.copy(path ? RED : h.hold ? ORANGE : DARKB); }
+}
+
+/* ================= menu panel (canvas, used in VR + on desktop) ================= */
+const PW = 1024, PH = 800;
+const pcv = document.createElement('canvas'); pcv.width = PW; pcv.height = PH; const pg = pcv.getContext('2d');
+$('#panelWrap').appendChild(pcv);
+const ptex = new THREE.CanvasTexture(pcv); ptex.colorSpace = THREE.SRGBColorSpace; ptex.anisotropy = 4;
+const panelMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.30, 0.30 * PH / PW), new THREE.MeshBasicMaterial({map: ptex, toneMapped: false}));
+const panelBack = new THREE.Mesh(new THREE.PlaneGeometry(0.312, 0.312 * PH / PW), new THREE.MeshBasicMaterial({color: '#000'}));
+panelBack.position.z = -.002; panelMesh.add(panelBack);
+panelMesh.position.set(0, 0.15, -0.06); panelMesh.rotation.x = -0.55;
+let hits = [], hoverPt = null, hoverKey = '', activeSlider = null, panelDirty = true, lastPanelDraw = 0;
+const TABS = [['voice', 'Voice', COL.r], ['arp', 'Arp', COL.o], ['tone', 'Tone', COL.y], ['synth', 'Synth', COL.p], ['space', 'Space', COL.c], ['paths', 'Paths', COL.g]];
+const X0 = 182, WC = 812;
+function rr(x, y, w, h, r) { pg.beginPath(); pg.roundRect(x, y, w, h, r); }
+function slab(x, y, w, h, bg, hv, r = 18) {
+  pg.fillStyle = '#000'; rr(x + 6, y + 6, w, h, r); pg.fill();
+  pg.fillStyle = bg; rr(x, y, w, h, r); pg.fill();
+  if (hv) { pg.fillStyle = 'rgba(255,255,255,.22)'; rr(x, y, w, h, r); pg.fill(); }
+  pg.lineWidth = 5; pg.strokeStyle = '#000'; rr(x, y, w, h, r); pg.stroke();
+}
+function txt(s, x, y, size, col, align = 'left', font = SANS, weight = '800') { pg.font = `${weight} ${size}px ${font}`; pg.fillStyle = col; pg.textAlign = align; pg.textBaseline = 'middle'; pg.fillText(s, x, y); }
+function wrap(s, x, y, maxW, size, lh, col) { pg.font = `700 ${size}px ${SANS}`; pg.fillStyle = col; pg.textAlign = 'left'; pg.textBaseline = 'middle';
+  let line = '', yy = y; for (const w of s.split(' ')) { const t = line ? line + ' ' + w : w; if (pg.measureText(t).width > maxW && line) { pg.fillText(line, x, yy); line = w; yy += lh; } else line = t; } if (line) pg.fillText(line, x, yy); return yy + lh; }
+const isHover = (x, y, w, h) => hoverPt && hoverPt[0] >= x && hoverPt[0] <= x + w && hoverPt[1] >= y && hoverPt[1] <= y + h;
+function button(x, y, w, h, label, bg, fg, fn, size = 30, font = BUNGEE) {
+  slab(x, y, w, h, bg, isHover(x, y, w, h));
+  const lines = label.split('\n'); let fs = size; pg.font = `400 ${fs}px ${font}`;
+  while (Math.max(...lines.map(l => pg.measureText(l).width)) > w - 16 && fs > 14) { fs -= 1; pg.font = `400 ${fs}px ${font}`; }
+  lines.forEach((l, i) => txt(l, x + w / 2, y + h / 2 + (i - (lines.length - 1) / 2) * fs * 1.1 + 2, fs, fg, 'center', font, '400'));
+  hits.push({x, y, w, h, fn, key: x + ',' + y});
+}
+function slider(y, label, key, min, max, fmt, lo, hi, step) {
+  const x = X0, w = WC;
+  txt(label, x, y, 30, '#fff'); txt(fmt(S[key]), x + w, y, 30, COL.y, 'right');
+  const ty = y + 42, th = 22, f = clamp((S[key] - min) / (max - min), 0, 1);
+  pg.fillStyle = '#000'; rr(x + 4, ty - th / 2 + 5, w, th, 11); pg.fill();
+  pg.fillStyle = COL.dark; rr(x, ty - th / 2, w, th, 11); pg.fill();
+  pg.fillStyle = COL.o; rr(x, ty - th / 2, Math.max(th, w * f), th, 11); pg.fill();
+  pg.lineWidth = 4; pg.strokeStyle = '#000'; rr(x, ty - th / 2, w, th, 11); pg.stroke();
+  const hv = isHover(x - 20, ty - 34, w + 40, 68) || (activeSlider && activeSlider.slider.key === key);
+  pg.beginPath(); pg.arc(x + w * f, ty, hv ? 27 : 23, 0, 7); pg.fillStyle = COL.y; pg.fill(); pg.lineWidth = 5; pg.strokeStyle = '#000'; pg.stroke();
+  if (lo) { txt(lo, x, ty + 38, 21, '#c9b6d6', 'left', SANS, '700'); txt(hi, x + w, ty + 38, 21, '#c9b6d6', 'right', SANS, '700'); }
+  hits.push({x: x - 20, y: ty - 34, w: w + 40, h: 68, slider: {key, min, max, step}, key: 's' + key});
+  return y + (lo ? 120 : 88);
+}
+function seg(y, label, key, opts, col = COL.y, size = 26) {
+  if (label) txt(label, X0, y, 30, '#fff');
+  const by = y + (label ? 26 : 0), n = opts.length, gap = 10, bw = (WC - gap * (n - 1)) / n, bh = 58;
+  opts.forEach(([v, l], i) => { const on = S[key] === v; button(X0 + i * (bw + gap), by, bw, bh, l, on ? col : COL.dark, on ? '#000' : '#fff', () => { S[key] = v; onSet(key); }, size); });
+  return by + bh + 30;
+}
+function icon(id, cx, cy, col) {
+  const g = pg; g.save(); g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 7; g.lineCap = 'round'; g.lineJoin = 'round';
+  switch (id) {
+    case 'voice': rr(cx - 12, cy - 30, 24, 38, 12); g.fill(); g.beginPath(); g.arc(cx, cy - 4, 21, .12 * Math.PI, .88 * Math.PI); g.stroke(); g.beginPath(); g.moveTo(cx, cy + 17); g.lineTo(cx, cy + 28); g.stroke(); break;
+    case 'arp': [[-24, 16], [-8, 4], [8, -8], [24, -20]].forEach(([x, y]) => { g.beginPath(); g.arc(cx + x, cy + y, 8, 0, 7); g.fill(); }); break;
+    case 'tone': g.beginPath(); g.arc(cx, cy, 24, 0, 7); g.stroke(); g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + 14, cy - 15); g.stroke(); break;
+    case 'synth': g.beginPath(); for (let i = 0; i <= 40; i++) { const x = cx - 30 + i * 1.5, y = cy - 16 * Math.sin(i / 40 * Math.PI * 2); i ? g.lineTo(x, y) : g.moveTo(x, y); } g.stroke(); break;
+    case 'space': for (let r = 12; r <= 34; r += 11) { g.beginPath(); g.arc(cx - 16, cy, r, -.85, .85); g.stroke(); } g.beginPath(); g.arc(cx - 16, cy, 6, 0, 7); g.fill(); break;
+    case 'paths': g.beginPath(); g.moveTo(cx - 28, cy + 18); g.bezierCurveTo(cx - 8, cy - 42, cx + 8, cy + 42, cx + 28, cy - 18); g.stroke(); [[-28, 18], [0, 0], [28, -18]].forEach(([x, y]) => { g.beginPath(); g.arc(cx + x, cy + y, 8, 0, 7); g.fill(); }); break;
+  }
+  g.restore();
+}
+const pct = v => Math.round(v * 100) + '%';
+function drawPanel() {
+  hits = []; panelDirty = false; lastPanelDraw = performance.now();
+  const g = pg;
+  g.fillStyle = COL.bg; g.fillRect(0, 0, PW, PH);
+  g.fillStyle = '#000'; g.fillRect(0, 0, 156, PH);
+  TABS.forEach(([id, name, c], i) => { const y = 16 + i * 129, on = S.tab === id;
+    slab(16, y, 122, 116, on ? c : '#1d1026', isHover(16, y, 122, 116));
+    icon(id, 77, y + 48, on ? '#000' : '#fff'); txt(name, 77, y + 96, 22, on ? '#000' : '#fff', 'center', BUNGEE, '400');
+    hits.push({x: 16, y, w: 122, h: 116, fn: () => { S.tab = id; saveSettings(); }, key: 'tab' + id}); });
+  const tab = TABS.find(t => t[0] === S.tab) || TABS[0];
+  txt(tab[1].toUpperCase(), X0, 52, 46, tab[2], 'left', BUNGEE, '400');
+  const dur = sample ? (sample.data.length / sample.sr) : 0;
+  txt(dots.length ? `${dots.length} suns · ${dur.toFixed(1)}s` : 'no take yet', X0 + WC, 52, 26, '#c9b6d6', 'right');
+  let y = 112;
+  switch (S.tab) {
+    case 'voice': {
+      const r = !!rec;
+      button(X0, y, 400, 136, r ? `■ STOP\n${recSec().toFixed(1)}s / 60` : '● REC\nhold B in VR', r ? '#ff2a2a' : COL.r, '#fff', () => { unlock(); rec ? stopRec() : startRec(); }, 40);
+      button(X0 + 420, y, 186, 136, 'DEMO\nVOICE', COL.v, '#fff', () => { unlock(); demoVoice(); }, 28);
+      button(X0 + 626, y, 186, 136, 'RESET\nPLACE', COL.c, '#000', () => { cloud.position.set(0, 0, 0); cloud.quaternion.identity(); cloud.scale.setScalar(1); toast('Suns back around you'); }, 28);
+      y += 170;
+      const p = dots.filter(d => d.pitched).length;
+      txt(dots.length ? `${dots.length} chops · ${p} with a clear note · ${dots.length - p} breaths + hits` : 'Hold B and talk, sing or rap for up to a minute.', X0, y, 26, '#fff'); y += 44;
+      y = slider(y, 'Chop sensitivity', 'sens', 0, 1, pct, 'fewer chops', 'more chops');
+      y = slider(y, 'Longest chop', 'maxLen', .08, .6, v => Math.round(v * 1000) + ' ms', 'short', 'long');
+      y = seg(y, 'Where the suns float', 'layout', [['around', 'Around you'], ['front', 'In front']]);
+      wrap('Filled suns have a clear note, cyan rings are breaths, hits and S sounds. Higher = higher pitch. Time runs clockwise from in front of you.', X0, y, WC, 22, 30, '#c9b6d6');
+      break; }
+    case 'arp':
+      y = seg(y, 'Pattern', 'pattern', [['up', 'Up'], ['down', 'Down'], ['bounce', 'Bounce'], ['random', 'Random'], ['speech', 'Speech']], COL.o, 22);
+      y = slider(y, 'Tempo  (stick ↔ in VR)', 'bpm', 40, 220, v => Math.round(v) + ' BPM', null, null, 1);
+      y = seg(y, 'Steps', 'div', [[2, '8ths'], [3, 'Triplets'], [4, '16ths'], [6, 'Fast']], COL.o, 24);
+      y = slider(y, 'Suns per hand  (stick ↕ in VR)', 'notes', 1, 8, v => Math.round(v) + '', null, null, 1);
+      y = slider(y, 'Chop length', 'gate', 0, 1, v => v >= .97 ? 'full' : pct(v), 'stutter', 'full chops');
+      y = seg(y, 'Blend in the gaps', 'blend', [[false, 'Off'], [true, 'On']], COL.o);
+      wrap('Empty space between suns plays a ghost blend of the 3 nearest.', X0, y - 8, WC, 22, 30, '#c9b6d6');
+      break;
+    case 'tone':
+      y = slider(y, 'Tone', 'tone', 0, 1, pct, 'raw voice', 'ringing notes');
+      y = seg(y, 'Snap to key', 'snap', [[false, 'Off'], [true, 'On']], COL.y);
+      { txt('Key', X0, y, 30, '#fff'); const by = y + 26, bw = (WC - 11 * 6) / 12;
+        NAMES.forEach((n, i) => { const on = S.key === i; button(X0 + i * (bw + 6), by, bw, 56, n, on ? COL.y : COL.dark, on ? '#000' : '#fff', () => { S.key = i; onSet('key'); }, 22); }); y = by + 86; }
+      y = seg(y, 'Scale', 'scale', [['minPent', 'Min pent'], ['majPent', 'Maj pent'], ['minor', 'Minor'], ['dorian', 'Dorian'], ['phrygian', 'Phrygian'], ['hijaz', 'Hijaz']], COL.y, 20);
+      button(X0, y, 380, 70, 'FIND KEY FROM VOICE', COL.amber, '#000', () => findKey(false), 24);
+      break;
+    case 'synth':
+      y = slider(y, 'Synth mix', 'mix', 0, 1, pct, 'voice only', 'synth only');
+      y = seg(y, 'Sound', 'wave', [['glass', 'Glass'], ['saw', 'Saw'], ['sub', 'Sub']], COL.p);
+      y = seg(y, 'Octave', 'oct', [[-1, '−1'], [0, '0'], [1, '+1']], COL.p);
+      y = slider(y, 'Brightness', 'cutoff', 0, 1, pct, 'dark', 'bright');
+      wrap('The synth doubles the note of every chop it plays.', X0, y, WC, 22, 30, '#c9b6d6');
+      break;
+    case 'space':
+      y = slider(y, 'Echo', 'echo', 0, 1, pct);
+      y = slider(y, 'Room', 'verb', 0, 1, pct);
+      y = slider(y, 'Volume', 'vol', 0, 1, pct);
+      y = seg(y, 'Twist to bend', 'twist', [[false, 'Off'], [true, 'On']], COL.c);
+      y = wrap('With Twist on, roll your wrist while you hold the trigger: right = faster + higher, left = slower + lower.', X0, y - 6, WC, 22, 30, '#c9b6d6') + 10;
+      y = seg(y, 'Button labels on the controllers', 'labels', [[true, 'Show'], [false, 'Hide']], COL.c);
+      break;
+    case 'paths': {
+      y = wrap('Click a stick to put that hand in Path mode, then hold the trigger and draw through the suns. The path plays the suns closest to it, in order. Drag the round handles to reshape it.', X0, y - 6, WC, 22, 30, '#c9b6d6') + 8;
+      y = slider(y, 'Reach (how far from the path it picks suns)', 'reach', .02, .15, v => Math.round(v * 100) + ' cm', 'tight', 'wide');
+      y = seg(y, 'Direction', 'pathDir', [['fwd', 'Loop'], ['bounce', 'Back + forth']], COL.g);
+      y = seg(y, null, 'pathMute', [[false, 'Paths playing'], [true, 'Paths muted']], COL.g);
+      if (!renderer.xr.isPresenting) y = seg(y, 'Mouse (on a computer)', 'deskMode', [['play', 'Play'], ['path', 'Draw path']], COL.g);
+      if (!paths.length) { txt('No paths yet.', X0, y + 10, 26, '#fff'); break; }
+      const colW = (WC - 14) / 2;
+      paths.forEach((p, i) => { const cx = X0 + (i % 2) * (colW + 14), cy = y + Math.floor(i / 2) * 64;
+        pg.fillStyle = p.col; rr(cx, cy, 40, 50, 10); pg.fill(); pg.lineWidth = 4; pg.strokeStyle = '#000'; pg.stroke();
+        txt(`Path ${i + 1} · ${p.nSuns || 0} suns` + (p.nGhost ? ` + ${p.nGhost} blends` : ''), cx + 54, cy + 26, 22, '#fff');
+        button(cx + colW - 62, cy, 56, 50, '✕', COL.r, '#fff', () => removePath(p), 28, SANS); });
+      const ly = y + Math.ceil(paths.length / 2) * 64 + 6;
+      if (ly < PH - 60) button(X0, ly, 260, 52, '✕ CLEAR ALL', COL.r, '#fff', () => { [...paths].forEach(p => removePath(p, true)); toast('All paths deleted'); }, 22);
+      break; }
+  }
+  ptex.needsUpdate = true;
+}
+function hitAt(px, py) { for (let i = hits.length - 1; i >= 0; i--) { const h = hits[i]; if (px >= h.x && px <= h.x + h.w && py >= h.y && py <= h.y + h.h) return h; } return null; }
+function setSlider(h, px) {
+  const {key, min, max, step} = h.slider; const f = clamp((px - (h.x + 20)) / (h.w - 40), 0, 1);
+  let v = min + f * (max - min); if (step) v = Math.round(v / step) * step; v = +v.toFixed(4);
+  if (v !== S[key]) { S[key] = v; onSet(key); }
+}
+function pDown(px, py) { const h = hitAt(px, py); if (!h) return false; if (h.slider) { activeSlider = h; setSlider(h, px); } else h.fn(); panelDirty = true; return true; }
+function pMove(px, py) {
+  hoverPt = [px, py]; if (activeSlider) { setSlider(activeSlider, px); return; }
+  const h = hitAt(px, py), k = h ? h.key : ''; if (k !== hoverKey) { hoverKey = k; panelDirty = true; }
+}
+function pUp() { if (activeSlider) { activeSlider = null; panelDirty = true; } }
+function pLeave() { if (hoverPt) { hoverPt = null; hoverKey = ''; panelDirty = true; } }
+function onSet(k) {
+  if (k === 'sens' || k === 'maxLen') { clearTimeout(reTimer); reTimer = setTimeout(() => runAnalysis(false), 250); }
+  if (k === 'snap' || k === 'key' || k === 'scale') assignNotes();
+  if (['echo', 'verb', 'vol', 'bpm'].includes(k)) applyFX();
+  if (k === 'layout') { place3D(); paths.forEach(computeSeq); }
+  if (k === 'reach' || k === 'blend') paths.forEach(computeSeq);
+  if (k === 'labels') hands.forEach(h => h.hints && (h.hints.grp.visible = S.labels));
+  saveSettings(); panelDirty = true;
+}
+// desktop panel pointer
+const pxy = e => { const r = pcv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width * PW, (e.clientY - r.top) / r.height * PH]; };
+pcv.addEventListener('pointerdown', e => { unlock(); pcv.setPointerCapture(e.pointerId); const [x, y] = pxy(e); pMove(x, y); pDown(x, y); });
+pcv.addEventListener('pointermove', e => { const [x, y] = pxy(e); pMove(x, y); });
+pcv.addEventListener('pointerup', () => pUp());
+pcv.addEventListener('pointerleave', () => { if (!activeSlider) pLeave(); });
+
+/* ================= toast ================= */
+const toastCv = document.createElement('canvas'); toastCv.width = 1024; toastCv.height = 112;
+const toastTex = new THREE.CanvasTexture(toastCv); toastTex.colorSpace = THREE.SRGBColorSpace;
+const toastSp = new THREE.Sprite(new THREE.SpriteMaterial({map: toastTex, transparent: true, depthTest: false, opacity: 0}));
+toastSp.scale.set(0.5, 0.0547, 1); toastSp.position.set(0, -0.17, -0.7); toastSp.renderOrder = 999; camera.add(toastSp);
+let toastUntil = 0, toastT = 0;
+function toast(m) {
+  const t = $('#toast'); t.textContent = m; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 2800);
+  const g = toastCv.getContext('2d'); g.clearRect(0, 0, 1024, 112);
+  g.fillStyle = '#000'; g.beginPath(); g.roundRect(10, 12, 1008, 94, 24); g.fill(); g.fillStyle = COL.y; g.beginPath(); g.roundRect(4, 6, 1008, 94, 24); g.fill(); g.lineWidth = 6; g.strokeStyle = '#000'; g.stroke();
+  let fs = 36; g.font = `800 ${fs}px ${SANS}`; while (g.measureText(m).width > 970 && fs > 18) { fs -= 2; g.font = `800 ${fs}px ${SANS}`; }
+  g.fillStyle = '#000'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(m, 508, 54); toastTex.needsUpdate = true;
+  toastUntil = performance.now() + 2800;
+}
+
+/* ================= hands ================= */
+const tipPlayGeo = new THREE.SphereGeometry(0.011, 16, 12), tipPathGeo = new THREE.OctahedronGeometry(0.013, 0);
+function makeHand(i) {
+  const ctrl = renderer.xr.getController(i); scene.add(ctrl);
+  const vis = new THREE.Group(); ctrl.add(vis); vis.visible = false;
+  const tip = new THREE.Mesh(tipPlayGeo, new THREE.MeshBasicMaterial({color: COL.amber, toneMapped: false})); tip.position.set(0, 0, -0.045); vis.add(tip);
+  const holdRing = new THREE.Mesh(new THREE.TorusGeometry(0.02, 0.003, 8, 28), new THREE.MeshBasicMaterial({color: COL.o, toneMapped: false})); holdRing.visible = false; tip.add(holdRing);
+  const recRing = new THREE.Mesh(new THREE.TorusGeometry(0.03, 0.004, 8, 32), new THREE.MeshBasicMaterial({color: '#ff2a2a', toneMapped: false})); recRing.visible = false; tip.add(recRing);
+  const laser = new THREE.Mesh(new THREE.CylinderGeometry(0.0016, 0.0016, 1, 6).rotateX(Math.PI / 2).translate(0, 0, -0.5), new THREE.MeshBasicMaterial({color: COL.y, toneMapped: false, depthTest: false}));
+  laser.renderOrder = 81; laser.visible = false; ctrl.add(laser);
+  const ldot = new THREE.Mesh(new THREE.SphereGeometry(0.005, 10, 8), new THREE.MeshBasicMaterial({color: COL.y, toneMapped: false, depthTest: false})); ldot.renderOrder = 82; ldot.visible = false; scene.add(ldot);
+  const cluster = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 2), new THREE.MeshBasicMaterial({color: COL.amber, wireframe: true, transparent: true, opacity: .22, depthWrite: false})); cluster.visible = false; cloud.add(cluster);
+  const h = {i, ctrl, vis, tip, holdRing, recRing, laser, ldot, cluster, side: i ? 'left' : 'right', src: null, model: null, hints: null, mode: 'play', hold: false, latch: null,
+    playing: false, player: makePlayer('hand'), prev: [], gripOn: false, drag: null, draw: null, twistRef: null, stickT: 0, panelPtr: false, recording: false};
+  const build = side => { if (h.model) { h.model.g.removeFromParent(); h.hints.grp.removeFromParent(); }
+    const sg = side === 'left' ? -1 : 1; h.model = makeController(sg); vis.add(h.model.g); h.hints = buildHints(h.model, sg); vis.add(h.hints.grp); writeHints(h); };
+  build(h.side);
+  ctrl.addEventListener('connected', e => { h.src = e.data; const sd = e.data.handedness === 'left' || e.data.handedness === 'right' ? e.data.handedness : h.side; h.side = sd; build(sd); vis.visible = true; });
+  ctrl.addEventListener('disconnected', () => { h.src = null; vis.visible = false; endPlay(h, true); h.laser.visible = h.ldot.visible = false; });
+  return h;
+}
+const hands = [makeHand(0), makeHand(1)];
+function buzz(h, v, ms) { try { const a = h.src && h.src.gamepad && h.src.gamepad.hapticActuators && h.src.gamepad.hapticActuators[0]; if (a && a.pulse) a.pulse(v, ms); } catch (e) {} }
+function makeLatch(pos, speed) {
+  const m = new THREE.Group();
+  m.add(new THREE.Mesh(new THREE.SphereGeometry(.008, 14, 10), new THREE.MeshBasicMaterial({color: '#000'})));
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(.017, .0035, 8, 28), new THREE.MeshBasicMaterial({color: COL.o, toneMapped: false})); m.add(ring);
+  const cl = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 2), new THREE.MeshBasicMaterial({color: COL.o, wireframe: true, transparent: true, opacity: .2, depthWrite: false}));
+  m.position.copy(pos); cloud.add(m); cloud.add(cl);
+  const p = makePlayer('latch'); p.pt.copy(pos); p.active = true; p.speed = speed;
+  return {pos: pos.clone(), mesh: m, ring, cluster: cl, player: p};
+}
+function dropLatch(h) { if (!h.latch) return; h.latch.mesh.removeFromParent(); h.latch.cluster.removeFromParent(); if (h.latch.player.gm) h.latch.player.gm.removeFromParent(); h.latch = null; }
+function startPlay(h) { h.playing = true; h.player.idx = 0; h.player.nextT = 0; h.twistRef = h.ctrl.quaternion.clone(); h.player.speed = 1; }
+function endPlay(h, cancel) {
+  if (!h.playing) return; h.playing = false; h.player.active = false;
+  if (h.hold && !cancel && dots.length) { dropLatch(h); h.latch = makeLatch(h.player.pt, h.player.speed); }
+}
+function twistSpeed(h) {
+  if (!S.twist || !h.twistRef) return 1;
+  const rel = h.twistRef.clone().invert().multiply(h.ctrl.quaternion);
+  let a = 2 * Math.atan2(rel.z, rel.w); if (a > Math.PI) a -= 2 * Math.PI; if (a < -Math.PI) a += 2 * Math.PI;
+  let sp = clamp(Math.pow(2, -a / (Math.PI / 2)), .5, 2);
+  if (S.snap) sp = Math.pow(2, Math.round(12 * Math.log2(sp)) / 12);
+  return sp;
+}
+const raycaster = new THREE.Raycaster(), _o = new V3(), _d = new V3(), _q = new THREE.Quaternion();
+function panelHand() { return hands.find(h => h.side === 'left' && h.src) || null; }
+function rayPanel(h) {
+  if (!S.menu || !panelMesh.parent || panelMesh.parent === h.vis) return null;
+  h.ctrl.getWorldPosition(_o); h.ctrl.getWorldQuaternion(_q); _d.set(0, 0, -1).applyQuaternion(_q);
+  raycaster.set(_o, _d); raycaster.far = 2;
+  const hit = raycaster.intersectObject(panelMesh, false)[0];
+  return hit ? {uv: hit.uv, dist: hit.distance, point: hit.point} : null;
+}
+function updateHand(h) {
+  const gp = h.src && h.src.gamepad; if (!gp) return;
+  const b = gp.buttons, on = k => !!(b[k] && b[k].pressed), down = k => on(k) && !h.prev[k], up = k => !on(k) && h.prev[k];
+  const tipW = h.tip.getWorldPosition(new V3()), tipL = cloud.worldToLocal(tipW.clone());
+  h.tipW = tipW;
+  // --- menu pointer
+  const ph = rayPanel(h);
+  if (ph || h.panelPtr) {
+    if (ph) { const px = ph.uv.x * PW, py = (1 - ph.uv.y) * PH; pMove(px, py); h.laser.visible = true; h.laser.scale.z = ph.dist; h.ldot.visible = true; h.ldot.position.copy(ph.point); }
+    if (down(0) && ph && !h.playing && !h.draw && !h.drag) { h.panelPtr = true; if (pDown((ph.uv.x) * PW, (1 - ph.uv.y) * PH)) buzz(h, .3, 20); }
+  } else if (h.laser.visible) { h.laser.visible = h.ldot.visible = false; pLeave(); }
+  if (h.panelPtr) { if (!on(0)) { h.panelPtr = false; pUp(); } }
+  else {
+    // --- trigger
+    if (down(0)) {
+      const hd = nearestHandle(tipW, .04);
+      if (hd) { h.drag = {path: hd.path, i: hd.i, off: hd.path.pts[hd.i].clone().sub(tipL)}; buzz(h, .4, 25); }
+      else if (h.mode === 'path') { h.draw = {pts: [tipL.clone()]}; }
+      else startPlay(h);
+    }
+    if (on(0)) {
+      if (h.drag) { const p = h.drag.path; if (paths.includes(p)) { p.pts[h.drag.i].copy(tipL).add(h.drag.off); buildPath(p); } }
+      else if (h.draw) { const pts = h.draw.pts; if (tipL.distanceTo(pts[pts.length - 1]) > .008 / cloud.scale.x) { pts.push(tipL.clone()); showStroke(pts); } }
+    }
+    if (up(0)) {
+      if (h.drag) { h.drag = null; savePaths(); }
+      else if (h.draw) { const pts = h.draw.pts; h.draw = null; strokeLine.visible = false; if (finishStroke(pts)) buzz(h, .5, 40); }
+      else endPlay(h);
+    }
+  }
+  if (h.playing) { h.player.active = true; h.player.pt.copy(tipL); h.player.speed = twistSpeed(h); }
+  // --- grip
+  h.gripOn = on(1);
+  // --- A / X
+  if (down(4)) {
+    if (h.mode === 'path') { const np = nearestPath(tipL); if (np && np.d < .25) { removePath(np.p); buzz(h, .6, 40); } else toast('Reach toward a path, then press ✕ to delete it.'); }
+    else { h.hold = !h.hold; if (!h.hold) dropLatch(h); writeHints(h); toast(h.hold ? 'Hold ON: let go of the trigger and those suns keep playing' : 'Hold OFF'); }
+  }
+  // --- B (right) = record, Y (left) = menu
+  if (h.side === 'right') { if (down(5)) { h.recording = true; startRec(); } if (up(5) && h.recording) { h.recording = false; stopRec(); } }
+  else if (down(5)) { S.menu = !S.menu; saveSettings(); }
+  // --- stick click = mode
+  if (down(3)) { h.mode = h.mode === 'play' ? 'path' : 'play'; if (h.mode === 'path') endPlay(h, true); writeHints(h);
+    h.tip.geometry = h.mode === 'path' ? tipPathGeo : tipPlayGeo; h.tip.material.color.set(h.mode === 'path' ? COL.y : COL.amber);
+    toast(h.mode === 'path' ? 'Path mode: hold the trigger and draw through the suns' : 'Play mode'); buzz(h, .3, 20); }
+  // --- stick push
+  const ax = gp.axes || [], sx = ax[2] || 0, sy = ax[3] || 0, now = performance.now();
+  if (Math.abs(sx) < .3 && Math.abs(sy) < .3) h.stickT = 0;
+  else if (now > h.stickT) {
+    if (Math.abs(sy) > .6 && Math.abs(sy) >= Math.abs(sx)) { const dir = sy < 0 ? 1 : -1;
+      if (h.mode === 'play') { S.notes = clamp(Math.round(S.notes) + dir, 1, 8); toast(S.notes + (S.notes === 1 ? ' sun per hand' : ' suns per hand')); }
+      else { S.reach = clamp(+(S.reach + dir * .01).toFixed(2), .02, .15); onSet('reach'); toast('Path reach ' + Math.round(S.reach * 100) + ' cm'); }
+      h.stickT = now + 300; saveSettings(); panelDirty = true; }
+    else if (Math.abs(sx) > .6) { S.bpm = clamp(Math.round(S.bpm) + (sx > 0 ? 4 : -4), 40, 220); applyFX(); toast(S.bpm + ' BPM'); h.stickT = now + 150; saveSettings(); panelDirty = true; }
+  }
+  h.prev = b.map(x => x.pressed);
+}
+// --- grabbing the whole cloud: one grip moves + turns, two grips stretch + turn
+let grab = null;
+const _m = new THREE.Matrix4(), YAX = new V3(0, 1, 0);
+function updateGrab() {
+  const gs = hands.filter(h => h.gripOn && h.src && h.tipW);
+  const key = gs.map(h => h.i).join(',');
+  if (key !== (grab ? grab.key : '')) {
+    if (!gs.length) grab = null;
+    else if (gs.length === 1) grab = {key, one: gs[0], M0: new THREE.Matrix4().copy(gs[0].ctrl.matrixWorld).invert().multiply(cloud.matrixWorld)};
+    else { const a = gs[0].tipW, b = gs[1].tipW, mid = a.clone().add(b).multiplyScalar(.5);
+      grab = {key, two: [gs[0], gs[1]], localMid: cloud.worldToLocal(mid.clone()), s0: cloud.scale.x, q0: cloud.quaternion.clone(), d0: Math.max(.02, a.distanceTo(b)), ang0: Math.atan2(b.x - a.x, b.z - a.z)}; }
+    if (grab) gs.forEach(h => buzz(h, .25, 20));
+  }
+  if (!grab) return;
+  if (grab.one) { _m.multiplyMatrices(grab.one.ctrl.matrixWorld, grab.M0); _m.decompose(cloud.position, cloud.quaternion, cloud.scale); }
+  else { const a = grab.two[0].tipW, b = grab.two[1].tipW, mid = a.clone().add(b).multiplyScalar(.5);
+    const s = clamp(grab.s0 * a.distanceTo(b) / grab.d0, .25, 5), ang = Math.atan2(b.x - a.x, b.z - a.z);
+    cloud.quaternion.setFromAxisAngle(YAX, ang - grab.ang0).multiply(grab.q0); cloud.scale.setScalar(s);
+    cloud.position.copy(mid).sub(grab.localMid.clone().multiplyScalar(s).applyQuaternion(cloud.quaternion)); }
+  cloud.updateMatrixWorld(true);
+}
+
+/* ================= desktop mouse ================= */
+const desk = {player: makePlayer('desk'), down: false, mouse: new THREE.Vector2(), draw: null, drag: null, cluster: null};
+desk.cluster = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 2), new THREE.MeshBasicMaterial({color: COL.amber, wireframe: true, transparent: true, opacity: .22, depthWrite: false})); desk.cluster.visible = false; cloud.add(desk.cluster);
+const deskRay = new THREE.Raycaster(), _plane = new THREE.Plane();
+function setMouse(e) { desk.mouse.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1); deskRay.setFromCamera(desk.mouse, camera); }
+function rayPlanePoint(through) { _plane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(new V3()), through); return deskRay.ray.intersectPlane(_plane, new V3()); }
+function screenHandle(e) {
+  let best = null, bd = 18;
+  for (const p of paths) p.pts.forEach((pt, i) => { const w = cloud.localToWorld(pt.clone()), s = w.clone().project(camera);
+    const dx = (s.x + 1) / 2 * innerWidth - e.clientX, dy = (1 - s.y) / 2 * innerHeight - e.clientY, d = Math.hypot(dx, dy); if (s.z < 1 && d < bd) { bd = d; best = {path: p, i, w}; } });
+  return best;
+}
+function deskPlayPoint() {
+  if (!dots.length) return null; let bd = 1e9, bp = null;
+  for (const d of dots) { const w = cloud.localToWorld(d.lp.clone()), dd = deskRay.ray.distanceSqToPoint(w); if (dd < bd) { bd = dd; bp = w; } }
+  const q = deskRay.ray.closestPointToPoint(bp, new V3()); return cloud.worldToLocal(q);
+}
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || renderer.xr.isPresenting) return; unlock(); setMouse(e); desk.down = true;
+  renderer.domElement.setPointerCapture(e.pointerId);
+  const hd = screenHandle(e);
+  if (hd) desk.drag = {path: hd.path, i: hd.i, w: hd.w};
+  else if (S.deskMode === 'path') { const a = deskPlayPoint(); const through = a ? cloud.localToWorld(a.clone()) : cloud.localToWorld(new V3(0, 1.3, 0)); const p = rayPlanePoint(through); if (p) desk.draw = {pts: [cloud.worldToLocal(p)], through}; }
+  else { desk.player.idx = 0; desk.player.nextT = 0; }
+});
+renderer.domElement.addEventListener('pointermove', e => {
+  if (renderer.xr.isPresenting) return; setMouse(e);
+  if (desk.drag) { const p = rayPlanePoint(desk.drag.w); if (p) { desk.drag.path.pts[desk.drag.i].copy(cloud.worldToLocal(p)); buildPath(desk.drag.path); } }
+  else if (desk.draw) { const p = rayPlanePoint(desk.draw.through); if (p) { const l = cloud.worldToLocal(p), pts = desk.draw.pts; if (l.distanceTo(pts[pts.length - 1]) > .008) { pts.push(l); showStroke(pts); } } }
+});
+addEventListener('pointerup', e => {
+  if (!desk.down) return; desk.down = false;
+  if (desk.drag) { desk.drag = null; savePaths(); }
+  else if (desk.draw) { const pts = desk.draw.pts; desk.draw = null; strokeLine.visible = false; finishStroke(pts); }
+});
+addEventListener('keydown', e => { if (e.key === 'p' || e.key === 'P') { S.deskMode = S.deskMode === 'play' ? 'path' : 'play'; onSet('deskMode'); toast(S.deskMode === 'path' ? 'Mouse draws paths' : 'Mouse plays suns'); } });
+
+/* ================= per-frame ================= */
+const beams = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: COL.y, transparent: true, opacity: .55, depthWrite: false}));
+beams.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6 * 80), 3)); beams.frustumCulled = false; cloud.add(beams);
+function updateSets() {
+  for (const d of dots) d.sel = 0;
+  const n = Math.round(S.notes), ba = beams.geometry.attributes.position; let bi = 0;
+  const live = [];
+  for (const h of hands) { const p = h.player; if (!h.playing) { p.active = false; p.set = []; } else { p.active = true; live.push([p, h.cluster]); } h.cluster.visible = false;
+    if (h.latch) { h.latch.player.pt.copy(h.latch.pos); live.push([h.latch.player, h.latch.cluster]); } }
+  const dp = desk.player; dp.active = false; desk.cluster.visible = false;
+  if (desk.down && !desk.drag && !desk.draw && !renderer.xr.isPresenting) { const pt = deskPlayPoint(); if (pt) { dp.active = true; dp.pt.copy(pt); live.push([dp, desk.cluster]); } }
+  for (const [p, cl] of live) {
+    let nd = 1e9; for (const d of dots) nd = Math.min(nd, d.lp.distanceTo(p.pt));
+    p.ghost = S.blend && dots.length > 1 && nd > GAP;
+    p.set = nearestN(p.pt, p.ghost ? 3 : n); let r = 0;
+    for (const d of p.set) { d.sel = 1; r = Math.max(r, d.lp.distanceTo(p.pt));
+      if (bi < 80) { ba.setXYZ(bi * 2, p.pt.x, p.pt.y, p.pt.z); ba.setXYZ(bi * 2 + 1, d.lp.x, d.lp.y, d.lp.z); bi++; } }
+    cl.visible = p.set.length > 0 && !p.ghost; cl.position.copy(p.pt); cl.scale.setScalar(r + .014);
+  }
+  ba.needsUpdate = true; beams.geometry.setDrawRange(0, bi * 2);
+  for (const p of paths) p.player.active = !S.pathMute;
+}
+let lastT = performance.now(), spin = 0, wasXR = false;
+renderer.setAnimationLoop(() => {
+  const now = performance.now(), dt = Math.min(.05, (now - lastT) / 1000); lastT = now; spin += dt;
+  const xr = renderer.xr.isPresenting;
+  if (xr !== wasXR) { wasXR = xr; panelDirty = true; }
+  if (!xr) controls.update();
+  scene.updateMatrixWorld();
+  camera.getWorldPosition(headPos); headRight.set(1, 0, 0).applyQuaternion(camera.getWorldQuaternion(_q));
+  if (xr) {
+    const L = panelHand();
+    if (L && S.menu) { if (panelMesh.parent !== L.vis) L.vis.add(panelMesh); } else if (panelMesh.parent) panelMesh.removeFromParent();
+    for (const h of hands) updateHand(h);
+    updateGrab();
+  }
+  updateSets();
+  tick();
+  processFlashes();
+  updateDots(dt);
+  fadeGhosts(dt);
+  // latches + path beads + hand rings
+  for (const h of hands) {
+    h.holdRing.visible = h.hold; if (h.hold) h.holdRing.rotation.z = spin * 2;
+    h.recRing.visible = !!rec && h.side === 'right'; if (rec) { const s = 1 + Math.sin(spin * 8) * .12 + Math.min(.6, (rec.level || 0) * 4); h.recRing.scale.setScalar(s); }
+    if (h.latch) { h.latch.ring.rotation.x = spin * 1.3; h.latch.ring.rotation.y = spin * 2.1; }
+    if (h.model) { h.model.bB.material.color.copy(rec && h.side === 'right' ? REC_RED : DARKB); h.model.trig.material.color.copy(h.playing || h.draw ? ORANGE : DARKB); }
+  }
+  for (const p of paths) { const tgt = p.samples[p.player.bead] || p.samples[0]; if (tgt) { p.beadPos.lerp(tgt, 1 - Math.exp(-dt * 18)); p.bead.position.copy(p.beadPos); }
+    p.bead.visible = !S.pathMute && p.seq.length > 0;
+    p.handles.forEach(hm => { let near = false; for (const h of hands) if (h.tipW && h.src && cloud.localToWorld(hm.position.clone()).distanceTo(h.tipW) < .04) near = true; hm.scale.setScalar(near ? 1.45 : 1); }); }
+  raysSprite.material.rotation = spin * .02;
+  toastSp.material.opacity = xr ? clamp((toastUntil - now) / 400, 0, 1) : 0;
+  if (panelDirty || (rec && now - lastPanelDraw > 120)) { if (now - lastPanelDraw > 45 || !xr) drawPanel(); }
+  renderer.render(scene, camera);
+});
+
+/* ================= start ================= */
+$('#file').addEventListener('change', e => { const f = e.target.files[0]; if (f) loadFile(f); e.target.value = ''; });
+const vrBtn = $('#vrBtn');
+if (navigator.xr && navigator.xr.isSessionSupported) navigator.xr.isSessionSupported('immersive-vr').then(ok => { if (!ok) { vrBtn.textContent = 'No VR here'; vrBtn.disabled = true; vrBtn.style.opacity = .5; } }).catch(() => {});
+else { vrBtn.textContent = 'No VR here'; vrBtn.disabled = true; vrBtn.style.opacity = .5; }
+vrBtn.addEventListener('click', async () => {
+  unlock();
+  try {
+    const s = await navigator.xr.requestSession('immersive-vr', {optionalFeatures: ['local-floor', 'bounded-floor']});
+    await renderer.xr.setSession(s);
+    toast(dots.length ? 'Reach into the suns and hold the trigger. Y opens the menu.' : 'Hold B and talk or sing to make suns.');
+  } catch (e) { toast("Couldn't start VR: " + (e.message || e)); }
+});
+window.__sx = {blendOf, playBlend, tick, flashes, S, dots: () => dots, paths, hands, desk, cloud, newPath, finishStroke, computeSeq, demoVoice, drawPanel, pDown, players: allPlayers, get ctx() { return ctx; }, get voiceBus() { return voiceBus; }};
+(async () => {
+  try { await document.fonts.load(`34px Bungee`); } catch (e) {}
+  hands.forEach(writeHints); panelDirty = true;
+  const v = await idbGet();
+  if (v && v.data && v.data.length) setSample(v.data, v.sr, false, false); else demoVoice(true);
+  loadPaths();
+  if (!v) toast('Demo voice loaded. Record your own with REC (or hold B in VR).');
+})();
+</script>
+<script src="../updated.js"></script>
+</body>
+</html>
