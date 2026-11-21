@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '469';
+const VERSION = '471';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2424,6 +2424,8 @@ function stepIn(c){
   const q0 = c.root.quaternion.clone(), upP = new THREE.Vector3(0,1,0).applyQuaternion(q0), tilted = !!c.guide && upP.y < 0.87;   // leaning more than ~30°
   if (tilted){ const f = new THREE.Vector3(0,0,1).applyQuaternion(q0); f.y = 0; if (f.lengthSq() < 0.04){ f.copy(upP); f.y = 0; } if (f.lengthSq() < 1e-6) f.set(0,0,1);
     c.root.quaternion.setFromAxisAngle(_y, Math.atan2(f.x, f.z)); c.root.updateMatrixWorld(true); }
+  for (const P of partsOf(c)) setPoseObj(P.group, P.rest);   // start from the pose you made in Characters
+  c.root.updateMatrixWorld(true);
   const H = partLayer(c,'head'), LH = partLayer(c,'lh'), RH = partLayer(c,'rh');
   const eyeY = Math.max(0.6, camera.position.y), gHead = c.guide ? c.guide.head[1] : 1.5;   // your real eye height in the room
   rig.scale.setScalar((c.place.s || 1) * clamp(gHead/eyeY, 0.6, 1.6)); rig.updateMatrixWorld(true);
@@ -2580,9 +2582,8 @@ function findGrabTarget(pW, rW=0){
 }
 function startSetGrab(L, ctrlM){
   if (L.locked){ toast('"'+L.name+'" is locked'); return false; }
-  if (show.tracks[String(L.id)] && !show.rec){ toast(L.name+' has recorded moves: record over them, or clear them in Motion'); return false; }
   L.group.updateMatrixWorld(true);
-  show.grab = {L, rel: ctrlM.clone().invert().multiply(L.group.matrixWorld.clone()), before: snapShow()};
+  show.grab = {L, rel: ctrlM.clone().invert().multiply(L.group.matrixWorld.clone()), before: snapShow(), walk: !!show.tracks[String(L.id)] && !show.rec};
   pulse('right',0.5,30); requestUI(); return true;
 }
 // BUILD / CHARACTERS: "Move" mode grabs the whole active layer (or character part)
@@ -2593,14 +2594,25 @@ function endLayerGrab(){ const gr = layerGrab; if (!gr) return; layerGrab = null
 function centerPart(L){ if (!L) return; const b = new THREE.Box3().setFromObject(L.group); if (b.isEmpty()) return; const c = b.getCenter(V()), before = JSON.parse(JSON.stringify(L.rest)); L.rest.p[0] -= c.x; L.rest.p[2] -= c.z; pushUndo({type:'rest', L:L.id, rest:before}); sceneDirty = true; toast('Centered'); }
 function startCharGrab(c, ctrlM){
   if (c.locked){ toast(c.name+' is locked'); return false; }
-  if (show.tracks['r'+c.id] && !show.rec){ toast(c.name+' has recorded moves — record over them, or clear them in Motion'); return false; }
   c.root.updateMatrixWorld(true);
-  show.grab = {c, rel: ctrlM.clone().invert().multiply(c.root.matrixWorld.clone()), before: snapShow()};
+  show.grab = {c, rel: ctrlM.clone().invert().multiply(c.root.matrixWorld.clone()), before: snapShow(), walk: !!show.tracks['r'+c.id] && !show.rec};
   state.selChar = c.id; pulse('right',0.5,30); requestUI(); return true;
 }
 function moveCharGrab(ctrlM){ if (show.grab) setWorldMatrix(grabObj(show.grab), ctrlM.clone().multiply(show.grab.rel)); }
+// it has recorded moves and you aren't recording: the whole recorded walk moves with your hand (same as "Bring here")
+function shiftWalk(key, obj){
+  const tr = show.tracks[key]; if (!tr || !tr.samples || !tr.samples.length) return;
+  const P0 = V(), Q0 = new THREE.Quaternion(), s0 = trackAt(tr, show.t || 0, P0, Q0);
+  obj.updateMatrixWorld(true);
+  const was = new THREE.Matrix4().compose(P0, Q0, new THREE.Vector3(s0, s0, s0)), now = new THREE.Matrix4().compose(obj.position, obj.quaternion, obj.scale);
+  const D = now.multiply(was.invert()), S = tr.samples, out = S.slice(), M = new THREE.Matrix4(), p = V(), q = new THREE.Quaternion(), sc = V();
+  for (let i=0; i+8 < S.length; i+=9){ const si = S[i+8]; M.compose(p.set(S[i+1],S[i+2],S[i+3]), q.set(S[i+4],S[i+5],S[i+6],S[i+7]), sc.set(si,si,si)).premultiply(D).decompose(p, q, sc);
+    out[i+1] = r4(p.x); out[i+2] = r4(p.y); out[i+3] = r4(p.z); out[i+4] = r4(q.x); out[i+5] = r4(q.y); out[i+6] = r4(q.z); out[i+7] = r4(q.w); out[i+8] = +sc.x.toFixed(4); }
+  show.tracks[key] = {...tr, samples:out}; motionDirty = true;
+}
 function endCharGrab(){
   const g0 = show.grab; if (!g0) return; show.grab = null;
+  if (g0.walk){ shiftWalk(g0.c ? 'r'+g0.c.id : String(g0.L.id), grabObj(g0)); if (g0.c) g0.c.place = poseOfObj(g0.c.root); pushUndo({type:'show', snap:g0.before}); sceneDirty = true; applyShowPose(show.t || 0); toast('Moved '+(g0.c ? g0.c.name : g0.L.name)+' with its whole recorded walk'); requestUI(); return; }
   if (!show.rec){ if (g0.c) g0.c.place = poseOfObj(g0.c.root); else g0.L.rest = poseOfObj(g0.L.group); pushUndo({type:'show', snap:g0.before}); sceneDirty = true; }
 }
 
@@ -5696,7 +5708,7 @@ function xrUpdate(dt){
   const embodied = !!show.embodied;
 
   // SHOOT, holding the right grip: left stick moves the camera's screen, right stick ↕ sizes it
-  camAdj = !!(R && pr && shoot && pr.grip && !winGrab && !keyGrab && !screenGrab);
+  camAdj = !!(R && pr && shoot && pr.grip && !winGrab && !keyGrab && !screenGrab && !show.grab);
   if (!(pr && pr.grip)) camAdjUsed = false;
   if (camAdj){ const m = state.camMon || (state.camMon = {x:0, y:0, s:1});
     if (pl && (Math.abs(pl.sx) > 0.15 || Math.abs(pl.sy) > 0.15)){ m.x = clamp(m.x + pl.sx*dt*0.25, -0.4, 0.4); m.y = clamp(m.y - pl.sy*dt*0.25, -0.3, 0.4); camAdjUsed = true; }
@@ -5758,7 +5770,9 @@ function xrUpdate(dt){
     // right grip: a window you point at, else the thing under your hand, else the world
     if (edge(R,pr,'grip')){
       const tipW = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(tipW);
+      const touchT = (perform || shoot) && !embodied && !show.grab && !(pl && pl.grip) ? findGrabTarget(tipW, 0.06*rig.scale.x) : null;
       if (ph==='edit' && gridHit && !(pl && pl.grip)){ startScreenGrab(R); }
+      else if (touchT && !(hover && hover.h.distance < 0.12*rig.scale.x)){ if (touchT.c) startCharGrab(touchT.c, unscaled(R.grip)); else startSetGrab(touchT.L, unscaled(R.grip)); }
       else if (hover && !(pl && pl.grip)){   // point at a window and grip to move it
         let w = hover.win, torn = false;
         if (w===menuWin && !hover.screen){   // grip on a tab's content tears that tab off; on the rail or top bar it moves the whole menu
@@ -5864,11 +5878,12 @@ function xrUpdate(dt){
     if (orbHex){ orbDot.position.set(orbHitL.x, orbHitL.y, state.pickStyle==='dots' ? orbHitL.z : 0.004); orbDot.scale.setScalar(0.011); orbDot.material.color.set(orbHex);
       orbDotRing.material.color.set(new THREE.Color(orbHex).getHSL({}).l > 0.6 ? '#111111' : '#ffffff');
       if (state.pickStyle==='dots'){ orb.updateMatrixWorld(true); const cw = V(); camera.getWorldPosition(cw); orbDot.lookAt(cw); } else orbDot.rotation.set(0,0,0); }
-    if (perform && !embodied && !onPanel && !show.grab && !tpArmed){
+    if ((perform || shoot) && !embodied && !onPanel && !show.grab && !tpArmed){
       const gr = 0.06*rig.scale.x, c = findGrabTarget(_tip, gr);
+      if (shoot && !c){} else {
       cursor.visible = true; cursor.position.copy(_tip); cursor.scale.setScalar(gr);
       cursor.material.color.set(c ? '#ff2d95' : '#ffffff'); cursor.material.opacity = c ? 0.35 : 0.1; cursorRing.material.color.set(c ? '#ff2d95' : '#ffffff');
-    }
+    } }
     const pressEdge = pr && edge(R,pr,'trigP');
     if (pressEdge && !onPanel && (blockGrab || (doodleGrab && !doodleGrab.bend))) duplicateHeld();
     if (state.pivotFor && sculpt && !onPanel){ if (pressEdge) setPivotAt(_tip); }
@@ -7375,7 +7390,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
