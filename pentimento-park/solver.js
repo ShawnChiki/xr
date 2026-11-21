@@ -1177,7 +1177,7 @@ function coarsen(M, Mfit, curves, Lo, L, iters){
   }
 }
 // make the smooth (subdivided) surface hug the fitted one: nudge each cage vertex by how far its limit point is off
-function hugCage(cage, Mtopo, Mfit, curves, L, iters, leash){   // Mtopo: anything with .fc[v] and .corner[v] per cage vertex
+function hugCage(cage, Mtopo, Mfit, curves, L, iters, leash, pin){   // Mtopo: anything with .fc[v] and .corner[v] per cage vertex
   const { V, F, sharp } = cage, nv = V.length / 3, proj = projector(Mfit, L);
   const eF = new Map(); F.forEach((f, fi) => f.forEach((a, i) => { const k = ek(a, f[(i + 1) % f.length]); (eF.get(k) || eF.set(k, []).get(k)).push(fi); }));
   const nbr = Array.from({ length: nv }, () => []), diag = Array.from({ length: nv }, () => []), tri = new Uint8Array(nv), cre = Array.from({ length: nv }, () => []);
@@ -1197,7 +1197,7 @@ function hugCage(cage, Mtopo, Mfit, curves, L, iters, leash){   // Mtopo: anythi
     const moves = new Float64Array(nv * 3);
     for (let v = 0; v < nv; v++){
       if (Mtopo.corner[v]) continue;
-      const lim = limit(v), id = Mtopo.fc[v], tgt = id >= 0 && curves[id] ? closestOnPoly(curves[id], lim).p : proj(lim);
+      const lim = limit(v), id = Mtopo.fc[v], tgt = id >= 0 && curves[id] ? closestOnPoly(curves[id], lim).p : (pin && pin(v, lim)) || proj(lim);
       moves[3 * v] = (tgt[0] - lim[0]) * 0.8; moves[3 * v + 1] = (tgt[1] - lim[1]) * 0.8; moves[3 * v + 2] = (tgt[2] - lim[2]) * 0.8;
     }
     for (let i = 0; i < V.length; i++) V[i] += moves[i] * (leash ? 0.6 : 1);
@@ -1486,7 +1486,8 @@ function guideCage(Mfit, curves, guides, L, level){
       let bv = -1, bd = Infinity; VG.each(P0[0], P0[1], P0[2], L * 3, v => { const dd = d2(M.P(v), P0); if (dd < bd){ bd = dd; bv = v; } }); if (bv < 0) continue;
       const m = [0, 0, 0]; for (const t of M.vt[bv]){ const c = M.triN(t); m[0] += c[0]; m[1] += c[1]; m[2] += c[2]; } agree += Math.sign(dot(n, m)); }
     if (agree < 0) Fo.forEach(f => f.reverse()); }
-  return { cage: { V, F: Fo, sharp, feat: null, corner: Uint8Array.from(corner, c => c ? 1 : 0) }, info: { fc, corner }, bad, lost, patches: F0.length };
+  const glines = new Map(); for (const [k, g] of G) if (g.kind === 2 && g.P && g.P.length > 1) glines.set(k, g.P);   // the guide each layout edge runs along
+  return { cage: { V, F: Fo, sharp, feat: null, corner: Uint8Array.from(corner, c => c ? 1 : 0) }, info: { fc, corner }, bad, lost, patches: F0.length, glines };
 }
 
 // ---------------- field-aligned quads (in the spirit of Instant Meshes)
@@ -2553,22 +2554,50 @@ function solve(strokes, prm, progress = () => {}){
   // simpler topology: rebuild at the size that gives the quad count asked for, on the fitted surface
   let Mfit = M;
   let gc = null;
-  if (prm.target < 0 && guides.length){ progress(0.9, 'Building the cage from your guides'); try { gc = guideCage(M, curves, guides, L, -1 - prm.target); } catch (e){ gc = null; } }
+  if (prm.target < 0 && guides.length){ progress(0.9, 'Building the cage from your guides'); try { gc = guideCage(M, curves, guides, L, prm.stick ? 1 : -1 - prm.target); } catch (e){ gc = null; } }
   if (gc){
-    const { cage, info } = gc;
+    let { cage, info } = gc;
     if (prm.hard > 0) autoCreases(cage, prm.hard);
     progress(0.95, 'Hugging the surface');
-    hugCage(cage, info, M, curves, L, 8, 0.3);
+    let gE = new Map(), pinOf = null;
+    if (prm.stick){
+      // points on a guide stay on that guide: each layout edge along a guide carries the guide's line down to its halves
+      gE = gc.glines || new Map();
+      pinOf = (c, gE) => { const at = new Map(); for (const [k, P] of gE){ for (const v of [Math.floor(k / 2097152), k % 2097152]) (at.get(v) || at.set(v, []).get(v)).push(P); }
+        return (v, p) => { const Ls = at.get(v); if (!Ls || Ls.length !== 2) return null; let best = null, bd = Infinity;
+          for (const P of Ls) for (let i = 0; i + 1 < P.length; i++){ const a = P[i], b = P[i + 1], ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], l2 = dot(ab, ab) || 1e-18, u = Math.max(0, Math.min(1, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2)), q = [a[0] + ab[0] * u, a[1] + ab[1] * u, a[2] + ab[2] * u], dd = d2(p, q); if (dd < bd){ bd = dd; best = q; } }
+          return best; }; };
+    }
+    hugCage(cage, info, M, curves, L, 8, prm.stick ? 0 : 0.3, pinOf && pinOf(cage, gE));
     untangleCage(cage, info, M, curves, L, 40);
+    if (prm.stick) hugCage(cage, info, M, curves, L, 6, 0, pinOf(cage, gE));
+    // Subdivide and stick: the lines you drew are the whole base layout (one face per patch they wall off). It is then
+    // subdivided again and again, and after every subdivision the new, smoother layout is pulled back onto the sculpted
+    // surface (crease points onto their crease), until the quads are about the size of the fit detail
+    let stuck = 0;
+    if (prm.stick){ cage.cageE = allEdges(cage.F);
+      const meanEdge = c => { let s2 = 0, n = 0; for (const f of c.F) for (let i = 0; i < f.length; i++){ const a = f[i], b = f[(i + 1) % f.length]; s2 += Math.hypot(c.V[3 * a] - c.V[3 * b], c.V[3 * a + 1] - c.V[3 * b + 1], c.V[3 * a + 2] - c.V[3 * b + 2]); n++; } return n ? s2 / n : 0; };
+      const maxLv = prm.stickLevels > 0 ? prm.stickLevels : 6;
+      while (stuck < maxLv && (prm.stickLevels > 0 || meanEdge(cage) > L * 1.5) && cage.F.reduce((a, f) => a + f.length, 0) <= 24000){
+        progress(0.95 + 0.006 * stuck, 'Subdividing and sticking, level ' + (stuck + 1));
+        const nv0 = cage.V.length / 3, eid = new Map(); let ne = 0; cage.F.forEach(f => { for (let i = 0; i < f.length; i++){ const k = ek(f[i], f[(i + 1) % f.length]); if (!eid.has(k)) eid.set(k, ne++); } });
+        const cnt = new Map(); cage.F.forEach(f => { for (let i = 0; i < f.length; i++){ const k = ek(f[i], f[(i + 1) % f.length]); cnt.set(k, (cnt.get(k) || 0) + 1); } });
+        const nx = catmullClark(cage, curves), nvN = nx.V.length / 3, fc = new Int32Array(nvN).fill(-1), corner = new Uint8Array(nvN);
+        for (let v = 0; v < nv0; v++){ fc[v] = info.fc[v] ?? -1; corner[v] = info.corner[v] ? 1 : 0; }
+        // a new point on a crease edge belongs to that crease (the one its two ends share, or the one end that has one)
+        for (const [k, e] of eid){ if (!cage.sharp.has(k) || cnt.get(k) !== 2) continue; const a = Math.floor(k / 2097152), b = k % 2097152, ia = info.fc[a] ?? -1, ib = info.fc[b] ?? -1; fc[nv0 + e] = ia >= 0 && (ia === ib || ib < 0 || info.corner[b]) ? ia : ib >= 0 && (ia < 0 || info.corner[a]) ? ib : -1; }
+        const gN = new Map(); for (const [k, P] of gE){ const e = eid.get(k); if (e === undefined) continue; const a = Math.floor(k / 2097152), b = k % 2097152; gN.set(ek(a, nv0 + e), P); gN.set(ek(nv0 + e, b), P); } gE = gN;
+        const inf = { fc, corner }; hugCage(nx, inf, M, curves, L, 6, 0, pinOf(nx, gE));
+        cage = nx; info = inf; stuck++; } }
     softenCreases(cage, info, curves, prm.softCrease); const lv = Math.max(1, prm.subd | 0); prepTips(cage, prm.tipFade || 0, endFades, L); applyTips(cage, lv);
-    cage.cageE = allEdges(cage.F); let smooth = catmullClark(cage, curves); for (let i = 1; i < lv; i++){ applyTips(smooth, lv - i); smooth = catmullClark(smooth, curves); }
+    if (!stuck) cage.cageE = allEdges(cage.F); let smooth = catmullClark(cage, curves); for (let i = 1; i < lv; i++){ applyTips(smooth, lv - i); smooth = catmullClark(smooth, curves); }
     smooth = hardView(smooth);
     progress(1, 'Done');
     const shc = shade(smooth); shc.trust = trustMap(shc, samples, h, L);
     return { surface: shc, quadWire: smooth.cageE ? edgeWire(smooth, smooth.cageE) : wire(cage), fineWire: wire(smooth), creases: creaseLines(smooth),
       quads: { V: new Float32Array(cage.V), F: new Int32Array(cage.F.flat()), C: new Int32Array(cage.F.map(f => f.length)) },
       curves: [...curves.map(C => ({ tag: C.tag, closed: C.closed, strict: !!C.strict, edge: !!C.edge, pts: C.pts.flat() })), ...guides.map(C => ({ tag: C.tag, closed: C.closed, guide: true, pts: C.pts.flat() }))],
-      nQuads: cage.F.length, cageMode: true, cage: cageOut(cage), levels: lv, cache, warm, note: gc.lost ? 'A line no guide crosses was left out: draw a guide across it' : gc.bad ? gc.bad + ' patch' + (gc.bad > 1 ? 'es' : '') + ' left open: close them with more guides' : '' };
+      nQuads: cage.F.length, cageMode: true, stuck, cage: cageOut(cage), levels: lv, cache, warm, note: gc.lost ? 'A line no guide crosses was left out: draw a guide across it' : gc.bad ? gc.bad + ' patch' + (gc.bad > 1 ? 'es' : '') + ' left open: close them with more guides' : '' };
   }
   
   const simplify = () => { if (prm.target > 0){ const Lo = 2 * Math.sqrt(triArea(M) / prm.target);
