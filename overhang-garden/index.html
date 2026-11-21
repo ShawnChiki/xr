@@ -5753,8 +5753,8 @@ function expDims() {   // the size it'll come out at
 function expLayers() { return layers.filter(l => l.visible && !(l.auto && !LOOK.expSup) && (l.chunks.size || l.meshes.size || (l.bridge && l.beams.length))); }
 // ───────────────────────── marbles: steel balls that roll down the clay, and marble tracks you draw (beta)
 // Balls live in bed space (mm) and feel the same solid field the climbers do: every shown layer, supports, bridges, the bed.
-const MB = { mode: 'drop', d: 8, balls: [], max: 30, slow: false, path: null, draw: null, drag: -1, tops: [], trigWas: false, lastHand: null, lastT: 0, env: null, shape: 'tube', slope: 4 };
-const MB_CLR = 2, MB_WALL = 3.2, MB_G = 9810;
+const MB = { mode: 'drop', d: 8, balls: [], max: 30, slow: false, path: null, draw: null, drag: -1, tops: [], trigWas: false, lastHand: null, lastT: 0, env: null, shape: 'auto', slope: 4 };
+const MB_CLR = 2, MB_WALL = 5, MB_G = 9810;
 const mbMat = new THREE.MeshStandardMaterial({ color: '#eef2f6', metalness: 1, roughness: 0.14 });
 const mbMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 28, 18), mbMat, 64);
 mbMesh.count = 0; mbMesh.frustumCulled = false; modelRoot.add(mbMesh);
@@ -5898,17 +5898,73 @@ function rdp(pts, eps) {
   const l = rdp(pts.slice(0, wi + 1), eps), r = rdp(pts.slice(wi), eps); return l.slice(0, -1).concat(r);
 }
 // a hand-drawn line becomes a handful of control points
+function mbLimits() { const r = mbR(), R = r + MB_CLR; return { R, sep: 2 * R + MB_WALL, minR: Math.max(1.5 * MB.d, R + MB_WALL + 2) }; }
+// Fitting works on how much the line turns at each step. A turn tighter than the ball allows hands its extra turning to
+// its neighbours (a tight hairpin or loop keeps its whole turn, spread over a wider arc, so it opens outward instead of
+// pinching into a kink; back-and-forth wiggles partly cancel). The line is then rebuilt from the start, step by step.
+function mbTurnFix(P, minR, h) {   // P evenly spaced (h). Returns the rebuilt line with no turn tighter than minR
+  const n = P.length, head = new Float64Array(n - 1), t = new Float64Array(n), len = new Float64Array(n - 1), dy = new Float64Array(n - 1);
+  for (let i = 0; i < n - 1; i++) { head[i] = Math.atan2(P[i + 1].z - P[i].z, P[i + 1].x - P[i].x); len[i] = Math.hypot(P[i + 1].x - P[i].x, P[i + 1].z - P[i].z); dy[i] = P[i + 1].y - P[i].y; }
+  for (let i = 1; i < n - 1; i++) { let d = head[i] - head[i - 1]; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; t[i] = d; }
+  const tmax = h / minR;
+  for (let sweep = 0; sweep < 8000; sweep++) {
+    let moved = false;
+    for (let i = 1; i < n - 1; i++) {
+      const v = t[i]; if (Math.abs(v) <= tmax) continue;
+      const e = v - Math.sign(v) * tmax; t[i] -= e; moved = true;
+      if (i - 1 >= 1) t[i - 1] += e / 2; if (i + 1 <= n - 2) t[i + 1] += e / 2;   // past either end it just fades
+    }
+    if (!moved) break;
+  }
+  const out = [P[0].clone()]; let hd = head[0];
+  for (let i = 0; i < n - 1; i++) { if (i > 0) hd += t[i]; const p = out[i], l = len[i] || h; out.push(new THREE.Vector3(p.x + Math.cos(hd) * l, p.y + dy[i], p.z + Math.sin(hd) * l)); }
+  return out;
+}
+function mbRelax(src, auto, y0) {
+  const { minR, R } = mbLimits(), h = 1.5, lim = HALF - R - MB_WALL - 1;
+  const O = resample(src, h), n = O.length; if (n < 5) return O;
+  if (auto) for (const p of O) p.y = y0;
+  for (let pass = 0; pass < 2; pass++) { const q = O.map(p => p.clone()); for (let i = 1; i < n - 1; i++) { q[i].x = (O[i - 1].x + 2 * O[i].x + O[i + 1].x) / 4; q[i].z = (O[i - 1].z + 2 * O[i].z + O[i + 1].z) / 4; } for (let i = 1; i < n - 1; i++) O[i].copy(q[i]); }   // hand jitter
+  let P = O;
+  for (let round = 0; round < 4; round++) {
+    const rec = mbTurnFix(P, minR * 1.3, h), m = rec.length;
+    // your drawing, spaced to match point for point by how far along it is
+    let LO = 0; for (let i = 1; i < O.length; i++) LO += O[i].distanceTo(O[i - 1]); const Om = resample(O, LO / (m - 1)); while (Om.length < m) Om.push(O[O.length - 1].clone());
+    if (round === 3) { P = rec; break; }
+    // pull it back onto your route at the large scale: the gap to your drawing, blurred over a few ball-turn widths
+    const dx = new Float64Array(m), dz = new Float64Array(m); for (let i = 0; i < m; i++) { dx[i] = Om[i].x - rec[i].x; dz[i] = Om[i].z - rec[i].z; const ox = rec[i].x - clamp(rec[i].x, -lim + 4, lim - 4), oz = rec[i].z - clamp(rec[i].z, -lim + 4, lim - 4); dx[i] -= ox * 1.5; dz[i] -= oz * 1.5; }   // and back onto the bed
+    const w = Math.max(2, Math.round(minR * 0.9 / h));
+    for (let b = 0; b < 2; b++) for (const a of [dx, dz]) { const c = Float64Array.from(a); let acc = 0, cnt = 0; const pre = new Float64Array(m + 1); for (let i = 0; i < m; i++) pre[i + 1] = pre[i] + c[i]; for (let i = 0; i < m; i++) { const lo = Math.max(0, i - w), hi = Math.min(m - 1, i + w); a[i] = (pre[hi + 1] - pre[lo]) / (hi - lo + 1); } }
+    P = rec.slice(0, m).map((p, i) => new THREE.Vector3(p.x + dx[i], p.y, p.z + dz[i]));
+    P = resample(P, h);
+  }
+  if (auto) for (const p of P) p.y = y0;
+  return P;
+}
+// evenly spaced dots along a line: few enough to drag, close enough to follow it
+function mbDots(P) {
+  const { minR } = mbLimits(); let L = 0; for (let i = 1; i < P.length; i++) L += P[i].distanceTo(P[i - 1]);
+  const step = Math.max(clamp(minR * 0.5, 6, 10), L / 45), q = resample(P, step);
+  if (q.length > 2 && q[q.length - 1].distanceTo(q[q.length - 2]) < step * 0.4) q.splice(q.length - 2, 1);
+  if (q.length === 2) q.splice(1, 0, q[0].clone().lerp(q[1], 0.5));
+  // place the dots so the spline runs through those points (a B-spline only passes near its dots)
+  const c = q.map(p => p.clone()), n = c.length;
+  for (let it = 0; it < 12; it++) for (let k = 1; k < n - 1; k++) {
+    const sx = (c[k - 1].x + 4 * c[k].x + c[k + 1].x) / 6, sy = (c[k - 1].y + 4 * c[k].y + c[k + 1].y) / 6, sz = (c[k - 1].z + 4 * c[k].z + c[k + 1].z) / 6;
+    c[k].x += (q[k].x - sx) * 0.9; c[k].y += (q[k].y - sy) * 0.9; c[k].z += (q[k].z - sz) * 0.9;
+  }
+  return c;
+}
 function mbFit(raw, auto, y0) {
   let pts = resample(raw, 2); if (pts.length < 4) return null;
-  for (let pass = 0; pass < 6; pass++) { const q = pts.map(p => p.clone()); for (let i = 1; i < pts.length - 1; i++) q[i].set((pts[i - 1].x + 2 * pts[i].x + pts[i + 1].x) / 4, (pts[i - 1].y + 2 * pts[i].y + pts[i + 1].y) / 4, (pts[i - 1].z + 2 * pts[i].z + pts[i + 1].z) / 4); pts = q; }
-  let eps = 2, cps = rdp(pts, eps);
-  while (cps.length > 28) { eps *= 1.4; cps = rdp(pts, eps); }
-  if (cps.length === 2) cps.splice(1, 0, cps[0].clone().lerp(cps[1], 0.5));
-  const path = { cps: cps.map(p => p.clone()), auto, y0: y0 !== undefined ? y0 : cps[0].y, bad: null, pts: [], s: [], flags: 0 };
+  for (let pass = 0; pass < 2; pass++) { const q = pts.map(p => p.clone()); for (let i = 1; i < pts.length - 1; i++) q[i].set((pts[i - 1].x + 2 * pts[i].x + pts[i + 1].x) / 4, (pts[i - 1].y + 2 * pts[i].y + pts[i + 1].y) / 4, (pts[i - 1].z + 2 * pts[i].z + pts[i + 1].z) / 4); pts = q; }
+  const Y0 = y0 !== undefined ? y0 : pts[0].y;
+  const cps = mbDots(mbRelax(pts, auto, Y0));
+  const path = { cps, auto, y0: Y0, bad: null, pts: [], s: [], flags: 0 };
   mbEval(path); return path;
 }
 function mbEval(P) {
-  const r = mbR(), R = r + MB_CLR, sep = 2 * R + MB_WALL, minR = Math.max(2 * MB.d, R + MB_WALL + 2), yMin = mbMinY();
+  const r = mbR(), R = r + MB_CLR, sep = 2 * R + MB_WALL, minR = Math.max(1.5 * MB.d, R + MB_WALL + 2), yMin = mbMinY();
   const pts = resample(bspline(P.cps, 14), 1), n = pts.length, s = new Float32Array(n);
   for (let i = 1; i < n; i++) s[i] = s[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, P.auto ? 0 : pts[i].y - pts[i - 1].y, pts[i].z - pts[i - 1].z);
   const bad = new Uint8Array(n), g = Math.tan(MB.slope * DEG);
@@ -5932,7 +5988,7 @@ function mbEval(P) {
     if (d < sep + MB_APEX * R * Math.abs(dy) / (d || 1)) { bad[i] |= 4; bad[j] |= 4; }
   }
   let flags = 0; for (let i = 0; i < n; i++) flags |= bad[i];
-  P.pts = pts; P.s = s; P.bad = bad; P.flags = flags;
+  P.pts = pts; P.s = s; P.bad = bad; P.flags = flags; P.cov = MB.shape === 'auto' ? mbCover(pts, s) : null;
   // where to show the control points: on the path itself
   P.show = P.cps.map(c => { let bi = 0, bd = 1e9; for (let i = 0; i < n; i += 2) { const d = (pts[i].x - c.x) ** 2 + (pts[i].z - c.z) ** 2 + (P.auto ? 0 : (pts[i].y - c.y) ** 2); if (d < bd) { bd = d; bi = i; } } return P.auto ? new THREE.Vector3(c.x, pts[bi].y, c.z) : c.clone(); });
   mbShow();
@@ -5947,7 +6003,7 @@ function mbShow() {
     T.subVectors(pts[Math.min(n - 1, i + 1)], pts[Math.max(0, i - 1)]).normalize();
     Sd.crossVectors(T, UPV); if (Sd.lengthSq() < 1e-6) Sd.set(1, 0, 0); Sd.normalize(); U.crossVectors(Sd, T);
     const bi = Math.min(P.bad.length - 1, i * 2), bad = P.bad[bi];
-    _mc.set(bad ? '#ff3b3b' : i === 0 ? '#5fffa0' : '#7fd8ff');
+    _mc.set(bad ? '#ff3b3b' : i === 0 ? '#5fffa0' : P.cov && P.cov[bi] ? '#b07cff' : '#7fd8ff');
     for (let k = 0; k < seg; k++) {
       const a = k / seg * Math.PI * 2, o = (i * seg + k) * 3;
       pos[o] = pts[i].x + (Sd.x * Math.cos(a) + U.x * Math.sin(a)) * r; pos[o + 1] = pts[i].y + (Sd.y * Math.cos(a) + U.y * Math.sin(a)) * r; pos[o + 2] = pts[i].z + (Sd.z * Math.cos(a) + U.z * Math.sin(a)) * r;
@@ -5962,10 +6018,34 @@ function mbShow() {
   mbCps.count = P.show.length; mbCps.instanceMatrix.needsUpdate = true; if (mbCps.instanceColor) mbCps.instanceColor.needsUpdate = true;
   UIS.dirty = true;
 }
-function mbSmooth() {
+function mbSmooth() {   // spread out what's too tight, from the route as it is now
   const P = MB.path; if (!P) return;
-  const c = P.cps; for (let pass = 0; pass < 2; pass++) { const q = c.map(p => p.clone()); for (let i = 1; i < c.length - 1; i++) q[i].copy(c[i]).multiplyScalar(0.5).addScaledVector(c[i - 1], 0.25).addScaledVector(c[i + 1], 0.25); for (let i = 1; i < c.length - 1; i++) c[i].copy(q[i]); }
-  mbEval(P);
+  const line = P.pts.map(p => p.clone()); if (P.auto) for (const p of line) p.y = P.y0;
+  P.cps = mbDots(mbRelax(line, P.auto, P.y0, 320)); mbEval(P);
+  toast(P.flags & 2 ? 'Spread it out: still tight in red. Try again or drag the dots' : 'Spread out the tight turns');
+}
+// the clay already there (not supports): where the route goes through it, the track gets a pointed roof
+function mbClayDens(x, y, z) {
+  const fx = ix(x), fy = iy(y), fz = iz(z), i = Math.floor(fx), j = Math.floor(fy), k = Math.floor(fz), tx = fx - i, ty = fy - j, tz = fz - k; let best = 0;
+  for (const L of layers) { if (!L.visible || L.auto || L.bridge || !L.chunks.size) continue; let v = 0;
+    for (let c = 0; c < 8; c++) { const a = c & 1, bb = (c >> 1) & 1, d = c >> 2; v += getD(L, i + a, Math.max(1, j + bb), k + d) * (a ? tx : 1 - tx) * (bb ? ty : 1 - ty) * (d ? tz : 1 - tz); }
+    if (v > best) best = v; }
+  return best;
+}
+function mbCover(pts, S) {
+  const n = pts.length, raw = new Uint8Array(n), { R } = mbLimits(), Ro = R + MB_WALL, T = new THREE.Vector3(), Sd = new THREE.Vector3(), U = new THREE.Vector3();
+  if (!layers.some(L => L.visible && !L.auto && !L.bridge && L.chunks.size)) return raw;
+  for (let i = 0; i < n; i += 2) {
+    T.subVectors(pts[Math.min(n - 1, i + 1)], pts[Math.max(0, i - 1)]).normalize(); Sd.crossVectors(T, UPV); if (Sd.lengthSq() < 1e-6) Sd.set(1, 0, 0); Sd.normalize(); U.crossVectors(Sd, T);
+    let hit = false;
+    for (const sx of [-R * 0.8, 0, R * 0.8]) { for (const uu of [R * 0.45, R, (R + Ro) / 2, Ro]) { const q = pts[i]; if (mbClayDens(q.x + Sd.x * sx + U.x * uu, q.y + Sd.y * sx + U.y * uu, q.z + Sd.z * sx + U.z * uu) > ISO) { hit = true; break; } } if (hit) break; }
+    if (hit) { raw[i] = 1; if (i + 1 < n) raw[i + 1] = 1; }
+  }
+  // reach a little past the clay on both sides, and bridge short gaps, so the roof meets the clay cleanly
+  const out = new Uint8Array(n), reach = Ro, gap = MB.d * 1.5;
+  for (let i = 0; i < n; i++) if (raw[i]) { for (let j = i; j >= 0 && S[i] - S[j] <= reach; j--) out[j] = 1; for (let j = i; j < n && S[j] - S[i] <= reach; j++) out[j] = 1; }
+  for (let i = 0, last = -1; i < n; i++) if (out[i]) { if (last >= 0 && i - last > 1 && S[i] - S[last] < gap) for (let j = last; j < i; j++) out[j] = 1; last = i; }
+  return out;
 }
 function mbSlopeDown() { const P = MB.path; if (!P) return; P.auto = true; P.y0 = Math.max(P.cps[0].y, mbMinY()); mbEval(P); toast('It runs downhill all the way now'); }
 function mbRedraw() { MB.path = null; MB.draw = null; MB.drag = -1; mbShow(); }
@@ -6045,8 +6125,8 @@ function mbProfile(s, u, R, top) {   // signed distance in the tube's cross-sect
   if (top === undefined) { const dl = Math.abs(s) * MB_CA + u * MB_SA - R; return Math.min(dc, Math.max(dl, R * MB_SA - u)); }
   return Math.max(dc, u - top);
 }
-function mbFields(pts, S, r, shape, clearOnly) {
-  const R = r + MB_CLR, Ro = R + MB_WALL, open = shape === 'channel', funnel = 5 * r, cut = R * 0.35;
+function mbFields(pts, S, r, shape, clearOnly, cov) {
+  const R = r + MB_CLR, Ro = R + MB_WALL, funnel = 5 * r, cut = R * 0.35;
   const n = pts.length, ext = Ro + VS * 2;
   // extend the clear bore a little past the end so the exit is open; extend the walls back past the start to cap it
   const T0 = _mv.subVectors(pts[1], pts[0]).normalize().clone(), T1 = _ms.subVectors(pts[n - 1], pts[n - 2]).normalize().clone();
@@ -6055,13 +6135,13 @@ function mbFields(pts, S, r, shape, clearOnly) {
   const T = new THREE.Vector3(), Sd = new THREE.Vector3(), U = new THREE.Vector3(), D = new THREE.Vector3();
   const segs = [];
   const stp = clearOnly ? 1 : 2;
-  for (let i = 0; i < n - 1; i += stp) { const j = Math.min(n - 1, i + stp); segs.push([pts[i], pts[j], S[i], 0]); }
+  for (let i = 0; i < n - 1; i += stp) { const j = Math.min(n - 1, i + stp); segs.push([pts[i], pts[j], S[i], 0, !!(cov && (cov[i] || cov[j]))]); }
   segs.push([pts[n - 1], pts[n - 1].clone().addScaledVector(T1, Ro + 2), S[n - 1], 2]);   // only clears (open exit)
   if (!clearOnly) segs.unshift([pts[0].clone().addScaledVector(T0, -MB_WALL - VS), pts[0], 0, 1]);          // only walls (closed start)
-  for (const [a, b, sA, kind] of segs) {
+  for (const [a, b, sA, kind, cv] of segs) {
     T.subVectors(b, a); const len = T.length(); if (len < 1e-6) continue; T.multiplyScalar(1 / len);
     Sd.crossVectors(T, UPV); if (Sd.lengthSq() < 1e-6) Sd.set(1, 0, 0); Sd.normalize(); U.crossVectors(Sd, T);
-    const top = open || sA < funnel ? cut : undefined;
+    const roof = sA >= funnel && (shape === 'tube' || cv), top = roof ? undefined : cut;   // open channel, or a pointed roof
     const bx = voxBox(Math.min(a.x, b.x) - ext, Math.max(a.x, b.x) + ext, Math.min(a.y, b.y) - ext, Math.max(a.y, b.y) + ext * 1.5, Math.min(a.z, b.z) - ext, Math.max(a.z, b.z) + ext);
     for (let k = bx[4]; k <= bx[5]; k++) for (let j = Math.max(1, bx[2]); j <= bx[3]; j++) for (let i = bx[0]; i <= bx[1]; i++) {
       D.set(vx(i) - a.x, vy(j) - a.y, vz(k) - a.z);
@@ -6081,7 +6161,7 @@ function mbFields(pts, S, r, shape, clearOnly) {
 function mbBuild() {
   const P = MB.path; if (!P || P.preview) return;
   if (userLayers().length >= 6) return toast('Max 6 layers: delete one to build a track');
-  const pts = P.pts, n = pts.length, ch = mbFields(pts, P.s, mbR(), MB.shape);
+  const pts = P.pts, n = pts.length, ch = mbFields(pts, P.s, mbR(), MB.shape, false, MB.shape === 'auto' ? mbCover(pts, P.s) : null);
   const prev = activeLayer, L = addLayer('Marble track ' + (layers.filter(l => l.track).length + 1), 8), rec = newRec();
   activeLayer = prev && layers.includes(prev) && !prev.auto && !prev.bridge ? prev : L;
   const others = layers.filter(l => l !== L && !l.auto && !l.bridge);
@@ -6159,11 +6239,11 @@ function drawMarbles(X, FW) {
   }
   y = 610;
   txt('Track', X, y, 30, TH.sub, 'left', 700);
-  button(X, y + 24, half, 84, 'Tube, pointed top', { on: MB.shape === 'tube', accent: '#7fd8ff', fs: 28, click: () => { MB.shape = 'tube'; } });
-  button(X + half + 20, y + 24, half, 84, 'Open channel', { on: MB.shape === 'channel', accent: '#7fd8ff', fs: 28, click: () => { MB.shape = 'channel'; } });
-  txt(MB.shape === 'tube' ? 'Closed over the ball with a peak, so it prints with no bridging' : 'Open on top: you can see the ball, it can hop out on fast turns', X, y + 140, 22, TH.dim, 'left', 500);
+  button(X, y + 24, half, 84, 'Open, roof in clay', { on: MB.shape !== 'tube', accent: '#7fd8ff', fs: 28, click: () => { MB.shape = 'auto'; mbEval(P); } });
+  button(X + half + 20, y + 24, half, 84, 'Tube all the way', { on: MB.shape === 'tube', accent: '#7fd8ff', fs: 28, click: () => { MB.shape = 'tube'; mbEval(P); } });
+  txt(MB.shape === 'tube' ? 'Closed over the ball with a pointed top, so it prints with no bridging' : 'Open on top. Purple bits go through clay: those get a pointed roof', X, y + 140, 22, TH.dim, 'left', 500);
   y = 790;
-  button(X, y, half, 84, 'Smooth it', { fs: 28, click: mbSmooth });
+  button(X, y, half, 84, 'Spread out tight bits', { fs: 26, click: mbSmooth });
   button(X + half + 20, y, half, 84, 'Start over', { fs: 28, click: mbRedraw });
   txt(xr ? 'Grab a dot with the trigger to move it.' : 'Drag the dots to move the route. Green is the top.', X, y + 118, 24, TH.dim, 'left', 500);
   const why = MB_WHY.filter(([b]) => P.flags & b).map(([, w]) => w);
