@@ -338,6 +338,13 @@ const tabFrac=(lg,t)=>lg>=t*6?1/3:.3;
 function legScrews(lg,tab,w,gap,t){return [Math.min(tab-w/2-gap,(t*.8+tab-w/2)/2),Math.max(tab+w/2+gap,(tab+w/2+lg-t*.5)/2)]}
 /* A corner block near a third panel reaches for it: if one of its walls runs into another panel within a little under twice the
    leg length, that leg is made long enough to end against it, and the block then tabs into all three. */
+/* an inside (innie) corner block: the two panels' backs face away from each other there, so the block is an L lying in the
+   cross-section that wraps round behind the corner, one arm along the back of each panel. Screws go in from outside through
+   each panel into its arm. nF/nG: the panels' outward normals; dP/dQ: along each panel's back, away from the corner. */
+function reflexPoly(C,dP,dQ,nF,nG,lP,lQ,D){const ax=dP,ay=new V().crossVectors(dP.clone().cross(dQ).normalize(),dP).normalize(),to=X=>{const d=X.clone().sub(C);return [d.dot(ax),d.dot(ay)]},back=([x,y])=>C.clone().addScaledVector(ax,x).addScaledVector(ay,y);
+  const arm=(d_,n_,l)=>[C.clone().addScaledVector(d_,-D),C.clone().addScaledVector(d_,l),C.clone().addScaledVector(d_,l).addScaledVector(n_,-D),C.clone().addScaledVector(d_,-D).addScaledVector(n_,-D)].map(to);
+  const r=clipRun([c2path(posC(arm(dP,nF,lP)))],[c2path(posC(arm(dQ,nG,lQ)))],ClipperLib.ClipType.ctUnion),o=r.contours.slice().sort((a,b_)=>Math.abs(areaF(b_))-Math.abs(areaF(a)))[0];
+  return o&&o.length>=3?o.map(back):[]}
 function legReach(C,d_,leg,t,faces,HD,inFace){let best=0;for(const h of faces){const den=h.n.dot(d_);if(den<.25)continue;const sH=((HD(h)-t)-h.n.dot(C))/den;
     if(sH>leg-1e-6&&sH<=leg*1.8&&inFace(h,C.clone().addScaledVector(d_,sH)))best=best?Math.min(best,sH):sH}return best?best+.25:leg}
 /* the extra sides of a block: every other panel it ends up lying against for at least two and a half plies */
@@ -529,7 +536,7 @@ function panelizeShell(b,name,B){const mtV=[];
     const g=F[e.nb],ky=f.i<g.i?f.i+':'+e.q:g.i+':'+e.nbq;let x=edges.get(ky);
     if(!x){const cp=-f.n.dot(g.n),sp=Math.max(.25,Math.sqrt(Math.max(0,1-cp*cp))),ekey=[f.pl.id,g.pl.id].sort().join('|'),o=EO[ekey]||{};
       const offSq=Math.abs(cp)>sOK,modE=false,jsel=o.joint||'auto',joint=jsel==='auto'?(e.convex&&(-cp>meetCos()||cp>sharpCos())?'meet':'fingers'):jsel,meet=joint==='meet',ends=o.ends||'proud';
-      const blk=e.convex&&(o.blocks==='on'||(o.blocks!=='off'&&(meet||((offSq||cp>SHARP)&&S.cleats))));
+      const blk=e.convex?(o.blocks==='on'||(o.blocks!=='off'&&(meet||((offSq||cp>SHARP)&&S.cleats)))):(o.blocks==='on'||(o.blocks!=='off'&&S.cleats!==false&&!jsel.startsWith('over:')));
       const hi=Math.max(f.i,g.i),lo=Math.min(f.i,g.i),segs=[],L=e.L;
       if(joint.startsWith('over:')){const own=F.find(h=>h.pl.id===joint.slice(5));segs.push({t0:0,t1:L,owner:own?own.i:hi})}
       /* inside corners butt: both panels stop at the corner line, which closes it from outside (the square behind it is hidden),
@@ -690,7 +697,7 @@ function panelizeShell(b,name,B){const mtV=[];
       panels.push({kind:'rib',order:rb.rank,label,frame:R,z0:-t/2,z1:t/2,...fin,engr,marks:rmarks,flagHoles:[],color:'#D7B98A'})})}
   /* ---- corner blocks on outside corners that are off square ---- */
   {let jn=0;const clr=Math.max(t*.5,stol*4);
-    for(const x of edges.values()){if(!x.blk||!x.convex)continue;const f=F[x.i],g=F[x.j],q=x.fq[f.i],qg=x.fq[g.i],ef=f.E[q];
+    for(const x of edges.values()){if(!x.blk)continue;const rfx=!x.convex,f=F[x.i],g=F[x.j],q=x.fq[f.i],qg=x.fq[g.i],ef=f.E[q];
       const a=ef.A,cE=ef.B,L=a.distanceTo(cE),e3=cE.clone().sub(a).normalize(),cc=f.n.dot(g.n);if(1+cc<.05)continue;
       const spots=cleatSpots(L,S.cleatLeg,t),placed=[],doneG=new Set(),cKey=[f.pl?.id??f.num,g.pl?.id??g.num].sort().join('~');
       const cnd=cleatCands(spots,b.cleatEdit,cKey,L,S.cleatLeg,t);
@@ -700,8 +707,8 @@ function panelizeShell(b,name,B){const mtV=[];
         const phi=Math.acos(Math.max(-1,Math.min(1,dP.dot(dQ)))),ch=t*.3,sp=Math.sin(phi);if(sp<.05)continue;
         const oth=F.filter(h=>h!==f&&h!==g&&!h.skip),HD=h=>h.d,inFace=(h,X)=>{const q2=to2(h,X);return pip2(h.cts,q2[0],q2[1])},lP=legReach(C3,dP,leg,t,oth,HD,inFace),lQ=legReach(C3,dQ,leg,t,oth,HD,inFace),legM=Math.max(lP,lQ);
         /* a leg is only made longer when that really lands it on a third panel; otherwise it would be a long leg with nothing on it */
-        let lP_=lP,lQ_=lQ;if(lP>leg||lQ>leg){let tp=bracketPoly(C3,dP,dQ,lP,Math.min(S.cleatDepth,leg*.7),ch,t,lQ);for(const h of oth){const c=clipPoly(tp,{n:h.n,d:HD(h)-t});if(c.length>=3)tp=c}if(!thirdSides(tp,oth,HD,t,e3,clr,to2,()=>false).length)lP_=lQ_=leg}
-        let poly=bracketPoly(C3,dP,dQ,lP_,Math.min(S.cleatDepth,leg*.7),ch,t,lQ_);
+        let lP_=lP,lQ_=lQ;if(rfx)lP_=lQ_=leg;else if(lP>leg||lQ>leg){let tp=bracketPoly(C3,dP,dQ,lP,Math.min(S.cleatDepth,leg*.7),ch,t,lQ);for(const h of oth){const c=clipPoly(tp,{n:h.n,d:HD(h)-t});if(c.length>=3)tp=c}if(!thirdSides(tp,oth,HD,t,e3,clr,to2,()=>false).length)lP_=lQ_=leg}
+        let poly=rfx?reflexPoly(C3,dP,dQ,f.n,g.n,lP_,lQ_,Math.min(S.cleatDepth,leg*.7)):bracketPoly(C3,dP,dQ,lP_,Math.min(S.cleatDepth,leg*.7),ch,t,lQ_);if(poly.length<3)continue;
         /* trim by nearby faces that face into the block, then make sure no plate's wood is inside it */
         for(const h of F){if(h===f||h===g)continue;if(Math.abs(h.n.dot(C3)-h.d)>legM+t*2)continue;const tp=clipPoly(poly,{n:h.n,d:h.d-t});if(tp.length>=3&&area3(tp,e3)>area3(poly,e3)*.25)poly=tp}
         let blocked=false;for(const rp of ribPlanes){if(poly.length<3)break;const dC=rp.axis.dot(C3)-rp.d,need=t/2+Math.max(clr,t+tabX+.15)/* room to back the block off its tab with the rib already in */;if(Math.abs(dC)<need+t){blocked=true;break}const sg=dC>0?1:-1;poly=clipPoly(poly,{n:rp.axis.clone().multiplyScalar(-sg),d:-sg*rp.d-need})}
@@ -717,15 +724,18 @@ function panelizeShell(b,name,B){const mtV=[];
         /* the same tab spot on both legs wherever both walls allow it, so the block is the same either way round */
         let cTab=null;const lgm=Math.min(sides[0].lg,sides[1].lg),even=Math.max(sides[0].lg,sides[1].lg)<lgm*1.3,wTm=Math.min(S.tabW,lgm*tabFrac(lgm,t));
         /* (legs of different lengths each get their own tab, in the middle of that leg) */
-        if(even&&lgm>wTm*2.2)for(const fr2 of [.5,.42,.58,.34,.66,.26,.74]){const c=lgm*fr2;if(c-wTm/2<t||c+wTm/2>lgm-t*.5)continue;
+        if(!rfx&&even&&lgm>wTm*2.2)for(const fr2 of [.5,.42,.58,.34,.66,.26,.74]){const c=lgm*fr2;if(c-wTm/2<t||c+wTm/2>lgm-t*.5)continue;
           if(sides.every(({F_,d_,qq})=>{const test=slotOn(F_,C3.clone().addScaledVector(d_,c-wTm/2),C3.clone().addScaledVector(d_,c+wTm/2),F_.n,t,e3,clr,false);return !hitsKeep(F_,qq,test)&&edgeOK(F_,test,minE)})){cTab=c;break}}
         sides.push(...thirdSides(poly,oth,HD,t,e3,clr,to2,hitsKeep));
         for(const {F_,d_,qq,lg,fp,O_=C3,third} of sides){const wT=cTab!=null&&!third?wTm:Math.min(S.tabW,lg*tabFrac(lg,t));let tabAt=null;
-          if(lg>wT*2.2)for(const fr2 of (cTab!=null&&!third?[cTab/lg]:[.5,.42,.58,.34,.66,.26,.74])){const c=lg*fr2;if(c-wT/2<t*(third?.5:1)||c+wT/2>lg-t*.5)continue;
+          /* an inside-corner block has no tabs: it goes in by hand once both panels are on, from behind, and is held by screws
+             from outside (tabs would pin the panels so they could not slide into place past it) */
+          if(!rfx&&lg>wT*2.2)for(const fr2 of (cTab!=null&&!third?[cTab/lg]:[.5,.42,.58,.34,.66,.26,.74])){const c=lg*fr2;if(c-wT/2<t*(third?.5:1)||c+wT/2>lg-t*.5)continue;
             const e0=O_.clone().addScaledVector(d_,c-wT/2),e1=O_.clone().addScaledVector(d_,c+wT/2),test=slotOn(F_,e0,e1,F_.n,t,e3,clr,false);
             if(hitsKeep(F_,qq,test)||!edgeOK(F_,test,minE))continue;
-            tabs.push([e0.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,t+tabX),e0.clone().addScaledVector(F_.n,t+tabX)].map(P=>{const d=P.clone().sub(C3);return [d.dot(dP),d.dot(vv)]}));
-            slotOn(F_,e0,e1,F_.n,t,e3);tabAt=c;fMarks.push({num:F_.num,P:O_.clone().addScaledVector(d_,c),n:F_.n});break}
+            /* (an inside-corner block's tabs stop flush: the other panel slides along that face on its way in) */
+            tabs.push([e0.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,-.02),e1.clone().addScaledVector(F_.n,rfx?t*.97:t+tabX),e0.clone().addScaledVector(F_.n,rfx?t*.97:t+tabX)].map(P=>{const d=P.clone().sub(C3);return [d.dot(dP),d.dot(vv)]}));
+            const n0=F_.slots.length;slotOn(F_,e0,e1,F_.n,t,e3);if(rfx)for(let z=n0;z<F_.slots.length;z++)F_.slots[z].rfx=true;tabAt=c;fMarks.push({num:F_.num,P:O_.clone().addScaledVector(d_,c),n:F_.n});break}
           F_.keep.push(fp);
           if(S.screws&&x.screws){const gapS=Math.max(t*.5,sd*1.5),base_=tabAt!=null?legScrews(lg,tabAt,wT,gapS,t):[lg*.3,lg*.78],cand=[...(S.cleatScrews===1?[base_[1],base_[0]]:base_)];
             for(let z=1;z<=6;z++)cand.push(base_[1]+z*gapS,base_[0]-z*gapS);let n2=0;const sideUsed=[0,0],oF=F_===f?g:f,eMin=third?t*.8:F_.E[qq].s-(-(oF.n.dot(d_))*t/(1+cc))+Math.max(t*.75,sd*3);
@@ -736,12 +746,12 @@ function panelizeShell(b,name,B){const mtV=[];
               for(const sd2 of all){if(n2>=S.cleatScrews)break;if(sd2<t*.8||sd2>lg-t*.5||sd2<eMin)continue;if(tabAt!=null&&Math.abs(sd2-tabAt)<wT/2+gp)continue;if(used.some(u=>Math.abs(u-sd2)<Math.max(t,sd*5)))continue;
                 const sI=tabAt!=null&&sd2>tabAt?1:0;if(strict&&tabAt!=null&&S.cleatScrews>1&&sideUsed[sI])continue;
                 const X=O_.clone().addScaledVector(d_,sd2).addScaledVector(F_.n,t),T_=X.clone().addScaledVector(F_.n,-sLen);
-                if(!clear(X)||!inBlock(T_)||sides.some(o=>o.F_!==F_&&(HD(o.F_)-t)-o.F_.n.dot(T_)<t*.35))continue;screwInto(F_,X,'J'+jn);bScr.push([X,F_.n]);n2++;sideUsed[sI]=1;used.push(sd2)}}}}
+                if(!clear(X)||!inBlock(T_)||(!rfx&&sides.some(o=>o.F_!==F_&&(HD(o.F_)-t)-o.F_.n.dot(T_)<t*.35)))continue;screwInto(F_,X,'J'+jn);bScr.push([X,F_.n]);n2++;sideUsed[sI]=1;used.push(sd2)}}}}
         const label=name+'J'+jn,fin=finish([p2,...tabs],[],[],mc),engr=[],jt=f.num+letter(q)+'>'+g.num+letter(qg);
         /* a block is marked with its joint and nothing else: every block on that joint is the same part */
         if(S.labels){const D_=Math.min(S.cleatDepth,leg*.7),Lb=blockLabel(jt,p2,[dQ.dot(dP),dQ.dot(vv)],D_,Math.min(lh*.6,D_*.42));if(Lb)engr.push(...strokes(jt,Lb.c,Lb.sz,Lb.ax));
           if(sides.length>2)fingerMarks(engr,p2,fMarks,toB,Math.min(lh*.3,D_*.22),Lb?[Lb.R]:[])}
-        panels.push({kind:'cleat',joint:jt,label,frame:fr,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#E7C48E',cleat:{key:cKey+'#'+sG,x:sP,leg,L,a:a.toArray(),e:e3.toArray(),ed}});placed.push(sP);doneG.add(sG)}}}
+        panels.push({kind:'cleat',joint:jt,label,frame:fr,z0:-t/2,z1:t/2,...fin,engr,flagHoles:[],color:'#E7C48E',cleat:{key:cKey+'#'+sG,x:sP,leg,L,a:a.toArray(),e:e3.toArray(),ed,rfx:rfx||undefined}});placed.push(sP);doneG.add(sG)}}}
   /* ---- face panels: setback bands come off, owned fingers go on ---- */
   /* ---- inside corners: one panel runs on into the corner square, so the two are joined along the corner instead of only
      touching on a line. The panel that runs on has to go in first (the other then slides in along its own normal, past the
@@ -749,7 +759,7 @@ function panelizeShell(b,name,B){const mtV=[];
      tab or block tab already stands there. Whichever of the two panels gets the longer run-on that way owns the corner. ---- */
   for(const x of edges.values()){if(x.convex||!x.segs.length||x.segs[0].owner<0||x.joint.startsWith('over:'))continue;
     const f=F[x.i],g=F[x.j],L=x.L,m=t*.6,free=oth=>{const eo=oth.E[x.fq[oth.i]],bad=[];
-      for(const K of oth.slots){let a=1e9,b_=-1e9;for(const p of K){const s_=dot(sub(p,eo.P),eo.D);a=Math.min(a,s_);b_=Math.max(b_,s_)}if(b_>-m&&a<L+m)bad.push([a-m,b_+m])}
+      for(const K of oth.slots){if(K.rfx)continue;let a=1e9,b_=-1e9;for(const p of K){const s_=dot(sub(p,eo.P),eo.D);a=Math.min(a,s_);b_=Math.max(b_,s_)}if(b_>-m&&a<L+m)bad.push([a-m,b_+m])}
       bad.sort((p,q)=>p[0]-q[0]);const out=[];let c=0;for(const [a,b_] of bad){if(a-c>=2*t)out.push([c,a]);c=Math.max(c,b_)}if(L-c>=2*t)out.push([c,L]);return out};
     const ff=free(g),fg=free(f),len=A=>A.reduce((s_,[a,b_])=>s_+b_-a,0),wall=h=>Math.abs(h.n.y)<=.7;
     /* a wall runs on past a floor or a ceiling (those drop in or lift in last); otherwise the longer run-on wins */
@@ -1408,7 +1418,7 @@ function basePanel(faces){const cy=p=>{let y=0,n=0;for(const c of p.part)for(con
 function planAssembly(panels,baseLabel){
   const parts=panels.map(asmPart),clash=asmClashes(parts),ign=new Set(clash.map(([i,j])=>i+'|'+j)),ok=(i,j)=>!ign.has(Math.min(i,j)+'|'+Math.max(i,j));
   const base=parts.findIndex(p=>p.label===baseLabel);
-  const prio=A=>A.idx===base?-1e9:A.kind==='face'?2000+A.c.y:A.kind==='cleat'?1900+A.c.y:1000+(A.p.order??0)*10+A.c.y*.01;
+  const prio=A=>A.idx===base?-1e9:A.kind==='face'?2000+A.c.y:A.kind==='cleat'?(A.p.cleat?.rfx?2100:1900)+A.c.y:1000+(A.p.order??0)*10+A.c.y*.01;
   const left=new Set(parts.map((_,i)=>i)),out=[],touch=parts.map(()=>new Set());
   /* corner blocks only hold on through their tabs in the walls, so a block brushing a rib or another block doesn't count */
   /* a rib block is the other way round: it is screwed to its rib first (those screws are out of reach once the face is on), so the rib is what holds it */
@@ -1433,6 +1443,10 @@ function planAssembly(panels,baseLabel){
     if(!pick){const i=order.find(i=>i!==base)??order[0];pick={i,d:parts[i].n.clone(),D:6,stuck:miss[i]||[],with:[]}}
     out.push(pick);left.delete(pick.i);pick.with.forEach(j=>left.delete(j))}
   out.reverse();
+  /* a block never goes in before every part it holds on to: one the search could only free early is put in right after the
+     first of its panels instead (it is fitted to that panel and screwed through it) */
+  for(let k=0;k<out.length;k++){const s=out[k];if(parts[s.i].kind!=='cleat'||s.with.length)continue;const t=touch[s.i],has=x=>t.has(x.i)||x.with.some(y=>t.has(y));
+    if(out.slice(0,k).some(has))continue;const j=out.findIndex((x,ix)=>ix>k&&has(x));if(j<0)continue;out.splice(k,1);out.splice(j,0,s);k--}
   /* blocks that go on one after another the same way read as one step ("these four blocks onto that wall") */
   const steps=[];for(const s of out){const p=steps[steps.length-1],isB=x=>parts[x.i].kind==='cleat'&&!x.stuck&&!x.lone;
     if(p&&isB(s)&&isB(p)&&!s.with.length&&p.d.dot(s.d)>.99&&parts[p.i].p.sub===parts[s.i].p.sub)p.with.push(s.i);else steps.push(s)}
@@ -1518,6 +1532,9 @@ function plyTex(n){const k='ply'+n;if(TEX[k])return TEX[k];const c=document.crea
   for(let i=0;i<n;i++){x.fillStyle=i%2?'#D6BC8F':'#EBD7B2';x.fillRect(0,i*16,16,16);x.fillStyle='rgba(90,60,30,.55)';x.fillRect(0,i*16,16,1.5)}
   const t=new THREE.CanvasTexture(c);t.wrapS=THREE.RepeatWrapping;t.colorSpace=THREE.SRGBColorSpace;return TEX[k]=t}
 function looks(p){const birch=S.look==='birch',laser=S.machine==='laser',real=thkModel()*scl(),isPly=S.scaleDen===1||[.118,.25].includes(S.stock);
+  if(xrMode){const L=o=>new THREE.MeshLambertMaterial({...o,side:THREE.DoubleSide}),face=birch?L({map:birchTex()}):L({color:p.color}),
+    wall=birch?(laser?L({color:'#4A2E1C'}):isPly?L({map:plyTex(Math.max(3,Math.round(real/.058)|1))}):L({color:'#E2CBA2'})):face;
+    return {face,wall,groove:L({color:birch?(laser?'#3A2414':'#C5A271'):new THREE.Color(p.color).lerp(new THREE.Color('#3b2412'),.6)})}}
   const face=birch?new THREE.MeshStandardMaterial({map:birchTex(),roughness:.85,side:THREE.DoubleSide}):new THREE.MeshStandardMaterial({color:p.color,roughness:.8,side:THREE.DoubleSide});
   const wall=birch?(laser?new THREE.MeshStandardMaterial({color:'#4A2E1C',roughness:.95,side:THREE.DoubleSide})
       :isPly?new THREE.MeshStandardMaterial({map:plyTex(Math.max(3,Math.round(real/.058)|1)),roughness:.9,side:THREE.DoubleSide})
@@ -1672,7 +1689,7 @@ function buildMeshes(){meshDirty=false;
   panelGroup.children.slice().forEach(g=>{if(!blocks.some(b=>b._grp===g)){panelGroup.remove(g);g.traverse(x=>{x.geometry?.dispose();x.userData.stencilGeo?.dispose();x.material?.dispose?.()})}});
   blocks.forEach((b,bi)=>{const res=b._res;if(!res)return;const s=b.sizer.scale,md=Math.max(s.x,s.y,s.z),ex=S.explode?md*.14+3:0,spread=new V();
     if(S.explode&&blocks.length>1){const d=centers[bi].clone().sub(gc);d.y=0;if(d.length()>1e-3)spread.copy(d.normalize().multiplyScalar(md*.55+8))}
-    const key=[S.explode,S.sanded,S.look,S.showScrews,spread.toArray().map(x=>x.toFixed(2)),[...hidden].join(',')].join('|');b.spread=spread.clone();
+    const key=[!!xrMode,S.explode,S.sanded,S.look,S.showScrews,spread.toArray().map(x=>x.toFixed(2)),[...hidden].join(',')].join('|');b.spread=spread.clone();
     if(b._grp&&b._grpRes===res&&b._grpKey===key){if(b._grp.parent!==panelGroup)panelGroup.add(b._grp);return}
     dropGroup(b);const bg=new THREE.Group();bg.position.copy(spread);panelGroup.add(bg);b._grp=bg;b._grpRes=res;b._grpKey=key;
     res.panels.forEach(p=>{if(!p.shapes.length||hidden.has(p.label))return;
@@ -1847,6 +1864,8 @@ renderer.domElement.addEventListener('contextmenu',e=>e.preventDefault());
 renderer.domElement.addEventListener('pointerdown',e=>{ctxDown=e.button===2?{x:e.clientX,y:e.clientY}:null});
 renderer.domElement.addEventListener('pointerup',e=>{if(e.button!==2||!ctxDown||xrMode)return;const mv=Math.hypot(e.clientX-ctxDown.x,e.clientY-ctxDown.y);ctxDown=null;if(mv>5)return;ctxMenu(e)});
 function ctxMenu(e){const r=renderer.domElement.getBoundingClientRect();mouse.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(mouse,camera);
+  if(figRoot&&figRoot.visible&&figs.length){const fh=figHit(ray);if(fh){const F=fh.F;figSelect(F);return ctxOpen(e.clientX,e.clientY,'Figure · '+ftIn(F.h),[...FIG_KEYS.map(k=>[(F.pose===k?'● ':'')+FIG_POSES[k].name,()=>figSetPose(F,k)]),'-',
+    ['Turn left 15°',()=>{F.ry=(F.ry||0)+15;figPlace(F);save()}],['Turn right 15°',()=>{F.ry=(F.ry||0)-15;figPlace(F);save()}],['Turn around',()=>{F.ry=(F.ry||0)+180;figPlace(F);save()}],'-',['Remove figure',()=>{figRemove(F);save()}]])}}
   const click=id=>()=>$(id).click(),T=[];(view==='mass'?massGroup:view==='panels'?panelGroup:new THREE.Group()).traverse(o=>{if(o.isMesh&&!o.userData.isStencil&&o.visible)T.push(o)});
   const hit=ray.intersectObjects(T,false).find(secSeen),nHid=hidden.size+ghost.size,showAll=nHid?[`Show all (${nHid})`,click('#showAllBtn')]:null;
   const views=[[S.secOn?'Section off':'Section',click('#secBtn')],view==='panels'?[S.explode?'Explode off':'Explode',click('#explodeBtn')]:null,view==='panels'?[S.showScrews?'Hide screws':'Show screws',click('#screwBtn')]:null];
@@ -1962,7 +1981,8 @@ $('#secPos').addEventListener('input',e=>{S.secPos=+e.target.value;updateSection
 let timer=0;
 function schedule(){dirty=true;clearTimeout(timer);$('#price')?.classList.add('stale');XR.price=null;
   if(xrMode&&view==='mass'){save();return}          /* headset modeling: no part work until you open Panels */
-  timer=setTimeout(()=>{rebuild();save()},view==='panels'?60:view==='mass'?450:180)}
+  if(xrMode&&view==='panels'){if(!XR.busy){XR.busy=menuMsg;menuMsg='Working out the parts…';drawMenu()}}
+  timer=setTimeout(()=>{rebuild();save();if(XR.busy){menuMsg=XR.busy==='Working out the parts…'?'Parts ready.':XR.busy;XR.busy=null;drawMenu()}},xrMode&&view==='panels'?120:view==='panels'?60:view==='mass'?450:180)}
 
 /* ---------------- nesting: raster true-shape, bottom-left fill, four turns per part ---------------- */
 let layoutDirty=true,sheets=[];
@@ -2227,7 +2247,7 @@ renderer.domElement.addEventListener('pointerup',e=>{if(!down)return;const moved
     if(e.shiftKey&&lab&&selPanel){selEdge=null;if(lab!==selPanel){if(selMore.has(lab))selMore.delete(lab);else selMore.add(lab)}}
     else if(!isBlk&&!e.shiftKey&&best&&best.d<Math.max(2.2*b.tModel,1.2)){selEdge={b,key:best.jt.key};selPanel=null}else{selEdge=null;selMore.clear();selPanel=lab}
     highlightPanel();updatePanelBar();showEdge()}});
-function select(b,cut=null){sel=b||null;selCut=cut;if(!b&&mode==='tilt')tilt.target=null;
+function select(b,cut=null){if(b&&typeof figSel!=='undefined'&&figSel){figSel=null;figShow();figCard()}sel=b||null;selCut=cut;if(!b&&mode==='tilt')tilt.target=null;
   showPlanes();blocks.forEach(x=>{x.lines.material.color.set(x===sel?tok('--accent'):'#15181d');x.lines.material.opacity=x===sel?1:.55});
   attachGizmo();renderModelPanel();}
 /* lay flat: click a face and the obstacle turns to sit on it, the way a slicer lays a print on the bed */
@@ -2862,6 +2882,9 @@ function renderAsmPanel(){const plan=AS.plan,P=plan.parts,n=plan.steps.length;
   $('#aSlider').max=n;$('#aStepCard').hidden=false;
   $('#aList').innerHTML=plan.steps.map((s,k)=>`<div class="item${k===AS.step?' on':''}" data-as="${k}"><span class="dot ${s.stuck?'tip':'hold'}"></span><span class="nm">${k+1}. ${s.sub?'Fit '+s.with.length+' block'+(s.with.length>1?'s':'')+' to '+P[s.i].label:P[s.i].kind==='cleat'?(s.with.length?(s.with.length+1)+' blocks ':'Block ')+(P[s.i].p.joint||P[s.i].label):P[s.i].label+(s.with.length?' + '+s.with.length+' block'+(s.with.length>1?'s':''):'')}</span><span class="meta">${kindWord(P[s.i].kind)}</span></div>`).join('');
   $$('#aList [data-as]').forEach(e=>e.onclick=()=>{AS.playing=false;showStep(+e.dataset.as)})}
+/* the current build step as plain words for the headset menu */
+function xrStepMsg(){const pl=AS.plan;if(!pl||!pl.steps.length){menuMsg='Nothing to build yet: make a box first.';return}const k=AS.step||0,ns=AS.stepScrews?.[k]?.length||0,d=document.createElement('div');d.innerHTML=stepText(k);
+  menuMsg=`Step ${k+1} of ${pl.steps.length} (${AS.b?.name||''}): ${d.textContent.trim()}${ns?` Drive ${ns} screw${ns>1?'s':''}.`:''}${pl.steps[k].stuck?` This one won't go in: it runs into ${pl.steps[k].stuck.join(', ')}.`:''}`}
 function showStep(k){const plan=AS.plan;if(!plan)return;const n=plan.steps.length;k=Math.max(0,Math.min(n-1,k));AS.step=k;AS.tt=0;AS.hold=false;
   const s=plan.steps[k],cur=new Set([s.i,...s.with]),blk=new Set(s.stuck?plan.parts.filter(p=>s.stuck.includes(p.label)).map(p=>p.idx):[]);
   AS.holders.forEach((h,i)=>{h.visible=AS.idx[i]<=k;h.position.set(0,0,0);
@@ -2879,7 +2902,7 @@ function showStep(k){const plan=AS.plan;if(!plan)return;const n=plan.steps.lengt
     (s.stuck?`<div class="tr" style="border:0;padding-top:8px"><span class="dot tip"></span><div><b>This won't go in.</b> Every way it can slide, its wood runs into ${s.stuck.join(', ')} (orange). Change the joint between them in the Panels view (click the edge and try flush or overlap), or move a rib. <button class="btn primary" id="aFindFix" style="margin-top:6px">Find a fix</button></div></div>`:'');
   $('#aFindFix')&&($('#aFindFix').onclick=findBuildFix);
   $$('#aList [data-as]').forEach(e=>e.classList.toggle('on',+e.dataset.as===k));$('#aList [data-as].on')?.scrollIntoView({block:'nearest'});
-  $('#aPrev').disabled=k===0;$('#aNext').disabled=k===n-1}
+  $('#aPrev').disabled=k===0;$('#aNext').disabled=k===n-1;if(xrMode){xrStepMsg();drawMenu()}}
 /* a low-poly cordless drill, bit tip at its origin, pointing down its own -Y; green body, grey chuck and battery */
 function asmDrill(){if(AS.drill&&AS.drill.parent===asmGroup)return AS.drill;const g=new THREE.Group(),k=thkModel()/.75,grn=new THREE.MeshStandardMaterial({color:0xC6E01B,roughness:.55,flatShading:true}),gry=new THREE.MeshStandardMaterial({color:0x2B2E34,roughness:.6,flatShading:true}),stl=new THREE.MeshStandardMaterial({color:0x8E949E,metalness:.6,roughness:.35,flatShading:true});
   const add=(geo,mat,x,y,z,par=g)=>{const m=new THREE.Mesh(geo,mat);m.position.set(x,y,z);m.raycast=()=>{};par.add(m);return m},spin=new THREE.Group();g.add(spin);
@@ -3064,7 +3087,7 @@ new MutationObserver(()=>{const tx=$('#hint').textContent;$('#tips').classList.t
 function showPlanes(){const on=view==='mass'&&S.showPlanes!==false;blocks.forEach(x=>{x.cuts.forEach(c=>c.visible=on&&x===sel);x.carves.forEach(c=>c.visible=on&&x===sel)});
   const pb=$('#planesBtn');if(pb){pb.hidden=view!=='mass';pb.setAttribute('aria-pressed',S.showPlanes!==false)}}
 function togglePlanes(){S.showPlanes=S.showPlanes===false;if(S.showPlanes===false&&selCut){selCut=null}showPlanes();attachGizmo();renderModelPanel();save()}
-function setView(v){view=v;skDraw();if(v!=='mass')freshen();showPlanes();$$('#viewSeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.view===v));
+function setView(v){view=v;skDraw();if(typeof figShow==='function')figShow();if(v!=='mass')freshen();showPlanes();$$('#viewSeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.view===v));
   massGroup.visible=v==='mass';panelGroup.visible=v==='panels';if(gapMesh)gapMesh.visible=v==='panels';testGroup.visible=v==='test';asmGroup.visible=v==='build';if(v==='test'){T.anim=null;buildTest()}if(v==='build')buildAsm(true);$('#explodeSeg').hidden=v!=='panels';$('#noteSeg').hidden=v!=='panels'&&v!=='mass';if(v!=='panels'&&v!=='mass'){noteMode=false;notePopClose()}drawNotes();renderNotes();$('#explodeBtn').hidden=v!=='panels';updatePanelBar();updateSection();showEdge();
   $('#flat').hidden=v!=='sheets';host.style.visibility=v==='sheets'?'hidden':'visible';$('#gizmoSeg').style.visibility=v==='sheets'||v==='test'||v==='build'?'hidden':'visible';
   if(v==='build'&&$('.tab[data-tab=build]').getAttribute('aria-selected')!=='true')$('.tab[data-tab=build]').click();
@@ -3149,19 +3172,19 @@ function cloudPush(){if(!cloud)return;clearTimeout(cloudT);cloudT=setTimeout(asy
 const serBlock=b=>({name:b.name,p:b.pivot.position.toArray(),q:b.pivot.quaternion.toArray(),s:b.sizer.scale.toArray(),edgeOpts:b.edgeOpts,
   ribMax:b.ribMax||undefined,ribAxis:b.ribAxis||undefined,glueRibs:b.glueRibs||undefined,useAs:b.useAs&&Object.keys(b.useAs).length?b.useAs:undefined,forceSplit:b.forceSplit&&Object.keys(b.forceSplit).length?b.forceSplit:undefined,sk:b.sk?{V:b.sk.V,F:b.sk.F.map(f=>({key:f.key,ids:f.ids}))}:undefined,cleatEdit:b.cleatEdit&&Object.keys(b.cleatEdit).length?b.cleatEdit:undefined,screwEdit:b.screwEdit&&((b.screwEdit.add||[]).length||(b.screwEdit.del||[]).length)?b.screwEdit:undefined,cuts:b.cuts.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray()})),
   carves:b.carves.map(c=>({cid:c.userData.cid,p:c.position.toArray(),q:c.quaternion.toArray(),s:c.userData.sizer.scale.toArray(),tilt:c.userData.tilt&&Object.keys(c.userData.tilt).length?c.userData.tilt:undefined}))});
-const serModel=()=>({app:'ply-grammar',v:3,S,blocks:blocks.map(serBlock),sketch:SK.e.length?SK:undefined,notes:notes.length?notes:undefined});
+const serModel=()=>({app:'ply-grammar',v:3,S,blocks:blocks.map(serBlock),sketch:SK.e.length?SK:undefined,figures:figs&&figs.length?figs.map(serFig):undefined,notes:notes.length?notes:undefined});
 /* undo: every saved state of the model, newest last */
 const undoS=[],redoS=[];let restoring=false;
 function pushUndo(j){if(restoring)return;if(undoS[undoS.length-1]===j)return;undoS.push(j);if(undoS.length>80)undoS.shift();redoS.length=0;updUndo()}
 function updUndo(){const u=$('#undoBtn'),r=$('#redoBtn');if(u)u.disabled=undoS.length<2;if(r)r.disabled=!redoS.length}
 function restoreModel(j){restoring=true;try{const d=typeof j==='string'?JSON.parse(j):j;tc.detach();blocks.slice().forEach(removeBlock);
-    if(d.S){Object.assign(S,d.S);syncInputs()}SK=d.sketch&&d.sketch.v?JSON.parse(JSON.stringify(d.sketch)):EW.emptySketch();SKX={};SKF=null;(d.blocks||[]).forEach(x=>makeBlock(x));skLoad();notes=Array.isArray(d.notes)?d.notes.filter(n=>n&&Array.isArray(n.p)).map(n=>({...n})):[];notePopClose();select(null);rebuild();drawNotes();renderNotes();
+    if(d.S){Object.assign(S,d.S);syncInputs()}SK=d.sketch&&d.sketch.v?JSON.parse(JSON.stringify(d.sketch)):EW.emptySketch();SKX={};SKF=null;(d.blocks||[]).forEach(x=>makeBlock(x));skLoad();figLoad(d.figures);notes=Array.isArray(d.notes)?d.notes.filter(n=>n&&Array.isArray(n.p)).map(n=>({...n})):[];notePopClose();select(null);rebuild();drawNotes();renderNotes();
     try{localStorage.setItem(KEY,JSON.stringify(serModel()))}catch(e){}cloudPush()}finally{restoring=false}}
 function undo(){if(undoS.length<2)return;redoS.push(undoS.pop());restoreModel(undoS[undoS.length-1]);updUndo();toast('Undone')}
 function redo(){if(!redoS.length)return;const j=redoS.pop();undoS.push(j);restoreModel(j);updUndo();toast('Redone')}
 function save(){clearTimeout(saveT);saveT=setTimeout(()=>{const j=JSON.stringify(serModel());try{localStorage.setItem(KEY,j)}catch(e){}pushUndo(j);cloudPush()},300)}
 function load(){try{let d=JSON.parse(localStorage.getItem(KEY));
-    if(d&&d.blocks){Object.assign(S,d.S||{});if(!S.rateSet&&S.scaleDen===1&&!S.shopRate)S.shopRate=FULL_DEF.shopRate;if(d.sketch&&d.sketch.v)SK=d.sketch;d.blocks.forEach(x=>makeBlock(x));skLoad();if(Array.isArray(d.notes))notes=d.notes.filter(n=>n&&Array.isArray(n.p));return true}
+    if(d&&d.blocks){Object.assign(S,d.S||{});if(!S.rateSet&&S.scaleDen===1&&!S.shopRate)S.shopRate=FULL_DEF.shopRate;if(d.sketch&&d.sketch.v)SK=d.sketch;d.blocks.forEach(x=>makeBlock(x));skLoad();PG_FIGS=d.figures||null;if(Array.isArray(d.notes))notes=d.notes.filter(n=>n&&Array.isArray(n.p));return true}
     d=JSON.parse(localStorage.getItem('plyGrammar.v1'));               // earlier version: keep the model, reset names to letters
     if(d&&d.blocks){d.blocks.forEach(x=>makeBlock({...x,name:null}));return true}}catch(e){console.warn('saved design did not load',e)}return false}
 /* a fresh start is one obstacle: the app is about getting a single piece right */
@@ -3304,12 +3327,36 @@ function skStrokeMove(c){const st=c.userData.stroke,p=skTip(c).toArray();if(EW.V
   /* the straight line this stroke would become, with its ends where they would land */
   const f=EW.fitLine(st.pts),G=skGfx();if(!f){G.prev.visible=false;return}const sa=EW.snapEnd(SK,f.a,SKX,skSnapR(),undefined,SKF&&SKF.faces),sb=EW.snapEnd(SK,f.b,SKX,skSnapR(),sa.kind==='vert'?sa.id:undefined,SKF&&SKF.faces);
   G.prev.visible=skRod({setMatrixAt:(i,m)=>{m.decompose(G.prev.position,G.prev.quaternion,G.prev.scale)}},0,skV(sa.at),skV(sb.at),.0016*skK())}
+/* one stroke with clear corners in it is several lines joined at those corners: the stroke is simplified, bends sharper
+   than about 30° between pieces long enough to mean it are kept as corners, and each corner sits where the two fitted lines
+   pass closest. Returns the pieces as point lists (one piece = one straight line). */
+function skSplitStroke(pts){const k=skK(),eps=.012*k,minL=.035*k,n=pts.length;if(n<6)return [pts];
+  const sub=EW.V.sub,dot=EW.V.dot,dist=EW.V.dist,segD=(p,a,b)=>{const ab=sub(b,a),L2=dot(ab,ab)||1,tt=Math.max(0,Math.min(1,dot(sub(p,a),ab)/L2));return dist(p,EW.V.add(a,EW.V.mul(ab,tt)))};
+  const brk=new Set([0,n-1]),rdp=(a,b)=>{let md=0,mi=-1;for(let i=a+1;i<b;i++){const d=segD(pts[i],pts[a],pts[b]);if(d>md){md=d;mi=i}}if(md>eps){brk.add(mi);rdp(a,mi);rdp(mi,b)}};rdp(0,n-1);
+  let B=[...brk].sort((x,y)=>x-y);const turn=i=>{const u=sub(pts[B[i]],pts[B[i-1]]),w=sub(pts[B[i+1]],pts[B[i]]),lu=Math.hypot(...u),lw=Math.hypot(...w);return {ang:Math.acos(Math.max(-1,Math.min(1,dot(u,w)/(lu*lw||1))))*180/Math.PI,short:Math.min(lu,lw)<minL}};
+  /* take out the weakest bend, again and again, until every one left is a real corner */
+  for(;;){let wi=-1,wa=1e9;for(let i=1;i<B.length-1;i++){const t=turn(i),sc=t.short?-1:t.ang;if(sc<wa){wa=sc;wi=i}}if(wi<0||(wa>=30))break;B.splice(wi,1)}
+  if(B.length<3)return [pts];
+  const fits=[];for(let i=0;i<B.length-1;i++){const f=EW.fitLine(pts.slice(B[i],B[i+1]+1));if(!f)return [pts];fits.push(f)}
+  /* where two fitted lines pass closest */
+  const meet=(f,g)=>{const d1=f.dir,d2=g.dir,r=sub(f.a,g.a),a_=dot(d1,d1),b_=dot(d1,d2),c_=dot(d2,d2),d_=dot(d1,r),e_=dot(d2,r),den=a_*c_-b_*b_;if(Math.abs(den)<1e-9)return EW.V.mul(EW.V.add(f.b,g.a),.5);
+    const s_=(b_*e_-c_*d_)/den,t_=(a_*e_-b_*d_)/den;return EW.V.mul(EW.V.add(EW.V.add(f.a,EW.V.mul(d1,s_)),EW.V.add(g.a,EW.V.mul(d2,t_))),.5)};
+  const C=[fits[0].a];for(let i=0;i<fits.length-1;i++)C.push(meet(fits[i],fits[i+1]));C.push(fits[fits.length-1].b);
+  return fits.map((_,i)=>{const out=[];for(let z=0;z<=6;z++)out.push(EW.V.add(C[i],EW.V.mul(sub(C[i+1],C[i]),z/6)));return out})}
+/* a free line end that a new line carries straight on from (within ~8°) has nothing to keep: the two become one longer line */
+function skStraighten(ids){let n=0;for(const id of new Set(ids)){if(!SK.v.some(v=>v.id===id))continue;const es=SK.e.filter(e=>e.a===id||e.b===id);if(es.length!==2||es.some(e=>skInBlock(e.a,e.b)))continue;
+    const P=x=>SKX[x]||EW.anchorOf(SK.v.find(v=>v.id===x)),o=es.map(e=>e.a===id?e.b:e.a),u=EW.V.sub(P(o[0]),P(id)),w=EW.V.sub(P(o[1]),P(id)),c=EW.V.dot(u,w)/(Math.hypot(...u)*Math.hypot(...w)||1);
+    if(c>-Math.cos(8*Math.PI/180))continue;EW.removeVert(SK,id,SKX);delete SKX[id];n++}return n}
 function skStrokeEnd(c){const st=c.userData.stroke;c.userData.stroke=null;skLive([]);skGfx().prev.visible=false;if(!st||st.pts.length<3)return;
-  const r=EW.addStroke(SK,st.pts,SKX,{snapR:skSnapR(),faces:SKF&&SKF.faces});
-  if(!r.ok){menuMsg=r.why==='too short'?'Too short for a line.':'That runs along a line that is already there.';drawMenu();return}
-  const n0=blocks.filter(b=>b.sk).length;skAfter([r.a,r.b]);const nf=SKF.faces.filter(f=>f.ids.includes(r.a)&&f.ids.includes(r.b)).length;
+  const pieces=skSplitStroke(st.pts),ends=[];let why=null,first=null,last=null;
+  for(const pc of pieces){const r=EW.addStroke(SK,pc,SKX,{snapR:skSnapR(),faces:SKF&&SKF.faces});if(!r.ok){why=why||r.why;continue}
+    for(const id of [r.a,r.b]){if(!SKX[id]){const v=SK.v.find(x=>x.id===id);if(v)SKX[id]=EW.anchorOf(v).slice()}ends.push(id)}if(first==null)first=r.a;last=r.b}
+  if(!ends.length){menuMsg=why==='too short'?'Too short for a line.':'That runs along a line that is already there.';drawMenu();return}
+  const merged=skStraighten(ends),alive=new Set(SK.v.map(v=>v.id)),keep=ends.filter(id=>alive.has(id));
+  skAfter(keep);const nf=SKF.faces.filter(f=>keep.filter(id=>f.ids.includes(id)).length>=2).length,np=pieces.length;
   if(skNewBlock){select(skNewBlock);menuMsg=`That closed a solid: it is now ${skNewBlock.name}. Panels shows how it is built.`;buzz(c,.9,80)}
-  else{menuMsg=nf?(nf===1?'Line in: it closed a face.':`Line in: it closed ${nf} faces.`):'Line in.';buzz(c,nf?.6:.3,nf?40:20)}drawMenu()}
+  else{const what=np>1?`${np} lines in, joined at ${np-1} ${np===2?'corner':'corners'}`:merged?'Line lengthened':'Line in';
+    menuMsg=nf?`${what}: it closed ${nf===1?'a face':nf+' faces'}.`:what+'.';buzz(c,nf?.6:.3,nf?40:20)}drawMenu()}
 /* ---- the eraser: brush a corner (its two lines become one) or a line ---- */
 function skEraseAt(c){const p=skTip(c).toArray(),h=skPick(p,.025*skK());if(!h||h.kind==='face')return;
   if(h.kind==='vert'){if(!skMarkV.has(h.id)){skMarkV.add(h.id);buzz(c,.3,20);skDraw()}}else if(!skMarkE.has(h.id)){skMarkE.add(h.id);buzz(c,.3,20);skDraw()}}
@@ -3359,12 +3406,170 @@ function skDeleteHeld(){const c=ctrls.find(x=>x.userData.skGrab);if(!c)return fa
 function skTool(t){XR.tool=t;menuMsg=t==='pen'?'Pen: hold the trigger and draw a line in the air. Start and end on corners to join them up. A closed shape becomes a solid.':t==='erase'?'Eraser: hold the trigger and brush the corners or lines to take out.':'Push / pull: point at a face, an edge or a corner and pull the trigger to drag it.';
   ctrls.forEach(c=>{if(c.userData.stroke){c.userData.stroke=null;skLive([])}c.userData.erasing=false});skMarkV.clear();skMarkE.clear();if(t!=='push'&&view!=='mass')setView('mass');skDraw();drawMenu()}
 
+/* ---------------- figure: a posable person to design around ----------------
+   Proportions are the standard body-segment fractions of standing height (thigh .245, shank .246, upper arm .186,
+   forearm .146, hand .108, shoulders at .818, hips at .53). Every joint keeps to a human range of motion: knees and
+   elbows only fold one way, hips and shoulders swing within their limits. Hands and feet can be dragged (the arm or leg
+   follows, as far as its joints allow), and a pose list sets the whole body at once. A figure is saved with the design
+   ({p: where it stands or holds on, ry: which way it faces, h: height in inches, pose, a: joint angles}); it is never panelized. */
+const FIG_LIM={spine:[[-30,60],[-25,25],[-30,30]],chest:[[-20,40],[-20,20],[-30,30]],neck:[[-45,60],[-70,70],[-35,35]],
+  Sh:[[-60,180],[-30,180],[-90,90]],El:[0,150],Hip:[[-30,130],[-30,60],[-45,45]],Kn:[0,150],Ank:[-45,30]};
+/* angles in plain body terms: flex (forward), then side or abduction (out), then twist; elbows and knees just fold */
+const FIG_POSES={
+  stand:{name:'Stand',anchor:'low',a:{lSh:[0,8,0],rSh:[0,8,0],lEl:10,rEl:10}},
+  walk:{name:'Walk',anchor:'low',a:{lHip:[22,0,0],rHip:[-14,0,0],lKn:8,rKn:28,rAnk:-10,lSh:[-18,6,0],rSh:[22,6,0],lEl:12,rEl:24}},
+  run:{name:'Run',anchor:'low',a:{spine:[12,0,0],lHip:[55,0,0],lKn:70,rHip:[-22,0,0],rKn:95,rAnk:-25,lSh:[-45,8,0],lEl:95,rSh:[55,8,0],rEl:95}},
+  reach:{name:'Reach up',anchor:'low',a:{chest:[-6,0,0],lSh:[172,6,0],rSh:[172,6,0],lEl:4,rEl:4,lAnk:-25,rAnk:-25}},
+  squat:{name:'Land / squat',anchor:'low',a:{spine:[32,0,0],chest:[10,0,0],neck:[-25,0,0],lHip:[112,10,0],rHip:[112,10,0],lKn:132,rKn:132,lAnk:28,rAnk:28,lSh:[70,10,0],rSh:[70,10,0],lEl:25,rEl:25}},
+  sit:{name:'Sit on a ledge',anchor:'seat',a:{spine:[6,0,0],lHip:[90,6,0],rHip:[90,6,0],lKn:85,rKn:85,lSh:[12,10,0],rSh:[12,10,0],lEl:40,rEl:40}},
+  kneel:{name:'Kneel',anchor:'low',a:{lHip:[2,4,0],rHip:[2,4,0],lKn:100,rKn:100,lAnk:-40,rAnk:-40,lSh:[10,8,0],rSh:[10,8,0],lEl:20,rEl:20}},
+  climb:{name:'Step up high',anchor:'low',a:{spine:[18,0,0],lHip:[105,4,0],lKn:118,lAnk:15,rHip:[-6,0,0],rKn:12,lSh:[140,10,0],rSh:[120,12,0],lEl:40,rEl:45}},
+  vault:{name:'Vault',anchor:'low',a:{root:[70,0],neck:[-40,0,0],lSh:[95,12,0],rSh:[95,12,0],lEl:5,rEl:5,lHip:[118,14,0],rHip:[118,14,0],lKn:128,rKn:128}},
+  cat:{name:'Cat hang',anchor:'hands',a:{lSh:[168,12,0],rSh:[168,12,0],lEl:35,rEl:35,lHip:[72,8,0],rHip:[60,8,0],lKn:78,rKn:70,lAnk:20,rAnk:20}},
+  hang:{name:'Hang',anchor:'hands',a:{lSh:[178,10,0],rSh:[178,10,0],lEl:2,rEl:2,lHip:[8,0,0],rHip:[4,0,0],lKn:12,rKn:8,lAnk:-20,rAnk:-20}},
+  crawl:{name:'Crawl',anchor:'low',a:{root:[90,0],neck:[-55,0,0],lSh:[90,6,0],rSh:[90,6,0],lEl:2,rEl:2,lHip:[90,4,0],rHip:[90,4,0],lKn:92,rKn:92,lAnk:-40,rAnk:-40}},
+  lie:{name:'Lie down',anchor:'low',a:{root:[-90,0],lSh:[0,14,0],rSh:[0,14,0],lEl:8,rEl:8,lAnk:-30,rAnk:-30}}};
+const FIG_KEYS=Object.keys(FIG_POSES);
+var figs=[],figSel=null,figRoot=new THREE.Group(),PG_FIGS;world.add(figRoot);
+const figMat=new THREE.MeshStandardMaterial({color:0x6C3BFF,roughness:.6}),figJoint=new THREE.MeshStandardMaterial({color:0x1F2430,roughness:.5}),
+  figHandleM=new THREE.MeshBasicMaterial({color:0xFFD23F,depthTest:false,transparent:true,opacity:.95}),figSelM=new THREE.MeshStandardMaterial({color:0x8F6BFF,roughness:.55,emissive:0x24105E});
+const deg=x=>x*Math.PI/180;
+const ftIn=h=>{const t=Math.round(h);return `${Math.floor(t/12)}′ ${t%12}″`};
+function figAngles(F){const a={},src=F.a||FIG_POSES[F.pose]?.a||{};for(const k of ['spine','chest','neck','lSh','rSh','lHip','rHip'])a[k]=(src[k]||[0,0,0]).slice();
+  for(const k of ['lEl','rEl','lKn','rKn','lAnk','rAnk'])a[k]=src[k]||0;a.root=(src.root||[0,0]).slice();return a}
+/* build the jointed body for one figure */
+function figBuild(F){const H=F.h,g=new THREE.Group(),rig=new THREE.Group();g.add(rig);g.userData.fig=F;F.g=g;F.rig=rig;const J={};
+  const node=(par,x,y,z,name)=>{const o=new THREE.Object3D();o.position.set(x*H,y*H,z*H);par.add(o);if(name)J[name]=o;return o};
+  const mesh=(par,geo,mat,x,y,z,part)=>{const m=new THREE.Mesh(geo,mat);m.position.set(x*H,y*H,z*H);m.userData.fig=F;m.userData.part=part||'body';par.add(m);return m};
+  const limb=(par,len,r0,part)=>{const L=len*H,R=r0*H;mesh(par,new THREE.CapsuleGeometry(R,Math.max(.01,L-R*2),4,10),figMat,0,-len/2,0,part)};
+  const ball=(par,r,part)=>mesh(par,new THREE.SphereGeometry(r*H,12,8),figJoint,0,0,0,part);
+  const ell=(par,rx,ry,rz,x,y,z)=>{const m=mesh(par,new THREE.SphereGeometry(1,16,12),figMat,x,y,z);m.scale.set(rx*H,ry*H,rz*H);return m};
+  const pel=node(rig,0,.56,0,'pelvis');ell(pel,.088,.06,.06,0,-.005,0);
+  const sp=node(pel,0,.03,0,'spine');mesh(sp,new THREE.CapsuleGeometry(.062*H,.06*H,4,12),figMat,0,.065,0);
+  const ch=node(sp,0,.13,0,'chest');ell(ch,.1,.085,.062,0,.05,0);
+  const nk=node(ch,0,.1,0,'neck');mesh(nk,new THREE.CapsuleGeometry(.022*H,.03*H,3,8),figMat,0,.025,0);
+  const hd=node(nk,0,.05,0,'head');ell(hd,.052,.065,.058,0,.055,.005);
+  for(const s of [1,-1]){const k=s>0?'l':'r';
+    const sh=node(ch,.105*s,.095,0,k+'Sh');ball(sh,.033);limb(sh,.186,.03);const el=node(sh,0,-.186,0,k+'El');ball(el,.026);limb(el,.146,.025);
+    const wr=node(el,0,-.146,0,k+'Wr');const hand=mesh(wr,new THREE.SphereGeometry(1,10,8),figMat,0,-.045,0,'hand-'+k);hand.scale.set(.022*H,.05*H,.032*H);
+    const hip=node(pel,.052*s,-.03,0,k+'Hip');ball(hip,.04);limb(hip,.245,.047);const kn=node(hip,0,-.245,0,k+'Kn');ball(kn,.034);limb(kn,.246,.036);
+    const an=node(kn,0,-.246,0,k+'Ank');const foot=mesh(an,new THREE.BoxGeometry(.05*H,.039*H,.15*H),figMat,0,-.02,.035,'foot-'+k);foot.geometry.translate(0,0,0)}
+  /* the four grab handles: hands and feet */
+  F.handles={};for(const [k,par,off] of [['hand-l','lWr',-.06],['hand-r','rWr',-.06],['foot-l','lAnk',-.02],['foot-r','rAnk',-.02]]){
+    const hm=new THREE.Mesh(new THREE.SphereGeometry(1,14,10),figHandleM);hm.position.set(0,off*H,k.startsWith('foot')?.05*H:0);hm.renderOrder=20;hm.userData.fig=F;hm.userData.part=k;hm.visible=false;J[par].add(hm);F.handles[k]=hm}
+  F.J=J;figRoot.add(g);figPose(F);return F}
+function figSetRot(F,name,e,order){const o=F.J[name];o.rotation.order=order||'XZY';o.rotation.set(e[0],e[1],e[2])}
+/* angles (body terms) -> joint rotations, each clamped to its range */
+function figApply(F){const a=F.ang,c=(v,[lo,hi])=>Math.max(lo,Math.min(hi,v));
+  for(const k of ['spine','chest']){const L=FIG_LIM[k],v=a[k];a[k]=[c(v[0],L[0]),c(v[1],L[1]),c(v[2],L[2])];figSetRot(F,k,[deg(a[k][0]),deg(a[k][2]),deg(a[k][1])],'XYZ')}
+  {const L=FIG_LIM.neck,v=a.neck;a.neck=[c(v[0],L[0]),c(v[1],L[1]),c(v[2],L[2])];figSetRot(F,'neck',[deg(a.neck[0]),deg(a.neck[1]),deg(a.neck[2])],'XYZ')}
+  for(const s of ['l','r']){const sg=s==='l'?1:-1;
+    {const L=FIG_LIM.Sh,v=a[s+'Sh'];a[s+'Sh']=[c(v[0],L[0]),c(v[1],L[1]),c(v[2],L[2])];const w=a[s+'Sh'];figSetRot(F,s+'Sh',[-deg(w[0]),sg*deg(w[2]),sg*deg(w[1])],'XZY')}
+    a[s+'El']=c(a[s+'El'],FIG_LIM.El);F.J[s+'El'].rotation.set(-deg(a[s+'El']),0,0);
+    {const L=FIG_LIM.Hip,v=a[s+'Hip'];a[s+'Hip']=[c(v[0],L[0]),c(v[1],L[1]),c(v[2],L[2])];const w=a[s+'Hip'];figSetRot(F,s+'Hip',[-deg(w[0]),sg*deg(w[2]),sg*deg(w[1])],'XZY')}
+    a[s+'Kn']=c(a[s+'Kn'],FIG_LIM.Kn);F.J[s+'Kn'].rotation.set(deg(a[s+'Kn']),0,0);
+    a[s+'Ank']=c(a[s+'Ank'],FIG_LIM.Ank);F.J[s+'Ank'].rotation.set(-deg(a[s+'Ank']),0,0)}
+  F.J.pelvis.rotation.set(deg(a.root[0]),0,deg(a.root[1]))}
+/* set the body down: its lowest point on the floor (or on the seat, or hanging by the hands) at the figure's spot */
+function figAnchor(F){const g=F.g,rig=F.rig;rig.position.set(0,0,0);g.updateMatrixWorld(true);const inv=g.matrixWorld.clone().invert(),M=new THREE.Matrix4(),P=new V();
+  let lo=1e9,hiH=-1e9,seat=1e9;const handC=new V();let nh=0;
+  rig.traverse(o=>{if(!o.isMesh||o.material===figHandleM)return;M.multiplyMatrices(inv,o.matrixWorld);const pos=o.geometry.attributes.position;
+    for(let i=0;i<pos.count;i++){P.fromBufferAttribute(pos,i).applyMatrix4(M);if(P.y<lo)lo=P.y;if(o.userData.part.startsWith('hand')){if(P.y>hiH)hiH=P.y}}});
+  for(const k of ['lWr','rWr']){const w=F.J[k].getWorldPosition(new V()).applyMatrix4(inv);handC.add(w);nh++}handC.multiplyScalar(1/nh);
+  const pv=F.J.pelvis.getWorldPosition(new V()).applyMatrix4(inv);
+  {/* the pelvis shell, for sitting */const pm=F.J.pelvis.children.find(x=>x.isMesh);if(pm){M.multiplyMatrices(inv,pm.matrixWorld);const pos=pm.geometry.attributes.position;for(let i=0;i<pos.count;i++){P.fromBufferAttribute(pos,i).applyMatrix4(M);if(P.y<seat)seat=P.y}}}
+  const an=F.anchor||FIG_POSES[F.pose]?.anchor||'low';
+  if(an==='hands')rig.position.set(-handC.x,-hiH,-handC.z);else if(an==='seat')rig.position.set(-pv.x,-seat,-pv.z);else rig.position.set(-pv.x,-lo,-pv.z)}
+function figPose(F){F.ang=figAngles(F);figApply(F);figPlace(F);figAnchor(F)}
+function figPlace(F){F.g.position.fromArray(F.p);F.g.rotation.set(0,deg(F.ry||0),0)}
+function figShow(){if(!figRoot)return;figRoot.visible=view==='mass'||view==='panels';for(const F of figs){const on=F===figSel;for(const k in F.handles){const h=F.handles[k];h.visible=on;h.scale.setScalar((xrMode?.05:.038)*F.h)}
+    F.rig.traverse(o=>{if(o.isMesh&&o.material!==figHandleM&&o.material!==figJoint)o.material=on?figSelM:figMat})}}
+function figNew(d){const F={id:d.id||'f'+Math.random().toString(36).slice(2,8),p:(d.p||[0,0,0]).slice(),ry:d.ry||0,h:d.h||69,pose:d.pose||'stand',anchor:d.anchor||null,a:d.a?JSON.parse(JSON.stringify(d.a)):null};figs.push(F);figBuild(F);return F}
+function figRemove(F){figRoot.remove(F.g);F.g.traverse(o=>o.geometry?.dispose());figs.splice(figs.indexOf(F),1);if(figSel===F)figSelect(null)}
+function figRebuild(F){figRoot.remove(F.g);F.g.traverse(o=>o.geometry?.dispose());figBuild(F);figShow()}
+const serFig=F=>({id:F.id,p:F.p.map(x=>+x.toFixed(2)),ry:+(F.ry||0).toFixed(1),h:+F.h.toFixed(1),pose:F.pose,anchor:F.anchor||undefined,a:F.pose==='custom'?F.ang:undefined});
+function figLoad(list){figs.slice().forEach(figRemove);for(const d of list||[])if(d&&Array.isArray(d.p))figNew(d);figShow();figCard()}
+/* where things are: the top surface under a spot (boxes, then the floor) */
+function figGroundAt(x,z,fromY){let best=0;const rc=new THREE.Raycaster(),o=world.localToWorld(new V(x,fromY??1e4,z)),d=new V(0,-1,0).transformDirection(world.matrixWorld);rc.set(o,d);massGroup.updateMatrixWorld(true);
+  const h=rc.intersectObjects(blocks.map(b=>b.mesh),false)[0];if(h){const y=world.worldToLocal(h.point.clone()).y;if(y>best)best=y}return best}
+/* two-bone reach: move a hand or foot toward T (model space); the shoulder or hip swings and the elbow or knee folds, within their ranges */
+function figIK(F,part,Tm){const arm=part.startsWith('hand'),s=part.slice(-1),H=F.h;
+  /* a foot's handle sits a little ahead of the ankle: aim the ankle so the handle lands on the target (twice, as the foot turns with the leg) */
+  if(!arm){for(let it=0;it<2;it++){F.g.updateMatrixWorld(true);const hw=F.handles[part].getWorldPosition(new V()),aw=F.J[s+'Ank'].getWorldPosition(new V()),off=world.worldToLocal(hw.clone()).sub(world.worldToLocal(aw.clone()));figReach(F,s,false,Tm.clone().sub(off),(.245)*H,.246*H)}return}
+  figReach(F,s,true,Tm,.186*H,.206*H)}
+function figReach(F,s,arm,Tm,a,b){const A=F.J[s+(arm?'Sh':'Hip')];
+  F.g.updateMatrixWorld(true);const T=world.localToWorld(Tm.clone()),S=A.getWorldPosition(new V()),ws=world.scale.x,aw=a*ws,bw=b*ws;
+  let d=T.clone().sub(S);const dl=Math.max(Math.abs(aw-bw)+1e-4,Math.min(aw+bw-1e-4,d.length()));const dir=d.normalize();
+  /* elbows point back and a little out; knees point forward */
+  const pq=A.parent.getWorldQuaternion(new THREE.Quaternion()),out=s==='l'?1:-1,pole=(arm?new V(.3*out,-.3,-1):new V(.15*out,0,1)).applyQuaternion(pq);let pp=pole.clone().addScaledVector(dir,-pole.dot(dir));if(pp.lengthSq()<1e-8)pp=new V(0,0,arm?-1:1).applyQuaternion(pq);pp.normalize();
+  const ca=(aw*aw+dl*dl-bw*bw)/(2*aw*dl),al=Math.acos(Math.max(-1,Math.min(1,ca))),M=S.clone().addScaledVector(dir,aw*Math.cos(al)).addScaledVector(pp,aw*Math.sin(al));
+  const u=M.clone().sub(S).normalize(),bd=pp.clone().negate().addScaledVector(u,pp.dot(u)).normalize(),Yw=u.clone().negate(),Zw=arm?bd:bd.clone().negate(),Xw=new V().crossVectors(Yw,Zw).normalize();
+  const qW=new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(Xw,Yw,Zw)),qL=pq.clone().invert().multiply(qW),e=new THREE.Euler().setFromQuaternion(qL,'XZY'),sg=s==='l'?1:-1;
+  /* the same turn can be read two ways; take the one a real shoulder or hip can do */
+  const wrap=x=>Math.atan2(Math.sin(x),Math.cos(x)),R=180/Math.PI,L=FIG_LIM[arm?'Sh':'Hip'],asA=(x,z,y)=>[-x*R,sg*z*R,sg*y*R],
+    bad=v=>v.reduce((t,x,i)=>t+Math.max(0,L[i][0]-x,x-L[i][1]),0),c1=asA(e.x,e.z,e.y),c2=asA(wrap(e.x+Math.PI),wrap(Math.PI-e.z),wrap(e.y+Math.PI));
+  const flex=180-Math.acos(Math.max(-1,Math.min(1,(aw*aw+bw*bw-dl*dl)/(2*aw*bw))))*R;
+  if(F.pose!=='custom')F.anchor=F.anchor||FIG_POSES[F.pose]?.anchor||'low';F.pose='custom';
+  F.ang[s+(arm?'Sh':'Hip')]=bad(c2)<bad(c1)?c2:c1;F.ang[s+(arm?'El':'Kn')]=flex;F.a=F.ang;figApply(F)}
+/* ---- desktop: pick, drag, the Model tab card and the right-click menu ---- */
+function figHit(rc){const T=[];figRoot.traverse(o=>{if(o.isMesh&&o.visible)T.push(o)});const h=rc.intersectObjects(T,false);if(!h.length)return null;
+  const hd=h.find(x=>x.object.material===figHandleM);return hd?{F:hd.object.userData.fig,part:hd.object.userData.part,hit:hd}:{F:h[0].object.userData.fig,part:'body',hit:h[0]}}
+function figSelect(F){figSel=F;if(F&&sel)select(null);figShow();figCard();if(xrMode)drawMenu()}
+function figCard(){const c=$('#figCard');if(!c||!figs)return;c.hidden=!figSel;$('#figAdd').textContent=figs.length?'+ Add another figure':'+ Add a figure';if(!figSel)return;const F=figSel;
+  $('#figH').value=F.h;$('#figHLab').textContent=`${ftIn(F.h)} · ${Math.round(F.h*2.54)} cm`;$$('#figPoses button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.pose===F.pose))}
+function figAddInFront(){let x=0,z=0;if(blocks.length){let mx=-1e9;for(const b of blocks)for(const f of b.faces||[])for(const q of f.poly)mx=Math.max(mx,q.x);x=mx+18}
+  const F=figNew({p:[x,figGroundAt(x,z),z],h:69,pose:'stand'});figSelect(F);save();return F}
+{const pc=$('#figPoses');if(pc)pc.innerHTML=FIG_KEYS.map(k=>`<button data-pose="${k}" aria-pressed="false">${FIG_POSES[k].name}</button>`).join('')}
+$('#figAdd')&&($('#figAdd').onclick=()=>{figAddInFront();toast('Figure added. Drag it onto your design; drag a hand or foot to pose it.')});
+$('#figPoses')&&($('#figPoses').onclick=e=>{const k=e.target.closest('[data-pose]')?.dataset.pose;if(!k||!figSel)return;figSetPose(figSel,k)});
+function figSetPose(F,k){F.pose=k;F.a=null;F.anchor=null;figPose(F);
+  /* a pose that sits or holds on lands on the surface under it; a standing one on the top surface below its spot */
+  if((FIG_POSES[k].anchor||'low')!=='hands'){F.p[1]=figGroundAt(F.p[0],F.p[2],F.p[1]+F.h*.2);figPlace(F)}
+  figFloor(F);figShow();figCard();save()}
+/* nothing goes through the floor: a figure sitting or hanging with nothing under it is lifted until it clears */
+function figFloor(F){const lo=figLow(F);if(lo<-.01){F.p[1]-=lo;figPlace(F)}}
+/* the figure's lowest point, in model inches */
+function figLow(F){F.g.updateMatrixWorld(true);const inv=world.matrixWorld.clone().invert(),M=new THREE.Matrix4(),P=new V();let lo=1e9;
+  F.rig.traverse(o=>{if(!o.isMesh||o.material===figHandleM)return;M.multiplyMatrices(inv,o.matrixWorld);const pos=o.geometry.attributes.position;for(let i=0;i<pos.count;i+=3){P.fromBufferAttribute(pos,i).applyMatrix4(M);if(P.y<lo)lo=P.y}});return lo}
+$('#figH')&&($('#figH').oninput=e=>{if(!figSel)return;figSel.h=+e.target.value;const keep=figSel.ang;figRebuild(figSel);if(figSel.pose==='custom'){figSel.ang=keep;figApply(figSel);figAnchor(figSel)}figCard()});
+$('#figH')&&($('#figH').onchange=()=>save());
+$('#figTurnL')&&($('#figTurnL').onclick=()=>{if(!figSel)return;figSel.ry=((figSel.ry||0)+15)%360;figPlace(figSel);save()});
+$('#figTurnR')&&($('#figTurnR').onclick=()=>{if(!figSel)return;figSel.ry=((figSel.ry||0)-15)%360;figPlace(figSel);save()});
+$('#figDel')&&($('#figDel').onclick=()=>{if(!figSel)return;figRemove(figSel);save();toast('Figure removed')});
+$$('[data-figh]').forEach(b=>b.onclick=()=>{if(!figSel)return;$('#figH').value=+b.dataset.figh;$('#figH').oninput({target:$('#figH')});save()});
+/* dragging on the computer: a hand or foot reaches, the body moves the whole figure across whatever it stands on */
+let figDrag=null;
+function figRay(e){const r=renderer.domElement.getBoundingClientRect();mouse.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(mouse,camera);return ray}
+renderer.domElement.addEventListener('pointerdown',e=>{if(e.button!==0||xrMode||!figRoot.visible||!figs.length)return;const h=figHit(figRay(e));if(!h)return;
+  e.stopImmediatePropagation();e.preventDefault();if(figSel!==h.F)figSelect(h.F);orbit.enabled=false;
+  const W=h.hit.point.clone(),n=camera.getWorldDirection(new V());figDrag={F:h.F,part:h.part,plane:new THREE.Plane().setFromNormalAndCoplanarPoint(n,W),x:e.clientX,y:e.clientY,moved:false,off:world.worldToLocal(W.clone()).sub(new V().fromArray(h.F.p))}},{capture:true});
+addEventListener('pointermove',e=>{if(!figDrag)return;if(!figDrag.moved&&Math.hypot(e.clientX-figDrag.x,e.clientY-figDrag.y)<4)return;figDrag.moved=true;const F=figDrag.F,rc=figRay(e);
+  if(figDrag.part!=='body'){const W=rc.ray.intersectPlane(figDrag.plane,new V());if(W)figIK(F,figDrag.part,world.worldToLocal(W));return}
+  /* the body: onto the box face under the pointer (a hanging pose grips any edge it is put on), else the floor */
+  const an=F.anchor||FIG_POSES[F.pose]?.anchor||'low';massGroup.updateMatrixWorld(true);const h=rc.intersectObjects(blocks.map(b=>b.mesh),false)[0];let P=null;
+  if(h&&(an==='hands'||h.face&&h.face.normal.clone().transformDirection(h.object.matrixWorld).y>.6))P=world.worldToLocal(h.point.clone());
+  else{const W=rc.ray.intersectPlane(new THREE.Plane(new V(0,1,0),0),new V());if(W){P=world.worldToLocal(W);P.y=0}}
+  if(P){F.p=[P.x,P.y,P.z];figPlace(F)}});
+addEventListener('pointerup',()=>{if(!figDrag)return;const d=figDrag;figDrag=null;orbit.enabled=true;if(d.part!=='body'&&d.moved)figAnchor(d.F);if(d.moved)figFloor(d.F);if(d.moved)save();figCard()});
+/* clicking empty space lets a figure go */
+renderer.domElement.addEventListener('pointerdown',e=>{if(e.button!==0||xrMode||!figSel)return;setTimeout(()=>{if(!figDrag&&figSel){const h=figHit(figRay(e));if(!h)figSelect(null)}},0)});
+addEventListener('keydown',e=>{if(!figSel||xrMode||e.target.closest?.('input,textarea,select'))return;if(e.key==='Delete'||e.key==='Backspace'){e.preventDefault();e.stopImmediatePropagation();figRemove(figSel);save()}},{capture:true});
+/* ---- headset: trigger a hand or foot to reach with it, trigger the body to pick the figure, grip to carry it ---- */
+function xrFigTrigger(c){if(!figRoot.visible||!figs.length)return false;const h=figHit(ctrlRay(c));if(!h)return false;figSelect(h.F);
+  if(h.part!=='body'){c.userData.figIK={F:h.F,part:h.part,D0:h.hit.distance};menuMsg='Reaching: move your hand to place it.'}else menuMsg=`Figure, ${ftIn(h.F.h)}: ${FIG_POSES[h.F.pose]?.name||'your own pose'}. Grip it to carry it somewhere.`;buzz(c,.3,20);drawMenu();return true}
+function xrFigTick(c){const U=c.userData.figIK;if(!U)return false;ctrlRay(c);figIK(U.F,U.part,world.worldToLocal(xray.ray.origin.clone().addScaledVector(xray.ray.direction,U.D0)));return true}
+function xrFigEnd(c){const U=c.userData.figIK;if(!U)return false;c.userData.figIK=null;figAnchor(U.F);figFloor(U.F);save();return true}
+function xrFigGrab(c){if(!figRoot.visible||!figs.length)return false;const h=figHit(ctrlRay(c));if(!h)return false;figSelect(h.F);c.userData.figGrab=h.F;c.attach(h.F.g);buzz(c,.3,20);return true}
+function xrFigRelease(c){const F=c.userData.figGrab;if(!F)return false;c.userData.figGrab=null;figRoot.attach(F.g);const e=new THREE.Euler().setFromQuaternion(F.g.quaternion,'YXZ');F.ry=e.y*180/Math.PI;
+  F.p=F.g.position.toArray();if((F.anchor||FIG_POSES[F.pose]?.anchor||'low')!=='hands')F.p[1]=figGroundAt(F.p[0],F.p[2],F.p[1]+F.h*.15);figPlace(F);figFloor(F);save();menuMsg='Figure set down.';drawMenu();return true}
+
+if(PG_FIGS){figLoad(PG_FIGS);PG_FIGS=null}
 /* ---------------- VR / XR ----------------
    Set up like Overhang Garden: the left controller holds the menu and the right one points at it and clicks with the trigger.
    Every session starts by setting the floor (Toy Box style). Then: trigger on a face pushes or pulls it, grip on a box, cut or
    cut-out moves it, grip on empty space moves the whole model and both grips turn and scale it, the left stick flies.
-   The buttons match Edgewise XR: A steps through the tools (push / pull, pen, eraser; the red X while you hold something),
-   B undoes, Y redoes, X hides the menu. Each button wears a little picture of what it does. */
+   Buttons: X undoes and Y redoes (left hand), A steps through the tools (push / pull, pen, eraser; the red X while you hold
+   something), B shows or hides the menu. Each button wears a little picture of what it does. */
 const xray=new THREE.Raycaster();
 try{XR.floorH=+(localStorage.getItem('pgFloor')||0)||0}catch(e){}
 function ctrlModel(col){const g=new THREE.Group(),m=new THREE.MeshStandardMaterial({color:col,roughness:.45}),dk=new THREE.MeshStandardMaterial({color:0x15181D,roughness:.6});
@@ -3387,9 +3592,10 @@ function xrIcon(kind){if(xrIconTex[kind])return xrIconTex[kind];const c=document
   else if(kind==='erase'){disc('#FF2D95');g.save();g.translate(64,64);g.rotate(-.6);g.fillStyle='#FFFFFF';g.fillRect(-30,-16,60,32);g.lineWidth=6;g.strokeStyle='#111';g.strokeRect(-30,-16,60,32);g.beginPath();g.moveTo(-6,-16);g.lineTo(-6,16);g.stroke();g.restore()}
   else if(kind==='del'){disc('#FF3B30');g.strokeStyle='#FFFFFF';g.lineWidth=16;g.beginPath();g.moveTo(40,40);g.lineTo(88,88);g.moveTo(88,40);g.lineTo(40,88);g.stroke()}
   else if(kind==='push'){/* a face with an arrow coming out of it */disc('#19B5A1');g.fillStyle='#FFFFFF';g.strokeStyle='#111';g.lineWidth=6;g.fillRect(30,74,68,18);g.strokeRect(30,74,68,18);g.lineWidth=12;g.beginPath();g.moveTo(64,70);g.lineTo(64,40);g.stroke();g.fillStyle='#111';g.beginPath();g.moveTo(64,22);g.lineTo(46,46);g.lineTo(82,46);g.closePath();g.fill()}
+  else if(kind==='blank'){g.beginPath();g.arc(64,64,30,0,7);g.fillStyle='rgba(60,63,74,.7)';g.fill()}
   else{disc('#FFD60A');g.strokeStyle='#111';g.lineWidth=10;g.beginPath();for(const y of [44,64,84]){g.moveTo(40,y);g.lineTo(88,y)}g.stroke()}
   const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return xrIconTex[kind]=t}
-const xrIconFor=(hand,i)=>hand==='right'?(i?'undo':ctrls.some(c=>c.userData.skGrab)?'del':XR.tool==='pen'?'pen':XR.tool==='erase'?'erase':'push'):(i?'redo':'menu');
+const xrIconFor=(hand,i)=>hand==='right'?(i?'menu':ctrls.some(c=>c.userData.skGrab)?'del':view!=='mass'?'blank':XR.tool==='pen'?'pen':XR.tool==='erase'?'erase':'push'):(i?'redo':'undo');
 function xrDecorate(c){const U=c.userData,hand=U.hand;if(hand!=='left'&&hand!=='right')return;const ids=hand==='right'?['a-button','b-button']:['x-button','y-button'],fm=U.fmodel,mc=fm&&fm.motionController;
   const mk=()=>{const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:xrIcon('menu'),transparent:true,depthTest:false}));sp.scale.set(.017,.017,1);sp.renderOrder=16;U.grip.add(sp);return sp};
   if(mc&&fm.children.length){if(U.model)U.model.visible=false;
@@ -3421,14 +3627,20 @@ const leftC=()=>ctrls.find(c=>c.userData.hand==='left')||ctrls[0],rightC=()=>ctr
 const ctrlRay=c=>{const rot=new THREE.Matrix4().extractRotation(c.matrixWorld);xray.ray.origin.setFromMatrixPosition(c.matrixWorld);xray.ray.direction.set(0,0,-1).applyMatrix4(rot);return xray};
 function xrParam(c,P0,n){ctrlRay(c);const inv=new THREE.Matrix4().copy(world.matrixWorld).invert(),o=xray.ray.origin.clone().applyMatrix4(inv),d=xray.ray.direction.clone().transformDirection(inv);
   const w=P0.clone().sub(o),b_=n.dot(d),den=1-b_*b_;if(den<1e-4)return null;return (b_*w.dot(d)-w.dot(n))/den}
-function xrFace(c){if(view!=='mass')return null;ctrlRay(c);const hit=xray.intersectObjects(blocks.map(b=>b.mesh),false)[0];if(!hit)return null;
-  const b=hit.object.userData.pick,id=b.triIds?.[hit.faceIndex],f=b.faces?.find(x=>x.pl.id===id);if(!f)return null;const P=hit.point.clone(),W=P.clone();world.worldToLocal(P);return {b,f,id,P,W,dist:hit.distance}}
+function xrFace(c){if(view!=='mass'&&view!=='panels')return null;ctrlRay(c);let ow=null,pd=0;
+  /* Panels view: the pointer lands on a part; the massing face right behind it (the box shape, hidden there) is what gets pushed */
+  if(view==='panels'){const T=[];panelGroup.traverse(o=>{if(o.isMesh&&!o.userData.isStencil&&o.visible&&o.userData.pick&&!o.userData.pick.isObject3D)T.push(o)});const ph=xray.intersectObjects(T,false)[0];if(!ph)return null;
+    let off=new V();for(let o=ph.object;o;o=o.parent)if(o.userData?.clip){off=o.userData.clip.off;break}ow=off.clone().multiplyScalar(world.scale.x).applyQuaternion(world.quaternion);pd=ph.distance;xray.ray.origin.sub(ow)}
+  massGroup.updateMatrixWorld(true);const hit=xray.intersectObjects(blocks.map(b=>b.mesh),false)[0];if(ow)xray.ray.origin.add(ow);if(!hit)return null;
+  const b=hit.object.userData.pick,id=b.triIds?.[hit.faceIndex],f=b.faces?.find(x=>x.pl.id===id);if(!f)return null;const P=hit.point.clone(),W=P.clone();world.worldToLocal(P);if(ow)W.add(ow);return {b,f,id,P,W,dist:ow?pd:hit.distance}}
+/* while a face is being pushed in Panels view the box shape shows instead (parts are worked out again when you let go) */
+function xrPreview(on){if(view!=='panels')return;massGroup.visible=!!on;panelGroup.visible=!on;if(gapMesh)gapMesh.visible=!on}
 /* the floor grid shown while setting the floor */
 const floorGrid=new THREE.GridHelper(3,12,0xF2A01F,0xF2A01F);floorGrid.material.transparent=true;floorGrid.material.opacity=.85;floorGrid.visible=false;scene.add(floorGrid);
 function setFloor(h){XR.floorH=Math.round(Math.max(-.3,Math.min(1.8,h))*100)/100;try{localStorage.setItem('pgFloor',XR.floorH)}catch(e){}
   if(XR.base&&typeof XRRigidTransform!=='undefined')try{renderer.xr.setReferenceSpace(XR.base.getOffsetReferenceSpace(new XRRigidTransform({x:0,y:XR.floorH,z:0})))}catch(e){}drawMenu()}
 function floorStep(on){XR.step=on?'floor':null;floorGrid.visible=on;menu.visible=true;
-  if(!on)menuMsg=view!=='mass'?'Panels view: point at a joint and pull the trigger to change it.':XR.tool==='push'?'Point at a face, an edge or a corner and pull the trigger to drag it.':'Pen: hold the trigger and draw a line in the air.';drawMenu()}
+  if(!on)menuMsg=view!=='mass'?'Panels view: tap a joint to change it, or pull a face or an edge to reshape.':XR.tool==='push'?'Point at a face, an edge or a corner and pull the trigger to drag it.':'Pen: hold the trigger and draw a line in the air.';drawMenu()}
 /* the menu: one canvas on the left controller */
 const MW=1024,MH=1230;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
 const menu=new THREE.Mesh(new THREE.PlaneGeometry(.335*MW/MH,.335),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
@@ -3440,7 +3652,7 @@ function mWrap(s,x,y,w,size=30,col='#C9CED8',lh=40,max=4){MX.font=`500 ${size}px
 function mBtn(x,y,w,h,label,o={}){const id=XR.W.length,hov=XR.hover===id;MX.fillStyle=o.on?(o.col||'#2E5BFF'):hov?'#3B3F49':(o.col&&o.solid?o.col:'#2A2D34');MX.beginPath();MX.roundRect(x,y,w,h,20);MX.fill();
   if(hov){MX.strokeStyle='#FFFFFF';MX.lineWidth=5;MX.stroke()}mText(label,x+w/2,y+h/2+2,o.fs||36,o.on||o.solid?'#FFFFFF':'#E9ECF1','center',700);XR.W.push({x,y,w,h,click:o.click})}
 function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.beginPath();MX.roundRect(0,0,MW,MH,36);MX.fill();
-  mText('Ply Grammar',48,64,52,'#FFFFFF','left',800);const sb=sel?sel.name+(selCut?(selCut.userData.isCarve?' · cut-out':' · cut'):''):'nothing selected';mText(sb,MW-48,64,30,'#F2A01F','right',700);
+  mText('Ply Grammar',48,64,52,'#FFFFFF','left',800);const sb=figSel?'figure · '+ftIn(figSel.h):sel?sel.name+(selCut?(selCut.userData.isCarve?' · cut-out':' · cut'):''):'nothing selected';mText(sb,MW-48,64,30,'#F2A01F','right',700);
   const B=(x,y,w,label,o)=>mBtn(x,y,w,104,label,o),c3=[48,356,664],w3=296,c2=[48,510],w2=450;
   if(XR.step==='floor'){const cm=Math.round(XR.floorH*100);
     mText('Set the floor',48,160,46,'#FFFFFF','left',800);
@@ -3448,13 +3660,23 @@ function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.be
     y+=30;B(c3[0],y,w3,'\u25B2  Up 2 cm',{click:()=>setFloor(XR.floorH+.02)});B(c3[1],y,w3,'\u25BC  Down 2 cm',{click:()=>setFloor(XR.floorH-.02)});B(c3[2],y,w3,'Real floor',{click:()=>setFloor(0)});
     y+=140;B(48,y,MW-96,'Done',{solid:true,col:'#2FBF5B',fs:44,click:()=>floorStep(false)});
   }else{let y=120;
-    B(c2[0],y,w2,'Massing',{on:view==='mass',click:()=>{setView('mass');drawMenu()}});B(c2[1],y,w2,'Panels',{on:view==='panels',click:()=>{if(view==='panels')return;menuMsg='Building the panels…';drawMenu();setTimeout(()=>{setView('panels');menuMsg='Panels view. Point at a joint and pull the trigger to change it. Grip a part to look closer.';drawMenu()},50)}});y+=124;
+    B(c3[0],y,w3,'Massing',{on:view==='mass',click:()=>{setView('mass');drawMenu()}});B(c3[1],y,w3,'Panels',{on:view==='panels',click:()=>{if(view==='panels')return;menuMsg='Building the panels…';drawMenu();setTimeout(()=>{setView('panels');menuMsg='Panels view. Tap a joint to change it, or pull a face or an edge to reshape.';drawMenu()},50)}});B(c3[2],y,w3,'Build',{on:view==='build',click:()=>{if(view==='build')return;menuMsg='Working out how it goes together…';drawMenu();setTimeout(()=>{freshen();setView('build');xrStepMsg();drawMenu()},50)}});y+=124;
     const jt=view==='panels'&&selEdge?selEdge.b.joints?.find(j=>j.key===selEdge.key):null,later=(f,msg)=>()=>{menuMsg='Rebuilding…';drawMenu();setTimeout(()=>{f();rebuild();save();menuMsg=typeof msg==='function'?msg():msg;drawMenu()},30)};
-    if(jt){/* a joint is picked: the same choices as the joint card on the computer */
+    if(figSel&&view!=='build'){const F=figSel,i=FIG_KEYS.indexOf(F.pose),step=d=>()=>{const k=FIG_KEYS[(Math.max(0,i)+d+FIG_KEYS.length)%FIG_KEYS.length];figSetPose(F,k);menuMsg='Pose: '+FIG_POSES[k].name+'.';drawMenu()};
+      B(c3[0],y,w3,'\u25C0  Pose',{click:step(-1)});B(c3[1],y,w3,FIG_POSES[F.pose]?.name||'Own pose',{solid:true,col:'#6C3BFF',fs:32,click:step(1)});B(c3[2],y,w3,'Pose  \u25B6',{click:step(1)});y+=124;
+      const hh=d=>()=>{F.h=Math.max(30,Math.min(80,F.h+d));const keep=F.ang,cu=F.pose==='custom';figRebuild(F);if(cu){F.ang=keep;figApply(F);figAnchor(F)}save();menuMsg=`Height ${ftIn(F.h)} (${Math.round(F.h*2.54)} cm).`;drawMenu()};
+      B(c3[0],y,w3,'Shorter',{click:hh(-2)});B(c3[1],y,w3,ftIn(F.h),{fs:38});B(c3[2],y,w3,'Taller',{click:hh(2)})}
+    else if(jt){/* a joint is picked: the same choices as the joint card on the computer */
       const b=selEdge.b,o=b.edgeOpts[jt.key]||{},[fA,fB]=jt.faces,cur=o.joint||'auto',put=(k,v,def)=>later(()=>{const c=b.edgeOpts[jt.key]||{};if(v===def)delete c[k];else c[k]=v;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},()=>{const j=b.joints?.find(x=>x.key===jt.key);return j?`${b.name} · ${j.label}: now ${j.joint==='meet'?'meet':j.joint?.startsWith?.('over')?'overlap':j.joint||'fingers'}.`:'Joint changed.'});
       B(c3[0],y,w3,'Auto',{on:cur==='auto',col:'#19B5A1',click:put('joint','auto','auto')});B(c3[1],y,w3,'Fingers',{on:cur==='fingers',col:'#19B5A1',click:put('joint','fingers','auto')});B(c3[2],y,w3,'Meet',{on:cur==='meet',col:'#19B5A1',click:put('joint','meet','auto')});y+=124;
       B(c3[0],y,w3,fA.num+' over '+fB.num,{on:cur==='over:'+fA.id,col:'#19B5A1',fs:34,click:put('joint','over:'+fA.id,'auto')});B(c3[1],y,w3,fB.num+' over '+fA.num,{on:cur==='over:'+fB.id,col:'#19B5A1',fs:34,click:put('joint','over:'+fB.id,'auto')});
       const en=o.ends||jt.ends;B(c3[2],y,w3,'Ends: '+en,{fs:32,click:put('ends',en==='proud'?'flush':'proud',null)})}
+    else if(view==='build'){const pl=AS.plan,n=pl?pl.steps.length:0,k=AS.step||0,st=pl&&pl.steps[k];
+      B(c3[0],y,w3,'\u25C0  Back',{click:()=>{AS.playing=false;$('#aPlay').textContent='Play';showStep(k-1)}});B(c3[1],y,w3,AS.playing?'Pause':'Play',{on:AS.playing,col:'#2E5BFF',click:()=>{$('#aPlay').click();drawMenu()}});
+      B(c3[2],y,w3,'Next  \u25B6',{click:()=>{AS.playing=false;$('#aPlay').textContent='Play';showStep(k+1)}});y+=124;
+      B(c3[0],y,w3,'Start over',{fs:34,click:()=>{AS.playing=false;$('#aPlay').textContent='Play';showStep(0)}});
+      if(blocks.length>1)B(c3[1],y,w3,'Box '+(AS.b?.name||'')+'  \u25B8',{fs:34,click:()=>{const i=blocks.indexOf(AS.b);select(blocks[(i+1)%blocks.length]);AS.b=sel;buildAsm(true);xrStepMsg();drawMenu()}});
+      if(pl&&pl.steps.some(x=>x.stuck))B(c3[2],y,w3,'Find a fix',{fs:34,solid:true,col:'#E5392B',click:()=>{menuMsg='Looking for a fix…';drawMenu();findBuildFix(AS.b).then(m=>{setTimeout(()=>{buildAsm(true);menuMsg=m||'';drawMenu()},400)})}})}
     else if(view==='panels'){const tb=sel||blocks[0];
       B(c3[0],y,w3,S.explode?'Explode on':'Explode',{on:!!S.explode,col:'#19B5A1',fs:34,click:()=>{$('#explodeBtn').click();drawMenu()}});B(c3[1],y,w3,S.showScrews?'Screws on':'Screws',{on:!!S.showScrews,col:'#19B5A1',fs:34,click:()=>{$('#screwBtn').click();drawMenu()}});
       const ra=()=>(tb&&tb.ribAxis)||S.ribAxis||'long';B(c3[2],y,w3,'Ribs: '+({long:'length',short:'width',vertical:'shelves'}[ra()]||'length'),{fs:30,click:later(()=>{if(tb)tb.ribAxis=ra()==='short'?'vertical':ra()==='vertical'?'long':'short'},()=>tb?`Ribs in ${tb.name} now run `+({long:'across the length',short:'across the width',vertical:'flat, like shelves'}[ra()])+'.':'')});y+=124;
@@ -3466,13 +3688,16 @@ function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.be
       B(c3[1],y,w3,S.skTilt!==false?'Wrist tilt on':'Wrist tilt off',{on:S.skTilt!==false,col:'#19B5A1',fs:32,click:()=>{S.skTilt=S.skTilt===false;menuMsg=S.skTilt?'A face you hold tilts with your wrist.':'A face you hold only moves in and out.';save();drawMenu()}});
       B(c3[2],y,w3,'Clear loose',{fs:32,click:()=>{skClearLoose();menuMsg='Loose lines removed. Solids stay.';drawMenu()}})}}y+=124;
     if(jt){const b=selEdge.b,bl=(b.edgeOpts[jt.key]||{}).blocks||'auto';B(c3[0],y,w3,'Blocks: '+bl,{fs:32,click:later(()=>{const c=b.edgeOpts[jt.key]||{},nx=bl==='auto'?'on':bl==='on'?'off':'auto';if(nx==='auto')delete c.blocks;else c.blocks=nx;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},'Corner blocks on this joint changed.')})}
-    else B(c3[0],y,w3,'Delete',{click:()=>menuDo('del')});B(c3[1],y,w3,'Undo  (B)',{click:()=>menuDo('undo')});B(c3[2],y,w3,'Redo  (Y)',{click:()=>menuDo('redo')});y+=124;
-    B(c2[0],y,w2,'Tabletop 1:12',{on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}});B(c2[1],y,w2,'Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}});y+=124;
+    else if(view==='build');else if(figSel)B(c3[0],y,w3,'Remove figure',{fs:32,col:'#E5392B',click:()=>{figRemove(figSel);save();menuMsg='Figure removed.';drawMenu()}});else B(c3[0],y,w3,'Delete',{click:()=>menuDo('del')});B(c3[1],y,w3,'Undo  (X)',{click:()=>menuDo('undo')});B(c3[2],y,w3,'Redo  (Y)',{click:()=>menuDo('redo')});y+=124;
+    B(c3[0],y,w3,'Tabletop 1:12',{fs:34,on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}});B(c3[1],y,w3,'Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}});
+    B(c3[2],y,w3,'Add figure',{col:'#6C3BFF',click:()=>{const cam=renderer.xr.getCamera(),p=new V().setFromMatrixPosition(cam.matrixWorld),f=new V(0,0,-1).transformDirection(cam.matrixWorld);f.y=0;f.normalize();
+      const at=world.worldToLocal(p.addScaledVector(f,S.xrScale==='table'?.35:1.1)),F=figNew({p:[at.x,figGroundAt(at.x,at.z),at.z],h:69,pose:'stand',ry:Math.atan2(-f.x,-f.z)*180/Math.PI});figSelect(F);save();menuMsg='Figure added in front of you, facing you. Trigger a hand or foot to pose it; grip to carry it.';drawMenu()}});y+=124;
     B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=150;
     {const c=XR.price;B(48,y-26,MW-96,c?`≈ ${money(c.cost)}  ·  ${c.sheets} sheet${c.sheets===1?'':'s'}  ·  ${hours(c.mins)} cutting`:'Price: tap to work it out',{solid:!!c,col:'#15181D',fs:c?38:34,click:()=>{menuMsg='Working out the price…';drawMenu();setTimeout(()=>{freshen();updateSheetsPanel(true);menuMsg='Price updated.';drawMenu()},50)}});y+=124}
-    MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,2)+18;
-    mWrap(view!=='panels'&&XR.tool==='push'?'Trigger the middle of a face: push or pull it. Near an edge or a corner: drag that edge or corner. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly.'
-      :view==='panels'?'Point at a joint and pull the trigger: its choices come up here (fingers, meet, which panel laps over, ends, corner blocks). Trigger on empty space lets it go. Grip a part to look closer.'
+    MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,view==='build'?4:2)+18;
+    mWrap(view==='mass'&&XR.tool==='push'?'Trigger the middle of a face: push or pull it. Near an edge or a corner: drag that edge or corner. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly.'
+      :view==='build'?'Back and Next step through how it goes together; Play runs it with the drill. Trigger a part: jump to the step it goes on. Grip: move the model.'
+      :view==='panels'?'Tap a joint with the trigger: its choices come up here (fingers, meet, which panel laps over, ends, corner blocks). Pull the trigger on a face, an edge or a corner and move your hand: reshape it, as in massing. Grip: move the model.'
       :'Hold the trigger and draw: each stroke is one straight line. Join lines at their corners; a closed flat loop is a face, and faces that close up are a solid you can build. Grip at the pen tip: move a corner, line or face. Grip a loop drawn on a face and pull: it comes out as a block.',48,y,MW-96,26,'#8B93A1',36,5)}
   menuTex.needsUpdate=true}
 function placeMenu(){const g=leftC().userData.grip;if(menu.parent!==g){menu.parent?.remove(menu);g.add(menu)}menu.position.set(0,.08,-.13);menu.rotation.set(-.35-Math.PI/2,0,0);drawMenu()}
@@ -3490,26 +3715,39 @@ function menuDo(k){if(typeof k==='number')k=['box','cut','carve','del','undo','r
   drawMenu()}
 function xrTrigger(c){const mh=menuHit(c);if(mh){if(mh.i>=0){buzz(c,.25,15);XR.W[mh.i].click?.()}return}
   if(XR.step==='floor'){setFloor(XR.floorH+gripPos(c).y-.02);buzz(c,.5,60);return}
+  if(!(XR.tool!=='push'&&view==='mass')&&xrFigTrigger(c))return;
+  if(figSel){figSelect(null)}
   /* holding a face with the grip: the trigger pulls it out as a new block */
   if(c.userData.skGrab){if(c.userData.skGrab.kind==='face')skExtrude(c,0,0);return}
   if(XR.tool!=='push'&&view==='mass'){if(XR.tool==='pen')skStrokeStart(c);else{c.userData.erasing=true;skEraseAt(c)}return}
-  if(view==='panels'){const j=xrJoint(c);
-    if(j){selEdge={b:j.b,key:j.jt.key};selPanel=null;highlightPanel();showEdge();buzz(c,.4,25);menuMsg=`${j.b.name} · ${j.jt.label}: a ${j.jt.ang}° joint, now ${j.jt.joint==='meet'?'meet':String(j.jt.joint||'fingers').startsWith('over')?'overlap':j.jt.joint||'fingers'}. Change it on the menu.`;drawMenu();return}
-    if(selEdge){selEdge=null;showEdge();menuMsg='Panels view. Point at a joint and pull the trigger to change it.';drawMenu();return}}
+  if(view==='build'){ctrlRay(c);const h=xray.intersectObjects(AS.holders.filter(x=>x.visible),true)[0];let o=h?.object;while(o&&!o.userData.part)o=o.parent;
+    if(o){AS.playing=false;$('#aPlay').textContent='Play';showStep(AS.idx[o.userData.part.idx]);buzz(c,.3,20)}return}
+  /* Panels view: a quick tap on a part picks the joint you pointed at; pulling the trigger and moving pushes that face, or moves
+     the edge or corner, exactly as in massing. The trigger never picks up the whole box here. */
+  const tap=view==='panels'?{j:xrJoint(c),at:gripPos(c),t:performance.now()}:null;
   /* what you point at decides what you grab: the middle of a face, an edge, or a corner */
   const h=xrFace(c),hd=pickHandle(h);
-  if(hd&&hd.type!=='face'){const g=startHandle(hd);if(g){c.userData.hd={g,D0:h.dist,P0:h.P.clone()};buzz(c,.3,20);menuMsg=hd.type==='edge'?'Moving an edge: both faces follow.':'Moving a corner: all its faces follow.';drawMenu();return}}
-  if(h){const d=startPush(h,xrParam(c,h.P,h.f.pl.n));if(d){c.userData.push=d;if(sel!==h.b)select(h.b);buzz(c,.2,15);return}}
+  if(hd&&hd.type!=='face'){const g=startHandle(hd);if(g){c.userData.hd={g,D0:h.dist,P0:world.worldToLocal(h.W.clone())};c.userData.tap=tap;buzz(c,.3,20);if(!tap){menuMsg=hd.type==='edge'?'Moving an edge: both faces follow.':'Moving a corner: all its faces follow.';drawMenu()}return}}
+  if(h){const d=startPush(h,xrParam(c,h.P,h.f.pl.n));if(d){c.userData.push=d;c.userData.tap=tap;if(sel!==h.b&&!tap)select(h.b);buzz(c,.2,15);return}}
+  if(tap){xrTap(tap);return}
   grab(c)}
+/* a tap in Panels view: pick the joint (its choices come up on the menu), or let go of the one picked */
+function xrTap(tap){if(tap.j){const j=tap.j;selEdge={b:j.b,key:j.jt.key};selPanel=null;highlightPanel();showEdge();menuMsg=`${j.b.name} · ${j.jt.label}: a ${j.jt.ang}° joint, now ${j.jt.joint==='meet'?'meet':String(j.jt.joint||'fingers').startsWith('over')?'overlap':j.jt.joint||'fingers'}. Change it on the menu.`}
+  else if(selEdge){selEdge=null;showEdge();menuMsg='Tap a joint to change it, or pull a face or edge to reshape.'}drawMenu()}
+/* has the hand moved far enough (or long enough) that a tap became a drag? */
+function xrDragging(c){const tp=c.userData.tap;if(!tp)return true;if(tp.live)return true;if(gripPos(c).distanceTo(tp.at)<.015)return false;tp.live=true;xrPreview(true);return true}
 /* the joint you point at in Panels view (the nearest one to where the pointer lands on a part) */
 function xrJoint(c){ctrlRay(c);const T=[];panelGroup.traverse(o=>{if(o.isMesh&&!o.userData.isStencil&&o.visible&&o.userData.pick)T.push(o)});const hit=xray.intersectObjects(T,false)[0];if(!hit)return null;
   const b=hit.object.userData.pick;if(!b||b.isObject3D||!b.joints)return null;let off=new V();for(let o=hit.object;o;o=o.parent)if(o.userData?.clip){off=o.userData.clip.off;break}
   const P=world.worldToLocal(hit.point.clone()).sub(off);let best=null;for(const jt of b.joints){const ab=jt.b.clone().sub(jt.a),tt=THREE.MathUtils.clamp(P.clone().sub(jt.a).dot(ab)/ab.lengthSq(),0,1),d=P.distanceTo(jt.a.clone().addScaledVector(ab,tt));if(!best||d<best.d)best={d,jt,b}}
   return best&&best.d<Math.max(3.5*b.tModel,2.5)?best:null}
-function xrTriggerEnd(c){if(c.userData.stroke){skStrokeEnd(c);return}if(c.userData.erasing){c.userData.erasing=false;skEraseEnd();skDraw();return}
-  if(c.userData.hd){const g=c.userData.hd.g;c.userData.hd=null;endHandle(g);drawMenu();return}
-  const d=c.userData.push;if(d){c.userData.push=null;showFace(null);if(d.moved){renderModelPanel();schedule();save()}return}release(c)}
+function xrTriggerEnd(c){if(xrFigEnd(c))return;if(c.userData.stroke){skStrokeEnd(c);return}if(c.userData.erasing){c.userData.erasing=false;skEraseEnd();skDraw();return}
+  const tp=c.userData.tap;c.userData.tap=null;if(tp&&tp.live)xrPreview(false);
+  if(c.userData.hd){const g=c.userData.hd.g;c.userData.hd=null;if(tp&&!tp.live){restoreBlock(g.b,g.snap);showHandle(null);updateMass(g.b);xrTap(tp);return}endHandle(g);if(tp)menuMsg=g.moved?'Reshaped. The parts are worked out again.':menuMsg;drawMenu();return}
+  const d=c.userData.push;if(d){c.userData.push=null;showFace(null);if(tp&&!tp.live){xrTap(tp);return}if(d.moved){renderModelPanel();schedule();save()}return}release(c)}
 function grab(c){if(XR.step==='floor')return;
+  if(!(XR.tool!=='push'&&view==='mass')&&xrFigGrab(c))return;
+  if(view==='panels'||view==='build'){c.userData.nav=true;buzz(c,.15,15);return}
   if(XR.tool!=='push'&&view==='mass'&&!c.userData.stroke){const h=skPick(skTip(c).toArray(),.035*skK());if(h){skGrabStart(c,h);return}}
   ctrlRay(c);
   const targets=[];blocks.forEach(b=>{b.cuts.forEach(cu=>{if(cu.visible)targets.push(cu.userData.vis)});b.carves.forEach(cv=>{if(cv.visible)targets.push(cv.userData.vis)})});
@@ -3518,7 +3756,7 @@ function grab(c){if(XR.step==='floor')return;
   if(pk?.isObject3D&&pk.userData.isCut){obj=pk;b=pk.userData.block}else{b=pk;obj=b?.pivot}
   if(!b){c.userData.nav=true;buzz(c,.15,15);return}
   select(b,obj===b.pivot?null:obj);c.userData.grab={obj,parent:obj.parent,b};c.attach(obj);buzz(c,.3,20);drawMenu()}
-function release(c){if(c.userData.skGrab){skGrabEnd(c);return}if(c.userData.nav){c.userData.nav=false;return}const g=c.userData.grab;if(!g)return;g.parent.attach(g.obj);c.userData.grab=null;updateMass(g.b);schedule();save()}
+function release(c){if(xrFigRelease(c))return;if(c.userData.skGrab){skGrabEnd(c);return}if(c.userData.nav){c.userData.nav=false;return}const g=c.userData.grab;if(!g)return;g.parent.attach(g.obj);c.userData.grab=null;updateMass(g.b);schedule();save()}
 /* moving the whole model: one grip drags it, both grips turn and scale it about the middle of your hands */
 function navTick(dt){const ns=ctrls.filter(c=>c.userData.nav),n=Math.min(2,ns.length);
   if(n!==XR.navN){if(XR.navN===2)skDraw();XR.navN=n;XR.nav={pos:world.position.clone(),q:world.quaternion.clone(),s:world.scale.x,a:ns[0]&&gripPos(ns[0]),b:ns[1]&&gripPos(ns[1])};}
@@ -3533,15 +3771,17 @@ function navTick(dt){const ns=ctrls.filter(c=>c.userData.nav),n=Math.min(2,ns.le
 let xrT0=0;
 function xrTick(){const now=performance.now(),dt=Math.min(.05,(now-(xrT0||now))/1000);xrT0=now;
   const L=leftC(),R=rightC();
-  if(edgeB(L,4)){menu.visible=!menu.visible;buzz(L,.2,15)}if(edgeB(L,5)&&R!==L){menuDo('redo');buzz(L,.3,20)}
-  if(R&&R!==L){if(edgeB(R,4)){if(!skDeleteHeld()&&!XR.step)skTool(XR.tool==='push'?'pen':XR.tool==='pen'?'erase':'push');buzz(R,.4,20)}if(edgeB(R,5)){menuDo('undo');buzz(R,.3,20)}}
+  if(R!==L){if(edgeB(L,4)){menuDo('undo');buzz(L,.3,20)}if(edgeB(L,5)){menuDo('redo');buzz(L,.3,20)}}
+  if(R&&R!==L){if(edgeB(R,4)){if(!skDeleteHeld()&&!XR.step&&view==='mass')skTool(XR.tool==='push'?'pen':XR.tool==='pen'?'erase':'push');buzz(R,.4,20)}if(edgeB(R,5)){menu.visible=!menu.visible;buzz(R,.2,15)}}
   navTick(dt);let hov=-1,skHov=null;const pen=XR.tool!=='push'&&!XR.step&&view==='mass';
   for(const c of ctrls){const U=c.userData;U.line.visible=!(menu.visible&&menu.parent===U.grip);U.dot.visible=false;U.line.scale.z=4;
     U.tip.visible=pen;U.tip.material.color.set(XR.tool==='erase'?0xFF2D95:0x15181D);xrDecorate(c);
+    if(U.figIK){xrFigTick(c);continue}if(U.figGrab)continue;
     if(U.skGrab){U.line.visible=false;skGrabMove(c);continue}
     if(U.stroke){U.line.visible=false;skStrokeMove(c);const h=skPick(skTip(c).toArray(),skSnapR());if(h&&h.kind==='vert')skHov=h;continue}
     if(U.erasing){U.line.visible=false;skEraseAt(c);continue}
     if(U.grab){updateMass(U.grab.b);schedule();continue}
+    if((U.hd||U.push)&&!xrDragging(c))continue;
     if(U.hd){ctrlRay(c);const Q=world.worldToLocal(xray.ray.origin.clone().addScaledVector(xray.ray.direction,U.hd.D0)),m=dragHandle(U.hd.g,Q.sub(U.hd.P0));if(m&&m!==menuMsg){menuMsg=m;drawMenu()}continue}
     const d=U.push;if(d){const t=xrParam(c,d.P,d.n);if(t!=null&&d.t0!=null){const m=pushTo(d,t-d.t0);if(m&&m!==menuMsg){menuMsg=m;drawMenu()}}continue}
     if(!U.line.visible)continue;
@@ -3556,12 +3796,12 @@ function xrTick(){const now=performance.now(),dt=Math.min(.05,(now-(xrT0||now))/
 function placeWorld(){setTimeout(updateSection,0);setTimeout(skDraw,0);world.quaternion.identity();if(S.xrScale==='table'){world.scale.setScalar(.0254/12);world.position.set(0,.8,-.6)}else{world.scale.setScalar(.0254);world.position.set(0,0,-1.6)}}
 async function enterXR(kind){
   try{const sess=await navigator.xr.requestSession(kind==='ar'?'immersive-ar':'immersive-vr',{optionalFeatures:['local-floor','bounded-floor','hand-tracking']});
-    xrMode=kind;tc.detach();if(view!=='mass'&&view!=='panels')setView('mass');placeWorld();applyTheme();menu.visible=true;placeMenu();
+    xrMode=kind;tc.detach();if(view!=='mass'&&view!=='panels'&&view!=='build')setView('mass');placeWorld();applyTheme();menu.visible=true;placeMenu();if(view==='panels')buildMeshes();
     /* in the headset distances are real metres: let things come right up to your eyes without being cut away */
     camera.near=.02;camera.far=400;camera.updateProjectionMatrix();skDraw();
     sess.addEventListener('end',()=>{ctrls.forEach(c=>{if(c.userData.stroke){c.userData.stroke=null;skLive([])}c.userData.erasing=false;release(c);c.userData.nav=false;c.userData.push=null;c.userData.hd=null;c.userData.dot.visible=false;c.userData.tip.visible=false});
       camera.near=1;camera.far=5000;camera.updateProjectionMatrix();skMarkV.clear();skMarkE.clear();setTimeout(skDraw,0);XR.base=null;XR.step=null;floorGrid.visible=false;menu.visible=false;showFace(null);xrMode=null;
-      world.scale.setScalar(1);world.position.set(0,0,0);world.quaternion.identity();applyTheme();updateSection();attachGizmo();resize()});
+      world.scale.setScalar(1);world.position.set(0,0,0);world.quaternion.identity();applyTheme();updateSection();attachGizmo();resize();xrPreview(false);if(view==='panels')buildMeshes()});
     await renderer.xr.setSession(sess);try{renderer.xr.setFoveation?.(1)}catch(e){}XR.base=renderer.xr.getReferenceSpace();setFloor(XR.floorH);floorStep(true);
   }catch(e){xrMode=null;toast('The headset session could not start')}}
 $('#vrBtn').onclick=()=>enterXR('vr');$('#arBtn').onclick=()=>enterXR('ar');
