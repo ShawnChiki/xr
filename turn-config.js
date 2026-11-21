@@ -14,14 +14,10 @@
     {
       urls: [
         'turn:free.expressturn.com:3478?transport=udp',
-        'turn:free.expressturn.com:3478?transport=tcp',
-        // ExpressTURN's documented relay name, plus TLS on port 443 for networks that block 3478
-        'turn:relay1.expressturn.com:3478?transport=udp',
-        'turn:relay1.expressturn.com:3478?transport=tcp',
-        'turns:relay1.expressturn.com:443?transport=tcp'
+        'turn:free.expressturn.com:3478?transport=tcp'
       ],
       username: '000000002110650914',
-      credential: 'zhSRZXeX9cnDrM9k7BQlcpLGT1I='
+      credential: 'zhSRZXeX9cnDrM9k7BQIcpLGT1I='   // capital I after BQ (checked against the dashboard's secret key)
     }
   ];
 
