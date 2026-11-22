@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '514';
+const VERSION = '516';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -106,7 +106,8 @@ const SKIES = {
   custom: {name:'Mine'},
 };
 const SHAPES = {cube:[1,1,1], brick:[1,0.5,0.5], plank:[2,0.125,0.5], pillar:[0.5,2,0.5]};
-const PART_NAMES = {head:'Head', lh:'Left hand', rh:'Right hand', body:'Body', eye:'Eye', mouth:'Mouth', extra:'Extra'};
+const PART_NAMES = {head:'Head', lh:'Left hand', rh:'Right hand', body:'Body', eye:'Eye', mouth:'Mouth', hair:'Hair', extra:'Extra'};
+const RIDERS = ['eye','mouth','hair','extra'];   // parts that sit on the head and go wherever it goes
 /* ============================================================
    PLAY TOGETHER: a room with a 4-digit code (PeerJS, like the other Chiki XR apps)
    The host runs every menu. Players sculpt, doodle and build with their own color and size,
@@ -120,6 +121,7 @@ const NET_PREFIX = 'chiki-moviemagic-', MAX_GUESTS = 3, PLAYER_COL = ['#ff2d95',
 const netTag = Math.random().toString(36).slice(2,6);
 let netMute = 0, netInOp = 0, uidSeq = 0, netChain = Promise.resolve(), netRecvChain = Promise.resolve();
 let netOps = [], netMetaSig = '', netMetaT = 0, netTickT = 0, netStT = 0, netPoseT = 0, netPoseFullT = 0, netMeT = 0, guestRec = null;
+const netGrabs = new Map();   // host: things partners are holding from outside, by key (r = puppet, L = set piece, T = eye target)
 const netSettle = new Map(), netVox = new Map(), netStTouch = new Map(), netStDrop = new Map(), netStFull = new Set(), netHash = new Map(), netPose = new Map(), netLastPose = new Map(), netRemote = new Map();
 const netQuiet = () => !NET.on || netMute > 0;
 const playerName = n => n===1 ? 'Host' : 'Player '+n;
@@ -314,6 +316,9 @@ function netPoses(){
     for (const L of layers) put('L'+L.id, L.group);
     for (const c of show.chars) put('r'+c.id, c.root);
     if (Object.keys(k).length) netSend({t:'pose', k, st:show.t});
+  } else if (show.grab && !show.embodied){   // holding a puppet from outside: the host moves it (and records it)
+    if (now - netPoseT < 50) return; netPoseT = now;
+    netSend({t:'pose', g:1, k:{[grabKey(show.grab)]: poseArr(grabObj(show.grab))}});
   } else if (show.embodied){
     if (now - netPoseT < 50) return; netPoseT = now;
     const c = show.embodied.c, k = {};
@@ -330,17 +335,40 @@ function netApplyPoses(){
   if (NET.guest){
     const own = show.embodied ? show.embodied.c.id : -1;
     for (const [key, a] of netPose){
-      if (key[0]==='L'){ const L = layerById(+key.slice(1)); if (L && L.char !== own) setPoseArr(L.group, a); }
-      else { const c = charById(+key.slice(1)); if (c && !(embGrab.left && embGrab.left.c===c) && !(embGrab.right && embGrab.right.c===c)) setPoseArr(c.root, a); }
+      if (key[0]==='L'){ const L = layerById(+key.slice(1)); if (L && L.char !== own && !(show.grab && show.grab.L===L)) setPoseArr(L.group, a); }
+      else { const c = charById(+key.slice(1)); if (c && !(embGrab.left && embGrab.left.c===c) && !(embGrab.right && embGrab.right.c===c) && !(show.grab && show.grab.c===c)) setPoseArr(c.root, a); }
     }
   } else if (NET.host){
     for (const [cid, r] of netRemote){ const c = charById(cid); if (!c || NET.assign.get(cid) !== r.peer) continue;
       for (const key in r.k){ if (key[0]==='r'){ const pc = charById(+key.slice(1)); if (pc && pc.type==='prop') setPoseArr(pc.root, r.k[key]); continue; } const L = layerById(+key.slice(1)); if (L && L.char===cid) setPoseArr(L.group, r.k[key]); }
       if (r.f){ c.look.position.set(r.f[0], r.f[1], r.f[3] || 0); c.mouthO.position.x = r.f[2]; } }
+    const now = performance.now();
+    for (const [key, g] of [...netGrabs]){ const o = netKeyObj(key); if (!o || !NET.peers.has(g.peer) || now - g.at > 1500){ netGrabEnd(key); continue; } setPoseArr(o, g.a); o.updateMatrixWorld(true); }
   }
+}
+const grabKey = gr => gr.T ? 'T'+gr.T.id : gr.c ? 'r'+gr.c.id : 'L'+gr.L.id;
+const trackKeyOf = key => key[0]==='r' ? key : key[0]==='T' ? 't'+key.slice(1) : key.slice(1);
+function netKeyObj(key){ const id = +key.slice(1);
+  if (key[0]==='L'){ const L = layerById(id); return L && !L.char ? L.group : null; }
+  const c = charById(id); return !c ? null : key[0]==='T' ? c.lookT : c.root; }
+function netGrabMove(key, a, from){
+  const o = netKeyObj(key); if (!o) return;
+  const id = +key.slice(1), held = show.grab && grabKey(show.grab) === key;
+  if (held || (key[0]==='r' && (NET.assign.has(id) || (show.embodied && show.embodied.c.id === id)))) return;   // someone already has it
+  let g = netGrabs.get(key); if (g && g.peer !== from) return;
+  if (!g){ g = {peer:from, before:snapShow(), walk: !!show.tracks[trackKeyOf(key)] && !show.rec}; netGrabs.set(key, g); if (key[0]==='r') state.selChar = id; }
+  g.a = a; g.at = performance.now();
+}
+function netGrabEnd(key, a){
+  const g = netGrabs.get(key); if (!g) return; netGrabs.delete(key); const o = netKeyObj(key); if (!o) return;
+  if (a) setPoseArr(o, a); o.updateMatrixWorld(true); const id = +key.slice(1), c = key[0]==='L' ? null : charById(id), L = key[0]==='L' ? layerById(id) : null;
+  if (g.walk){ shiftWalk(trackKeyOf(key), o); if (key[0]==='r') c.place = poseOfObj(c.root); applyShowPose(show.t || 0); }
+  else if (!show.rec){ if (key[0]==='r') c.place = poseOfObj(c.root); else if (key[0]==='T') c.lookRest = poseOfObj(c.lookT); else if (L) L.rest = poseOfObj(L.group); }
+  pushUndo({type:'show', snap:g.before}); sceneDirty = true; requestUI();
 }
 function netControlled(set){   // the host leaves puppets that players are in alone, and records them
   if (!NET.host) return;
+  for (const key of netGrabs.keys()) set.add(trackKeyOf(key));   // and anything a partner holds from outside
   for (const [cid] of NET.assign){ const c = charById(cid); if (!c) continue; for (const L of partsOf(c)) set.add(String(L.id)); set.add('e'+cid); set.add('m'+cid); const rr2 = netRemote.get(cid); if (rr2) for (const key in rr2.k) if (key[0]==='r') set.add(key); }
 }
 
@@ -365,8 +393,10 @@ async function onNet(m, from){
     case 'sl': applySl(m); if (NET.host) netSend(m); return;
     case 'pose':
       if (NET.guest){ for (const key in m.k) netPose.set(key, m.k[key]); }
+      else if (m.g){ for (const key in m.k) netGrabMove(key, m.k[key], from); }
       else if (m.c != null && NET.assign.get(m.c) === from) netRemote.set(m.c, {peer:from, k:m.k, f:m.f});
       return;
+    case 'gend': if (NET.host){ const g = netGrabs.get(m.k); if (g && g.peer === from) netGrabEnd(m.k, m.a); } return;
     case 'me': {
       const id = NET.host ? from : m.from; if (NET.host) netSend({...m, from});
       if (!NET.host && m.from==='host' && m.rig) NET.hostRig = m.rig;
@@ -889,8 +919,11 @@ function applyStage(){
   const gc = selChar(); guides.visible = st && state.showGuides && !!gc && gc.type==='puppet' && !!gc.guide;
   if (guides.visible){ guideHead.position.fromArray(gc.guide.head); guideHands[0].position.fromArray(gc.guide.lh); guideHands[1].position.fromArray(gc.guide.rh);
     guideHands[0].quaternion.copy(gc.guide.lhQ ? new THREE.Quaternion().fromArray(gc.guide.lhQ) : GUIDE_Q); guideHands[1].quaternion.copy(gc.guide.rhQ ? new THREE.Quaternion().fromArray(gc.guide.rhQ) : GUIDE_Q);
-    const pv = k => partLayer(gc,k)?.visible !== false; guideHead.visible = pv('head'); guideHands[0].visible = pv('lh'); guideHands[1].visible = pv('rh'); }
+    const pv = k => partLayer(gc,k)?.visible !== false; guideHead.visible = pv('head'); guideHands[0].visible = pv('lh'); guideHands[1].visible = pv('rh'); sizeGuides(gc); }
 }
+// stepping in sizes you so your eyes meet its eyes, which also sizes your controllers: draw the guides at that same size
+function guideScale(c){ const gHead = c && c.guide ? c.guide.head[1] : 1.5, eyeY = renderer.xr.isPresenting ? Math.max(0.6, camera.position.y) : 1.6; return clamp(gHead/eyeY, 0.2, 5); }
+function sizeGuides(c){ const k = guideScale(c); for (const o of [guideHead, ...guideHands]) o.scale.setScalar(k); }
 
 /* ---------------- layers & chunks ---------------- */
 let layers = []; let layerSeq = 1;
@@ -2254,6 +2287,26 @@ function applyShowPose(t){
     if (ctl.has('r'+c.id)) continue;
     poseFromTrack(c.root, 'r'+c.id, t, c.place);
   }
+  if (!st) for (const c of show.chars) followHead(c, ctl);
+}
+// whatever you add to a puppet after recording sticks to it: eyes, mouth, hair and extras go wherever the head went,
+// and a body with no moves of its own hangs under the head and turns with it
+function restM(L){ const r = L.rest || ZERO_POSE; return new THREE.Matrix4().compose(_fh.p.fromArray(r.p), _fh.q.fromArray(r.q), _fh.s.setScalar(r.s)); }
+const _fh = {p:new THREE.Vector3(), q:new THREE.Quaternion(), s:new THREE.Vector3()};
+function hasMoves(key){ const tr = show.tracks[key]; if (tr && tr.samples && tr.samples.length) return true; const rk = show.rec && show.rec.phase==='rec' ? show.rec.keys.get(key) : null; return !!(rk && rk.length >= 9); }
+function followHead(c, ctl){
+  const H = partLayer(c,'head'); if (!H) return; const hk = String(H.id);
+  if (ctl.has(hk) || !hasMoves(hk)) return;   // someone is in it right now (everything rides along live), or the head never moved
+  const Hm = new THREE.Matrix4().compose(H.group.position, H.group.quaternion, H.group.scale), D = Hm.clone().multiply(restM(H).invert());
+  for (const L of partsOf(c)){ if (L === H || ctl.has(String(L.id))) continue;
+    if (RIDERS.includes(L.part)) D.clone().multiply(restM(L)).decompose(L.group.position, L.group.quaternion, L.group.scale);
+    else if (L.part === 'body' && !hasMoves(String(L.id))){
+      const ctr = partCenter(H) || new THREE.Vector3(), hR = ctr.clone().applyMatrix4(restM(H)), hC = ctr.clone().applyMatrix4(Hm);
+      const dq = new THREE.Quaternion(); D.decompose(_fh.p, dq, _fh.s); const f = new THREE.Vector3(0,0,1).applyQuaternion(dq); f.y = 0;
+      const yaw = f.lengthSq() > 1e-6 ? Math.atan2(f.x, f.z) : 0;
+      new THREE.Matrix4().makeTranslation(hC.x, hC.y, hC.z).multiply(new THREE.Matrix4().makeRotationY(yaw)).multiply(new THREE.Matrix4().makeTranslation(-hR.x, -hR.y, -hR.z)).multiply(restM(L))
+        .decompose(L.group.position, L.group.quaternion, L.group.scale);
+    } }
 }
 // where a character's look target sits when nothing is recorded: set by grabbing it, or in front of its face
 function lookRestOf(c){
@@ -2395,7 +2448,7 @@ function wobbleRestore(){ for (const [L, p, q, sc] of wobUndo){ L.group.position
 function wobbleApply(dt, wob = wobMain){
   if (state.wobble === false || !(dt > 0)) return;
   for (const c of show.chars){ if (!c.placed || !c.root.visible) continue;
-    const xs = partsOf(c).filter(L => L.part === 'extra' && L.group.visible); if (!xs.length) continue;
+    const xs = partsOf(c).filter(L => (L.part === 'extra' || L.part === 'hair') && L.group.visible); if (!xs.length) continue;
     c.root.updateMatrixWorld(true); const H = partLayer(c, 'head'), hc = H && partCenter(H);
     for (const L of xs){ const bx = partBox(L); if (!bx) continue; L.group.updateMatrixWorld(true);
       const inv = L.group.matrixWorld.clone().invert();
@@ -2534,7 +2587,7 @@ function stepIn(c){
     }
     const BD = partLayer(c,'body');   // the body hangs under your head and turns with you, but doesn't tilt
     if (BD){ updateBodyFollow(true); parts.push({L:BD, body:true, tracker:bodyFollow, off: idealInv(headW).multiply(BD.group.matrixWorld.clone())}); }
-    for (const P2 of partsOf(c)) if (['eye','mouth','extra'].includes(P2.part)) parts.push({L:P2, tracker:camera, off: idealInv(headW).multiply(P2.group.matrixWorld.clone())});   // they ride on your head
+    for (const P2 of partsOf(c)) if (RIDERS.includes(P2.part)) parts.push({L:P2, tracker:camera, off: idealInv(headW).multiply(P2.group.matrixWorld.clone())});   // they ride on your head
     c.look.position.set(0,0,0);
   } else {
     if (H){ const hc = layerCenter(H), cw = V(); camera.getWorldPosition(cw); rig.position.add(hc.sub(cw)); rig.updateMatrixWorld(true); }
@@ -2720,6 +2773,7 @@ function shiftWalk(key, obj){
 }
 function endCharGrab(){
   const g0 = show.grab; if (!g0) return; show.grab = null;
+  if (NET.guest){ netSend({t:'gend', k:grabKey(g0), a:poseArr(grabObj(g0))}); return; }   // the host owns the show: it keeps the move
   if (g0.T){ if (g0.walk) shiftWalk('t'+g0.T.id, g0.T.lookT); else if (!show.rec) g0.T.lookRest = poseOfObj(g0.T.lookT); pushUndo({type:'show', snap:g0.before}); sceneDirty = true; return; }
   if (g0.walk){ shiftWalk(g0.c ? 'r'+g0.c.id : String(g0.L.id), grabObj(g0)); if (g0.c) g0.c.place = poseOfObj(g0.c.root); pushUndo({type:'show', snap:g0.before}); sceneDirty = true; applyShowPose(show.t || 0); toast('Moved '+(g0.c ? g0.c.name : g0.L.name)+' with its whole recorded walk'); requestUI(); return; }
   if (!show.rec){ if (g0.c) g0.c.place = poseOfObj(g0.c.root); else g0.L.rest = poseOfObj(g0.L.group); pushUndo({type:'show', snap:g0.before}); sceneDirty = true; }
@@ -5009,9 +5063,11 @@ function drawChars(X,W){
     y += 52;
     button(X,y,W,40,'1:1 size: your eyes at its eye height', state.oneToOne === c.id && Math.abs(rig.scale.x - (state.oneToOneS||0)) < 0.01*rig.scale.x, ()=>oneToOne(c), '#ffd400');
     y += 48;
-    button(X,y,t3,40,'+ Eye',false,()=>{ const E = addPart(c,'eye',0.00625); state.activePart = E.id; toast('New eye: sculpt it on the face, or use Copy eye'); requestUI(); },'#00c7be');
-    button(X+t3+8,y,t3,40,'+ Mouth',false,()=>{ const M2 = addPart(c,'mouth',0.00625); state.activePart = M2.id; toast('Sculpt a mouth. It opens with your voice when you step in.'); requestUI(); },'#00c7be');
-    button(X+2*(t3+8),y,t3,40,'Copy eye ↔',false,()=>{ if (aL && aL.part==='eye') copyEye(aL); else toast('Pick an eye first'); },'#1e6bff');
+    const t4 = (W-24)/4;
+    button(X,y,t4,40,'+ Eye',false,()=>{ const E = addPart(c,'eye',0.00625); state.activePart = E.id; toast('New eye: sculpt it on the face, or use Copy eye'); requestUI(); },'#00c7be');
+    button(X+t4+8,y,t4,40,'+ Mouth',false,()=>{ const M2 = addPart(c,'mouth',0.00625); state.activePart = M2.id; toast('Sculpt a mouth. It opens with your voice when you step in.'); requestUI(); },'#00c7be');
+    button(X+2*(t4+8),y,t4,40,'+ Hair',false,()=>{ const H2 = addPart(c,'hair',0.00625); state.activePart = H2.id; toast('Sculpt hair on the head. It sways a little and goes wherever the head goes.'); requestUI(); },'#00c7be');
+    button(X+3*(t4+8),y,t4,40,'Copy eye',false,()=>{ if (aL && aL.part==='eye') copyEye(aL); else toast('Pick an eye first'); },'#1e6bff');
     y += 48;
     button(X,y,hw,40,'Mirror R hand → L',false,()=>mirrorHand('rh'),'#5e2bff');
     button(X+hw+8,y,hw,40,'Mirror L hand → R',false,()=>mirrorHand('lh'),'#5e2bff');
@@ -7655,6 +7711,10 @@ function drawPartsDiagram(c, X, y, W, h){
   }
   // head, then eyes and mouth on top of it
   shape(H, ()=>g.arc(cx, hy, R, 0, 7)); hit(cx-R, hy-R, R*2, R*2, ()=>pick(H, ()=>addPart(c,'head',0.0125)));
+  { const HR = parts.find(L=>L.part==='hair'); g.beginPath(); g.arc(cx, hy, R*1.16, 1.18*Math.PI, 1.82*Math.PI); g.lineWidth = 9; g.lineCap = 'round';
+    g.strokeStyle = HR ? (sel(HR) ? '#ffd400' : '#ff9500') : 'rgba(255,255,255,0.22)'; if (!HR) g.setLineDash([5,6]); g.stroke(); g.setLineDash([]); g.lineCap = 'butt';
+    if (!HR) txt('+ hair', cx, hy-R*1.32, 10, '#6b73a6','center',800);
+    hit(cx-R*0.95, hy-R*1.45, R*1.9, R*0.42, ()=>pick(HR, ()=>{ const N = addPart(c,'hair',0.00625); toast('New hair: sculpt it on the head'); return N; })); }
   if (!H) label(H, 'Head', cx, hy+R*0.55);
   const eyes = parts.filter(L=>L.part==='eye').sort((a,b)=>(a.rest.p[0]+(partCenter(a)?.x||0)) - (b.rest.p[0]+(partCenter(b)?.x||0)));
   const ne = eyes.length + 1, er = Math.max(8, Math.min(13, R*0.22)), span = Math.min(R*1.3, (ne-1)*er*2.6);
@@ -7668,7 +7728,7 @@ function drawPartsDiagram(c, X, y, W, h){
   if (!M) txt('+ mouth', cx, my, 10, '#6b73a6','center',800);
   hit(cx-mw/2, my-12, mw, 24, ()=>pick(M, ()=>{ const N = addPart(c,'mouth',0.00625); toast('New mouth: sculpt it on the face. It opens when you talk.'); return N; }));
   // anything extra
-  const ex = parts.filter(L=>!['head','body','lh','rh','eye','mouth'].includes(L.part));
+  const ex = parts.filter(L=>!['head','body','lh','rh','eye','mouth','hair'].includes(L.part));
   if (ex.length){ const ew = Math.min(90, (W-8*(ex.length-1))/ex.length);
     ex.slice(0,4).forEach((L,i)=>{ const x = X+i*(ew+8), yy = y+h-26; shape(L, ()=>g.roundRect(x, yy, ew, 24, 8)); label(L, (L.name.split(' ').pop()||'Extra').slice(0,9), x+ew/2, yy+12); hit(x, yy, ew, 24, ()=>pick(L)); }); }
 }
@@ -8006,7 +8066,7 @@ function setAspect(a){
 }
 let previewFlip = false, lastUIDraw = 0;
 renderer.setAnimationLoop(() => {
-  wobbleRestore(); for (const o of thirdsOn) o.visible = !!state.thirds;
+  wobbleRestore(); for (const o of thirdsOn) o.visible = !!state.thirds; if (guides.visible) sizeGuides(selChar());
   for (let i=0;i<xrRays.length;i++) if (xrRays[i].userData.bare){ xrRays[i].visible = false; xrGrips[i].visible = false; }   // a bare hand stands in for a resting controller: keep its pose off everything
   if (handNoticeT && !xrRays.some(r => r.userData.bare)) handNoticeT = 0;
   const raw = clock.getDelta();
@@ -8119,7 +8179,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
