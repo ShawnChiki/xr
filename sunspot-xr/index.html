@@ -21,7 +21,7 @@
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bungee&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Bungee&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
 html,body{margin:0;height:100%;background:#06020a;overflow:hidden;color:#fff;font-family:Helvetica,Arial,sans-serif;font-weight:800;touch-action:none;overscroll-behavior:none}
@@ -75,12 +75,13 @@ const AF2 = '-apple-system, "SF Pro Display", "Helvetica Neue", Helvetica, Arial
 
 /* ================= settings ================= */
 const DEF = {sens:.55, maxLen:.25, bpm:92, div:4, pattern:'up', notes:4, gate:.6, tone:0, snap:false, key:9, scale:'minPent',
-  mix:0, wave:'glass', oct:0, cutoff:.55, echo:0, verb:0, vol:.85, twist:false, labels:true, layout:'sound',
-  reach:.05, blend:true, handMode:'pinch', fcycle:1, hold:false, pathDir:'fwd', pathMute:false, tab:'voice', menu:true};
+  mix:0, wave:'glass', oct:0, cutoff:.55, echo:0, verb:0, vol:.85, twist:false, labels:true, layout:'pitch',
+  reach:.05, blend:true, handMode:'pinch', fcycle:1, fTogether:false, fTiming:'fill', tips:false, menuShape:'wide', erase:false, pathTiming:'drawn', hold:false, pathDir:'fwd', pathMute:false, tab:'voice', menu:true};
 const S = Object.assign({}, DEF);
 try { Object.assign(S, JSON.parse(localStorage.getItem('sunspot-xr-settings') || '{}')); } catch (e) {}
-if (S.layout !== 'sound' && S.layout !== 'grid') S.layout = 'sound';
-S.hold = false; if (!['pinch', 'fingers', 'pluck', 'path'].includes(S.handMode)) S.handMode = 'pinch';
+if (S.modeVer !== 2) { if (S.handMode === 'pluck') S.handMode = 'perc'; S.tips = false; S.menuShape = 'wide'; S.layout = 'pitch'; S.modeVer = 2; }
+if (!['pitch', 'sound', 'grid'].includes(S.layout)) S.layout = 'pitch';
+S.hold = false; S.erase = false; if (!['pinch', 'sphere', 'fingers', 'pluck', 'perc', 'path'].includes(S.handMode)) S.handMode = 'pinch';
 const saveSettings = () => { try { localStorage.setItem('sunspot-xr-settings', JSON.stringify(S)); } catch (e) {} };
 
 /* ================= audio graph ================= */
@@ -139,7 +140,7 @@ function runAnalysis(autoKey) {
   place3D();
   paths.forEach(computeSeq);
   panelDirty = true;
-  if (!dots.length) toast("Didn't hear much. Try again closer to the mic.");
+  if (!dots.length) toast("Didn't hear much. Try again closer to the mic.", true);
 }
 function analyze(x, sr) {
   const hop = Math.max(64, Math.round(sr * .005)), win = hop * 4;
@@ -289,16 +290,20 @@ let simJob = null;
 function simFeatures() {
   const n = dots.length;
   const raw = dots.map(d => [d.pm, d.spec.centroid, d.spec.flat, d.zcr * 50, 20 * Math.log10(d.rms + 1e-6), Math.log(d.len), d.pitched ? d.conf : 0, ...d.spec.cep]);
-  const W = [2.2, 1.3, 1.2, .8, .6, .5, 1, .8, .8, .7, .7, .6, .6, .5, .5];
+  const W = [S.layout === 'pitch' ? 0 : 2.2, 1.3, 1.2, .8, .6, .5, 1, .8, .8, .7, .7, .6, .6, .5, .5];
   const m = raw[0].length, mu = new Array(m).fill(0), sdv = new Array(m).fill(0);
   raw.forEach(r => r.forEach((v, k) => mu[k] += v / n)); raw.forEach(r => r.forEach((v, k) => sdv[k] += (v - mu[k]) ** 2 / n));
   return raw.map(r => r.map((v, k) => (v - mu[k]) / (Math.sqrt(sdv[k]) || 1) * W[k]));
 }
 function fitBox(Y) {
   const n = Y.length, c = [0, 0, 0]; Y.forEach(y => { for (let k = 0; k < 3; k++) c[k] += y[k] / n; });
-  const pts = Y.map(y => new V3(y[0] - c[0], y[1] - c[1], y[2] - c[2]));
+  let pts = Y.map(y => new V3(y[0] - c[0], y[1] - c[1], y[2] - c[2]));
+  if (S.layout === 'pitch') {   // up = pitch only; the two strongest sound directions spread left/right and front/back
+    const P2 = pca3(pts.map(p => [p.x, p.y, p.z]));
+    pts = P2.map((q, i) => new V3(q[0], (dots[i].v - .5), q[1]));
+  }
   const regress = vals => { const mv = vals.reduce((a, b) => a + b, 0) / n, w = new V3(); pts.forEach((p, i) => w.addScaledVector(p, vals[i] - mv)); return w.lengthSq() > 1e-12 ? w.normalize() : null; };
-  const up = regress(dots.map(d => d.pm));
+  const up = S.layout === 'pitch' ? null : regress(dots.map(d => d.pm));
   if (up) { const q = new THREE.Quaternion().setFromUnitVectors(up, new V3(0, 1, 0)); pts.forEach(p => p.applyQuaternion(q)); }
   const br = regress(dots.map(d => d.spec.centroid));
   if (br) { br.y = 0; if (br.lengthSq() > 1e-8) { const q = new THREE.Quaternion().setFromAxisAngle(new V3(0, 1, 0), Math.atan2(br.z, br.x)); pts.forEach(p => p.applyQuaternion(q)); } }
@@ -321,7 +326,7 @@ function similarityPositions() {
 }
 function runSimJob() {
   if (!simJob) return;
-  if (simJob.dots !== dots || S.layout !== 'sound') { simJob = null; return; }
+  if (simJob.dots !== dots || S.layout === 'grid') { simJob = null; return; }
   const t0 = performance.now();
   while (performance.now() - t0 < 7) {
     const r = simJob.gen.next();
@@ -408,9 +413,9 @@ function blendOf(pos) {
   near.forEach(([, d], i) => { col.g += d.col.g * ws[i]; col.b += d.col.b * ws[i]; });
   return {near: near.map(a => a[1]), ws, midi: m, col};
 }
-function playBlend(pos, t, stepDur, sp, pan) {
+function playBlend(pos, t, stepDur, sp, pan, gain = 1) {
   const b = blendOf(pos); if (!b) return null;
-  const parts = b.near.map((d, i) => ({d, gain: Math.pow(b.ws[i], .6) * 1.6, soft: true,
+  const parts = b.near.map((d, i) => ({d, gain: Math.pow(b.ws[i], .6) * 1.6 * gain, soft: true,
     rate: clamp(Math.pow(2, (b.midi - (d.pitched ? d.midi : d.note)) / 12), .5, 2) * sp}));
   voice(t, stepDur, pan, parts, mtof(b.midi) * sp, Math.max(S.tone, .45));
   return b;
@@ -435,10 +440,10 @@ let rec = null;
 async function startRec() {
   if (rec) return;
   unlock(); await ctx.resume();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('The mic needs the https link (GitHub Pages).'); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('The mic needs the https link (GitHub Pages).', true); return; }
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}}); }
-  catch (e) { toast('Mic blocked. Leave XR, tap REC on the page and allow the microphone.'); return; }
+  catch (e) { toast('Mic blocked. Leave XR, tap REC on the page and allow the microphone.', true); return; }
   const src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(4096, 1, 1), mute = ctx.createGain();
   mute.gain.value = 0;
   rec = {stream, src, proc, mute, chunks: [], count: 0, level: 0, stopAsked: false};
@@ -466,7 +471,7 @@ function stopRec() {
   panelDirty = true;
   const max = Math.min(r.count, MAXREC * ctx.sampleRate), data = new Float32Array(max);
   let o = 0; for (const c of r.chunks) { if (o >= max) break; data.set(c.subarray(0, Math.min(c.length, max - o)), o); o += c.length; }
-  if (max < ctx.sampleRate * .3) { toast('Too short. Hold the button a little longer.'); return; }
+  if (max < ctx.sampleRate * .3) { toast('Too short. Hold the button a little longer.', true); return; }
   toast('Chopping…');
   setTimeout(() => { setSample(data, ctx.sampleRate, true); if (dots.length) toast(`${dots.length} suns. Reach in and hold the trigger.`); }, 40);
 }
@@ -506,7 +511,7 @@ async function loadFile(f) {
     for (let c = 0; c < b.numberOfChannels; c++) { const ch = b.getChannelData(c); for (let i = 0; i < n; i++) data[i] += ch[i] / b.numberOfChannels; }
     setSample(data, b.sampleRate, true);
     toast(`${dots.length} suns from ${f.name}` + (b.length > n ? ' (first minute)' : ''));
-  } catch (e) { toast("Couldn't read that file."); }
+  } catch (e) { toast("Couldn't read that file.", true); }
 }
 function idb() { return new Promise((res, rej) => { const r = indexedDB.open('sunspot-xr', 1); r.onupgradeneeded = () => r.result.createObjectStore('s'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
 async function idbPut(v) { try { const db = await idb(); db.transaction('s', 'readwrite').objectStore('s').put(v, 'sample'); } catch (e) {} }
@@ -570,7 +575,7 @@ function updateCloudBox() {
   if (!dots.length) { cloudBar.visible = false; return; }
   cloudBox.makeEmpty(); for (const d of dots) cloudBox.expandByPoint(d.tp);
   const c = cloudBox.getCenter(new V3());
-  cloudBar.position.set(c.x, cloudBox.min.y - .05, cloudBox.max.z); cloudBar.visible = true;
+  cloudBar.position.set(c.x, cloudBox.min.y - .05, cloudBox.max.z); cloudBar.visible = false;
   cloudBox.expandByScalar(.1);
 }
 
@@ -682,7 +687,7 @@ function panAt(lp) { _wp.copy(lp); cloud.localToWorld(_wp); _wp.sub(headPos); _w
 function allPlayers() {
   const out = [];
   for (const h of [...hands, ...tHands]) { out.push(h.player); if (h.latch) out.push(h.latch.player); if (h.fplayer) out.push(h.fplayer); }
-  out.push(desk.player); for (const p of paths) out.push(p.player);
+  out.push(desk.player, fAll); for (const p of paths) out.push(p.player);
   return out;
 }
 function tick() {
@@ -690,6 +695,7 @@ function tick() {
   const now = ctx.currentTime, stepDur = 60 / S.bpm / S.div;
   for (const p of allPlayers()) {
     if (p.kind === 'fingers') { tickFingers(p, now); continue; }
+    if (p.kind === 'path' && S.pathTiming === 'drawn' && p.path.T && p.path.tmap) { tickDrawn(p, now, stepDur); continue; }
     const has = p.kind === 'path' ? p.active && p.seq && p.seq.length : p.active && p.set.length;
     if (!has) { p.nextT = 0; continue; }
     if (!p.nextT || p.nextT < now - .05) {
@@ -699,11 +705,33 @@ function tick() {
     let guard = 0;
     while (p.nextT < now + .12 && guard++ < 16) {
       const st = pickStep(p);
-      if (st && st.ghost) { const b = playBlend(st.pos, p.nextT, stepDur, p.speed, panAt(st.pos)); if (b) flashes.push({b, pos: st.pos, t: p.nextT, p, k: st.k}); }
-      else if (st && st.d) { playDot(st.d, p.nextT, stepDur, p.speed, panFor(st.d)); flashes.push({d: st.d, t: p.nextT, p, k: st.k}); }
+      const vg = p.kind === 'path' ? p.path.vol * 1.25 : 1;
+      if (vg < .02) { p.idx++; p.nextT += stepDur; continue; }
+      if (st && st.ghost) { const b = playBlend(st.pos, p.nextT, stepDur, p.speed, panAt(st.pos), vg); if (b) flashes.push({b, pos: st.pos, t: p.nextT, p, k: st.k}); }
+      else if (st && st.d) { playDot(st.d, p.nextT, stepDur, p.speed, panFor(st.d), vg); flashes.push({d: st.d, t: p.nextT, p, k: st.k}); }
       p.idx++;
       if (p.fresh) { p.fresh = false; p.nextT = Math.ceil((p.nextT + stepDur * .5) / stepDur) * stepDur; } else p.nextT += stepDur;
     }
+  }
+}
+// Paths at the speed you drew them: each sun on the path plays when the bead passes it, then the path loops
+function drawnEvents(P) {
+  const ev = P.seq.map(e => ({e, t: P.tmap[e.k] * P.T}));
+  if (S.pathDir === 'bounce' && ev.length > 1) for (let i = ev.length - 2; i > 0; i--) ev.push({e: ev[i].e, t: 2 * P.T - ev[i].t});
+  return ev;
+}
+function tickDrawn(p, now, stepDur) {
+  const P = p.path; if (!p.active || !P.seq.length) { p.loopT = 0; return; }
+  const per = (S.pathDir === 'bounce' ? 2 : 1) * P.T + .06, ev = drawnEvents(P);
+  if (!p.loopT || p.loopT + per < now) { p.loopT = now + .03; p.idx = 0; }
+  let guard = 0;
+  while (guard++ < 64) {
+    if (p.idx >= ev.length) { p.loopT += per; p.idx = 0; }
+    const x = ev[p.idx], at = p.loopT + x.t; if (at > now + .12) break;
+    p.idx++; if (at < now - .02) continue;
+    const vg = P.vol * 1.25; if (vg < .02) continue;
+    if (x.e.ghost) { const b = playBlend(x.e.pos, at, stepDur, 1, panAt(x.e.pos), vg); if (b) flashes.push({b, pos: x.e.pos, t: at, p, k: x.e.k}); }
+    else { const d = dots[x.e.j]; if (d) { playDot(d, at, stepDur, 1, panFor(d), vg); flashes.push({d, t: at, p, k: x.e.k}); } }
   }
 }
 // Fingers: each hand splits every cycle into as many even steps as it has fingers out (2 vs 3 = polyrhythm)
@@ -715,16 +743,19 @@ function fingerStep(tip) {
 }
 function tickFingers(p, now) {
   if (!p.active || !p.n) { p.nextT = 0; return; }
-  const cyc = 60 / S.bpm * S.fcycle;
-  if (!p.nextT || p.nextT < now - .05) { const t0 = now + .015; let c = Math.floor(t0 / cyc), k = Math.ceil((t0 - c * cyc) / (cyc / p.n) - 1e-6); if (k >= p.n) { c++; k = 0; } p.c = c; p.k = k; p.nextT = c * cyc + k * cyc / p.n; }
+  const steady = S.fTiming === 'steady', step = 60 / S.bpm / S.div, cyc = steady ? step * p.n : 60 / S.bpm * S.fcycle;
+  if (!p.nextT || p.nextT < now - .05) { const t0 = now + .015;
+    if (steady) { p.nextT = Math.ceil(t0 / step) * step; p.k = 0; }
+    else { let c = Math.floor(t0 / cyc), k = Math.ceil((t0 - c * cyc) / (cyc / p.n) - 1e-6); if (k >= p.n) { c++; k = 0; } p.c = c; p.k = k; p.nextT = c * cyc + k * cyc / p.n; } }
   let guard = 0;
   while (p.nextT < now + .12 && guard++ < 24) {
-    if (p.k >= p.n) { p.k = 0; p.c++; p.nextT = p.c * cyc; continue; }
-    const tip = p.tips[p.k], st = tip && fingerStep(tip), stepDur = cyc / p.n;
-    if (st && st.ghost) { const b = playBlend(st.pos, p.nextT, stepDur, 1, panAt(st.pos)); if (b) flashes.push({b, pos: st.pos, t: p.nextT, p, fk: p.fi[p.k]}); }
-    else if (st) { playDot(st.d, p.nextT, stepDur, 1, panFor(st.d)); flashes.push({d: st.d, t: p.nextT, p, fk: p.fi[p.k]}); }
-    p.k++; if (p.k >= p.n) { p.k = 0; p.c++; }
-    p.nextT = p.c * cyc + p.k * cyc / p.n;
+    if (p.k >= p.n) { p.k = 0; if (!steady) { p.c++; p.nextT = p.c * cyc; continue; } }
+    const tip = p.tips[p.k], st = tip && fingerStep(tip), stepDur = steady ? step : cyc / p.n, own = p.own && p.own[p.k];
+    if (st && st.ghost) { const b = playBlend(st.pos, p.nextT, stepDur, 1, panAt(st.pos)); if (b) flashes.push({b, pos: st.pos, t: p.nextT, p, fo: own}); }
+    else if (st) { playDot(st.d, p.nextT, stepDur, 1, panFor(st.d)); flashes.push({d: st.d, t: p.nextT, p, fo: own}); }
+    p.k++;
+    if (steady) { if (p.k >= p.n) p.k = 0; p.nextT += step; }
+    else { if (p.k >= p.n) { p.k = 0; p.c++; } p.nextT = p.c * cyc + p.k * cyc / p.n; }
   }
 }
 setInterval(tick, 20);
@@ -743,7 +774,7 @@ function fadeGhosts(dt) {
 function processFlashes() {
   if (!ctx) return; const now = ctx.currentTime;
   for (let i = flashes.length - 1; i >= 0; i--) { const f = flashes[i];
-    if (f.t <= now) { if (f.fk != null) { f.p.flash = f.p.flash || [0, 0, 0, 0, 0]; f.p.flash[f.fk] = 1; }
+    if (f.t <= now) { if (f.fo) { const fp = f.fo[0].fplayer; fp.flash = fp.flash || [0, 0, 0, 0, 0]; fp.flash[f.fo[1]] = 1; }
       if (f.b) { f.b.near.forEach((d, j) => d.glow = Math.max(d.glow, .3 + .7 * f.b.ws[j])); ghostFlash(f.p, f.pos, f.b.col); } else f.d.glow = 1; if (f.p.kind === 'path' && f.k != null) f.p.bead = f.k; flashes.splice(i, 1); } }
   if (flashes.length > 400) flashes.splice(0, flashes.length - 400);
 }
@@ -756,7 +787,7 @@ const outlineMat = new THREE.MeshBasicMaterial({color: '#000', side: THREE.BackS
 function newPath(pts, col) {
   const used = new Set(paths.map(p => p.col));
   col = col || PATHCOL.find(c => !used.has(c)) || PATHCOL[paths.length % PATHCOL.length];
-  const p = {pts, col, grp: new THREE.Group(), tube: null, handles: [], seq: [], samples: [], player: makePlayer('path')};
+  const p = {pts, col, vol: .8, T: 0, tmap: null, grp: new THREE.Group(), tube: null, handles: [], seq: [], samples: [], player: makePlayer('path')};
   p.player.path = p; p.player.active = true;
   p.mat = new THREE.MeshBasicMaterial({color: col, toneMapped: false, transparent: true, opacity: 1});
   p.bead = new THREE.Mesh(new THREE.SphereGeometry(.013, 16, 12), new THREE.MeshBasicMaterial({color: '#fff', toneMapped: false}));
@@ -801,16 +832,40 @@ function resample(pts) {
     const seg = cum[j + 1] - cum[j], f = seg > 1e-9 ? (t - cum[j]) / seg : 0; out.push(pts[j].clone().lerp(pts[j + 1], clamp(f, 0, 1))); }
   return out;
 }
-function finishStroke(pts) {
+const undoStack = [];
+function pushUndo(op) { undoStack.push(op); if (undoStack.length > 60) undoStack.shift(); panelDirty = true; }
+const snapPath = p => ({pts: p.pts.map(v => v.clone()), col: p.col, vol: p.vol, T: p.T, tmap: p.tmap});
+function deletePathUser(p) { if (!paths.includes(p)) return; pushUndo({t: 'del', ...snapPath(p)}); removePath(p, true); toast('Path deleted · Undo brings it back'); }
+function clearAllPaths() { if (!paths.length) return; pushUndo({t: 'multi', ops: paths.map(p => ({t: 'del', ...snapPath(p)}))}); [...paths].forEach(p => removePath(p, true)); }
+function undoOp(op) {
+  if (op.t === 'add') { if (paths.includes(op.p)) removePath(op.p, true); }
+  else if (op.t === 'del') { const np = newPath(op.pts.map(v => v.clone()), op.col); np.vol = op.vol != null ? op.vol : .8; np.T = op.T || 0; np.tmap = op.tmap || null; }
+  else if (op.t === 'edit') { if (paths.includes(op.p)) { op.p.pts = op.pts.map(v => v.clone()); buildPath(op.p); } }
+  else if (op.t === 'multi') [...op.ops].reverse().forEach(undoOp);
+}
+function undo() { const op = undoStack.pop(); if (!op) return; undoOp(op); savePaths(); panelDirty = true; tickSound(800); }
+function timeMap(pts, ts) {   // for each of the 161 spaced samples along the path: when (0..1) you drew through it
+  const cum = [0]; for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + pts[i].distanceTo(pts[i - 1]));
+  const L = cum[cum.length - 1] || 1, T = Math.max(1e-3, ts[ts.length - 1] - ts[0]), out = []; let j = 0;
+  for (let k = 0; k <= 160; k++) { const a = L * k / 160; while (j < cum.length - 2 && cum[j + 1] < a) j++;
+    const seg = cum[j + 1] - cum[j], f = seg > 1e-9 ? clamp((a - cum[j]) / seg, 0, 1) : 0;
+    out.push(clamp(((ts[j] + (ts[j + 1] - ts[j]) * f) - ts[0]) / T, 0, 1)); }
+  for (let k = 1; k <= 160; k++) out[k] = Math.max(out[k], out[k - 1]);
+  return out;
+}
+function finishStroke(pts, ts) {
   let L = 0; for (let i = 1; i < pts.length; i++) L += pts[i].distanceTo(pts[i - 1]);
   if (pts.length < 3 || L < .06) { toast('Path too short. Hold the trigger and draw a longer line.'); return null; }
-  const p = newPath(resample(pts)); savePaths();
+  const p = newPath(resample(pts));
+  if (ts && ts.length === pts.length) { p.T = clamp(ts[ts.length - 1] - ts[0], .25, 30); p.tmap = timeMap(pts, ts); }
+  savePaths(); pushUndo({t: 'add', p});
   toast(p.seq.length ? `Path plays ${p.nSuns} suns` + (p.nGhost ? ` and ${p.nGhost} blends` : '') + '. Drag its handles to reshape.' : 'No suns near that path. Drag a handle closer or raise Reach.');
   return p;
 }
-function savePaths() { try { localStorage.setItem('sunspot-xr-paths', JSON.stringify(paths.map(p => ({col: p.col, pts: p.pts.map(v => [+v.x.toFixed(4), +v.y.toFixed(4), +v.z.toFixed(4)])})))); } catch (e) {} }
-function loadPaths() { try { const a = JSON.parse(localStorage.getItem('sunspot-xr-paths') || '[]'); for (const o of a) if (o.pts && o.pts.length >= 2) newPath(o.pts.map(q => new V3(q[0], q[1], q[2])), o.col); } catch (e) {} }
+function savePaths() { try { localStorage.setItem('sunspot-xr-paths', JSON.stringify(paths.map(p => ({col: p.col, vol: p.vol, T: p.T, tmap: p.tmap ? p.tmap.map(v => +v.toFixed(4)) : null, pts: p.pts.map(v => [+v.x.toFixed(4), +v.y.toFixed(4), +v.z.toFixed(4)])})))); } catch (e) {} }
+function loadPaths() { try { const a = JSON.parse(localStorage.getItem('sunspot-xr-paths') || '[]'); for (const o of a) if (o.pts && o.pts.length >= 2) { const p = newPath(o.pts.map(q => new V3(q[0], q[1], q[2])), o.col); if (o.vol != null) p.vol = o.vol; if (o.T && o.tmap && o.tmap.length === 161) { p.T = o.T; p.tmap = o.tmap; } } } catch (e) {} }
 function nearestHandle(world, maxD) {
+  if (S.handMode !== 'path') return null;
   let best = null, bd = maxD;
   for (const p of paths) p.pts.forEach((pt, i) => { const w = cloud.localToWorld(pt.clone()), d = w.distanceTo(world); if (d < bd) { bd = d; best = {path: p, i}; } });
   return best;
@@ -820,9 +875,10 @@ function nearestPath(local) {
   for (const p of paths) for (const s of p.samples) { const d = s.distanceTo(local); if (d < bd) { bd = d; best = p; } }
   return best ? {p: best, d: bd * cloud.scale.x} : null;
 }
-const strokeLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: '#fff'}));
+const strokeLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color: '#fff', transparent: true, opacity: .9}));
 strokeLine.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3 * 3000), 3)); strokeLine.frustumCulled = false; strokeLine.visible = false; cloud.add(strokeLine);
-function showStroke(pts) { const a = strokeLine.geometry.attributes.position, n = Math.min(3000, pts.length); for (let i = 0; i < n; i++) a.setXYZ(i, pts[i].x, pts[i].y, pts[i].z); a.needsUpdate = true; strokeLine.geometry.setDrawRange(0, n); strokeLine.visible = n > 1; }
+function nextPathCol() { const used = new Set(paths.map(p => p.col)); return PATHCOL.find(c => !used.has(c)) || PATHCOL[paths.length % PATHCOL.length]; }
+function showStroke(pts) { strokeLine.material.color.set(nextPathCol()); const a = strokeLine.geometry.attributes.position, n = Math.min(3000, pts.length); for (let i = 0; i < n; i++) a.setXYZ(i, pts[i].x, pts[i].y, pts[i].z); a.needsUpdate = true; strokeLine.geometry.setDrawRange(0, n); strokeLine.visible = n > 1; }
 
 /* ================= Quest controllers (labelled) ================= */
 const CTRL_W = new THREE.MeshStandardMaterial({color: '#f4f2ff', roughness: .32, metalness: 0});
@@ -878,184 +934,237 @@ function writeHints(h) {
   const m = h.model; if (m) { m.bA.material.color.copy(path ? RED : h.hold ? ORANGE : DARKB); }
 }
 
-/* ================= menu panel (canvas, used in XR + on desktop) — white, crisp, Apple-style ================= */
-const PW = 1024, PH = 940, RS = 1.25;
-const AF = '-apple-system, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif';
-const AP = {bg: '#f5f5f7', card: '#ffffff', ink: '#1d1d1f', sub: '#6e6e73', fill: '#e8e8ed', fillHv: '#dcdce2', line: 'rgba(0,0,0,.08)',
-  blue: '#0A84FF', orange: '#FF9500', red: '#FF3B30', green: '#34C759', pink: '#FF2D55', purple: '#AF52DE', yellow: '#FFCC00', teal: '#30B0C7', indigo: '#5E5CE6'};
-const pcv = document.createElement('canvas'); pcv.width = PW * RS; pcv.height = PH * RS; const pg = pcv.getContext('2d');
+/* ================= menu panel (canvas, used in XR + on desktop) — see-through glass with thin white frames ================= */
+const SHAPES = {wide: [1700, 600], tall: [1024, 1180]};
+let PW = 1700, PH = 600, PANEL_W = .6, PANEL_H = .2;
+const RS = 1.25, MPP = .00036;
+const AF = '"Space Grotesk", -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif';
+const AP = {blue: '#0A84FF', orange: '#FF9500', red: '#FF3B30', green: '#34C759', pink: '#FF2D55', purple: '#AF52DE', yellow: '#FFCC00', teal: '#30D5E8', indigo: '#5E5CE6'};
+const GL = {tint: 'rgba(8,12,22,.34)', edge: 'rgba(255,255,255,.75)', frame: 'rgba(255,255,255,.5)', frameHv: 'rgba(255,255,255,.95)', fill: 'rgba(255,255,255,.05)', fillHv: 'rgba(255,255,255,.16)',
+  on: 'rgba(255,255,255,.94)', ink: '#ffffff', sub: 'rgba(255,255,255,.62)', dark: '#0b0e16', track: 'rgba(255,255,255,.28)'};
+const pcv = document.createElement('canvas'); const pg = pcv.getContext('2d');
 $('#panelWrap').appendChild(pcv);
-const ptex = new THREE.CanvasTexture(pcv); ptex.colorSpace = THREE.SRGBColorSpace; ptex.anisotropy = 8;
-const panelMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.30, 0.30 * PH / PW), new THREE.MeshBasicMaterial({map: ptex, toneMapped: false, transparent: true}));
-panelMesh.position.set(0, 0.15, -0.06); panelMesh.rotation.x = -0.55; panelMesh.renderOrder = 10;
-let hits = [], hoverPt = null, hoverKey = '', activeSlider = null, panelDirty = true, lastPanelDraw = 0;
+let ptex = null;
+const panelMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({toneMapped: false, transparent: true, depthWrite: false}));
+panelMesh.renderOrder = 10;
+function rebuildPanel() {
+  const sh = SHAPES[S.menuShape] || SHAPES.wide; PW = sh[0]; PH = sh[1];
+  pcv.width = Math.round(PW * RS); pcv.height = Math.round(PH * RS);
+  if (ptex) ptex.dispose();
+  ptex = new THREE.CanvasTexture(pcv); ptex.colorSpace = THREE.SRGBColorSpace; ptex.anisotropy = 8;
+  panelMesh.material.map = ptex; panelMesh.material.needsUpdate = true;
+  PANEL_W = PW * MPP; PANEL_H = PH * MPP;
+  panelMesh.geometry.dispose(); panelMesh.geometry = new THREE.PlaneGeometry(PANEL_W, PANEL_H);
+  $('#panelWrap').style.width = S.menuShape === 'tall' ? 'min(440px,46vw)' : 'min(860px,70vw)';
+  panelDirty = true; panelPlaced = false;
+}
+let hits = [], hoverPt = null, hoverKey = '', activeSlider = null, panelDirty = true, lastPanelDraw = 0, panelPlaced = false;
 const TABS = [['voice', 'Voice', AP.red], ['arp', 'Arp', AP.orange], ['tone', 'Tone', AP.yellow], ['synth', 'Synth', AP.pink], ['space', 'Space', AP.teal], ['paths', 'Paths', AP.green]];
-const X0 = 182, WC = 800;
+let X0 = 182, WC = 800, CX0 = 182, CW = 800, FY0 = 256, FYMAX = 1150, COLN = 1, COLI = 0, COLW = 800;
+const COLGAP = 34;
+rebuildPanel();
+function flowStart(y, cols) { COLN = cols; COLI = 0; FY0 = y; FYMAX = PH - 20; COLW = (CW - COLGAP * (cols - 1)) / cols; X0 = CX0; WC = COLW; }
+function need(y, h) { if (y + h > FYMAX && COLI < COLN - 1) { COLI++; X0 = CX0 + COLI * (COLW + COLGAP); return FY0; } return y; }
 function rr(x, y, w, h, r) { pg.beginPath(); pg.roundRect(x, y, w, h, r); }
-function txt(s, x, y, size, col, align = 'left', font = AF, weight = '600') { pg.font = `${weight} ${size}px ${font}`; pg.fillStyle = col; pg.textAlign = align; pg.textBaseline = 'middle'; pg.fillText(s, x, y); }
-function wrap(s, x, y, maxW, size, lh, col) { pg.font = `500 ${size}px ${AF}`; pg.fillStyle = col; pg.textAlign = 'left'; pg.textBaseline = 'middle';
-  let line = '', yy = y; for (const w of s.split(' ')) { const t = line ? line + ' ' + w : w; if (pg.measureText(t).width > maxW && line) { pg.fillText(line, x, yy); line = w; yy += lh; } else line = t; } if (line) pg.fillText(line, x, yy); return yy + lh; }
+function txt(s, x, y, size, col, align = 'left', weight = '500', ls = 0) { pg.font = `${weight} ${size}px ${AF}`; pg.fillStyle = col; pg.textAlign = align; pg.textBaseline = 'middle'; pg.letterSpacing = ls + 'px'; pg.fillText(s, x, y); pg.letterSpacing = '0px'; }
+function wrapLines(s, maxW, size) { pg.font = `400 ${size}px ${AF}`; const out = []; let line = ''; for (const w of s.split(' ')) { const t = line ? line + ' ' + w : w; if (pg.measureText(t).width > maxW && line) { out.push(line); line = w; } else line = t; } if (line) out.push(line); return out; }
+function wrap(s, x, y, maxW, size, lh, col) { const ls = wrapLines(s, maxW, size); y = need(y, ls.length * lh); x = X0; ls.forEach((l, i) => txt(l, x, y + i * lh, size, col, 'left', '400')); return y + ls.length * lh; }
 const isHover = (x, y, w, h) => hoverPt && hoverPt[0] >= x && hoverPt[0] <= x + w && hoverPt[1] >= y && hoverPt[1] <= y + h;
-function pill(x, y, w, h, bg, hv, r) { r = r == null ? Math.min(h / 2, 26) : r;
-  pg.fillStyle = bg; rr(x, y, w, h, r); pg.fill();
-  if (hv) { pg.fillStyle = 'rgba(0,0,0,.07)'; rr(x, y, w, h, r); pg.fill(); } }
-function button(x, y, w, h, label, bg, fg, fn, size = 28, weight = '600') {
-  pill(x, y, w, h, bg, isHover(x, y, w, h));
-  let fs = size; pg.font = `${weight} ${fs}px ${AF}`;
-  while (pg.measureText(label).width > w - 20 && fs > 14) { fs -= 1; pg.font = `${weight} ${fs}px ${AF}`; }
-  txt(label, x + w / 2, y + h / 2 + 1, fs, fg, 'center', AF, weight);
-  hits.push({x, y, w, h, fn, key: x + ',' + y});
+function frame(x, y, w, h, on, hv, accent, r = 14) {
+  pg.fillStyle = on ? GL.on : hv ? GL.fillHv : GL.fill; rr(x, y, w, h, r); pg.fill();
+  if (!on) { pg.lineWidth = 1.6; pg.strokeStyle = hv ? GL.frameHv : GL.frame; rr(x + .8, y + .8, w - 1.6, h - 1.6, r); pg.stroke(); }
+  if (on && accent) { pg.fillStyle = accent; rr(x + 12, y + h - 7, w - 24, 3.5, 2); pg.fill(); }
 }
-function slider(y, label, key, min, max, fmt, lo, hi, step, col = AP.blue) {
+function button(x, y, w, h, label, on, fn, size = 24, accent, dim) {
+  frame(x, y, w, h, on, isHover(x, y, w, h) && !dim, accent);
+  let fs = size; const L = label.toUpperCase(); pg.font = `600 ${fs}px ${AF}`; pg.letterSpacing = '1.5px';
+  while (pg.measureText(L).width > w - 18 && fs > 12) { fs -= 1; pg.font = `600 ${fs}px ${AF}`; }
+  txt(L, x + w / 2, y + h / 2 + 1, fs, on ? GL.dark : dim ? 'rgba(255,255,255,.3)' : GL.ink, 'center', '600', 1.5);
+  if (!dim) hits.push({x, y, w, h, fn, key: 'b' + x + ',' + y});
+}
+function label(s, y) { txt(s.toUpperCase(), X0, y, 18, GL.sub, 'left', '600', 2.2); }
+function slider(y, lab, key, min, max, fmt, lo, hi, step) {
+  y = need(y, lo ? 100 : 82);
   const x = X0, w = WC;
-  txt(label, x, y, 27, AP.ink); txt(fmt(S[key]), x + w, y, 27, AP.sub, 'right', AF, '500');
-  const ty = y + 40, th = 10, f = clamp((S[key] - min) / (max - min), 0, 1);
-  pg.fillStyle = AP.fill; rr(x, ty - th / 2, w, th, 5); pg.fill();
-  pg.fillStyle = col; rr(x, ty - th / 2, Math.max(th, w * f), th, 5); pg.fill();
-  const hv = isHover(x - 20, ty - 34, w + 40, 68) || (activeSlider && activeSlider.slider.key === key);
-  pg.save(); pg.shadowColor = 'rgba(0,0,0,.22)'; pg.shadowBlur = 10; pg.shadowOffsetY = 3;
-  pg.beginPath(); pg.arc(x + w * f, ty, hv ? 21 : 18, 0, 7); pg.fillStyle = '#fff'; pg.fill(); pg.restore();
-  pg.lineWidth = 1.5; pg.strokeStyle = AP.line; pg.beginPath(); pg.arc(x + w * f, ty, hv ? 21 : 18, 0, 7); pg.stroke();
-  if (lo) { txt(lo, x, ty + 34, 20, AP.sub, 'left', AF, '500'); txt(hi, x + w, ty + 34, 20, AP.sub, 'right', AF, '500'); }
-  hits.push({x: x - 20, y: ty - 34, w: w + 40, h: 68, slider: {key, min, max, step}, key: 's' + key});
-  return y + (lo ? 112 : 88);
+  label(lab, y); txt(fmt(S[key]), x + w, y, 22, GL.ink, 'right', '500');
+  const ty = y + 36, f = clamp((S[key] - min) / (max - min), 0, 1);
+  pg.fillStyle = GL.track; pg.fillRect(x, ty - 1, w, 2);
+  pg.fillStyle = GL.ink; pg.fillRect(x, ty - 1.5, w * f, 3);
+  for (let t = 0; t <= 10; t++) { pg.fillStyle = 'rgba(255,255,255,.35)'; pg.fillRect(x + w * t / 10 - .75, ty + 8, 1.5, t % 5 ? 5 : 9); }
+  const hv = isHover(x - 20, ty - 30, w + 40, 60) || (activeSlider && activeSlider.slider && activeSlider.slider.key === key), kx = x + w * f;
+  pg.beginPath(); pg.arc(kx, ty, hv ? 15 : 12, 0, 7); pg.fillStyle = GL.dark; pg.fill(); pg.lineWidth = 2.5; pg.strokeStyle = GL.ink; pg.stroke();
+  pg.beginPath(); pg.arc(kx, ty, 4, 0, 7); pg.fillStyle = GL.ink; pg.fill();
+  if (lo) { txt(lo, x, ty + 30, 17, GL.sub, 'left', '400'); txt(hi, x + w, ty + 30, 17, GL.sub, 'right', '400'); }
+  hits.push({x: x - 20, y: ty - 30, w: w + 40, h: 60, slider: {key, min, max, step}, key: 's' + key});
+  return y + (lo ? 100 : 82);
 }
-function segRow(x, y, w, h, opts, cur, col, fn, size = 24) {   // Apple segmented control
-  pg.fillStyle = AP.fill; rr(x, y, w, h, h / 2); pg.fill();
-  const n = opts.length, sw = (w - 8) / n;
-  opts.forEach(([v, l], i) => { const on = cur === v, bx = x + 4 + i * sw;
-    if (on) { pg.save(); pg.shadowColor = 'rgba(0,0,0,.18)'; pg.shadowBlur = 8; pg.shadowOffsetY = 2; pg.fillStyle = col || '#fff'; rr(bx, y + 4, sw, h - 8, (h - 8) / 2); pg.fill(); pg.restore(); }
-    else if (isHover(bx, y, sw, h)) { pg.fillStyle = 'rgba(0,0,0,.05)'; rr(bx, y + 4, sw, h - 8, (h - 8) / 2); pg.fill(); }
-    let fs = size; pg.font = `600 ${fs}px ${AF}`; while (pg.measureText(l).width > sw - 14 && fs > 13) { fs -= 1; pg.font = `600 ${fs}px ${AF}`; }
-    txt(l, bx + sw / 2, y + h / 2 + 1, fs, on && col && col !== AP.yellow ? '#fff' : AP.ink, 'center');
-    hits.push({x: bx, y, w: sw, h, fn: () => fn(v), key: 'g' + x + ',' + y + ',' + i}); });
+function segRow(x, y, w, h, opts, cur, accent, fn, size = 20) {
+  const n = opts.length, gap = 6, sw = (w - gap * (n - 1)) / n;
+  opts.forEach(([v, l], i) => { const bx = x + i * (sw + gap); button(bx, y, sw, h, l, cur === v, () => fn(v), size, typeof accent === 'function' ? accent(v) : accent); });
 }
-function seg(y, label, key, opts, col, size = 24) {
-  if (label) txt(label, X0, y, 27, AP.ink);
-  const by = y + (label ? 24 : 0);
-  segRow(X0, by, WC, 58, opts, S[key], col, v => { S[key] = v; onSet(key); }, size);
-  return by + 58 + 30;
+function seg(y, lab, key, opts, accent, size = 20) {
+  y = need(y, (lab ? 24 : 0) + 52 + 26);
+  if (lab) label(lab, y);
+  const by = y + (lab ? 24 : 0);
+  segRow(X0, by, WC, 52, opts, S[key], accent, v => { S[key] = v; onSet(key); }, size);
+  return by + 52 + 26;
 }
 function icon(id, cx, cy, col) {
-  const g = pg; g.save(); g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 5; g.lineCap = 'round'; g.lineJoin = 'round';
+  const g = pg; g.save(); g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 3.2; g.lineCap = 'round'; g.lineJoin = 'round';
   switch (id) {
-    case 'voice': rr(cx - 9, cy - 22, 18, 28, 9); g.fill(); g.beginPath(); g.arc(cx, cy - 3, 16, .12 * Math.PI, .88 * Math.PI); g.stroke(); g.beginPath(); g.moveTo(cx, cy + 13); g.lineTo(cx, cy + 21); g.stroke(); break;
-    case 'arp': [[-18, 12], [-6, 3], [6, -6], [18, -15]].forEach(([x, y]) => { g.beginPath(); g.arc(cx + x, cy + y, 6, 0, 7); g.fill(); }); break;
-    case 'tone': g.beginPath(); g.arc(cx, cy, 18, 0, 7); g.stroke(); g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + 10, cy - 11); g.stroke(); break;
-    case 'synth': g.beginPath(); for (let i = 0; i <= 40; i++) { const x = cx - 22 + i * 1.1, y = cy - 12 * Math.sin(i / 40 * Math.PI * 2); i ? g.lineTo(x, y) : g.moveTo(x, y); } g.stroke(); break;
-    case 'space': for (let r = 9; r <= 25; r += 8) { g.beginPath(); g.arc(cx - 12, cy, r, -.85, .85); g.stroke(); } g.beginPath(); g.arc(cx - 12, cy, 4.5, 0, 7); g.fill(); break;
-    case 'paths': g.beginPath(); g.moveTo(cx - 21, cy + 13); g.bezierCurveTo(cx - 6, cy - 31, cx + 6, cy + 31, cx + 21, cy - 13); g.stroke(); [[-21, 13], [0, 0], [21, -13]].forEach(([x, y]) => { g.beginPath(); g.arc(cx + x, cy + y, 6, 0, 7); g.fill(); }); break;
+    case 'voice': rr(cx - 8, cy - 20, 16, 25, 8); g.stroke(); g.beginPath(); g.arc(cx, cy - 3, 14, .12 * Math.PI, .88 * Math.PI); g.stroke(); g.beginPath(); g.moveTo(cx, cy + 11); g.lineTo(cx, cy + 18); g.stroke(); break;
+    case 'arp': [[-15, 10], [-5, 3], [5, -4], [15, -11]].forEach(([x, y]) => { g.beginPath(); g.arc(cx + x, cy + y, 4.5, 0, 7); g.fill(); }); break;
+    case 'tone': g.beginPath(); g.arc(cx, cy, 15, 0, 7); g.stroke(); g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + 8, cy - 9); g.stroke(); break;
+    case 'synth': g.beginPath(); for (let i = 0; i <= 40; i++) { const x = cx - 19 + i * .95, y = cy - 10 * Math.sin(i / 40 * Math.PI * 2); i ? g.lineTo(x, y) : g.moveTo(x, y); } g.stroke(); break;
+    case 'space': for (let r = 8; r <= 22; r += 7) { g.beginPath(); g.arc(cx - 10, cy, r, -.85, .85); g.stroke(); } g.beginPath(); g.arc(cx - 10, cy, 3.5, 0, 7); g.fill(); break;
+    case 'paths': g.beginPath(); g.moveTo(cx - 18, cy + 11); g.bezierCurveTo(cx - 5, cy - 27, cx + 5, cy + 27, cx + 18, cy - 11); g.stroke(); [[-18, 11], [0, 0], [18, -11]].forEach(([x, y]) => { g.beginPath(); g.arc(cx + x, cy + y, 4.5, 0, 7); g.fill(); }); break;
   }
   g.restore();
 }
 const pct = v => Math.round(v * 100) + '%';
-const MODES = [['pinch', 'Pinch'], ['fingers', 'Fingers'], ['pluck', 'Pluck'], ['path', 'Path']];
-const MODE_COL = {pinch: AP.blue, fingers: AP.purple, pluck: AP.orange, path: AP.green};
+const MODES = [['pinch', 'Pinch'], ['sphere', 'Sphere'], ['fingers', 'Fingers'], ['pluck', 'Pluck'], ['perc', 'Percussion'], ['path', 'Path']];
+const MODE_COL = {pinch: AP.blue, sphere: AP.teal, fingers: AP.purple, pluck: AP.pink, perc: AP.orange, path: AP.green};
 const MODE_HELP = {
   pinch: 'Pinch inside the suns: the nearest ones play as an arpeggio until you let go. Hold keeps them going.',
-  fingers: 'Reach into the suns with fingers out: each hand plays one note per finger, evenly in every beat, on the sun nearest each fingertip. 2 fingers + 3 fingers = 2 against 3.',
-  pluck: 'Touch a sun with any fingertip to pluck it once, like a string. Faster touches pluck louder.',
-  path: 'Pinch and draw through the suns. The path plays the suns closest to it, in order. Pinch a round handle to reshape it.'};
+  sphere: 'The space between your thumb and index finger is a sphere. Every sun inside it plays. Open wide for more, close tight for one.',
+  fingers: 'Reach in with fingers out: one note per finger, on the sun nearest each fingertip. A fist is silence.',
+  pluck: 'Pinch near suns to grab their strings, pull back, let go to twang them. Pull further for louder and a little higher.',
+  perc: 'Tap suns with any fingertip to hit them once, like drums. Faster taps hit harder.',
+  path: 'Pinch and draw through the suns. The path plays the suns closest to it. Handles appear when your hand is near.'};
 function drawPanel() {
   hits = []; panelDirty = false; lastPanelDraw = performance.now();
-  const g = pg; g.setTransform(RS, 0, 0, RS, 0, 0);
+  const g = pg, wide = S.menuShape !== 'tall'; g.setTransform(RS, 0, 0, RS, 0, 0);
   g.clearRect(0, 0, PW, PH);
-  g.fillStyle = AP.bg; rr(0, 0, PW, PH, 52); g.fill();
-  g.fillStyle = 'rgba(0,0,0,.035)'; rr(0, 0, 156, PH, [52, 0, 0, 52]); g.fill();
-  TABS.forEach(([id, name, c], i) => { const y = 24 + i * 132, on = S.tab === id, cx = 78, cy = y + 44;
-    const hv = isHover(12, y, 132, 120);
-    g.beginPath(); g.arc(cx, cy, 40, 0, 7); g.fillStyle = on ? c : hv ? AP.fillHv : AP.fill; g.fill();
-    icon(id, cx, cy, on && c !== AP.yellow ? '#fff' : AP.ink); txt(name, cx, y + 104, 20, on ? AP.ink : AP.sub, 'center', AF, on ? '700' : '500');
-    hits.push({x: 12, y, w: 132, h: 120, fn: () => { S.tab = id; saveSettings(); }, key: 'tab' + id}); });
+  // glass + frame + corner brackets
+  g.fillStyle = GL.tint; rr(2, 2, PW - 4, PH - 4, 30); g.fill();
+  g.lineWidth = 2; g.strokeStyle = GL.edge; rr(3, 3, PW - 6, PH - 6, 30); g.stroke();
+  g.lineWidth = 5; g.strokeStyle = '#fff'; g.lineCap = 'round';
+  [[3, 3, 1, 1], [PW - 3, 3, -1, 1], [3, PH - 3, 1, -1], [PW - 3, PH - 3, -1, -1]].forEach(([x, y, sx, sy]) => { g.beginPath(); g.moveTo(x + sx * 70, y); g.lineTo(x + sx * 30, y); g.arcTo(x, y, x, y + sy * 30, 30); g.lineTo(x, y + sy * 70); g.stroke(); });
+  // icon rail down the left side
+  const railW = wide ? 128 : 156, tabH = wide ? 94 : 132, ty0 = wide ? 18 : 24;
+  g.fillStyle = 'rgba(255,255,255,.18)'; g.fillRect(railW, 24, 1.5, PH - 48);
+  TABS.forEach(([id, name, c], i) => { const y = ty0 + i * tabH, on = S.tab === id, cx = railW / 2, cy = y + (wide ? 34 : 44), r = wide ? 27 : 36;
+    const hv = isHover(8, y, railW - 16, tabH - 6);
+    g.beginPath(); g.arc(cx, cy, r, 0, 7); g.fillStyle = on ? GL.on : hv ? GL.fillHv : GL.fill; g.fill();
+    if (!on) { g.lineWidth = 1.6; g.strokeStyle = hv ? GL.frameHv : GL.frame; g.stroke(); }
+    if (on) { g.beginPath(); g.arc(cx, cy, r + 5, -.6, .6); g.lineWidth = 3; g.strokeStyle = c; g.stroke(); }
+    icon(id, cx, cy, on ? GL.dark : GL.ink); txt(name.toUpperCase(), cx, y + (wide ? 76 : 102), wide ? 13 : 16, on ? GL.ink : GL.sub, 'center', '600', 1.5);
+    hits.push({x: 8, y, w: railW - 16, h: tabH - 6, fn: () => { S.tab = id; saveSettings(); }, key: 'tab' + id}); });
+  CX0 = railW + 30; CW = PW - CX0 - 30; X0 = CX0; WC = CW;
   const tab = TABS.find(t => t[0] === S.tab) || TABS[0];
-  const fl = panelFloating && renderer.xr.isPresenting;
-  txt(tab[1], X0, 50, 40, AP.ink, 'left', AF, '700');
+  const fl = panelFloating && renderer.xr.isPresenting, hy = wide ? 36 : 48;
+  txt(tab[1].toUpperCase(), CX0, hy, wide ? 30 : 36, GL.ink, 'left', '600', 4);
+  g.fillStyle = tab[2]; g.fillRect(CX0, hy + 20, 34, 3);
   const dur = sample ? (sample.data.length / sample.sr) : 0;
-  txt(dots.length ? `${dots.length} suns · ${dur.toFixed(1)}s` : 'No take yet', X0 + WC - (fl ? 70 : 0), 50, 23, AP.sub, 'right', AF, '500');
-  if (fl) { const bx = X0 + WC - 50, by = 26; g.beginPath(); g.arc(bx + 25, by + 25, 25, 0, 7); g.fillStyle = isHover(bx, by, 50, 50) ? AP.fillHv : AP.fill; g.fill();
-    g.strokeStyle = AP.ink; g.lineWidth = 4; g.lineCap = 'round'; g.beginPath(); g.moveTo(bx + 17, by + 17); g.lineTo(bx + 33, by + 33); g.moveTo(bx + 33, by + 17); g.lineTo(bx + 17, by + 33); g.stroke();
-    hits.push({x: bx - 6, y: by - 6, w: 62, h: 62, fn: () => { S.menu = false; saveSettings(); }, key: 'close'}); }
-  // always-there strip: record · what your hands do · hold
-  { const sy = 92, r = !!rec, h = 72;
-    if (r) button(X0, sy, 150, h, `■  ${recSec().toFixed(1)}s`, AP.red, '#fff', () => { unlock(); stopRec(); }, 26);
-    else { pill(X0, sy, 150, h, isHover(X0, sy, 150, h) ? AP.fillHv : AP.fill); g.beginPath(); g.arc(X0 + 40, sy + h / 2, 11, 0, 7); g.fillStyle = AP.red; g.fill(); txt('Rec', X0 + 60, sy + h / 2 + 1, 27, AP.ink); hits.push({x: X0, y: sy, w: 150, h, fn: () => { unlock(); startRec(); }, key: 'rec'}); }
-    segRow(X0 + 162, sy, 470, h, MODES, S.handMode, MODE_COL[S.handMode], v => setHandMode(v), 24);
-    const ho = S.hold;
-    button(X0 + 644, sy, 156, h, ho ? 'Hold on' : 'Hold', ho ? AP.blue : AP.fill, ho ? '#fff' : AP.ink, () => setHold(!S.hold), 25); }
-  let y = 206;
+  txt(dots.length ? `${dots.length} SUNS · ${dur.toFixed(1)}S` : 'NO TAKE YET', CX0 + CW - (fl ? 64 : 0), hy, 17, GL.sub, 'right', '600', 2);
+  if (fl) { const bx = CX0 + CW - 44, by = hy - 22; frame(bx, by, 44, 44, false, isHover(bx, by, 44, 44), null, 22);
+    g.strokeStyle = GL.ink; g.lineWidth = 2.5; g.beginPath(); g.moveTo(bx + 15, by + 15); g.lineTo(bx + 29, by + 29); g.moveTo(bx + 29, by + 15); g.lineTo(bx + 15, by + 29); g.stroke();
+    hits.push({x: bx - 6, y: by - 6, w: 56, h: 56, fn: () => { S.menu = false; saveSettings(); }, key: 'close'}); }
+  // strip: record · hand modes · hold · undo · erase · pop-ups
+  const sh = 58, r = !!rec, recFn = () => { unlock(); rec ? stopRec() : startRec(); };
+  const tools = (x, y) => {
+    button(x, y, 116, sh, r ? '■ ' + recSec().toFixed(1) + 's' : '● Rec', r, recFn, 21, AP.red); x += 126;
+    button(x, y, 104, sh, 'Hold', S.hold, () => setHold(!S.hold), 20, AP.blue); x += 114;
+    button(x, y, 104, sh, 'Undo', false, () => undo(), 20, null, !undoStack.length); x += 114;
+    if (S.handMode === 'path') button(x, y, 104, sh, 'Erase', S.erase, () => { S.erase = !S.erase; saveSettings(); panelDirty = true; }, 20, AP.red);
+    x += 114;
+    button(x, y, 150, sh, S.tips ? 'Pop-ups on' : 'Pop-ups off', S.tips, () => { S.tips = !S.tips; saveSettings(); }, 18, AP.yellow);
+  };
+  let y;
+  if (wide) { const sy = 72, mw = 690; segRow(CX0, sy, mw, sh, MODES, S.handMode, v => MODE_COL[v], v => setHandMode(v), 19); tools(CX0 + mw + 22, sy); y = 160; }
+  else { tools(CX0, 92); segRow(CX0, 92 + sh + 12, CW, sh, MODES, S.handMode, v => MODE_COL[v], v => setHandMode(v), 18); y = 92 + 2 * sh + 46; }
+  flowStart(y, wide ? 3 : 1);
   switch (S.tab) {
     case 'voice': {
-      y = wrap(MODE_HELP[S.handMode], X0, y - 6, WC, 22, 29, MODE_COL[S.handMode]) + 4;
-      button(X0, y, 394, 66, 'Demo voice', AP.fill, AP.ink, () => { unlock(); demoVoice(); }, 25);
-      button(X0 + 406, y, 394, 66, 'Reset place', AP.fill, AP.ink, () => { cloud.position.set(0, 0, 0); cloud.quaternion.identity(); cloud.scale.setScalar(1); toast('Suns back in front of you'); }, 25);
-      y += 106;
+      y = wrap(MODE_HELP[S.handMode], X0, y, WC, 19, 25, GL.ink) + 14;
+      y = need(y, 72);
+      const bw = (WC - 10) / 2;
+      button(X0, y, bw, 54, 'Demo voice', false, () => { unlock(); demoVoice(); }, 19);
+      button(X0 + bw + 10, y, bw, 54, 'Reset place', false, () => { cloud.position.set(0, 0, 0); cloud.quaternion.identity(); cloud.scale.setScalar(1); toast('Suns back in front of you'); }, 19);
+      y += 80;
       y = slider(y, 'Chop sensitivity', 'sens', 0, 1, pct, 'fewer chops', 'more chops');
       y = slider(y, 'Longest chop', 'maxLen', .08, .6, v => Math.round(v * 1000) + ' ms', 'short', 'long');
-      y = seg(y, 'Arrange the suns', 'layout', [['sound', 'By sound'], ['grid', 'Time · pitch']], AP.red);
-      y = wrap(S.layout === 'grid' ? 'Left to right is time, up is pitch, nearer is brighter.' : 'Similar sounds float together. Up is roughly higher pitch, right is brighter.', X0, y - 6, WC, 21, 28, AP.sub) + 4;
-      wrap('Fist grabs the suns (two fists stretch + turn), or pinch the white bar under them. Pinch the bar under this menu to move it.', X0, y, WC, 21, 28, AP.sub);
+      y = seg(y, 'Arrange the suns', 'layout', [['pitch', 'Pitch up'], ['sound', 'By sound'], ['grid', 'Time · pitch']], AP.red, 18);
+      y = wrap({pitch: 'Up is pitch. Similar sounds sit near each other left to right and front to back.', sound: 'Similar sounds float together in every direction.', grid: 'Left to right is time, up is pitch, nearer is brighter.'}[S.layout] || '', X0, y - 8, WC, 17, 23, GL.sub) + 12;
+      y = wrap('A fist grabs the suns, and two fists stretch and turn them. Pinch the line under this menu to move it.', X0, y, WC, 17, 23, GL.sub);
       break; }
     case 'arp':
-      y = seg(y, 'Pattern (Pinch)', 'pattern', [['up', 'Up'], ['down', 'Down'], ['bounce', 'Bounce'], ['random', 'Random'], ['speech', 'Speech']], AP.orange, 22);
-      y = slider(y, 'Tempo', 'bpm', 40, 220, v => Math.round(v) + ' BPM', null, null, 1, AP.orange);
-      y = seg(y, 'Steps (Pinch + Path)', 'div', [[2, '8ths'], [3, 'Triplets'], [4, '16ths'], [6, 'Fast']], AP.orange, 22);
-      y = seg(y, 'Fingers: each hand’s notes fill', 'fcycle', [[.5, 'Half beat'], [1, '1 beat'], [2, '2 beats'], [4, '1 bar']], AP.purple, 22);
-      y = slider(y, 'Suns per pinch', 'notes', 1, 8, v => Math.round(v) + '', null, null, 1, AP.orange);
-      y = slider(y, 'Chop length', 'gate', 0, 1, v => v >= .97 ? 'full' : pct(v), 'stutter', 'full chops', null, AP.orange);
+      y = slider(y, 'Tempo', 'bpm', 40, 220, v => Math.round(v) + ' BPM', null, null, 1);
+      y = seg(y, 'Pattern (pinch, sphere)', 'pattern', [['up', 'Up'], ['down', 'Down'], ['bounce', 'Bounce'], ['random', 'Rand'], ['speech', 'Speech']], AP.orange, 16);
+      y = seg(y, 'Steps', 'div', [[2, '8ths'], [3, 'Trip'], [4, '16ths'], [6, 'Fast']], AP.orange, 17);
+      y = slider(y, 'Suns per pinch / pluck', 'notes', 1, 8, v => Math.round(v) + '', null, null, 1);
+      y = slider(y, 'Chop length', 'gate', 0, 1, v => v >= .97 ? 'full' : pct(v), 'stutter', 'full chops');
       y = seg(y, 'Blend in the gaps', 'blend', [[false, 'Off'], [true, 'On']], AP.orange);
+      y = seg(y, 'Fingers: hands', 'fTogether', [[false, 'Each hand'], [true, 'Together']], AP.purple, 18);
+      y = seg(y, 'Fingers: timing', 'fTiming', [['fill', 'Fit the beat'], ['steady', 'Steady steps']], AP.purple, 17);
+      if (S.fTiming === 'fill') y = seg(y, 'Fingers: notes fill', 'fcycle', [[.5, '½ beat'], [1, '1 beat'], [2, '2 beats'], [4, '1 bar']], AP.purple, 17);
       break;
     case 'tone':
-      y = slider(y, 'Tone', 'tone', 0, 1, pct, 'raw voice', 'ringing notes', null, AP.yellow);
+      y = slider(y, 'Tone', 'tone', 0, 1, pct, 'raw voice', 'ringing notes');
       y = seg(y, 'Snap to key', 'snap', [[false, 'Off'], [true, 'On']], AP.yellow);
-      { txt('Key', X0, y, 27, AP.ink); const by = y + 24;
-        segRow(X0, by, WC, 56, NAMES.map((n, i) => [i, n]), S.key, AP.yellow, v => { S.key = v; onSet('key'); }, 19); y = by + 86; }
-      y = seg(y, 'Scale', 'scale', [['minPent', 'Min pent'], ['majPent', 'Maj pent'], ['minor', 'Minor'], ['dorian', 'Dorian'], ['phrygian', 'Phrygian'], ['hijaz', 'Hijaz']], AP.yellow, 19);
-      button(X0, y, 360, 64, 'Find key from voice', AP.fill, AP.ink, () => findKey(false), 24);
+      { y = need(y, 24 + 2 * 46 + 30); label('Key', y); const by = y + 24, half = NAMES.length / 2;
+        segRow(X0, by, WC, 42, NAMES.slice(0, half).map((n, i) => [i, n]), S.key, AP.yellow, v => { S.key = v; onSet('key'); }, 17);
+        segRow(X0, by + 48, WC, 42, NAMES.slice(half).map((n, i) => [i + half, n]), S.key, AP.yellow, v => { S.key = v; onSet('key'); }, 17); y = by + 116; }
+      y = seg(y, 'Scale', 'scale', [['minPent', 'Min pent'], ['majPent', 'Maj pent'], ['minor', 'Minor']], AP.yellow, 17);
+      y = need(y, 52 + 26); segRow(X0, y - 18, WC, 52, [['dorian', 'Dorian'], ['phrygian', 'Phrygian'], ['hijaz', 'Hijaz']], S.scale, AP.yellow, v => { S.scale = v; onSet('scale'); }, 17); y += 60;
+      y = need(y, 70); button(X0, y, Math.min(WC, 340), 54, 'Find key from voice', false, () => findKey(false), 18); y += 80;
       break;
     case 'synth':
-      y = slider(y, 'Synth mix', 'mix', 0, 1, pct, 'voice only', 'synth only', null, AP.pink);
+      y = slider(y, 'Synth mix', 'mix', 0, 1, pct, 'voice only', 'synth only');
       y = seg(y, 'Sound', 'wave', [['glass', 'Glass'], ['saw', 'Saw'], ['sub', 'Sub']], AP.pink);
       y = seg(y, 'Octave', 'oct', [[-1, '−1'], [0, '0'], [1, '+1']], AP.pink);
-      y = slider(y, 'Brightness', 'cutoff', 0, 1, pct, 'dark', 'bright', null, AP.pink);
-      wrap('The synth doubles the note of every chop it plays.', X0, y - 6, WC, 21, 28, AP.sub);
+      y = slider(y, 'Brightness', 'cutoff', 0, 1, pct, 'dark', 'bright');
+      y = wrap('The synth doubles the note of every chop it plays.', X0, y - 6, WC, 17, 23, GL.sub);
       break;
     case 'space':
-      y = slider(y, 'Echo', 'echo', 0, 1, pct, null, null, null, AP.teal);
-      y = slider(y, 'Room', 'verb', 0, 1, pct, null, null, null, AP.teal);
-      y = slider(y, 'Volume', 'vol', 0, 1, pct, null, null, null, AP.teal);
+      y = slider(y, 'Echo', 'echo', 0, 1, pct);
+      y = slider(y, 'Room', 'verb', 0, 1, pct);
+      y = slider(y, 'Volume', 'vol', 0, 1, pct);
       y = seg(y, 'Twist to bend', 'twist', [[false, 'Off'], [true, 'On']], AP.teal);
-      y = wrap('With Twist on, roll your wrist while playing: right = faster + higher, left = slower + lower.', X0, y - 6, WC, 21, 28, AP.sub) + 10;
-      y = seg(y, 'Button labels on controllers', 'labels', [[true, 'Show'], [false, 'Hide']], AP.teal);
+      y = wrap('With Twist on, roll your wrist while playing: right = faster and higher, left = slower and lower.', X0, y - 8, WC, 17, 23, GL.sub) + 14;
+      y = seg(y, 'Menu shape', 'menuShape', [['wide', 'Wide · bottom'], ['tall', 'Tall · side']], AP.teal, 18);
+      y = seg(y, 'Controller button labels', 'labels', [[true, 'Show'], [false, 'Hide']], AP.teal);
       break;
     case 'paths': {
-      y = slider(y, 'Reach (how far from the path it picks suns)', 'reach', .02, .15, v => Math.round(v * 100) + ' cm', 'tight', 'wide', null, AP.green);
+      y = slider(y, 'Reach', 'reach', .02, .15, v => Math.round(v * 100) + ' cm', 'tight', 'wide');
       y = seg(y, 'Direction', 'pathDir', [['fwd', 'Loop'], ['bounce', 'Back + forth']], AP.green);
-      y = seg(y, null, 'pathMute', [[false, 'Paths playing'], [true, 'Paths muted']], AP.green);
-      if (!paths.length) { txt('No paths yet. Choose Path up top, then pinch and draw.', X0, y + 10, 23, AP.sub, 'left', AF, '500'); break; }
-      const colW = (WC - 14) / 2;
-      paths.forEach((p, i) => { const cx = X0 + (i % 2) * (colW + 14), cy = y + Math.floor(i / 2) * 64;
-        pill(cx, cy, colW, 54, AP.card, false, 16); g.beginPath(); g.arc(cx + 28, cy + 27, 11, 0, 7); g.fillStyle = p.col; g.fill();
-        txt(`Path ${i + 1} · ${p.nSuns || 0} suns` + (p.nGhost ? ` + ${p.nGhost} blends` : ''), cx + 50, cy + 28, 21, AP.ink, 'left', AF, '500');
-        button(cx + colW - 54, cy + 7, 40, 40, '✕', AP.red, '#fff', () => removePath(p), 20); });
-      const ly = y + Math.ceil(paths.length / 2) * 64 + 8;
-      if (ly < PH - 60) button(X0, ly, 220, 54, 'Clear all', AP.red, '#fff', () => { [...paths].forEach(p => removePath(p, true)); toast('All paths deleted'); }, 22);
+      y = seg(y, 'Paths', 'pathMute', [[false, 'Playing'], [true, 'Muted']], AP.green);
+      y = seg(y, 'Timing', 'pathTiming', [['drawn', 'Speed I drew'], ['beat', 'On the beat']], AP.green, 17);
+      if (!paths.length) { y = wrap('No paths yet. Choose Path up top, then pinch and draw.', X0, y, WC, 18, 24, GL.sub); break; }
+      // mixer: one vertical fader per path, in its colour
+      { const fh = 190, blockH = 24 + fh + 96; y = need(y, blockH); label('Path volumes', y);
+        const cw = Math.min(78, (WC - 8) / paths.length), top = y + 34;
+        paths.forEach((p, i) => { const cx = X0 + i * cw + cw / 2, f = clamp(p.vol, 0, 1), ky = top + fh * (1 - f);
+          g.fillStyle = GL.track; g.fillRect(cx - 1, top, 2, fh); g.fillStyle = p.col; g.fillRect(cx - 2, ky, 4, top + fh - ky);
+          for (let t = 0; t <= 4; t++) { g.fillStyle = 'rgba(255,255,255,.35)'; g.fillRect(cx - 14, top + fh * t / 4 - .75, 8, 1.5); }
+          const hv = isHover(cx - cw / 2, top - 16, cw, fh + 32) || (activeSlider && activeSlider.fader === p);
+          frame(cx - 20, ky - 11, 40, 22, false, hv, null, 6); g.fillStyle = p.col; g.fillRect(cx - 12, ky - 1.5, 24, 3);
+          txt(Math.round(f * 100) + '', cx, top + fh + 20, 16, GL.ink, 'center', '500');
+          g.beginPath(); g.arc(cx, top + fh + 44, 6, 0, 7); g.fillStyle = p.col; g.fill();
+          hits.push({x: cx - cw / 2 + 2, y: top - 16, w: cw - 4, h: fh + 32, fader: p, top, fh, key: 'f' + i});
+          const by = top + fh + 58; frame(cx - 17, by, 34, 30, false, isHover(cx - 17, by, 34, 30), null, 8);
+          g.strokeStyle = AP.red; g.lineWidth = 2.5; g.beginPath(); g.moveTo(cx - 6, by + 8); g.lineTo(cx + 6, by + 22); g.moveTo(cx + 6, by + 8); g.lineTo(cx - 6, by + 22); g.stroke();
+          hits.push({x: cx - 17, y: by, w: 34, h: 30, fn: () => deletePathUser(p), key: 'del' + i}); });
+        y = top + fh + 104; }
+      y = need(y, 64); button(X0, y, Math.min(WC, 220), 50, 'Clear all', false, () => clearAllPaths(), 18);
       break; }
   }
   g.setTransform(1, 0, 0, 1, 0, 0);
   ptex.needsUpdate = true;
 }
 function hitAt(px, py) { for (let i = hits.length - 1; i >= 0; i--) { const h = hits[i]; if (px >= h.x && px <= h.x + h.w && py >= h.y && py <= h.y + h.h) return h; } return null; }
-function setSlider(h, px) {
+function setSlider(h, px, py) {
+  if (h.fader) { if (py == null) return; h.fader.vol = +clamp(1 - (py - h.top) / h.fh, 0, 1).toFixed(3); panelDirty = true; return; }
   const {key, min, max, step} = h.slider; const f = clamp((px - (h.x + 20)) / (h.w - 40), 0, 1);
   let v = min + f * (max - min); if (step) v = Math.round(v / step) * step; v = +v.toFixed(4);
   if (v !== S[key]) { S[key] = v; onSet(key); }
 }
-function pDown(px, py) { const h = hitAt(px, py); if (!h) return false; if (h.slider) { activeSlider = h; setSlider(h, px); } else h.fn(); panelDirty = true; return true; }
+function pDown(px, py) { const h = hitAt(px, py); if (!h) return false; if (h.slider || h.fader) { activeSlider = h; setSlider(h, px, py); } else h.fn(); panelDirty = true; return true; }
 function pMove(px, py) {
-  hoverPt = [px, py]; if (activeSlider) { setSlider(activeSlider, px); return; }
+  hoverPt = [px, py]; if (activeSlider) { setSlider(activeSlider, px, py); return; }
   const h = hitAt(px, py), k = h ? h.key : ''; if (k !== hoverKey) { hoverKey = k; panelDirty = true; }
 }
-function pUp() { if (activeSlider) { activeSlider = null; panelDirty = true; } }
+function pUp() { if (activeSlider) { if (activeSlider.fader) savePaths(); activeSlider = null; panelDirty = true; } }
 function pLeave() { if (hoverPt) { hoverPt = null; hoverKey = ''; panelDirty = true; } }
 function onSet(k) {
   if (k === 'sens' || k === 'maxLen') { clearTimeout(reTimer); reTimer = setTimeout(() => runAnalysis(false), 250); }
@@ -1065,6 +1174,7 @@ function onSet(k) {
   if (k === 'world') applyWorld();
   if (k === 'reach' || k === 'blend') paths.forEach(computeSeq);
   if (k === 'labels') hands.forEach(h => h.hints && (h.hints.grp.visible = S.labels));
+  if (k === 'menuShape') rebuildPanel();
   saveSettings(); panelDirty = true;
 }
 // desktop panel pointer
@@ -1074,20 +1184,21 @@ pcv.addEventListener('pointermove', e => { const [x, y] = pxy(e); pMove(x, y); }
 pcv.addEventListener('pointerup', () => pUp());
 pcv.addEventListener('pointerleave', () => { if (!activeSlider) pLeave(); });
 
-/* ================= toast ================= */
+/* ================= pop-ups (off unless you turn them on; problems always show) ================= */
 const toastCv = document.createElement('canvas'); toastCv.width = 1024; toastCv.height = 112;
 const toastTex = new THREE.CanvasTexture(toastCv); toastTex.colorSpace = THREE.SRGBColorSpace;
 const toastSp = new THREE.Sprite(new THREE.SpriteMaterial({map: toastTex, transparent: true, depthTest: false, opacity: 0}));
 toastSp.scale.set(0.5, 0.0547, 1); toastSp.position.set(0, -0.17, -0.7); toastSp.renderOrder = 999; camera.add(toastSp);
 let toastUntil = 0, toastT = 0;
-function toast(m) {
-  const t = $('#toast'); t.textContent = m; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 2800);
+function toast(m, important) {
+  if (!S.tips && !important) return;
+  const t = $('#toast'); t.textContent = m; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 2600);
   const g = toastCv.getContext('2d'); g.clearRect(0, 0, 1024, 112);
-  let fs = 34; g.font = `600 ${fs}px ${AF}`; while (g.measureText(m).width > 940 && fs > 18) { fs -= 2; g.font = `600 ${fs}px ${AF}`; }
+  let fs = 32; g.font = `500 ${fs}px ${AF}`; while (g.measureText(m).width > 940 && fs > 18) { fs -= 2; g.font = `500 ${fs}px ${AF}`; }
   const w = Math.min(1012, g.measureText(m).width + 70), x = (1024 - w) / 2;
-  g.fillStyle = 'rgba(250,250,252,.96)'; g.beginPath(); g.roundRect(x, 10, w, 92, 46); g.fill();
-  g.fillStyle = AP.ink; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(m, 512, 57); toastTex.needsUpdate = true;
-  toastUntil = performance.now() + 2800;
+  g.fillStyle = 'rgba(8,12,22,.55)'; g.beginPath(); g.roundRect(x, 12, w, 88, 20); g.fill(); g.lineWidth = 2; g.strokeStyle = 'rgba(255,255,255,.8)'; g.stroke();
+  g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(m, 512, 57); toastTex.needsUpdate = true;
+  toastUntil = performance.now() + 2600;
 }
 
 /* ================= hands ================= */
@@ -1163,17 +1274,17 @@ function updateHand(h) {
     // --- trigger
     if (down(0)) {
       const hd = nearestHandle(tipW, .04);
-      if (hd) { h.drag = {path: hd.path, i: hd.i, off: hd.path.pts[hd.i].clone().sub(tipL)}; buzz(h, .4, 25); }
-      else if (h.mode === 'path') { h.draw = {pts: [tipL.clone()]}; }
+      if (hd) { pushUndo({t: 'edit', p: hd.path, pts: snapPath(hd.path).pts}); h.drag = {path: hd.path, i: hd.i, off: hd.path.pts[hd.i].clone().sub(tipL)}; buzz(h, .4, 25); }
+      else if (h.mode === 'path') { h.draw = {pts: [tipL.clone()], ts: [performance.now() / 1000]}; }
       else startPlay(h);
     }
     if (on(0)) {
       if (h.drag) { const p = h.drag.path; if (paths.includes(p)) { p.pts[h.drag.i].copy(tipL).add(h.drag.off); buildPath(p); } }
-      else if (h.draw) { const pts = h.draw.pts; if (tipL.distanceTo(pts[pts.length - 1]) > .008 / cloud.scale.x) { pts.push(tipL.clone()); showStroke(pts); } }
+      else if (h.draw) { const pts = h.draw.pts; if (tipL.distanceTo(pts[pts.length - 1]) > .008 / cloud.scale.x) { pts.push(tipL.clone()); h.draw.ts.push(performance.now() / 1000); showStroke(pts); } }
     }
     if (up(0)) {
       if (h.drag) { h.drag = null; savePaths(); }
-      else if (h.draw) { const pts = h.draw.pts; h.draw = null; strokeLine.visible = false; if (finishStroke(pts)) buzz(h, .5, 40); }
+      else if (h.draw) { const {pts, ts} = h.draw; h.draw = null; strokeLine.visible = false; if (finishStroke(pts, ts)) buzz(h, .5, 40); }
       else endPlay(h);
     }
   }
@@ -1182,7 +1293,7 @@ function updateHand(h) {
   h.gripOn = on(1);
   // --- A / X
   if (down(4)) {
-    if (h.mode === 'path') { const np = nearestPath(tipL); if (np && np.d < .25) { removePath(np.p); buzz(h, .6, 40); } else toast('Reach toward a path, then press ✕ to delete it.'); }
+    if (h.mode === 'path') { const np = nearestPath(tipL); if (np && np.d < .25) { deletePathUser(np.p); buzz(h, .6, 40); } else toast('Reach toward a path, then press ✕ to delete it.'); }
     else { h.hold = !h.hold; if (!h.hold) dropLatch(h); writeHints(h); toast(h.hold ? 'Hold ON: let go of the trigger and those suns keep playing' : 'Hold OFF'); }
   }
   // --- B (right) = record, Y (left) = menu
@@ -1252,17 +1363,19 @@ function makeTHand(i) {
   const pinchDot = new THREE.Mesh(new THREE.SphereGeometry(.009, 14, 10), new THREE.MeshBasicMaterial({color: '#fff', toneMapped: false, transparent: true, opacity: .8})); pinchDot.visible = false; scene.add(pinchDot);
   const holdRing = new THREE.Mesh(new THREE.TorusGeometry(0.02, 0.002, 8, 32), new THREE.MeshBasicMaterial({color: AP.blue, toneMapped: false})); pinchDot.add(holdRing);
   const tipRings = FINGERS.map(() => { const m = new THREE.Mesh(new THREE.TorusGeometry(.011, .0018, 6, 24), new THREE.MeshBasicMaterial({color: AP.purple, toneMapped: false, transparent: true})); m.visible = false; scene.add(m); return m; });
-  const fplayer = makePlayer('fingers'); fplayer.tips = []; fplayer.n = 0; fplayer.fi = [];
+  const fplayer = makePlayer('fingers'); fplayer.tips = []; fplayer.n = 0; fplayer.fi = []; fplayer.own = [];
+  const sphMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 20), new THREE.MeshBasicMaterial({color: '#ffffff', transparent: true, opacity: .08, depthWrite: false, toneMapped: false}));
+  const sphRing = new THREE.Mesh(new THREE.TorusGeometry(1, .02, 6, 64), new THREE.MeshBasicMaterial({color: AP.teal, transparent: true, opacity: .8, toneMapped: false})); sphMesh.add(sphRing); sphMesh.visible = false; scene.add(sphMesh);
   const pokeDot = new THREE.Mesh(new THREE.CircleGeometry(.006, 18), new THREE.MeshBasicMaterial({color: COL.y, toneMapped: false, depthTest: false})); pokeDot.renderOrder = 90; pokeDot.visible = false;
   const cluster = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 2), new THREE.MeshBasicMaterial({color: COL.amber, wireframe: true, transparent: true, opacity: .22, depthWrite: false})); cluster.visible = false; cloud.add(cluster);
   const H = {isT: true, i, hand, im, bones, pinchDot, holdRing, pokeDot, cluster, side: i ? 'left' : 'right', src: null, on: false,
     pinch: false, wasPinch: false, fist: false, pp: new V3(), gp: new V3(), player: makePlayer('hand'), latch: null, playing: false,
     draw: null, drag: null, poke: false, nearPanel: false, movePanel: null, ignore: false, gripOn: false, twistRef: null, orbArmed: true,
-    tipRings, fplayer, ext: [false, false, false, false, false], plk: [-1, -1, -1, -1, -1], prevTips: FINGERS.map(() => new V3()), plkT: {}, moveCloud: null,
+    tipRings, fplayer, sphMesh, sphRing, str: null, fingersOn: false, ext: [false, false, false, false, false], plk: [-1, -1, -1, -1, -1], prevTips: FINGERS.map(() => new V3()), plkT: {}, moveCloud: null,
     get hold() { return S.hold; }};
   fplayer.hand = H;
   hand.addEventListener('connected', e => { if (!e.data || !e.data.hand) return; H.src = e.data; H.side = e.data.handedness || H.side; H.on = true; });
-  hand.addEventListener('disconnected', () => { H.on = false; H.src = null; im.visible = bones.visible = pinchDot.visible = pokeDot.visible = false; fplayer.active = false; tipRings.forEach(m => m.visible = false); H.gripOn = false; endPlay(H, true); H.draw = null; H.drag = null; });
+  hand.addEventListener('disconnected', () => { H.on = false; H.src = null; im.visible = bones.visible = pinchDot.visible = pokeDot.visible = sphMesh.visible = false; fplayer.active = false; H.fingersOn = false; H.str = null; tipRings.forEach(m => m.visible = false); H.gripOn = false; endPlay(H, true); H.draw = null; H.drag = null; });
   return H;
 }
 const tHands = [makeTHand(0), makeTHand(1)];
@@ -1270,7 +1383,7 @@ const _jp = {}, _hm = new THREE.Matrix4(), _hs = new V3();
 function updateTHand(H) {
   const J = H.hand.joints;
   if (!H.on || !J || !J['wrist'] || !J['index-finger-tip'] || !J['thumb-tip'] || !J['wrist'].visible) {
-    H.im.visible = H.bones.visible = H.pinchDot.visible = H.pokeDot.visible = false; H.gripOn = false; H.fplayer.active = false; H.tipRings.forEach(m => m.visible = false);
+    H.im.visible = H.bones.visible = H.pinchDot.visible = H.pokeDot.visible = H.sphMesh.visible = false; H.gripOn = false; H.fplayer.active = false; H.fingersOn = false; H.str = null; H.tipRings.forEach(m => m.visible = false);
     if (H.playing) endPlay(H, true); return; }
   const P = n => J[n] ? J[n].position : J['wrist'].position;
   // draw the hand: joints + bones
@@ -1283,11 +1396,15 @@ function updateTHand(H) {
   const icurl = P('index-finger-tip').distanceTo(P('index-finger-phalanx-proximal'));
   H.fist = H.fist ? curl < .052 && icurl < .05 : curl < .04 && icurl < .04;
   const pd = th.distanceTo(ix);
-  H.pinch = !H.fist && (H.pinch ? pd < .035 : pd < .018);
+  // Path drawing needs a tight, deliberate pinch (held a few frames); other modes stay light
+  const tight = S.handMode === 'path', onT = tight ? .011 : .018, offT = tight ? .026 : .035;
+  if (H.fist) { H.pinch = false; H.pinchN = 0; }
+  else if (H.pinch) H.pinch = pd < offT;
+  else { H.pinchN = pd < onT ? (H.pinchN || 0) + 1 : 0; H.pinch = H.pinchN >= (tight ? 4 : 1); }
   H.pp.copy(th).add(ix).multiplyScalar(.5);
   H.gp.copy(P('middle-finger-metacarpal'));
-  H.gripOn = H.fist && S.handMode !== 'fingers' && !H.moveCloud;
-  H.pinchDot.visible = !H.fist && S.handMode !== 'fingers' && S.handMode !== 'pluck'; H.pinchDot.position.copy(H.pp);
+  H.gripOn = H.fist && S.handMode !== 'fingers' && !H.moveCloud && !H.str;
+  H.pinchDot.visible = !H.fist && ['pinch', 'pluck', 'path'].includes(S.handMode); H.pinchDot.position.copy(H.pp);
   H.pinchDot.material.color.set(H.pinch ? MODE_COL[S.handMode] : '#ffffff'); H.pinchDot.scale.setScalar(H.pinch ? 1.3 : .8);
   H.holdRing.visible = S.hold; H.holdRing.rotation.z = spin * 2; H.holdRing.lookAt(headPos);
   // poke the floating menu with the index fingertip
@@ -1311,25 +1428,39 @@ function updateTHand(H) {
     else if (panelFloating && S.menu && panelMesh.parent === scene && H.pp.distanceTo(bar.getWorldPosition(new V3())) < .06) { H.movePanel = panelMesh.position.clone().sub(H.pp); tickSound(900); }
     else if (cloudBar.visible && H.pp.distanceTo(cloudBar.getWorldPosition(new V3())) < .07) { H.moveCloud = cloud.position.clone().sub(H.pp); tickSound(900); }
     else { const hd = nearestHandle(H.pp, .045);
-      if (hd) { H.drag = {path: hd.path, i: hd.i, off: hd.path.pts[hd.i].clone().sub(pl)}; tickSound(1000); }
-      else if (S.handMode === 'path') H.draw = {pts: [pl.clone()]};
-      else if (S.handMode === 'pinch') startPlay(H); }
+      if (hd) { pushUndo({t: 'edit', p: hd.path, pts: snapPath(hd.path).pts}); H.drag = {path: hd.path, i: hd.i, off: hd.path.pts[hd.i].clone().sub(pl)}; tickSound(1000); }
+      else if (S.handMode === 'path' && S.erase) { const np = nearestPath(pl); if (np && np.d < .04) { deletePathUser(np.p); tickSound(500); } }
+      else if (S.handMode === 'path') H.draw = {pts: [pl.clone()], ts: [performance.now() / 1000]};
+      else if (S.handMode === 'pinch') startPlay(H);
+      else if (S.handMode === 'pluck' && dots.length) { H.str = {set: nearestN(pl, Math.round(S.notes)), anchor: pl.clone()}; tickSound(1800); } }
   }
   if (H.pinch) {
     if (H.movePanel) { panelMesh.position.copy(H.pp).add(H.movePanel); facePanel(); }
     else if (H.moveCloud) { cloud.position.copy(H.pp).add(H.moveCloud); cloud.updateMatrixWorld(true); }
     else if (H.drag) { const p = H.drag.path; if (paths.includes(p)) { p.pts[H.drag.i].copy(pl).add(H.drag.off); buildPath(p); } }
-    else if (H.draw) { const pts = H.draw.pts; if (pl.distanceTo(pts[pts.length - 1]) > .008 / cloud.scale.x) { pts.push(pl.clone()); showStroke(pts); } }
+    else if (H.draw) { const pts = H.draw.pts; if (pl.distanceTo(pts[pts.length - 1]) > .008 / cloud.scale.x) { pts.push(pl.clone()); H.draw.ts.push(performance.now() / 1000); showStroke(pts); } }
   }
   if (!H.pinch && H.wasPinch) {
     if (H.movePanel) H.movePanel = null;
     else if (H.moveCloud) H.moveCloud = null;
     else if (H.drag) { H.drag = null; savePaths(); }
-    else if (H.draw) { const pts = H.draw.pts; H.draw = null; strokeLine.visible = false; if (finishStroke(pts)) tickSound(1300); }
-    else endPlay(H);
+    else if (H.draw) { const {pts, ts} = H.draw; H.draw = null; strokeLine.visible = false; if (finishStroke(pts, ts)) tickSound(1300); }
+    else if (H.str) { twang(H, pl); H.str = null; }
+    else if (S.handMode === 'pinch') endPlay(H);
     H.ignore = false;
   }
-  if (H.playing) { H.player.active = true; H.player.pt.copy(pl); H.player.speed = twistSpeed(H); }
+  if (H.str) { H.str.pull = pl.distanceTo(H.str.anchor) * cloud.scale.x; H.str.pt = pl.clone(); }
+  // Sphere: the gap between thumb and index is a sphere; suns inside it play
+  H.sphMesh.visible = false;
+  if (S.handMode === 'sphere') {
+    const c = H.pp, rW = Math.max(.006, pd / 2), cl = cloud.worldToLocal(c.clone());
+    const on = !H.fist && pd < .18 && cloudBox.containsPoint(cl) && dots.length > 0;
+    H.sphMesh.visible = !H.fist && pd < .18; H.sphMesh.position.copy(c); H.sphMesh.scale.setScalar(rW); H.sphMesh.lookAt(headPos);
+    H.sphMesh.material.opacity = on ? .1 : .04; H.sphRing.material.opacity = on ? .9 : .35;
+    if (on && !H.playing) startPlay(H); else if (!on && H.playing) endPlay(H, true);
+    H.player.sphereR = on ? rW / cloud.scale.x : null;
+  } else H.player.sphereR = null;
+  if (H.playing) { H.player.active = true; H.player.pt.copy(S.handMode === 'sphere' ? cloud.worldToLocal(H.pp.clone()) : pl); H.player.speed = twistSpeed(H); }
   if (H.latch) { H.latch.ring.rotation.x = spin * 1.3; H.latch.ring.rotation.y = spin * 2.1; }
   // --- which fingers are out (straight + reaching away from the palm), with hysteresis
   const W0 = P('wrist');
@@ -1353,13 +1484,13 @@ function updateTHand(H) {
     const ins = cloudBox.containsPoint(palmL);
     fp.fi = []; fp.tips = [];
     FINGERS.forEach((f, k) => { if (H.ext[k]) { fp.fi.push(k); fp.tips.push(cloud.worldToLocal(P(TIPN(f)).clone())); } });
-    fp.n = fp.tips.length; fp.active = ins && fp.n > 0 && dots.length > 0;
-    fp.speed = 1;
-    if (fp.active) fp.fi.forEach((k, j) => { const m = H.tipRings[k]; m.visible = true; m.position.copy(P(TIPN(FINGERS[k]))); m.lookAt(headPos);
+    fp.n = fp.tips.length; H.fingersOn = ins && fp.n > 0 && dots.length > 0; fp.active = H.fingersOn && !S.fTogether;
+    fp.own = fp.fi.map(k => [H, k]); fp.speed = 1;
+    if (H.fingersOn) fp.fi.forEach((k, j) => { const m = H.tipRings[k]; m.visible = true; m.position.copy(P(TIPN(FINGERS[k]))); m.lookAt(headPos);
       const fl = fp.flash && fp.flash[k] || 0; m.scale.setScalar(1 + fl * .8); m.material.opacity = .55 + fl * .45; });
-  } else fp.active = false;
+  } else { fp.active = false; H.fingersOn = false; }
   if (fp.flash) for (let k = 0; k < 5; k++) fp.flash[k] = (fp.flash[k] || 0) * .86;
-  if (mode === 'pluck' && dots.length && ctx) {
+  if (mode === 'perc' && dots.length && ctx) {
     const sc = cloud.scale.x, now = performance.now();
     FINGERS.forEach((f, k) => {
       const tw = P(TIPN(f)), tl = cloud.worldToLocal(tw.clone());
@@ -1374,14 +1505,34 @@ function updateTHand(H) {
   } else H.tipRings.forEach(m => m.material.color.set(AP.purple));
   H.wasPinch = H.pinch;
 }
+// Pluck: pull the strings back and let go — the suns twang as a quick strum, louder and a touch higher the further you pull
+function twang(H, at) {
+  const st = H.str; if (!st || !st.set.length || !ctx) return;
+  unlock();
+  const pull = st.pull || 0, gain = clamp(.4 + pull * 7, .4, 1.35);
+  let bend = Math.min(3, pull * 25); if (S.snap) bend = Math.round(bend);
+  const sp = Math.pow(2, bend / 12), dir = st.anchor.clone().sub(at), t0 = ctx.currentTime + .005;
+  const order = [...st.set].sort((a, b) => a.tp.distanceTo(at) - b.tp.distanceTo(at));
+  order.forEach((d, i) => { const t = t0 + i * .028; playDot(d, t, .5, sp, panFor(d), gain); flashes.push({d, t, p: H.player}); d.wob = 1; d.wobDir = dir.lengthSq() > 1e-8 ? dir.clone().normalize() : YAX; });
+  tickSound(2400);
+}
+// Fingers, both hands together: one phrase through every finger out, left hand first
+const fAll = makePlayer('fingers'); fAll.tips = []; fAll.n = 0; fAll.own = [];
+function updateFingersTogether() {
+  fAll.active = false; if (S.handMode !== 'fingers' || !S.fTogether) return;
+  const hs = [...tHands].filter(H => H.fingersOn).sort((a, b) => (a.side === 'left' ? 0 : 1) - (b.side === 'left' ? 0 : 1));
+  fAll.tips = []; fAll.own = [];
+  for (const H of hs) H.fplayer.tips.forEach((tp, j) => { fAll.tips.push(tp); fAll.own.push([H, H.fplayer.fi[j]]); });
+  fAll.n = fAll.tips.length; fAll.active = fAll.n > 0;
+}
 function tickSound(f) { if (!ctx || ctx.state !== 'running') return; const t = ctx.currentTime, o = ctx.createOscillator(), g = ctx.createGain();
   o.type = 'sine'; o.frequency.value = f; g.gain.setValueAtTime(.09, t); g.gain.exponentialRampToValueAtTime(.0001, t + .05); o.connect(g); g.connect(master); o.start(t); o.stop(t + .06); }
 function setHandMode(v) {
   S.handMode = v; saveSettings(); panelDirty = true;
   const cm = v === 'path' ? 'path' : 'play';
   for (const h of hands) { h.mode = cm; if (cm === 'path') endPlay(h, true); h.tip.geometry = cm === 'path' ? tipPathGeo : tipPlayGeo; h.tip.material.color.set(cm === 'path' ? COL.y : COL.amber); writeHints(h); }
-  for (const H of tHands) { if (v !== 'pinch') endPlay(H, true); H.fplayer.active = false; H.plk.fill(-1); }
-  toast({pinch: 'Pinch: pinch in the suns to play them', fingers: 'Fingers: reach in, each finger out plays a note', pluck: 'Pluck: touch suns with your fingertips', path: 'Path: pinch and draw through the suns'}[v]);
+  for (const H of tHands) { endPlay(H, true); H.fplayer.active = false; H.fingersOn = false; H.plk.fill(-1); H.str = null; H.player.sphereR = null; }
+  toast(MODE_HELP[v]);
 }
 function setHold(on) {
   S.hold = on; panelDirty = true;
@@ -1391,30 +1542,32 @@ function setHold(on) {
 }
 // --- floating menu (used whenever no left controller is holding it)
 let panelFloating = false;
-const PANEL_W = 0.30, PANEL_H = 0.30 * PH / PW;
 const bar = new THREE.Group();
-{ const b = new THREE.Mesh(new THREE.CapsuleGeometry(.008, .09, 6, 16).rotateZ(Math.PI / 2), new THREE.MeshBasicMaterial({color: '#ffffff', transparent: true, opacity: .92, toneMapped: false})); bar.add(b);
-  bar.position.set(0, -PANEL_H / 2 - .022, 0); bar.visible = false; panelMesh.add(bar); }
+{ const b = new THREE.Mesh(new THREE.CapsuleGeometry(.004, .12, 6, 16).rotateZ(Math.PI / 2), new THREE.MeshBasicMaterial({color: '#ffffff', transparent: true, opacity: .85, toneMapped: false})); bar.add(b);
+  bar.visible = false; panelMesh.add(bar); }
 const orb = new THREE.Group();
-{ orb.add(new THREE.Mesh(new THREE.SphereGeometry(.026, 32, 20), new THREE.MeshBasicMaterial({color: '#f5f5f7', toneMapped: false})));
-  const lab = textSprite('Menu', '#1d1d1f', .02, 'rgba(250,250,252,.95)'); lab.position.y = .05; orb.add(lab); orb.visible = false; scene.add(orb); }
+{ orb.add(new THREE.Mesh(new THREE.SphereGeometry(.026, 32, 20), new THREE.MeshBasicMaterial({color: '#ffffff', transparent: true, opacity: .18, depthWrite: false})));
+  orb.add(new THREE.Mesh(new THREE.TorusGeometry(.027, .0015, 8, 48), new THREE.MeshBasicMaterial({color: '#ffffff', toneMapped: false})));
+  const lab = textSprite('MENU', '#ffffff', .016, 'rgba(8,12,22,.5)'); lab.position.y = .045; orb.add(lab); orb.visible = false; scene.add(orb); }
 function facePanel() { panelMesh.lookAt(headPos); }
 function placePanel() {
   const fwd = new V3(0, 0, -1).applyQuaternion(camera.getWorldQuaternion(new THREE.Quaternion())); fwd.y = 0;
   if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1); fwd.normalize();
   const left = new V3(fwd.z, 0, -fwd.x);
-  panelMesh.position.copy(headPos).addScaledVector(fwd, .42).addScaledVector(left, .3); panelMesh.position.y = headPos.y - .2;
-  facePanel();
+  if (S.menuShape === 'tall') { panelMesh.position.copy(headPos).addScaledVector(fwd, .42).addScaledVector(left, .3); panelMesh.position.y = headPos.y - .2; }
+  else { panelMesh.position.copy(headPos).addScaledVector(fwd, .46); panelMesh.position.y = headPos.y - .42; }
+  facePanel(); panelPlaced = true;
 }
 function updateFloatingMenu() {
   const L = panelHand();
-  if (L) { panelFloating = false; bar.visible = false; orb.visible = false; panelMesh.scale.setScalar(1);
+  bar.position.set(0, -PANEL_H / 2 - .024, 0);
+  if (L) { panelFloating = false; bar.visible = false; orb.visible = false; panelMesh.scale.setScalar(S.menuShape === 'tall' ? .8 : .5);
     if (S.menu) { if (panelMesh.parent !== L.vis) { L.vis.add(panelMesh); panelMesh.position.set(0, 0.15, -0.06); panelMesh.rotation.set(-0.55, 0, 0); } } else if (panelMesh.parent) panelMesh.removeFromParent();
     return; }
   if (!panelFloating) { panelFloating = true; panelDirty = true; if (panelMesh.parent) panelMesh.removeFromParent(); }
   if (S.menu) {
-    if (panelMesh.parent !== scene) { scene.add(panelMesh); panelMesh.scale.setScalar(1.4); if (!orb.userData.placed) placePanel(); else { panelMesh.position.copy(orb.position); facePanel(); } panelDirty = true; }
-    if (panelMesh.position.distanceTo(headPos) > 1.8) placePanel();
+    if (panelMesh.parent !== scene) { scene.add(panelMesh); panelMesh.scale.setScalar(1); if (!orb.userData.placed) placePanel(); else { panelMesh.position.copy(orb.position); facePanel(); } panelDirty = true; }
+    if (!panelPlaced || panelMesh.position.distanceTo(headPos) > 1.8) placePanel();
     bar.visible = true; orb.visible = false;
   } else {
     if (panelMesh.parent === scene) { orb.position.copy(panelMesh.position); orb.userData.placed = true; panelMesh.removeFromParent(); }
@@ -1430,6 +1583,7 @@ function setMouse(e) { desk.mouse.set(e.clientX / innerWidth * 2 - 1, -(e.client
 function rayPlanePoint(through) { _plane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(new V3()), through); return deskRay.ray.intersectPlane(_plane, new V3()); }
 function screenHandle(e) {
   let best = null, bd = 18;
+  if (S.handMode !== 'path') return null;
   for (const p of paths) p.pts.forEach((pt, i) => { const w = cloud.localToWorld(pt.clone()), s = w.clone().project(camera);
     const dx = (s.x + 1) / 2 * innerWidth - e.clientX, dy = (1 - s.y) / 2 * innerHeight - e.clientY, d = Math.hypot(dx, dy); if (s.z < 1 && d < bd) { bd = d; best = {path: p, i, w}; } });
   return best;
@@ -1443,19 +1597,19 @@ renderer.domElement.addEventListener('pointerdown', e => {
   if (e.button !== 0 || renderer.xr.isPresenting) return; unlock(); setMouse(e); desk.down = true;
   renderer.domElement.setPointerCapture(e.pointerId);
   const hd = screenHandle(e);
-  if (hd) desk.drag = {path: hd.path, i: hd.i, w: hd.w};
-  else if (S.handMode === 'path') { const a = deskPlayPoint(); const through = a ? cloud.localToWorld(a.clone()) : cloud.localToWorld(new V3(0, 1.3, 0)); const p = rayPlanePoint(through); if (p) desk.draw = {pts: [cloud.worldToLocal(p)], through}; }
+  if (hd) { pushUndo({t: 'edit', p: hd.path, pts: snapPath(hd.path).pts}); desk.drag = {path: hd.path, i: hd.i, w: hd.w}; }
+  else if (S.handMode === 'path') { const a = deskPlayPoint(); const through = a ? cloud.localToWorld(a.clone()) : cloud.localToWorld(new V3(0, 1.3, 0)); const p = rayPlanePoint(through); if (p) desk.draw = {pts: [cloud.worldToLocal(p)], ts: [performance.now() / 1000], through}; }
   else { desk.player.idx = 0; desk.player.nextT = 0; }
 });
 renderer.domElement.addEventListener('pointermove', e => {
   if (renderer.xr.isPresenting) return; setMouse(e);
   if (desk.drag) { const p = rayPlanePoint(desk.drag.w); if (p) { desk.drag.path.pts[desk.drag.i].copy(cloud.worldToLocal(p)); buildPath(desk.drag.path); } }
-  else if (desk.draw) { const p = rayPlanePoint(desk.draw.through); if (p) { const l = cloud.worldToLocal(p), pts = desk.draw.pts; if (l.distanceTo(pts[pts.length - 1]) > .008) { pts.push(l); showStroke(pts); } } }
+  else if (desk.draw) { const p = rayPlanePoint(desk.draw.through); if (p) { const l = cloud.worldToLocal(p), pts = desk.draw.pts; if (l.distanceTo(pts[pts.length - 1]) > .008) { pts.push(l); desk.draw.ts.push(performance.now() / 1000); showStroke(pts); } } }
 });
 addEventListener('pointerup', e => {
   if (!desk.down) return; desk.down = false;
   if (desk.drag) { desk.drag = null; savePaths(); }
-  else if (desk.draw) { const pts = desk.draw.pts; desk.draw = null; strokeLine.visible = false; finishStroke(pts); }
+  else if (desk.draw) { const {pts, ts} = desk.draw; desk.draw = null; strokeLine.visible = false; finishStroke(pts, ts); }
 });
 addEventListener('keydown', e => { if (e.key === 'p' || e.key === 'P') setHandMode(S.handMode === 'path' ? 'pinch' : 'path'); });
 
@@ -1471,14 +1625,24 @@ function updateSets() {
   const dp = desk.player; dp.active = false; desk.cluster.visible = false;
   if (desk.down && !desk.drag && !desk.draw && !renderer.xr.isPresenting) { const pt = deskPlayPoint(); if (pt) { dp.active = true; dp.pt.copy(pt); live.push([dp, desk.cluster]); } }
   for (const [p, cl] of live) {
+    let r = 0;
+    if (p.sphereR != null) {
+      const inside = dots.filter(d => d.tp.distanceTo(p.pt) < p.sphereR + .012);
+      if (S.pattern === 'speech') inside.sort((a, b) => a.start - b.start); else inside.sort((a, b) => a.note - b.note || a.start - b.start);
+      p.ghost = !inside.length && S.blend && dots.length > 1; p.set = p.ghost ? nearestN(p.pt, 3) : inside;
+      for (const d of inside) { d.sel = 1; if (bi < 80) { ba.setXYZ(bi * 2, p.pt.x, p.pt.y, p.pt.z); ba.setXYZ(bi * 2 + 1, d.lp.x, d.lp.y, d.lp.z); bi++; } }
+      cl.visible = false; continue;
+    }
     let nd = 1e9; for (const d of dots) nd = Math.min(nd, d.tp.distanceTo(p.pt));
     p.ghost = S.blend && dots.length > 1 && nd > GAP;
-    p.set = nearestN(p.pt, p.ghost ? 3 : n); let r = 0;
+    p.set = nearestN(p.pt, p.ghost ? 3 : n);
     for (const d of p.set) { d.sel = 1; r = Math.max(r, d.lp.distanceTo(p.pt));
       if (bi < 80) { ba.setXYZ(bi * 2, p.pt.x, p.pt.y, p.pt.z); ba.setXYZ(bi * 2 + 1, d.lp.x, d.lp.y, d.lp.z); bi++; } }
     cl.visible = p.set.length > 0 && !p.ghost; cl.position.copy(p.pt); cl.scale.setScalar(r + .014);
   }
-  for (const H of tHands) { const fp = H.fplayer; if (!fp.active) continue;
+  for (const H of tHands) { if (!H.str || !H.str.pt) continue; const pt = H.str.pt;
+    for (const d of H.str.set) { d.sel = 1; if (bi < 80) { ba.setXYZ(bi * 2, pt.x, pt.y, pt.z); ba.setXYZ(bi * 2 + 1, d.lp.x, d.lp.y, d.lp.z); bi++; } } }
+  for (const H of tHands) { const fp = H.fplayer; if (!H.fingersOn) continue;
     fp.tips.forEach(tp => { const st = fingerStep(tp); if (st && st.d) { st.d.sel = 1; if (bi < 80) { ba.setXYZ(bi * 2, tp.x, tp.y, tp.z); ba.setXYZ(bi * 2 + 1, st.d.lp.x, st.d.lp.y, st.d.lp.z); bi++; } } }); }
   ba.needsUpdate = true; beams.geometry.setDrawRange(0, bi * 2);
   for (const p of paths) p.player.active = !S.pathMute;
@@ -1495,6 +1659,7 @@ renderer.setAnimationLoop(() => {
     updateFloatingMenu();
     for (const h of hands) updateHand(h);
     for (const H of tHands) { H.dtLast = dt; updateTHand(H); }
+    updateFingersTogether();
     updateGrab();
   }
   runSimJob();
@@ -1510,9 +1675,17 @@ renderer.setAnimationLoop(() => {
     if (h.latch) { h.latch.ring.rotation.x = spin * 1.3; h.latch.ring.rotation.y = spin * 2.1; }
     if (h.model) { h.model.bB.material.color.copy(rec && h.side === 'right' ? REC_RED : DARKB); h.model.trig.material.color.copy(h.playing || h.draw ? ORANGE : DARKB); }
   }
-  for (const p of paths) { const tgt = p.samples[p.player.bead] || p.samples[0]; if (tgt) { p.beadPos.lerp(tgt, 1 - Math.exp(-dt * 18)); p.bead.position.copy(p.beadPos); }
+  for (const p of paths) {
+    if (S.pathTiming === 'drawn' && p.T && p.tmap && p.player.loopT && ctx) {
+      const per = (S.pathDir === 'bounce' ? 2 : 1) * p.T + .06; let el = ((ctx.currentTime - p.player.loopT) % per + per) % per; if (el > p.T) el = Math.max(0, 2 * p.T - el);
+      const f = el / p.T; let lo = 0, hi = 160; while (lo < hi) { const m = (lo + hi) >> 1; if (p.tmap[m] < f) lo = m + 1; else hi = m; } p.player.bead = lo; }
+    const tgt = p.samples[p.player.bead] || p.samples[0]; if (tgt) { p.beadPos.lerp(tgt, 1 - Math.exp(-dt * 18)); p.bead.position.copy(p.beadPos); }
     p.bead.visible = !S.pathMute && p.seq.length > 0;
-    p.handles.forEach(hm => { let near = false; for (const h of hands) if (h.tipW && h.src && cloud.localToWorld(hm.position.clone()).distanceTo(h.tipW) < .04) near = true; hm.scale.setScalar(near ? 1.45 : 1); }); }
+    p.handles.forEach(hm => { let dmin = 9; const w = cloud.localToWorld(hm.position.clone());
+      for (const h of hands) if (h.tipW && h.src && !h.src.hand) dmin = Math.min(dmin, w.distanceTo(h.tipW));
+      for (const H of tHands) if (H.on && H.im.visible) dmin = Math.min(dmin, w.distanceTo(H.pp));
+      const show = S.handMode === 'path' && (xr ? dmin < .12 : true);
+      hm.visible = show; if (show) hm.scale.setScalar(xr ? clamp(1.5 - dmin * 6, .45, 1.4) : 1); }); }
   raysSprite.material.rotation = spin * .02;
   toastSp.material.opacity = xr ? clamp((toastUntil - now) / 400, 0, 1) : 0;
   if (panelDirty || (rec && now - lastPanelDraw > 120)) { if (now - lastPanelDraw > 45 || !xr) drawPanel(); }
@@ -1533,7 +1706,7 @@ async function enter(mode) {
     s.addEventListener('end', () => { passthrough = false; applyWorld(); });
     await renderer.xr.setSession(s); applyWorld();
     toast(dots.length ? 'Pinch inside the suns to play · fist to grab them · poke the menu' : 'Poke REC on the menu and talk or sing to make suns.');
-  } catch (e) { toast("Couldn't start: " + (e.message || e)); }
+  } catch (e) { toast("Couldn't start: " + (e.message || e), true); }
 }
 let mainMode = 'immersive-ar';
 vrBtn.addEventListener('click', () => enter(mainMode));
@@ -1546,9 +1719,9 @@ const off = (el, t) => { el.textContent = t; el.disabled = true; el.style.opacit
   else if (!ar && !vr) { off(vrBtn, 'No headset here'); $('#vrOnly').style.display = 'none'; }
   else if (!vr) $('#vrOnly').style.display = 'none';
 })();
-window.__sx = {updateTHand: H => updateTHand(H), tHands, panelMesh, updateFloatingMenu: () => updateFloatingMenu(), get panelFloating() { return panelFloating; }, setPF: v => { panelFloating = v; }, setSample, blendOf, playBlend, tick, flashes, S, dots: () => dots, paths, hands, desk, cloud, newPath, finishStroke, computeSeq, demoVoice, drawPanel, pDown, players: allPlayers, get ctx() { return ctx; }, get voiceBus() { return voiceBus; }};
+window.__sx = {onSet, updateTHand: H => updateTHand(H), updateFT: () => updateFingersTogether(), fAll, tHands, panelMesh, updateFloatingMenu: () => updateFloatingMenu(), get panelFloating() { return panelFloating; }, setPF: v => { panelFloating = v; }, setSample, blendOf, playBlend, tick, flashes, S, dots: () => dots, paths, hands, desk, cloud, newPath, finishStroke, computeSeq, demoVoice, drawPanel, pDown, players: allPlayers, get ctx() { return ctx; }, get voiceBus() { return voiceBus; }};
 (async () => {
-  try { await document.fonts.load(`34px Bungee`); } catch (e) {}
+  try { await Promise.all([document.fonts.load(`34px Bungee`), document.fonts.load(`500 24px "Space Grotesk"`), document.fonts.load(`600 24px "Space Grotesk"`)]); } catch (e) {}
   hands.forEach(writeHints); panelDirty = true;
   const v = await idbGet();
   if (v && v.data && v.data.length) setSample(v.data, v.sr, false, false); else demoVoice(true);
