@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '487';
+const VERSION = '491';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -384,6 +384,7 @@ async function onNet(m, from){
     case 'doundo': if (NET.guest){ m.redo ? redo() : undo(); } return;
     case 'shots': if (NET.guest) applyShotsMsg(m); return;
     case 'ph': if (NET.guest) applyPhMsg(m); return;
+    case 'hv': if (NET.guest){ NET.hostView = m; NET.hostViewAt = performance.now(); } return;
     case 'live': applyLive(m); if (NET.host) netSend(m); return;
     case 'cam': if (NET.guest){ state.camOn = !!m.on; state.camRecHeld = false; toast(m.on ? 'You have the camera! Pull the trigger to film, let go to stop. Right stick zooms.' : 'The camera went back to the host'); if (!m.on) setRecLabel(''); requestUI(); } return;
     case 'cp': if (NET.host && from === NET.camPeer) NET.camPose = m; return;
@@ -423,7 +424,7 @@ function applyMeta(m){
       let L = layerById(ld.id); if (!L) L = makeLayer(ld.name, ld.vs, ld.id, parent);
       if (L.group.parent !== parent) parent.add(L.group);
       L.char = c ? c.id : null; L.part = c ? (ld.part || 'extra') : null;
-      L.name = ld.name; L.visible = ld.vis; L.group.visible = ld.vis; L.locked = ld.lk; L.anim = ld.anim; L.rest = ld.rest; L.pivot = ld.pivot || null; L._ctr = null; if (!!ld.light !== !!L.light || !!ld.rough !== !!L.rough){ L.light = !!ld.light; L.rough = !!ld.rough; unlight(L); } L.filmOnly = !!ld.film;
+      L.name = ld.name; L.visible = ld.vis; L.group.visible = ld.vis; L.locked = ld.lk; L.anim = ld.anim; L.rest = ld.rest || {p:[0,0,0], q:[0,0,0,1], s:1}; L.pivot = ld.pivot || null; L._ctr = null; if (!!ld.light !== !!L.light || !!ld.rough !== !!L.rough){ L.light = !!ld.light; L.rough = !!ld.rough; unlight(L); } L.filmOnly = !!ld.film;
       if (ld.vs !== L.vs) clearLayerVox(L, ld.vs);
       if (JSON.stringify(ld.mat) !== JSON.stringify(L.matProps)) setLayerMat(L, ld.mat);
     }
@@ -1664,7 +1665,7 @@ function canEdit(){
 }
 let hintT = -1e9;
 function beginStroke(rWorld){
-  if (!canEdit()) return false;
+  if (state.tool==='magic' ? !SCULPT_PHASES.includes(state.phase) : !canEdit()) return false;
   if (state.randColor && ['clay','paint','spray','doodle','blocks'].includes(state.tool) && !(state.tool==='clay' && state.carve)){ let c; do { c = PALETTE[Math.floor(Math.random()*8)]; } while (c===state.color); state.color = c; }
   if (['clay','paint','doodle','blocks'].includes(state.tool) && !state.carve) addRecent(state.color);
   const L = activeLayer();
@@ -1676,6 +1677,9 @@ function beginStroke(rWorld){
     L.strokes.push(s);
   } else if (state.tool==='erase'){
     stroke = {kind:'erase', L, snap:snapStrokes(L), changed:false};
+  } else if (state.tool==='magic'){
+    const per = []; for (const M of domainLayers()) if (M.visible && !M.locked) per.push({L:M, map:new Map(), snap:snapStrokes(M), changed:false});
+    stroke = {kind:'magic', L, per, last:null};
   } else {
     const base = rToL(L, rWorld ?? 0.1);
     if (base < L.vs*0.7) autoFiner(L, base);
@@ -1693,6 +1697,7 @@ function strokeTo(pW, rWorld, pressure, upW, dt, qW){
   const L = stroke.L;
   if (stroke.kind==='blocks'){ blockStrokeTo(pW, qW); return; }
   if (stroke.kind==='angle') return;
+  if (stroke.kind==='magic'){ magicTo(pW, rWorld); return; }
   const p = wToL(L, pW), up = upW ? dToL(L, upW) : new THREE.Vector3(0,1,0), rL = rToL(L, rWorld);
   if (stroke.kind==='vox'){
     const r = clamp(rL, L.vs*0.7, L.vs*MAXVOX);
@@ -1718,6 +1723,15 @@ function strokeTo(pW, rWorld, pressure, upW, dt, qW){
     eraseAt(p, rL);
   }
 }
+function magicTo(pW, rWorld){   // the magic eraser: carve clay and clear doodles and blocks on every layer it was given
+  const step = Math.max(rWorld*0.35, 1e-4), last = stroke.last, n = last ? Math.min(8, Math.floor(last.distanceTo(pW)/step)) : 1;
+  if (last && n < 1) return;
+  for (let i=1;i<=n;i++){ const q = last ? last.clone().lerp(pW, i/n) : pW;
+    for (const e of stroke.per){ const M = e.L, pl = wToL(M, q), rl = rToL(M, rWorld);
+      if (M.chunks.size) applyOp({t:'carve', L:M.id, p:[pl.x,pl.y,pl.z], r:clamp(rl, M.vs*0.7, M.vs*MAXVOX), s:1, col:[0,0,0], seed:0}, e.map);
+      if (M.strokes.length) eraseAt(pl, rl, M, e); } }
+  stroke.last = pW.clone();
+}
 function stamp(p, r, pressure){
   const t = state.tool==='clay' ? (state.carve ? 'carve' : 'clay') : state.tool;
   applyOp({t, L:stroke.L.id, p:[p.x,p.y,p.z], r: t==='spray' ? r*1.4 : r, s:clamp(0.35+0.65*pressure,0.02,1), col:hexRgb(state.color), seed: t==='spray' ? Math.random()*1000 : 0}, stroke.map);
@@ -1742,6 +1756,9 @@ function endStroke(cancel){
     else dropStroke(L, s);
   } else if (stroke.kind==='erase'){
     if (stroke.changed){ pushUndo({type:'strokes', L:L.id, snap:stroke.snap}); sceneDirty=true; }
+  } else if (stroke.kind==='magic'){   // one undo puts back everything the stroke cleared, on every layer
+    const parts = []; for (const e of stroke.per){ if (e.map.size) parts.push({type:'vox', L:e.L.id, map:e.map}); if (e.changed) parts.push({type:'strokes', L:e.L.id, snap:e.snap}); }
+    if (parts.length){ pushUndo(parts.length===1 ? parts[0] : {type:'multi', parts}); sceneDirty = true; }
   }
   stroke = null; requestUI();
 }
@@ -1841,8 +1858,8 @@ function angleBuild(){
   pushBlockW(s, st.L, c, q, [lx, ly, lz], st.boxCol);
   rebuildLiveThrottle();
 }
-function eraseAt(p, r){
-  const L = stroke.L; const tmp = V();
+function eraseAt(p, r, L = stroke.L, rec = stroke){
+  const tmp = V();
   for (const s of [...L.strokes]){
     if (s.type==='blocks'){
       const it = s.items, keep = []; let gone = false;
@@ -1851,7 +1868,7 @@ function eraseAt(p, r){
         if (tmp.distanceTo(p) < r + half*0.8){ gone = true; continue; }
         for (let k=0;k<13;k++) keep.push(it[o+k]);
       }
-      if (gone){ s.items = keep; stroke.changed = true; if (keep.length) rebuildStroke(L, s); else dropStroke(L, s); }
+      if (gone){ s.items = keep; rec.changed = true; if (keep.length) rebuildStroke(L, s); else dropStroke(L, s); }
     } else if (s.pts){
       // erase only the part of the doodle inside the eraser; the rest splits into pieces
       const P = s.pts, U = s.ups || [], segs = []; let cur = null, cut = false;
@@ -1862,7 +1879,7 @@ function eraseAt(p, r){
         cur.pts.push(P[o],P[o+1],P[o+2]); if (U.length) cur.ups.push(U[o],U[o+1],U[o+2]);
       }
       if (!cut) continue;
-      dropStroke(L, s); stroke.changed = true;
+      dropStroke(L, s); rec.changed = true;
       segs.forEach((sg,k)=>{ if (sg.pts.length < 6) return; const ns = {type:s.type, pts:sg.pts, ups:sg.ups, r:s.r, col:s.col, anim:s.anim, seed:(s.seed||1)+k*7919}; L.strokes.push(ns); rebuildStroke(L, ns); });
     }
   }
@@ -2037,7 +2054,7 @@ function setTool(t){
   if (['clay','smooth','paint','spray'].includes(t)) state.lastSculpt = t;
   requestUI();
 }
-function toolFamily(){ if (state.tool==='erase') return state.eraseFor || 'doodle'; if (['clay','smooth','paint','spray'].includes(state.tool)) return 'sculpt'; return state.tool; }
+function toolFamily(){ if (state.tool==='erase') return state.eraseFor || 'doodle'; if (state.tool==='magic') return 'sculpt'; if (['clay','smooth','paint','spray'].includes(state.tool)) return 'sculpt'; return state.tool; }
 function pageFamily(){ return {tools:'sculpt', doodle:'doodle', blocks:'blocks'}[state.phase==='characters' ? state.toolTab : state.page] || toolFamily(); }
 // A flips inside the tab you're on: Sculpt add<->carve, Doodle draw<->erase, Blocks build<->erase
 function flipCarve(){
@@ -2456,11 +2473,12 @@ function stepIn(c){
   const q0 = c.root.quaternion.clone(), upP = new THREE.Vector3(0,1,0).applyQuaternion(q0), tilted = !!c.guide && upP.y < 0.87;   // leaning more than ~30°
   if (tilted){ const f = new THREE.Vector3(0,0,1).applyQuaternion(q0); f.y = 0; if (f.lengthSq() < 0.04){ f.copy(upP); f.y = 0; } if (f.lengthSq() < 1e-6) f.set(0,0,1);
     c.root.quaternion.setFromAxisAngle(_y, Math.atan2(f.x, f.z)); c.root.updateMatrixWorld(true); }
-  for (const P of partsOf(c)) setPoseObj(P.group, P.rest);   // start from the pose you made in Characters
+  for (const P of partsOf(c)){ if (!P.rest) P.rest = {p:[0,0,0], q:[0,0,0,1], s:1}; setPoseObj(P.group, P.rest); }   // start from the pose you made in Characters
   c.root.updateMatrixWorld(true);
   const H = partLayer(c,'head'), LH = partLayer(c,'lh'), RH = partLayer(c,'rh');
   const eyeY = Math.max(0.6, camera.position.y), gHead = c.guide ? c.guide.head[1] : 1.5;   // your real eye height in the room
-  rig.scale.setScalar((c.place.s || 1) * clamp(gHead/eyeY, 0.6, 1.6)); rig.updateMatrixWorld(true);
+  const rootS = c.root.getWorldScale(V()).x || (c.place.s || 1);   // its size right now (a recorded walk can have grown or shrunk it)
+  rig.scale.setScalar(rootS * clamp(gHead/eyeY, 0.2, 5)); rig.updateMatrixWorld(true);   // your eyes at its eyes: its arms are as long as yours
   const parts = [];
   if (c.guide){
     const rootQ = c.root.getWorldQuaternion(new THREE.Quaternion());
@@ -2567,10 +2585,10 @@ function updateEmbodied(){
   let undrift = null;
   if (ride){   // the body keeps its recorded walk, plus a smoothed step toward wherever your head (and a little of your hands) went
     const e = show.embodied, Bm = ridingBase(e), tgt = V(); let ws = 0; e.drift = e.drift || V();
-    for (const part of e.parts){ if (part.body) continue; const w = part.L.part==='head' ? 0.75 : part.side ? 0.125 : 0; if (!w) continue;
+    for (const part of e.parts){ if (part.body) continue; const w = part.L.part==='head' ? 1 : 0; if (!w) continue;   // your head leads the body; waving your hands doesn't drag it
       const tr = part.side ? ctrl[part.side]?.grip : part.tracker; if (!tr) continue;
       const p = V().setFromMatrixPosition(inv.clone().multiply(unscaled(tr).multiply(part.off))); tgt.addScaledVector(p.sub(V().fromArray(part.L.rest.p)), w); ws += w; }
-    if (ws){ tgt.divideScalar(ws); tgt.y = 0; e.drift.lerp(tgt, 0.07); }
+    if (ws){ tgt.divideScalar(ws); tgt.y = 0; const dz = 0.05/Math.max(1e-3, root.scale.x); const dd = tgt.clone().sub(e.drift); if (dd.length() > dz){ dd.setLength(dd.length() - dz); e.drift.addScaledVector(dd, 0.08); } }   // small sways leave it be
     root.parent.updateMatrixWorld(true); setObjMatrix(root, root.parent.matrixWorld.clone().invert().multiply(Bm).multiply(new THREE.Matrix4().makeTranslation(e.drift.x, 0, e.drift.z))); root.updateMatrixWorld(true);
     undrift = new THREE.Matrix4().makeTranslation(-e.drift.x, 0, -e.drift.z);
   }
@@ -3876,6 +3894,7 @@ const WINS = [menuWin, layersWin, previewWin, charsWin, transWin];
 function winVisible(win){
   if (win===menuWin) return state.panelOpen;
   if (win.id==='editor') return state.phase==='edit' && !state.edHidden;
+  if (win===previewWin && hostViewLive()) return true;   // your partner's screen: what your camera sees, or the edit
   if (NET.guest && (win===layersWin || (win===previewWin && !state.camOn))) return false;
   if (win===layersWin) return state.win.layers && SCULPT_PHASES.includes(state.phase) && (state.panelOpen || layersWin.dock!=='hand');
   if (win===transWin) return (state.phase==='perform' || state.phase==='shoot') && (state.panelOpen || transWin.dock!=='hand');
@@ -4423,7 +4442,7 @@ function drawChip(){
   let t='', tc='#fff';
   if (SCULPT_PHASES.includes(state.phase)){
     t = state.tool==='clay' ? (state.carve?'CARVE':'ADD') : state.tool==='blocks' ? ({stamp:'STAMP',box:'BOX',angle:'4-POINT',fill:'FILL'}[state.blockMode]) : state.tool.toUpperCase();
-    tc = state.tool==='clay' ? (state.carve?'#ff3b30':'#34c759') : state.tool==='smooth' ? '#1e6bff' : state.tool==='erase' ? '#ff3b30' : state.color;
+    tc = state.tool==='clay' ? (state.carve?'#ff3b30':'#34c759') : state.tool==='smooth' ? '#1e6bff' : (state.tool==='erase' || state.tool==='magic') ? '#ff3b30' : state.color;
   } else if (state.phase==='shoot'){
     t = rec ? (rec.phase==='rec' ? 'REC '+fmtTime(rec.t) : 'READY…') : play ? 'PLAYING' : (selTake()?.name || 'NO TAKES').toUpperCase();
     tc = rec ? '#ff3b30' : '#1e6bff';
@@ -4450,7 +4469,8 @@ function drawTools(X,W){
   button(X+hw+8,222,hw,52,'− CARVE', state.tool==='clay'&&state.carve, ()=>{setTool('clay'); state.carve=true;}, '#ff3b30');
   { const [mn, mx] = sculptSizeRange(), sz = clamp(state.size, mn, mx);
     slider(X,300,W,'Size  (right stick ↕)', Math.log(sz), Math.log(mn), Math.log(mx), v=>{ state.size = Math.exp(v); }, '#ffd400', fmtLen(sz*sizeScale()*2)+' across'); }
-  para(['Right stick ← →: Sculpt · Doodle · Blocks'], X, 376, 14, '#8f97c7');
+  para(['Right stick ← →: Sculpt · Doodle · Blocks'], X, 364, 14, '#8f97c7');
+  button(X,384,W,46,'✦ Magic eraser: every layer at once',state.tool==='magic',()=>setTool('magic'),'#ff3b30');
   rr(X,440,52,52,12,state.color); txt('Brush color', X+64, 466, 18, '#cfd6ff','left',700);
   hit(X,440,W,52,()=>{state.page='color'; requestUI();});
   const L = activeLayer();
@@ -5300,7 +5320,7 @@ function legendLines(hand){
     if (hand==='L') return SCULPT_PHASES.includes(state.phase) ? [['T','open / close menu'],['X','undo'],['Y','redo']] : [['T','open / close menu']];
     if (!SCULPT_PHASES.includes(state.phase)) return show.embodied ? [['S','where its eyes look'],['T','menu clicks']] : [['T','menu clicks'],['G','move a window']];
   }
-  const ph = state.phase, toolName = {clay: state.carve?'carve':'add clay', smooth:'smooth', paint:'paint', spray:'spray paint', doodle:'doodle', blocks:'blocks', erase:'erase'}[state.tool];
+  const ph = state.phase, toolName = {clay: state.carve?'carve':'add clay', smooth:'smooth', paint:'paint', spray:'spray paint', doodle:'doodle', blocks:'blocks', erase:'erase', magic:'magic erase (all layers)'}[state.tool];
   if (hand==='L') return [['T', menuWin.dock!=='hand' ? 'menu back to hand' : 'open / close menu'],['X','undo'],['Y','redo'],['S', camAdj ? 'move camera screen' : show.embodied ? 'fly · click: blink' : 'fly'],['G', show.embodied ? 'grip a wall: climb' : 'move / scale world']];
   const fam = pageFamily();
   const aLbl = fam==='sculpt' ? (state.tool==='clay' ? (state.carve?'switch to add':'switch to carve') : 'clay add / carve') : state.tool==='erase' ? 'back to '+fam : 'eraser';
@@ -5346,7 +5366,7 @@ const ghost = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({color:'#ffffff
 const ghostEdges = new THREE.LineSegments(new THREE.EdgesGeometry(boxGeo), new THREE.LineBasicMaterial({color:'#ffffff'}));
 ghost.add(ghostEdges); ghost.visible=false; scene.add(ghost);
 function styleCursor(){
-  const col = state.tool==='clay' ? (state.carve ? '#ff3b30' : state.color) : state.tool==='smooth' ? '#1e6bff' : state.tool==='erase' ? '#ff3b30' : state.color;
+  const col = state.tool==='clay' ? (state.carve ? '#ff3b30' : state.color) : state.tool==='smooth' ? '#1e6bff' : (state.tool==='erase' || state.tool==='magic') ? '#ff3b30' : state.color;
   cursor.material.color.set(col); cursorRing.material.color.set(state.tool==='clay' && !state.carve ? '#ffffff' : col);
   cursor.material.opacity = state.tool==='erase' ? 0.18 : 0.42;
 }
@@ -5492,7 +5512,7 @@ addEventListener('keydown', e => {
   else if (k==='y') redo();
   else if (k==='[') { { const [mn,mx] = sculptSizeRange(); state.size=clamp(state.size/1.15,mn,mx); } requestUI(); }
   else if (k===']') { { const [mn,mx] = sculptSizeRange(); state.size=clamp(state.size*1.15,mn,mx); } requestUI(); }
-  else if (SCULPT_PHASES.includes(state.phase) && k>='1' && k<='6') setTool(['clay','smooth','paint','doodle','blocks','erase'][+k-1]);
+  else if (SCULPT_PHASES.includes(state.phase) && k>='1' && k<='7') setTool(['clay','smooth','paint','doodle','blocks','erase','magic'][+k-1]);
   else if (k==='tab'){ state.panelOpen=!state.panelOpen; uiCanvas.style.display=state.panelOpen?'block':'none'; e.preventDefault(); }
 });
 function desktopUpdate(dt){
@@ -7385,6 +7405,20 @@ function guestLayerRow(X, y, W){
   button(X+W-140, y+28, 40, 40, '▶', false, ()=>set(list[(i+1)%list.length]), '#00c7be');
   button(X+W-94, y+28, 94, 40, 'Same as host', !state.gPick, ()=>{ state.gPick = false; requestUI(); }, '#5e2bff');
 }
+// the host's camera picture goes to everyone else: on the Camera tabs what the camera sees, in Edit what the film shows
+function netHostView(){
+  if (!NET.host || !NET.on || !(NET.peers && NET.peers.size)) return; const ph = state.phase; if (ph !== 'shoot' && ph !== 'edit') return;
+  const now = performance.now(); if (now - (netHostView.t||0) < 50) return; netHostView.t = now;
+  shotCam.updateMatrixWorld(true); const p = shotCam.getWorldPosition(V()), q = shotCam.getWorldQuaternion(new THREE.Quaternion());
+  netSend({t:'hv', ph, p:[r4(p.x), r4(p.y), r4(p.z)], q:[r4(q.x), r4(q.y), r4(q.z), r4(q.w)], pm:Array.from(shotCam.projectionMatrix.elements, x => +x.toFixed(5)), a:+(ASPECTS[shots.aspect] || 16/9).toFixed(3)});
+}
+const hostViewLive = () => NET.guest && NET.hostView && !state.camOn && performance.now() - (NET.hostViewAt||0) < 1500 && state.win.partnerView !== false;
+function applyHostView(){   // put our film camera where the host's is, so our preview screen shows the same picture
+  if (!hostViewLive()) return false; const m = NET.hostView;
+  shotCam.position.fromArray(m.p); shotCam.quaternion.fromArray(m.q); shotCam.updateMatrixWorld(true);
+  shotCam.projectionMatrix.fromArray(m.pm); shotCam.projectionMatrixInverse.copy(shotCam.projectionMatrix).invert();
+  previewWin.title = m.ph === 'edit' ? 'Edit · the film' : 'The camera'; return true;
+}
 function netCamGuest(dt){   // the player holding the camera: send where it points, and record when she pulls the trigger
   if (!NET.guest || !state.camOn) return;
   const now = performance.now(); if (now - (netCamGuest.t||0) < 33) return; netCamGuest.t = now;
@@ -7899,7 +7933,7 @@ renderer.setAnimationLoop(() => {
   applyFace(tdt);
   if (NET.guest) netApplyPoses();
   animTime += tdt; animateDoodles(animTime);
-  netTick(); netPoses(); netShots(); netLiveStroke(); netCamGuest(dt); netCamHost(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum(); updateArms(); tickShoulders(tdt); tickPose(tdt); tickThumbs(); updateMonitor(tdt); tickLight(tdt); workView(); updateSelMark(tdt); tickHear(); pathGroup.visible = state.phase==='shoot'; if (pathGroup.visible) sizeKeyDots(); if (xr){ updatePivotDot(); updateCtrlModels(); }
+  netTick(); netPoses(); netShots(); netLiveStroke(); netCamGuest(dt); netCamHost(); netHostView(); updateAvatars(dt); syncTakeEnds(); updateDoodleEdit(tdt); updateFrustum(); updateArms(); tickShoulders(tdt); tickPose(tdt); tickThumbs(); updateMonitor(tdt); tickLight(tdt); workView(); updateSelMark(tdt); tickHear(); pathGroup.visible = state.phase==='shoot'; if (pathGroup.visible) sizeKeyDots(); if (xr){ updatePivotDot(); updateCtrlModels(); }
   if (rec){ uiTick += dt; if (uiTick > 0.25){ uiTick = 0; requestUI(); } }
   processRemesh(xr ? 5 : 10);
   if (pathDirty) rebuildPaths();
@@ -7911,7 +7945,8 @@ renderer.setAnimationLoop(() => {
   applyStage();
   if (xr){
     previewFlip = !previewFlip;
-    if (state.phase==='shoot' || state.phase==='edit' || state.camOn || NET.camPeer){ renderPreview(shotCam); }
+    if (applyHostView()) renderPreview(shotCam);
+    else if (state.phase==='shoot' || state.phase==='edit' || state.camOn || NET.camPeer){ renderPreview(shotCam); }
     else if (state.phase==='perform' && state.mirrorOn && show.embodied) renderPreview(mirrorCam);
     else if (state.phase==='perform' && selTake() && state.win.preview) renderPreview(shotCam);
     const dark = state.phase==='edit' && shots.blackRoom;
@@ -7993,7 +8028,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
