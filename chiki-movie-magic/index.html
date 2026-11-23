@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '524';
+const VERSION = '526';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -121,7 +121,7 @@ const NET_PREFIX = 'chiki-moviemagic-', MAX_GUESTS = 3, PLAYER_COL = ['#ff2d95',
 const netTag = Math.random().toString(36).slice(2,6);
 let netMute = 0, netInOp = 0, uidSeq = 0, netChain = Promise.resolve(), netRecvChain = Promise.resolve();
 let netOps = [], netMetaSig = '', netMetaT = 0, netTickT = 0, netStT = 0, netPoseT = 0, netPoseFullT = 0, netMeT = 0, guestRec = null;
-const netGrabs = new Map(), netSocks = new Map(); let netSockT = 0;   // host: things partners are holding from outside, by key (r = puppet, L = set piece, T = eye target)
+const netGrabs = new Map(), netSocks = new Map(); let netSockT = 0, netLastCk = '';   // host: things partners are holding from outside, by key (r = puppet, L = set piece, T = eye target)
 const netSettle = new Map(), netVox = new Map(), netStTouch = new Map(), netStDrop = new Map(), netStFull = new Set(), netHash = new Map(), netPose = new Map(), netLastPose = new Map(), netRemote = new Map();
 const netQuiet = () => !NET.on || netMute > 0;
 const playerName = n => n===1 ? 'Host' : 'Player '+n;
@@ -273,7 +273,8 @@ function voxMsg(L, keys){
   return {L:L.id, vs:L.vs, ks, u8};
 }
 function metaNow(){
-  return {phase:state.phase, selChar:state.selChar, aw:state.activeWorld, ap:state.activePart, world:state.world,
+  return {phase:state.phase, selChar:state.selChar, aw:state.activeWorld, ap:state.activePart, world:state.world, thirds:!!state.thirds, limit1:limitOn(),
+    takes:(show.takes || []).map(t => ({id:t.id, t0:t.t0, t1:t.t1, who:t.who, clips:t.clips, keys:t.keys})),   // a partner sees the takes (the host keeps what they replaced)
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     chars: show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx, voicePitch:c.voicePitch, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null, lookOn:!!c.lookOn, lookRest:c.lookRest||null, sock:c.sock||null})),
     layers: layers.map(L=>({id:L.id, name:L.name, vs:L.vs, vis:L.visible, lk:L.locked, anim:!!L.anim, rest:L.rest, char:L.char, part:L.part, mat:L.matProps, pivot:L.pivot||null, fwd:L.fwd||null, light:!!L.light, rough:!!L.rough, film:!!L.filmOnly}))};
@@ -317,8 +318,11 @@ function netPoses(){
     const put = (key, o) => { const a = poseArr(o), s2 = a.join(','); if (full || netLastPose.get(key) !== s2){ netLastPose.set(key, s2); k[key] = a; } };
     for (const L of layers) put('L'+L.id, L.group);
     for (const c of show.chars) put('r'+c.id, c.root);
-    for (const c of show.chars) if (c.type === 'sock'){ const a = [r4(c.mouthO.position.x)], s2 = String(a[0]); if (full || netLastPose.get('m'+c.id) !== s2){ netLastPose.set('m'+c.id, s2); k['m'+c.id] = a; } }
-    if (Object.keys(k).length) netSend({t:'pose', k, st:show.t});
+    for (const c of show.chars){   // every mouth and every pair of eyes, as the host sees them
+      const am = [r4(c.mouthO.position.x)], sm = String(am[0]); if (full || netLastPose.get('m'+c.id) !== sm){ netLastPose.set('m'+c.id, sm); k['m'+c.id] = am; }
+      const ae = [r4(c.look.position.x), r4(c.look.position.y), r4(c.look.position.z)], se = ae.join(','); if (full || netLastPose.get('e'+c.id) !== se){ netLastPose.set('e'+c.id, se); k['e'+c.id] = ae; } }
+    const ck = [...controlledKeys()].sort().join(','), sendCk = full || ck !== netLastCk; netLastCk = ck;
+    if (Object.keys(k).length || sendCk) netSend({t:'pose', k, st:show.t, ...(sendCk ? {ck} : {})});
   } else if (show.grab && !show.embodied){   // holding a puppet from outside: the host moves it (and records it)
     if (now - netPoseT < 50) return; netPoseT = now;
     netSend({t:'pose', g:1, k:{[grabKey(show.grab)]: poseArr(grabObj(show.grab))}});
@@ -339,7 +343,8 @@ function netApplyPoses(){
     const own = show.embodied ? show.embodied.c.id : -1;
     for (const [key, a] of netPose){
       if (key[0]==='L'){ const L = layerById(+key.slice(1)); if (L && L.char !== own && !(show.grab && show.grab.L===L)) setPoseArr(L.group, a); }
-      else if (key[0]==='m'){ const c = charById(+key.slice(1)); if (c && !c.sockLive) c.mouthO.position.x = a[0]; }
+      else if (key[0]==='m'){ const c = charById(+key.slice(1)); if (c && !c.sockLive && c.id !== own) c.mouthO.position.x = a[0]; }
+      else if (key[0]==='e'){ const c = charById(+key.slice(1)); if (c && c.id !== own) c.look.position.set(a[0], a[1], a[2] || 0); }
       else { const c = charById(+key.slice(1)); if (c && !c.sockLive && !(embGrab.left && embGrab.left.c===c) && !(embGrab.right && embGrab.right.c===c) && !(show.grab && show.grab.c===c)) setPoseArr(c.root, a); }
     }
   } else if (NET.host){
@@ -381,7 +386,8 @@ function netControlled(set){   // the host leaves puppets that players are in al
 
 // ---- together: a partner sees every panel; taps on the shared ones run on the host (with the partner's own selections), so the world stays one
 const LOCAL_PAGES = new Set(['together','tools','color','doodle','blocks','dmotion','dedit','settings','updates','files','allworlds','ghworlds','soon']);
-const SKIP_CTX = new Set(['world','toastMsg','toastT','phase','labels','fov','flySpeed','mic','micGain','beeps','worldId','dialOpen','recent','_asGuest','gPick']);
+const SHARED_KEYS = new Set(['world','thirds','limit1']);   // one value for everyone
+const SKIP_CTX = new Set(['world','thirds','limit1','toastMsg','toastT','phase','labels','fov','flySpeed','mic','micGain','beeps','worldId','dialOpen','recent','_asGuest','gPick']);
 let remoteFrom = null, remoteDown = null; const remoteTaps = new Map(), scratchWins = {};
 const isGuestUI = () => !!(NET.guest || state._asGuest);
 function uiCtx(){ const o = {}; for (const k in state){ if (SKIP_CTX.has(k)) continue; const v = state[k]; if (typeof v === 'function') continue;
@@ -390,7 +396,7 @@ function remoteWinKey(win, x, y){
   if (!NET.guest || !NET.synced) return null;
   if (win === menuWin) return (x >= 100 && y >= 70 && !LOCAL_PAGES.has(state.page)) ? 'menu' : null;
   if (y < 48) return null;   // a window's own header (move, close) stays yours
-  if (win === layersWin) return 'layers'; if (win === charsWin) return 'chars'; if (win === transWin) return 'trans'; if (win.id === 'editor') return 'editor';
+  if (win === layersWin) return 'layers'; if (win === transWin) return 'trans'; if (win.id === 'editor') return 'editor';
   if (win.isPage) return LOCAL_PAGES.has(win.page) ? null : 'page:'+win.page; return null; }
 function scratchWin(page){ if (scratchWins[page]) return scratchWins[page]; const cv = document.createElement('canvas'); cv.width = 380; cv.height = UIH;
   return (scratchWins[page] = {id:'page:'+page, canvas:cv, ctx:cv.getContext('2d'), tex:{needsUpdate:false}, hits:[], cw:380, ch:UIH, dock:'room', isPage:true, page, title:page}); }
@@ -408,7 +414,7 @@ function remoteTap(m, from){
   finally {
     for (const k in state){ if (SKIP_CTX.has(k)) continue; let s; try { s = JSON.stringify(state[k]); } catch(e){ continue; } if (s === undefined || s.length > 20000) continue; if (JSON.stringify(ctx[k]) !== s) out[k] = JSON.parse(s); }
     for (const k of Object.keys(state)) if (!prevKeys.has(k)) delete state[k];
-    for (const k in keep) if (k !== 'world') state[k] = keep[k];
+    for (const k in keep) if (!SHARED_KEYS.has(k)) state[k] = keep[k];
     remoteFrom = null; const r = remoteTaps.get(from); if (r) r.st = {...ctx, ...out};
     if (Object.keys(out).length){ netTick(true); netSend({t:'tapres', st:out}, from); }   // the world first, then their screen
     drawUI(); requestUI();
@@ -434,7 +440,7 @@ async function onNet(m, from){
     case 'st': applySt(m); if (NET.host) netSend(m); return;
     case 'sl': applySl(m); if (NET.host) netSend(m); return;
     case 'pose':
-      if (NET.guest){ for (const key in m.k) netPose.set(key, m.k[key]); }
+      if (NET.guest){ for (const key in m.k) netPose.set(key, m.k[key]); if (m.ck != null) NET.hostCk = new Set(m.ck ? m.ck.split(',') : []); }
       else if (m.g){ for (const key in m.k) netGrabMove(key, m.k[key], from); }
       else if (m.c != null && NET.assign.get(m.c) === from) netRemote.set(m.c, {peer:from, k:m.k, f:m.f});
       return;
@@ -477,12 +483,15 @@ async function onNet(m, from){
     case 'ui': { const p2 = NET.peers.get(NET.host ? from : m.from); if (NET.host) netSend({...m, from}); if (p2) setPeerUI(p2, m.img); return; }
     case 'out': for (const [cid, pid] of [...NET.assign]) if (pid===from){ NET.assign.delete(cid); netRemote.delete(cid); } requestUI(); return;
     case 'rec':
-      NET.hostRec = !!m.on; if (m.on) guestRecStart(); else guestRecStop(m.keep);
+      NET.hostRec = !!m.on; if (m.on){ guestRecStart(); if (guestRec) guestRec.at = m.at || 0; } else guestRecStop(m.keep);
       return;
     case 'voice': {
       const p = NET.peers.get(from);
-      const clip = {id:show.audioSeq++, b64:m.b64, mime:m.mime, dur:m.dur, at:0, vol:1, fx:'none', name:(m.who ? m.who+' · ' : '')+playerName(p ? p.n : 2)};
+      const lt = lastTake && Date.now() - lastTake.at < 60000 ? lastTake : null;
+      const clip = {id:show.audioSeq++, b64:m.b64, mime:m.mime, dur:m.dur, at:m.at ?? (lt ? lt.t0 : 0), vol:1, fx:'none', name:(m.who ? m.who+' · ' : '')+playerName(p ? p.n : 2)};
       voiceFromChar(clip, m.cid); clip.name = (m.who ? m.who+' · ' : '')+playerName(p ? p.n : 2);
+      if (m.cid != null && clip.cid === m.cid) overwriteVoice(clip, lt ? lt.id : null);   // they re-recorded from inside: their old lines in that stretch go quiet
+      if (lt){ lt.clips = [...(lt.clips || []), clip.id]; if (clip.cid != null && !lt.who.includes(clip.cid)) lt.who.push(clip.cid); }
       show.audio.push(clip); try { await decodeClip(clip); } catch(e){}
       sceneDirty = true; toast(playerName(p ? p.n : 2)+"'s voice is in the show"); requestUI(); return; }
   }
@@ -514,6 +523,7 @@ function applyMeta(m){
     if (JSON.stringify(m.world) !== JSON.stringify(state.world)){ state.world = m.world; applyWorld(); }
     const ls = JSON.stringify(m.lights); if (ls !== NET.lightSig){ NET.lightSig = ls; clearLights(); for (const ld of m.lights) makeLight(ld); }
     if (!state.gPick || !charById(state.selChar)) state.selChar = m.selChar;
+    state.thirds = !!m.thirds; state.limit1 = m.limit1 !== false; if (m.takes) show.takes = m.takes;
     if (!state.gPick || !layerById(state.activeWorld)) state.activeWorld = m.aw; if (!state.gPick || !layerById(state.activePart)) state.activePart = m.ap;
     if (m.phase !== state.phase) setPhase(m.phase);
   } finally { netMute--; }
@@ -589,7 +599,7 @@ function guestRecStop(keep){
   const g2 = guestRec; guestRec = null; if (!g2) return;
   const dur = (performance.now() - g2.t0)/1000, who = show.embodied ? show.embodied.c.name : null, cid = show.embodied ? show.embodied.c.id : null;
   g2.mr.onstop = async () => { if (!keep || !g2.chunks.length) return; const blob = new Blob(g2.chunks, {type:g2.mr.mimeType || 'audio/webm'});
-    netSend({t:'voice', b64:u8ToB64(new Uint8Array(await blob.arrayBuffer())), mime:g2.mr.mimeType, dur, who, cid}); };
+    netSend({t:'voice', b64:u8ToB64(new Uint8Array(await blob.arrayBuffer())), mime:g2.mr.mimeType, dur, who, cid, at:g2.at}); };
   if (g2.mr.state !== 'inactive') g2.mr.stop();
 }
 
@@ -809,13 +819,14 @@ function wsola(x, f){
   return y;
 }
 // a newer take of the same voice replaces the older one where they overlap (no doubled-up mic)
-function overwriteVoice(clip){
+let lastTake = null;
+function overwriteVoice(clip, takeId){
   const a0 = clip.at || 0, a1 = a0 + (clip.dur || 0); if (a1 - a0 < 0.05) return;
   show.audio = show.audio.flatMap(a => {
     if ((a.cid ?? null) !== (clip.cid ?? null)) return [a];
     const b0 = a.at || 0, b1 = b0 + (a.dur || 0); if (b1 <= a0 || b0 >= a1) return [a];
-    if (b0 >= a0 - 0.05 && b1 <= a1 + 0.05) return [{...a, _peaks:null, mute: [...(a.mute || []), [+b0.toFixed(3), +b1.toFixed(3)]]}];   // fully covered: silenced (kept, can be restored)
-    return [{...a, _peaks:null, mute: [...(a.mute || []), [+Math.max(a0, b0).toFixed(3), +Math.min(a1, b1).toFixed(3)]]}];
+    if (b0 >= a0 - 0.05 && b1 <= a1 + 0.05) return [{...a, _peaks:null, mute: [...(a.mute || []), [+b0.toFixed(3), +b1.toFixed(3), null, takeId ?? null]]}];   // fully covered: silenced (kept, can be restored)
+    return [{...a, _peaks:null, mute: [...(a.mute || []), [+Math.max(a0, b0).toFixed(3), +Math.min(a1, b1).toFixed(3), null, takeId ?? null]]}];
   });
 }
 function voiceMutes(c){ const at = c.at || 0, end = at + (c.dur || 0), m = (c.mute || []).slice();
@@ -824,11 +835,11 @@ function playBuf(c, buf){
   buf = pitchBuf(c, buf);
   const mutes = voiceMutes(c);
   if (!buf || !mutes.length) return buf;
-  const key = c.id+'|m|'+(c.pitch||0)+'|'+JSON.stringify(mutes)+'|'+buf.length; if (pitchCache.has(key)) return pitchCache.get(key);
+  const key = c.id+'|m|'+(c.pitch||0)+'|'+JSON.stringify(mutes)+'|'+(c.bleep?1:0)+'|'+buf.length; if (pitchCache.has(key)) return pitchCache.get(key);
   const sr = buf.sampleRate, at = c.at || 0, fade = Math.round(sr*0.02), out = new AudioBuffer({length:buf.length, numberOfChannels:buf.numberOfChannels, sampleRate:sr});
   for (let ch=0; ch<buf.numberOfChannels; ch++){ const d = out.getChannelData(ch); d.set(buf.getChannelData(ch));
-    for (const [m0, m1] of mutes){ const i0 = Math.max(0, Math.round((m0-at)*sr)), i1 = Math.min(d.length, Math.round((m1-at)*sr));
-      for (let i=i0;i<i1;i++) d[i] = 0;
+    for (const mm of mutes){ const [m0, m1] = mm, i0 = Math.max(0, Math.round((m0-at)*sr)), i1 = Math.min(d.length, Math.round((m1-at)*sr)), bl = c.bleep && mm[2] === 'u';
+      for (let i=i0;i<i1;i++) d[i] = bl ? 0.2*Math.sin(2*Math.PI*1000*(i - i0)/sr) : 0;   // silence, or a TV bleep
       for (let k=1;k<=fade;k++){ const g2 = k/fade; if (i0-k >= 0) d[i0-k] *= g2; if (i1+k-1 < d.length) d[i1+k-1] *= g2; } } }
   pitchCache.set(key, out); return out;
 }
@@ -857,7 +868,7 @@ const state = {
   confirm:null, toastMsg:'', toastT:0,
 };
 const shots = {takes:[], seq:[], sel:null, seqSel:null, aspect:'1:1', res:1080, fps:30, blackRoom:true, showAll:false, playhead:0, takeSeq:1, keyT:0, keySel:-1};
-const show = {music:{song:-1, speed:1, vol:0.5}, tracks:{}, audio:[], chars:[], t:0, playing:false, rec:null, grab:null, embodied:null, charSeq:1, audioSeq:1};
+const show = {music:{song:-1, speed:1, vol:0.5}, tracks:{}, audio:[], takes:[], chars:[], t:0, playing:false, rec:null, grab:null, embodied:null, charSeq:1, audioSeq:1};
 
 /* ---------------- renderer / scene ---------------- */
 const renderer = new THREE.WebGLRenderer({antialias:true});
@@ -2306,8 +2317,9 @@ function newCharacter(type){
 }
 function deleteChar(c){
   if (show.embodied && show.embodied.c===c) stepOut();
+  clearCharMotion(c, true);   // its moves and its voice go too, in every scene
   for (const L of partsOf(c)) removeLayer(L);
-  delete show.tracks['r'+c.id]; delete show.tracks['e'+c.id]; delete show.tracks['m'+c.id]; actors.remove(c.root);
+  actors.remove(c.root); for (const sd of ['left','right']) if (state.socks && state.socks[sd] === c.id) state.socks[sd] = null;
   show.chars = show.chars.filter(x=>x!==c);
   if (state.selChar===c.id) state.selChar = show.chars[0]?.id ?? null;
   sceneDirty = true; requestUI();
@@ -2325,7 +2337,7 @@ function placeChar(c){
       out[i+1] = r4(p.x); out[i+2] = r4(p.y); out[i+3] = r4(p.z); out[i+4] = r4(q.x); out[i+5] = r4(q.y); out[i+6] = r4(q.z); out[i+7] = r4(q.w); out[i+8] = +(S[i+8]*k).toFixed(4); }
     show.tracks['r'+c.id] = {samples:out}; motionDirty = true; applyShowPose(t); }
 }
-function offStage(c){ const b = snapShow(); if (show.embodied && show.embodied.c===c) stepOut(); c.placed = false; c.root.visible = false; pushUndo({type:'show', snap:b}); sceneDirty = true; toast(c.name+' is off stage in this scene · "Place" brings them back'); requestUI(); }
+function offStage(c){ const b = snapShow(); if (show.embodied && show.embodied.c===c) stepOut(); const had = Object.keys(show.tracks).some(k => keyChar(k) === c.id) || show.audio.some(a => a.cid === c.id); clearCharMotion(c, false); c.placed = false; c.root.visible = false; if (had) setTimeout(() => toast(c.name+' · moves and voice in this scene cleared too · X undoes'), 1600); pushUndo({type:'show', snap:b}); sceneDirty = true; toast(c.name+' is off stage in this scene · "Place" brings them back'); requestUI(); }
 function placeCharRaw(c){
   if (!c) return;
   const before = snapShow();
@@ -2387,6 +2399,7 @@ function controlledKeys(){
   for (const sd of ['left','right']) if (embGrab[sd]) set.add('r'+embGrab[sd].c.id);
   for (const c of show.chars) if (c.type === 'sock' && c.sockLive){ set.add('r'+c.id); set.add('m'+c.id); }   // socks on your hands
   netControlled(set);
+  if (NET.guest && NET.hostCk) for (const k of NET.hostCk) set.add(k);   // what the host is driving live: take it from the host
   return set;
 }
 const ZERO_POSE = {p:[0,0,0], q:[0,0,0,1], s:1};
@@ -2433,7 +2446,7 @@ const _fh = {p:new THREE.Vector3(), q:new THREE.Quaternion(), s:new THREE.Vector
 function hasMoves(key){ const tr = show.tracks[key]; if (tr && tr.samples && tr.samples.length) return true; const rk = show.rec && show.rec.phase==='rec' ? show.rec.keys.get(key) : null; return !!(rk && rk.length >= 9); }
 function followHead(c, ctl){
   const H = partLayer(c,'head'); if (!H) return; const hk = String(H.id);
-  if (ctl.has(hk) || !hasMoves(hk)) return;   // someone is in it right now (everything rides along live), or the head never moved
+  if (!ctl.has(hk) && !hasMoves(hk)) return;   // the head never moved: everything rests where it was made (live or recorded, the rest rides on it)
   const Hm = new THREE.Matrix4().compose(H.group.position, H.group.quaternion, H.group.scale), D = Hm.clone().multiply(restM(H).invert());
   for (const L of partsOf(c)){ if (L === H || ctl.has(String(L.id))) continue;
     if (RIDERS.includes(L.part)) D.clone().multiply(restM(L)).decompose(L.group.position, L.group.quaternion, L.group.scale);
@@ -2453,10 +2466,10 @@ function lookRestOf(c){
   return {p:p.toArray(), q:[0,0,0,1], s:0.12*s};
 }
 function snapShow(){
-  return {tracks:{...show.tracks}, audio:show.audio.slice(), chars:show.chars.map(c=>({id:c.id, name:c.name, place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}))};
+  return {tracks:{...show.tracks}, audio:show.audio.slice(), takes:(show.takes || []).slice(), chars:show.chars.map(c=>({id:c.id, name:c.name, place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}))};
 }
 function restoreShow(s){
-  show.tracks = {...s.tracks}; show.audio = s.audio.slice();
+  show.tracks = {...s.tracks}; show.audio = s.audio.slice(); if (s.takes) show.takes = s.takes.slice();
   for (const sc of s.chars){ const c = charById(sc.id); if (c){ c.name = sc.name; c.place = JSON.parse(JSON.stringify(sc.place)); c.placed = sc.placed; } }
   requestUI();
 }
@@ -2988,14 +3001,19 @@ function cutShowRec(cancel){
   show.rec = null; setRecLabel(''); audioStop();
   if (NET.host) netSend({t:'rec', on:0, keep: r.phase==='rec' && !cancel});
   if (r.phase!=='rec' || cancel){ if (r.mr && r.mr.state!=='inactive') r.mr.stop(); requestUI(); return; }
-  let n = 0;
+  let n = 0; show.takes ||= []; const tk = {id:(Math.max(0, ...show.takes.map(o => o.id)) + 1), t0:r.t0 || 0, t1:r.t, keys:[], rng:{}, before:{}, clips:[], who:[], at:Date.now()};
   for (const [key, samples] of r.keys){ if (samples.length >= 18){ const old = show.tracks[key];   // overwrite the overlap, keep what's before and after
-    if (!(old && old.samples.length) && samples[0] > 0.05) samples.unshift(0, ...samples.slice(1, 9));   // nothing before: hold your first pose from the start
-    show.tracks[key] = {samples: old && old.samples.length ? punchSplice(old.samples, samples, samples.start ?? r.t0 ?? 0, samples[samples.length-9]) : samples}; n++; } }
+    const had = !!(old && old.samples.length);
+    if (!had && samples[0] > 0.05) samples.unshift(0, ...samples.slice(1, 9));   // nothing before: hold your first pose from the start
+    const s0 = had ? (samples.start ?? r.t0 ?? 0) : 0, s1 = samples[samples.length-9];
+    tk.keys.push(key); tk.rng[key] = [s0, s1]; tk.before[key] = had ? old.samples.filter((v, i, A) => { const b0 = i - i % 9; return A[b0] >= s0 - 1e-4 && A[b0] <= s1 + 1e-4; }) : null;
+    const cid = keyChar(key); if (cid != null && !tk.who.includes(cid)) tk.who.push(cid);
+    show.tracks[key] = {samples: had ? punchSplice(old.samples, samples, s0, s1) : samples}; n++; } }
   let clip = null;
   if (r.mr){
     clip = {id: show.audioSeq++, b64:null, mime:r.mr.mimeType, dur:r.t - (r.t0||0), at:r.t0||0}; voiceFromChar(clip, r.who);
-    if (r.inside != null && r.inside === clip.cid) overwriteVoice(clip);   // only re-recording from inside the puppet replaces its voice
+    if (r.inside != null && r.inside === clip.cid) overwriteVoice(clip, tk.id);   // only re-recording from inside the puppet replaces its voice
+    tk.clips.push(clip.id); if (clip.cid != null && !tk.who.includes(clip.cid)) tk.who.push(clip.cid);
     show.audio.push(clip);
     r.mr.onstop = async () => {
       const blob = new Blob(r.chunks, {type: r.mr.mimeType || 'audio/webm'});
@@ -3006,6 +3024,7 @@ function cutShowRec(cancel){
     if (r.mr.state!=='inactive') r.mr.stop();
   }
   if (!n && !clip){ toast('Nothing moved or spoken: grab a character, step into a puppet, or use Voice only'); requestUI(); return; }
+  show.takes.push(tk); lastTake = tk; while (show.takes.length > 20) show.takes.shift();   // the last 20 takes can each be deleted
   if (show.grab) show.grab.before = snapShow();
   pushUndo({type:'show', snap:r.before}); sceneDirty = true;
   toast((r.t0 > 0 ? 'Redid '+fmtTime(r.t0)+'–'+fmtTime(r.t) : 'Recorded '+fmtTime(r.t))+(n?' · '+n+' moving part'+(n>1?'s':''):'')+(clip?' · voice':'')); requestUI();
@@ -3018,7 +3037,7 @@ function updateShow(dt){
     if (r.phase==='count'){
       r.t -= dt; const n = Math.ceil(r.t); if (n>0){ setRecLabel(String(n)); if (n!==r.lastN){ r.lastN = n; beep(660); } }
       if (r.t <= 0){
-        r.phase='rec'; r.t=r.t0||0; show.t=r.t; r._wall = performance.now(); pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(r.t); if (NET.host) netSend({t:'rec', on:1});
+        r.phase='rec'; r.t=r.t0||0; show.t=r.t; r._wall = performance.now(); pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(r.t); if (NET.host) netSend({t:'rec', on:1, at:r.t0 || 0});
         if (state.mic && micStream && window.MediaRecorder){
           try { r.mr = micRecorder(); r.mr.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); }; r.mr.start(250); } catch(e){ toast('Mic recording failed'); }
         }
@@ -3026,6 +3045,7 @@ function updateShow(dt){
       return;
     }
     r.t += realDt(r); show.t = r.t;
+    if (limitOn() && r.t >= 60){ cutShowRec(); toast('1:00 · the take stopped at the 1-minute limit (⏱ on the show bar turns it off)'); return; }
     if (show.embodied){ r.who = show.embodied.c.id; r.inside = show.embodied.c.id; } else if (show.grab && show.grab.c) r.who = show.grab.c.id; else if (r.who == null && r.voiceFor) r.who = r.voiceFor;
     setRecLabel('● REC '+fmtTime(r.t));
     if (r.t - r.last >= 1/45){
@@ -3051,10 +3071,10 @@ function updateShow(dt){
 let scenes = [{id:1, name:'Scene 1', tracks:null, audio:null, places:null}], curScene = 1, sceneSeq = 2;
 const sceneById = id => scenes.find(x=>x.id===id);
 const sceneTakes = () => shots.takes.filter(t=>(t.sceneId ?? 1)===curScene);
-function stashScene(){ const sc = sceneById(curScene); if (!sc) return; sc.tracks = show.tracks; sc.audio = show.audio; sc.music = show.music; sc.places = Object.fromEntries(show.chars.map(c=>[c.id, {place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}])); }
+function stashScene(){ const sc = sceneById(curScene); if (!sc) return; sc.tracks = show.tracks; sc.audio = show.audio; sc.music = show.music; sc.takes = show.takes || []; sc.places = Object.fromEntries(show.chars.map(c=>[c.id, {place:JSON.parse(JSON.stringify(c.place)), placed:c.placed}])); }
 function loadScene(id){
   const sc = sceneById(id); if (!sc) return;
-  show.tracks = sc.tracks || {}; show.audio = sc.audio || []; show.music = sc.music || {song:-1, speed:1, vol:0.5};
+  show.tracks = sc.tracks || {}; show.audio = sc.audio || []; show.music = sc.music || {song:-1, speed:1, vol:0.5}; show.takes = sc.takes || [];
   for (const c of show.chars){ const pl = sc.places && sc.places[c.id]; if (pl){ c.place = JSON.parse(JSON.stringify(pl.place)); c.placed = pl.placed; } }
   curScene = id;
 }
@@ -3251,6 +3271,7 @@ function updateRecording(dt){
     return;
   }
   rec.t += realDt(rec);
+  if (limitOn() && rec.t >= 60){ stopRecording(); toast('1:00 · filming stopped at the 1-minute limit (⏱ on the show bar turns it off)'); return; }
   if (rec.t - rec.last >= 1/60){
     rec.last = rec.t;
     const fs = rec.fovS; if (!fs.length || Math.abs(fs[fs.length-1]-state.fov) > 0.05) fs.push(+rec.t.toFixed(3), +state.fov.toFixed(2));
@@ -3899,7 +3920,7 @@ function serialize(){
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
     shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, sceneId:c.sceneId ?? null, seq:c.seq.slice(), mix:c.mix||{}, fin:c.fin||0, fout:c.fout ?? null}))), sceneCut:shots.sceneCut||{}, xfade:shots.xfade ?? 0.3, cut:shots.cut, clipSeq:shots.clipSeq||1},
-    scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, music:sc.music||null, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null, k0:a.k0 ?? null, k1:a.k1 ?? null})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}]))}))), curScene, sceneSeq,
+    scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, music:sc.music||null, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null, k0:a.k0 ?? null, k1:a.k1 ?? null, bleep:!!a.bleep})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}])), takes:(sc.takes||[]).map(t=>({...t, before:Object.fromEntries(Object.entries(t.before||{}).map(([k,v])=>[k, v ? r5(v) : null]))}))}))), curScene, sceneSeq,
     show: {music:show.music, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null, k0:a.k0 ?? null, k1:a.k1 ?? null})),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx||'none', voicePitch:c.voicePitch||0, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null, lookOn:!!c.lookOn, lookRest:c.lookRest||null, sock:c.sock||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
     layers: layers.map(L => ({
@@ -3916,7 +3937,7 @@ function clearScene(){
   for (const L of layers){ L.group.parent?.remove(L.group); disposeMesh(L.group); }
   for (const c of show.chars) actors.remove(c.root);
   layers = []; dirty.clear(); undoStack.length=0; redoStack.length=0;
-  show.tracks = {}; show.audio = []; show.chars = []; show.embodied = null; show.grab = null; show.t = 0; audioBufs.clear();
+  show.tracks = {}; show.audio = []; show.takes = []; show.chars = []; show.embodied = null; show.grab = null; show.t = 0; audioBufs.clear();
   state.selChar = null; state.activePart = null;
   scenes = [{id:1, name:'Scene 1', tracks:null, audio:null, places:null}]; curScene = 1; sceneSeq = 2;
 }
@@ -4498,8 +4519,9 @@ function drawTransWin(){
   g.clearRect(0,0,W,win.ch); rr(0,0,W,win.ch,18,'#151935');
   const scn = sceneById(curScene), busy = !!(show.rec || rec);
   button(10,8,40,40,'◀',false,()=>{ if (!busy) cycleScene(-1); },'#ff2d95');
-  rr(56,8,W-56-46-128-62,40,10,'#0d1029'); txt(scn ? (scn.name.length > 13 ? scn.name.slice(0,12)+'…' : scn.name) : '', 56+(W-292)/2, 28, 16, '#fff','center'); hit(56,8,W-292,40,()=>openRename('scene', curScene));
-  button(W-128-46-62,8,40,40,'▶',false,()=>{ if (!busy) cycleScene(1); },'#ff2d95');
+  rr(56,8,W-56-46-128-62-70,40,10,'#0d1029'); txt(scn ? (scn.name.length > 11 ? scn.name.slice(0,10)+'…' : scn.name) : '', 56+(W-362)/2, 28, 16, '#fff','center'); hit(56,8,W-362,40,()=>openRename('scene', curScene));
+  button(W-128-46-62-70,8,40,40,'▶',false,()=>{ if (!busy) cycleScene(1); },'#ff2d95');
+  button(W-128-62-12+4-70, 8, 62, 40, '⏱ 1:00', limitOn(), toggleLimit, '#00c7be');   // stop takes, filming and exports at a minute
   button(W-128-62-12+4, 8, 66, 40, '♪ Snap', !!state.musicSnap, ()=>{ state.musicSnap = !state.musicSnap; saveSnapPref(); requestUI(); }, '#ffd400');   // snap the timeline to the song's beats
   const tNow = rec && rec.phase==='rec' ? rec.t : play && play.mode==='take' ? play.t : show.t;
   txt(fmtTime(tNow)+' / '+fmtTime(showLength()), W-10, 28, 15, '#ffd400','right',700);
@@ -4511,9 +4533,11 @@ function drawTransWin(){
     button(64+bw+8,by,bw*2+8,48, rec ? '■ Stop filming' : '● Film from here (trigger)', !!rec, ()=>{ rec ? stopRecording() : startRecording(); requestUI(); }, '#ff3b30');
   } else {
     const punch = !show.rec && state.punchAt != null && state.punchAt > 0.05 && state.punchAt < showLength() - 0.05;
-    button(64,by,bw,48, show.playing ? '■ Stop (A)' : '▶ Play (A)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); requestUI(); }, '#34c759');
-    button(64+bw+8,by,bw,48, show.rec ? '■ Cut (B)' : punch ? '● Redo (B)' : '● Record (B)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); requestUI(); }, '#ff3b30');
-    button(64+2*(bw+8),by,bw,48, '🎤 Voice only', false, ()=>voiceOnlyRec(), '#ff9500');
+    const b3 = (W-20-54-90-24)/3;
+    button(64,by,b3,48, show.playing ? '■ Stop (A)' : '▶ Play (A)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); requestUI(); }, '#34c759');
+    button(64+b3+8,by,b3,48, show.rec ? '■ Cut (B)' : punch ? '● Redo (B)' : '● Record (B)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); requestUI(); }, '#ff3b30');
+    button(64+2*(b3+8),by,b3,48, '🎤 Voice only', false, ()=>voiceOnlyRec(), '#ff9500');
+    button(64+3*(b3+8),by,90,48, '🎞 Takes'+((show.takes||[]).length ? ' '+show.takes.length : ''), false, ()=>{ state.page = 'tracks'; state.motionScroll = 0; state.panelOpen = true; requestUI(); }, '#5e2bff');
   }
   win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
 }
@@ -5508,6 +5532,7 @@ function drawShowRows(X,W,aud){
       rows.push(...list);
     }
   }
+  if (!aud && (show.takes || []).length){ const tks = show.takes.slice().reverse(); rows.unshift({kind:'th', n:tks.length}, ...tks.map(tk => ({kind:'tk', tk}))); }
   if (aud) for (const a of show.audio) rows.push({kind:'a', a, name:(a.name||'Voice '+a.id), len:a.dur||0});
   const vs = aud ? show.audio.find(x=>x.id===state.voiceSel) : null, SK = aud ? 'audioScroll' : 'motionScroll';
   let top = 124;
@@ -5527,6 +5552,13 @@ function drawShowRows(X,W,aud){
     txt((sc+1)+'–'+Math.min(rows.length, sc+fit)+' of '+rows.length, X+W, UIH-170, 13, '#8f97c7','right',700);
   }
   const X_ = X; (vs ? rows.filter(r=>r.a===vs) : rows.slice(sc, sc+fit)).forEach((r,i)=>{ const y=top+i*48; let W = RW, X = X_;
+    if (r.kind==='th'){ txt('🎞 Takes · newest first · ✕ deletes one (X undoes)', X+4, y+28, 15, '#ffd400','left',800); return; }
+    if (r.kind==='tk'){ const tk = r.tk, len = tk.t1 - tk.t0, who = takeWho(tk);
+      rr(X, y+6, W, 36, 10, '#0d1029'); rr(X, y+6, 10, 36, 5, takeColor(tk));
+      txt('T'+tk.id+' · '+(who.length > 16 ? who.slice(0,15)+'…' : who)+' · '+fmtTime(tk.t0)+'–'+fmtTime(tk.t1)+' · '+(len < 10 ? len.toFixed(1) : Math.round(len))+' s'+((tk.clips||[]).length ? ' 🎤' : ''), X+18, y+24, 14, len < 4 ? '#ff9500' : '#fff','left',700);
+      rr(X+W-92, y+8, 40, 32, 10, '#34c759'); txt('▶', X+W-72, y+24, 15, '#111','center'); hit(X+W-92, y+8, 40, 32, () => { show.t = tk.t0; state.punchAt = tk.t0 > 0.05 ? tk.t0 : null; stopShow(); applyShowPose(show.t); playShow(); requestUI(); });
+      rr(X+W-46, y+8, 40, 32, 10, '#ff3b30'); txt('✕', X+W-26, y+24, 16, '#fff','center'); hit(X+W-46, y+8, 40, 32, () => deleteTake(tk));
+      return; }
     if (r.kind==='h'){   // character header: tap to pick them, ✕ clears all of their motion
       const sel = r.cid != null && state.selChar===r.cid;
       rr(X,y+6,W,36,10,sel?'#ffd400':'#1e6bff');
@@ -7530,7 +7562,7 @@ function filmClips(){
   return out;
 }
 function clipFilmStart(c){ let acc = 0; for (const x of shots.seq){ if (x===c) return acc; const R = clipRange(x); if (R) acc += (R.b-R.a)/R.sp; } return acc; }
-function filmRange(){ const L = filmLength(), a = clamp(ensureCuts().fin || 0, 0, L), b = ensureCuts().fout == null ? L : clamp(ensureCuts().fout, a, L); return [a, b > a + 0.05 ? b : L]; }
+function filmRange(){ const L = filmLength(), a = clamp(ensureCuts().fin || 0, 0, L), b0 = ensureCuts().fout == null ? L : clamp(ensureCuts().fout, a, L), b = b0 > a + 0.05 ? b0 : L; return [a, limitOn() ? Math.min(b, a + 60) : b]; }   // exports stop at 1:00 while the limit is on
 function clipAt(t){ let acc = 0; for (const c of shots.seq){ const R = clipRange(c); if (!R) continue; const L = (R.b-R.a)/R.sp; if (t < acc+L) return {c, R, start:acc, u:R.a + (t-acc)*R.sp}; acc += L; }
   const last = [...shots.seq].reverse().find(c=>clipRange(c)); if (!last) return null; const R = clipRange(last); return {c:last, R, start:acc-(R.b-R.a)/R.sp, u:R.b}; }
 const clipById = id => shots.seq.find(c=>c.id===id);
@@ -7636,13 +7668,10 @@ function drawEditor(X, Y, W, big){
       if (selC && shots.laneSel===j) rr(x0+1, yy+1, Math.max(6, x1-x0-2), lh-6, 8, null, '#ffffff');
       const hx0 = Math.max(x0, TX), hx1 = Math.min(x1, TX+TW);
       hit(hx0, yy, hx1-hx0, lh-4, (px)=>{ const t = tOf(px);
-        if (play && play.mode==='film' && play.rec){ const f = clipAt(play.t); if (f && f.c===c){ const b = editSnap(); setSwitch(c, f.u, j); pushShotsUndo(b); sceneDirty = true; play.clipId = null; } }   // live: tap a lane while it plays to switch to it
-        else if (!play){ const now = performance.now(), D = state._laneTap, dbl = D && D.c === c.id && D.j === j && now - D.at < 380 && Math.abs(px - D.x) < 14; state._laneTap = {c:c.id, j, at:now, x:px};
-          const ph = clipAt(shots.playhead), here = ph && ph.c === c;
-          if (dbl){ if (D.changed) undo(); state._laneTap.changed = false; const cc = clipById(c.id) || c, tt = snapFilm(t), f = clipAt(tt); shots.playhead = tt; if (f && f.c===cc && visibleK(cc, f.u) !== j){ const b = editSnap(); setSwitch(cc, f.u, j); pushShotsUndo(b); sceneDirty = true; } }   // double-tap: cut to this take right where you tapped
-          else if (here){ if (visibleK(c, ph.u) !== j){ const b = editSnap(); setSwitch(c, ph.u, j); pushShotsUndo(b); sceneDirty = true; state._laneTap.changed = true; } }   // tap a take: it's on from the playhead
-          else shots.playhead = snapFilm(t); }   // playhead is in another clip: tapping just moves it here first
-        else { shots.playhead = t; }
+        if (play && play.mode==='film'){ const f = clipAt(play.t); if (f && f.c===c && visibleK(c, f.u) !== j){ const b = editSnap(); setSwitch(c, f.u, j); pushShotsUndo(b); sceneDirty = true; play.clipId = null; beep(990, 0.05); } }   // playing: tap a lane to cut to it right there
+        else if (!play){ const tt = snapFilm(t), f = clipAt(tt);
+          if (f && f.c === c && visibleK(c, f.u) !== j){ const b = editSnap(); setSection(c, f.u, j); pushShotsUndo(b); sceneDirty = true; }   // stopped: tap inside a section to show this lane for that whole section (no new cut)
+          shots.playhead = tt; }
         shots.clipSel = c.id; shots.laneSel = j; requestUI(); }, scrub);
     }
     if (selC) rr(x0, y-1, Math.max(6, x1-x0), nl*lh-2, 8, null, '#ffd400');
@@ -7850,8 +7879,23 @@ function drawSoundPanel(X, y, W){
   { const bw3 = 250, off = (a.vol ?? 1) === 0;
     button(X+16, y+62, bw3, 40, '✂ Split at the playhead', false, ()=>splitVoiceHere(a, ea.sid), '#ff9500');
     button(X+16+bw3+8, y+62, 220, 40, off ? '🔇 Muted · tap to hear' : '🔈 Mute this piece', off, ()=>{ const b = snapShow(); if (off){ a.vol = a._vol || 1; } else { a._vol = a.vol ?? 1; a.vol = 0; } pushUndo({type:'show', snap:b}); sceneDirty = true; if (play) play.clipId = null; requestUI(); }, '#ff3b30'); }
+  { const wx = X+510, ww = W-16-510-118, wy = y+62, wh = 40, d0 = a.at || 0, dur = Math.max(0.01, a.dur || 0), tx2 = t => wx + (t - d0)/dur*ww, tOf2 = px => d0 + clamp((px - wx)/ww, 0, 1)*dur;
+    rr(wx, wy, ww, wh, 8, '#151935');
+    const buf = audioBufs.get(a.id); if (buf){ if (!a._pk) a._pk = peaksOf(buf); const pk = a._pk; g.fillStyle = '#00c7be';
+      for (let i=0;i<ww;i+=2){ const v = pk[Math.min(pk.length-1, Math.floor(i/ww*pk.length))] || 0; g.fillRect(wx+i, wy + wh/2 - v*wh*0.45, 1.5, Math.max(1, v*wh*0.9)); } }
+    else if (a.b64 && !a._decoding) decodeClip(a).then(requestUI).catch(()=>{});
+    for (const m of (a.mute || [])) if (m[2] === 'u'){ g.fillStyle = a.bleep ? 'rgba(255,212,0,0.6)' : 'rgba(255,59,48,0.6)'; g.fillRect(tx2(m[0]), wy, Math.max(2, tx2(m[1]) - tx2(m[0])), wh); }
+    const sp = state._spot; if (sp && sp.id === a.id){ g.fillStyle = 'rgba(255,255,255,0.35)'; const p0 = Math.min(sp.a, sp.b), p1 = Math.max(sp.a, sp.b); g.fillRect(tx2(p0), wy, Math.max(2, tx2(p1) - tx2(p0)), wh); }
+    txt('Drag across a word to mute it · tap a red bit to bring it back', wx+4, wy-8, 11, '#8f97c7','left',700);
+    hit(wx, wy, ww, wh, px => { state._spot = {id:a.id, a:tOf2(px), b:tOf2(px)}; requestUI(); }, px => { if (state._spot) state._spot.b = tOf2(px); requestUI(); }, () => {
+      const sq = state._spot; state._spot = null; if (!sq) return; const p0 = Math.min(sq.a, sq.b), p1 = Math.max(sq.a, sq.b), bs = snapShow();
+      if (p1 - p0 < 0.06){ const ms = (a.mute || []).filter(m => !(m[2] === 'u' && p0 >= m[0] - 0.03 && p0 <= m[1] + 0.03)); if (ms.length === (a.mute || []).length){ requestUI(); return; } replaceClip(a, {mute:ms}); toast('Brought that bit back'); }
+      else { replaceClip(a, {mute:[...(a.mute || []), [+p0.toFixed(3), +p1.toFixed(3), 'u']]}); toast(a.bleep ? 'Bleeped' : 'Muted that bit · tap it to bring it back'); }
+      pushUndo({type:'show', snap:bs}); sceneDirty = true; if (play) play.clipId = null; requestUI(); });
+    button(wx+ww+8, wy, 110, wh, a.bleep ? '🎺 Bleep' : '🔇 Silence', !!a.bleep, () => { replaceClip(a, {bleep:!a.bleep}); sceneDirty = true; if (play) play.clipId = null; requestUI(); }, '#ffd400'); }
   drawFxWide(X+16, y+112, W-32, fxOf(a), ()=>{ sceneDirty = true; });
 }
+
 function drawAudEdit(X, W){
   const ea = state.edAud, a = ea.a, back = () => { state.edAud = null; audioStop(); requestUI(); };
   txt('Edit · '+(ea.key==='music' ? 'music' : 'voice'), X, 100, 26);
@@ -8236,6 +8280,43 @@ function orbPickV18(p){   // p in orb space; returns 'DICE', a color, or undefin
 }
 
 // ---- PERFORM: redo just part of a performance
+// ---- takes: every recording remembers what it replaced, so any one of them can be deleted later
+const keyChar = key => { if ('remt'.includes(key[0])) return +key.slice(1); const L = layerById(+key); return L && L.char != null ? L.char : null; };
+function takeColor(tk){ const cid = (tk.who || [])[0]; return cid != null ? PALETTE[(cid*3 + 1) % 8] : '#8f97c7'; }
+function takeWho(tk){ const ns = (tk.who || []).map(id => charById(id)?.name).filter(Boolean); return ns.length ? ns.join(', ') : 'scenery'; }
+function deleteTake(tk){
+  const b = snapShow(), later = show.takes.filter(o => o.id > tk.id);
+  for (const key of (tk.keys || [])){ const [s0, s1] = (tk.rng && tk.rng[key]) || [tk.t0, tk.t1];
+    let segs = [[s0, s1]];   // put back what was there before, except where a later take recorded over it again
+    for (const o of later){ if (!(o.keys || []).includes(key)) continue; const [a, b2] = (o.rng && o.rng[key]) || [o.t0, o.t1];
+      segs = segs.flatMap(([x, y]) => (b2 <= x || a >= y) ? [[x, y]] : [[x, a], [b2, y]].filter(([p, q]) => q - p > 1e-3)); }
+    let cur = show.tracks[key] ? show.tracks[key].samples : [];
+    const bf = tk.before ? tk.before[key] : null;
+    for (const [x, y] of segs){ const nw = []; if (bf) for (let i=0;i<bf.length;i+=9) if (bf[i] >= x - 1e-4 && bf[i] <= y + 1e-4) nw.push(...bf.slice(i, i+9)); cur = punchSplice(cur, nw, x, y); }
+    if (cur.length >= 9) show.tracks[key] = {samples:cur}; else delete show.tracks[key]; }
+  const gone = new Set(tk.clips || []);
+  show.audio = show.audio.filter(a => !gone.has(a.id)).map(a => (a.mute || []).some(m => m[3] === tk.id) ? {...a, _peaks:null, mute:a.mute.filter(m => m[3] !== tk.id)} : a);   // their voice goes, and what it had silenced comes back
+  show.takes = show.takes.filter(o => o !== tk);
+  pushUndo({type:'show', snap:b}); sceneDirty = true; motionDirty = true; applyShowPose(show.t || 0); if (play) play.clipId = null;
+  toast('Deleted take '+tk.id+' ('+takeWho(tk)+', '+fmtTime(tk.t0)+'–'+fmtTime(tk.t1)+') · X undoes'); requestUI();
+}
+function clearCharMotion(c, everywhere){   // a character's moves (and voice) in this scene, or in every scene
+  const ids = new Set([c.id]), pk = new Set(partsOf(c).map(L => String(L.id)));
+  const mine = key => ('remt'.includes(key[0]) && ids.has(+key.slice(1))) || pk.has(key);
+  const strip = (tracks, audio, takes) => { for (const k of Object.keys(tracks || {})) if (mine(k)) delete tracks[k];
+    const a2 = (audio || []).filter(a => a.cid !== c.id); const t2 = (takes || []).map(t => ({...t, keys:(t.keys || []).filter(k => !mine(k)), who:(t.who || []).filter(id => id !== c.id)})).filter(t => t.keys.length || (t.clips || []).length); return [a2, t2]; };
+  show.tracks = {...show.tracks}; const [a1, t1] = strip(show.tracks, show.audio, show.takes); show.audio = a1; show.takes = t1;
+  if (everywhere) for (const sc of scenes) if (sc.id !== curScene){ sc.tracks = {...(sc.tracks || {})}; const [a2, t2] = strip(sc.tracks, sc.audio, sc.takes); sc.audio = a2; sc.takes = t2; }
+}
+function replaceClip(a, patch){ const n = {...a, ...patch, _peaks:null}, i = show.audio.indexOf(a); if (i >= 0) show.audio[i] = n; if (state.edAud && state.edAud.a === a) state.edAud.a = n; return n; }
+function setSection(c, u, k){   // the stretch between two cuts shows this lane (no new cut)
+  const R = clipRange(c); if (!R) return; c.sw.sort((a, b) => a.t - b.t); let i = -1;
+  for (let n=0;n<c.sw.length;n++) if (c.sw[n].t <= u + 1e-6) i = n;
+  if (i >= 0) c.sw[i] = {...c.sw[i], k}; else c.sw.unshift({t:R.a, k});
+}
+function limitOn(){ return state.limit1 !== false; }
+try { if (localStorage.getItem('cmm.lim1') === '0') state.limit1 = false; } catch(e){}
+function toggleLimit(){ state.limit1 = !limitOn(); try { localStorage.setItem('cmm.lim1', state.limit1 ? '1' : '0'); } catch(e){} toast(state.limit1 ? 'Takes, filming and exports stop at 1 minute' : 'No time limit'); requestUI(); }
 function punchSplice(old, nw, t0, t1){
   const out = [];
   for (let i=0;i<old.length;i+=9) if (old[i] < t0 - 1e-4) out.push(...old.slice(i, i+9));
@@ -8268,6 +8349,9 @@ function drawPerformTimeline(X, y, W, viewOnly){
   rr(X, y, W, 34, 10, '#0d1029');
   for (const key in show.tracks){ const s = show.tracks[key].samples; if (!s.length) continue; const a = tx(s[0]), b = tx(s[s.length-9]); g.globalAlpha = 0.18; rr(a, y+6, Math.max(3,b-a), 22, 6, '#ff2d95'); g.globalAlpha = 1; }
   for (const a of show.audio){ const a0 = tx(a.at||0), a1 = tx((a.at||0)+(a.dur||0)); g.globalAlpha = 0.5; rr(a0, y+26, Math.max(3,a1-a0), 6, 3, '#ffd400'); g.globalAlpha = 1; }
+  { const tks = (show.takes || []).slice(-8);   // each take: exactly the stretch it recorded, the newest brightest
+    tks.forEach((tk, i) => { const a0 = tx(tk.t0), a1 = tx(tk.t1), nw = i === tks.length - 1; g.globalAlpha = nw ? 0.95 : 0.3 + 0.4*i/tks.length; rr(a0, y+5, Math.max(4, a1-a0), 18, 6, takeColor(tk)); g.globalAlpha = 1;
+      if (a1 - a0 > 28) txt('T'+tk.id, a0+5, y+14, 11, '#111','left',900); }); }
   if (t0 != null){ g.globalAlpha = 0.35; rr(tx(t0), y, Math.max(3, tx(show.t)-tx(t0)), 34, 8, '#ff3b30'); g.globalAlpha = 1; }
   beatTicks(curScene, 0, L, tx, y+2, 30);
   const px = tx(show.t); g.fillStyle = '#ffd400'; g.fillRect(px-2, y-3, 4, 40);
@@ -8590,7 +8674,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
