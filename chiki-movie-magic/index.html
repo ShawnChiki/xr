@@ -78,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '537';
+const VERSION = '538';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -4164,6 +4164,77 @@ function exportSize(){
   if (r < 1) return [base, Math.round(base/r/2)*2];
   return [base, base];
 }
+// ---- the film's sound for the MP4: AAC (plays everywhere, iPhone Photos too). Each try is checked, so a silent file never slips out.
+async function encodeSoundTrack(abuf, fa, fb){
+  const SR = abuf.sampleRate, o0 = Math.min(abuf.length, Math.round(fa*SR)), N = Math.max(0, Math.min(abuf.length, Math.round(fb*SR)) - o0);
+  const L0 = abuf.getChannelData(0).subarray(o0), R0 = (abuf.numberOfChannels > 1 ? abuf.getChannelData(1) : abuf.getChannelData(0)).subarray(o0);
+  const ASC = new Uint8Array([0x11, 0x90]);   // AAC-LC, 48 kHz, stereo
+  const tryEnc = async (cfg, interleaved) => {
+    if (!('AudioEncoder' in window)) return null;
+    try { if (!(await AudioEncoder.isConfigSupported(cfg)).supported) return null; } catch(e){ return null; }
+    const chunks = []; let err = null, meta0 = null;
+    const enc = new AudioEncoder({output:(c, m) => { const d = new Uint8Array(c.byteLength); c.copyTo(d); chunks.push({d, t:c.timestamp, dur:c.duration, type:c.type}); if (m && m.decoderConfig && !meta0) meta0 = m.decoderConfig; }, error:e => { err = e; }});
+    try { enc.configure(cfg);
+      for (let o=0; o<N && !err; o+=4800){ const n = Math.min(4800, N-o); let data;
+        if (interleaved){ data = new Float32Array(n*2); for (let i=0;i<n;i++){ data[i*2] = L0[o+i]; data[i*2+1] = R0[o+i]; } }
+        else { data = new Float32Array(n*2); data.set(L0.subarray(o, o+n), 0); data.set(R0.subarray(o, o+n), n); }
+        const ad = new AudioData({format: interleaved ? 'f32' : 'f32-planar', sampleRate:SR, numberOfFrames:n, numberOfChannels:2, timestamp:Math.round(o/SR*1e6), data}); enc.encode(ad); ad.close(); }
+      await enc.flush(); enc.close(); } catch(e){ err = err || e; try { enc.close(); } catch(_){} }
+    if (err || chunks.length < Math.max(1, N/SR*20)) { console.warn('sound try failed', cfg.codec, interleaved, err, chunks.length); return null; }
+    let desc = meta0 && meta0.description ? new Uint8Array(meta0.description.buffer ? meta0.description.buffer.slice(meta0.description.byteOffset || 0, (meta0.description.byteOffset || 0) + meta0.description.byteLength) : meta0.description) : null;
+    if (cfg.codec.startsWith('mp4a')){
+      if (!desc || !desc.length) desc = ASC;
+      for (const c of chunks) if (c.d.length > 7 && c.d[0] === 0xFF && (c.d[1] & 0xF0) === 0xF0){ const hl = (c.d[1] & 1) ? 7 : 9; c.d = c.d.slice(hl); }   // ADTS headers off: MP4 wants plain AAC frames
+    }
+    return {codec: cfg.codec.startsWith('mp4a') ? 'aac' : 'opus', chunks, desc, how:'encoder'};
+  };
+  const base = {sampleRate:SR, numberOfChannels:2};
+  for (const br of [160000, 128000, 192000]) for (const il of [false, true]){
+    const r = await tryEnc({codec:'mp4a.40.2', ...base, bitrate:br, aac:{format:'aac'}}, il) || await tryEnc({codec:'mp4a.40.2', ...base, bitrate:br}, il); if (r) return r; }
+  const rec = await recordSoundAAC(L0, R0, N, SR); if (rec) return rec;   // no AAC encoder here: the phone records the mix as AAC in real time
+  return await tryEnc({codec:'opus', ...base, bitrate:160000}, false);
+}
+// real-time fallback: play the mix (silently) into the browser's own recorder, which makes AAC, then lift the frames out of its MP4
+async function recordSoundAAC(L0, R0, N, SR){
+  if (!window.MediaRecorder) return null;
+  const mime = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/aac'].find(t => { try { return MediaRecorder.isTypeSupported(t); } catch(e){ return false; } }); if (!mime) return null;
+  const a = ac(); if (a.state !== 'running') try { await a.resume(); } catch(e){}
+  const b = a.createBuffer(2, N, SR); b.getChannelData(0).set(L0.subarray(0, N)); b.getChannelData(1).set(R0.subarray(0, N));
+  const src = a.createBufferSource(); src.buffer = b; const dst = a.createMediaStreamDestination(); src.connect(dst);
+  const mr = new MediaRecorder(dst.stream, {mimeType:mime, audioBitsPerSecond:160000}), parts = [];
+  mr.ondataavailable = e => { if (e.data && e.data.size) parts.push(e.data); };
+  const done = new Promise(r => { mr.onstop = r; });
+  const secs = N/SR; if (exporting) exporting.note = 'Recording the sound';
+  mr.start(1000); src.start(a.currentTime + 0.05);
+  const t0 = performance.now(); while ((performance.now() - t0)/1000 < secs + 0.4){ if (exporting && exporting.cancel) break; if (exporting){ exporting.note = 'Recording the sound '+fmtTime((performance.now()-t0)/1000)+' / '+fmtTime(secs); requestUI(); } await new Promise(r => setTimeout(r, 250)); }
+  try { src.stop(); } catch(e){} mr.stop(); await done; src.disconnect(); if (exporting) exporting.note = null;
+  const buf = new Uint8Array(await new Blob(parts).arrayBuffer());
+  const got = aacFromMP4(buf); if (!got || !got.frames.length) return null;
+  const fd = 1024/got.sr*1e6, delay = 0.05*1e6;
+  return {codec:'aac', desc:got.asc, chunks:got.frames.map((d, i) => ({d, t:Math.max(0, Math.round(i*fd - delay)), dur:Math.round(fd), type:'key'})), how:'recorder', sr:got.sr, ch:got.ch};
+}
+function aacFromMP4(u8){   // find the AAC config and frames in an MP4 (fragmented or plain)
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), str = (o) => String.fromCharCode(u8[o], u8[o+1], u8[o+2], u8[o+3]);
+  const boxes = (s, e, fn) => { let o = s; while (o + 8 <= e){ let sz = dv.getUint32(o), h = 8; const ty = str(o+4); if (sz === 1){ sz = Number(dv.getBigUint64(o+8)); h = 16; } else if (sz === 0) sz = e - o; if (sz < h) break; fn(ty, o + h, o + sz, o); o += sz; } };
+  let asc = null, sr = 48000, ch = 2; const frames = [], sizes = [], stco = [], stsc = []; let pend = [];
+  const walk = (s, e) => boxes(s, e, (ty, a, b, o0) => {
+    if (['moov','trak','mdia','minf','stbl','moof','traf','udta'].includes(ty)) walk(a, b);
+    else if (ty === 'stsd') walk(a + 8, b);
+    else if (ty === 'mp4a'){ ch = dv.getUint16(a + 16); sr = dv.getUint32(a + 24) >>> 16; walk(a + 28, b); }
+    else if (ty === 'esds'){ let p = a + 4; const rd = () => { let len = 0; for (let k=0;k<4;k++){ const v = u8[p++]; len = (len << 7) | (v & 0x7f); if (!(v & 0x80)) break; } return len; };
+      while (p < b){ const tag = u8[p++], len = rd(); if (tag === 3){ p += 3; } else if (tag === 4){ p += 13; } else if (tag === 5){ asc = u8.slice(p, p + len); break; } else p += len; } }
+    else if (ty === 'trun'){ const fl = dv.getUint32(a) & 0xffffff, cnt = dv.getUint32(a + 4); let p = a + 8; if (fl & 1) p += 4; if (fl & 4) p += 4;
+      for (let k=0;k<cnt;k++){ if (fl & 0x100) p += 4; let sz = 0; if (fl & 0x200){ sz = dv.getUint32(p); p += 4; } if (fl & 0x400) p += 4; if (fl & 0x800) p += 4; pend.push(sz); } }
+    else if (ty === 'tfhd'){ const fl = dv.getUint32(a) & 0xffffff; let p = a + 8; if (fl & 1) p += 8; if (fl & 2) p += 4; if (fl & 8) p += 4; if (fl & 0x10){ const def = dv.getUint32(p); pend.def = def; } }
+    else if (ty === 'mdat'){ if (pend.length){ let p = a; for (const sz0 of pend){ const sz = sz0 || pend.def || 0; if (!sz || p + sz > b) break; frames.push(u8.slice(p, p + sz)); p += sz; } pend = []; } else frames.mdat = [a, b]; }
+    else if (ty === 'stsz'){ const fix = dv.getUint32(a + 4), cnt = dv.getUint32(a + 8); for (let k=0;k<cnt;k++) sizes.push(fix || dv.getUint32(a + 12 + k*4)); }
+    else if (ty === 'stco' || ty === 'co64'){ const cnt = dv.getUint32(a + 4); for (let k=0;k<cnt;k++) stco.push(ty === 'stco' ? dv.getUint32(a + 8 + k*4) : Number(dv.getBigUint64(a + 8 + k*8))); }
+    else if (ty === 'stsc'){ const cnt = dv.getUint32(a + 4); for (let k=0;k<cnt;k++) stsc.push([dv.getUint32(a + 8 + k*12), dv.getUint32(a + 12 + k*12)]); }
+  });
+  walk(0, u8.length);
+  if (!frames.length && sizes.length && stco.length){ let si = 0; for (let c=0; c<stco.length; c++){ let per = 1; for (const [first, n] of stsc) if (c + 1 >= first) per = n; let p = stco[c]; for (let k=0; k<per && si < sizes.length; k++){ frames.push(u8.slice(p, p + sizes[si])); p += sizes[si++]; } } }
+  if (!asc) return null; return {asc, frames, sr, ch};
+}
 async function exportMP4(fresh){
   if (exporting) return;
   if (!fresh && guestExport()) return;
@@ -4194,19 +4265,13 @@ async function exportMP4(fresh){
     if (!config) throw new Error('no video encoder for '+W+'×'+H);
     const target = new ArrayBufferTarget();
     stashScene();
-    let abuf = null, aCfg = null;
-    if ('AudioEncoder' in window){
-      try { abuf = await renderFilmAudio(total); } catch(e){ console.warn('audio mix failed', e); }
-      if (abuf) for (const codec of ['mp4a.40.2','opus']){ const c = {codec, sampleRate:48000, numberOfChannels:2, bitrate:160000}; try { if ((await AudioEncoder.isConfigSupported(c)).supported){ aCfg = c; break; } } catch(e){} }
-    }
-    const muxer = new Muxer({target, video:{codec: isHevc ? 'hevc' : 'avc', width:W, height:H, frameRate:fps}, ...(aCfg ? {audio:{codec: aCfg.codec==='opus' ? 'opus' : 'aac', numberOfChannels:2, sampleRate:48000}} : {}), fastStart:'in-memory'});
-    if (aCfg){
-      const aenc = new AudioEncoder({output:(c,m)=>muxer.addAudioChunk(c,m), error:e=>console.warn(e)}); aenc.configure(aCfg);
-      const o0 = Math.min(abuf.length, Math.round(fa*48000)), N = Math.max(0, Math.min(abuf.length, Math.round(fb*48000)) - o0), L0 = abuf.getChannelData(0).subarray(o0), R0 = (abuf.numberOfChannels > 1 ? abuf.getChannelData(1) : abuf.getChannelData(0)).subarray(o0);
-      for (let o=0; o<N; o+=4800){ const n = Math.min(4800, N-o), data = new Float32Array(n*2); data.set(L0.subarray(o,o+n), 0); data.set(R0.subarray(o,o+n), n);
-        const ad = new AudioData({format:'f32-planar', sampleRate:48000, numberOfFrames:n, numberOfChannels:2, timestamp:Math.round(o/48000*1e6), data}); aenc.encode(ad); ad.close(); }
-      await aenc.flush(); aenc.close();
-    }
+    let abuf = null, aCfg = null, snd = null, sndWhy = '';
+    try { abuf = await renderFilmAudio(total); } catch(e){ console.warn('audio mix failed', e); sndWhy = 'the sound mix failed ('+(e.message||e)+')'; }
+    if (abuf){ try { snd = await encodeSoundTrack(abuf, fa, fb); } catch(e){ console.warn(e); } if (!snd) sndWhy = 'this browser could not encode sound'; }
+    if (snd) aCfg = {codec:snd.codec};
+    const muxer = new Muxer({target, video:{codec: isHevc ? 'hevc' : 'avc', width:W, height:H, frameRate:fps}, ...(snd ? {audio:{codec:snd.codec, numberOfChannels:snd.ch || 2, sampleRate:snd.sr || 48000}} : {}), fastStart:'in-memory'});
+    if (snd){ const meta = {decoderConfig:{codec: snd.codec === 'aac' ? 'mp4a.40.2' : 'opus', sampleRate:snd.sr || 48000, numberOfChannels:snd.ch || 2, description:snd.desc || undefined}};
+      snd.chunks.forEach((c, i) => muxer.addAudioChunkRaw(c.d, c.type || 'key', c.t, c.dur || 21333, i === 0 ? meta : undefined)); }
     let encErr = null;
     const enc = new VideoEncoder({output:(chunk, meta)=>muxer.addVideoChunk(chunk, meta), error:e=>{ encErr = e; }});
     enc.configure(config);
@@ -4232,10 +4297,10 @@ async function exportMP4(fresh){
     const blob = new Blob([target.buffer], {type:'video/mp4'});
     const d = new Date(), pad=n=>String(n).padStart(2,'0');
     lastSave = lastMP4 = {blob, name:`chikimoviemagic-${W}x${H}-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.mp4`};
-    window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec, audio: aCfg ? aCfg.codec : null};
+    window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec, audio: snd ? snd.codec+' ('+snd.how+')' : null, why:sndWhy}; state.lastSound = snd ? (snd.codec === 'aac' ? 'with sound (AAC)' : 'with sound (Opus: may be silent in iPhone Photos)') : 'NO SOUND: '+sndWhy;
     const mb = (blob.size/1e6).toFixed(1)+' MB'+(isHevc ? ' · HEVC' : '');
-    if (renderer.xr.isPresenting || TOUCH()){ showSaveBtn(); toast(renderer.xr.isPresenting ? 'MP4 ready'+(aCfg?' with voices':'')+'. Exit VR and tap the green Save button.' : 'Video ready ('+mb+'). Tap 📲 Save to Photos, then "Save Video".'); }   // a phone needs your tap to open the share sheet
-    else { saveMP4(); toast('MP4 saved · '+W+'×'+H+' · '+mb+(aCfg?' · with voices':'')); }
+    if (renderer.xr.isPresenting || TOUCH()){ showSaveBtn(); toast(renderer.xr.isPresenting ? 'MP4 ready, '+state.lastSound+'. Exit VR and tap the green Save button.' : 'Video ready ('+mb+', '+state.lastSound+'). Tap 📲 Save to Photos, then "Save Video".'); }   // a phone needs your tap to open the share sheet
+    else { saveMP4(); toast('MP4 saved · '+W+'×'+H+' · '+mb+' · '+state.lastSound); }
   } catch(e){ console.error(e); toast(String(e.message||e)==='cancelled' ? 'Export cancelled' : 'Export failed: '+(e.message||e)); window.__lastExport = {error:String(e)}; }
   finally { if (shots._whole){ shots._whole = null; shots.seq = keepSeq; } activateScene(startScene); ensureCuts(); if (er){ er.dispose(); er.forceContextLoss?.(); } exporting = null; workView(); requestUI(); }
 }
@@ -5951,9 +6016,10 @@ function drawExport(X,W){
   if (scenes.length > 1 && !exporting){ const sc = sceneById(curScene); toggle(X,y,W,40, state.exportWhole ? 'Whole film: every scene in order' : 'Just '+(sc ? sc.name : 'this scene'), !!state.exportWhole, ()=>{ state.exportWhole = !state.exportWhole; requestUI(); }, '#ff2d95'); y += 48; }
   const [w,h] = exportSize();
   txt(w+' × '+h+'  ·  '+shots.fps+' fps  ·  '+fmtTime(filmLength()), X, y+12, 16, '#ffd400','left',700); y += 30;
+  if (state.lastSound && !exporting){ txt('Last video: '+state.lastSound, X, y+2, 13, /^NO/.test(state.lastSound) ? '#ff3b30' : '#34c759', 'left', 800); y += 20; }
   if (exporting){
     rr(X,y,W,56,14,'#2a3060'); rr(X,y,Math.max(28,W*exporting.i/exporting.frames),56,14,'#34c759');
-    txt((exporting.what==='Blender' ? 'Baking moves ' : 'Rendering ')+exporting.i+' / '+exporting.frames, X+W/2, y+28, 17, '#fff','center');
+    txt(exporting.note || ((exporting.what==='Blender' ? 'Baking moves ' : 'Rendering ')+exporting.i+' / '+exporting.frames), X+W/2, y+28, 17, '#fff','center');
     button(X,y+64,W,44,'Cancel export',false,()=>{ exporting.cancel = true; },'#ff3b30');
   } else button(X,y,W,56,state.confirm==='exportvr' ? 'Tap again to start' : NET.guest ? 'Export MP4 to this phone' : 'Export MP4',state.confirm==='exportvr',()=>exportMP4(),'#ff3b30');
   if (!exporting) para(NET.guest ? ['Gets the latest film from the headset first,','then renders it here and saves it to this','device. The headset can go off once it says so.'] :
@@ -9772,7 +9838,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, aacFromMP4, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
