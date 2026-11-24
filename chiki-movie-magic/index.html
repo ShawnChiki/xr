@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '531';
+const VERSION = '532';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -183,7 +183,7 @@ function netReset(){
   try { NET.conn && NET.conn.close(); } catch(e){} try { NET.peer && NET.peer.destroy(); } catch(e){}
   for (const p of NET.peers.values()) dropAvatar(p);
   state.camOn = false; state.roam = false; state.gPick = false;
-  Object.assign(NET, {camPeer:null, camPose:null, on:false, host:false, guest:false, synced:false, code:'', peer:null, conns:{}, conn:null, me:'host', n:1, hostRig:null, snapParts:null});
+  Object.assign(NET, {trkSig:null, camPeer:null, camPose:null, on:false, host:false, guest:false, synced:false, code:'', peer:null, conns:{}, conn:null, me:'host', n:1, hostRig:null, snapParts:null});
   NET.peers.clear(); NET.assign.clear(); netRemote.clear(); netPose.clear(); netLastPose.clear(); netHash.clear();
   netOps = []; netVox.clear(); netSettle.clear(); netStTouch.clear(); netStDrop.clear(); netStFull.clear(); netMetaSig = '';
   requestUI();
@@ -231,25 +231,92 @@ async function netLeave(lost){
   if (was) toast(lost ? 'The room closed' : 'Left the room');
 }
 
+// ---- big transfers (the world when someone joins, a fresh copy before a phone export): numbered parts, the player keeps every part
+// that arrived (even across a dropped connection) and asks again only for the missing ones, until it has everything
+const BX_PART = 60000, bxIn = new Map(), bxOut = new Map();
+const fnvStr = s => { let h = 2166136261; for (let i=0;i<s.length;i+=7){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h>>>0).toString(36)+'.'+s.length; };
+function worldForPlayer(){ const o = serialize(), views = o.views; delete o.views; delete o.saved; return {json:JSON.stringify(o), views}; }
+function bxOffer(to, kind, json, extra){
+  netSend(async () => {
+    const d = u8ToB64(await zipU8(new TextEncoder().encode(json))), n = Math.max(1, Math.ceil(d.length/BX_PART)), id = fnvStr(d);
+    const parts = []; for (let i=0;i<n;i++) parts.push(d.slice(i*BX_PART, (i+1)*BX_PART));
+    bxOut.set(id+'|'+to, {parts, kind, at:performance.now()});
+    for (const [k, o] of bxOut) if (performance.now() - o.at > 10*60*1000) bxOut.delete(k);   // old ones go after ten minutes
+    return {t:'bxhead', id, kind, n, bytes:d.length, extra:extra||null};
+  }, to);
+}
+function bxSendParts(to, id, list){
+  const o = bxOut.get(id+'|'+to); if (!o) return;
+  o.at = performance.now();
+  netSend(async () => { for (const i of list) if (o.parts[i] != null) await rawSend({t:'bx', id, i, d:o.parts[i]}, to); return null; }, to);
+}
+function bxMissing(X){ const miss = []; for (let i=0;i<X.n && miss.length<300;i++) if (X.parts[i] == null) miss.push(i); return miss; }
+function bxProgress(X){ if (X.kind === 'trk') return; const got = X.parts.filter(p => p != null).length, pc = Math.round(got/X.n*100), mb = (X.bytes*0.75/1e6);
+  netStatus((X.kind==='snap' && X.extra && X.extra.then==='export' ? 'Getting the latest film… ' : 'Getting the world… ')+pc+'%  ('+got+' of '+X.n+' pieces'+(mb > 0.5 ? ', '+mb.toFixed(1)+' MB' : '')+')'+(X.tries ? ' · asked again '+X.tries+'×' : '')); }
+function bxHead(m){
+  let X = bxIn.get(m.id);
+  if (!X){ X = {id:m.id, kind:m.kind, n:m.n, bytes:m.bytes||0, parts:new Array(m.n).fill(null), tries:0}; bxIn.set(m.id, X); }
+  X.extra = m.extra; X.lastT = performance.now(); X.done = false;
+  for (const [k, Y] of [...bxIn]) if (bxIn.size > 4 && k !== m.id && (Y.done || Y.kind === 'trk')) bxIn.delete(k);   // keep a few; a world still coming in stays
+  const miss = bxMissing(X);
+  if (!miss.length){ bxFinish(X); return; }
+  if (miss.length < X.n && X.kind !== 'trk') toast('Picking up where it stopped: '+(X.n - miss.length)+' of '+X.n+' pieces already here');
+  bxProgress(X); netSend({t:'bxneed', id:X.id, miss});
+}
+function bxPart(m){
+  const X = bxIn.get(m.id); if (!X || X.done) return;
+  if (window.__bxDrop && window.__bxDrop.has(m.i)){ window.__bxDrop.delete(m.i); return; }   // tests: lose a piece on purpose
+  if (X.parts[m.i] == null) X.parts[m.i] = m.d;
+  X.lastT = performance.now(); bxProgress(X);
+  if (!bxMissing(X).length) bxFinish(X);
+}
+async function bxFinish(X){
+  if (X.done) return; X.done = true;
+  netSend({t:'bxok', id:X.id});
+  if (X.kind !== 'trk'){ netStatus('Building the world…'); await new Promise(r => setTimeout(r, 30)); }
+  let o = null; try { o = JSON.parse(new TextDecoder().decode(await zipU8(b64ToU8(X.parts.join('')), true))); } catch(e){ X.done = false; X.parts.fill(null); X.tries++; netStatus('A piece came in broken. Asking again…'); netSend({t:'bxneed', id:X.id, miss:bxMissing(X)}); return; }
+  if (X.kind === 'trk'){ if (o.scene === curScene) show.tracks = o.tracks; else { const sc = sceneById(o.scene); if (sc) sc.tracks = o.tracks; } motionDirty = true; requestUI(); return; }
+  if (X.extra && X.extra.views) o.views = X.extra.views;
+  const keepEx = {res:shots.res, fps:shots.fps, small:shots.small};
+  netMute++; try { if (show.embodied) show.embodied = null; deserialize(o); } finally { netMute--; }
+  const first = !NET.synced;
+  NET.synced = true; netPose.clear(); netHash.clear();
+  if (X.extra && X.extra.then === 'export'){ Object.assign(shots, keepEx); netStatus(''); state.page = 'export'; toast('Got everything, safe to turn off the headset. Making the video here…'); requestUI(); setTimeout(() => exportMP4(true), 200); return; }
+  if (first) state.page = SCULPT_PHASES.includes(state.phase) ? 'tools' : 'together';
+  netStatus(''); toast(first ? "You're in! "+playerName(NET.n)+': got everything, safe to turn off the headset any time.' : 'Got everything.');
+}
+setInterval(() => {   // a piece that never came: ask again for whatever is missing
+  if (!NET.on || NET.host) return;
+  for (const X of bxIn.values()) if (!X.done && performance.now() - X.lastT > 2500){ const miss = bxMissing(X); if (!miss.length) continue; X.tries++; X.lastT = performance.now(); bxProgress(X); netSend({t:'bxneed', id:X.id, miss}); }
+}, 1000);
+// the recorded moves go to players whenever they change (not while recording), so their timeline shows what the host's does
+let trkT = 0;
+function trkSig(){ let h = curScene+'|'; for (const k in show.tracks){ const sm = show.tracks[k].samples || []; let a = 0; for (let i=0;i<sm.length;i++) a += sm[i]*((i%7)+1); h += k+':'+sm.length+':'+a.toFixed(3)+';'; } return h; }
+function netTracks(){
+  const now = performance.now(); if (now - trkT < 1000 || show.rec || !Object.keys(NET.conns).length) return; trkT = now;
+  const sig = trkSig(); if (sig === NET.trkSig) return; NET.trkSig = sig;
+  const json = JSON.stringify({scene:curScene, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}]))});
+  for (const id in NET.conns) bxOffer(id, 'trk', json);
+}
+function guestExport(){
+  if (NET.guest && NET.on){ netStatus('Asking the headset for the latest film…'); netSend({t:'filmreq'}); requestUI(); return true; }
+  return false;
+}
 // ---- host → a new player: who they are, then the whole world
 function hostWelcome(c){
   netTick(true);   // anything not sent yet goes out first, so nothing is applied twice
   const used = new Set([...NET.peers.values()].map(p=>p.n)); let n = 2; while (used.has(n)) n++;
   NET.conns[c.peer] = c; NET.peers.set(c.peer, {id:c.peer, n, av:null});
-  const json = JSON.stringify(serialize());
+  const W = worldForPlayer();
   netSend({t:'welcome', n, code:NET.code}, c.peer);
-  netSend(async () => {
-    const d = u8ToB64(await zipU8(new TextEncoder().encode(json))), parts = Math.max(1, Math.ceil(d.length/120000));
-    for (let i=0;i<parts;i++) await rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, c.peer);
-    return null; }, c.peer);
+  bxOffer(c.peer, 'snap', W.json, {views:W.views});
   netMetaSig = ''; netLastPose.clear();
   toast(playerName(n)+' joined'); requestUI();
 }
 function netResync(){   // the host opened another world: everybody gets it
   if (!NET.host) return; netLastPose.clear(); netMetaSig = '';
-  const json = JSON.stringify(serialize());
-  for (const id in NET.conns) netSend(async () => { const d = u8ToB64(await zipU8(new TextEncoder().encode(json))), parts = Math.max(1, Math.ceil(d.length/120000));
-    for (let i=0;i<parts;i++) await rawSend({t:'snap', i, n:parts, d:d.slice(i*120000, (i+1)*120000)}, id); return null; }, id);
+  const W = worldForPlayer();
+  for (const id in NET.conns) bxOffer(id, 'snap', W.json, {views:W.views});
 }
 
 // ---- what gets sent
@@ -284,7 +351,7 @@ const poseArr = o => [r4(o.position.x), r4(o.position.y), r4(o.position.z), r4(o
 function setPoseArr(o, a){ o.position.set(a[0],a[1],a[2]); o.quaternion.set(a[3],a[4],a[5],a[6]); o.scale.setScalar(a[7]); }
 function netTick(force){
   if (!NET.on || !NET.synced) return;
-  if (NET.host) netAudioList();
+  if (NET.host){ netAudioList(); netTracks(); }
   const now = performance.now();
   if (!force && now - netTickT < 90) return; netTickT = now;
   if (NET.host && (force || now - netMetaT > 250 || netVox.size || netStTouch.size || netStFull.size || netOps.length)){ netMetaT = now; const m = metaNow(), sg = JSON.stringify(m); if (sg !== netMetaSig){ netMetaSig = sg; netSend({t:'meta', ...m}); } }
@@ -385,7 +452,7 @@ function netControlled(set){   // the host leaves puppets that players are in al
 }
 
 // ---- together: a partner sees every panel; taps on the shared ones run on the host (with the partner's own selections), so the world stays one
-const LOCAL_PAGES = new Set(['together','tools','color','doodle','blocks','dmotion','dedit','settings','updates','files','allworlds','ghworlds','soon']);
+const LOCAL_PAGES = new Set(['export','together','tools','color','doodle','blocks','dmotion','dedit','settings','updates','files','allworlds','ghworlds','soon']);
 const SHARED_KEYS = new Set(['world','thirds','limit1']);   // one value for everyone
 const SKIP_CTX = new Set(['world','thirds','limit1','toastMsg','toastT','phase','labels','fov','flySpeed','mic','micGain','beeps','worldId','dialOpen','recent','_asGuest','gPick']);
 let remoteFrom = null, remoteDown = null; const remoteTaps = new Map(), scratchWins = {};
@@ -435,6 +502,11 @@ async function onNet(m, from){
       NET.synced = true; netPose.clear(); netHash.clear(); state.page = SCULPT_PHASES.includes(state.phase) ? 'tools' : 'together';
       netStatus(''); toast("You're in! "+playerName(NET.n)+': pick a color, then draw with the trigger.'); return; }
     case 'meta': if (NET.synced) applyMeta(m); return;
+    case 'bxhead': if (!NET.host) bxHead(m); return;
+    case 'bx': if (!NET.host) bxPart(m); return;
+    case 'bxneed': if (NET.host) bxSendParts(from, m.id, m.miss || []); return;
+    case 'bxok': if (NET.host){ const o = bxOut.get(m.id+'|'+from); bxOut.delete(m.id+'|'+from); if (o && o.kind==='snap' && o.parts.length > 1) toast(playerName((NET.peers.get(from)||{}).n||2)+' got everything'); } return;
+    case 'filmreq': if (NET.host){ netTick(true); const W = worldForPlayer(); bxOffer(from, 'snap', W.json, {views:W.views, then:'export'}); toast('Sending the film to '+playerName((NET.peers.get(from)||{}).n||2)+' to save on their phone'); } return;
     case 'op': { netMute++; try { for (const op of m.ops){ if (layerById(op.L)) applyOp(op); else netPendFor({t:'op', L:op.L, op}); } } finally { netMute--; } if (NET.host) netSend(m); return; }
     case 'vox': await applyVox(m); if (NET.host) netSend(m); return;
     case 'st': applySt(m); if (NET.host) netSend(m); return;
@@ -2553,6 +2625,7 @@ function trackAt(tr, t, outP, outQ){
 }
 function controlledKeys(){
   const set = new Set();
+  if (exporting) return set;   // a film is made from the recording alone
   if (show.grab) set.add(show.grab.T ? 't'+show.grab.T.id : show.grab.c ? 'r'+show.grab.c.id : String(show.grab.L.id));
   if (show.grab && show.grab.c && show.grab.blinked) set.add('e'+show.grab.c.id);   // blinking a puppet you hold
   if (show.embodied){ const ride = riding(show.embodied); for (const part of show.embodied.parts) if (!(ride && part.body)) set.add(String(part.L.id)); if (show.embodied.rootMoved || ride) set.add('r'+show.embodied.c.id); /* riding: the body's walk is re-recorded with your steps in it */ set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
@@ -3921,9 +3994,14 @@ function renderPreview(cam){
 /* ============================================================
    EXPORT: MP4 via WebCodecs (picture only for now)
    ============================================================ */
-let exporting = null, lastMP4 = null;
+let exporting = null, lastMP4 = null, hevcOK = null;
+const HEVC_CANDS = big => big ? ['hvc1.1.6.L153.B0','hev1.1.6.L153.B0','hvc1.1.6.L150.B0'] : ['hvc1.1.6.L123.B0','hev1.1.6.L123.B0','hvc1.1.6.L120.B0'];
+async function checkHevc(){ hevcOK = false; if (!('VideoEncoder' in window)) return;
+  for (const codec of HEVC_CANDS(false)){ try { if ((await VideoEncoder.isConfigSupported({codec, width:1920, height:1080, bitrate:5e6, framerate:60})).supported){ hevcOK = true; break; } } catch(e){} } requestUI(); }
 function saveMP4(){
   if (!lastMP4) return;
+  try { const f = new File([lastMP4.blob], lastMP4.name, {type:'video/mp4'});
+    if (matchMedia('(pointer:coarse)').matches && navigator.canShare && navigator.canShare({files:[f]})){ navigator.share({files:[f], title:lastMP4.name}).catch(()=>{}); document.getElementById('savemp4').style.display = 'none'; return; } } catch(e){}
   const a = document.createElement('a'); a.href = URL.createObjectURL(lastMP4.blob); a.download = lastMP4.name;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 8000);
   document.getElementById('savemp4').style.display = 'none';
@@ -3935,8 +4013,9 @@ function exportSize(){
   if (r < 1) return [base, Math.round(base/r/2)*2];
   return [base, base];
 }
-async function exportMP4(){
+async function exportMP4(fresh){
   if (exporting) return;
+  if (!fresh && guestExport()) return;
   if (renderer.xr.isPresenting && state.confirm!=='exportvr'){ state.confirm='exportvr'; toast('Making an MP4 in the headset can take a while (you can cancel). Tap Export again to start.'); requestUI(); return; }
   state.confirm = null;
   if (!('VideoEncoder' in window)){ toast('This browser can’t make MP4s — try desktop Chrome'); return; }
@@ -3952,14 +4031,16 @@ async function exportMP4(){
   let er = null;
   try {
     const {Muxer, ArrayBufferTarget} = await import(MUXER_URL);
-    const big = Math.max(W,H) > 2000;
-    const cands = big ? ['avc1.640034','avc1.640033','avc1.4d0034','avc1.420034'] : ['avc1.640028','avc1.64002a','avc1.4d0028','avc1.42002a','avc1.42001f'];
-    let config = null;
-    for (const codec of cands){
-      const cfg = {codec, width:W, height:H, bitrate: big ? 40e6 : 12e6, framerate:fps};
-      try { const s = await VideoEncoder.isConfigSupported(cfg); if (s.supported){ config = cfg; break; } } catch(e){}
+    const big = Math.max(W,H) > 2000, small = !!shots.small, fpsK = fps > 30 ? 1.35 : 1;
+    const avc = big ? ['avc1.640034','avc1.640033','avc1.4d0034','avc1.420034'] : (fps > 30 ? ['avc1.64002a','avc1.640028'] : ['avc1.640028','avc1.64002a']).concat(['avc1.4d0028','avc1.42002a','avc1.42001f']);
+    const tries = (small ? HEVC_CANDS(big).map(codec => ({codec, bitrate:(big ? 16e6 : 4.5e6)*fpsK, hevc:true})) : [])
+      .concat(avc.map(codec => ({codec, bitrate: small ? (big ? 20e6 : 6e6)*fpsK : (big ? 40e6 : 12e6)})));   // smaller: HEVC if it can, else a lighter H.264. Always the fps you picked
+    let config = null, isHevc = false;
+    for (const tr of tries){
+      const cfg = {codec:tr.codec, width:W, height:H, bitrate:Math.round(tr.bitrate), framerate:fps};
+      try { const s = await VideoEncoder.isConfigSupported(cfg); if (s.supported){ config = cfg; isHevc = !!tr.hevc; break; } } catch(e){}
     }
-    if (!config) throw new Error('no H.264 encoder for '+W+'×'+H);
+    if (!config) throw new Error('no video encoder for '+W+'×'+H);
     const target = new ArrayBufferTarget();
     stashScene();
     let abuf = null, aCfg = null;
@@ -3967,7 +4048,7 @@ async function exportMP4(){
       try { abuf = await renderFilmAudio(total); } catch(e){ console.warn('audio mix failed', e); }
       if (abuf) for (const codec of ['mp4a.40.2','opus']){ const c = {codec, sampleRate:48000, numberOfChannels:2, bitrate:160000}; try { if ((await AudioEncoder.isConfigSupported(c)).supported){ aCfg = c; break; } } catch(e){} }
     }
-    const muxer = new Muxer({target, video:{codec:'avc', width:W, height:H, frameRate:fps}, ...(aCfg ? {audio:{codec: aCfg.codec==='opus' ? 'opus' : 'aac', numberOfChannels:2, sampleRate:48000}} : {}), fastStart:'in-memory'});
+    const muxer = new Muxer({target, video:{codec: isHevc ? 'hevc' : 'avc', width:W, height:H, frameRate:fps}, ...(aCfg ? {audio:{codec: aCfg.codec==='opus' ? 'opus' : 'aac', numberOfChannels:2, sampleRate:48000}} : {}), fastStart:'in-memory'});
     if (aCfg){
       const aenc = new AudioEncoder({output:(c,m)=>muxer.addAudioChunk(c,m), error:e=>console.warn(e)}); aenc.configure(aCfg);
       const o0 = Math.min(abuf.length, Math.round(fa*48000)), N = Math.max(0, Math.min(abuf.length, Math.round(fb*48000)) - o0), L0 = abuf.getChannelData(0).subarray(o0), R0 = (abuf.numberOfChannels > 1 ? abuf.getChannelData(1) : abuf.getChannelData(0)).subarray(o0);
@@ -4001,8 +4082,9 @@ async function exportMP4(){
     const d = new Date(), pad=n=>String(n).padStart(2,'0');
     lastMP4 = {blob, name:`chikimoviemagic-${W}x${H}-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.mp4`};
     window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec, audio: aCfg ? aCfg.codec : null};
-    if (renderer.xr.isPresenting){ document.getElementById('savemp4').style.display = ''; toast('MP4 ready'+(aCfg?' with voices':'')+'. Exit VR and tap the green Save MP4 button.'); }
-    else { saveMP4(); toast('MP4 saved · '+W+'×'+H+(aCfg?' · with voices':'')); }
+    const mb = (blob.size/1e6).toFixed(1)+' MB'+(isHevc ? ' · HEVC' : '');
+    if (renderer.xr.isPresenting || (NET.guest && matchMedia('(pointer:coarse)').matches)){ document.getElementById('savemp4').style.display = ''; if (!renderer.xr.isPresenting){ toast('Video ready ('+mb+'). Tap the green Save MP4 button to keep it on this phone.'); } else document.getElementById('savemp4').style.display = ''; toast('MP4 ready'+(aCfg?' with voices':'')+'. Exit VR and tap the green Save MP4 button.'); }
+    else { saveMP4(); toast('MP4 saved · '+W+'×'+H+' · '+mb+(aCfg?' · with voices':'')); }
   } catch(e){ console.error(e); toast(String(e.message||e)==='cancelled' ? 'Export cancelled' : 'Export failed: '+(e.message||e)); window.__lastExport = {error:String(e)}; }
   finally { if (shots._whole){ shots._whole = null; shots.seq = keepSeq; } activateScene(startScene); ensureCuts(); if (er){ er.dispose(); er.forceContextLoss?.(); } exporting = null; workView(); requestUI(); }
 }
@@ -4159,7 +4241,7 @@ function serialize(){
     world: state.world,
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
-    shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, sceneId:c.sceneId ?? null, seq:c.seq.slice(), mix:c.mix||{}, fin:c.fin||0, fout:c.fout ?? null}))), sceneCut:shots.sceneCut||{}, xfade:shots.xfade ?? 0.3, cut:shots.cut, clipSeq:shots.clipSeq||1},
+    shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, small:!!shots.small, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, sceneId:c.sceneId ?? null, seq:c.seq.slice(), mix:c.mix||{}, fin:c.fin||0, fout:c.fout ?? null}))), sceneCut:shots.sceneCut||{}, xfade:shots.xfade ?? 0.3, cut:shots.cut, clipSeq:shots.clipSeq||1},
     scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, music:sc.music||null, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null, k0:a.k0 ?? null, k1:a.k1 ?? null, bleep:!!a.bleep})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}])), takes:(sc.takes||[]).map(t=>({...t, before:Object.fromEntries(Object.entries(t.before||{}).map(([k,v])=>[k, v ? r5(v) : null]))}))}))), curScene, sceneSeq,
     show: {music:show.music, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null, k0:a.k0 ?? null, k1:a.k1 ?? null})),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx||'none', voicePitch:c.voicePitch||0, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null, lookOn:!!c.lookOn, lookRest:c.lookRest||null, sock:c.sock||null, outline:c.outline||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
@@ -5435,15 +5517,19 @@ function drawExport(X,W){
     button(X+i*(tw+8),228,tw,48,l,shots.aspect===a,()=>{ setAspect(a); sceneDirty=true; },'#1e6bff'));
   txt('Frames per second', X, 296, 16, '#cfd6ff','left',700);
   [24,30,60].forEach((f,i)=> button(X+i*(tw+8),310,tw,48,String(f),shots.fps===f,()=>{ shots.fps=f; sceneDirty=true; requestUI(); },'#5e2bff'));
-  if (scenes.length > 1 && !exporting){ const sc = sceneById(curScene); toggle(X,364,W,40, state.exportWhole ? 'Whole film: every scene in order' : 'Just '+(sc ? sc.name : 'this scene'), !!state.exportWhole, ()=>{ state.exportWhole = !state.exportWhole; requestUI(); }, '#ff2d95'); }
+  let y = 366;
+  if (hevcOK === null) checkHevc();
+  toggle(X,y,W,40, shots.small ? (hevcOK ? 'Smaller file: HEVC (H.265)' : 'Smaller file: lighter H.264') : 'Smaller file (HEVC)', !!shots.small, ()=>{ shots.small = !shots.small; sceneDirty = true; requestUI(); }, '#00c7be'); y += 48;
+  if (scenes.length > 1 && !exporting){ const sc = sceneById(curScene); toggle(X,y,W,40, state.exportWhole ? 'Whole film: every scene in order' : 'Just '+(sc ? sc.name : 'this scene'), !!state.exportWhole, ()=>{ state.exportWhole = !state.exportWhole; requestUI(); }, '#ff2d95'); y += 48; }
   const [w,h] = exportSize();
-  txt(w+' × '+h+'  ·  '+fmtTime(filmLength()), X, 384, 17, '#ffd400','left',700);
+  txt(w+' × '+h+'  ·  '+shots.fps+' fps  ·  '+fmtTime(filmLength()), X, y+12, 16, '#ffd400','left',700); y += 30;
   if (exporting){
-    rr(X,410,W,56,14,'#2a3060'); rr(X,410,Math.max(28,W*exporting.i/exporting.frames),56,14,'#34c759');
-    txt('Rendering '+exporting.i+' / '+exporting.frames, X+W/2, 438, 17, '#fff','center');
-    button(X,474,W,44,'Cancel export',false,()=>{ exporting.cancel = true; },'#ff3b30');
-  } else button(X,410,W,56,state.confirm==='exportvr' ? 'Tap again to start' : 'Export MP4',state.confirm==='exportvr',exportMP4,'#ff3b30');
-  if (!exporting) para(['Renders every frame with your voices.','Desktop Chrome is fastest; in the headset','it works too, just slower. You can cancel.'], X, 492, 13);
+    rr(X,y,W,56,14,'#2a3060'); rr(X,y,Math.max(28,W*exporting.i/exporting.frames),56,14,'#34c759');
+    txt('Rendering '+exporting.i+' / '+exporting.frames, X+W/2, y+28, 17, '#fff','center');
+    button(X,y+64,W,44,'Cancel export',false,()=>{ exporting.cancel = true; },'#ff3b30');
+  } else button(X,y,W,56,state.confirm==='exportvr' ? 'Tap again to start' : NET.guest ? 'Export MP4 to this phone' : 'Export MP4',state.confirm==='exportvr',()=>exportMP4(),'#ff3b30');
+  if (!exporting) para(NET.guest ? ['Gets the latest film from the headset first,','then renders it here and saves it to this','device. The headset can go off once it says so.'] :
+    shots.small && hevcOK === false ? ['This browser has no HEVC, so Smaller uses','H.264 at a lower bitrate.'] : ['Renders every frame with your voices.','Desktop Chrome is fastest; in the headset','it works too, just slower. You can cancel.'], X, y+80, 13);
   if (lastMP4 && GHS.ok && !exporting) button(X+W-150,UIH-36,150,30,'MP4 → GitHub',false,()=>ghPushMP4(),'#34c759');
 }
 function clearPart(L){
@@ -8988,7 +9074,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, bxIn, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
