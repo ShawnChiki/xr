@@ -78,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '539';
+const VERSION = '540';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -4174,6 +4174,23 @@ function exportSize(){
   return [base, base];
 }
 // ---- the film's sound for the MP4: AAC (plays everywhere, iPhone Photos too). Each try is checked, so a silent file never slips out.
+// the 2-byte AAC setup the MP4 needs. Some encoders (Apple's) hand back a bigger "cookie" instead: players then play the video silent, so it's checked and rebuilt
+function ascFor(sr, ch){ const fi = [96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000].indexOf(sr); const f = fi < 0 ? 3 : fi; return new Uint8Array([(2 << 3) | (f >> 1), ((f & 1) << 7) | ((ch || 2) << 3)]); }
+function cleanASC(d, sr, ch){
+  if (d && d.length >= 2 && d.length <= 5 && (d[0] >> 3) >= 1 && (d[0] >> 3) <= 5) return d;
+  if (d && d.length > 5){ for (let i=0;i<d.length-3;i++) if (d[i] === 0x05){ let p = i+1, len = 0; for (let k=0;k<4;k++){ const v = d[p++]; len = (len << 7) | (v & 0x7f); if (!(v & 0x80)) break; } if (len >= 2 && len <= 5 && p + len <= d.length){ const a = d.slice(p, p+len); if ((a[0] >> 3) >= 1 && (a[0] >> 3) <= 5) return a; } } }
+  return ascFor(sr, ch);
+}
+async function soundPlays(r, sr){   // decode the first second back: if this phone can't play what it just made, it isn't used
+  if (!('AudioDecoder' in window) || !r || !r.chunks.length) return true;
+  let outs = 0, loud = 0, err = null;
+  try { const dec = new AudioDecoder({output:a => { outs++; try { const n = a.numberOfFrames, f = new Float32Array(n); a.copyTo(f, {planeIndex:0, format:'f32-planar'}); for (let i=0;i<n;i+=16) if (Math.abs(f[i]) > 1e-4){ loud++; break; } } catch(e){} a.close(); }, error:e => { err = e; }});
+    dec.configure({codec: r.codec === 'aac' ? 'mp4a.40.2' : 'opus', sampleRate:sr, numberOfChannels:2, ...(r.desc ? {description:r.desc} : {})});
+    for (const c of r.chunks.slice(0, 60)) dec.decode(new EncodedAudioChunk({type:'key', timestamp:c.t, duration:c.dur, data:c.d}));
+    await dec.flush(); dec.close(); } catch(e){ err = err || e; }
+  if (err || !outs){ console.warn('sound does not decode', err, outs); return false; }
+  r.loud = loud; return true;
+}
 async function encodeSoundTrack(abuf, fa, fb){
   const SR = abuf.sampleRate, o0 = Math.min(abuf.length, Math.round(fa*SR)), N = Math.max(0, Math.min(abuf.length, Math.round(fb*SR)) - o0);
   const L0 = abuf.getChannelData(0).subarray(o0), R0 = (abuf.numberOfChannels > 1 ? abuf.getChannelData(1) : abuf.getChannelData(0)).subarray(o0);
@@ -4192,10 +4209,11 @@ async function encodeSoundTrack(abuf, fa, fb){
     if (err || chunks.length < Math.max(1, N/SR*20)) { console.warn('sound try failed', cfg.codec, interleaved, err, chunks.length); return null; }
     let desc = meta0 && meta0.description ? new Uint8Array(meta0.description.buffer ? meta0.description.buffer.slice(meta0.description.byteOffset || 0, (meta0.description.byteOffset || 0) + meta0.description.byteLength) : meta0.description) : null;
     if (cfg.codec.startsWith('mp4a')){
-      if (!desc || !desc.length) desc = ASC;
+      desc = cleanASC(desc, SR, 2);
       for (const c of chunks) if (c.d.length > 7 && c.d[0] === 0xFF && (c.d[1] & 0xF0) === 0xF0){ const hl = (c.d[1] & 1) ? 7 : 9; c.d = c.d.slice(hl); }   // ADTS headers off: MP4 wants plain AAC frames
     }
-    return {codec: cfg.codec.startsWith('mp4a') ? 'aac' : 'opus', chunks, desc, how:'encoder'};
+    const res = {codec: cfg.codec.startsWith('mp4a') ? 'aac' : 'opus', chunks, desc, how:'encoder'};
+    return (await soundPlays(res, SR)) ? res : null;
   };
   const base = {sampleRate:SR, numberOfChannels:2};
   for (const br of [160000, 128000, 192000]) for (const il of [false, true]){
@@ -4218,9 +4236,10 @@ async function recordSoundAAC(L0, R0, N, SR){
   const t0 = performance.now(); while ((performance.now() - t0)/1000 < secs + 0.4){ if (exporting && exporting.cancel) break; if (exporting){ exporting.note = 'Recording the sound '+fmtTime((performance.now()-t0)/1000)+' / '+fmtTime(secs); requestUI(); } await new Promise(r => setTimeout(r, 250)); }
   try { src.stop(); } catch(e){} mr.stop(); await done; src.disconnect(); if (exporting) exporting.note = null;
   const buf = new Uint8Array(await new Blob(parts).arrayBuffer());
-  const got = aacFromMP4(buf); if (!got || !got.frames.length) return null;
+  const got = aacFromMP4(buf); if (!got || !got.frames.length) return null; got.asc = cleanASC(got.asc, got.sr, got.ch);
   const fd = 1024/got.sr*1e6, delay = 0.05*1e6;
-  return {codec:'aac', desc:got.asc, chunks:got.frames.map((d, i) => ({d, t:Math.max(0, Math.round(i*fd - delay)), dur:Math.round(fd), type:'key'})), how:'recorder', sr:got.sr, ch:got.ch};
+  const res = {codec:'aac', desc:got.asc, chunks:got.frames.map((d, i) => ({d, t:Math.max(0, Math.round(i*fd - delay)), dur:Math.round(fd), type:'key'})), how:'recorder', sr:got.sr, ch:got.ch};
+  return (await soundPlays(res, got.sr)) ? res : null;
 }
 function aacFromMP4(u8){   // find the AAC config and frames in an MP4 (fragmented or plain)
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), str = (o) => String.fromCharCode(u8[o], u8[o+1], u8[o+2], u8[o+3]);
@@ -4308,7 +4327,7 @@ async function exportMP4(fresh){
     const blob = new Blob([target.buffer], {type:'video/mp4'});
     const d = new Date(), pad=n=>String(n).padStart(2,'0');
     lastSave = lastMP4 = {blob, name:`chikimoviemagic-${W}x${H}-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.mp4`};
-    window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec, audio: snd ? snd.codec+' ('+snd.how+')' : null, why:sndWhy}; state.lastSound = snd ? (snd.codec === 'aac' ? 'with sound (AAC)' : 'with sound (Opus: may be silent in iPhone Photos)') : 'NO SOUND: '+sndWhy;
+    window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec, audio: snd ? snd.codec+' ('+snd.how+')' : null, why:sndWhy}; state.lastSound = snd ? (snd.codec === 'aac' ? 'with sound (AAC · '+snd.how+' · '+Array.from(snd.desc || []).map(b => b.toString(16).padStart(2,'0')).join('')+')' : 'with sound (Opus: may be silent in iPhone Photos)') : 'NO SOUND: '+sndWhy;
     const mb = (blob.size/1e6).toFixed(1)+' MB'+(isHevc ? ' · HEVC' : '');
     if (renderer.xr.isPresenting || TOUCH()){ showSaveBtn(); toast(renderer.xr.isPresenting ? 'MP4 ready, '+state.lastSound+'. Exit VR and tap the green Save button.' : 'Video ready ('+mb+', '+state.lastSound+'). Tap 📲 Save to Photos, then "Save Video".'); }   // a phone needs your tap to open the share sheet
     else { saveMP4(); toast('MP4 saved · '+W+'×'+H+' · '+mb+' · '+state.lastSound); }
