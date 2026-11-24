@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '533';
+const VERSION = '534';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -183,7 +183,7 @@ function netReset(){
   try { NET.conn && NET.conn.close(); } catch(e){} try { NET.peer && NET.peer.destroy(); } catch(e){}
   for (const p of NET.peers.values()) dropAvatar(p);
   state.camOn = false; state.roam = false; state.gPick = false;
-  Object.assign(NET, {trkSig:null, camPeer:null, camPose:null, on:false, host:false, guest:false, synced:false, code:'', peer:null, conns:{}, conn:null, me:'host', n:1, hostRig:null, snapParts:null});
+  Object.assign(NET, {trkSig:null, lastRx:0, hbT:0, keptId:null, keptName:null, camPeer:null, camPose:null, on:false, host:false, guest:false, synced:false, code:'', peer:null, conns:{}, conn:null, me:'host', n:1, hostRig:null, snapParts:null});
   NET.peers.clear(); NET.assign.clear(); netRemote.clear(); netPose.clear(); netLastPose.clear(); netHash.clear();
   netOps = []; netVox.clear(); netSettle.clear(); netStTouch.clear(); netStDrop.clear(); netStFull.clear(); netMetaSig = '';
   requestUI();
@@ -215,7 +215,7 @@ async function netJoin(code, retry){
   const peer = makePeer(); NET.peer = peer; let done = false;
   peer.on('open', () => { const c = peer.connect(NET_PREFIX+code, {reliable:true}); NET.conn = c;
     c.on('open', () => { done = true; NET.on = true; NET.guest = true; NET.me = peer.id; netStatus('Getting the world…'); });
-    c.on('data', d => { const m = netDecode(d, 'host'); if (m) netRecvChain = netRecvChain.then(() => onNet(m, null)).catch(e => console.warn(e)); });
+    c.on('data', d => { NET.lastRx = performance.now(); const m = netDecode(d, 'host'); if (m) netRecvChain = netRecvChain.then(() => onNet(m, null)).catch(e => console.warn(e)); });
     const gone = () => { if (!NET.on) return;
       if (!NET.synced && (NET.retry||0) < 2){ const r2 = (NET.retry||0) + 1; netStatus('Connection hiccup, trying again…'); setTimeout(() => netJoin(code, r2), 1200); return; }   // dropped while loading: try again by itself
       netLeave(true); };
@@ -223,10 +223,20 @@ async function netJoin(code, retry){
   peer.on('error', e => { if (!done) netStatus(netErrText(e)); });
   setTimeout(() => { if (!done && NET.code === code) netStatus("Couldn't connect. Check the code and the internet, then try again."); }, 20000);
 }
-async function netLeave(lost){
+async function netLeave(lost, keep){
   const wasGuest = NET.guest, was = NET.on;
   if (show.embodied && wasGuest){ show.embodied = null; }
+  const synced = NET.synced, keepIt = wasGuest && synced && (lost || keep), kid = NET.keptId, kname = NET.keptName;
   netReset(); netStatus('');
+  if (keepIt){
+    let nm = kname, miss = missingVoices();
+    try { if (kid){ await idbSet('world:'+kid, JSON.stringify(serialize())); const w = worldList.find(x => x.id === kid); if (w){ w.saved = Date.now(); await idbSet('worlds', JSON.stringify(worldList)); } state.worldId = kid; }   // the newest version of it
+          else { nm = await keepWorldHere(); state.worldId = NET.keptId; } } catch(e){ console.error(e); }
+    NET.keptId = null; NET.keptName = null;
+    try { await idbSet('cur', state.worldId); } catch(e){}
+    toast((lost ? 'The headset left. ' : '')+'Everything is on this phone as "'+nm+'": keep editing, or EDIT → Export.'+(miss ? ' ('+miss+' voice clip'+(miss>1?'s':'')+' had not arrived.)' : ''));
+    requestUI(); return;
+  }
   if (wasGuest){ const id = state.worldId; state.worldId = -1; try { const s2 = await idbGet('world:'+id); if (s2) deserialize(JSON.parse(s2)); } catch(e){} state.worldId = id; setPhase('build'); }
   if (was) toast(lost ? 'The room closed' : 'Left the room');
 }
@@ -281,6 +291,8 @@ async function bxFinish(X){
   netMute++; try { if (show.embodied) show.embodied = null; deserialize(o); } finally { netMute--; }
   const first = !NET.synced;
   NET.synced = true; netPose.clear(); netHash.clear();
+  if (X.extra && X.extra.then === 'keep'){ netStatus(''); const nm = await keepWorldHere(o); state.worldId = NET.keptId;
+    toast('Got everything, saved on this phone as "'+nm+'". Safe to turn off the headset.'); netSend({t:'kept'}); requestUI(); return; }
   if (X.extra && X.extra.then === 'export'){ Object.assign(shots, keepEx); netStatus(''); state.page = 'export'; toast('Got everything, safe to turn off the headset. Making the video here…'); requestUI(); setTimeout(() => exportMP4(true), 200); return; }
   if (first) state.page = SCULPT_PHASES.includes(state.phase) ? 'tools' : 'together';
   netStatus(''); toast(first ? "You're in! "+playerName(NET.n)+': got everything, safe to turn off the headset any time.' : 'Got everything.');
@@ -293,10 +305,24 @@ setInterval(() => {   // a piece that never came: ask again for whatever is miss
 let trkT = 0;
 function trkSig(){ let h = curScene+'|'; for (const k in show.tracks){ const sm = show.tracks[k].samples || []; let a = 0; for (let i=0;i<sm.length;i++) a += sm[i]*((i%7)+1); h += k+':'+sm.length+':'+a.toFixed(3)+';'; } return h; }
 function netTracks(){
-  const now = performance.now(); if (now - trkT < 1000 || show.rec || !Object.keys(NET.conns).length) return; trkT = now;
+  const now = performance.now(); if (now - trkT < 1500 || show.rec || show.playing || play || rec || exporting || !Object.keys(NET.conns).length) return; trkT = now;
   const sig = trkSig(); if (sig === NET.trkSig) return; NET.trkSig = sig;
   const json = JSON.stringify({scene:curScene, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}]))});
   for (const id in NET.conns) bxOffer(id, 'trk', json);
+}
+// ---- keeping the headset's world on this phone: saved here as its own world, so the headset can go off and you keep editing or exporting
+async function keepWorldHere(o){
+  o = o || serialize();
+  const id = Math.max(0, ...worldList.map(w => w.id)) + 1, d = new Date();
+  const name = 'From the headset · ' + d.toLocaleString('en-US', {timeZone:'America/Toronto', month:'short', day:'numeric', hour:'numeric', minute:'2-digit'});
+  await idbSet('world:'+id, JSON.stringify(o)); worldList.push({id, name, saved:Date.now()}); await idbSet('worlds', JSON.stringify(worldList));
+  NET.keptId = id; NET.keptName = name; return name;
+}
+const missingVoices = () => show.audio.filter(a => !a.b64).length + scenes.reduce((n, sc) => n + (sc.id === curScene ? 0 : (sc.audio||[]).filter(a => !a.b64).length), 0);
+function sendAllToPhone(to){
+  netTick(true); const W = worldForPlayer();
+  for (const id of (to ? [to] : Object.keys(NET.conns))) bxOffer(id, 'snap', W.json, {views:W.views, then:'keep'});
+  toast('Sending everything to the phone. Keep the headset on until it says it got everything.'); requestUI();
 }
 function guestExport(){
   if (NET.guest && NET.on){ netStatus('Asking the headset for the latest film…'); netSend({t:'filmreq'}); requestUI(); return true; }
@@ -353,6 +379,8 @@ function netTick(force){
   if (!NET.on || !NET.synced) return;
   if (NET.host){ netAudioList(); netTracks(); }
   const now = performance.now();
+  if (NET.host && now - (NET.hbT||0) > 2000){ NET.hbT = now; netSend({t:'hb'}); }
+  if (NET.guest && NET.lastRx && now - NET.lastRx > 12000){ NET.lastRx = 0; try { NET.conn && NET.conn.close(); } catch(e){} netLeave(true); return; }
   if (!force && now - netTickT < 90) return; netTickT = now;
   if (NET.host && (force || now - netMetaT > 250 || netVox.size || netStTouch.size || netStFull.size || netOps.length)){ netMetaT = now; const m = metaNow(), sg = JSON.stringify(m); if (sg !== netMetaSig){ netMetaSig = sg; netSend({t:'meta', ...m}); } }
   if (netOps.length){ const ops = netOps; netOps = []; for (let i=0;i<ops.length;i+=300) netSend({t:'op', from:NET.me, ops:ops.slice(i, i+300)}); }
@@ -506,6 +534,8 @@ async function onNet(m, from){
     case 'bx': if (!NET.host) bxPart(m); return;
     case 'bxneed': if (NET.host) bxSendParts(from, m.id, m.miss || []); return;
     case 'bxok': if (NET.host){ const o = bxOut.get(m.id+'|'+from); bxOut.delete(m.id+'|'+from); if (o && o.kind==='snap' && o.parts.length > 1) toast(playerName((NET.peers.get(from)||{}).n||2)+' got everything'); } return;
+    case 'kept': if (NET.host){ const p = NET.peers.get(from); toast((p ? playerName(p.n) : 'The phone')+' has everything saved. Safe to turn off the headset.'); if (p) p.kept = Date.now(); requestUI(); } return;
+    case 'hb': return;
     case 'filmreq': if (NET.host){ netTick(true); const W = worldForPlayer(); bxOffer(from, 'snap', W.json, {views:W.views, then:'export'}); toast('Sending the film to '+playerName((NET.peers.get(from)||{}).n||2)+' to save on their phone'); } return;
     case 'op': { netMute++; try { for (const op of m.ops){ if (layerById(op.L)) applyOp(op); else netPendFor({t:'op', L:op.L, op}); } } finally { netMute--; } if (NET.host) netSend(m); return; }
     case 'vox': await applyVox(m); if (NET.host) netSend(m); return;
@@ -820,8 +850,9 @@ function drawTogether(X,W){
     else if (show.embodied){ rr(X,322,W,52,14,'#ff2d95'); txt('You are '+show.embodied.c.name, X+W/2, 348, 19, '#111','center');
       para(['Head and hands move it. Talk: the mouth moves.','Grip a prop to hold it, a wall to climb.'], X, 392, 13); }
     button(X,440,W,46,'Mic '+(state.mic && micStream ? 'on' : 'off'),!!(state.mic && micStream),async ()=>{ state.mic = !state.mic; if (state.mic) await ensureMic(); requestUI(); },'#ff9500');
-    button(X,UIH-150,W,46,'Leave the room',false,()=>netLeave(false),'#ff3b30');
-    if (NET.status) para([NET.status], X, UIH-190, 14, '#ffd400');
+    if (NET.synced){ button(X,UIH-204,W,46,'📱 Keep this world on this phone & leave',false,()=>netLeave(false, true),'#34c759'); }
+    button(X,UIH-150,W,46,'Leave (back to my own world)',false,()=>netLeave(false),'#ff3b30');
+    if (NET.status) para([NET.status], X, UIH-244, 14, '#ffd400');
     return;
   }
   if (NET.host){
@@ -855,6 +886,8 @@ function drawTogether(X,W){
     const h2 = (W-8)/2;
     button(X, my+116, h2, 38, '↶ Undo theirs', false, ()=>netSend({t:'doundo', redo:false}, sel.id), '#1e6bff');
     button(X+h2+8, my+116, h2, 38, 'Redo theirs ↷', false, ()=>netSend({t:'doundo', redo:true}, sel.id), '#1e6bff');
+    const kept = ps.some(p => p.kept);
+    button(X,Math.max(UIH-160, my+162),W,44, kept ? '📱 Phone has everything ✓ (send again)' : '📱 Send everything to the phone', kept, ()=>sendAllToPhone(), '#34c759');
     button(X,UIH-110,W,42,'Close the room',false,()=>{ netLeave(false); },'#ff3b30');
     return;
   }
@@ -875,6 +908,7 @@ function railNow(){
 
 /* voice pitch: stretch the sound in time without changing its pitch (WSOLA), then play it back faster or slower */
 const pitchCache = new Map();
+const _pcSet = pitchCache.set.bind(pitchCache); pitchCache.set = (k, v) => { if (pitchCache.size > 48) pitchCache.delete(pitchCache.keys().next().value); return _pcSet(k, v); };
 function wsola(x, f){
   const W = 1024, Hs = 512, Ha = Hs/f, tol = 192, n = x.length, outLen = Math.floor(n*f) + W;
   const y = new Float32Array(outLen), ws = new Float32Array(outLen), win = new Float32Array(W);
@@ -2711,7 +2745,13 @@ function restoreShow(s){
 /* audio */
 let actx = null; const audioBufs = new Map(); let audioSrcs = []; let audioToken = 0;
 function beep(freq, dur=0.12, vol=0.22){ if (!state.beeps) return; try { const a = ac(); const o = a.createOscillator(), gn = a.createGain(); o.type='square'; o.frequency.value=freq; gn.gain.setValueAtTime(vol, a.currentTime); gn.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur); o.connect(gn); gn.connect(a.destination); o.start(); o.stop(a.currentTime+dur+0.03); } catch(e){} }
-function ac(){ if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)(); if (actx.state==='suspended') actx.resume(); return actx; }
+let nodeSink = null;
+function ac(){ if (!actx){ actx = new (window.AudioContext||window.webkitAudioContext)();
+    for (const k of ['createGain','createDelay','createBiquadFilter','createConvolver','createOscillator','createStereoPanner','createWaveShaper','createDynamicsCompressor','createBufferSource']){
+      const f = actx[k]; if (!f) continue; actx[k] = function(...a){ const n = f.apply(this, a); if (nodeSink) nodeSink.push(n); return n; }; } }
+  if (actx.state==='suspended') actx.resume(); return actx; }
+function teardown(nodes){ for (const n of nodes){ try { if (n.stop) n.stop(); } catch(e){} try { n.disconnect(); } catch(e){} } nodes.length = 0; }
+let audioPending = [];
 async function decodeClip(c){
   if (audioBufs.has(c.id)) return audioBufs.get(c.id);
   if (!c.b64) return null;
@@ -2736,7 +2776,16 @@ function applyAudList(m){
   if (need.length) netSend({t:'aget', ids:need});
 }
 function findClipAnywhere(id){ let a = show.audio.find(x=>x.id===id); if (a) return a; for (const sc of scenes) if (sc.audio){ a = sc.audio.find(x=>x.id===id); if (a) return a; } return null; }
-function audioStop(){ if (NET.host && showAudOn){ showAudOn = false; netSend({t:'astop'}); } musicSrc = null; audioToken++; for (const s of audioSrcs){ try{ s.stop(); }catch(e){} } audioSrcs = []; }
+function audioStop(cont){
+  if (!cont && NET.host && showAudOn){ showAudOn = false; netSend({t:'astop'}); }
+  audioToken++; audioPending = [];
+  const keep = [], now = actx ? actx.currentTime : 0;
+  for (const s of audioSrcs){
+    if (cont && s === musicSrc){ keep.push(s); continue; }   // a cut in one continuous stretch: the music runs straight through
+    if (cont && s._fg && actx){ try { s._fg.gain.setValueAtTime(s._fg.gain.value, now); s._fg.gain.linearRampToValueAtTime(0, now + 0.04); s.stop(now + 0.05); } catch(e){} const nd = s._nodes; if (nd) setTimeout(() => teardown(nd), 150); continue; }   // voices fade over 40 ms: no click
+    try { s.stop(); } catch(e){} if (s._nodes) teardown(s._nodes); }
+  if (!cont) musicSrc = null;
+  audioSrcs = keep; }
 const VOICE_FX = [['none','Plain'],['echo','Echo'],['robot','Robot'],['radio','Radio'],['cave','Cave']];
 let _caveIR = null;
 function caveIR(ctx){
@@ -2794,20 +2843,35 @@ function spatialNode(ctx, node, c, tk, u0, u1, timeOf, vis){
 }
 let audioSkip = null;   // while re-recording: whose old lines stay quiet
 function recSkipSet(){ if (state.hearOld) return null; const s2 = new Set(); if (show.embodied) s2.add(show.embodied.c.id); if (show.grab && show.grab.c) s2.add(show.grab.c.id); for (const id of NET.assign.keys()) s2.add(id); for (const sd of ['left','right']){ const c = sockOn(sd); if (c) s2.add(c.id); } for (const id of netSocks.keys()) s2.add(id); if (show.rec && show.rec.voiceFor != null) s2.add(show.rec.voiceFor); return s2.size ? s2 : null; }
-async function audioPlayFrom(t, rate=1, only, tk){
-  audioStop(); const token = audioToken;
+async function audioPlayFrom(t, rate=1, only, tk, cont){
+  audioStop(cont && musicSrc && !only); cont = !!(cont && musicSrc && !only); const token = audioToken; let t0 = null;
   if (NET.on && NET.host && !only && !tk){ showAudOn = true; netSend({t:'aplay', at:t, r:rate, skip:audioSkip ? [...audioSkip] : null}); }   // the show's sound: partners start it at the same spot
-  if (!only) musicPlayFrom(t, rate, tk && tk._seg ? laneGain('music') : 1);
+  if (!only && !cont) musicPlayFrom(t, rate, tk && tk._seg ? laneGain('music') : 1);
   for (const c of (only ? [only] : show.audio)){
     if (!only && !tk && audioSkip && audioSkip.has(c.cid) && (c.at||0) + (c.dur||0) > t) continue;   // the take you're redoing: don't talk over yourself
     let buf = null; try { buf = playBuf(c, await decodeClip(c)); } catch(e){}
     const at = c.at || 0;
     if (!buf || token!==audioToken || t >= at + buf.duration) continue;
-    const a = ac(), src = a.createBufferSource(); src.buffer = buf; src.playbackRate.value = rate;
-    const t0 = a.currentTime; spatialNode(a, buildFx(a, c, src), c, (tk && tk._snd) || tk, Math.max(t, at), at + buf.duration, u => t0 + (u - t)/rate, tk).connect(tk && tk._seg ? laneNode(a, c) : a.destination);
-    if (t >= at) src.start(0, t - at); else src.start(a.currentTime + (at - t)/rate, 0);
-    audioSrcs.push(src);
+    if (t0 == null) t0 = ac().currentTime;
+    const job = {c, buf, t, t0, rate, tk, token, when: t0 + (at - t)/rate, fade:cont};
+    if (job.when - ac().currentTime > 2.5) audioPending.push(job); else startClip(job);   // far-off lines are wired up just before they play, so only a few effect chains run at once
   }
+}
+function startClip(J){
+  const {c, buf, t, rate, tk} = J, at = c.at || 0, a = ac(), nodes = [];
+  nodeSink = nodes;
+  try {
+    const src = a.createBufferSource(); src.buffer = buf; src.playbackRate.value = rate;
+    const fg = a.createGain(); if (J.fade && t >= at){ fg.gain.setValueAtTime(0, a.currentTime); fg.gain.linearRampToValueAtTime(1, a.currentTime + 0.04); }
+    spatialNode(a, buildFx(a, c, src), c, (tk && tk._snd) || tk, Math.max(t, at), at + buf.duration, u => J.t0 + (u - t)/rate, tk).connect(fg); fg.connect(tk && tk._seg ? laneNode(a, c) : a.destination); src._fg = fg;
+    if (t >= at) src.start(0, t - at); else src.start(Math.max(a.currentTime, J.when), 0);
+    src._nodes = nodes; audioSrcs.push(src);
+    src.addEventListener('ended', () => setTimeout(() => { teardown(nodes); const i = audioSrcs.indexOf(src); if (i >= 0) audioSrcs.splice(i, 1); }, 3000));   // after the echo and cave tails die down
+  } finally { nodeSink = null; }
+}
+function audioPendingTick(){
+  if (!audioPending.length || !actx) return;
+  const now = actx.currentTime; audioPending = audioPending.filter(J => { if (J.token !== audioToken) return false; if (J.when - now < 1.5){ startClip(J); return false; } return true; });
 }
 // the whole film's voices, mixed offline for the MP4
 async function renderFilmAudio(total, only){
@@ -3633,7 +3697,9 @@ function updatePlay(dt){
     play.t += realDt(play);
     const L = filmRange()[1]; if (play.t >= L){ shots.playhead = L; stopPlay(); return; }
     shots.playhead = play.t; const f = filmAt(play.t);
-    if (f){ poseShotCam(f.tk, f.u); const sk = f.tk._seg ?? f.tk.id; if (play.clipId !== sk){ play.clipId = sk; activateScene(f.tk.sceneId); if (!play.silent) audioPlayFrom(f.u, spd(f.tk), null, f.tk); else audioStop(); } }
+    if (f){ poseShotCam(f.tk, f.u); const sk = f.tk._seg ?? f.tk.id; if (play.clipId !== sk){ const pv = play.seg; play.clipId = sk; play.seg = f.tk; activateScene(f.tk.sceneId);
+      const cont = !!(pv && (pv.sceneId ?? 1) === (f.tk.sceneId ?? 1) && Math.abs(pv.outT - f.tk.inT) < 0.06 && Math.abs(spd(pv) - spd(f.tk)) < 1e-3);   // the same moment seen from another camera
+      if (!play.silent) audioPlayFrom(f.u, spd(f.tk), null, f.tk, cont); else audioStop(); } }
     uiTick += dt; if (uiTick > 0.1){ uiTick = 0; requestUI(); }
   }
 }
@@ -9035,7 +9101,7 @@ function renderGridRT(G, all){
     const xr = renderer.xr.enabled; renderer.xr.enabled = false; const old = renderer.getRenderTarget();
     const key = G.cols+'x'+G.rows+'|'+n;
     if (key !== gridKey){ gridKey = key; bigRT.scissorTest = false; bigRT.viewport.set(0,0,W,H); renderer.setRenderTarget(bigRT); renderer.setClearColor('#000'); renderer.clear(); all = true; }
-    const k = (all || !(state.gridLite && play)) ? n : Math.min(n, 2);
+    const xrp = renderer.xr.isPresenting, k = (all || !((state.gridLite || xrp) && play)) ? n : Math.min(n, xrp ? 1 : 2);   // in the headset a playing grid redraws one lane a frame
     for (let j=0;j<k;j++){ const i = (gridNext + j) % n; renderGridCell(G, i, bigRT, W, H, true); }
     gridNext = (gridNext + k) % n;
     bigRT.scissorTest = false; bigRT.viewport.set(0,0,W,H); bigRT.scissor.set(0,0,W,H);
@@ -9161,9 +9227,9 @@ renderer.setAnimationLoop(() => {
   if (state.toastT > 0){ state.toastT -= tdt; if (state.toastT <= 0) requestUI(); }
   const xr = renderer.xr.isPresenting;
   if (xr){ netFollowHost(); xrCameraUpdate(); xrUpdate(dt); btnColorT += raw; if (btnColorT > 0.5){ btnColorT = 0; for (const h of ['left','right']) if (ctrl[h]) colorButtons(ctrl[h].grip); } } else desktopUpdate(dt);
-  updateRecording(tdt); updatePlay(tdt);
+  updateRecording(tdt); updatePlay(tdt); audioPendingTick();
   if (show.music && show.music.song >= 0 && !songBufs.has(show.music.song)) songBuf(show.music.song);   // have it ready before you press play
-  if (state.warmSongs && !songBusy.size && !show.rec && !rec && !exporting){ const j = SONGS.findIndex((S, k) => S.compose && !songKept.has(k) && !songBufs.has(k)); if (j >= 0) songBuf(j, true); else state.warmSongs = false; }   // after you open Music: compose the rest quietly, once
+  if (state.warmSongs && !songBusy.size && !show.rec && !rec && !exporting && !show.playing && !play){ const j = SONGS.findIndex((S, k) => S.compose && !songKept.has(k) && !songBufs.has(k)); if (j >= 0) songBuf(j, true); else state.warmSongs = false; }   // after you open Music: compose the rest quietly, once
   applyShowPose(currentShowTime());
   netApplyPoses();
   if (xr && show.embodied){ followRoot(tdt); updateEmbodied(); }
@@ -9186,7 +9252,8 @@ renderer.setAnimationLoop(() => {
   applyStage();
   if (xr){
     previewFlip = !previewFlip;
-    if (applyHostView()) renderPreview(shotCam);
+    if (!previewFlip && (play || show.playing || show.rec || rec)){}   // while things play, the little preview screen draws every other frame: the headset keeps its full frame rate
+    else if (applyHostView()) renderPreview(shotCam);
     else if (state.phase==='shoot' || state.phase==='edit' || state.camOn || NET.camPeer){ renderPreview(shotCam); }
     else if (((state.phase==='perform' && state.mirrorOn) || state.phase==='characters') && show.embodied) renderPreview(mirrorCam);
     else if (state.phase==='perform' && selTake() && state.win.preview) renderPreview(shotCam);
@@ -9269,7 +9336,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, bxIn, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
