@@ -62,7 +62,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '526';
+const VERSION = '528';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -447,7 +447,7 @@ async function onNet(m, from){
     case 'aud': if (!NET.host) applyAudList(m); return;
     case 'aget': if (NET.host){ const clips = (m.ids||[]).map(findClipAnywhere).filter(a => a && a.b64); for (const a of clips) netSend({t:'aclip', clip:{id:a.id, b64:a.b64, mime:a.mime}}); } return;
     case 'aclip': if (!NET.host){ const a = findClipAnywhere(m.clip.id); if (a){ a.b64 = m.clip.b64; a.mime = m.clip.mime || a.mime; audioBufs.delete(a.id); } } return;
-    case 'aplay': if (!NET.host && !(play && play.mode==='film')) audioPlayFrom(m.at || 0, m.r || 1); return;
+    case 'aplay': if (!NET.host && !(play && play.mode==='film')){ audioSkip = m.skip ? new Set(m.skip) : null; audioPlayFrom(m.at || 0, m.r || 1); } return;
     case 'astop': if (!NET.host && !(play && play.mode==='film')) audioStop(); return;
     case 'sock': if (NET.host){ const now = performance.now(); for (const id in m.k){ const c = charById(+id); if (!c || c.sockLive) continue; const o = netSocks.get(+id); if (o && o.peer !== from && now - o.at < 1000) continue; netSocks.set(+id, {peer:from, a:m.k[id], at:now}); } } return;
     case 'recreq': if (NET.host && (state.phase === 'perform' || state.phase === 'shoot')){ show.rec ? cutShowRec() : startShowRec(); requestUI(); } return;
@@ -1849,7 +1849,7 @@ let hintT = -1e9;
 function beginStroke(rWorld){
   if (show.embodied) return false;   // wearing a puppet: no sculpting with your hands
   if (state.tool==='magic' ? !SCULPT_PHASES.includes(state.phase) : !canEdit()) return false;
-  if (state.randColor && ['clay','paint','spray','doodle','blocks'].includes(state.tool) && !(state.tool==='clay' && state.carve)){ let c; do { c = PALETTE[Math.floor(Math.random()*8)]; } while (c===state.color); state.color = c; }
+  if (state.randColor && ['clay','paint','spray','doodle','blocks'].includes(state.tool) && !(state.tool==='clay' && state.carve)){ const h0 = hexHsv(state.color).h; let h; do { h = Math.random(); } while (Math.abs(((h - h0 + 1.5) % 1) - 0.5) < 0.08); state.color = hsvHex(h, 1, 1); }
   if (['clay','paint','doodle','blocks'].includes(state.tool) && !state.carve) addRecent(state.color);
   const L = activeLayer();
   if (state.tool==='doodle'){
@@ -2558,11 +2558,14 @@ function spatialNode(ctx, node, c, tk, u0, u1, timeOf, vis){
     if (first){ gn.gain.setValueAtTime(z.g, tt); pn.pan.setValueAtTime(z.pan, tt); first = false; } else { gn.gain.linearRampToValueAtTime(z.g, tt); pn.pan.linearRampToValueAtTime(z.pan, tt); } }
   node.connect(gn); gn.connect(pn); return pn;
 }
+let audioSkip = null;   // while re-recording: whose old lines stay quiet
+function recSkipSet(){ if (state.hearOld) return null; const s2 = new Set(); if (show.embodied) s2.add(show.embodied.c.id); if (show.grab && show.grab.c) s2.add(show.grab.c.id); for (const id of NET.assign.keys()) s2.add(id); for (const sd of ['left','right']){ const c = sockOn(sd); if (c) s2.add(c.id); } for (const id of netSocks.keys()) s2.add(id); if (show.rec && show.rec.voiceFor != null) s2.add(show.rec.voiceFor); return s2.size ? s2 : null; }
 async function audioPlayFrom(t, rate=1, only, tk){
   audioStop(); const token = audioToken;
-  if (NET.on && NET.host && !only && !tk){ showAudOn = true; netSend({t:'aplay', at:t, r:rate}); }   // the show's sound: partners start it at the same spot
+  if (NET.on && NET.host && !only && !tk){ showAudOn = true; netSend({t:'aplay', at:t, r:rate, skip:audioSkip ? [...audioSkip] : null}); }   // the show's sound: partners start it at the same spot
   if (!only) musicPlayFrom(t, rate, tk && tk._seg ? laneGain('music') : 1);
   for (const c of (only ? [only] : show.audio)){
+    if (!only && !tk && audioSkip && audioSkip.has(c.cid) && (c.at||0) + (c.dur||0) > t) continue;   // the take you're redoing: don't talk over yourself
     let buf = null; try { buf = playBuf(c, await decodeClip(c)); } catch(e){}
     const at = c.at || 0;
     if (!buf || token!==audioToken || t >= at + buf.duration) continue;
@@ -2997,6 +3000,7 @@ function startShowRec(){
   if (state.mic) ensureMic();
 }
 function cutShowRec(cancel){
+  audioSkip = null;
   const r = show.rec; if (!r) return;
   show.rec = null; setRecLabel(''); audioStop();
   if (NET.host) netSend({t:'rec', on:0, keep: r.phase==='rec' && !cancel});
@@ -3037,7 +3041,7 @@ function updateShow(dt){
     if (r.phase==='count'){
       r.t -= dt; const n = Math.ceil(r.t); if (n>0){ setRecLabel(String(n)); if (n!==r.lastN){ r.lastN = n; beep(660); } }
       if (r.t <= 0){
-        r.phase='rec'; r.t=r.t0||0; show.t=r.t; r._wall = performance.now(); pulse('right',0.7,60); beep(1320, 0.22); audioPlayFrom(r.t); if (NET.host) netSend({t:'rec', on:1, at:r.t0 || 0});
+        r.phase='rec'; r.t=r.t0||0; show.t=r.t; r._wall = performance.now(); pulse('right',0.7,60); beep(1320, 0.22); audioSkip = recSkipSet(); audioPlayFrom(r.t); if (NET.host) netSend({t:'rec', on:1, at:r.t0 || 0});
         if (state.mic && micStream && window.MediaRecorder){
           try { r.mr = micRecorder(); r.mr.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); }; r.mr.start(250); } catch(e){ toast('Mic recording failed'); }
         }
@@ -4366,7 +4370,7 @@ function updateOrb(){
   if (!host || !renderer.xr.isPresenting || state.orbPos==='off'){ orb.visible = false; return; }
   if (orb.parent !== host.mesh) host.mesh.add(orb);
   pickWheel.visible = state.pickStyle==='wheel'; pickDots.visible = state.pickStyle==='dots'; pickChips.visible = state.pickStyle==='chips'; pickHSV.visible = state.pickStyle==='hsv';
-  if (pickHSV.visible) drawHSV(); diceMesh.position.set(dicePos(), 0, 0.002); if (diceDrawn === null) drawDice(!!state.randColor, false);
+  if (pickHSV.visible) drawHSV(); diceMesh.position.set(dicePos(), 0, 0.002); bwSw[0].position.set(dicePos(), 0.03, 0.002); bwSw[1].position.set(dicePos(), -0.03, 0.002); if (diceDrawn === null) drawDice(!!state.randColor, false);
   if (pickWheel.visible){ const o = curHSL(), l = clamp(o.l, 0.15, 0.85); if (Math.abs(l-wheelDrawnL) > 0.03) drawWheel(l); if (Math.abs(o.h-barDrawnH) > 0.02 && o.s > 0.05) drawBar(o.h); if (barDrawnH < 0) drawBar(0); }
   const top = host.mesh.geometry.parameters.height/2;
   const off = state.pickStyle==='chips' ? 0.05 : state.pickStyle==='wheel' ? 0.07 : state.pickStyle==='hsv' ? 0.05 : 0.065;
@@ -4806,6 +4810,7 @@ function addRecent(hex){ state.recent = [hex, ...(state.recent||[]).filter(c=>c!
 function drawColor(X,W){
   txt('Color', X, 100, 26);
   button(X+W-130,82,130,34,'🎲 Random each stroke',!!state.randColor,()=>{ state.randColor=!state.randColor; requestUI(); },'#ff2d95');
+  [['#ffffff','#111'],['#111111','#fff']].forEach(([col, ink], i) => { const cx = X+W-130-24-i*44; g.fillStyle = col; g.beginPath(); g.arc(cx, 99, 17, 0, 7); g.fill(); g.lineWidth = 3; g.strokeStyle = ink; g.stroke(); hit(cx-18, 81, 36, 36, () => { pickColor(col); requestUI(); }); });
   const o = curHSL();
   rr(X,116,W,46,14,state.color); txt(state.color.toUpperCase(), X+W/2, 139, 15, o.l>0.6?'#111':'#fff','center',700);
   const cw = (W-5*6)/6, chh = 34;
@@ -5301,9 +5306,10 @@ function drawChars(X,W){
     txt('Arms', X, y+15, 14, '#cfd6ff','left',800);
     ARM_STYLES.forEach(([id,l],i)=> button(X+46+i*(aw+8), y, aw, 30, l, A.style===id, ()=>{ A.style = id; sceneDirty = true; requestUI(); }, '#ffd400'));
     y += 38;
-    if (A.style !== 'none'){ slider(X,y,(W-8)*0.55,'Thickness', A.thick, 0.005, 0.08, v=>{ A.thick = +v.toFixed(4); sceneDirty = true; }, '#ffd400', fmtLen(A.thick*2));
-      button(X+(W-8)*0.55+8,y+6,(W-8)*0.45,34,'Color = brush',false,()=>{ A.col = state.color; sceneDirty = true; requestUI(); },'#ff2d95');
-      button(X,y+50,W,34,'Set shoulders (hold controllers there)',false,()=>startSetShoulders(),'#5e2bff'); y += 92; }
+    if (A.style !== 'none'){ const w1 = (W-16)*0.44, w2 = (W-16)*0.22, w3 = (W-16)*0.34;
+      slider(X,y,w1,'Thickness', A.thick, 0.005, 0.08, v=>{ A.thick = +v.toFixed(4); sceneDirty = true; }, '#ffd400', fmtLen(A.thick*2));
+      button(X+w1+8,y+6,w2,34,'Color = brush',false,()=>{ A.col = state.color; sceneDirty = true; requestUI(); },'#ff2d95');
+      button(X+w1+w2+16,y+6,w3,34,shoulderSet > 0 ? 'Hold still…' : 'Set shoulders',shoulderSet > 0,()=>startSetShoulders(),'#5e2bff'); y += 52; }
   }
   else if (c.type==='sock'){
     const worn = sd => !!(state.socks && state.socks[sd] === c.id);
@@ -5316,10 +5322,11 @@ function drawChars(X,W){
   }
   drawWeight(X, y+4, W, c);
   const ac2 = state.confirm==='clearpart', a = state.confirm==='delchar';
-  button(X,UIH-56,t3,42,ac2?'Tap again':'Clear part',ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(activeLayer()); },'#ff9500');
-  button(X+t3+8,UIH-56,t3,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
-  button(X+2*(t3+8),UIH-56,t3,42,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
-  button(X,UIH-104,W,40,'⧉ Duplicate '+(c.name.length > 16 ? c.name.slice(0,15)+'…' : c.name),false,()=>dupChar(c),'#34c759');
+  const t4 = (W-24)/4, by4 = Math.max(UIH-56, y+8);   // one row at the bottom, below whatever the character needed
+  button(X,by4,t4,42,ac2?'Tap again':'Clear part',ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(activeLayer()); },'#ff9500');
+  button(X+t4+8,by4,t4,42,'⧉ Duplicate',false,()=>dupChar(c),'#34c759');
+  button(X+2*(t4+8),by4,t4,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
+  button(X+3*(t4+8),by4,t4,42,a?'Tap again':'Delete',a,()=>{ if(!a){state.confirm='delchar';requestUI();return;} state.confirm=null; deleteChar(c); },'#ff3b30');
 }
 function cycleTake(d){ const T = sceneTakes(), n = T.length; if (!n) return; const i = T.findIndex(t=>t.id===shots.sel); shots.sel = T[((i<0?0:i)+d+n)%n].id; shots.keySel=-1; pathDirty=true; requestUI(); }
 function cycleChar(d){ const pool = state.phase==='characters' ? show.chars.filter(c=>c.type==='puppet' || c.type==='sock') : show.chars, n = pool.length; if (!n) return; const i = pool.findIndex(c=>c.id===state.selChar); const c = pool[((i<0?0:i)+d+n)%n]; state.selChar = c.id; for (const P of partsOf(c)) P.flashT = 0.9; selMarkT = 3; requestUI(); }
@@ -5365,8 +5372,9 @@ function drawPerform(X,W){
   button(X+tw+8,ty,tw,42,'Hear me',!!state.monitor,async ()=>{ state.monitor = !state.monitor; if (state.monitor){ state.mic = true; await ensureMic(); toast('You hear your puppet voice live (use headphones or keep it low)'); } monT = 0; requestUI(); },'#34c759');
   button(X+2*(tw+8),ty,tw,42,'Mirror',state.mirrorOn,()=>{ state.mirrorOn=!state.mirrorOn; if (state.mirrorOn){ placeMirror(); state.win.preview = true; } requestUI(); },'#1e6bff');
   button(X+3*(tw+8),ty,tw,42,'Camera',state.win.preview,()=>{ state.win.preview=!state.win.preview; requestUI(); },'#00c7be');
+  button(X,ty+50,W,38,'Hear your old take while re-recording',!!state.hearOld,()=>{ state.hearOld = !state.hearOld; toast(state.hearOld ? 'You hear your old lines as a guide while you redo them' : 'Your old lines go quiet while you redo them'); requestUI(); },'#5e2bff');
   const gps = NET.host ? [...NET.peers.values()].sort((a,b)=>a.n-b.n) : [];
-  if (gps.length) gps.forEach((p,i)=>{ const y = ty+52+i*48, cur = [...NET.assign].find(([,pid])=>pid===p.id), cc = cur ? charById(cur[0]) : null, col = PLAYER_COL[(p.n-1)%4];
+  if (gps.length) gps.forEach((p,i)=>{ const y = ty+98+i*48, cur = [...NET.assign].find(([,pid])=>pid===p.id), cc = cur ? charById(cur[0]) : null, col = PLAYER_COL[(p.n-1)%4];
     rr(X,y,10,42,5,col); txt(playerName(p.n), X+18, y+21, 15, '#fff');
     if (cc) button(X+96,y,W-96,42,'In '+cc.name+' · take out',true,()=>netUnassign(p.id),'#00c7be');
     else if (sc0 && sc0.type==='puppet' && !assignedTo(sc0)) button(X+96,y,W-96,42,'Put in '+sc0.name,false,()=>netAssign(sc0, p.id),'#00c7be');
@@ -5601,7 +5609,7 @@ function drawShowRows(X,W,aud){
     button(X, yb+6, hw2, 40, hearing ? '■ Stop' : '▶ Hear it from here', hearing, ()=>{
       if (hearing){ audioStop(); hearVoice = null; requestUI(); return; }
       stopShow(); const from = clamp(show.t, a0, a0+d0-0.05); audioPlayFrom(from, 1, vs); hearVoice = {clip:vs, from, t0:performance.now(), end:a0+d0}; requestUI(); }, '#34c759');
-    button(X+hw2+8, yb+6, hw2, 40, '✕ Close', false, ()=>{ state.voiceSel = null; hearVoice = null; audioStop(); requestUI(); }, '#ff3b30');
+    button(X+hw2+8, yb+6, hw2, 40, '◀ Back to all voices', false, ()=>{ state.voiceSel = null; hearVoice = null; audioStop(); requestUI(); }, '#1e6bff');
     return;
   }
   const a = state.confirm==='clearshow';
@@ -8247,6 +8255,8 @@ const diceCv = document.createElement('canvas'); diceCv.width = diceCv.height = 
 const diceTex = new THREE.CanvasTexture(diceCv); diceTex.colorSpace = THREE.SRGBColorSpace;
 const diceMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.026, 0.026), new THREE.MeshBasicMaterial({map:diceTex, transparent:true, toneMapped:false, side:THREE.DoubleSide}));
 orb.add(diceMesh); let diceDrawn = null;
+const bwSw = ['#ffffff', '#111111'].map((col, i) => { const m = new THREE.Mesh(new THREE.CircleGeometry(0.011, 24), new THREE.MeshBasicMaterial({color:col, toneMapped:false, side:THREE.DoubleSide}));
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.011, 0.0135, 24), new THREE.MeshBasicMaterial({color:i ? '#ffffff' : '#111111', toneMapped:false, side:THREE.DoubleSide})); m.add(ring); m.userData.hex = col; orb.add(m); return m; });   // white and black, one tap away
 function drawDice(on, hover){ const k = (on?1:0) + (hover?2:0); if (diceDrawn === k) return; diceDrawn = k; const c = diceCv.getContext('2d'); c.clearRect(0,0,64,64);
   c.fillStyle = on ? '#ff2d95' : '#2a3060'; c.beginPath(); c.roundRect(2,2,60,60,14); c.fill(); if (hover){ c.lineWidth = 5; c.strokeStyle = '#ffd400'; c.stroke(); }
   c.font = '40px system-ui'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('🎲', 32, 35); diceTex.needsUpdate = true; }
@@ -8272,6 +8282,7 @@ function drawHSV(){
 function dicePos(){ return state.pickStyle==='chips' ? -((CHIP_COLS-1)/2*(CHIP+CHIP_GAP) + 0.03) : state.pickStyle==='dots' ? -(ORB_R + 0.03) : -(WHEEL_R + 0.03); }
 function orbPickV18(p){   // p in orb space; returns 'DICE', a color, or undefined (let the old picker answer)
   if (Math.abs(p.z) < 0.025 && Math.abs(p.x - diceMesh.position.x) < 0.016 && Math.abs(p.y - diceMesh.position.y) < 0.016) return 'DICE';
+  for (const m of bwSw) if (Math.abs(p.z) < 0.025 && Math.hypot(p.x - m.position.x, p.y - m.position.y) < 0.015) return m.userData.hex;
   if (state.pickStyle !== 'hsv') return undefined;
   if (Math.abs(p.z) > 0.025 || Math.abs(p.x) > HSV_W/2 + 0.006) return null;
   const i = HSV_Y.findIndex(y => Math.abs(p.y - y) < HSV_H/2 + 0.004); if (i < 0) return null;
