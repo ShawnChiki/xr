@@ -19,7 +19,13 @@ async def main():
         await pg.evaluate("document.querySelector('[data-view=build]').click()");await pg.wait_for_timeout(4000)
         n=await pg.evaluate("document.querySelectorAll('#aList [data-as]').length");print('steps',n,'| summary:',await pg.evaluate("document.querySelector('#aSum').textContent.trim().slice(0,200)"))
         for k in range(n):
-            await pg.evaluate("k=>document.querySelector('#aList [data-as=\"'+k+'\"]').click()",k);await pg.wait_for_timeout(250 if k not in shots else 2500)
+            await pg.evaluate("k=>document.querySelector('#aList [data-as=\"'+k+'\"]').click()",k)
+            if k in shots and os.environ.get('SCRUB'):
+                for nm,v in zip('abcd',os.environ['SCRUB'].split(',')):
+                    await pg.evaluate("v=>{const sl=document.querySelector('#aStepSlider');sl.value=v;sl.dispatchEvent(new Event('input',{bubbles:true}))}",v);await pg.wait_for_timeout(700);await pg.screenshot(path=SP+f'bld_{k+1}{nm}.png')
+            if k in shots and os.environ.get('MID'):
+                await pg.wait_for_timeout(350);await pg.screenshot(path=SP+f'bld_{k+1}a.png');await pg.wait_for_timeout(1250);await pg.screenshot(path=SP+f'bld_{k+1}b.png')
+            await pg.wait_for_timeout(250 if k not in shots else 2500)
             print(k+1,await pg.evaluate("document.querySelector('#aText').textContent.trim()"))
             if k in shots:await pg.screenshot(path=SP+f'bld_{k+1}.png')
         if errs:print('ERR',errs)

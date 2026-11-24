@@ -69,3 +69,9 @@ function blockSections(r,P,dir,only){const fs=require('fs'),t=thkModel(),sLen=S.
       for(let s=0;s<=sLen;s+=px*.5){const X=sc.p3.clone().addScaledVector(sc.n,-s).sub(A.O),h=X.dot(A.n)-zc;dot(X.dot(A.u),X.dot(A.v),Math.abs(h)<t*.5?(mine?[0,0,0]:[90,90,200]):[170,170,170],s<.1?3:1)}}
     fs.writeFileSync(`${dir}/${A.label}.rgb`,buf);idx.push({label:A.label,joint:A.p.joint,rfx:!!A.p.cleat?.rfx,rib:A.p.sub==='rib',W,H,legend})}
   fs.writeFileSync(dir+'/index.json',JSON.stringify(idx));return idx.length}
+/* a picture of the parts cut by any plane: O centre, u/v in-plane unit vectors, w/h inches. Writes raw RGB + legend json. */
+function sliceParts(P,O,u,v,w,h,file,px=.03){const fs=require('fs'),W=Math.ceil(w/px),H=Math.ceil(h/px),buf=Buffer.alloc(W*H*3,255),col=new Map(),hue=i=>{const hh=(i*.618034)%1,f=(n,k=(n+hh*6)%6)=>Math.round(255*(.85-.55*Math.max(Math.min(k,4-k,1),0)));return [f(5),f(3),f(1)]};
+  P.forEach((B,i)=>col.set(B,B.kind==='rib'?[150,120,90]:B.kind==='cleat'?[240,140,40]:hue(B.idx)));const seen=new Set();
+  for(let j=0;j<H;j++)for(let i=0;i<W;i++){const X=O.clone().addScaledVector(u,(i+.5)*px-w/2).addScaledVector(v,(j+.5)*px-h/2);let c=null,n=0;for(const B of P)if(inPart(B,X.x,X.y,X.z)){c=n?[255,0,0]:col.get(B);n++;seen.add(B)}
+    if(c){const o=((H-1-j)*W+i)*3;buf[o]=c[0];buf[o+1]=c[1];buf[o+2]=c[2]}}
+  fs.writeFileSync(file+'.rgb',buf);fs.writeFileSync(file+'.json',JSON.stringify({W,H,legend:[...seen].map(B=>[B.label,col.get(B)])}))}

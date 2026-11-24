@@ -8,3 +8,4 @@ s=s[:i]+b+s[j:]
 open('fz.js','w').write(s)
 PY
 python3 mkh.py fz.js >/dev/null && cp h.mjs hfz.mjs && node --check hfz.mjs
+python3 mkh.py ld.js >/dev/null && cp h.mjs hldu.mjs && node --check hldu.mjs

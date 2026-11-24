@@ -1,0 +1,6 @@
+#!/bin/bash
+# coll.sh design.json "A7:AR2:n" "A3:AR1:up" ...  where each is part:other:direction(n|-n|up|x|z)
+D=$1; shift; SPEC="$*"
+D=$D SPEC="$SPEC" JS='(()=>{const mp=mergeSplices(r.panels.filter(p=>p.part&&p.part.length));const P=mp.map(asmPart);const g=l=>P.find(p=>p.label===l);const out={};for(const sp of process.env.SPEC.split(" ")){const [a,bs,dn]=sp.split(":");const A=g(a),O=bs.split(",").map(g);if(!A||O.some(x=>!x)){out[sp]="missing";continue}const d=dn==="up"?new V(0,1,0):dn==="n"?A.n.clone():dn==="-n"?A.n.clone().negate():dn==="x"?new V(1,0,0):new V(0,0,1);const rr=asmSweep(A,O,d,0);let where=null;if(!rr.ok){const B=rr.by,o=d.clone().multiplyScalar(rr.s);const pts=[];for(let i=0;i<A.P.length;i+=3){const x=A.P[i]+o.x,y=A.P[i+1]+o.y,z=A.P[i+2]+o.z;if(inPart(B,x,y,z))pts.push([A.P[i],A.P[i+1],A.P[i+2]].map(v=>+v.toFixed(2)))}for(let i=0;i<B.P.length&&pts.length<8;i+=3){const x=B.P[i]-o.x,y=B.P[i+1]-o.y,z=B.P[i+2]-o.z;if(inPart(A,x,y,z))pts.push(["B",+B.P[i].toFixed(2),+B.P[i+1].toFixed(2),+B.P[i+2].toFixed(2)])}where={by:B.label,s:rr.s,n:A.n.toArray().map(v=>+v.toFixed(2)),pts:pts.slice(0,6)}}out[sp]=rr.ok?"ok":where}return out})()' node hldu.mjs | python3 -c "
+import json,sys
+for k,v in json.load(sys.stdin).items():print(k,v)"

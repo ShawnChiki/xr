@@ -897,7 +897,11 @@ function panelizeShell(b,name,B){const mtV=[],blkSolids=[],blkHeads=[];
     for(const e of E){if(e.L<1e-9||e.nb<0)continue;const kp=E[e.prev],kn=E[e.next],Lk=e.L;let oc=0;
       /* a finger only runs on past an outline corner that points outward; at an inside corner of the outline (around a hole) it stops there */
       const cvS=kp.D[0]*e.D[1]-kp.D[1]*e.D[0]>1e-6,cvE=e.D[0]*kn.D[1]-e.D[1]*kn.D[0]>1e-6;
-      for(const sg of e.segs){if(!sg.own)continue;const st=sg.a<1e-6,en=sg.b>Lk-1e-6;let a=st?(cvS?-Lk:0):sg.a+ftol/2,bb=en?(cvE?2*Lk:Lk):sg.b-ftol/2;if(bb<=a)continue;
+      /* Round a raised block, one inside corner can belong to this panel (it runs on under that wall) and the next to the wall
+         there (which runs on past this panel and so goes in first). At the outline corner between them this panel's run-on then
+         stops a ply short: any further and it would lie under the end of the wall that is already standing. */
+      const backS=!cvS&&!e.convex&&kp.nb>=0&&kp.convex===false&&!ownsEnd(kp)?t:0,backE=!cvE&&!e.convex&&kn.nb>=0&&kn.convex===false&&!ownsStart(kn)?t:0;
+      for(const sg of e.segs){if(!sg.own)continue;const st=sg.a<1e-6,en=sg.b>Lk-1e-6;let a=st?(cvS?-Lk:backS):sg.a+ftol/2,bb=en?(cvE?2*Lk:Lk-backE):sg.b-ftol/2;if(bb<=a)continue;
         const P0=add(e.P,mul(e.M,-e.ext));let qd=[add(P0,mul(e.D,a)),add(P0,mul(e.D,bb)),add(add(e.P,mul(e.D,bb)),mul(e.M,e.s+.01)),add(add(e.P,mul(e.D,a)),mul(e.M,e.s+.01))];
         qd=clip2(qd,e.P,e.M,-e.ext);
         /* corners: run on past a neighbor edge only where that edge is an outside corner this panel owns; inside corners and inside-corner fingers stop short */
@@ -1538,19 +1542,24 @@ function asmPart(p,idx){const {O,u,v,n}=p.frame,cts=(p.part||[]).filter(c=>c.len
     for(let j=0;j<k;j++){const x=a[0]+ex*(j+.5)/k,y=a[1]+ey*(j+.5)/k;let sx=x+nx*ASM_EPS,sy=y+ny*ASM_EPS;
       if(!pipC(cts,sx,sy)){sx=x-nx*ASM_EPS;sy=y-ny*ASM_EPS;if(!pipC(cts,sx,sy))continue}
       for(const z of zs)pts.push(O.x+u.x*sx+v.x*sy+n.x*z,O.y+u.y*sx+v.y*sy+n.y*z,O.z+u.z*sx+v.z*sy+n.z*z)}}}
-  const P=new Float32Array(pts),mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];
+  let P=new Float32Array(pts);const mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];
   for(let i=0;i<P.length;i+=3)for(let k=0;k<3;k++){mn[k]=Math.min(mn[k],P[i+k]);mx[k]=Math.max(mx[k],P[i+k])}
   const c=new V((mn[0]+mx[0])/2,(mn[1]+mx[1])/2,(mn[2]+mx[2])/2);
-  return {p,idx,O:O.clone(),u:u.clone(),v:v.clone(),n:n.clone(),z0:p.z0,z1:p.z1,cts,bb:[x0,y0,x1,y1],P,mn,mx,c,label:p.label,kind:p.kind}}
+  /* the points in order along the part's longest side, so a test against a neighbour only walks the stretch beside it */
+  const sk=[0,1,2].reduce((a,k)=>mx[k]-mn[k]>mx[a]-mn[a]?k:a,0);
+  {const m=P.length/3,ix=Array.from({length:m},(_,i)=>i).sort((a,b)=>P[a*3+sk]-P[b*3+sk]),Q=new Float32Array(P.length);ix.forEach((j,i)=>{Q[i*3]=P[j*3];Q[i*3+1]=P[j*3+1];Q[i*3+2]=P[j*3+2]});P=Q}
+  return {p,idx,O:O.clone(),u:u.clone(),v:v.clone(),n:n.clone(),z0:p.z0,z1:p.z1,cts,bb:[x0,y0,x1,y1],P,sk,mn,mx,c,label:p.label,kind:p.kind}}
+/* first point of P whose coordinate k is at least lo (P is in order along k) */
+function asmLow(P,k,lo){let a=0,b=P.length/3;while(a<b){const m=(a+b)>>1;if(P[m*3+k]<lo)a=m+1;else b=m}return a*3}
 /* is world point (x,y,z), shifted back by o, inside part B's wood? */
 function inPart(B,x,y,z){const dx=x-B.O.x,dy=y-B.O.y,dz=z-B.O.z,h=dx*B.n.x+dy*B.n.y+dz*B.n.z;if(h<=B.z0+ASM_M||h>=B.z1-ASM_M)return false;
   const a=dx*B.u.x+dy*B.u.y+dz*B.u.z,b=dx*B.v.x+dy*B.v.y+dz*B.v.z;if(a<B.bb[0]||a>B.bb[2]||b<B.bb[1]||b>B.bb[3])return false;return pipC(B.cts,a,b)}
 const bbHit=(A,B,ox,oy,oz,g=.05)=>A.mn[0]+ox<B.mx[0]+g&&A.mx[0]+ox>B.mn[0]-g&&A.mn[1]+oy<B.mx[1]+g&&A.mx[1]+oy>B.mn[1]-g&&A.mn[2]+oz<B.mx[2]+g&&A.mx[2]+oz>B.mn[2]-g;
 /* does A, moved by (ox,oy,oz), share wood with B? */
 function asmHit(A,B,ox,oy,oz){if(!bbHit(A,B,ox,oy,oz))return false;
-  const P=A.P;for(let i=0;i<P.length;i+=3){const x=P[i]+ox,y=P[i+1]+oy,z=P[i+2]+oz;
+  const P=A.P,ka=A.sk,oa=ka===0?ox:ka===1?oy:oz,ha=B.mx[ka]+.1-oa;for(let i=asmLow(P,ka,B.mn[ka]-.1-oa);i<P.length&&P[i+ka]<=ha;i+=3){const x=P[i]+ox,y=P[i+1]+oy,z=P[i+2]+oz;
     if(x<B.mn[0]-.1||x>B.mx[0]+.1||y<B.mn[1]-.1||y>B.mx[1]+.1||z<B.mn[2]-.1||z>B.mx[2]+.1)continue;if(inPart(B,x,y,z))return true}
-  const Q=B.P;for(let i=0;i<Q.length;i+=3){const x=Q[i]-ox,y=Q[i+1]-oy,z=Q[i+2]-oz;
+  const Q=B.P,kb=B.sk,ob=kb===0?ox:kb===1?oy:oz,hb=A.mx[kb]+.1+ob;for(let i=asmLow(Q,kb,A.mn[kb]-.1+ob);i<Q.length&&Q[i+kb]<=hb;i+=3){const x=Q[i]-ox,y=Q[i+1]-oy,z=Q[i+2]-oz;
     if(x<A.mn[0]-.1||x>A.mx[0]+.1||y<A.mn[1]-.1||y>A.mx[1]+.1||z<A.mn[2]-.1||z>A.mx[2]+.1)continue;if(inPart(A,x,y,z))return true}
   return false}
 /* slide A out along d until it clears everything in `others`; returns the part it hits first, if any */
@@ -1560,12 +1569,23 @@ function asmSweep(A,others,d,maxD){if(!others.length)return {ok:true,D:10};
   D=Math.max(0,D)+.2;if(maxD)D=Math.min(D,maxD);
   for(let s=ASM_STEP*.5;s<=D;s+=ASM_STEP){const ox=d.x*s,oy=d.y*s,oz=d.z*s;for(const B of others)if(asmHit(A,B,ox,oy,oz))return {ok:false,by:B,s}}
   return {ok:true,D}}
+/* the same, with A already moved by o: a panel unseated to one side, then drawn out another way */
+function asmSweepFrom(A,others,o,d){if(!others.length)return {ok:true,D:10};const mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];for(const B of others)for(let k=0;k<3;k++){mn[k]=Math.min(mn[k],B.mn[k]);mx[k]=Math.max(mx[k],B.mx[k])}
+  const dv=[d.x,d.y,d.z],ov=[o.x,o.y,o.z];let D=Infinity;for(let k=0;k<3;k++){if(dv[k]>1e-6)D=Math.min(D,(mx[k]-(A.mn[k]+ov[k]))/dv[k]);else if(dv[k]<-1e-6)D=Math.min(D,((A.mx[k]+ov[k])-mn[k])/-dv[k])}
+  D=Math.max(0,D)+.2;for(let z=0;z<=D;z+=ASM_STEP){const ox=o.x+d.x*z,oy=o.y+d.y*z,oz=o.z+d.z*z;for(const B of others)if(asmHit(A,B,ox,oy,oz))return {ok:false,by:B,s:z}}return {ok:true,D}}
 function asmDirs(A,others){const out=[],add=v=>{if(v.lengthSq()<1e-6)return;v=v.clone().normalize();if(!out.some(w=>w.dot(v)>.995))out.push(v)};
   add(new V(0,1,0));add(A.n);add(A.n.clone().negate());
   const near=others.filter(B=>bbHit(A,B,0,0,0,.3));
   for(const B of near){add(B.n);add(B.n.clone().negate());add(A.n.clone().add(B.n));add(A.n.clone().sub(B.n))}
   if(A.kind!=='face'){add(A.u);add(A.u.clone().negate());add(A.v);add(A.v.clone().negate())}
   return out.slice(0,1).concat(out.slice(1).sort((a,b)=>b.y-a.y)).slice(0,20)}
+/* the ways a panel can be slid along its own plane: the directions of its longest outline edges (a wall of a tunnel comes out
+   along the tunnel once it is off its tabs). Upward ones first. */
+function asmAlong(A){const acc=new Map();for(const ct of A.cts){const m=ct.length;for(let i=0;i<m;i++){const a=ct[i],b=ct[(i+1)%m],ex=b[0]-a[0],ey=b[1]-a[1],L=Math.hypot(ex,ey);if(L<1)continue;
+      let th=Math.atan2(ey,ex);if(th<0)th+=Math.PI;if(th>=Math.PI-1e-9)th-=Math.PI;const k=Math.round(th/(Math.PI/36))%36,q=acc.get(k)||{L:0,m:0,th:0};q.L+=L;if(L>q.m){q.m=L;q.th=th}acc.set(k,q)}}
+  /* the exact line of the longest edge in each group: a slide a degree or two off true drifts into the neighbours over a long panel */
+  const out=[];for(const [,q] of [...acc.entries()].sort((x,y)=>y[1].L-x[1].L).slice(0,2)){const th=q.th,d=A.u.clone().multiplyScalar(Math.cos(th)).addScaledVector(A.v,Math.sin(th)).normalize();out.push(d,d.clone().negate())}
+  return out.sort((a,b)=>b.y-a.y)}
 /* touching: parts within a hair of each other's wood (used so nothing is left floating mid-build) */
 function asmTouch(A,B){if(!bbHit(A,B,0,0,0,.2))return false;const g=.08;
   const near=(X,Y)=>{const P=X.P;for(let i=0;i<P.length;i+=3){const dx=P[i]-Y.O.x,dy=P[i+1]-Y.O.y,dz=P[i+2]-Y.O.z,h=dx*Y.n.x+dy*Y.n.y+dz*Y.n.z;if(h<Y.z0-g||h>Y.z1+g)continue;
@@ -1591,12 +1611,18 @@ function planAssembly(panels,baseLabel){
   const orphansOf=i=>[...left].filter(j=>j!==i&&j!==base&&touch[j].has(i)&&[...touch[j]].filter(k=>left.has(k)).length===1);
   /* slide a group as one rigid piece */
   const sweepG=(G,others,d,maxD)=>{let D=0;for(const A of G){const r=asmSweep(A,others,d,maxD);if(!r.ok)return r;D=Math.max(D,r.D)}return {ok:true,D}};
+  /* what blocked a move last time still blocks it while that part is in: remember it instead of sweeping again every round */
+  const blkBy=new Map(),dk=d=>d.x.toFixed(3)+','+d.y.toFixed(3)+','+d.z.toFixed(3),
+    memo=(key,run)=>{const b=blkBy.get(key);if(b&&left.has(b.idx))return {ok:false,by:b,s:0};const r=run();if(r.ok)blkBy.delete(key);else blkBy.set(key,r.by);return r};
   /* a block on its own is put in by hand: it only has to back off its tab, a couple of plies, without touching anything.
      It does not have to travel out of the obstacle in one straight line the way a plate does. */
-  const tP=parts.find(p=>p.kind==='face'),handD=tP?Math.max(1.5,(tP.z1-tP.z0)*2.2):1.6;
+  const tP=parts.find(p=>p.kind==='face'),handD=tP?Math.max(1.5,(tP.z1-tP.z0)*2.2):1.6,seatD=tP?(tP.z1-tP.z0)*1.45:1.1;
   while(left.size){let pick=null;const order=[...left].sort((a,c)=>prio(parts[c])-prio(parts[a])),miss={};
     /* three tries: by the book; then letting a block come out even with all its panels on; then letting a part go that leaves others hanging */
-    for(const pass of [0,1,2]){for(const i of order){if(i===base&&left.size>1)continue;
+    /* ...and at each of those, first parts that come straight out in one move, then parts that take two: a panel boxed in
+       (an inner wall of a channel, say) is eased off its tabs a ply or so, square to itself, and only then drawn out along
+       the channel. Put together it is the reverse: lowered in a little to one side of its place, then pushed home. */
+    for(const pass of [0,1,2]){for(const two of [0,1]){for(const i of order){if(i===base&&left.size>1)continue;
       /* a block is only within reach while one of the panels it sits on is off. One with no tab could otherwise be planned to go
          in at any time, even deep inside a shape that is already closed. */
       if(!pass&&parts[i].kind==='cleat'&&parts[i].p.sub!=='rib'){const fs=[...touch[i]].filter(j=>parts[j].kind==='face');if(fs.length&&fs.every(j=>left.has(j)))continue}
@@ -1606,8 +1632,20 @@ function planAssembly(panels,baseLabel){
       if(orph.length&&pass<2){/* corner blocks that only hang on this panel come out with it, screwed on as a sub-assembly */
         if((parts[i].kind==='face'||parts[i].kind==='rib')&&orph.every(j=>parts[j].kind==='cleat'))grp=[i,...orph];else continue}
       const G=grp.map(j=>parts[j]),others=[...left].filter(j=>!grp.includes(j)&&grp.every(g=>ok(g,j))).map(j=>parts[j]);
-      const hits=new Set();for(const d of asmDirs(parts[i],others)){const r=sweepG(G,others,d,parts[i].kind==='cleat'&&grp.length===1?(parts[i].p.sub==='rib'?handD*.66:handD):0);if(r.ok){pick={i,d,D:r.D,with:grp.slice(1)};break}hits.add(r.by.label)}
-      if(pick)break;miss[i]=[...hits]}if(pick)break}
+      if(two){if(parts[i].kind!=='face'||globalThis.DBG_NO2)continue;const A=parts[i];
+        /* (first the plain slide along its own plane: a wall standing in finger slots that also passes through a rib a little off square) */
+        const gk=grp.join('.');
+        for(const d of asmAlong(A)){const r=memo(gk+'|a|'+dk(d),()=>sweepG(G,others,d,0));if(r.ok){pick={i,d,D:r.D,with:grp.slice(1)};break}}
+        if(pick)break;
+        for(const s1 of [seatD,seatD*1.8]){for(const d1 of [A.n.clone(),A.n.clone().negate()]){const k1=gk+'|s|'+s1.toFixed(2)+'|'+dk(d1);if(!memo(k1,()=>sweepG(G,others,d1,s1)).ok)continue;const o=d1.clone().multiplyScalar(s1);
+            for(const d2 of [...asmDirs(A,others),...asmAlong(A)]){if(Math.abs(d2.dot(d1))>.9)continue;
+              const r=memo(k1+'|'+dk(d2),()=>{let D=0;for(const M of G){const q=asmSweepFrom(M,others,o,d2);if(!q.ok)return q;D=Math.max(D,q.D)}return {ok:true,D}});
+              if(r.ok){pick={i,d:d2,D:r.D,seat:{d:d1,s:s1},with:grp.slice(1)};break}}
+            if(pick)break}if(pick)break}
+        if(pick)break;continue}
+      const hits=new Set(),mD=parts[i].kind==='cleat'&&grp.length===1?(parts[i].p.sub==='rib'?handD*.66:handD):0,g1=grp.join('.')+'|1|'+mD.toFixed(2)+'|';
+      for(const d of asmDirs(parts[i],others)){const r=memo(g1+dk(d),()=>sweepG(G,others,d,mD));if(r.ok){pick={i,d,D:r.D,with:grp.slice(1)};break}hits.add(r.by.label)}
+      if(pick)break;miss[i]=[...hits]}if(pick)break}if(pick)break}
     if(!pick){const i=order.find(i=>i!==base)??order[0];pick={i,d:parts[i].n.clone(),D:6,stuck:miss[i]||[],with:[]}}
     out.push(pick);left.delete(pick.i);pick.with.forEach(j=>left.delete(j))}
   out.reverse();
@@ -3028,7 +3066,7 @@ const asmRed=new THREE.MeshStandardMaterial({color:0xE5392B,roughness:.7}),asmOr
 asmRed.userData.shared=asmOrange.userData.shared=true;
 const kindWord=k=>k==='rib'?'rib':k==='cleat'?'corner block':'panel';
 function buildAsm(keep){
-  asmGroup.children.slice().forEach(o=>{asmGroup.remove(o);o.traverse(x=>{x.geometry?.dispose();x.userData.stencilGeo?.dispose()})});AS.holders=[];AS.arrow=null;
+  asmGroup.children.slice().forEach(o=>{asmGroup.remove(o);o.traverse(x=>{x.geometry?.dispose();x.userData.stencilGeo?.dispose()})});AS.holders=[];AS.arrow=null;AS.arrow2=null;AS.seat=null;
   const b=AS.b&&blocks.includes(AS.b)?AS.b:(sel||blocks[0]);const moved=AS.b!==b;AS.b=b;
   if(!b){$('#aSum').innerHTML='<p class="note">Add a box first.</p>';$('#aStepCard').hidden=true;return}
   const panels=mergeSplices(lastPanels.filter(p=>p.block===b&&p.part?.length));if(!panels.length)return;
@@ -3046,13 +3084,21 @@ function buildAsm(keep){
   for(const s of allScrews){if(s.block!==b||s.flag)continue;const fi=s.f.pl.id==='__rib'?P.findIndex(p=>p.kind==='rib'&&p.label===s.name):P.findIndex(p=>p.kind==='face'&&p.p.planeId===s.f.pl.id);if(fi<0)continue;
     let tj=-1;for(const dep of [1.5,1.25,1.8]){const X=s.p3.clone().addScaledVector(s.n,-tm*dep);tj=P.findIndex((p,j)=>j!==fi&&inPart(p,X.x,X.y,X.z));if(tj>=0)break}
     /* a screw between a block and the part it was fitted to on the bench is driven there; any other once both parts are in place */
-    const k=tj>=0&&grp[fi]>=0&&grp[fi]===grp[tj]?grp[fi]:Math.max(idxIn[fi],tj>=0?idxIn[tj]:idxIn[fi]);AS.stepScrews[k].push({s,into:tj})}
+    const k=tj>=0&&grp[fi]>=0&&grp[fi]===grp[tj]?grp[fi]:Math.max(idxIn[fi],tj>=0?idxIn[tj]:idxIn[fi]);AS.stepScrews[k].push({s,into:tj,fi})}
+  /* a drill with its bit needs about 7" in front of a screw head. With what is built by that step, which screws have less? */
+  AS.tight=plan.steps.map((st,k)=>{let n=0;for(const q of AS.stepScrews[k]){let hit=false;for(let z=.6;z<=DRILL_ROOM&&!hit;z+=.4){const X=q.s.p3.clone().addScaledVector(q.s.n,z);
+        for(let j=0;j<P.length&&!hit;j++){if(j===q.fi||idxIn[j]>k)continue;const B=P[j];if(X.x<B.mn[0]||X.x>B.mx[0]||X.y<B.mn[1]||X.y>B.mx[1]||X.z<B.mn[2]||X.z>B.mx[2])continue;if(inPart(B,X.x,X.y,X.z))hit=true}}
+      q.tight=hit;if(hit)n++}return n});
   for(const p of P){const h=new THREE.Group();h.add(panelObject(p.p,b));h.userData.part=p;asmGroup.add(h);AS.holders.push(h)}
   const sm=new THREE.CylinderGeometry(tm*.14,tm*.14,1,8);AS.screwGeo=sm;
   if(AS.framed!==b){AS.framed=b;const mn=new V(1e9,1e9,1e9),mx=new V(-1e9,-1e9,-1e9);P.forEach(p=>{mn.min(new V(...p.mn));mx.max(new V(...p.mx))});
     const c=mn.clone().add(mx).multiplyScalar(.5),R=mx.distanceTo(mn)/2;world.localToWorld(c);const dir=camera.position.clone().sub(orbit.target);if(dir.lengthSq()<1)dir.set(1,.8,1.3);
     dir.normalize();if(dir.y<.35){dir.y=.55;dir.normalize()}orbit.target.copy(c);camera.position.copy(c).addScaledVector(dir,R*3.2*(world.scale.x||1))}
   AS.step=keep?Math.min(AS.step,plan.steps.length-1):0;renderAsmPanel();showStep(AS.step)}
+const DRILL_ROOM=7;
+/* "Drive 6 screws", and how many of them a full-size drill cannot reach */
+function screwLine(k){const ns=AS.stepScrews?.[k]?.length||0,nt=AS.tight?.[k]||0;if(!ns)return '';
+  return `Drive ${ns} screw${ns>1?'s':''}.`+(nt?` ${nt===ns?(ns>1?'They all have':'It has'):nt+' of them (orange) '+(nt>1?'have':'has')} less than ${DRILL_ROOM}" in front of the head: use a stubby or right-angle driver there.`:'')}
 function stepText(k){const P=AS.plan.parts,s=AS.plan.steps[k],A=P[s.i],L=A.label,d=s.d,w=kindWord(A.kind);
   const pre=A.p.pieces?`${L} comes in ${A.p.pieces.length} pieces (${A.p.pieces.join(', ')}). Lay them flat, glue the keys and mallet them together into one ${w} first. `:'';
   if(k===0)return pre+`Lay ${L} down flat, outside face on the floor. Everything builds up from it.`;
@@ -3072,7 +3118,10 @@ function stepText(k){const P=AS.plan.parts,s=AS.plan.steps[k],A=P[s.i],L=A.label
   const move=d.y>.9?(A.kind==='rib'?`Drop ${w} ${L} straight down into its slots.`:`Lower ${w} ${L} straight down onto it.`)
     :d.y<-.9?`Push ${w} ${L} up into place from underneath.`:d.y>.45?`Lower ${w} ${L} on at an angle, along the arrow.`
     :best.v>.8?(best.F.id===A.p.planeId?`Slide ${w} ${L} straight in from outside.`:`Slide ${w} ${L} in from the ${faceName(AS.b,best.F.id)} side, along the arrow.`):`Slide ${w} ${L} in along the arrow, at the angle shown.`;
-  let txt=s.pre?move.replace(/\.$/,'')+`, with its block${s.with.length>1?'s':''} already on.`:s.with.length?`Off the box, fit the ${s.with.length>1?s.with.length+' ':''}${A.kind==='rib'?'rib':'corner'} block${s.with.length>1?'s':''} marked ${[...new Set(s.with.map(j=>P[j].p.joint||P[j].label))].join(', ')} onto ${L} and screw ${s.with.length>1?'them':'it'} on. Then ${move[0].toLowerCase()+move.slice(1)}`:move;
+  /* a boxed-in panel takes two moves: in beside its place, then pushed flat onto its tabs */
+  const out=s.seat&&s.seat.d.dot(A.n)>0,m0=move.replace(/\.$/,'')+(s.seat?`, about ${frac(Math.max(1,Math.round(s.seat.s*4))/4)} ${out?'out from':'to the inside of'} where it sits so it clears the tabs`:'');
+  let txt=s.pre?m0+`, with its block${s.with.length>1?'s':''} already on.`:s.with.length?`Off the box, fit the ${s.with.length>1?s.with.length+' ':''}${A.kind==='rib'?'rib':'corner'} block${s.with.length>1?'s':''} marked ${[...new Set(s.with.map(j=>P[j].p.joint||P[j].label))].join(', ')} onto ${L} and screw ${s.with.length>1?'them':'it'} on. Then ${m0[0].toLowerCase()+m0.slice(1)}.`:m0+'.';
+  if(s.seat)txt+=` Then ${out?'push':'pull'} it flat onto them, along the short pink arrow.`;
   const jn=[...AS.plan.touch[s.i]].filter(j=>AS.idx[j]<k&&!s.with.includes(j)),jl=jn.filter(j=>P[j].kind!=='cleat').map(j=>P[j].label),jb=jn.length-jl.length;
   if(jn.length)txt+=` It locks into ${jl.join(', ')}${jb?(jl.length?' and ':'')+jb+' corner block'+(jb>1?'s':''):''}.`;
   return pre+txt}
@@ -3083,28 +3132,33 @@ function renderAsmPanel(){const plan=AS.plan,P=plan.parts,n=plan.steps.length;
   if(!stuck.length&&!plan.clash.length)rows.push(['hold',`<b>Everything goes together.</b> ${P.length} parts in ${n} steps, and every part slides in without its wood passing through another part.`]);
   plan.clash.forEach(([i,j])=>{const th=(AS.b.thin||[]).find(x=>[x.A,x.B].includes(P[i].label)&&[x.A,x.B].includes(P[j].label));
     rows.push(['tip',`<b>${P[i].label} and ${P[j].label} overlap</b> in the finished model. ${th?thinText(th):"Their wood occupies the same space, so this can't be cut and built as drawn."}`])});
+  {const tk=(AS.tight||[]).map((n,k)=>n?k+1:0).filter(Boolean),tn=(AS.tight||[]).reduce((a,c)=>a+c,0);
+    if(tn)rows.push(['tip',`<b>${tn} screw${tn>1?'s are':' is'} in a tight spot</b> (step${tk.length>1?'s':''} ${tk.join(', ')}): less than ${DRILL_ROOM}" in front of the head, so a full-size drill won't fit. Use a stubby or right-angle driver there.`])}
   stuck.forEach(s=>rows.push(['tip',`<b>${P[s.i].label} can't go in.</b> Whatever way it slides, it runs into ${s.stuck.join(', ')||'other parts'}.`]));
   $('#aSum').innerHTML=rows.map(([c,h])=>`<div class="tr"><span class="dot ${c}"></span><div>${h}</div></div>`).join('');
   $('#aSlider').max=n;$('#aStepCard').hidden=false;
   $('#aList').innerHTML=plan.steps.map((s,k)=>`<div class="item${k===AS.step?' on':''}" data-as="${k}"><span class="dot ${s.stuck?'tip':'hold'}"></span><span class="nm">${k+1}. ${s.sub?'Fit '+s.with.length+' block'+(s.with.length>1?'s':'')+' to '+P[s.i].label:P[s.i].kind==='cleat'?(s.with.length?(s.with.length+1)+' blocks ':'Block ')+(P[s.i].p.joint||P[s.i].label):P[s.i].label+(s.with.length?' + '+s.with.length+' block'+(s.with.length>1?'s':''):'')}</span><span class="meta">${kindWord(P[s.i].kind)}</span></div>`).join('');
   $$('#aList [data-as]').forEach(e=>e.onclick=()=>{AS.playing=false;showStep(+e.dataset.as)})}
 /* the current build step as plain words for the headset menu */
-function xrStepMsg(){const pl=AS.plan;if(!pl||!pl.steps.length){menuMsg='Nothing to build yet: make a box first.';return}const k=AS.step||0,ns=AS.stepScrews?.[k]?.length||0,d=document.createElement('div');d.innerHTML=stepText(k);
-  menuMsg=`Step ${k+1} of ${pl.steps.length} (${AS.b?.name||''}): ${d.textContent.trim()}${ns?` Drive ${ns} screw${ns>1?'s':''}.`:''}${pl.steps[k].stuck?` This one won't go in: it runs into ${pl.steps[k].stuck.join(', ')}.`:''}`}
+function xrStepMsg(){const pl=AS.plan;if(!pl||!pl.steps.length){menuMsg='Nothing to build yet: make a box first.';return}const k=AS.step||0,sl=screwLine(k),d=document.createElement('div');d.innerHTML=stepText(k);
+  menuMsg=`Step ${k+1} of ${pl.steps.length} (${AS.b?.name||''}): ${d.textContent.trim()}${sl?' '+sl.replace(' (orange)',''):''}${pl.steps[k].stuck?` This one won't go in: it runs into ${pl.steps[k].stuck.join(', ')}.`:''}`}
 function showStep(k){const plan=AS.plan;if(!plan)return;const n=plan.steps.length;k=Math.max(0,Math.min(n-1,k));AS.step=k;AS.tt=0;AS.hold=false;
   const s=plan.steps[k],cur=new Set([s.i,...s.with]),blk=new Set(s.stuck?plan.parts.filter(p=>s.stuck.includes(p.label)).map(p=>p.idx):[]);
   AS.holders.forEach((h,i)=>{h.visible=AS.idx[i]<=k;h.position.set(0,0,0);
     h.traverse(o=>{if(!o.isMesh)return;if(!o.userData.m0)o.userData.m0=o.material;o.material=(s.stuck&&cur.has(i))?asmRed:blk.has(i)?asmOrange:o.userData.m0})});
   /* screws for this step */
   AS.screws.forEach(o=>asmGroup.remove(o));AS.screws=[];
-  for(const {s:sc} of AS.stepScrews[k]){const L=S.screwLen,m=new THREE.Mesh(AS.screwGeo,new THREE.MeshStandardMaterial({color:0x1B1E24,metalness:.6,roughness:.35}));
+  for(const {s:sc,tight} of AS.stepScrews[k]){const L=S.screwLen,m=new THREE.Mesh(AS.screwGeo,new THREE.MeshStandardMaterial(tight?{color:0xFF7A00,metalness:.2,roughness:.5}:{color:0x1B1E24,metalness:.6,roughness:.35}));
     m.userData.sc={p:sc.p3.clone(),n:sc.n.clone(),L};m.scale.y=L;m.position.copy(sc.p3).addScaledVector(sc.n,-L/2+.15);m.quaternion.setFromUnitVectors(new V(0,1,0),sc.n);m.visible=false;asmGroup.add(m);AS.screws.push(m)}
-  if(AS.arrow){asmGroup.remove(AS.arrow);AS.arrow=null}
+  if(AS.arrow){asmGroup.remove(AS.arrow);AS.arrow=null}if(AS.arrow2){asmGroup.remove(AS.arrow2);AS.arrow2=null}
   const A=plan.parts[s.i],size=Math.max(...[0,1,2].map(q=>A.mx[q]-A.mn[q]));AS.D=k===0?0:Math.max(8,Math.min(30,size*.6));AS.off=s.sub?s.d.clone().multiplyScalar(AS.D):new V();
-  if(k>0&&!s.sub){const from=A.c.clone().addScaledVector(s.d,AS.D+size*.35);AS.arrow=new THREE.ArrowHelper(s.d.clone().negate(),from,AS.D*.8,s.stuck?0xE5392B:0x2E5BFF,Math.min(5,AS.D*.3),Math.min(3.5,AS.D*.2));asmGroup.add(AS.arrow)}
+  /* where the part waits before its last push home (two-move parts only) */
+  const st=!s.sub&&s.seat?s.seat.d.clone().multiplyScalar(s.seat.s):null;AS.seat=st;
+  if(k>0&&!s.sub){const from=A.c.clone().addScaledVector(s.d,AS.D+size*.35);if(st)from.add(st);AS.arrow=new THREE.ArrowHelper(s.d.clone().negate(),from,AS.D*.8,s.stuck?0xE5392B:0x2E5BFF,Math.min(5,AS.D*.3),Math.min(3.5,AS.D*.2));asmGroup.add(AS.arrow)
+    if(st){const L2=Math.max(3.5,Math.min(7,size*.16));AS.arrow2=new THREE.ArrowHelper(s.seat.d.clone().negate(),A.c.clone().addScaledVector(s.seat.d,s.seat.s+L2+thkModel()*.6),L2,0xFF2E88,L2*.42,L2*.3);asmGroup.add(AS.arrow2)}}
   $('#aNum').textContent=`Step ${k+1} of ${n}`;$('#aSlider').value=k+1;
-  const ns=AS.stepScrews[k].length;
-  $('#aText').innerHTML=stepText(k)+(ns?` <b>Drive ${ns} screw${ns>1?'s':''}.</b>`:'')+
+  const sl=screwLine(k);
+  $('#aText').innerHTML=stepText(k)+(sl?` <b>${sl}</b>`:'')+
     (s.stuck?`<div class="tr" style="border:0;padding-top:8px"><span class="dot tip"></span><div><b>This won't go in.</b> Every way it can slide, its wood runs into ${s.stuck.join(', ')} (orange). Change the joint between them in the Panels view (click the edge and try flush or overlap), or move a rib. <button class="btn primary" id="aFindFix" style="margin-top:6px">Find a fix</button></div></div>`:'');
   $('#aFindFix')&&($('#aFindFix').onclick=findBuildFix);
   $$('#aList [data-as]').forEach(e=>e.classList.toggle('on',+e.dataset.as===k));$('#aList [data-as].on')?.scrollIntoView({block:'nearest'});
@@ -3116,19 +3170,21 @@ function asmDrill(){if(AS.drill&&AS.drill.parent===asmGroup)return AS.drill;cons
   add(new THREE.CylinderGeometry(.95,.8,3.4,8),grn,0,4.4,0);add(new THREE.CylinderGeometry(.8,.95,.5,8),gry,0,6.3,0);
   const h=add(new THREE.BoxGeometry(1.3,1.5,4.2),grn,0,5.2,2.6);h.rotation.x=.18;add(new THREE.BoxGeometry(.5,.9,.5),gry,0,3.6,1.1);
   add(new THREE.BoxGeometry(2.3,1.5,3),gry,0,5.7,5.4);g.scale.setScalar(k);g.userData.spin=spin;g.visible=false;asmGroup.add(g);AS.drill=g;return g}
-function asmTick(now){const plan=AS.plan;if(!plan||view!=='build')return;const k=AS.step,s=plan.steps[k],slide=1.3;
+function asmTick(now){const plan=AS.plan;if(!plan||view!=='build')return;const k=AS.step,s=plan.steps[k],st=AS.seat,slide=st?2:1.3;
   /* the step runs on its own clock, so it can be paused and scrubbed */
   const dtm=Math.min(.1,Math.max(0,(now-(AS.last||now))/1000));AS.last=now;if(!AS.hold)AS.tt=(AS.tt||0)+dtm;const t=AS.tt||0;
-  const e=Math.min(1,t/slide),ease=1-(1-e)**3,off=AS.off||new V();
+  const e=Math.min(1,t/slide),off=AS.off||new V();
+  /* two-move parts: 1.3 s travelling in beside their place, then .7 s pushed home */
+  const e1=st?Math.min(1,t/1.3):e,ease=1-(1-e1)**3,e2=st?Math.max(0,Math.min(1,(t-1.3)/.7)):1,push=e2*e2*(3-2*e2);
   if(s.sub){/* on the bench: the part waits off the box while its blocks go onto it */
     const h0=AS.holders[s.i];if(h0)h0.position.copy(off);for(const j of s.with){const h=AS.holders[j];if(h)h.position.copy(off).addScaledVector(s.bd[j],7*(1-ease))}}
-  else for(const i of [s.i,...s.with]){const h=AS.holders[i];if(h)h.position.copy(s.d).multiplyScalar(AS.D*(1-ease))}
+  else for(const i of [s.i,...s.with]){const h=AS.holders[i];if(h){h.position.copy(s.d).multiplyScalar(AS.D*(1-ease));if(st)h.position.addScaledVector(st,1-push)}}
   /* each screw is driven in turn by the drill: it starts standing proud and sinks as the bit spins */
   const nS=AS.screws.length,dt=nS?Math.min(.26,3.2/nS):0,t0s=slide+.15,total=slide+1.4+nS*dt;let active=null;
   AS.screws.forEach((m,q)=>{const u=(t-t0s-q*dt)/dt,sc=m.userData.sc;m.visible=u>0;if(!sc)return;const w=Math.max(0,Math.min(1,u));m.position.copy(sc.p).add(off).addScaledVector(sc.n,-sc.L/2+.15+sc.L*.8*(1-w));if(u>0&&u<1.15)active={sc,w}});
   const dr=asmDrill();if(active){const {sc,w}=active,up=new V(0,1,0),zv=up.clone().addScaledVector(sc.n,-up.dot(sc.n));if(zv.lengthSq()<1e-4)zv.set(0,0,1);zv.normalize();const xv=new V().crossVectors(sc.n,zv);
     dr.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(xv,sc.n,zv));dr.position.copy(sc.p).add(off).addScaledVector(sc.n,.2+sc.L*.8*(1-w));dr.userData.spin.rotation.y=now*.03;dr.visible=true}else dr.visible=false;
-  if(AS.arrow)AS.arrow.visible=e<1;AS.total=total;
+  if(AS.arrow)AS.arrow.visible=e1<1;if(AS.arrow2)AS.arrow2.visible=e<1;AS.total=total;
   const sl=$('#aStepSlider');if(sl&&document.activeElement!==sl)sl.value=Math.round(Math.min(1,t/total)*1000);
   if(AS.playing&&!AS.hold&&t>total){if(k<plan.steps.length-1)showStep(k+1);else{AS.playing=false;$('#aPlay').textContent='Play'}}}
 function asmPick(e){const r=renderer.domElement.getBoundingClientRect();mouse.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(mouse,camera);
@@ -3258,7 +3314,7 @@ async function saveBooklet(){if(!await needUnlock())return;freshen();if(!dl){toa
     const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,w,h);x.drawImage(src,0,0,w,h);return c.toDataURL('image/jpeg',.8)};
   const esc=t=>String(t).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));const secs=[];
   for(const b of blocks){AS.b=b;AS.playing=false;buildAsm();const plan=AS.plan;if(!plan)continue;const steps=[];
-    for(let k=0;k<plan.steps.length;k++){showStep(k);const s=plan.steps[k];for(const i of [s.i,...s.with])AS.holders[i]?.position.copy(s.sub?AS.off:new V());AS.screws.forEach(m=>m.visible=true);if(AS.arrow)AS.arrow.visible=true;
+    for(let k=0;k<plan.steps.length;k++){showStep(k);const s=plan.steps[k];for(const i of [s.i,...s.with])AS.holders[i]?.position.copy(s.sub?AS.off:new V());AS.screws.forEach(m=>m.visible=true);if(AS.arrow)AS.arrow.visible=true;if(AS.arrow2)AS.arrow2.visible=true;
       steps.push(`<div class="st"><img src="${shot()}" alt="Step ${k+1}"><div><h3>Step ${k+1}</h3><p>${$('#aText').innerHTML}</p></div></div>`);await new Promise(r=>setTimeout(r,0))}
     const kinds={face:[],rib:[],cleat:[]};plan.parts.forEach(p=>kinds[p.kind]?.push(p.label));
     secs.push(`<section><h2>Obstacle ${esc(b.name)}</h2><p class="parts"><b>${plan.parts.length} parts.</b> Panels: ${kinds.face.join(', ')}.${kinds.rib.length?' Ribs: '+kinds.rib.join(', ')+'.':''}${kinds.cleat.length?' Corner blocks: '+kinds.cleat.join(', ')+'.':''}</p>${steps.join('')}</section>`)}
