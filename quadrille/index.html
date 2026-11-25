@@ -812,7 +812,7 @@ function buildCage(net, autoLoops) {
   const fills = net.faces.filter((f) => f.fill);
   let S = Math.max(1, (autoLoops | 0) + 1);
   if (S > 1 && S % 2 === 1 && fills.some((f) => f.n !== 4)) S += 1; // odd-sided patches need an even split
-  const P = [], F = [], flag = [], sharp = [], onCurve = [];
+  const P = [], F = [], flag = [], sharp = [], onCurve = [], main = [], fpAt = new Map();
   const addV = (p) => { P.push(p[0], p[1], p[2]); return P.length / 3 - 1; };
   const getP = (i) => [P[3 * i], P[3 * i + 1], P[3 * i + 2]];
   const nodeV = new Map(), edgeV = new Map();
@@ -825,6 +825,7 @@ function buildCage(net, autoLoops) {
       ids.push(nv(e.b)); edgeV.set(ei, ids);
       for (const id of ids) onCurve[id] = 1;
       if (e.cr) for (let k = 0; k + 1 < ids.length; k++) sharp.push(ids[k], ids[k + 1]);
+      for (let k = 0; k + 1 < ids.length; k++) main.push(ids[k], ids[k + 1]);   // cage edges that lie on your lines
     }
     const ids = edgeV.get(ei);
     return he & 1 ? ids.slice().reverse() : ids;
@@ -847,18 +848,18 @@ function buildCage(net, autoLoops) {
   for (const f of fills) {
     const sides = f.hes.map(side);
     if (f.n === 4) { coons(sides[0], sides[1], sides[2], sides[3], S, false); continue; }
-    if (S === 1) { F.push(sides.map((s) => s[0])); flag.push(1); continue; }
+    if (S === 1) { F.push(sides.map((s) => s[0])); flag.push(f.pole ? 0 : 1); if (f.pole) fpAt.set(F.length - 1, f.poleFp || f.pole); continue; }
     const m = S / 2; const c = [0, 0, 0]; let cnt = 0;
     for (const s of sides) for (let k = 0; k < S; k++) { const p = getP(s[k]); c[0] += p[0]; c[1] += p[1]; c[2] += p[2]; cnt++; }
-    const C = addV(mul(c, 1 / cnt)), Cp = getP(C);
+    const C = addV(f.pole || mul(c, 1 / cnt)), Cp = getP(C);
     const spokes = sides.map((s) => { const Mi = s[m], Mp = getP(Mi), ids = [Mi]; for (let k = 1; k < m; k++) ids.push(addV(lerp(Mp, Cp, k / m))); ids.push(C); return ids; });
     for (let k = 0; k < f.n; k++) {
       const pk = (k - 1 + f.n) % f.n;
-      coons(sides[k].slice(0, m + 1), spokes[k], spokes[pk].slice().reverse(), sides[pk].slice(m), m, true);
+      coons(sides[k].slice(0, m + 1), spokes[k], spokes[pk].slice().reverse(), sides[pk].slice(m), m, !f.pole);
     }
   }
   const oc = new Array(P.length / 3).fill(0); onCurve.forEach((v, i) => { if (v) oc[i] = 1; });
-  return { P, F, flag, wire: null, S, sharp, onCurve: oc };
+  return { P, F, flag, wire: null, S, sharp, onCurve: oc, main, fpAt };
 }
 
 function subdivide(mesh) {
@@ -869,6 +870,7 @@ function subdivide(mesh) {
     const vs = F[f]; let x = 0, y = 0, z = 0;
     for (const v of vs) { x += P[3 * v]; y += P[3 * v + 1]; z += P[3 * v + 2]; }
     fpts[3 * f] = x / vs.length; fpts[3 * f + 1] = y / vs.length; fpts[3 * f + 2] = z / vs.length;
+    const q = mesh.fpAt && mesh.fpAt.get(f); if (q) { fpts[3 * f] = q[0]; fpts[3 * f + 1] = q[1]; fpts[3 * f + 2] = q[2]; }   // a pole you placed in an n-sided patch
   }
   for (let f = 0; f < NF; f++) {
     const vs = F[f], n = vs.length, es = new Array(n);
@@ -918,15 +920,18 @@ function subdivide(mesh) {
     for (let i = 0; i < n; i++) { F2.push([vs[i], NV + es[i], fp, NV + es[(i - 1 + n) % n]]); flag2.push(mesh.flag[f]); }
   }
   // wire = edges that descend from the cage
-  const wire = [];
-  if (!mesh.wire) { for (let e = 0; e < NE; e++) wire.push(ev0[e], NV + e, NV + e, ev1[e]); }
-  else {
+  // wireK: 1 where the edge lies on one of your lines, 0 for auto loops
+  const wire = [], wireK = [];
+  if (!mesh.wire) {
+    const mk = new Set(); if (mesh.main) for (let i = 0; i < mesh.main.length; i += 2) { const a = mesh.main[i], b = mesh.main[i + 1]; mk.add(a < b ? a * NV + b : b * NV + a); }
+    for (let e = 0; e < NE; e++) { const a = ev0[e], b = ev1[e], k = mk.has(a < b ? a * NV + b : b * NV + a) ? 1 : 0; wire.push(a, NV + e, NV + e, b); wireK.push(k, k); }
+  } else {
     for (let i = 0; i < mesh.wire.length; i += 2) {
-      const a = mesh.wire[i], b = mesh.wire[i + 1], e = emap.get(a < b ? a * NV + b : b * NV + a);
-      if (e !== undefined) wire.push(a, NV + e, NV + e, b);
+      const a = mesh.wire[i], b = mesh.wire[i + 1], e = emap.get(a < b ? a * NV + b : b * NV + a), k = mesh.wireK ? mesh.wireK[i >> 1] : 0;
+      if (e !== undefined) { wire.push(a, NV + e, NV + e, b); wireK.push(k, k); }
     }
   }
-  return { P: Q, F: F2, flag: flag2, wire, S: mesh.S, sharp: sharp2 };
+  return { P: Q, F: F2, flag: flag2, wire, wireK, S: mesh.S, sharp: sharp2 };
 }
 
 // where each vertex of an all-quad mesh ends up on the limit surface (Catmull-Clark limit masks)
@@ -971,13 +976,14 @@ function fitCage(cage, iters = 14) {
 }
 
 function cageWire(mesh) {
-  if (mesh.wire) return mesh.wire;
-  const NV = mesh.P.length / 3, seen = new Set(), wire = [];
+  if (mesh.wire) return { wire: mesh.wire, wireK: mesh.wireK || mesh.wire.map(() => 0).slice(0, mesh.wire.length / 2) };
+  const NV = mesh.P.length / 3, seen = new Set(), wire = [], wireK = [], mk = new Set();
+  if (mesh.main) for (let i = 0; i < mesh.main.length; i += 2) { const a = mesh.main[i], b = mesh.main[i + 1]; mk.add(a < b ? a * NV + b : b * NV + a); }
   for (const vs of mesh.F) for (let i = 0; i < vs.length; i++) {
     const a = vs[i], b = vs[(i + 1) % vs.length], key = a < b ? a * NV + b : b * NV + a;
-    if (!seen.has(key)) { seen.add(key); wire.push(a, b); }
+    if (!seen.has(key)) { seen.add(key); wire.push(a, b); wireK.push(mk.has(key) ? 1 : 0); }
   }
-  return wire;
+  return { wire, wireK };
 }
 
 // iron out squiggles shorter than a chosen length (Taubin smoothing: no shrinking). amount 0..1
@@ -1047,14 +1053,62 @@ const ptFlags = (P, closed, test) => P.map((p, i) => {
   return test(p, norm(sub(b, a))) ? 1 : 0;
 });
 
+// Poles: inside a pole sphere every topology line is cut, and its ends run straight to the sphere's centre,
+// so all the lines that reach in meet at one point there.
+function applyPoles(curves, poles, h) {
+  if (!poles.length) return curves;
+  const inside = (p) => poles.findIndex((q) => dist(p, q.c) < q.r), out = [];
+  const seg = (a, b) => { const n = Math.max(1, Math.ceil(dist(a, b) / h)), o = []; for (let k = 0; k <= n; k++) o.push(lerp(a, b, k / n)); return o; };
+  for (const c of curves) {
+    let P = c.pts, tag = P.map(inside);
+    if (tag.every((t) => t < 0)) { out.push(c); continue; }
+    if (c.closed) { const s0 = tag.findIndex((t) => t >= 0); P = P.slice(s0).concat(P.slice(0, s0), [P[s0]]); tag = tag.slice(s0).concat(tag.slice(0, s0), [tag[s0]]); }
+    const n = P.length;
+    for (let a = 0; a < n; ) {
+      if (tag[a] >= 0) { a++; continue; }
+      let b = a; while (b + 1 < n && tag[b + 1] < 0) b++;
+      let pts = P.slice(a, b + 1);
+      if (a > 0) pts = seg(poles[tag[a - 1]].c, P[a]).slice(0, -1).concat(pts);
+      if (b < n - 1) pts = pts.concat(seg(P[b], poles[tag[b + 1]].c).slice(1));
+      if (pts.length >= 3) out.push(finalize(Object.assign({}, c, { pts, w: pts.map(() => 1), closed: false })));
+      a = b + 1;
+    }
+  }
+  return out;
+}
+
+// a pole placed inside an n-sided patch (not touching its lines) becomes that patch's centre: its quads all meet there
+function markPoleFaces(net, poles) {
+  if (!poles.length) return;
+  for (const f of net.faces) {
+    if (!f.fill || f.n === 4) continue;
+    const pts = f.hes.map((he) => { const e = net.edges[he >> 1]; return net.nodes[he & 1 ? e.b : e.a].pos; }), n = pts.length;
+    const c = mul(pts.reduce((a, p) => add(a, p), [0, 0, 0]), 1 / n), N = [0, 0, 0];
+    for (let i = 0; i < n; i++) { const a = pts[i], b = pts[(i + 1) % n]; N[0] += (a[1] - b[1]) * (a[2] + b[2]); N[1] += (a[2] - b[2]) * (a[0] + b[0]); N[2] += (a[0] - b[0]) * (a[1] + b[1]); }
+    const nl = Math.hypot(...N); if (nl < 1e-12) continue; const nn = mul(N, 1 / nl), u = norm(sub(pts[0], c)), v = cross(nn, u), R = Math.max(...pts.map((p) => dist(p, c)));
+    const P2 = pts.map((p) => [dot(sub(p, c), u), dot(sub(p, c), v)]);
+    for (const q of poles) {
+      const d = sub(q.c, c); if (Math.hypot(...d) > 1.2 * R || Math.abs(dot(d, nn)) > 0.6 * R) continue;
+      const inPoly = (x, y) => { let inside = false; for (let i = 0, j = n - 1; i < n; j = i++) { const [xi, yi] = P2[i], [xj, yj] = P2[j]; if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside; } return inside; };
+      const x = dot(d, u), y = dot(d, v);
+      if (inPoly(x, y)) {
+        f.pole = q.c; f.flagged = false;
+        // with no auto loops the smoothing pulls the centre about halfway back to the middle, so aim past the pole
+        f.poleFp = inPoly(1.9 * x, 1.9 * y) ? add(c, mul(d, 1.9)) : q.c; break;
+      }
+    }
+  }
+}
+
 // full pipeline. params: {tol, autoLoops, smooth, fit, tidy, kinds, patch}   fit 0..1 = how far the smooth surface is pulled onto the curves
 function buildAll(strokes, params) {
   const tol = params.tol;
   // stroke kinds: bit 0 = loose surface guide (no topology), bit 1 = sharp crease
   const kinds = params.kinds || [], topo = [], cr = [], gs = [];
-  strokes.forEach((st, i) => { const k = kinds[i] | 0; if (k & 1) gs.push(st); else { topo.push(st); cr.push(!!(k & 2)); } });
+  const poles = [], softs = [];   // bit 2: a pole sphere, bit 3: a smooth-surface spot; both stored as a centre and a point on the rim
+  strokes.forEach((st, i) => { const k = kinds[i] | 0; if (k & 8) { if (st.length >= 2) softs.push({ c: st[0], r: dist(st[0], st[1]) }); } else if (k & 4) { if (st.length >= 2) poles.push({ c: st[0], r: dist(st[0], st[1]) }); } else if (k & 1) gs.push(st); else { topo.push(st); cr.push(!!(k & 2)); } });
   const hT = strokeSpacing(tol), tidy = (list) => (params.tidy > 0 ? list.map((c) => tidyCurve(c, params.tidy, hT)) : list);
-  let curves = tidy(buildCurves(topo, tol, null));
+  let curves = applyPoles(tidy(buildCurves(topo, tol, null)), poles, hT);
   const creaseTest = creaseMarker(topo.filter((_, i) => cr[i]), tol);
   // loose guides stay exactly where they were drawn: evenly spaced points, no blending, tidying or closing up
   const gcurves = gs.map((st) => { const P = st.filter((p, i) => i === 0 || dist(p, st[i - 1]) > 1e-6); return P.length < 2 ? null : finalize(Object.assign(resampleOpen(P, null, hT), { closed: false })); }).filter(Boolean);
@@ -1070,6 +1124,7 @@ function buildAll(strokes, params) {
   const sharpPts = []; for (const e of net.edges) if (e.cr) sharpPts.push(e.pts);
   const sharpTest = sharpPts.length ? creaseMarker(sharpPts, 0.75 * hT) : null;
   for (const c of curves) c.crw = sharpTest ? ptFlags(c.pts, c.closed, sharpTest) : null;
+  markPoleFaces(net, poles);
   let mesh = buildCage(net, gcurves.length ? Math.max(1, params.autoLoops | 0) : params.autoLoops);
   if (gcurves.length && mesh.F.length) applyGuides(mesh, gcurves, tol);
   const cageFaces = mesh.F.length;
@@ -1077,13 +1132,16 @@ function buildAll(strokes, params) {
   while (levels > 0 && cageFaces * Math.pow(4, levels) > 70000) levels--;
   const cageP = mesh.P, fit = clamp(params.fit === undefined ? 1 : params.fit, 0, 1);
   if (levels > 0 && mesh.F.length) {
-    if (fit > 0) { const Pf = fitCage(mesh); mesh = Object.assign({}, mesh, { P: cageP.map((v, i) => v + (Pf[i] - v) * fit) }); }
+    // smooth-surface spots: there the surface is not pulled onto the lines, so it relaxes over their wobble
+    const fitAt = new Float32Array(cageP.length / 3).fill(fit);
+    if (softs.length) for (let v = 0; v < fitAt.length; v++) { const p = [cageP[3 * v], cageP[3 * v + 1], cageP[3 * v + 2]]; for (const q of softs) { const d = dist(p, q.c); if (d < q.r) { const u = 1 - (d * d) / (q.r * q.r); fitAt[v] *= 1 - u * u; } } }
+    if (fit > 0) { const Pf = fitCage(mesh); mesh = Object.assign({}, mesh, { P: cageP.map((v, i) => v + (Pf[i] - v) * fitAt[(i / 3) | 0]) }); }
     for (let i = 0; i < levels; i++) mesh = subdivide(mesh);
     mesh.P = limitPositions(mesh);
   }
   const fills = net.faces.filter((f) => f.fill);
   return {
-    curves, gcurves, net, mesh, wire: cageWire(mesh), levels, cageP,
+    curves, gcurves, net, mesh, ...(() => { const w = cageWire(mesh); return { wire: w.wire, wireK: w.wireK }; })(), levels, cageP,
     stats: { curves: curves.length, nodes: net.nodes.filter((n) => n.alive).length, patches: fills.length, flagged: fills.filter((f) => f.flagged).length },
   };
 }
@@ -1091,7 +1149,7 @@ function buildAll(strokes, params) {
 // Auto join distance: read the sketch at a range of join distances and keep the one with the most clean quads
 // (filled patches, minus flagged ones). Among equally good ones it takes the middle of the run, which is the steadiest.
 function suggestTol(strokes, params = {}) {
-  const kinds = params.kinds || [], topo = strokes.filter((_, i) => !((kinds[i] | 0) & 1));
+  const kinds = params.kinds || [], topo = strokes.filter((_, i) => !((kinds[i] | 0) & 13));
   if (!topo.length) return 0;
   const lo = Math.max(params.min || 0.003, 0.005), hi = Math.min(params.max || 0.15, 0.12), N = 14, res = [];
   for (let k = 0; k < N; k++) {
@@ -1246,7 +1304,8 @@ function pack(r) {
   const usedN = new Set(); for (const e of r.net.edges) { usedN.add(e.a); usedN.add(e.b); }
   const nodes = new Float32Array(usedN.size * 3); o = 0;
   for (const ni of usedN) { const p = r.net.nodes[ni].pos; nodes[o++] = p[0]; nodes[o++] = p[1]; nodes[o++] = p[2]; }
-  return { pos, idx, nMain, nFlag, wire, curvePts, curveLens, curveKind, curvePtKind, nodes, stats: r.stats, levels: r.levels, S: m.S, quads: m.F.length };
+  const wireK = Uint8Array.from(r.wireK || []);
+  return { pos, idx, nMain, nFlag, wire, wireK, curvePts, curveLens, curveKind, curvePtKind, nodes, stats: r.stats, levels: r.levels, S: m.S, quads: m.F.length };
 }
 
 self.QE = { buildAll, makeExample, toOBJ, pack, strokeSpacing, eig3: smallestEigenvector, suggestTol };
@@ -1267,10 +1326,12 @@ const TOOLINFO = {
   draw: { name: 'Draw', icon: 'pencil', col: C.yellow, hex: 0xFFD400, ink: C.ink }, redraw: { name: 'Redraw', icon: 'redraw', col: C.orange, hex: 0xFF7A00, ink: C.ink },
   erase: { name: 'Erase', icon: 'eraser', col: C.red, hex: 0xE8212B, ink: '#fff' }, bend: { name: 'Bend', icon: 'bend', col: C.blue, hex: 0x2A7BFF, ink: '#fff' },
   iron: { name: 'Iron', icon: 'iron', col: C.violet, hex: 0x7B2FF7, ink: '#fff' }, loosen: { name: 'Loosen', icon: 'loosen', col: C.steel, hex: 0x8A8D93, ink: '#fff' },
-  crease: { name: 'Crease', icon: 'crease', col: C.ink, hex: 0x111111, ink: '#fff' }, smooth: { name: 'Smooth', icon: 'smooth', col: '#00A6B4', hex: 0x00A6B4, ink: '#fff' },
-  heal: { name: 'Heal', icon: 'heal', col: C.green, hex: 0x0E9F4A, ink: '#fff' }, look: { name: 'Look', icon: 'eye', col: C.yellow, hex: 0xFFD400, ink: C.ink },
+  crease: { name: 'Crease', icon: 'crease', col: C.ink, hex: 0x111111, ink: '#fff' }, smooth: { name: 'Smooth lines', icon: 'smooth', col: '#00A6B4', hex: 0x00A6B4, ink: '#fff' }, soft: { name: 'Smooth surface', icon: 'soft', col: '#2A7BFF', hex: 0x2A7BFF, ink: '#fff' },
+  heal: { name: 'Heal', icon: 'heal', col: C.green, hex: 0x0E9F4A, ink: '#fff' }, pole: { name: 'Pole', icon: 'pole', col: '#C026D3', hex: 0xC026D3, ink: '#fff' }, look: { name: 'Look', icon: 'eye', col: C.yellow, hex: 0xFFD400, ink: C.ink },
 };
-const BRUSH = { erase: 1, iron: 1, loosen: 1, crease: 1, smooth: 1, heal: 1 }, SIZED = Object.assign({ bend: 1 }, BRUSH);
+const BRUSH = { erase: 1, iron: 1, loosen: 1, crease: 1, smooth: 1, heal: 1, soft: 1 }, SIZED = Object.assign({ bend: 1, pole: 1 }, BRUSH);
+const isTopo = (s) => !((s.k | 0) & 13);   // bits: 1 guide, 2 crease, 4 pole, 8 smooth-surface spot
+const isSpot = (s) => !!((s.k | 0) & 12);   // a red line (not a gray guide, not a pole)
 // the sphere on the pen: brush tools show their size; Draw shows only a small dot at the tip
 const ballRadius = (tool, ws, size) => (SIZED[tool] ? size : 0.0035);
 const sizeOf = (tool) => state.size[tool] || 0.03;
@@ -1291,10 +1352,11 @@ const state = {
   lastTool: 'erase',         // what A swaps with Draw
   line: 'topo',              // what Draw makes: 'topo' (red, becomes edge loops) or 'guide' (gray, loose surface hint)
   tidy: 0.3,                 // how hard squiggles are ironed out of the clean curves (0..1)
-  size: { erase: 0.025, loosen: 0.03, crease: 0.02, heal: 0.07, smooth: 0.05, iron: 0.1, bend: 0.12 },   // brush size per tool, metres in your hand space (right stick)
+  size: { erase: 0.025, loosen: 0.03, crease: 0.02, heal: 0.07, smooth: 0.05, iron: 0.1, bend: 0.12, pole: 0.05, soft: 0.06 },   // brush size per tool, metres in your hand space (right stick)
   tol: 0.04, autoLoops: 0, smooth: 2, fit: 1,   // fit: how far the smooth surface is pulled onto the drawn curves
   exMess: 1,                                    // how sloppy the built-in examples are drawn (0..1.5)
-  show: { sketch: true, curves: true, surface: true, wire: true, labels: true, preview: true },
+  show: { sketch: true, curves: true, surface: true, wire: true, labels: true, preview: true, board: false },
+  surfOp: 1,                 // how solid the surface is (0 = hidden)
   view: 'third',             // what a watching phone shows: third | first | split (local to that device)
   mr: false,
 };
@@ -1308,7 +1370,7 @@ const sync = { sv: 0, pv: 0 };     // "last edited" stamps for the sketch and fo
 let spect = null;                  // set while this flat view is watching a headset: that peer's tool, menu tab, poses...
 let debugXR = false;               // tests: behave as the headset without a real XR session
 const lastXR = { L: null, R: null };
-const TOOLS = ['draw', 'erase', 'bend', 'look', 'redraw', 'iron', 'loosen', 'crease', 'smooth', 'heal'];
+const TOOLS = ['draw', 'erase', 'bend', 'look', 'redraw', 'iron', 'loosen', 'crease', 'smooth', 'heal', 'pole', 'soft'];
 const isPresenter = () => inXR || debugXR;
 const xrLike = () => inXR || !!spect;                       // lay the menu out the way the headset sees it
 const shownTool = () => (spect ? spect.tool : state.tool);
@@ -1401,19 +1463,41 @@ scene.add(floor);
 
 const world = new THREE.Group(); world.position.copy(HOME); scene.add(world);   // model space
 const dotGeo = new THREE.SphereGeometry(1, 12, 8), dotMat = new THREE.MeshBasicMaterial({ color: 0xFFD400 });
+const poleGeo = new THREE.SphereGeometry(1, 24, 16), poleMat = new THREE.MeshBasicMaterial({ color: 0xC026D3, transparent: true, opacity: 0.28, depthWrite: false }), softMat = new THREE.MeshBasicMaterial({ color: 0x2A7BFF, transparent: true, opacity: 0.12, depthWrite: false });
 // one set of display objects per layer; the active layer is drawn in full, the others as see-through ghosts
 function makeView() {
   const mat = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.62, metalness: 0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
   const v = { built: null, g: new THREE.Group(), surfMats: [mat(0xffffff), mat(0xFF2D9B)] };
   v.surface = new THREE.Mesh(new THREE.BufferGeometry(), v.surfMats);
-  v.wire = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x0b0b0b }));
+  v.wire = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x6a6a6a, transparent: true, opacity: 0.7 }));   // auto loops: thin
+  v.wireMain = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0x0b0b0b }));   // loops on your lines: solid
   v.sketch = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.7 }));
   v.tubes = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
   v.dots = new THREE.InstancedMesh(dotGeo, dotMat, 64); v.dots.count = 0;
-  for (const o of [v.surface, v.wire, v.sketch, v.tubes, v.dots]) { o.frustumCulled = false; v.g.add(o); }
+  v.poles = new THREE.InstancedMesh(poleGeo, poleMat, 8); v.poles.count = 0; v.softs = new THREE.InstancedMesh(poleGeo, softMat, 8); v.softs.count = 0;
+  for (const o of [v.surface, v.wire, v.wireMain, v.sketch, v.tubes, v.dots, v.poles, v.softs]) { o.frustumCulled = false; v.g.add(o); }
   world.add(v.g); return v;
 }
 const views = state.layers.map(makeView);
+// a real-size skateboard (80 cm deck) beside the model, to judge scale; it grows and shrinks with the model
+const board = new THREE.Group();
+{
+  const M = (c) => new THREE.MeshLambertMaterial({ color: c }), deck = new THREE.Group(), L = 0.80, W = 0.21, T = 0.012;
+  const mid = new THREE.Mesh(new THREE.BoxGeometry(L - W, T, W), M(0x111111)); deck.add(mid);
+  for (const sx of [-1, 1]) { const end = new THREE.Mesh(new THREE.CylinderGeometry(W / 2, W / 2, T, 24, 1, false, sx > 0 ? 0 : Math.PI, Math.PI), M(0x111111)); end.position.x = (sx * (L - W)) / 2; deck.add(end); }
+  const under = new THREE.Mesh(new THREE.BoxGeometry(L - W, 0.004, W * 0.98), M(0xE8212B)); under.position.y = -T / 2 - 0.002; deck.add(under);
+  deck.position.y = 0.09; board.add(deck);
+  for (const sx of [-1, 1]) {
+    const truck = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.03, 0.2), M(0xb9c0c8)); truck.position.set(sx * 0.21, 0.065, 0); board.add(truck);
+    for (const sz of [-1, 1]) { const wh = new THREE.Mesh(new THREE.CylinderGeometry(0.027, 0.027, 0.032, 20), M(0xFFD400)); wh.rotation.x = Math.PI / 2; wh.position.set(sx * 0.21, 0.027, sz * 0.105); board.add(wh); }
+  }
+  board.visible = false; board.traverse((o) => { o.frustumCulled = false; }); world.add(board);
+}
+function placeBoard() {   // on the ground beside the active layer's surface
+  const o = views[state.active].built, p = o && o.pos.length ? o.pos : null; let x1 = 0.2, y0 = -0.1, cz = 0;
+  if (p) { let mx = -1e9, mn = 1e9, z0 = 1e9, z1 = -1e9; for (let i = 0; i < p.length; i += 3) { mx = Math.max(mx, p[i]); mn = Math.min(mn, p[i + 1]); z0 = Math.min(z0, p[i + 2]); z1 = Math.max(z1, p[i + 2]); } x1 = mx; y0 = mn; cz = (z0 + z1) / 2; }
+  board.position.set(x1 + 0.5, y0, cz); board.rotation.y = Math.PI / 2;
+}
 const liveBuf = new Float32Array(3 * 8000);
 const liveLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xFFD400 }));
 liveLine.geometry.setAttribute('position', new THREE.BufferAttribute(liveBuf, 3)); liveLine.geometry.setDrawRange(0, 0);
@@ -1426,11 +1510,30 @@ function setLive(flat) {
   liveLine.geometry.attributes.position.needsUpdate = true; liveLine.geometry.setDrawRange(0, n / 3);
 }
 function rebuildSketch(li = state.active) {   // raw strokes: white = topology, gray = loose guide
-  const S = state.layers[li].strokes, v = views[li]; let n = 0; for (const s of S) n += Math.max(0, s.length / 3 - 1) * 2;
+  const S = state.layers[li].strokes, v = views[li]; let n = 0; for (const s of S) if (!isSpot(s)) n += Math.max(0, s.length / 3 - 1) * 2;
   const pos = new Float32Array(n * 3), col = new Float32Array(n * 3); let o = 0;
-  for (const s of S) { const c = s.k & 1 ? 0.55 : 1; for (let i = 0; i + 5 < s.length; i += 3) for (let k = 0; k < 6; k++) { col[o] = c; pos[o++] = s[i + k]; } }
+  for (const s of S) { if (isSpot(s)) continue; const c = s.k & 1 ? 0.55 : 1; for (let i = 0; i + 5 < s.length; i += 3) for (let k = 0; k < 6; k++) { col[o] = c; pos[o++] = s[i + k]; } }
   v.sketch.geometry.dispose(); v.sketch.geometry = new THREE.BufferGeometry();
   v.sketch.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3)); v.sketch.geometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const m = new THREE.Matrix4();   // pole spheres (magenta) and smooth-surface spots (blue)
+  for (const [key, bit, mat] of [['poles', 4, poleMat], ['softs', 8, softMat]]) {
+    const list = S.filter((st) => st.k & bit);
+    if (list.length > v[key].instanceMatrix.count) { v.g.remove(v[key]); v[key].dispose(); v[key] = new THREE.InstancedMesh(poleGeo, mat, list.length * 2); v[key].frustumCulled = false; v.g.add(v[key]); }
+    list.forEach((st, i) => { const r = Math.hypot(st[3] - st[0], st[4] - st[1], st[5] - st[2]); m.makeScale(r, r, r); m.setPosition(st[0], st[1], st[2]); v[key].setMatrixAt(i, m); });
+    v[key].count = list.length; v[key].instanceMatrix.needsUpdate = true;
+  }
+}
+// short square tubes, one per segment: edge loops that keep a visible thickness in the headset
+function segTubes(seg, r) {
+  const n = seg.length / 6, pos = new Float32Array(n * 8 * 3), idx = new Uint32Array(n * 24), a = new THREE.Vector3(), b = new THREE.Vector3(), t = new THREE.Vector3(), u = new THREE.Vector3(), w = new THREE.Vector3();
+  for (let i = 0; i < n; i++) {
+    a.fromArray(seg, 6 * i); b.fromArray(seg, 6 * i + 3); t.subVectors(b, a); if (t.lengthSq() < 1e-14) t.set(1, 0, 0); t.normalize();
+    u.set(Math.abs(t.y) < 0.9 ? 0 : 1, Math.abs(t.y) < 0.9 ? 1 : 0, 0).cross(t).normalize().multiplyScalar(r); w.crossVectors(t, u).normalize().multiplyScalar(r);
+    const o = i * 24;
+    [[1, 1], [-1, 1], [-1, -1], [1, -1]].forEach(([p, q], k) => { for (const [e, c] of [[0, a], [1, b]]) { const j = o + (k * 2 + e) * 3; pos[j] = c.x + u.x * p + w.x * q; pos[j + 1] = c.y + u.y * p + w.y * q; pos[j + 2] = c.z + u.z * p + w.z * q; } });
+    for (let k = 0; k < 4; k++) { const v0 = i * 8 + k * 2, v1 = i * 8 + ((k + 1) % 4) * 2, x = i * 24 + k * 6; idx[x] = v0; idx[x + 1] = v0 + 1; idx[x + 2] = v1; idx[x + 3] = v1; idx[x + 4] = v0 + 1; idx[x + 5] = v1 + 1; }
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setIndex(new THREE.BufferAttribute(idx, 1)); return g;
 }
 // clean curves as thin tubes. kinds: 0 topology (red), 1 loose guide (gray), 2 crease (black, thicker), 3 guessed by Fill holes (blue)
 const KIND_COL = [[0.94, 0.13, 0.18], [0.62, 0.62, 0.64], [0.03, 0.03, 0.03], [0.16, 0.48, 1]], KIND_R = [1, 0.8, 1.6, 1];
@@ -1469,6 +1572,7 @@ function tubeGeometry(pts, lens, radius, kinds, ptKinds) {
 function rebuildCurveDisplay(li = state.active) {
   const v = views[li], o = v.built; if (!o) return;
   const r = 0.0026 / dispScale;
+  if (o.mainSegs) { v.wireMain.geometry.dispose(); v.wireMain.geometry = segTubes(o.mainSegs, 0.0009 / dispScale); }
   v.tubes.geometry.dispose(); v.tubes.geometry = tubeGeometry(o.curvePts, o.curveLens, r, o.curveKind, o.curvePtKind);
   const n = o.nodes.length / 3;
   if (n > v.dots.instanceMatrix.count) { v.g.remove(v.dots); v.dots.dispose(); v.dots = new THREE.InstancedMesh(dotGeo, dotMat, Math.max(64, n * 2)); v.dots.frustumCulled = false; v.g.add(v.dots); }
@@ -1478,13 +1582,16 @@ function rebuildCurveDisplay(li = state.active) {
   applyShow();
 }
 function applyBuilt(o, li) {
-  const v = views[li]; v.built = o;
+  const v = views[li]; v.built = o; if (li === state.active && state.show.board) placeBoard();
   if (li === state.active) { built = o; stats = o.stats; }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(o.pos, 3)); geo.setIndex(new THREE.BufferAttribute(o.idx, 1));
   geo.addGroup(0, o.nMain, 0); geo.addGroup(o.nMain, o.nFlag, 1); geo.computeVertexNormals();
   v.surface.geometry.dispose(); v.surface.geometry = geo;
-  const wg = new THREE.BufferGeometry(); wg.setAttribute('position', new THREE.BufferAttribute(o.wire, 3));
+  const K = o.wireK || new Uint8Array(o.wire.length / 6), nm = K.reduce((a, b) => a + b, 0), auto = new Float32Array((K.length - nm) * 6), mainS = new Float32Array(nm * 6); let ia = 0, im = 0;
+  for (let i = 0; i < K.length; i++) { const seg = o.wire.subarray(6 * i, 6 * i + 6); if (K[i]) { mainS.set(seg, im); im += 6; } else { auto.set(seg, ia); ia += 6; } }
+  o.mainSegs = mainS;
+  const wg = new THREE.BufferGeometry(); wg.setAttribute('position', new THREE.BufferAttribute(auto, 3));
   v.wire.geometry.dispose(); v.wire.geometry = wg;
   rebuildCurveDisplay(li); ui.dirty = true;
 }
@@ -1492,12 +1599,14 @@ function applyShow() {
   views.forEach((v, i) => {
     const act = i === state.active, has = !!(v.built && v.built.idx.length > 0), ghost = !act && state.ghost;
     v.g.visible = act || state.layers[i].vis;
-    v.surface.visible = state.show.surface && has; v.wire.visible = act && state.show.wire && has;
-    v.sketch.visible = act && state.show.sketch; v.tubes.visible = state.show.curves; v.dots.visible = act && state.show.curves;
-    for (const m of v.surfMats) { if (m.transparent !== ghost) { m.transparent = ghost; m.needsUpdate = true; } m.opacity = ghost ? 0.3 : 1; m.depthWrite = !ghost; }
+    v.surface.visible = state.surfOp > 0.01 && has; v.wire.visible = v.wireMain.visible = act && state.show.wire && has;
+    v.sketch.visible = act && state.show.sketch; v.poles.visible = v.softs.visible = act; v.tubes.visible = state.show.curves; v.dots.visible = act && state.show.curves;
+    const op = ghost ? 0.3 * Math.min(1, state.surfOp) : state.surfOp, see = op < 0.999;
+    for (const m of v.surfMats) { if (m.transparent !== see) { m.transparent = see; m.needsUpdate = true; } m.opacity = op; m.depthWrite = !see; }
     const tm = v.tubes.material; if (tm.transparent !== ghost) { tm.transparent = ghost; tm.needsUpdate = true; } tm.opacity = ghost ? 0.4 : 1;
-    v.surface.renderOrder = ghost ? 2 : 0;
+    v.surface.renderOrder = ghost || state.surfOp < 0.999 ? 2 : 0;
   });
+  board.visible = state.show.board; if (board.visible) placeBoard();
 }
 function refreshDisplayScale() { dispScale = world.scale.x; views.forEach((v, i) => rebuildCurveDisplay(i)); }
 function setActiveLayer(i, remote) {
@@ -1527,6 +1636,12 @@ async function autoTol() {
   const tol = await Engine.auto(S, { tidy: state.tidy, kinds: Array.from(S, (f) => f.k | 0), min: TOL_MIN, max: TOL_MAX }); autoBusy = false;
   if (tol > 0) { setTol(tol); toast('Join distance ' + (tol * 100).toFixed(1) + ' cm reads the most clean quads'); } else toast('Could not find a better join distance');
 }
+function togglePole(p, r) {
+  const S = state.strokes, hit = S.findIndex((st) => st.k & 4 && Math.hypot(st[0] - p.x, st[1] - p.y, st[2] - p.z) < Math.hypot(st[3] - st[0], st[4] - st[1], st[5] - st[2]));
+  if (hit >= 0) { commit(S.filter((_, i) => i !== hit)); return 'removed'; }
+  const f = Float32Array.from([p.x, p.y, p.z, p.x + r, p.y, p.z]); f.k = 4; commit(S.concat([f])); return 'added';
+}
+const poleUnder = (p) => state.strokes.some((st) => st.k & 4 && Math.hypot(st[0] - p.x, st[1] - p.y, st[2] - p.z) < Math.hypot(st[3] - st[0], st[4] - st[1], st[5] - st[2]));
 function setLine(k) { state.line = k; ui.dirty = true; refreshTags(); }
 function setTol(v) { v = clamp(v, TOL_MIN, TOL_MAX); if (v === state.tol) return; state.tol = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; refreshTags(); }
 function setParam(k, v) { if (state[k] === v) return; state[k] = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; }
@@ -1535,13 +1650,22 @@ function finishStroke(flat, ws) {
   if (!(flat.length >= 9 && len * ws > 0.012)) return;
   const f = Float32Array.from(flat); f.k = state.line === 'guide' ? 1 : 0;
   let base = state.strokes;
-  if (state.tool === 'redraw' && !(f.k & 1)) base = withoutAlong(base, f);   // the new line replaces the topology lines it runs along
+  if (state.tool === 'redraw' && !(f.k & 1)) {   // the new line replaces the topology lines it runs along, and keeps their creases
+    base = withoutAlong(base, f); const c = base.creaseAt, n = c.length, w = new Uint8Array(n);
+    for (let i = 0; i < n; i++) for (let k = -3; k <= 3; k++) if (c[i + k]) { w[i] = 1; break; }   // close small gaps
+    if (w.some((v) => v)) {
+      const pieces = [];
+      for (let a = 0, i = 1; i <= n; i++) if (i === n || w[i] !== w[a]) { const b = Math.min(n, i + 1); if (b - a >= 2) { const g = f.slice(a * 3, b * 3); g.k = w[a] ? 2 : 0; pieces.push(g); } a = i; }
+      commit(base.concat(pieces)); return;
+    }
+  }
   commit(base.concat([f]));
 }
 // remove every raw point for which pred is true; strokes split where points go
 function eraseWhere(pred) {
   let changed = false; const out = [];
   for (const s of state.strokes) {
+    if (isSpot(s)) { if (pred(s[0], s[1], s[2])) changed = true; else out.push(s); continue; }
     const n = s.length / 3; let hit = false; const keep = new Uint8Array(n);
     for (let i = 0; i < n; i++) { if (pred(s[3 * i], s[3 * i + 1], s[3 * i + 2])) hit = true; else keep[i] = 1; }
     if (!hit) { out.push(s); continue; }
@@ -1557,9 +1681,10 @@ function eraseWhere(pred) {
 const eraserRadiusModel = (ws) => Math.max(state.tol, 0.018 / ws);
 // Redraw: topology strokes that run alongside the new stroke `f` (close and roughly parallel) are removed where they do.
 function withoutAlong(strokes, f) {
-  const r2 = (1.5 * state.tol) ** 2, nf = f.length / 3, out = [];
+  const r2 = (1.5 * state.tol) ** 2, nf = f.length / 3, out = [], cr = new Uint8Array(nf);
+  out.creaseAt = cr;   // which points of the new line replace a creased one
   for (const s of strokes) {
-    if (s.k & 1) { out.push(s); continue; }
+    if (!isTopo(s)) { out.push(s); continue; }
     const n = s.length / 3, keep = new Uint8Array(n); let hit = false;
     for (let i = 0; i < n; i++) {
       const x = s[3 * i], y = s[3 * i + 1], z = s[3 * i + 2]; let bd = r2, bj = -1;
@@ -1567,7 +1692,7 @@ function withoutAlong(strokes, f) {
       keep[i] = 1; if (bj < 0) continue;
       const i0 = Math.max(0, i - 2), i1 = Math.min(n - 1, i + 2), j0 = Math.max(0, bj - 2), j1 = Math.min(nf - 1, bj + 2);
       const ax = s[3 * i1] - s[3 * i0], ay = s[3 * i1 + 1] - s[3 * i0 + 1], az = s[3 * i1 + 2] - s[3 * i0 + 2], bx = f[3 * j1] - f[3 * j0], by = f[3 * j1 + 1] - f[3 * j0 + 1], bz = f[3 * j1 + 2] - f[3 * j0 + 2];
-      if (Math.abs(ax * bx + ay * by + az * bz) > 0.65 * Math.hypot(ax, ay, az) * Math.hypot(bx, by, bz)) { keep[i] = 0; hit = true; }
+      if (Math.abs(ax * bx + ay * by + az * bz) > 0.65 * Math.hypot(ax, ay, az) * Math.hypot(bx, by, bz)) { keep[i] = 0; hit = true; if (s.k & 2) cr[bj] = 1; }
     }
     if (!hit) { out.push(s); continue; }
     let start = -1;
@@ -1590,7 +1715,7 @@ function applyMasks(P, kOf) {
 function paintWhere(pred, P) {   // Loosen and Heal
   let changed = false;
   P.before.forEach((s, si) => {
-    if (s.k & 1) return; const n = s.length / 3; let m = P.masks.get(si);
+    if (!isTopo(s)) return; const n = s.length / 3; let m = P.masks.get(si);
     for (let i = 0; i < n; i++) if (!(m && m[i]) && pred(s[3 * i], s[3 * i + 1], s[3 * i + 2])) { if (!m) { m = new Uint8Array(n); P.masks.set(si, m); } m[i] = 1; changed = true; }
   });
   if (changed) applyMasks(P, () => 1);
@@ -1618,9 +1743,28 @@ function spanIndex(o) {
   return spans;
 }
 // Crease brush: touch a red line and the span between its two nearest crossings folds sharp (touch a black one to unfold it)
+// what the Crease brush would do here: the span under it, and whether it would fold (black) or unfold (red)
+function creaseHover(p, r, P) {
+  const o = views[state.active].built; if (!o) return null;
+  const spans = o._spans || (o._spans = spanIndex(o)), C = o.curvePts, r2 = r * r;
+  for (const sp of spans) for (const i of sp) if ((C[3 * i] - p.x) ** 2 + (C[3 * i + 1] - p.y) ** 2 + (C[3 * i + 2] - p.z) ** 2 < r2)
+    return { sp, fold: P && P.mode !== null ? P.mode : o.curvePtKind[sp[sp.length >> 1]] !== 2 };
+  return null;
+}
+const hoverHalo = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0xFFD400 })), hoverCore = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ vertexColors: true }));
+for (const h of [hoverHalo, hoverCore]) { h.frustumCulled = false; h.visible = false; world.add(h); } hoverCore.renderOrder = 3;
+let hoverKey = '';
+function showCreaseHover(hv) {
+  const key = hv ? hv.sp[0] + ':' + hv.sp.length + ':' + hv.fold + ':' + dispScale : '';
+  hoverHalo.visible = hoverCore.visible = !!hv; if (key === hoverKey) return; hoverKey = key; if (!hv) return;
+  const o = views[state.active].built, pts = new Float32Array(hv.sp.length * 3); hv.sp.forEach((i, k) => pts.set(o.curvePts.subarray(3 * i, 3 * i + 3), 3 * k));
+  const r = 0.0026 / dispScale, lens = [hv.sp.length];
+  hoverHalo.geometry.dispose(); hoverHalo.geometry = tubeGeometry(pts, lens, r * 3.4, [0]);
+  hoverCore.geometry.dispose(); hoverCore.geometry = tubeGeometry(pts, lens, r * 1.4, [hv.fold ? 2 : 0]);
+}
 function creasePaint(p, r, P) {
   const o = views[state.active].built; if (!o) return false;
-  if (!P.spans) P.spans = spanIndex(o);
+  if (!P.spans) P.spans = o._spans || (o._spans = spanIndex(o));
   const C = o.curvePts, r2 = r * r, fresh = [];
   P.spans.forEach((sp, k) => {
     if (P.hit.has(k)) return;
@@ -1637,7 +1781,7 @@ function creasePaint(p, r, P) {
     const lo = sp[0], hi = sp[sp.length - 1], bb = [1e9, 1e9, 1e9, -1e9, -1e9, -1e9];
     for (const i of sp) for (let k = 0; k < 3; k++) { bb[k] = Math.min(bb[k], C[3 * i + k] - reach); bb[k + 3] = Math.max(bb[k + 3], C[3 * i + k] + reach); }
     P.before.forEach((s, si) => {
-      if (s.k & 1) return; const n = s.length / 3;
+      if (!isTopo(s)) return; const n = s.length / 3;
       for (let j = 0; j < n; j++) {
         const x = s[3 * j], y = s[3 * j + 1], z = s[3 * j + 2];
         if (x < bb[0] || y < bb[1] || z < bb[2] || x > bb[3] || y > bb[4] || z > bb[5]) continue;
@@ -1721,15 +1865,21 @@ function healFinish(P) {
   state.strokes = out.filter(Boolean).concat(bridges);
   return true;
 }
-// Smooth brush: evens out the raw lines along their length (ends stay put)
+// Smooth surface brush: leaves blue spots where you paint; there the surface relaxes instead of following every wobble of the lines
+function softPaint(p, r, P) {
+  if (P.last && Math.hypot(p.x - P.last.x, p.y - P.last.y, p.z - P.last.z) < 0.45 * r) return false;
+  P.last = { x: p.x, y: p.y, z: p.z }; const f = Float32Array.from([p.x, p.y, p.z, p.x + r, p.y, p.z]); f.k = 8;
+  state.strokes = state.strokes.concat([f]); return true;
+}
+// Smooth lines brush: evens out the raw lines along their length (ends stay put)
 function smoothAt(p, R, rate) {
   const S = state.strokes, R2 = R * R; let any = false; const out = S.slice();
   S.forEach((s, si) => {
-    const n = s.length / 3; if (n < 5) return;
+    const n = s.length / 3; if (n < 5 || isSpot(s)) return;
     let hit = false; for (let i = 0; i < n && !hit; i++) hit = (s[3 * i] - p.x) ** 2 + (s[3 * i + 1] - p.y) ** 2 + (s[3 * i + 2] - p.z) ** 2 < R2;
     if (!hit) return;
     let len = 0; for (let i = 1; i < n; i++) len += Math.hypot(s[3 * i] - s[3 * i - 3], s[3 * i + 1] - s[3 * i - 2], s[3 * i + 2] - s[3 * i - 1]);
-    const m = clamp(Math.round((R * 0.35) / Math.max(1e-5, len / (n - 1))), 2, 24), cs = new Float64Array((n + 1) * 3);
+    const m = clamp(Math.round((R * 0.8) / Math.max(1e-5, len / (n - 1))), 3, 40), cs = new Float64Array((n + 1) * 3);
     for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) cs[3 * (i + 1) + k] = cs[3 * i + k] + s[3 * i + k];
     const f = new Float32Array(s); f.k = s.k | 0;
     for (let i = 1; i < n - 1; i++) {
@@ -1745,7 +1895,7 @@ function smoothAt(p, R, rate) {
 // Iron: press the raw lines near the pen onto one smooth sheet fitted through them, and relax each line along its length
 function ironAt(p, R, rate) {
   const S = state.strokes, R2 = R * R, hits = []; let sw = 0, cx = 0, cy = 0, cz = 0;
-  S.forEach((s, si) => { for (let i = 0; i < s.length; i += 3) { const d2 = (s[i] - p.x) ** 2 + (s[i + 1] - p.y) ** 2 + (s[i + 2] - p.z) ** 2; if (d2 < R2) { const u = 1 - d2 / R2, w = u * u; hits.push(si, i, w); sw += w; cx += w * s[i]; cy += w * s[i + 1]; cz += w * s[i + 2]; } } });
+  S.forEach((s, si) => { if (isSpot(s)) return; for (let i = 0; i < s.length; i += 3) { const d2 = (s[i] - p.x) ** 2 + (s[i + 1] - p.y) ** 2 + (s[i + 2] - p.z) ** 2; if (d2 < R2) { const u = 1 - d2 / R2, w = u * u; hits.push(si, i, w); sw += w; cx += w * s[i]; cy += w * s[i + 1]; cz += w * s[i + 2]; } } });
   if (hits.length < 24) return false;
   cx /= sw; cy /= sw; cz /= sw; const C6 = [0, 0, 0, 0, 0, 0];
   for (let h = 0; h < hits.length; h += 3) { const s = S[hits[h]], i = hits[h + 1], w = hits[h + 2], x = s[i] - cx, y = s[i + 1] - cy, z = s[i + 2] - cz; C6[0] += w * x * x; C6[1] += w * x * y; C6[2] += w * x * z; C6[3] += w * y * y; C6[4] += w * y * z; C6[5] += w * z * z; }
@@ -1772,7 +1922,7 @@ function startBend(p, R) {
   const items = [];
   state.strokes.forEach((s, idx) => {
     const n = s.length / 3; let w = null;
-    for (let i = 0; i < n; i++) { const d2 = (s[3 * i] - p.x) ** 2 + (s[3 * i + 1] - p.y) ** 2 + (s[3 * i + 2] - p.z) ** 2; if (d2 < R * R) { if (!w) w = new Float32Array(n); const u = 1 - d2 / (R * R); w[i] = u * u; } }
+    for (let i = 0; i < n; i++) { const j = isSpot(s) ? 0 : i, d2 = (s[3 * j] - p.x) ** 2 + (s[3 * j + 1] - p.y) ** 2 + (s[3 * j + 2] - p.z) ** 2; if (d2 < R * R) { if (!w) w = new Float32Array(n); const u = 1 - d2 / (R * R); w[i] = u * u; } }
     if (w) items.push({ idx, base: s, w });
   });
   return { x: p.x, y: p.y, z: p.z, before: state.strokes, items, moved: false };
@@ -1791,7 +1941,7 @@ function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 
 function save() {
   try {
     localStorage.setItem('quadrille.v1', JSON.stringify({ v: 4, sv: sync.sv, pv: sync.pv, tidy: state.tidy, size: state.size, show: state.show, tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, exMess: state.exMess,
-      active: state.active, ghost: state.ghost, line: state.line,
+      active: state.active, ghost: state.ghost, line: state.line, surfOp: state.surfOp,
       layers: state.layers.map((l) => ({ vis: l.vis, k: l.strokes.map((s) => s.k | 0), s: l.strokes.map((s) => Array.from(s, (v) => Math.round(v * 10000))) })) }));
   } catch (e) { /* storage is a convenience only */ }
 }
@@ -1803,7 +1953,7 @@ function load() {
     if (Array.isArray(d.layers)) d.layers.slice(0, NL).forEach((l, i) => { state.layers[i].strokes = (l.s || []).map((a, j) => un(a, (l.k || [])[j])); state.layers[i].vis = l.vis !== false; });
     else state.layers[0].strokes = d.strokes.map((a) => un(a, 0));
     if (d.active >= 0) state.active = clamp(d.active | 0, 0, NL - 1);
-    state.ghost = d.ghost !== false; if (d.line === 'guide') state.line = 'guide';
+    state.ghost = d.ghost !== false; if (d.line === 'guide') state.line = 'guide'; if (d.surfOp >= 0) state.surfOp = clamp(+d.surfOp, 0, 1);
     if (d.tol > 0) state.tol = clamp(d.tol, TOL_MIN, TOL_MAX);
     if (d.autoLoops >= 0) state.autoLoops = clamp(d.autoLoops | 0, 0, 6);
     if (d.smooth >= 0) state.smooth = clamp(d.smooth | 0, 0, 3);
@@ -1914,9 +2064,18 @@ function icon(c, name, cx, cy, s, col) {
     c.beginPath(); c.moveTo(0, -s * 0.34); c.lineTo(0, s * 0.4); c.setLineDash([s * 0.06, s * 0.12]); c.stroke(); c.setLineDash([]);
   } else if (name === 'smooth') {
     c.beginPath(); c.moveTo(-s * 0.46, 0); c.lineTo(-s * 0.36, -s * 0.18); c.lineTo(-s * 0.26, s * 0.16); c.lineTo(-s * 0.16, -s * 0.14); c.lineTo(-s * 0.06, s * 0.1); c.quadraticCurveTo(s * 0.04, -s * 0.06, s * 0.2, 0); c.lineTo(s * 0.46, 0); c.stroke();
+  } else if (name === 'soft') {
+    c.beginPath(); c.moveTo(-s * 0.46, s * 0.2); c.lineTo(-s * 0.32, -s * 0.06); c.lineTo(-s * 0.2, s * 0.14); c.lineTo(-s * 0.08, -s * 0.12); c.quadraticCurveTo(s * 0.2, -s * 0.36, s * 0.46, s * 0.2); c.stroke();
+    c.beginPath(); c.moveTo(-s * 0.46, s * 0.36); c.lineTo(s * 0.46, s * 0.36); c.stroke();
   } else if (name === 'heal') {
     c.rotate(-Math.PI / 4); rrect(c, -s * 0.46, -s * 0.18, s * 0.92, s * 0.36, s * 0.18); c.stroke();
     c.beginPath(); c.moveTo(-s * 0.1, 0); c.lineTo(s * 0.1, 0); c.moveTo(0, -s * 0.1); c.lineTo(0, s * 0.1); c.stroke();
+  } else if (name === 'pole') {
+    c.beginPath(); c.arc(0, 0, s * 0.42, 0, Math.PI * 2); c.setLineDash([s * 0.08, s * 0.1]); c.stroke(); c.setLineDash([]);
+    for (let k = 0; k < 5; k++) { const a = -Math.PI / 2 + (k * 2 * Math.PI) / 5; c.beginPath(); c.moveTo(0, 0); c.lineTo(Math.cos(a) * s * 0.3, Math.sin(a) * s * 0.3); c.stroke(); }
+    c.beginPath(); c.arc(0, 0, s * 0.09, 0, Math.PI * 2); c.fill();
+  } else if (name === 'chip') {
+    rrect(c, -s * 0.42, -s * 0.13, s * 0.84, s * 0.26, s * 0.13); c.fill();
   } else if (name === 'layers') {
     for (const y of [0.2, -0.02, -0.24]) { c.beginPath(); c.moveTo(0, s * (y - 0.2)); c.lineTo(s * 0.46, s * y); c.lineTo(0, s * (y + 0.2)); c.lineTo(-s * 0.46, s * y); c.closePath(); if (y < -0.2) c.fill(); else c.stroke(); }
   } else if (name === 'menu') {
@@ -1948,12 +2107,12 @@ function layoutUI() {
   if (ui.tab === 0) {
     const tl = (key) => [TOOLINFO[key].name, { icon: TOOLINFO[key].icon, on: () => setTool(key), active: () => shownTool() === key }];
     row(10, 70, ['draw', 'redraw', 'erase', 'bend'].map(tl));
-    row(86, 70, ['iron', 'smooth', 'loosen', 'crease'].map(tl));
-    row(162, 70, (xrLike() ? ['heal'] : ['heal', 'look']).map(tl));
+    row(86, 70, ['iron', 'loosen', 'crease', 'heal'].map(tl));
+    row(162, 70, (xrLike() ? ['smooth', 'soft', 'pole'] : ['smooth', 'soft', 'pole', 'look']).map(tl));
     const ln = (key, label, col) => [label, { chip: col, on: () => setLine(key), active: () => shownLine() === key }];
     row(240, 64, [ln('topo', 'Topology line', C.red), ln('guide', 'Loose guide line', C.steel)]);
     const t = shownTool();
-    if (SIZED[t]) W.push({ type: 'sld', x: x0, y: 310, w: cw, h: 96, label: t === 'bend' ? 'Bend reach' : TOOLINFO[t].name + ' brush size', get: () => Math.log(sizeOf(t) / 0.008) / Math.log(0.5 / 0.008),
+    if (SIZED[t]) W.push({ type: 'sld', x: x0, y: 310, w: cw, h: 96, label: t === 'bend' ? 'Bend reach' : t === 'pole' ? 'Pole size' : TOOLINFO[t].name + ' brush size', get: () => Math.log(sizeOf(t) / 0.008) / Math.log(0.5 / 0.008),
       set: (v) => { state.size[t] = 0.008 * Math.pow(0.5 / 0.008, v); refreshTags(); scheduleSave(); ui.dirty = true; }, fmt: () => (sizeOf(t) * 100).toFixed(sizeOf(t) < 0.1 ? 1 : 0) + ' cm' });
     else tolRow(310, 96);
     row(414, 66, [['Undo', { icon: 'undo', on: undo, disabled: () => !undoS().length }], ['Redo', { icon: 'redo', on: redo, disabled: () => !redoS().length }], ['Clear layer', { kind: 'danger', on: clearAll }]]);
@@ -1968,9 +2127,10 @@ function layoutUI() {
   } else if (ui.tab === 2) {
     const tg = (k, label) => [label, { kind: 'toggle', on: () => { state.show[k] = !state.show[k]; paramsTouched(); applyShow(); refreshTags(); scheduleSave(); ui.dirty = true; }, active: () => state.show[k] }];
     W.push({ type: 'legend', x: x0, y: 14, w: cw, items: [['Topology', C.red], ['Loose guide', C.steel], ['Crease', C.ink]] });
-    row(64, 88, [tg('sketch', 'Raw sketch'), tg('curves', 'Clean curves')]);
-    row(168, 88, [tg('surface', 'Surface'), tg('wire', 'Edge loops')]);
-    if (xrLike()) row(272, 88, [tg('labels', 'Button labels'), tg('preview', 'Phone preview')]);
+    row(60, 82, [tg('sketch', 'Raw sketch'), tg('curves', 'Clean curves')]);
+    row(154, 82, [tg('wire', 'Edge loops'), tg('board', 'Skateboard')]);
+    sld(250, 'Surface', { h: 96, steps: 10, get: () => state.surfOp, set: (t) => { state.surfOp = Math.round(t * 10) / 10; paramsTouched(); applyShow(); scheduleSave(); ui.dirty = true; }, fmt: () => (state.surfOp ? Math.round(state.surfOp * 100) + '%' : 'hidden') });
+    if (xrLike()) row(360, 82, [tg('preview', 'Phone preview')]);
   } else if (ui.tab === 3) {
     const bw = cw - 150 - gap;
     for (let i = 0; i < NL; i++) {
@@ -2122,7 +2282,12 @@ function fitPanel() {
 // =====================================================================
 // FLAT-SCREEN INPUT (mouse / touch): draw on a view-facing plane, orbit, zoom
 // =====================================================================
-const orbit = { theta: 0.65, phi: 1.02, r: 1.4 }, orbitTarget = HOME.clone();
+const orbit = { theta: 0.65, phi: 1.02, r: 1.4 }, orbitTarget = HOME.clone(), panOff = new THREE.Vector3();
+function panBy(dx, dy) {   // slide the view with the fingers: the scene follows them
+  const h = glCanvas.getBoundingClientRect().height || 1, mpp = (2 * camera.position.distanceTo(orbitTarget) * Math.tan((camera.fov * Math.PI) / 360)) / h;
+  camera.updateMatrixWorld(); const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0), up = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+  const d = right.multiplyScalar(-dx * mpp).addScaledVector(up, dy * mpp); orbitTarget.add(d); panOff.add(d); applyOrbit();
+}
 function applyOrbit() {
   const aspect = viewAspect(), r = orbit.r * Math.max(1, 0.72 / aspect), s = Math.sin(orbit.phi);
   const T = orbitTarget;
@@ -2157,10 +2322,10 @@ const pxPerM = (rect) => rect.height / (2 * camera.position.distanceTo(orbitTarg
 function deskBrush(e, tool) {
   const rect = glCanvas.getBoundingClientRect(), cx = e.clientX, cy = e.clientY, size = sizeOf(tool), Rp = Math.max(6, size * pxPerM(rect)), R2 = Rp * Rp, ws = world.scale.x;
   world.updateMatrixWorld(true);
-  if (tool === 'iron' || tool === 'smooth' || tool === 'crease') {
+  if (tool === 'iron' || tool === 'smooth' || tool === 'crease' || tool === 'soft') {
     const a = deskAnchor(cx, cy); if (!deskAnchor.found) return;
     const q = world.worldToLocal(a);
-    if (tool === 'iron' ? ironAt(q, size / ws, 0.35) : tool === 'smooth' ? smoothAt(q, size / ws, 0.5) : creasePaint(q, size / ws, gest.paint)) strokesTouched();
+    if (tool === 'iron' ? ironAt(q, size / ws, 0.35) : tool === 'smooth' ? smoothAt(q, size / ws, 0.6) : tool === 'soft' ? softPaint(q, size / ws, gest.paint) : creasePaint(q, size / ws, gest.paint)) strokesTouched();
     return;
   }
   const pred = (x, y, z) => { tA.set(x, y, z).applyMatrix4(world.matrixWorld); const p = toScreen(tA, rect); return p[2] < 1 && (p[0] - cx) ** 2 + (p[1] - cy) ** 2 < R2; };
@@ -2170,6 +2335,12 @@ function deskBrush(e, tool) {
 const brushRing = document.createElement('div');
 brushRing.style.cssText = 'position:fixed;pointer-events:none;border:3px solid #0b0b0b;border-radius:50%;box-shadow:0 0 0 2px #fff;display:none;z-index:5';
 document.body.appendChild(brushRing);
+function deskHover(e) {
+  if (inXR || spect || state.tool !== 'crease' || (gest && gest.type !== 'brush')) { showCreaseHover(null); return; }
+  const a = deskAnchor(e.clientX, e.clientY); if (!deskAnchor.found) { showCreaseHover(null); return; }
+  world.updateMatrixWorld(true); showCreaseHover(creaseHover(world.worldToLocal(a), sizeOf('crease') / world.scale.x, gest ? gest.paint : null));
+}
+glCanvas.addEventListener('pointermove', deskHover);
 function showBrushRing(e) {
   const t = state.tool, on = !inXR && !spect && SIZED[t] && t !== 'bend' && e && e.pointerType !== 'touch';
   brushRing.style.display = on ? 'block' : 'none'; if (!on) return;
@@ -2195,10 +2366,15 @@ glCanvas.addEventListener('pointerdown', (e) => {
     const [a, b] = [...ptrs.values()];
     gest = { type: 'two', d: Math.hypot(a.x - b.x, a.y - b.y), cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 };
   } else if (ptrs.size === 1) {
-    if (e.button === 2 || e.button === 1 || state.tool === 'look' || spect) gest = { type: 'orbit', x: e.clientX, y: e.clientY };
+    if (e.button === 1) gest = { type: 'pan', x: e.clientX, y: e.clientY };
+    else if (e.button === 2 || state.tool === 'look' || spect) gest = { type: 'orbit', x: e.clientX, y: e.clientY };
     else if (state.tool === 'bend') {
       camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
       const p = deskPoint(e); if (p) gest = { type: 'bend', b: startBend(p, sizeOf('bend')) };
+    }
+    else if (state.tool === 'pole') {
+      camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
+      const p = deskPoint(e); if (p) togglePole(p, sizeOf('pole') / world.scale.x);
     }
     else if (state.tool === 'draw' || state.tool === 'redraw') {
       camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
@@ -2209,10 +2385,11 @@ glCanvas.addEventListener('pointerdown', (e) => {
 glCanvas.addEventListener('pointermove', (e) => {
   const p = ptrs.get(e.pointerId); if (!p || !gest) return;
   const dx = e.clientX - p.x, dy = e.clientY - p.y; p.x = e.clientX; p.y = e.clientY;
+  if (gest.type === 'pan') { panBy(dx, dy); return; }
   if (gest.type === 'orbit') { orbit.theta -= dx * 0.008; orbit.phi = clamp(orbit.phi - dy * 0.008, 0.12, 3.0); applyOrbit(); }
   else if (gest.type === 'two' && ptrs.size === 2) {
     const [a, b] = [...ptrs.values()], d = Math.hypot(a.x - b.x, a.y - b.y), cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
-    orbit.r = clamp((orbit.r * gest.d) / Math.max(1, d), 0.25, 8); orbit.theta -= (cx - gest.cx) * 0.008; orbit.phi = clamp(orbit.phi - (cy - gest.cy) * 0.008, 0.12, 3.0);
+    orbit.r = clamp((orbit.r * gest.d) / Math.max(1, d), 0.25, 8); panBy(cx - gest.cx, cy - gest.cy);   // two fingers: pinch zooms, dragging pans
     gest.d = d; gest.cx = cx; gest.cy = cy; applyOrbit();
   } else if (gest.type === 'draw') {
     const q = deskPoint(e); if (!q) return; const n = gest.pts.length;
@@ -2246,7 +2423,7 @@ function renderPhonePreview() {
   const c = Net.flatCam(), on = isPresenter() && state.show.preview && okPose(c, 9) && !!lastXR.L;
   pvPanel.visible = on; if (!on) return;
   const asp = clamp(c[8], 0.3, 3), w = asp < 1 ? 0.2 * asp : 0.2, h = asp < 1 ? 0.2 : 0.2 / asp;
-  pvPanel.scale.set(w, h, 1); pvPanel.position.x = PANEL_W / 2 + 0.016 + w / 2;
+  pvPanel.scale.set(w, h, 1); pvPanel.position.x = vrPanel.visible ? PANEL_W / 2 + 0.016 + w / 2 : 0;
   if (pvTick++ & 1) return;                                   // every other frame is plenty
   const key = asp.toFixed(2); if (key !== pvKey) { pvKey = key; pvRT.setSize(asp < 1 ? Math.round(480 * asp) : 480, asp < 1 ? 480 : Math.round(480 / asp)); }
   pvCam.position.set(c[0], c[1], c[2]); pvCam.quaternion.set(c[3], c[4], c[5], c[6]).normalize(); pvCam.fov = clamp(c[7], 10, 120); pvCam.aspect = asp; pvCam.updateProjectionMatrix(); pvCam.updateMatrixWorld();
@@ -2276,7 +2453,7 @@ const tolBall = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.Me
 function capTexture(name, bg, fg) {
   const cv = document.createElement('canvas'); cv.width = cv.height = 96; const c = cv.getContext('2d');
   const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
-  tex.userData.set = (n, b, f) => { c.fillStyle = b; c.fillRect(0, 0, 96, 96); if (n === 'x') { c.strokeStyle = f; c.lineWidth = 12; c.lineCap = 'round'; c.beginPath(); c.moveTo(28, 28); c.lineTo(68, 68); c.moveTo(68, 28); c.lineTo(28, 68); c.stroke(); } else icon(c, n, 48, 48, 62, f); tex.needsUpdate = true; };
+  tex.userData.set = (n, b, f) => { c.clearRect(0, 0, 96, 96); c.fillStyle = b; if (n === 'MENU') { rrect(c, 2, 22, 92, 52, 14); c.fill(); c.fillStyle = f; c.font = `900 30px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('MENU', 48, 50); tex.needsUpdate = true; return; } c.beginPath(); c.arc(48, 48, 47, 0, Math.PI * 2); c.fill(); if (n === 'x') { c.strokeStyle = f; c.lineWidth = 12; c.lineCap = 'round'; c.beginPath(); c.moveTo(28, 28); c.lineTo(68, 68); c.moveTo(68, 28); c.lineTo(28, 68); c.stroke(); } else icon(c, n, 48, 48, 62, f); tex.needsUpdate = true; };
   tex.userData.set(name, bg, fg); return tex;
 }
 function makeTag(key, text, keyCol) {
@@ -2343,7 +2520,10 @@ function buildController(hand) {
   const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(lead, 3));
   const leadLines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0xffffff })); tags.add(leadLines);
   const gripHolder = new THREE.Group(); grp.add(gripHolder);   // grip space as seen from the pointing ray: the real controller model lives here
-  grp.add(tags); grp.userData = { parts, tags, hand, proc, gripHolder, leadLines, sx };
+  tags.visible = false;   // no floating labels: the buttons carry their own colours and icons
+  { const tex = capTexture(hand === 'left' ? 'MENU' : 'pencil', C.red, '#fff'), d = new THREE.Mesh(new THREE.PlaneGeometry(0.019, 0.019), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+    d.position.set(0, 0, -0.0123); d.rotation.y = Math.PI; parts.trigger.add(d); parts.trigDecal = { tex }; }
+  grp.add(tags); grp.userData = { parts, tags, hand, proc, gripHolder, leadLines, sx, gtex: {}, gbtn: {} };
   grp.traverse((o) => { o.frustumCulled = false; });
   return grp;
 }
@@ -2367,6 +2547,49 @@ function adoptGLB(hand, glb) {
   const zc = items.reduce((a, it) => a + it.a.z, 0) / Math.max(1, items.length);   // one tidy column, so labels never sit on top of each other
   items.forEach((it, i) => { const x = U.sx * 0.105, y = top - i * 0.03; it.t.sprite.position.set(x, y, zc); lead.push(it.a.x, it.a.y, it.a.z, x - U.sx * 0.036, y, zc); });
   U.leadLines.geometry.dispose(); U.leadLines.geometry = new THREE.BufferGeometry(); U.leadLines.geometry.setAttribute('position', new THREE.Float32BufferAttribute(lead, 3));
+  // paint the real buttons, like in ChikiMovieMagic: each button mesh gets its colour, and face buttons and the trigger get an icon on their face
+  const KEYS = { lower: hand === 'right' ? 'a_button' : 'x_button', upper: hand === 'right' ? 'b_button' : 'y_button', trigger: 'trigger', grip: 'squeeze', stick: 'thumbstick' };
+  U.gbtn = {}; U.gtex = {};
+  glb.traverse((o) => {
+    if (!o.isMesh) return; let n = o, key = null;
+    while (n && n !== glb && !key) { const nm = (n.name || '').toLowerCase().replace(/-/g, '_'); for (const k of Object.keys(KEYS)) if (nm.includes(KEYS[k])) { key = k; break; } n = n.parent; }
+    if (key) { o.material = new THREE.MeshBasicMaterial({ color: 0x202020, toneMapped: false }); (U.gbtn[key] = U.gbtn[key] || []).push(o); }
+  });
+  U.gripHolder.updateMatrixWorld(true);
+  for (const key of ['lower', 'upper', 'trigger']) {
+    const list = U.gbtn[key]; if (!list || !list.length) continue;
+    const o = list[0], bx = new THREE.Box3(); for (const m of list) bx.expandByObject(m);
+    const ce = bx.getCenter(new THREE.Vector3()), sz = bx.getSize(new THREE.Vector3()), G = U.gripHolder.matrixWorld;
+    let nrm = key === 'trigger' ? new THREE.Vector3(0, -0.45, -1).normalize().transformDirection(G) : new THREE.Vector3(0, 1, 0).transformDirection(G);
+    if (key !== 'trigger') { const base = KEYS[key] + '_pressed', mn = glb.getObjectByName(base + '_min'), mx = glb.getObjectByName(base + '_max');
+      if (mn && mx) { const a = new THREE.Vector3().setFromMatrixPosition(mn.matrixWorld), b = new THREE.Vector3().setFromMatrixPosition(mx.matrixWorld); if (a.distanceTo(b) > 1e-7) nrm = a.sub(b).normalize(); } }
+    const halfN = 0.5 * (Math.abs(sz.x * nrm.x) + Math.abs(sz.y * nrm.y) + Math.abs(sz.z * nrm.z)), dia = Math.max(0.008, Math.min(0.022, key === 'trigger' ? Math.max(sz.x, sz.y, sz.z) * 0.8 : Math.max(sz.x, sz.y, sz.z)));
+    const fwd = new THREE.Vector3(0, 0, -1).transformDirection(G), yAx = key === 'trigger' ? new THREE.Vector3(0, 1, 0).transformDirection(G) : fwd;
+    yAx.addScaledVector(nrm, -yAx.dot(nrm)).normalize(); const xAx = new THREE.Vector3().crossVectors(yAx, nrm).normalize();
+    const tex = capTexture('pencil', '#202020', '#fff'), d = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: tex, transparent: true, toneMapped: false, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4 }));
+    d.position.copy(ce).addScaledVector(nrm, halfN * 0.9 + dia * 0.03); d.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(xAx, yAx, nrm)); d.scale.setScalar(dia * 0.85);
+    scene.add(d); d.updateMatrixWorld(true); o.attach(d); U.gtex[key] = tex;
+  }
+  refreshTags();
+}
+// button colours and icons for each hand, from the current tool and line type
+function buttonLook(hand) {
+  if (hand === 'left') return { trigger: [C.red, 'MENU', '#fff'], lower: [C.blue, 'undo', '#fff'], upper: [C.blue, 'redo', '#fff'], grip: [C.blue2], stick: ['#202020'] };
+  const t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0, info = TOOLINFO[tool], nxt = TOOLINFO[tool === 'draw' ? (spect ? 'draw' : state.lastTool) : 'draw'], guide = shownLine() === 'guide';
+  return { trigger: [info.col, tool === 'erase' ? 'x' : info.icon, info.ink], lower: [nxt.col, nxt.icon, nxt.ink], upper: ['#ffffff', 'chip', guide ? C.steel : C.red], grip: [C.blue2], stick: [C.blue] };
+}
+const WHITE3 = new THREE.Color(0xffffff);
+function partMeshes(hand, key) { const U = models[hand].userData, p = U.parts, m = { trigger: p.trigger, grip: p.grip, stick: p.stick, lower: p.lower.m, upper: p.upper.m }[key]; return (U.gbtn[key] || []).concat(m ? [m] : []); }
+function paintButtons(hand) {
+  const U = models[hand].userData, L = buttonLook(hand), key = JSON.stringify(L); if (U.lookKey === key) return; U.lookKey = key;
+  for (const k of Object.keys(L)) {
+    for (const m of partMeshes(hand, k)) { m.userData.base = new THREE.Color(L[k][0]); if (m.material && m.material.color) m.material.color.copy(m.userData.base); }
+    if (L[k][1]) { const texs = [U.gtex[k], k === 'lower' ? U.parts.lower.tex : k === 'upper' ? U.parts.upper.tex : k === 'trigger' ? U.parts.trigDecal.tex : null]; for (const t of texs) if (t) t.userData.set(L[k][1], L[k][0], L[k][2]); }
+  }
+}
+// pressed buttons light up
+function pressButtons(hand, bits) {
+  [['trigger', 1], ['grip', 2], ['lower', 4], ['upper', 8], ['stick', 16]].forEach(([k, b]) => { for (const m of partMeshes(hand, k)) if (m.material && m.material.color && m.userData.base) { m.material.color.copy(m.userData.base); if (bits & b) m.material.color.lerp(WHITE3, 0.55); } });
 }
 if (GLTFLoader) {
   const base = 'https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/meta-quest-touch-plus/', ld = new GLTFLoader();
@@ -2374,21 +2597,10 @@ if (GLTFLoader) {
 }
 models.left.add(vrPanel, pvPanel); models.right.add(laser);
 function refreshTags() {
-  const r = models.right.userData.parts, t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0, info = TOOLINFO[tool], guide = shownLine() === 'guide';
-  const last = spect ? 'draw' : state.lastTool, hex = info.hex, drawish = tool === 'draw' || tool === 'redraw', size = spect ? spect.size : sizeOf(tool);
-  r.tag_trigger.set('TRIGGER', info.name.toLowerCase() + (drawish ? (guide ? ' gray guide' : ' red line') : ''), info.col);
-  r.tag_lower.set('A', tool === 'draw' ? 'tool: ' + TOOLINFO[last].name.toLowerCase() : 'back to draw', info.col);
-  r.tag_upper.set('B', guide ? 'line: loose guide' : 'line: topology', guide ? C.steel : C.red);
-  r.tag_stick.set('STICK', SIZED[tool] ? (tool === 'bend' ? 'reach ' : 'brush ') + (size * 100).toFixed(size < 0.1 ? 1 : 0) + ' cm' : 'brush size (brush tools)', C.blue);
-  const capKey = tool + (guide ? 'g' : 't');
-  if (r.capTool !== capKey) {
-    r.capTool = capKey;
-    r.lower.tex.userData.set(tool === 'erase' ? 'x' : info.icon, info.col, info.ink);
-    r.upper.tex.userData.set('loosen', guide ? C.steel : C.red, '#fff');
-    r.nib.material.color.set(drawish && guide ? 0x8A8D93 : hex);
-  }
+  const t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0, info = TOOLINFO[tool], hex = info.hex, drawish = tool === 'draw' || tool === 'redraw', guide = shownLine() === 'guide';
+  paintButtons('left'); paintButtons('right');
+  const r = models.right.userData.parts; if (r.nib) r.nib.material.color.set(drawish && guide ? 0x8A8D93 : hex);
   tolBall.material.color.set(hex); tolBall.material.opacity = SIZED[tool] ? 0.16 : 0.9;
-  models.left.userData.tags.visible = models.right.userData.tags.visible = state.show.labels;
 }
 
 const hands = { left: null, right: null };
@@ -2403,7 +2615,7 @@ for (let i = 0; i < 2; i++) {
 }
 const readPad = (src) => {
   const gp = src.gamepad, b = gp.buttons;
-  return { trigger: b[0] ? b[0].value : 0, grip: b[1] ? b[1].value : 0, a: !!(b[4] && b[4].pressed), b: !!(b[5] && b[5].pressed), stickX: gp.axes.length > 2 ? gp.axes[2] : 0 };
+  return { trigger: b[0] ? b[0].value : 0, grip: b[1] ? b[1].value : 0, a: !!(b[4] && b[4].pressed), b: !!(b[5] && b[5].pressed), stickX: gp.axes.length > 2 ? gp.axes[2] : 0, stickY: gp.axes.length > 3 ? gp.axes[3] : 0 };
 };
 const pulse = (h, strength, ms) => { try { const a = h.src && h.src.gamepad && h.src.gamepad.hapticActuators; if (a && a[0]) a[0].pulse(strength, ms); } catch (e) { /* no haptics */ } };
 
@@ -2432,7 +2644,6 @@ function updateGrab(L, R) {
     m1.copy((mode === 1 ? L : R).obj.matrixWorld).multiply(grab.rel); m1.decompose(world.position, world.quaternion, world.scale);
   }
 }
-function setPressed(part, on) { if (part && part.material && part.material.color) part.material.color.set(on ? 0xFFD400 : 0x202020); }
 // one frame of XR interaction. L / R = { obj (ray-space Object3D), pad, src } or null
 function xrFrame(dt, L, R) {
   if (L) L.obj.updateMatrixWorld(true); if (R) R.obj.updateMatrixWorld(true);
@@ -2451,6 +2662,7 @@ function xrFrame(dt, L, R) {
     }
     const trig = xs.trig ? R.pad.trigger > 0.2 : R.pad.trigger > 0.45, down = trig && !xs.trig, up = !trig && xs.trig; xs.trig = trig;
     const penBusy = xs.drawing || xs.erasing || !!xs.bending;
+    const hv = state.tool === 'crease' && !over ? creaseHover(penM, sizeOf('crease') / ws, xs.erasing ? xs.paint : null) : null; showCreaseHover(hv);
     if ((over || xs.uiCap) && !penBusy) {
       if (down && over) { xs.uiCap = true; uiPointer('down', xs.ux, xs.uy); } else uiPointer('move', xs.ux, xs.uy);
       if (up && xs.uiCap) { xs.uiCap = false; uiPointer('up', xs.ux, xs.uy); pulse(R, 0.3, 20); }
@@ -2459,6 +2671,7 @@ function xrFrame(dt, L, R) {
       if (down) {
         if (BRUSH[state.tool]) { xs.erasing = true; xs.brushTool = state.tool; xs.eraseStart = state.strokes; xs.paint = startPaint(state.tool); }
         else if (state.tool === 'bend') xs.bending = startBend(penM, sizeOf('bend') / ws);
+        else if (state.tool === 'pole') { togglePole(penM, sizeOf('pole') / ws); pulse(R, 0.6, 30); }
         else { xs.drawing = true; xs.live = [penM.x, penM.y, penM.z]; }
       }
     }
@@ -2472,7 +2685,7 @@ function xrFrame(dt, L, R) {
     }
     if (xs.erasing) {
       const bt = xs.brushTool, rad = sizeOf(bt) / ws, r2 = rad * rad, px = penM.x, py = penM.y, pz = penM.z, near = (x, y, z) => (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < r2;
-      const did = bt === 'iron' ? ironAt(penM, rad, Math.min(1, dt * 7)) : bt === 'smooth' ? smoothAt(penM, rad, Math.min(1, dt * 8)) : bt === 'crease' ? creasePaint(penM, rad, xs.paint)
+      const did = bt === 'iron' ? ironAt(penM, rad, Math.min(1, dt * 7)) : bt === 'smooth' ? smoothAt(penM, rad, Math.min(1, dt * 12)) && (smoothAt(penM, rad, Math.min(1, dt * 12)), true) : bt === 'soft' ? softPaint(penM, rad, xs.paint) : bt === 'crease' ? creasePaint(penM, rad, xs.paint)
         : bt === 'erase' ? eraseWhere(near) : paintWhere(near, xs.paint);
       if (did) { strokesTouched(); pulse(R, bt === 'iron' || bt === 'smooth' ? 0.08 : 0.25, 12); }
       if (!trig) { xs.erasing = false; if (xs.brushTool === 'heal' && healFinish(xs.paint)) { strokesTouched(); pulse(R, 0.6, 40); } if (state.strokes !== xs.eraseStart) { undoS().push(xs.eraseStart); redoS().length = 0; ui.dirty = true; } xs.eraseStart = null; }
@@ -2481,12 +2694,13 @@ function xrFrame(dt, L, R) {
     if (R.pad.a && !xs.pa && !penBusy) setTool(state.tool === 'draw' ? state.lastTool : 'draw');              // A: Draw <-> the last other tool
     if (R.pad.b && !xs.pb && !penBusy) setLine(state.line === 'guide' ? 'topo' : 'guide');                  // B: red topology line <-> gray loose guide
     xs.pa = R.pad.a; xs.pb = R.pad.b;
-    if (Math.abs(R.pad.stickX) > 0.5 && !penBusy) {
-      if (SIZED[state.tool]) { state.size[state.tool] = clamp(sizeOf(state.tool) * Math.exp(R.pad.stickX * dt * 1.3), 0.008, 0.5); refreshTags(); scheduleSave(); if (ui.tab === 0) ui.dirty = true; }   // stick: brush size only
+    if (Math.abs(R.pad.stickY || 0) > 0.5 && !penBusy) {   // stick up = bigger brush, down = smaller
+      if (SIZED[state.tool]) { state.size[state.tool] = clamp(sizeOf(state.tool) * Math.exp(-R.pad.stickY * dt * 1.3), 0.008, 0.5); refreshTags(); scheduleSave(); if (ui.tab === 0) ui.dirty = true; }   // stick: brush size only
     }
     tolBall.visible = !laser.visible; tolBall.position.copy(pen);
     tolBall.scale.setScalar(ballRadius(state.tool, ws, sizeOf(state.tool)));
-    const p = models.right.userData.parts; setPressed(p.trigger, trig); setPressed(p.grip, R.pad.grip > 0.5); setPressed(p.lower.m, R.pad.a); setPressed(p.upper.m, R.pad.b); setPressed(p.stick, Math.abs(R.pad.stickX) > 0.5);
+    tolBall.material.color.set(hv ? (hv.fold ? 0x111111 : 0xE8212B) : state.tool === 'pole' && poleUnder(penM) ? 0xE8212B : TOOLINFO[state.tool === 'look' ? 'draw' : state.tool].hex);
+    pressButtons('right', (trig ? 1 : 0) | (R.pad.grip > 0.5 ? 2 : 0) | (R.pad.a ? 4 : 0) | (R.pad.b ? 8 : 0) | (Math.abs(R.pad.stickY || 0) > 0.5 ? 16 : 0));
   } else {
     if (xs.drawing) { Net.liveEnd(); finishStroke(xs.live, ws); setLive(null); }
     if (xs.bending) { endBend(xs.bending); xs.bending = null; }
@@ -2500,7 +2714,7 @@ function xrFrame(dt, L, R) {
     if (L.pad.a && !xs.px) undo();                                                   // X: undo
     if (L.pad.b && !xs.py) redo();                                                   // Y: redo
     xs.px = L.pad.a; xs.py = L.pad.b;
-    const p = models.left.userData.parts; setPressed(p.trigger, L.pad.trigger > 0.45); setPressed(p.grip, L.pad.grip > 0.5); setPressed(p.lower.m, L.pad.a); setPressed(p.upper.m, L.pad.b);
+    pressButtons('left', (L.pad.trigger > 0.45 ? 1 : 0) | (L.pad.grip > 0.5 ? 2 : 0) | (L.pad.a ? 4 : 0) | (L.pad.b ? 8 : 0));
   }
 }
 function xrTick(dt) {
@@ -2679,7 +2893,7 @@ const Net = (() => {
     let e = parts.get(d.id); if (!e || e.n !== d.n) { e = { n: d.n, f: new Float32Array(d.n * 3), got: 0, seen: new Set() }; parts.set(d.id, e); }
     if (d.i * 3 + pts.length > e.f.length || e.seen.has(d.i)) return;
     e.f.set(pts, d.i * 3); e.seen.add(d.i); e.got += pts.length / 3;
-    if (e.got >= e.n) { e.f.id = d.id; e.f.k = (d.k | 0) & 3; cache.set(d.id, e.f); sent.add(d.id); parts.delete(d.id); tryApply(); }
+    if (e.got >= e.n) { e.f.id = d.id; e.f.k = (d.k | 0) & 15; cache.set(d.id, e.f); sent.add(d.id); parts.delete(d.id); tryApply(); }
     if (parts.size > 400) parts.clear();
   }
   function onOrder(d) {
@@ -2707,19 +2921,19 @@ const Net = (() => {
     setLive(spect.live);
   }
   function applyParams(q) {
-    const P = q.P; if (!okPose(P, 8)) return;
+    const P = q.P; if (!okPose(P, 9)) return;
     state.tol = clamp(P[0], TOL_MIN, TOL_MAX); state.autoLoops = clamp(P[1] | 0, 0, 6); state.smooth = clamp(P[2] | 0, 0, 3); state.fit = clamp(P[3], 0, 1); state.tidy = clamp(P[4], 0, 1);
-    const b = P[5] | 0; state.show.sketch = !!(b & 1); state.show.curves = !!(b & 2); state.show.surface = !!(b & 4); state.show.wire = !!(b & 8); state.show.labels = !!(b & 16);
+    const b = P[5] | 0; state.show.sketch = !!(b & 1); state.show.curves = !!(b & 2); state.show.surface = !!(b & 4); state.show.wire = !!(b & 8); state.show.labels = !!(b & 16); state.show.board = !!(b & 32); state.surfOp = clamp(P[8], 0, 1);
     const lb = P[7] | 0; state.layers.forEach((l, i) => { l.vis = !!(lb & (1 << i)); }); state.ghost = !!(lb & 16);
     const act = clamp(P[6] | 0, 0, NL - 1); if (act !== state.active) setActiveLayer(act, true);
     sync.pv = q.pv; applyShow(); refreshTags(); requestBuild(); scheduleSave(); ui.dirty = true;
   }
   function myPresence() {
-    const b = (state.show.sketch ? 1 : 0) | (state.show.curves ? 2 : 0) | (state.show.surface ? 4 : 0) | (state.show.wire ? 8 : 0) | (state.show.labels ? 16 : 0);
-    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b, state.active, state.layers.reduce((a, l, i) => a | (l.vis ? 1 << i : 0), 0) | (state.ghost ? 16 : 0)], c: null, h: null, w: null, L: null, R: null, u: null };
+    const b = (state.show.sketch ? 1 : 0) | (state.show.curves ? 2 : 0) | (state.show.surface ? 4 : 0) | (state.show.wire ? 8 : 0) | (state.show.labels ? 16 : 0) | (state.show.board ? 32 : 0);
+    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b, state.active, state.layers.reduce((a, l, i) => a | (l.vis ? 1 << i : 0), 0) | (state.ghost ? 16 : 0), r4(state.surfOp)], c: null, h: null, w: null, L: null, R: null, u: null };
     if (isPresenter()) {
       const hand = (H, key) => { if (!H) return null; const G = models[key].userData.gripHolder;
-        return pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickX || 0) > 0.5 ? 16 : 0),
+        return pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickY || 0) > 0.5 ? 16 : 0),
           r4(G.position.x), r4(G.position.y), r4(G.position.z), r4(G.quaternion.x), r4(G.quaternion.y), r4(G.quaternion.z), r4(G.quaternion.w)]); };
       world.updateMatrixWorld(); camera.updateMatrixWorld();
       p.h = pose7(camera); p.w = pose7(world).concat([r4(world.scale.x)]); p.L = hand(lastXR.L, 'left'); p.R = hand(lastXR.R, 'right');
@@ -2748,7 +2962,7 @@ const Net = (() => {
       prox.visible = okPose(a, 15); if (!prox.visible) continue;
       setPose(prox, a, k); const pr = models[key].userData.parts, bits = a[7] | 0, G = models[key].userData.gripHolder;
       G.position.set(a[8], a[9], a[10]); G.quaternion.set(a[11], a[12], a[13], a[14]).normalize();
-      setPressed(pr.trigger, bits & 1); setPressed(pr.grip, bits & 2); setPressed(pr.lower.m, bits & 4); setPressed(pr.upper.m, bits & 8); setPressed(pr.stick, bits & 16);
+      pressButtons(key, bits);
     }
     vrPanel.visible = spect.panel;
     if (proxyR.visible) {
@@ -2759,7 +2973,7 @@ const Net = (() => {
       tolBall.scale.setScalar(ballRadius(tool, ws, size));
     } else tolBall.visible = laser.visible = cursorDot.visible = false;
     if (spect.liveEndAt && performance.now() - spect.liveEndAt > 1500) { spect.live = []; spect.liveEndAt = 0; setLive(null); }
-    orbitTarget.lerp(world.position, first ? 1 : 1 - Math.exp(-dt * 3)); applyOrbit();
+    tC.copy(world.position).add(panOff); orbitTarget.lerp(tC, first ? 1 : 1 - Math.exp(-dt * 3)); applyOrbit();
   }
   function unwatch() {
     spect = null; proxyL.visible = proxyR.visible = headMark.visible = false; tolBall.visible = laser.visible = cursorDot.visible = false; vrPanel.visible = true; setLive(null);
@@ -2873,13 +3087,13 @@ if (!load()) state.strokes = packStrokes(QE.makeExample('sheet', 1 + Math.floor(
 layoutUI(); refreshTags(); applyShow(); onResize(); state.layers.forEach((l, i) => { if (i === state.active || l.strokes.length) { rebuildSketch(i); requestBuild(i); } }); probeDownloads();
 const coarse = window.matchMedia('(pointer: coarse)').matches;
 if (coarse) setTool('look');
-$('hint').textContent = coarse ? '2 fingers: orbit + zoom' : 'right-drag: orbit \u00b7 wheel: zoom';
+$('hint').textContent = coarse ? '1 finger: orbit \u00b7 2 fingers: pan + zoom' : 'right-drag: orbit \u00b7 middle-drag: pan \u00b7 wheel: zoom';
 if (navigator.xr) {
   Promise.all([navigator.xr.isSessionSupported('immersive-vr').catch(() => false), navigator.xr.isSessionSupported('immersive-ar').catch(() => false)])
     .then(([vr, ar]) => { xrSupport.vr = !!vr; xrSupport.ar = !!ar; $('enter').hidden = !(vr || ar); });
 }
 // handle for tests and tinkering
-window.QX = { THREE, state, views, tolBall, setActiveLayer, setLine, ironAt, loosenWhere, smoothAt, startPaint, paintWhere, creasePaint, healFinish, autoTol, spanIndex, strokesTouched, withoutAlong, commit, pvPanel, adoptGLB, setView: (v) => { state.view = v; $('splitLine').hidden = v !== 'split'; onResize(); }, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
+window.QX = { THREE, state, views, board, applyShow, tolBall, softPaint, togglePole, creaseHover, hoverCore, panBy, orbitTarget, buttonLook, vrPanel, setActiveLayer, setLine, ironAt, loosenWhere, smoothAt, startPaint, paintWhere, creasePaint, healFinish, autoTol, spanIndex, strokesTouched, withoutAlong, commit, pvPanel, adoptGLB, setView: (v) => { state.view = v; $('splitLine').hidden = v !== 'split'; onResize(); }, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
 </script>
 <script src="../updated.js"></script>
 </body>
