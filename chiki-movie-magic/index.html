@@ -78,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '546';
+const VERSION = '547';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -3206,7 +3206,7 @@ function stepIn(c){
     // turn you to face the way the puppet faces, then put your eyes where the headset guide is
     const fc = V(); camera.getWorldDirection(fc); fc.y = 0;
     const fp = new THREE.Vector3(0,0,1).applyQuaternion(rootQ); fp.y = 0;
-    if (state.freeTurn){ const cf = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion); rig.quaternion.copy(rootQ).multiply(new THREE.Quaternion().setFromAxisAngle(_y, -Math.atan2(cf.x, cf.z))); rig.updateMatrixWorld(true); }
+    if (freeTurn()){ const cf = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion); rig.quaternion.copy(rootQ).multiply(new THREE.Quaternion().setFromAxisAngle(_y, -Math.atan2(cf.x, cf.z))); rig.updateMatrixWorld(true); }
     else if (fc.lengthSq() > 1e-6 && fp.lengthSq() > 1e-6){
       const qd = new THREE.Quaternion().setFromAxisAngle(_y, Math.atan2(fp.x,fp.z) - Math.atan2(fc.x,fc.z));
       const cp = V(); camera.getWorldPosition(cp);
@@ -3250,11 +3250,13 @@ function stepOut(){
   if (remoteFrom){ netUnassign(remoteFrom); return; }
   if (!show.embodied || show.rec) return;
   for (const sd of ['left','right']){ embGripHeld[sd] = false; embGrab[sd] = null; climb[sd] = null; }   // nothing stays stuck to a hand
-  show.embodied = null; if (NET.guest) netSend({t:'out'}); if (!state.freeTurn) levelMe(); toast('Stepped out'); requestUI();
+  show.embodied = null; if (NET.guest) netSend({t:'out'}); if (!freeTurn()) levelMe(); toast('Stepped out'); requestUI();
 }
 const bodyFollow = new THREE.Object3D(); scene.add(bodyFollow);
 const NECK_TO_EYE = new THREE.Vector3(0, 0.11, -0.09);   // eyes sit about this far above and in front of the neck
-const upVec = () => state.freeTurn || (show.embodied && show.embodied.tip) ? new THREE.Vector3(0,1,0).applyQuaternion(rig.quaternion) : new THREE.Vector3(0,1,0);   // your own up: tipped when you wear a tipped puppet
+// "Turn any way" is for the world you build and act in. The character studio and the editor are their own spaces: the ground always stays down there.
+const freeTurn = () => !!state.freeTurn && state.phase !== 'characters' && state.phase !== 'edit';
+const upVec = () => freeTurn() || (show.embodied && show.embodied.tip) ? new THREE.Vector3(0,1,0).applyQuaternion(rig.quaternion) : new THREE.Vector3(0,1,0);   // your own up: tipped when you wear a tipped puppet
 function updateBodyFollow(snap){
   // the body faces between your head and your hands, so you can shake your head "no" while it stays put
   const up = upVec(), flat = v => v.addScaledVector(up, -v.dot(up));
@@ -3312,7 +3314,7 @@ function followRoot(dt){
   if (riding(e)){
     const Mv = ridingBase(e).multiply(e.rigRel), vp = V(), vq = new THREE.Quaternion(), vs = V(); Mv.decompose(vp, vq, vs);
     let qT = vq;   // you stay level and turn with it, unless it is tipped: then you tip with it
-    if (!state.freeTurn && !e.tip){ const f = new THREE.Vector3(0,0,-1).applyQuaternion(vq); f.y = 0;
+    if (!freeTurn() && !e.tip){ const f = new THREE.Vector3(0,0,-1).applyQuaternion(vq); f.y = 0;
       qT = f.lengthSq() > 1e-4 ? new THREE.Quaternion().setFromAxisAngle(_y, Math.atan2(-f.x, -f.z)) : rig.quaternion.clone(); }
     if (rig.quaternion.dot(qT) < 0) qT = new THREE.Quaternion(-qT.x, -qT.y, -qT.z, -qT.w);   // the short way round
     const eyeW = camera.position.clone().applyMatrix4(Mv);   // where the puppet's eyes are now
@@ -6782,6 +6784,11 @@ function setPhase(id){
   state.phase=id; state.dialOpen=false; state.page = FIRST_PAGE[id] || 'soon'; state.confirm=null; state.rename=null;
   if (NET.guest) state.page = FIRST_PAGE[id] || 'together';
   if (from !== to){ applyView(to); if (to==='studio' && !selChar() && show.chars.length) state.selChar = show.chars[0].id; }
+  if (renderer.xr.isPresenting){   // the studio and the editor stand level; your turned view of the world is kept for when you go back
+    const tilted = new THREE.Vector3(0,1,0).applyQuaternion(rig.quaternion).y < 0.9995;
+    if (id==='edit'){ if (tilted){ state._preEdit = {p:rig.position.toArray(), q:rig.quaternion.toArray(), s:rig.scale.x}; levelMe(); } }
+    else if (id==='characters'){ if (tilted) levelMe(); }
+    else if (id!=='app' && state._preEdit){ const v = state._preEdit; state._preEdit = null; if (state.freeTurn){ rig.position.fromArray(v.p); rig.quaternion.fromArray(v.q); rig.scale.setScalar(v.s); rig.updateMatrixWorld(true); } } }
   pathDirty = true; if (id==='edit'){ if (window.__edReady){ applyGridSize(false); } placeBigScreen(); if (window.__edReady){ state.edHidden = false; placeEditor(); } }
   if (id==='perform' && state.mirrorOn) placeMirror();
   requestUI();
@@ -7346,11 +7353,11 @@ function navUpdate(gl, gr){
     if (mode===2){
       nav.W1 = rig.localToWorld(ctrl.left.grip.position.clone());
       nav.W2 = rig.localToWorld(ctrl.right.grip.position.clone());
-      nav.theta = rigYaw(); nav.q0 = rig.quaternion.clone(); const hq = state.freeTurn ? handsQ() : null; nav.qF = hq ? rig.quaternion.clone().multiply(hq) : null;
+      nav.theta = rigYaw(); nav.q0 = rig.quaternion.clone(); const hq = freeTurn() ? handsQ() : null; nav.qF = hq ? rig.quaternion.clone().multiply(hq) : null;
     } else {
       const c = mode==='l' ? ctrl.left : ctrl.right;
       nav.W = rig.localToWorld(c.grip.position.clone());
-      if (state.freeTurn){ rig.updateMatrix(); nav.G0 = rig.matrix.clone().multiply(gripLocal(c)); nav.s0 = rig.scale.x; }   // where that hand holds the world
+      if (freeTurn()){ rig.updateMatrix(); nav.G0 = rig.matrix.clone().multiply(gripLocal(c)); nav.s0 = rig.scale.x; }   // where that hand holds the world
     }
     return;
   }
@@ -7359,7 +7366,7 @@ function navUpdate(gl, gr){
     const lv = _l.subVectors(L2, L1), wv = _m.subVectors(nav.W2, nav.W1);
     const ll = lv.length(); if (ll < 0.02) return;
     const s = clamp(wv.length()/ll, SMIN, SMAX);
-    if (state.freeTurn){ const hq = nav.qF && handsQ(); if (hq) _q.copy(nav.qF).multiply(hq.invert()); else _q.setFromUnitVectors(lv.clone().normalize().applyQuaternion(nav.q0), wv.clone().normalize()).multiply(nav.q0); }   // turn any way: held by both hands
+    if (freeTurn()){ const hq = nav.qF && handsQ(); if (hq) _q.copy(nav.qF).multiply(hq.invert()); else _q.setFromUnitVectors(lv.clone().normalize().applyQuaternion(nav.q0), wv.clone().normalize()).multiply(nav.q0); }   // turn any way: held by both hands
     else {
       let theta = nav.theta;
       if (Math.hypot(lv.x,lv.z) > 0.04) theta = Math.atan2(wv.x, wv.z) - Math.atan2(lv.x, lv.z);
@@ -7372,7 +7379,7 @@ function navUpdate(gl, gr){
     if (++scaleUITick % 10 === 0) requestUI();
   } else {
     const c = mode==='l' ? ctrl.left : ctrl.right;
-    if (state.freeTurn && nav.G0){ nav.G0.clone().multiply(gripLocal(c).invert()).decompose(rig.position, rig.quaternion, _w1); rig.quaternion.normalize(); rig.scale.setScalar(nav.s0); }   // the world stays in your hand: it moves and turns with it
+    if (freeTurn() && nav.G0){ nav.G0.clone().multiply(gripLocal(c).invert()).decompose(rig.position, rig.quaternion, _w1); rig.quaternion.normalize(); rig.scale.setScalar(nav.s0); }   // the world stays in your hand: it moves and turns with it
     else { rig.updateMatrixWorld(true);
       const cur = rig.localToWorld(c.grip.position.clone());
       rig.position.add(_w1.subVectors(nav.W, cur)); }
