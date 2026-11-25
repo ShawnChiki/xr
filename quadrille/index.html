@@ -1,0 +1,2291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Quadrille XR</title>
+<link rel="icon" href="data:,">
+<script src="../turn-config.js"></script>
+<!--
+  QUADRILLE XR : sketch quad SubD topology in VR / MR (Quest), with a desktop + phone fallback.
+  One file: UI, WebXR, rendering, and the engine inside <script id="engine">. three.js r170 loads from a CDN.
+  Engine pipeline: raw strokes -> blended curves -> curve network (join distance) -> quad cage -> Catmull-Clark.
+  It runs in a Web Worker built from the text of <script id="engine">, with a main-thread fallback.
+  Multiplayer uses the artifact `room` capability (see MULTIPLAYER): strokes travel as messages, poses and settings as presence.
+  A flat-screen view that finds a headset in the room becomes a third-person spectator of it.
+-->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1238B0; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #panelWrap { position: fixed; left: 10px; top: 10px; overflow: hidden; border-radius: 14px; touch-action: none; }
+  #panel { display: block; touch-action: none; }
+  #enter { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); padding: 14px 30px; font: 800 20px/1 inherit;
+    font-family: inherit; letter-spacing: .04em; color: #0b0b0b; background: #FFD400; border: 4px solid #0b0b0b; border-radius: 999px;
+    box-shadow: 0 6px 0 #0b0b0b; cursor: pointer; }
+  #enter:active { transform: translateX(-50%) translateY(4px); box-shadow: 0 2px 0 #0b0b0b; }
+  #hint { position: fixed; right: 12px; bottom: 10px; color: #fff; font-weight: 700; font-size: 12px; text-align: right;
+    pointer-events: none; text-shadow: 0 1px 0 rgba(0,0,0,.5); max-width: 46vw; }
+  #toast { position: fixed; left: 50%; top: 14px; transform: translateX(-50%); background: #0b0b0b; color: #fff; font-weight: 700;
+    font-size: 14px; padding: 10px 16px; border-radius: 999px; pointer-events: none; max-width: 80vw; text-align: center; }
+  #watch { position: fixed; left: 10px; top: 10px; background: #E8212B; color: #fff; font-weight: 800; font-size: 13px; padding: 8px 14px;
+    border: 3px solid #0b0b0b; border-radius: 999px; pointer-events: none; }
+  #roomBox { position: fixed; left: 10px; bottom: 10px; background: #fff; color: #0b0b0b; font-weight: 800; font-size: 13px; padding: 6px 10px;
+    border: 3px solid #0b0b0b; border-radius: 12px; display: flex; gap: 6px; align-items: center; }
+  #roomIn { width: 4.2em; font: inherit; font-weight: 800; text-align: center; border: 2px solid #0b0b0b; border-radius: 8px; padding: 3px 2px; background: #FFD400; -webkit-user-select: text; user-select: text; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="panelWrap"><canvas id="panel" width="900" height="600"></canvas></div>
+<button id="enter" hidden>ENTER VR</button>
+<div id="hint"></div>
+<div id="toast" hidden></div>
+<div id="watch" hidden>WATCHING VR</div>
+<label id="roomBox" hidden>room <input id="roomIn" inputmode="numeric" maxlength="4" autocomplete="off"> <span id="roomN"></span></label>
+
+<script id="engine">
+(function () {
+// =====================================================================
+// QUADRILLE ENGINE  (no dependencies)
+// raw strokes -> blended curves -> curve network -> quad cage -> SubD
+// Everything is recomputed from the raw strokes, so the join distance
+// ("tolerance") stays a live, non-destructive control.
+// =====================================================================
+
+// ---------- small vector helpers (plain [x,y,z] arrays) ----------
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const mul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const vlen = (a) => Math.hypot(a[0], a[1], a[2]);
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const norm = (a) => { const l = vlen(a); return l > 1e-12 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 0]; };
+const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+
+// ---------- polyline helpers ----------
+function cumLengths(P) {
+  const c = new Array(P.length); c[0] = 0;
+  for (let i = 1; i < P.length; i++) c[i] = c[i - 1] + dist(P[i - 1], P[i]);
+  return c;
+}
+function sampleAt(P, cum, s, W) {
+  const n = P.length, L = cum[n - 1];
+  if (s <= 0) return { p: P[0].slice(), w: W ? W[0] : 1 };
+  if (s >= L) return { p: P[n - 1].slice(), w: W ? W[n - 1] : 1 };
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= s) lo = m; else hi = m; }
+  const t = (s - cum[lo]) / Math.max(1e-12, cum[hi] - cum[lo]);
+  return { p: lerp(P[lo], P[hi], t), w: W ? W[lo] + (W[hi] - W[lo]) * t : 1 };
+}
+function resampleOpen(P, W, h) {
+  const cum = cumLengths(P), L = cum[P.length - 1];
+  const n = Math.max(2, Math.round(L / h) + 1);
+  const pts = [], w = [];
+  for (let k = 0; k < n; k++) { const r = sampleAt(P, cum, (L * k) / (n - 1), W); pts.push(r.p); w.push(r.w); }
+  return { pts, w };
+}
+function resampleClosed(P, W, h) {
+  const R = P.concat([P[0]]), RW = W ? W.concat([W[0]]) : null;
+  const cum = cumLengths(R), L = cum[R.length - 1];
+  const n = Math.max(6, Math.round(L / h));
+  const pts = [], w = [];
+  for (let k = 0; k < n; k++) { const r = sampleAt(R, cum, (L * k) / n, RW); pts.push(r.p); w.push(r.w); }
+  return { pts, w };
+}
+function smoothPts(P, iters, closed) {
+  let cur = P; const n = P.length;
+  for (let it = 0; it < iters; it++) {
+    const nx = new Array(n);
+    for (let i = 0; i < n; i++) {
+      if (!closed && (i === 0 || i === n - 1)) { nx[i] = cur[i]; continue; }
+      const a = cur[(i - 1 + n) % n], b = cur[(i + 1) % n], c = cur[i];
+      nx[i] = [c[0] * 0.5 + (a[0] + b[0]) * 0.25, c[1] * 0.5 + (a[1] + b[1]) * 0.25, c[2] * 0.5 + (a[2] + b[2]) * 0.25];
+    }
+    cur = nx;
+  }
+  return cur;
+}
+let TW = 2; // tangent window in samples, set per build so it spans about 2.8 cm
+function tangentAt(P, i, closed, k = TW) {
+  // direction over a window of +-k samples, so hand wobble does not swing it around
+  const n = P.length;
+  const a = closed ? P[(((i - k) % n) + n) % n] : P[Math.max(0, i - k)];
+  const b = closed ? P[(i + k) % n] : P[Math.min(n - 1, i + k)];
+  return norm(sub(b, a));
+}
+function segTangent(P, i) { return norm(sub(P[Math.min(P.length - 1, i + TW)], P[Math.max(0, i - TW + 1)])); }
+function ptSeg(q, a, b) {
+  const abx = b[0] - a[0], aby = b[1] - a[1], abz = b[2] - a[2];
+  const apx = q[0] - a[0], apy = q[1] - a[1], apz = q[2] - a[2];
+  const ab2 = abx * abx + aby * aby + abz * abz;
+  let t = ab2 > 1e-18 ? (apx * abx + apy * aby + apz * abz) / ab2 : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const dx = apx - abx * t, dy = apy - aby * t, dz = apz - abz * t;
+  return { d: Math.sqrt(dx * dx + dy * dy + dz * dz), t };
+}
+function closestOnPoly(q, P, cum) {
+  let best = Infinity, bi = 0, bt = 0;
+  for (let i = 0; i < P.length - 1; i++) {
+    const r = ptSeg(q, P[i], P[i + 1]);
+    if (r.d < best) { best = r.d; bi = i; bt = r.t; }
+  }
+  return { d: best, i: bi, t: bt, s: cum[bi] + (cum[bi + 1] - cum[bi]) * bt, p: lerp(P[bi], P[bi + 1], bt) };
+}
+
+function strokeSpacing(tol) { return clamp(tol / 3, 0.004, 0.01); }
+const minOverlap = (tol, h) => Math.max(0.6 * tol, 3 * h);
+
+// A curve: { pts, w, closed, ring:{P,W,cum,L} }   (ring repeats the first point when closed)
+function finalize(c) {
+  const P = c.closed ? c.pts.concat([c.pts[0]]) : c.pts;
+  const W = c.closed ? c.w.concat([c.w[0]]) : c.w;
+  const cum = cumLengths(P);
+  c.ring = { P, W, cum, L: cum[P.length - 1] };
+  return c;
+}
+function makeClosed(P, W, h) {
+  const r = resampleClosed(P, W, h);
+  return { pts: smoothPts(r.pts, 2, true), w: r.w, closed: true };
+}
+// direction a curve is heading as it reaches one end, measured over a few cm so a hook or wobble does not fool it
+function endHeading(P, cum, atEnd, tol) {
+  const L = cum[P.length - 1], back = Math.min(L * 0.5, Math.max(2 * tol, 0.04));
+  return atEnd ? norm(sub(P[P.length - 1], sampleAt(P, cum, L - back).p)) : norm(sub(P[0], sampleAt(P, cum, back).p));
+}
+function tryClose(c, h, tol) {
+  if (c.closed) return c;
+  const P = c.pts, n = P.length;
+  if (n < 8) return c;
+  const cum = cumLengths(P), L = cum[n - 1];
+  if (L < 6 * tol) return c;
+  const gap = dist(P[0], P[n - 1]);
+  if (gap < tol) return makeClosed(P, c.w, h);
+  if (gap < 2 * tol) { // a wider gap still closes when the two ends are heading into each other
+    const out = endHeading(P, cum, true, tol), into = mul(endHeading(P, cum, false, tol), -1);
+    if (dot(out, into) > 0.3 && dot(norm(sub(P[0], P[n - 1])), out) > 0.5) return makeClosed(P, c.w, h);
+  }
+  // the tail overshoots and runs back over the head
+  const headN = Math.floor(n * 0.4);
+  let bi = -1, bd = tol;
+  for (let i = 0; i < headN; i++) { const d = dist(P[i], P[n - 1]); if (d < bd) { bd = d; bi = i; } }
+  if (bi > 0 && dot(tangentAt(P, bi, false), tangentAt(P, n - 1, false)) > 0.5) {
+    return makeClosed(P.slice(bi), c.w.slice(bi), h);
+  }
+  return c;
+}
+// cut the little hook the hand leaves when the trigger goes down or comes up
+function dehook(P) {
+  const cut = (Q) => {
+    const cum = cumLengths(Q), L = cum[Q.length - 1]; if (L < 0.1) return Q;
+    let best = 0;
+    for (let i = 1; i < Q.length && cum[i] <= 0.02; i++) {
+      const body = norm(sub(sampleAt(Q, cum, cum[i] + 0.03).p, Q[i])), tip = norm(sub(Q[i], Q[0]));
+      if (dot(body, tip) < 0.57) best = i;
+    }
+    return best ? Q.slice(best) : Q;
+  };
+  return cut(cut(P).reverse()).reverse();
+}
+function prepStroke(raw, h, tol) {
+  if (!raw || raw.length < 2) return null;
+  let P = [raw[0]];
+  for (let i = 1; i < raw.length; i++) if (dist(raw[i], P[P.length - 1]) > 1e-6) P.push(raw[i]);
+  if (P.length < 2) return null;
+  P = dehook(P);
+  const cum = cumLengths(P);
+  if (cum[P.length - 1] < h * 2) return null;
+  const r = resampleOpen(P, null, h);
+  const c = { pts: smoothPts(r.pts, 3, false), w: r.w, closed: false };
+  return tryClose(c, h, tol);
+}
+
+// ---------- spatial hash of polyline segments ----------
+class SegGrid {
+  constructor(cell) { this.inv = 1 / cell; this.map = new Map(); }
+  key(ix, iy, iz) { return ((ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791)) >>> 0; }
+  add(cid, P) {
+    const inv = this.inv;
+    for (let i = 0; i < P.length - 1; i++) {
+      const a = P[i], b = P[i + 1];
+      const x0 = Math.floor(Math.min(a[0], b[0]) * inv), x1 = Math.floor(Math.max(a[0], b[0]) * inv);
+      const y0 = Math.floor(Math.min(a[1], b[1]) * inv), y1 = Math.floor(Math.max(a[1], b[1]) * inv);
+      const z0 = Math.floor(Math.min(a[2], b[2]) * inv), z1 = Math.floor(Math.max(a[2], b[2]) * inv);
+      for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) {
+        const k = this.key(x, y, z); let arr = this.map.get(k);
+        if (!arr) { arr = []; this.map.set(k, arr); }
+        arr.push(cid * 65536 + i);
+      }
+    }
+  }
+  near(q, cb) {
+    const inv = this.inv;
+    const cx = Math.floor(q[0] * inv), cy = Math.floor(q[1] * inv), cz = Math.floor(q[2] * inv);
+    for (let x = cx - 1; x <= cx + 1; x++) for (let y = cy - 1; y <= cy + 1; y++) for (let z = cz - 1; z <= cz + 1; z++) {
+      const arr = this.map.get(this.key(x, y, z));
+      if (arr) for (let e = 0; e < arr.length; e++) { const v = arr[e]; cb(Math.floor(v / 65536), v % 65536); }
+    }
+  }
+}
+
+// =====================================================================
+// 1. STROKES -> BLENDED CURVES
+// Strokes that run alongside each other (within tol, roughly parallel)
+// are blended into one averaged curve; chains extend it.
+// =====================================================================
+const PARALLEL = 0.8;
+
+function findRun(add_, baseP, baseCum, tol) {
+  const P = add_.pts, n = P.length;
+  // "alongside" starts within tol, and keeps going while the two stay within 1.6 tol (a second pass that wanders)
+  const on = new Array(n), strong = new Array(n), ss = new Array(n);
+  for (let j = 0; j < n; j++) {
+    const c = closestOnPoly(P[j], baseP, baseCum);
+    ss[j] = c.s; on[j] = strong[j] = false;
+    if (c.d < 1.6 * tol && Math.abs(dot(tangentAt(P, j, false), segTangent(baseP, c.i))) > PARALLEL) { on[j] = true; strong[j] = c.d < tol; }
+  }
+  for (let j = 1; j < n - 1; j++) if (!on[j] && on[j - 1] && (on[j + 1] || (j + 2 < n && on[j + 2]))) on[j] = true;
+  const cum = cumLengths(P);
+  let best = null, start = -1, nStrong = 0;
+  for (let j = 0; j <= n; j++) {
+    if (j < n && on[j]) { if (start < 0) { start = j; nStrong = 0; } if (strong[j]) nStrong++; }
+    else if (start >= 0) {
+      // trim weak ends so the run starts and stops where the two are properly close
+      let a = start, b = j - 1; while (a < b && !strong[a]) a++; while (b > a && !strong[b]) b--;
+      const l = cum[b] - cum[a];
+      if (nStrong >= 2 && (!best || l > best.len)) best = { j0: a, j1: b, len: l, s0: ss[a], s1: ss[b] };
+      start = -1;
+    }
+  }
+  return best;
+}
+
+function curveFromPts(P, W, h) {
+  if (P.length < 2) return null;
+  const cum = cumLengths(P);
+  if (cum[P.length - 1] < 3 * h) return null;
+  const r = resampleOpen(P, W, h);
+  return { pts: r.pts, w: r.w, closed: false };
+}
+
+// merge an open curve `add_` onto `base` (open or closed).
+// returns null | {type:'merge'|'trimNew'|'trimBase', curve}
+function mergeOnto(base, add_, tol, h) {
+  const minOv = minOverlap(tol, h);
+  let run = findRun(add_, base.ring.P, base.ring.cum, tol);
+  if (!run || run.len < minOv) return null;
+  let A = base.pts, AW = base.w;
+  if (base.closed) {
+    // re-cut the ring so its seam is opposite the overlap
+    const R = base.ring, L = R.L;
+    const jm = (run.j0 + run.j1) >> 1;
+    const sm = closestOnPoly(add_.pts[jm], R.P, R.cum).s;
+    const seam = (sm + L / 2) % L;
+    const n = base.pts.length; A = []; AW = [];
+    for (let k = 0; k <= n; k++) { const r = sampleAt(R.P, R.cum, (seam + (L * k) / n) % L, R.W); A.push(r.p); AW.push(r.w); }
+    A[n] = A[0].slice();
+    const cumA0 = cumLengths(A);
+    run = findRun(add_, A, cumA0, tol);
+    if (!run || run.len < minOv) return null;
+  }
+  const cumA = cumLengths(A), LA = cumA[A.length - 1];
+  let B = add_.pts, BW = add_.w, j0 = run.j0, j1 = run.j1, a0 = run.s0, a1 = run.s1;
+  if (a1 < a0) {
+    const n = B.length; B = B.slice().reverse(); BW = BW.slice().reverse();
+    const t0 = n - 1 - j1, t1 = n - 1 - j0; j0 = t0; j1 = t1;
+    const t = a0; a0 = a1; a1 = t;
+  }
+  if (a1 - a0 < 0.3 * run.len) return null;
+  const cumB = cumLengths(B), LB = cumB[B.length - 1];
+  const b0 = cumB[j0], b1 = cumB[j1];
+  const stub = tol;
+  const hasApre = base.closed || a0 > stub, hasApost = base.closed || LA - a1 > stub;
+  const hasBpre = b0 > stub, hasBpost = LB - b1 > stub;
+  const forkS = hasApre && hasBpre, forkE = hasApost && hasBpost;
+  if (forkS && forkE) return null;
+  const Aat = (s) => sampleAt(A, cumA, s, AW);
+  if (forkE) {
+    if (hasBpre && !hasApre) {
+      const P = [B[j1].slice()], W = [BW[j1]];
+      for (let i = 0; i < A.length; i++) if (cumA[i] > a1 + 1e-9) { P.push(A[i]); W.push(AW[i]); }
+      return { type: 'trimBase', curve: curveFromPts(P, W, h) };
+    }
+    const r = Aat(a1); const P = [r.p], W = [r.w];
+    for (let j = j1 + 1; j < B.length; j++) { P.push(B[j]); W.push(BW[j]); }
+    return { type: 'trimNew', curve: curveFromPts(P, W, h) };
+  }
+  if (forkS) {
+    if (hasBpost && !hasApost) {
+      const P = [], W = [];
+      for (let i = 0; i < A.length; i++) if (cumA[i] < a0 - 1e-9) { P.push(A[i]); W.push(AW[i]); }
+      P.push(B[j0].slice()); W.push(BW[j0]);
+      return { type: 'trimBase', curve: curveFromPts(P, W, h) };
+    }
+    const P = [], W = [];
+    for (let j = 0; j < j0; j++) { P.push(B[j]); W.push(BW[j]); }
+    const r = Aat(a0); P.push(r.p); W.push(r.w);
+    return { type: 'trimNew', curve: curveFromPts(P, W, h) };
+  }
+  // blend
+  const preFrom = hasApre ? 'A' : hasBpre ? 'B' : null;
+  const postFrom = hasApost ? 'A' : hasBpost ? 'B' : null;
+  const ramp = (x) => { x = clamp(x / 0.4, 0, 1); return x * x * (3 - 2 * x); };
+  const P = [], W = [];
+  if (preFrom === 'A') { for (let i = 0; i < A.length; i++) if (cumA[i] < a0 - 1e-9) { P.push(A[i]); W.push(AW[i]); } }
+  else if (preFrom === 'B') { for (let j = 0; j < j0; j++) { P.push(B[j]); W.push(BW[j]); } }
+  const M = Math.max(3, Math.ceil(Math.max(a1 - a0, b1 - b0) / h) + 1);
+  for (let k = 0; k < M; k++) {
+    const t = k / (M - 1);
+    const ra = Aat(a0 + t * (a1 - a0)), rb = sampleAt(B, cumB, b0 + t * (b1 - b0), BW);
+    let fA = 1, fB = 1;
+    if (preFrom === 'A') fB *= ramp(t); else if (preFrom === 'B') fA *= ramp(t);
+    if (postFrom === 'A') fB *= ramp(1 - t); else if (postFrom === 'B') fA *= ramp(1 - t);
+    const ca = fA * ra.w, cb = fB * rb.w, den = ca + cb;
+    if (den < 1e-9) { P.push(ra.p); W.push(ra.w); }
+    else { P.push([(ca * ra.p[0] + cb * rb.p[0]) / den, (ca * ra.p[1] + cb * rb.p[1]) / den, (ca * ra.p[2] + cb * rb.p[2]) / den]); W.push(Math.max(den, 0.25)); }
+  }
+  if (postFrom === 'A') { for (let i = 0; i < A.length; i++) if (cumA[i] > a1 + 1e-9) { P.push(A[i]); W.push(AW[i]); } }
+  else if (postFrom === 'B') { for (let j = j1 + 1; j < B.length; j++) { P.push(B[j]); W.push(BW[j]); } }
+  if (base.closed) {
+    P.pop(); W.pop();
+    return { type: 'merge', curve: makeClosed(P, W, h) };
+  }
+  const r = resampleOpen(P, W, h);
+  const c = { pts: smoothPts(r.pts, 2, false), w: r.w, closed: false };
+  return { type: 'merge', curve: tryClose(c, h, tol) };
+}
+
+function blendRings(A, B, tol, h) {
+  let hit = 0;
+  for (let j = 0; j < B.pts.length; j++) if (closestOnPoly(B.pts[j], A.ring.P, A.ring.cum).d < tol) hit++;
+  if (hit < 0.9 * B.pts.length) return null;
+  const P = [], W = [];
+  for (let i = 0; i < A.pts.length; i++) {
+    const c = closestOnPoly(A.pts[i], B.ring.P, B.ring.cum);
+    if (c.d < 1.5 * tol) {
+      const wb = B.ring.W[c.i] + (B.ring.W[c.i + 1] - B.ring.W[c.i]) * c.t, wa = A.w[i];
+      P.push(lerp(A.pts[i], c.p, wb / (wa + wb))); W.push(wa + wb);
+    } else { P.push(A.pts[i]); W.push(A.w[i]); }
+  }
+  return { type: 'merge', curve: makeClosed(P, W, h) };
+}
+
+function mergePair(A, B, tol, h) {
+  if (A.closed && B.closed) return blendRings(A, B, tol, h);
+  if (B.closed) {
+    const r = mergeOnto(B, A, tol, h);
+    if (!r) return null;
+    if (r.type === 'trimNew') return { type: 'trimA', curve: r.curve };
+    return { type: 'merge', curve: r.curve };
+  }
+  const r = mergeOnto(A, B, tol, h);
+  if (!r) return null;
+  if (r.type === 'trimNew') return { type: 'trimB', curve: r.curve };
+  if (r.type === 'trimBase') return { type: 'trimA', curve: r.curve };
+  return r;
+}
+
+function buildCurves(strokes, tol) {
+  const h = strokeSpacing(tol);
+  TW = Math.max(2, Math.round(0.028 / h));
+  const minOv = minOverlap(tol, h);
+  const curves = [];
+  const grid = new SegGrid(tol);
+  const addCurve = (c) => { c.id = curves.length; c.alive = true; finalize(c); curves.push(c); grid.add(c.id, c.ring.P); };
+  for (const raw of strokes) {
+    let B = prepStroke(raw, h, tol);
+    if (!B) continue;
+    const skip = new Set();
+    for (let guard = 0; guard < 12 && B; guard++) {
+      finalize(B);
+      const counts = new Map();
+      for (let j = 0; j < B.pts.length; j++) {
+        const q = B.pts[j], tq = tangentAt(B.pts, j, B.closed), seen = new Set();
+        grid.near(q, (cid, seg) => {
+          if (seen.has(cid) || skip.has(cid)) return;
+          const A = curves[cid]; if (!A.alive) return;
+          const a = A.ring.P[seg], b = A.ring.P[seg + 1];
+          if (ptSeg(q, a, b).d < tol && Math.abs(dot(tq, segTangent(A.ring.P, seg))) > PARALLEL) { seen.add(cid); counts.set(cid, (counts.get(cid) || 0) + 1); }
+        });
+      }
+      const cand = [...counts.entries()].filter((e) => (e[1] - 1) * h >= minOv * 0.6).sort((x, y) => y[1] - x[1]);
+      let acted = false;
+      for (const [cid] of cand) {
+        const A = curves[cid];
+        const res = mergePair(A, B, tol, h);
+        if (!res) { skip.add(cid); continue; }
+        if (res.type === 'merge') { A.alive = false; B = res.curve; }
+        else if (res.type === 'trimB') { B = res.curve; skip.add(cid); }
+        else { A.alive = false; if (res.curve) { addCurve(res.curve); skip.add(res.curve.id); } }
+        acted = true; break;
+      }
+      if (!acted) break;
+    }
+    if (B) addCurve(B);
+  }
+  // link pieces of one line that stop short of each other, or pass each other only briefly
+  let live = curves.filter((c) => c.alive);
+  for (let guard = 0; guard < 200; guard++) {
+    let best = null;
+    const ends = [];
+    for (const c of live) if (!c.closed) for (const atEnd of [false, true]) ends.push({ c, atEnd, p: atEnd ? c.pts[c.pts.length - 1] : c.pts[0], out: endHeading(c.pts, c.ring.cum, atEnd, tol) });
+    for (let a = 0; a < ends.length; a++) for (let b = a + 1; b < ends.length; b++) {
+      const A = ends[a], B = ends[b]; if (A.c === B.c) continue;
+      const g = sub(B.p, A.p), d = vlen(g); if (d > 1.5 * tol) continue;
+      if (dot(A.out, B.out) > -0.6) continue;                     // must be heading into each other
+      const along = dot(g, A.out), lat = vlen(sub(g, mul(A.out, along)));
+      if (lat > 0.75 * tol) continue;
+      if (!best || d < best.d) best = { A, B, d, along };
+    }
+    if (!best) break;
+    const { A, B, along } = best;
+    let P1 = A.atEnd ? A.c.pts : A.c.pts.slice().reverse(), W1 = A.atEnd ? A.c.w : A.c.w.slice().reverse();
+    let P2 = B.atEnd ? B.c.pts.slice().reverse() : B.c.pts, W2 = B.atEnd ? B.c.w.slice().reverse() : B.c.w;
+    if (along < 0) { // they overlap a little: cut both back to the middle of the overlap
+      const cutBack = (P, W, len, fromEnd) => { const cum = cumLengths(P), L = cum[P.length - 1]; const keep = []; const kw = [];
+        for (let i = 0; i < P.length; i++) { const s = fromEnd ? L - cum[i] : cum[i]; if (s >= len) { keep.push(P[i]); kw.push(W[i]); } } return [keep, kw]; };
+      const back = -along / 2 + h;
+      [P1, W1] = cutBack(P1, W1, back, true); [P2, W2] = cutBack(P2, W2, back, false);
+    }
+    if (P1.length < 2 || P2.length < 2) { A.c.linkSkip = true; break; }
+    const r = resampleOpen(P1.concat(P2), W1.concat(W2), h);
+    const merged = finalize(tryClose({ pts: smoothPts(r.pts, 2, false), w: r.w, closed: false }, h, tol));
+    merged.id = A.c.id; merged.alive = true;
+    live = live.filter((c) => c !== A.c && c !== B.c); live.push(merged);
+  }
+  return live;
+}
+
+// =====================================================================
+// 2. CURVES -> NETWORK (nodes where curves pass within tol) -> FACES
+// =====================================================================
+function smallestEigenvector(c) {
+  const A = [[c[0], c[1], c[2]], [c[1], c[3], c[4]], [c[2], c[4], c[5]]];
+  const Vm = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 16; sweep++) {
+    let off = Math.abs(A[0][1]) + Math.abs(A[0][2]) + Math.abs(A[1][2]);
+    if (off < 1e-14) break;
+    for (const [p, q] of [[0, 1], [0, 2], [1, 2]]) {
+      if (Math.abs(A[p][q]) < 1e-15) continue;
+      const th = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+      const t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+      const cs = 1 / Math.sqrt(t * t + 1), sn = t * cs;
+      for (let k = 0; k < 3; k++) { const kp = A[k][p], kq = A[k][q]; A[k][p] = cs * kp - sn * kq; A[k][q] = sn * kp + cs * kq; }
+      for (let k = 0; k < 3; k++) { const pk = A[p][k], qk = A[q][k]; A[p][k] = cs * pk - sn * qk; A[q][k] = sn * pk + cs * qk; }
+      for (let k = 0; k < 3; k++) { const kp = Vm[k][p], kq = Vm[k][q]; Vm[k][p] = cs * kp - sn * kq; Vm[k][q] = sn * kp + cs * kq; }
+    }
+  }
+  let m = 0; if (A[1][1] < A[m][m]) m = 1; if (A[2][2] < A[m][m]) m = 2;
+  return norm([Vm[0][m], Vm[1][m], Vm[2][m]]);
+}
+
+function subPoly(R, s0, s1) {
+  const out = [sampleAt(R.P, R.cum, s0).p];
+  for (let i = 0; i < R.P.length; i++) if (R.cum[i] > s0 + 1e-9 && R.cum[i] < s1 - 1e-9) out.push(R.P[i].slice());
+  out.push(sampleAt(R.P, R.cum, s1).p);
+  return out;
+}
+function dirAlong(P, fromEnd, r) {
+  // unit direction from one end of polyline P towards the point at arclength r
+  const n = P.length; let acc = 0;
+  if (!fromEnd) {
+    for (let i = 1; i < n; i++) { acc += dist(P[i - 1], P[i]); if (acc >= r || i === n - 1) return norm(sub(P[i], P[0])); }
+  } else {
+    for (let i = n - 2; i >= 0; i--) { acc += dist(P[i + 1], P[i]); if (acc >= r || i === 0) return norm(sub(P[i], P[n - 1])); }
+  }
+  return [0, 0, 0];
+}
+
+function buildNetwork(curves, tol) {
+  // (inside, `curves` becomes the end-extended copies; the originals are returned for display)
+  const h = strokeSpacing(tol);
+  TW = Math.max(2, Math.round(0.028 / h));
+  const N = curves.length;
+  for (const c of curves) if (!c.ring) finalize(c);
+  // open curves reach a little past their ends (in the direction they were heading) so undershoots still connect
+  const EXT = 0.75 * tol;
+  const srcCurves = curves;
+  curves = srcCurves.map((c) => {
+    if (c.closed) return { pts: c.pts, closed: true, ring: c.ring, s0: -Infinity, s1: Infinity };
+    const P = c.pts, d0 = endHeading(P, c.ring.cum, false, tol), d1 = endHeading(P, c.ring.cum, true, tol);
+    const k = Math.max(1, Math.round(EXT / h)), pre = [], post = [];
+    for (let i = k; i >= 1; i--) pre.push(add(P[0], mul(d0, (EXT * i) / k)));
+    for (let i = 1; i <= k; i++) post.push(add(P[P.length - 1], mul(d1, (EXT * i) / k)));
+    const pts = pre.concat(P, post), cum = cumLengths(pts);
+    return { pts, closed: false, ring: { P: pts, cum, L: cum[pts.length - 1] }, s0: EXT, s1: cum[pts.length - 1] - EXT };
+  });
+  const nearEnd = (c, s) => !c.closed && (s < c.s0 + 1.5 * tol || s > c.s1 - 1.5 * tol);
+  const grid = new SegGrid(tol);
+  curves.forEach((c, i) => grid.add(i, c.ring.P));
+
+  // --- close approaches between different curves ---
+  const pairs = new Map();
+  for (let i = 0; i < N; i++) {
+    const P = curves[i].pts;
+    for (let k = 0; k < P.length; k++) {
+      const q = P[k]; let best = null;
+      grid.near(q, (cid, seg) => {
+        if (cid <= i) return;
+        const R = curves[cid].ring, r = ptSeg(q, R.P[seg], R.P[seg + 1]);
+        if (r.d < tol) {
+          if (!best) best = new Map();
+          const b = best.get(cid);
+          if (!b || r.d < b.d) best.set(cid, { k, d: r.d, seg, t: r.t });
+        }
+      });
+      if (best) for (const [cid, b] of best) { const key = i * N + cid; let arr = pairs.get(key); if (!arr) { arr = []; pairs.set(key, arr); } arr.push(b); }
+    }
+  }
+  const recs = [];
+  for (const [key, arr] of pairs) {
+    const i = Math.floor(key / N), j = key % N;
+    const Ri = curves[i].ring, Rj = curves[j].ring;
+    let s = 0;
+    for (let e = 1; e <= arr.length; e++) {
+      if (e === arr.length || arr[e].k - arr[e - 1].k > 2) {
+        let b = arr[s];
+        for (let x = s + 1; x < e; x++) if (arr[x].d < b.d) b = arr[x];
+        const pj = lerp(Rj.P[b.seg], Rj.P[b.seg + 1], b.t);
+        const sj = Rj.cum[b.seg] + (Rj.cum[b.seg + 1] - Rj.cum[b.seg]) * b.t;
+        // refine on curve i around sample k
+        const nSeg = Ri.P.length - 1; let bd = Infinity, bs = 0, bp = null, bg = 0;
+        for (let g = b.k - 2; g <= b.k + 1; g++) {
+          let gi = g; if (curves[i].closed) gi = ((g % nSeg) + nSeg) % nSeg; else if (g < 0 || g >= nSeg) continue;
+          const r = ptSeg(pj, Ri.P[gi], Ri.P[gi + 1]);
+          if (r.d < bd) { bd = r.d; bs = Ri.cum[gi] + (Ri.cum[gi + 1] - Ri.cum[gi]) * r.t; bp = lerp(Ri.P[gi], Ri.P[gi + 1], r.t); bg = gi; }
+        }
+        // two lines that only brush past each other side by side are not a join (unless one of them ends there)
+        const kiss = bp && Math.abs(dot(segTangent(Ri.P, bg), segTangent(Rj.P, b.seg))) > 0.9 && !nearEnd(curves[i], bs) && !nearEnd(curves[j], sj);
+        if (bp && !kiss) recs.push({ ci: i, si: bs, cj: j, sj, pos: lerp(bp, pj, 0.5) });
+        s = e;
+      }
+    }
+  }
+  // --- cluster records into nodes ---
+  const par = recs.map((_, i) => i);
+  const find = (x) => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+  // records fuse into one node when they are the same pair of curves, or three curves that all meet each other there
+  const byPair = new Map();
+  for (const r of recs) { const k = r.ci * N + r.cj; if (!byPair.has(k)) byPair.set(k, []); byPair.get(k).push(r); }
+  const meet = (c1, c2, pos) => { const l = byPair.get(c1 < c2 ? c1 * N + c2 : c2 * N + c1); return !!l && l.some((r) => dist(r.pos, pos) < 1.5 * tol); };
+  for (let a = 0; a < recs.length; a++) for (let b = a + 1; b < recs.length; b++) {
+    const A = recs[a], B = recs[b];
+    if (dist(A.pos, B.pos) >= tol) continue;
+    let ok = A.ci === B.ci && A.cj === B.cj;
+    if (!ok) {
+      let o1 = -1, o2 = -1;
+      if (A.ci === B.ci) { o1 = A.cj; o2 = B.cj; } else if (A.ci === B.cj) { o1 = A.cj; o2 = B.ci; } else if (A.cj === B.ci) { o1 = A.ci; o2 = B.cj; } else if (A.cj === B.cj) { o1 = A.ci; o2 = B.ci; }
+      ok = o1 >= 0 && meet(o1, o2, A.pos);
+    }
+    if (ok) { const ra = find(a), rb = find(b); if (ra !== rb) par[ra] = rb; }
+  }
+  const groups = new Map();
+  recs.forEach((r, i) => { const g = find(i); if (!groups.has(g)) groups.set(g, []); groups.get(g).push(r); });
+  const nodes = [];
+  const att = curves.map(() => []); // per curve: [{s,node}]
+  for (const g of groups.values()) {
+    const pos = [0, 0, 0];
+    for (const r of g) { pos[0] += r.pos[0]; pos[1] += r.pos[1]; pos[2] += r.pos[2]; }
+    const ni = nodes.length;
+    nodes.push({ pos: mul(pos, 1 / g.length), n: null, alive: true });
+    const per = new Map();
+    for (const r of g) { for (const [c, s] of [[r.ci, r.si], [r.cj, r.sj]]) { if (!per.has(c)) per.set(c, []); per.get(c).push(s); } }
+    for (const [c, list] of per) {
+      list.sort((a, b) => a - b);
+      const L = curves[c].ring.L, closed = curves[c].closed;
+      let grp = [list[0]]; const outS = [];
+      for (let x = 1; x < list.length; x++) { if (list[x] - grp[grp.length - 1] < 2 * tol) grp.push(list[x]); else { outS.push(grp); grp = [list[x]]; } }
+      outS.push(grp);
+      if (closed && outS.length > 1 && outS[0][0] + L - outS[outS.length - 1].slice(-1)[0] < 2 * tol) {
+        const last = outS.pop(); outS[0] = last.map((v) => v - L).concat(outS[0]);
+      }
+      for (const gs of outS) { let m = gs.reduce((a, b) => a + b, 0) / gs.length; if (closed) m = ((m % L) + L) % L; att[c].push({ s: m, node: ni }); }
+    }
+  }
+  // --- edges: curve pieces between consecutive nodes ---
+  const edges = [];
+  const pushEdge = (a, b, cid, pts) => {
+    if (a === b || pts.length < 2) return;
+    const cum = cumLengths(pts), L = cum[pts.length - 1];
+    if (L < 1e-7) return;
+    const oa = sub(nodes[a].pos, pts[0]), ob = sub(nodes[b].pos, pts[pts.length - 1]);
+    for (let i = 0; i < pts.length; i++) { const f = cum[i] / L; pts[i] = [pts[i][0] + oa[0] * (1 - f) + ob[0] * f, pts[i][1] + oa[1] * (1 - f) + ob[1] * f, pts[i][2] + oa[2] * (1 - f) + ob[2] * f]; }
+    edges.push({ a, b, cids: [cid], pts, alive: true });
+  };
+  curves.forEach((c, cid) => {
+    let list = att[cid].sort((x, y) => x.s - y.s);
+    const ded = [];
+    for (const a of list) { if (ded.length && ded[ded.length - 1].node === a.node) continue; ded.push(a); }
+    if (c.closed && ded.length > 1 && ded[0].node === ded[ded.length - 1].node) ded.pop();
+    list = ded;
+    for (let x = 0; x + 1 < list.length; x++) pushEdge(list[x].node, list[x + 1].node, cid, subPoly(c.ring, list[x].s, list[x + 1].s));
+    if (c.closed && list.length >= 2) {
+      const a = list[list.length - 1], b = list[0];
+      const p1 = subPoly(c.ring, a.s, c.ring.L), p2 = subPoly(c.ring, 0, b.s);
+      pushEdge(a.node, b.node, cid, p1.concat(p2.slice(1)));
+    }
+  });
+  // --- prune dangling edges, dissolve straight pass-through nodes ---
+  const rDir = Math.max(1.5 * tol, 3 * h);
+  const eDir = (e, atB) => { const cum = cumLengths(e.pts); return dirAlong(e.pts, atB, Math.min(cum[e.pts.length - 1] * 0.5, rDir)); };
+  for (let changed = true, guard = 0; changed && guard < 10000; guard++) {
+    changed = false;
+    const inc = nodes.map(() => []);
+    edges.forEach((e, ei) => { if (e.alive) { inc[e.a].push(ei); inc[e.b].push(ei); } });
+    for (const e of edges) if (e.alive && (inc[e.a].length === 1 || inc[e.b].length === 1)) { e.alive = false; changed = true; }
+    if (changed) continue;
+    for (let v = 0; v < nodes.length && !changed; v++) {
+      if (inc[v].length !== 2 || inc[v][0] === inc[v][1]) continue;
+      const e1 = edges[inc[v][0]], e2 = edges[inc[v][1]];
+      const o1 = e1.a === v ? e1.b : e1.a, o2 = e2.a === v ? e2.b : e2.a;
+      if (o1 === o2) continue;
+      const d1 = eDir(e1, e1.b === v), d2 = eDir(e2, e2.b === v);
+      if (dot(d1, d2) > -0.75) continue;
+      const p1 = e1.b === v ? e1.pts : e1.pts.slice().reverse();
+      const p2 = e2.a === v ? e2.pts : e2.pts.slice().reverse();
+      e1.alive = false; e2.alive = false; nodes[v].alive = false;
+      edges.push({ a: o1, b: o2, cids: [...new Set(e1.cids.concat(e2.cids))], pts: p1.concat(p2.slice(1)), alive: true });
+      changed = true;
+    }
+  }
+  const E = edges.filter((e) => e.alive);
+  // --- node normals from the directions of their edges ---
+  const out = nodes.map(() => []); // outgoing half-edges: {he, d}
+  E.forEach((e, ei) => { out[e.a].push({ he: 2 * ei, d: eDir(e, false) }); out[e.b].push({ he: 2 * ei + 1, d: eDir(e, true) }); });
+  nodes.forEach((nd, v) => {
+    const D = out[v].map((o) => o.d);
+    if (D.length < 2) return;
+    let n = null;
+    if (D.length === 2) n = cross(D[0], D[1]);
+    else if (D.length === 3) n = cross(sub(D[1], D[0]), sub(D[2], D[0]));
+    else {
+      const m = [0, 0, 0]; for (const d of D) { m[0] += d[0]; m[1] += d[1]; m[2] += d[2]; }
+      m[0] /= D.length; m[1] /= D.length; m[2] /= D.length;
+      const c = [0, 0, 0, 0, 0, 0];
+      for (const d of D) { const x = d[0] - m[0], y = d[1] - m[1], z = d[2] - m[2]; c[0] += x * x; c[1] += x * y; c[2] += x * z; c[3] += y * y; c[4] += y * z; c[5] += z * z; }
+      n = smallestEigenvector(c);
+    }
+    if (vlen(n) < 0.05) { // nearly collinear: fall back to the least parallel pair
+      let bl = 0; n = null;
+      for (let a = 0; a < D.length; a++) for (let b = a + 1; b < D.length; b++) { const x = cross(D[a], D[b]), l = vlen(x); if (l > bl) { bl = l; n = x; } }
+      if (bl < 0.05) n = null;
+    }
+    nd.n = n ? norm(n) : null;
+  });
+  // --- make normals agree across the network (carry them along edges) ---
+  const transport = (n, P) => {
+    let v = n.slice();
+    for (let i = 0; i < P.length - 1; i++) {
+      const t = norm(sub(P[i + 1], P[i])); v = sub(v, mul(t, dot(v, t)));
+      const l = vlen(v); if (l < 1e-9) return null; v = mul(v, 1 / l);
+    }
+    return v;
+  };
+  const visited = new Array(nodes.length).fill(false);
+  const order = nodes.map((_, i) => i).filter((i) => out[i].length >= 2).sort((a, b) => (nodes[b].n ? 1 : 0) - (nodes[a].n ? 1 : 0));
+  for (const seed of order) {
+    if (visited[seed] || !nodes[seed].n) continue;
+    visited[seed] = true; const queue = [seed];
+    while (queue.length) {
+      const v = queue.shift();
+      for (const o of out[v]) {
+        const e = E[o.he >> 1], rev = o.he & 1, u = rev ? e.a : e.b;
+        if (visited[u]) continue;
+        const tn = transport(nodes[v].n, rev ? e.pts.slice().reverse() : e.pts);
+        if (!nodes[u].n) nodes[u].n = tn || nodes[v].n.slice();
+        else if (tn && dot(tn, nodes[u].n) < 0) nodes[u].n = mul(nodes[u].n, -1);
+        visited[u] = true; queue.push(u);
+      }
+    }
+  }
+  for (const nd of nodes) if (!nd.n) nd.n = [0, 1, 0];
+  // --- rotation system + face tracing ---
+  const pos = new Map(); // half-edge -> index in its origin's sorted ring
+  nodes.forEach((nd, v) => {
+    const list = out[v]; if (!list.length) return;
+    const n = nd.n;
+    let u = sub(list[0].d, mul(n, dot(list[0].d, n)));
+    if (vlen(u) < 1e-6) u = cross(n, Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0]);
+    u = norm(u); const w = cross(n, u);
+    for (const o of list) o.ang = Math.atan2(dot(o.d, w), dot(o.d, u));
+    list.sort((a, b) => a.ang - b.ang);
+    list.forEach((o, i) => pos.set(o.he, i));
+  });
+  const used = new Uint8Array(E.length * 2);
+  const faces = [];
+  for (let h0 = 0; h0 < E.length * 2; h0++) {
+    if (used[h0]) continue;
+    const hes = []; let he = h0, ok = true;
+    for (let guard = 0; ; guard++) {
+      if (guard > 400 || used[he]) { ok = false; break; }
+      used[he] = 1; hes.push(he);
+      const e = E[he >> 1], head = he & 1 ? e.a : e.b, twin = he ^ 1;
+      const list = out[head], i = pos.get(twin);
+      he = list[(i - 1 + list.length) % list.length].he;
+      if (he === h0) break;
+    }
+    if (!ok) continue;
+    const fn = hes.map((x) => (x & 1 ? E[x >> 1].b : E[x >> 1].a));
+    // corner angles of this loop, measured on the surface at each node. A patch has small corners
+    // (they add up to about (n-2)*pi); the outside of a sheet or the mouth of a tube has wide ones (n*pi or more).
+    let turning = 0;
+    for (let x = 0; x < hes.length; x++) {
+      const hv = hes[x], nx = hes[(x + 1) % hes.length], e = E[hv >> 1], head = hv & 1 ? e.a : e.b, list = out[head];
+      let th = list[pos.get(hv ^ 1)].ang - list[pos.get(nx)].ang; while (th <= 1e-9) th += 2 * Math.PI;
+      turning += th;
+    }
+    const c0 = E[hes[0] >> 1].cids;
+    const oneRing = c0.length === 1 && curves[c0[0]].closed && hes.every((x) => E[x >> 1].cids.length === 1 && E[x >> 1].cids[0] === c0[0]);
+    const distinct = new Set(fn).size === fn.length;
+    const fill = hes.length >= 3 && hes.length <= 12 && distinct && !oneRing && turning < (hes.length - 0.5) * Math.PI;
+    faces.push({ hes, nodes: fn, n: hes.length, turning, fill, flagged: fill && hes.length !== 4 });
+  }
+  return { nodes, edges: E, faces, curves: srcCurves };
+}
+
+// =====================================================================
+// 3. NETWORK -> QUAD CAGE (with auto loops) -> CATMULL-CLARK
+// =====================================================================
+function buildCage(net, autoLoops) {
+  const fills = net.faces.filter((f) => f.fill);
+  let S = Math.max(1, (autoLoops | 0) + 1);
+  if (S > 1 && S % 2 === 1 && fills.some((f) => f.n !== 4)) S += 1; // odd-sided patches need an even split
+  const P = [], F = [], flag = [];
+  const addV = (p) => { P.push(p[0], p[1], p[2]); return P.length / 3 - 1; };
+  const getP = (i) => [P[3 * i], P[3 * i + 1], P[3 * i + 2]];
+  const nodeV = new Map(), edgeV = new Map();
+  const nv = (ni) => { if (!nodeV.has(ni)) nodeV.set(ni, addV(net.nodes[ni].pos)); return nodeV.get(ni); };
+  const side = (he) => {
+    const ei = he >> 1, e = net.edges[ei];
+    if (!edgeV.has(ei)) {
+      const ids = [nv(e.a)];
+      if (S > 1) { const cum = cumLengths(e.pts), L = cum[e.pts.length - 1]; for (let k = 1; k < S; k++) ids.push(addV(sampleAt(e.pts, cum, (L * k) / S).p)); }
+      ids.push(nv(e.b)); edgeV.set(ei, ids);
+    }
+    const ids = edgeV.get(ei);
+    return he & 1 ? ids.slice().reverse() : ids;
+  };
+  const coons = (c0, c1, c2, c3, m, flagged) => {
+    const G = [];
+    for (let i = 0; i <= m; i++) { G.push(new Array(m + 1)); }
+    for (let i = 0; i <= m; i++) { G[i][0] = c0[i]; G[i][m] = c2[m - i]; }
+    for (let j = 0; j <= m; j++) { G[m][j] = c1[j]; G[0][j] = c3[m - j]; }
+    const p00 = getP(c0[0]), p10 = getP(c0[m]), p11 = getP(c2[0]), p01 = getP(c2[m]);
+    for (let i = 1; i < m; i++) for (let j = 1; j < m; j++) {
+      const u = i / m, v = j / m;
+      const bo = getP(c0[i]), to = getP(c2[m - i]), le = getP(c3[m - j]), ri = getP(c1[j]);
+      const p = [0, 0, 0];
+      for (let k = 0; k < 3; k++) p[k] = (1 - v) * bo[k] + v * to[k] + (1 - u) * le[k] + u * ri[k] - ((1 - u) * (1 - v) * p00[k] + u * (1 - v) * p10[k] + (1 - u) * v * p01[k] + u * v * p11[k]);
+      G[i][j] = addV(p);
+    }
+    for (let i = 0; i < m; i++) for (let j = 0; j < m; j++) { F.push([G[i][j], G[i + 1][j], G[i + 1][j + 1], G[i][j + 1]]); flag.push(flagged ? 1 : 0); }
+  };
+  for (const f of fills) {
+    const sides = f.hes.map(side);
+    if (f.n === 4) { coons(sides[0], sides[1], sides[2], sides[3], S, false); continue; }
+    if (S === 1) { F.push(sides.map((s) => s[0])); flag.push(1); continue; }
+    const m = S / 2; const c = [0, 0, 0]; let cnt = 0;
+    for (const s of sides) for (let k = 0; k < S; k++) { const p = getP(s[k]); c[0] += p[0]; c[1] += p[1]; c[2] += p[2]; cnt++; }
+    const C = addV(mul(c, 1 / cnt)), Cp = getP(C);
+    const spokes = sides.map((s) => { const Mi = s[m], Mp = getP(Mi), ids = [Mi]; for (let k = 1; k < m; k++) ids.push(addV(lerp(Mp, Cp, k / m))); ids.push(C); return ids; });
+    for (let k = 0; k < f.n; k++) {
+      const pk = (k - 1 + f.n) % f.n;
+      coons(sides[k].slice(0, m + 1), spokes[k], spokes[pk].slice().reverse(), sides[pk].slice(m), m, true);
+    }
+  }
+  return { P, F, flag, wire: null, S };
+}
+
+function subdivide(mesh) {
+  const P = mesh.P, F = mesh.F, NV = P.length / 3, NF = F.length;
+  const emap = new Map(); const ev0 = [], ev1 = [], efc = [], efs = [];
+  const fpts = new Array(NF * 3), fedges = new Array(NF);
+  for (let f = 0; f < NF; f++) {
+    const vs = F[f]; let x = 0, y = 0, z = 0;
+    for (const v of vs) { x += P[3 * v]; y += P[3 * v + 1]; z += P[3 * v + 2]; }
+    fpts[3 * f] = x / vs.length; fpts[3 * f + 1] = y / vs.length; fpts[3 * f + 2] = z / vs.length;
+  }
+  for (let f = 0; f < NF; f++) {
+    const vs = F[f], n = vs.length, es = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = vs[i], b = vs[(i + 1) % n], key = a < b ? a * NV + b : b * NV + a;
+      let e = emap.get(key);
+      if (e === undefined) { e = ev0.length; emap.set(key, e); ev0.push(a); ev1.push(b); efc.push(0); efs.push(0, 0, 0); }
+      efc[e]++; efs[3 * e] += fpts[3 * f]; efs[3 * e + 1] += fpts[3 * f + 1]; efs[3 * e + 2] += fpts[3 * f + 2];
+      es[i] = e;
+    }
+    fedges[f] = es;
+  }
+  const NE = ev0.length;
+  const Q = new Array((NV + NE + NF) * 3);
+  // per-vertex accumulators
+  const vF = new Float64Array(NV * 3), vFc = new Uint16Array(NV), vR = new Float64Array(NV * 3), vEc = new Uint16Array(NV);
+  const sharpN = new Uint8Array(NV), sharpSum = new Float64Array(NV * 3);
+  for (let f = 0; f < NF; f++) for (const v of F[f]) { vF[3 * v] += fpts[3 * f]; vF[3 * v + 1] += fpts[3 * f + 1]; vF[3 * v + 2] += fpts[3 * f + 2]; vFc[v]++; }
+  for (let e = 0; e < NE; e++) {
+    const a = ev0[e], b = ev1[e];
+    const mx = (P[3 * a] + P[3 * b]) / 2, my = (P[3 * a + 1] + P[3 * b + 1]) / 2, mz = (P[3 * a + 2] + P[3 * b + 2]) / 2;
+    for (const v of [a, b]) { vR[3 * v] += mx; vR[3 * v + 1] += my; vR[3 * v + 2] += mz; vEc[v]++; }
+    const o = (NV + e) * 3;
+    if (efc[e] === 2) { Q[o] = (P[3 * a] + P[3 * b] + efs[3 * e]) / 4; Q[o + 1] = (P[3 * a + 1] + P[3 * b + 1] + efs[3 * e + 1]) / 4; Q[o + 2] = (P[3 * a + 2] + P[3 * b + 2] + efs[3 * e + 2]) / 4; }
+    else {
+      Q[o] = mx; Q[o + 1] = my; Q[o + 2] = mz;
+      sharpN[a]++; sharpN[b]++;
+      sharpSum[3 * a] += P[3 * b]; sharpSum[3 * a + 1] += P[3 * b + 1]; sharpSum[3 * a + 2] += P[3 * b + 2];
+      sharpSum[3 * b] += P[3 * a]; sharpSum[3 * b + 1] += P[3 * a + 1]; sharpSum[3 * b + 2] += P[3 * a + 2];
+    }
+  }
+  for (let v = 0; v < NV; v++) {
+    const o = 3 * v, n = vEc[v];
+    if (n === 0 || vFc[v] === 0) { Q[o] = P[o]; Q[o + 1] = P[o + 1]; Q[o + 2] = P[o + 2]; continue; }
+    if (sharpN[v] === 0) {
+      for (let k = 0; k < 3; k++) Q[o + k] = (vF[o + k] / vFc[v] + (2 * vR[o + k]) / n + (n - 3) * P[o + k]) / n;
+    } else if (sharpN[v] === 2 && vFc[v] > 1) {
+      for (let k = 0; k < 3; k++) Q[o + k] = (6 * P[o + k] + sharpSum[o + k]) / 8;
+    } else { Q[o] = P[o]; Q[o + 1] = P[o + 1]; Q[o + 2] = P[o + 2]; }
+  }
+  for (let f = 0; f < NF; f++) { const o = (NV + NE + f) * 3; Q[o] = fpts[3 * f]; Q[o + 1] = fpts[3 * f + 1]; Q[o + 2] = fpts[3 * f + 2]; }
+  const F2 = [], flag2 = [];
+  for (let f = 0; f < NF; f++) {
+    const vs = F[f], es = fedges[f], n = vs.length, fp = NV + NE + f;
+    for (let i = 0; i < n; i++) { F2.push([vs[i], NV + es[i], fp, NV + es[(i - 1 + n) % n]]); flag2.push(mesh.flag[f]); }
+  }
+  // wire = edges that descend from the cage
+  const wire = [];
+  if (!mesh.wire) { for (let e = 0; e < NE; e++) wire.push(ev0[e], NV + e, NV + e, ev1[e]); }
+  else {
+    for (let i = 0; i < mesh.wire.length; i += 2) {
+      const a = mesh.wire[i], b = mesh.wire[i + 1], e = emap.get(a < b ? a * NV + b : b * NV + a);
+      if (e !== undefined) wire.push(a, NV + e, NV + e, b);
+    }
+  }
+  return { P: Q, F: F2, flag: flag2, wire, S: mesh.S };
+}
+
+// where each vertex of an all-quad mesh ends up on the limit surface (Catmull-Clark limit masks)
+function limitPositions(mesh) {
+  const P = mesh.P, F = mesh.F, NV = P.length / 3, Q = new Array(P.length);
+  const sE = new Float64Array(NV * 3), sF = new Float64Array(NV * 3), nE = new Uint16Array(NV), nF = new Uint16Array(NV), sh = new Uint8Array(NV), sS = new Float64Array(NV * 3);
+  const edges = new Map();
+  for (const f of F) {
+    const n = f.length;
+    for (let i = 0; i < n; i++) {
+      const v = f[i]; nF[v]++;
+      if (n === 4) { const o = f[(i + 2) % 4]; sF[3 * v] += P[3 * o]; sF[3 * v + 1] += P[3 * o + 1]; sF[3 * v + 2] += P[3 * o + 2]; }
+      const b = f[(i + 1) % n], key = v < b ? v * NV + b : b * NV + v; edges.set(key, (edges.get(key) || 0) + 1);
+    }
+  }
+  for (const [key, cnt] of edges) {
+    const a = Math.floor(key / NV), b = key % NV;
+    for (const [u, w] of [[a, b], [b, a]]) {
+      sE[3 * u] += P[3 * w]; sE[3 * u + 1] += P[3 * w + 1]; sE[3 * u + 2] += P[3 * w + 2]; nE[u]++;
+      if (cnt !== 2) { sh[u]++; sS[3 * u] += P[3 * w]; sS[3 * u + 1] += P[3 * w + 1]; sS[3 * u + 2] += P[3 * w + 2]; }
+    }
+  }
+  for (let v = 0; v < NV; v++) {
+    const o = 3 * v, n = nE[v];
+    if (n && nF[v] && sh[v] === 0) for (let k = 0; k < 3; k++) Q[o + k] = (n * n * P[o + k] + 4 * sE[o + k] + sF[o + k]) / (n * (n + 5));
+    else if (sh[v] === 2 && nF[v] > 1) for (let k = 0; k < 3; k++) Q[o + k] = (4 * P[o + k] + sS[o + k]) / 6;
+    else { Q[o] = P[o]; Q[o + 1] = P[o + 1]; Q[o + 2] = P[o + 2]; }
+  }
+  return Q;
+}
+// move the cage until the smooth surface passes through the original cage points (which sit on the drawn curves)
+function fitCage(cage, iters = 14) {
+  const T = cage.P, n = T.length; let P = T.slice();
+  for (let it = 0; it < iters; it++) {
+    const L = limitPositions(subdivide({ P, F: cage.F, flag: cage.flag, wire: null, S: cage.S }));
+    let worst = 0;
+    for (let i = 0; i < n; i++) { const d = T[i] - L[i]; P[i] += d; if (Math.abs(d) > worst) worst = Math.abs(d); }
+    if (worst < 1e-4) break;
+  }
+  return P;
+}
+
+function cageWire(mesh) {
+  if (mesh.wire) return mesh.wire;
+  const NV = mesh.P.length / 3, seen = new Set(), wire = [];
+  for (const vs of mesh.F) for (let i = 0; i < vs.length; i++) {
+    const a = vs[i], b = vs[(i + 1) % vs.length], key = a < b ? a * NV + b : b * NV + a;
+    if (!seen.has(key)) { seen.add(key); wire.push(a, b); }
+  }
+  return wire;
+}
+
+// iron out squiggles shorter than a chosen length (Taubin smoothing: no shrinking). amount 0..1
+function tidyCurve(c, amount, h) {
+  if (!(amount > 0) || c.pts.length < 5) return c;
+  const Lc = 0.04 + 0.26 * amount, lam = 0.5, kpb = 2 - 2 * Math.cos((2 * Math.PI * h) / Lc), mu = 1 / (kpb - 1 / lam);
+  const n = c.pts.length, closed = c.closed; let P = c.pts;
+  const pass = (Q, f) => Q.map((q, i) => {
+    if (!closed && (i === 0 || i === n - 1)) return q;
+    const a = Q[(i - 1 + n) % n], b = Q[(i + 1) % n];
+    return [q[0] + f * ((a[0] + b[0]) / 2 - q[0]), q[1] + f * ((a[1] + b[1]) / 2 - q[1]), q[2] + f * ((a[2] + b[2]) / 2 - q[2])];
+  });
+  for (let it = 0; it < 60; it++) { P = pass(P, lam); P = pass(P, mu); }
+  return finalize({ pts: P, w: c.w, closed, id: c.id, alive: true });
+}
+
+// full pipeline. params: {tol, autoLoops, smooth, fit, tidy}   fit 0..1 = how far the smooth surface is pulled onto the curves
+function buildAll(strokes, params) {
+  const tol = params.tol;
+  let curves = buildCurves(strokes, tol);
+  if (params.tidy > 0) { const h = strokeSpacing(tol); curves = curves.map((c) => tidyCurve(c, params.tidy, h)); }
+  const net = buildNetwork(curves, tol);
+  let mesh = buildCage(net, params.autoLoops);
+  const cageFaces = mesh.F.length;
+  let levels = params.smooth | 0;
+  while (levels > 0 && cageFaces * Math.pow(4, levels) > 70000) levels--;
+  const cageP = mesh.P, fit = clamp(params.fit === undefined ? 1 : params.fit, 0, 1);
+  if (levels > 0 && mesh.F.length) {
+    if (fit > 0) { const Pf = fitCage(mesh); mesh = Object.assign({}, mesh, { P: cageP.map((v, i) => v + (Pf[i] - v) * fit) }); }
+    for (let i = 0; i < levels; i++) mesh = subdivide(mesh);
+    mesh.P = limitPositions(mesh);
+  }
+  const fills = net.faces.filter((f) => f.fill);
+  return {
+    curves, net, mesh, wire: cageWire(mesh), levels, cageP,
+    stats: { curves: curves.length, nodes: net.nodes.filter((n) => n.alive).length, patches: fills.length, flagged: fills.filter((f) => f.flagged).length },
+  };
+}
+
+function flaggedCenters(net) {
+  const out = [];
+  for (const f of net.faces) if (f.flagged) {
+    const c = [0, 0, 0];
+    for (const ni of f.nodes) { const p = net.nodes[ni].pos; c[0] += p[0]; c[1] += p[1]; c[2] += p[2]; }
+    out.push(mul(c, 1 / f.nodes.length));
+  }
+  return out;
+}
+
+function toOBJ(mesh, scale = 1) {
+  const L = ['# Quadrille quad mesh', 'o quadrille'];
+  for (let i = 0; i < mesh.P.length; i += 3) L.push('v ' + (mesh.P[i] * scale).toFixed(5) + ' ' + (mesh.P[i + 1] * scale).toFixed(5) + ' ' + (mesh.P[i + 2] * scale).toFixed(5));
+  for (const f of mesh.F) L.push('f ' + f.map((v) => v + 1).join(' '));
+  return L.join('\n') + '\n';
+}
+
+// =====================================================================
+// EXAMPLES: hand-like strokes. `mess` (0..1) scales how sloppy they are:
+// drifting lines, hooks at the ends, over/undershoots, lines drawn in
+// pieces or gone over twice, uneven spacing, random order and direction.
+// =====================================================================
+function rng32(seed) { let a = seed >>> 0; return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function messParams(m) {
+  return { drift: 0.002 + 0.005 * m, offset: 0.002 + 0.005 * m, jitter: 0.0004 + 0.0008 * m, hook: 0.003 + 0.009 * m, over: 0.015 + 0.045 * m, under: 0.003 + 0.007 * m,
+    pSplit2: 0.1 + 0.2 * m, pSplit3: 0.08 * m, pDouble: 0.05 + 0.15 * m, pGap: 0.25, space: 0.04 + 0.11 * m, tilt: 0.07 * m };
+}
+// one pass of the hand along fn(t); unit = metres per unit of t
+function handStroke(fn, t0, t1, unit, rnd, M) {
+  const len = Math.abs(t1 - t0) * unit, n = Math.max(6, Math.round(len / 0.006));
+  const sp = []; let acc = 0; const ph = rnd() * 6.28, fq = 1 + rnd() * 3;
+  for (let i = 0; i <= n; i++) { sp.push(acc); acc += 0.4 + 0.6 * (1 + Math.sin(ph + (fq * i * 6.28) / n)) + rnd() * 0.3; }
+  const off = [0, 1, 2].map(() => (rnd() - 0.5) * 2 * M.offset);
+  const waves = [0, 1, 2].map(() => [0, 1].map(() => ({ a: (rnd() - 0.5) * 2 * M.drift, f: 1.5 + rnd() * 4.5, p: rnd() * 6.28 })));
+  const h0 = [0, 1, 2].map(() => (rnd() - 0.5) * 2 * M.hook), h1 = [0, 1, 2].map(() => (rnd() - 0.5) * 2 * M.hook);
+  const out = [];
+  for (let i = 0; i <= n; i++) {
+    const u = sp[i] / sp[n], p = fn(t0 + (t1 - t0) * u), s = u * len;
+    const a0 = Math.max(0, 1 - s / 0.02) ** 2, a1 = Math.max(0, 1 - (len - s) / 0.02) ** 2;
+    out.push([0, 1, 2].map((k) => p[k] + off[k] + waves[k][0].a * Math.sin(6.28 * waves[k][0].f * s + waves[k][0].p) + waves[k][1].a * Math.sin(6.28 * waves[k][1].f * s + waves[k][1].p) + (rnd() - 0.5) * 2 * M.jitter + h0[k] * a0 + h1[k] * a1));
+  }
+  return out;
+}
+function drawOpen(S, fn, t0, t1, unit, rnd, M) {
+  const a = t0 - (rnd() * (M.over + M.under) - M.under) / unit, b = t1 + (rnd() * (M.over + M.under) - M.under) / unit;
+  const L = (b - a) * unit, r = rnd(); let parts = [[a, b]];
+  if (r < M.pSplit2 && L > 0.25) {
+    const m = a + (b - a) * (0.35 + rnd() * 0.3);
+    const d = rnd() < M.pGap ? -(0.002 + rnd() * 0.008) / unit : (0.04 + rnd() * 0.08) / unit;
+    parts = [[a, m + d / 2], [m - d / 2, b]];
+  } else if (r < M.pSplit2 + M.pSplit3 && L > 0.4) {
+    const m1 = a + (b - a) * (0.25 + rnd() * 0.15), m2 = a + (b - a) * (0.6 + rnd() * 0.15), d = (0.04 + rnd() * 0.06) / unit;
+    parts = [[a, m1 + d / 2], [m1 - d / 2, m2 + d / 2], [m2 - d / 2, b]];
+  } else if (r < M.pSplit2 + M.pSplit3 + M.pDouble) {
+    parts = [[a, b], [a + (b - a) * rnd() * 0.4, b - (b - a) * rnd() * 0.4]];
+  }
+  for (const [p0, p1] of parts) S.push(rnd() < 0.5 ? handStroke(fn, p0, p1, unit, rnd, M) : handStroke(fn, p1, p0, unit, rnd, M));
+}
+// fn has period 2*PI in t
+function drawLoop(S, fn, unit, rnd, M) {
+  const TAU = Math.PI * 2, st = rnd() * TAU, r = rnd(), g = (fnT0, fnT1) => S.push(rnd() < 0.5 ? handStroke(fn, st + fnT0, st + fnT1, unit, rnd, M) : handStroke(fn, st + fnT1, st + fnT0, unit, rnd, M));
+  const ov = () => (0.035 + rnd() * 0.07) / unit;
+  if (r < 0.45) g(0, TAU + ov());
+  else if (r < 0.62) g(0, TAU - (0.003 + rnd() * 0.009) / unit);
+  else if (r < 0.62 + 0.25) { const m = TAU * (0.4 + rnd() * 0.2), o1 = ov(), o2 = ov(); g(-o1 / 2, m + o2 / 2); g(m - o2 / 2, TAU + o1 / 2); }
+  else { g(0, TAU + ov()); const s0 = rnd() * TAU; g(s0, s0 + TAU * (0.3 + rnd() * 0.4)); }
+}
+function spaced(n, lo, hi, rnd, M) { const out = [], d = (hi - lo) / (n - 1); for (let i = 0; i < n; i++) out.push(lo + d * i + (i > 0 && i < n - 1 ? (rnd() - 0.5) * 2 * M.space * d : 0)); return out; }
+
+// returns an array of strokes (arrays of [x,y,z]) with .expect = number of quad patches a clean read gives
+function makeExample(name, seed = 1, mess = 0.6) {
+  const rnd = rng32((seed * 2654435761) ^ (name.length * 97 + name.charCodeAt(0) * 131)), M = messParams(mess), S = [], TAU = Math.PI * 2;
+  const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+  if (name === 'sheet') {
+    const nu = ri(4, 6), nv = ri(4, 6), w = 0.3 + rnd() * 0.06, a = 2 + rnd() * 2.5, b = 2 + rnd() * 2.5, hgt = 0.04 + rnd() * 0.06, tw = (rnd() - 0.5) * 0.4, p0 = rnd() * 3;
+    const f = (x, z) => hgt * Math.sin(a * x + p0) * Math.cos(b * z) + tw * x * z;
+    for (const z of spaced(nu, -w, w, rnd, M)) { const t = (rnd() - 0.5) * 2 * M.tilt; drawOpen(S, (x) => [x, f(x, z + t * x), z + t * x], -w, w, 1, rnd, M); }
+    for (const x of spaced(nv, -w, w, rnd, M)) { const t = (rnd() - 0.5) * 2 * M.tilt; drawOpen(S, (z) => [x + t * z, f(x + t * z, z), z], -w, w, 1, rnd, M); }
+    S.expect = (nu - 1) * (nv - 1);
+  } else if (name === 'tube') {
+    const R = 0.3, r = 0.08 + rnd() * 0.025, nR = ri(4, 5), nL = ri(5, 7), th0 = rnd() * TAU;
+    const pt = (a, th) => { const rr = R + r * Math.cos(th); return [rr * Math.cos(a) - 0.2, rr * Math.sin(a) - 0.2, r * Math.sin(th)]; };
+    for (const a of spaced(nR, 0, Math.PI / 2, rnd, M)) drawLoop(S, (th) => pt(a, th), r, rnd, M);
+    for (let k = 0; k < nL; k++) { const th = th0 + ((k + (rnd() - 0.5) * 2 * M.space) * TAU) / nL; drawOpen(S, (a) => pt(a, th), 0, Math.PI / 2, R, rnd, M); }
+    S.expect = (nR - 1) * nL;
+  } else if (name === 'wormhole') {
+    const nM = ri(6, 8), k = 0.9 + rnd() * 0.25, a0 = rnd() * TAU;
+    const prof = [[0.36, 0.2], [0.24, 0.2], [0.13, 0.15], [0.085, 0], [0.13, -0.15], [0.24, -0.2], [0.36, -0.2]].map(([rr, y]) => [rr * k, y * k]);
+    const cat = (t) => { const n = prof.length - 1, x = clamp(t, 0, 1) * n, i = Math.min(n - 1, Math.floor(x)), g = x - i, q0 = prof[Math.max(0, i - 1)], q1 = prof[i], q2 = prof[i + 1], q3 = prof[Math.min(n, i + 2)];
+      return [0, 1].map((c) => 0.5 * (2 * q1[c] + (-q0[c] + q2[c]) * g + (2 * q0[c] - 5 * q1[c] + 4 * q2[c] - q3[c]) * g * g + (-q0[c] + 3 * q1[c] - 3 * q2[c] + q3[c]) * g * g * g)); };
+    for (let i = 0; i < nM; i++) {
+      const ang = a0 + ((i + (rnd() - 0.5) * 2 * M.space) * TAU) / nM;
+      drawOpen(S, (t) => { const p = cat(t), rr = p[0] + (t < 0 ? -t : t > 1 ? t - 1 : 0) * 1.1; return [rr * Math.cos(ang), p[1], rr * Math.sin(ang)]; }, 0, 1, 1.1 * k, rnd, M);
+    }
+    for (const [rr, y] of prof) drawLoop(S, (th) => [rr * Math.cos(th), y, rr * Math.sin(th)], rr, rnd, M);
+    S.expect = nM * (prof.length - 1);
+  } else {
+    const R = 0.24, r = 0.09 + rnd() * 0.02, nR = ri(7, 9), nP = ri(4, 6), o1 = rnd() * TAU, o2 = rnd() * TAU;
+    const pt = (phi, psi) => { const rr = R + r * Math.cos(psi); return [rr * Math.cos(phi), r * Math.sin(psi), rr * Math.sin(phi)]; };
+    for (let i = 0; i < nR; i++) { const phi = o1 + ((i + (rnd() - 0.5) * 2 * M.space) * TAU) / nR; drawLoop(S, (psi) => pt(phi, psi), r, rnd, M); }
+    for (let i = 0; i < nP; i++) { const psi = o2 + ((i + (rnd() - 0.5) * 2 * M.space) * TAU) / nP; drawLoop(S, (phi) => pt(phi, psi), R + r * Math.cos(psi), rnd, M); }
+    S.expect = nR * nP;
+  }
+  const expect = S.expect;
+  for (let i = S.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [S[i], S[j]] = [S[j], S[i]]; }
+  S.expect = expect;
+  return S;
+}
+
+// =====================================================================
+// PACK: typed arrays for the renderer (also crosses the worker boundary)
+// =====================================================================
+function pack(r) {
+  const m = r.mesh;
+  const pos = new Float32Array(m.P);
+  let nMain = 0, nFlag = 0;
+  for (let i = 0; i < m.F.length; i++) { const t = (m.F[i].length - 2) * 3; if (m.flag[i]) nFlag += t; else nMain += t; }
+  const idx = new Uint32Array(nMain + nFlag); let a = 0, b = nMain;
+  for (let i = 0; i < m.F.length; i++) {
+    const f = m.F[i];
+    for (let k = 1; k < f.length - 1; k++) {
+      if (m.flag[i]) { idx[b++] = f[0]; idx[b++] = f[k]; idx[b++] = f[k + 1]; } else { idx[a++] = f[0]; idx[a++] = f[k]; idx[a++] = f[k + 1]; }
+    }
+  }
+  const wire = new Float32Array(r.wire.length * 3);
+  for (let i = 0; i < r.wire.length; i++) { const v = r.wire[i] * 3; wire[3 * i] = m.P[v]; wire[3 * i + 1] = m.P[v + 1]; wire[3 * i + 2] = m.P[v + 2]; }
+  let total = 0; for (const c of r.curves) total += c.pts.length + (c.closed ? 1 : 0);
+  const curvePts = new Float32Array(total * 3), curveLens = new Uint32Array(r.curves.length); let o = 0;
+  r.curves.forEach((c, ci) => {
+    const P = c.closed ? c.pts.concat([c.pts[0]]) : c.pts; curveLens[ci] = P.length;
+    for (const p of P) { curvePts[o++] = p[0]; curvePts[o++] = p[1]; curvePts[o++] = p[2]; }
+  });
+  const usedN = new Set(); for (const e of r.net.edges) { usedN.add(e.a); usedN.add(e.b); }
+  const nodes = new Float32Array(usedN.size * 3); o = 0;
+  for (const ni of usedN) { const p = r.net.nodes[ni].pos; nodes[o++] = p[0]; nodes[o++] = p[1]; nodes[o++] = p[2]; }
+  return { pos, idx, nMain, nFlag, wire, curvePts, curveLens, nodes, stats: r.stats, levels: r.levels, S: m.S, quads: m.F.length };
+}
+
+self.QE = { buildAll, makeExample, toOBJ, pack, strokeSpacing };
+})();
+</script>
+
+<script type="module">
+// three.js r170, from the CDNs the artifact sandbox allows (the same build on both)
+let THREE;
+try { THREE = await import('https://cdnjs.cloudflare.com/ajax/libs/three.js/0.170.0/three.module.min.js'); }
+catch (e1) {
+  try { THREE = await import('https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js'); }
+  catch (e2) { const t = document.getElementById('toast'); t.textContent = 'Could not load the 3D library. Check the connection and reload.'; t.hidden = false; throw e2; }
+}
+
+const QE = self.QE;
+const $ = (id) => document.getElementById(id);
+const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+const C = { ink: '#0b0b0b', white: '#ffffff', blue: '#1238B0', blue2: '#2A55D8', yellow: '#FFD400', red: '#E8212B', green: '#0E9F4A', pink: '#FF2D9B', grey: '#D8D8D8' };
+const IN_CLAUDE = (() => { try { return !!(window.claude && window.claude.use); } catch (e) { return false; } })();   // artifact, or a plain web page?
+const HOME = new THREE.Vector3(0, 1.05, -0.5);   // where the model sits in front of you
+const TOL_MIN = 0.003, TOL_MAX = 0.15;
+
+// =====================================================================
+// STATE
+// =====================================================================
+const state = {
+  strokes: [],               // raw strokes: Float32Array xyz... in model space (metres). Never edited in place.
+  tool: 'draw',              // draw | erase | bend | look (look = orbit, flat screens only). Local to each device.
+  tidy: 0.3,                 // how hard squiggles are ironed out of the clean curves (0..1)
+  bendR: 0.12,               // reach of the Bend tool, metres in your hand space
+  tol: 0.04, autoLoops: 0, smooth: 2, fit: 1,   // fit: how far the smooth surface is pulled onto the drawn curves
+  exMess: 1,                                    // how sloppy the built-in examples are drawn (0..1.5)
+  show: { sketch: true, curves: true, surface: true, wire: true, labels: true },
+  mr: false,
+};
+const undoStack = [], redoStack = [];
+let stats = { curves: 0, nodes: 0, patches: 0, flagged: 0 }, built = null;
+let inXR = false, xrMode = null;
+// --- multiplayer bookkeeping (see MULTIPLAYER) ---
+const sync = { sv: 0, pv: 0 };     // "last edited" stamps for the sketch and for the settings; the newest wins across devices
+let spect = null;                  // set while this flat view is watching a headset: that peer's tool, menu tab, poses...
+let debugXR = false;               // tests: behave as the headset without a real XR session
+const lastXR = { L: null, R: null };
+const TOOLS = ['draw', 'erase', 'bend', 'look'];
+const isPresenter = () => inXR || debugXR;
+const xrLike = () => inXR || !!spect;                       // lay the menu out the way the headset sees it
+const shownTool = () => (spect ? spect.tool : state.tool);
+const xrSupport = { vr: false, ar: false };
+
+// =====================================================================
+// ENGINE BRIDGE (worker, newest request wins)
+// =====================================================================
+const WORKER_GLUE = `
+let last = null;
+onmessage = (e) => { const m = e.data;
+  if (m.type === 'build') { let out;
+    try { const s = m.strokes.map((f) => { const o = []; for (let i = 0; i < f.length; i += 3) o.push([f[i], f[i + 1], f[i + 2]]); return o; });
+      const r = QE.buildAll(s, m.params); last = r.mesh; out = QE.pack(r); }
+    catch (err) { postMessage({ type: 'error', message: String((err && err.stack) || err) }); return; }
+    postMessage({ type: 'built', out }, [out.pos.buffer, out.idx.buffer, out.wire.buffer, out.curvePts.buffer, out.curveLens.buffer, out.nodes.buffer]);
+  } else if (m.type === 'obj') postMessage({ type: 'obj', text: last ? QE.toOBJ(last, m.scale) : '' });
+};`;
+const Engine = (() => {
+  let worker = null, busy = false, pending = null, lastJob = null, lastMain = null, objResolve = null;
+  const toArrays = (strokes) => strokes.map((f) => { const o = []; for (let i = 0; i < f.length; i += 3) o.push([f[i], f[i + 1], f[i + 2]]); return o; });
+  function pump() {
+    if (busy || !pending) return;
+    const job = pending; pending = null; busy = true; lastJob = job;
+    if (worker) worker.postMessage({ type: 'build', strokes: job.strokes, params: job.params });
+    else setTimeout(() => {
+      try { const r = QE.buildAll(toArrays(job.strokes), job.params); lastMain = r.mesh; busy = false; applyBuilt(QE.pack(r)); }
+      catch (err) { busy = false; console.error(err); toast('Could not build that surface'); }
+      pump();
+    }, 0);
+  }
+  return {
+    start() {
+      try {
+        worker = new Worker(URL.createObjectURL(new Blob([$('engine').textContent + WORKER_GLUE], { type: 'text/javascript' })));
+        worker.onmessage = (e) => {
+          const m = e.data;
+          if (m.type === 'built') { busy = false; applyBuilt(m.out); pump(); }
+          else if (m.type === 'error') { busy = false; console.error(m.message); toast('Could not build that surface'); pump(); }
+          else if (m.type === 'obj' && objResolve) { objResolve(m.text); objResolve = null; }
+        };
+        worker.onerror = () => { worker = null; if (busy) { busy = false; pending = pending || lastJob; } pump(); };
+      } catch (e) { worker = null; }
+    },
+    request(strokes, params) { pending = { strokes, params }; pump(); },
+    mode: () => (worker ? 'worker' : 'main'),
+    obj(scale) {
+      if (worker) return new Promise((res) => { objResolve = res; worker.postMessage({ type: 'obj', scale }); });
+      return Promise.resolve(lastMain ? QE.toOBJ(lastMain, scale) : '');
+    },
+  };
+})();
+function requestBuild() { Engine.request(state.strokes, { tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, tidy: state.tidy }); }
+
+// =====================================================================
+// SCENE
+// =====================================================================
+const glCanvas = $('gl');
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.setClearColor(0x1238B0, 1);
+renderer.xr.enabled = true;
+const scene = new THREE.Scene();
+// near plane is tiny so nothing clips when the model is scaled huge and held close
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.005, 1500);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x4466dd, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.7); sun.position.set(1.5, 3, 2); scene.add(sun);
+
+const sky = new THREE.Mesh(new THREE.SphereGeometry(500, 24, 16), new THREE.MeshBasicMaterial({ color: 0x1238B0, side: THREE.BackSide, depthWrite: false }));
+scene.add(sky);
+const floor = (() => {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 256; const c = cv.getContext('2d');
+  c.fillStyle = '#0C2A86'; c.fillRect(0, 0, 256, 256); c.strokeStyle = 'rgba(255,255,255,0.6)'; c.lineWidth = 4; c.strokeRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(cv); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(20, 20); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
+  const m = new THREE.Mesh(new THREE.CircleGeometry(10, 64), new THREE.MeshBasicMaterial({ map: t }));
+  m.rotation.x = -Math.PI / 2; return m;
+})();
+scene.add(floor);
+
+const world = new THREE.Group(); world.position.copy(HOME); scene.add(world);   // model space
+const surfMats = [
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.62, metalness: 0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
+  new THREE.MeshStandardMaterial({ color: 0xFF2D9B, roughness: 0.62, metalness: 0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
+];
+const surface = new THREE.Mesh(new THREE.BufferGeometry(), surfMats);
+const wire = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x0b0b0b }));
+const sketch = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 }));
+const tubes = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0xF0222D, side: THREE.DoubleSide }));
+const dotGeo = new THREE.SphereGeometry(1, 12, 8), dotMat = new THREE.MeshBasicMaterial({ color: 0xFFD400 });
+let dots = new THREE.InstancedMesh(dotGeo, dotMat, 64); dots.count = 0;
+const liveBuf = new Float32Array(3 * 8000);
+const liveLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xFFD400 }));
+liveLine.geometry.setAttribute('position', new THREE.BufferAttribute(liveBuf, 3)); liveLine.geometry.setDrawRange(0, 0);
+for (const o of [surface, wire, sketch, tubes, dots, liveLine]) { o.frustumCulled = false; world.add(o); }
+let dispScale = 1;
+
+function setLive(flat) {
+  const n = flat ? Math.min(flat.length, liveBuf.length) : 0;
+  for (let i = 0; i < n; i++) liveBuf[i] = flat[i];
+  liveLine.geometry.attributes.position.needsUpdate = true; liveLine.geometry.setDrawRange(0, n / 3);
+}
+function rebuildSketch() {
+  let n = 0; for (const s of state.strokes) n += Math.max(0, s.length / 3 - 1) * 2;
+  const pos = new Float32Array(n * 3); let o = 0;
+  for (const s of state.strokes) for (let i = 0; i + 5 < s.length; i += 3) { for (let k = 0; k < 6; k++) pos[o++] = s[i + k]; }
+  sketch.geometry.dispose(); sketch.geometry = new THREE.BufferGeometry(); sketch.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+}
+function tubeGeometry(pts, lens, radius) {
+  const RS = 5; let nPts = 0, nIdx = 0;
+  for (const l of lens) { nPts += l; nIdx += Math.max(0, l - 1) * RS * 6; }
+  const pos = new Float32Array(nPts * RS * 3), nor = new Float32Array(nPts * RS * 3), idx = new Uint32Array(nIdx);
+  const T = new THREE.Vector3(), N = new THREE.Vector3(), B = new THREE.Vector3(), a = new THREE.Vector3(), b = new THREE.Vector3();
+  let p = 0, vi = 0, ii = 0;
+  for (const l of lens) {
+    const base = vi;
+    for (let i = 0; i < l; i++) {
+      a.fromArray(pts, (p + Math.max(0, i - 1)) * 3); b.fromArray(pts, (p + Math.min(l - 1, i + 1)) * 3); T.subVectors(b, a).normalize();
+      if (i === 0) N.set(0, 1, 0);
+      N.addScaledVector(T, -N.dot(T));
+      if (N.lengthSq() < 1e-8) { N.set(1, 0, 0).addScaledVector(T, -T.x); if (N.lengthSq() < 1e-8) N.set(0, 0, 1).addScaledVector(T, -T.z); }
+      N.normalize(); B.crossVectors(T, N);
+      const cx = pts[(p + i) * 3], cy = pts[(p + i) * 3 + 1], cz = pts[(p + i) * 3 + 2];
+      for (let k = 0; k < RS; k++) {
+        const ang = (k / RS) * Math.PI * 2, cs = Math.cos(ang), sn = Math.sin(ang);
+        const nx = N.x * cs + B.x * sn, ny = N.y * cs + B.y * sn, nz = N.z * cs + B.z * sn;
+        pos[vi * 3] = cx + nx * radius; pos[vi * 3 + 1] = cy + ny * radius; pos[vi * 3 + 2] = cz + nz * radius;
+        nor[vi * 3] = nx; nor[vi * 3 + 1] = ny; nor[vi * 3 + 2] = nz; vi++;
+      }
+    }
+    for (let i = 0; i < l - 1; i++) for (let k = 0; k < RS; k++) {
+      const a0 = base + i * RS + k, a1 = base + i * RS + ((k + 1) % RS), b0 = a0 + RS, b1 = a1 + RS;
+      idx[ii++] = a0; idx[ii++] = b0; idx[ii++] = a1; idx[ii++] = a1; idx[ii++] = b0; idx[ii++] = b1;
+    }
+    p += l;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3)); geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  return geo;
+}
+function rebuildCurveDisplay() {
+  if (!built) return;
+  const r = 0.0026 / dispScale;
+  tubes.geometry.dispose(); tubes.geometry = tubeGeometry(built.curvePts, built.curveLens, r);
+  const n = built.nodes.length / 3;
+  if (n > dots.instanceMatrix.count) { world.remove(dots); dots.dispose(); dots = new THREE.InstancedMesh(dotGeo, dotMat, Math.max(64, n * 2)); dots.frustumCulled = false; world.add(dots); }
+  const m = new THREE.Matrix4(), s = r * 2.4;
+  for (let i = 0; i < n; i++) { m.makeScale(s, s, s); m.setPosition(built.nodes[3 * i], built.nodes[3 * i + 1], built.nodes[3 * i + 2]); dots.setMatrixAt(i, m); }
+  dots.count = n; dots.instanceMatrix.needsUpdate = true;
+  applyShow();
+}
+function applyBuilt(o) {
+  built = o; stats = o.stats;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(o.pos, 3)); geo.setIndex(new THREE.BufferAttribute(o.idx, 1));
+  geo.addGroup(0, o.nMain, 0); geo.addGroup(o.nMain, o.nFlag, 1); geo.computeVertexNormals();
+  surface.geometry.dispose(); surface.geometry = geo;
+  const wg = new THREE.BufferGeometry(); wg.setAttribute('position', new THREE.BufferAttribute(o.wire, 3));
+  wire.geometry.dispose(); wire.geometry = wg;
+  rebuildCurveDisplay(); ui.dirty = true;
+}
+function applyShow() {
+  const has = built && built.idx.length > 0;
+  surface.visible = state.show.surface && !!has; wire.visible = state.show.wire && !!has;
+  sketch.visible = state.show.sketch; tubes.visible = state.show.curves; dots.visible = state.show.curves;
+}
+function refreshDisplayScale() { dispScale = world.scale.x; rebuildCurveDisplay(); }
+function applyMR() { const pass = inXR && state.mr && xrMode === 'immersive-ar'; sky.visible = !pass; floor.visible = !pass; }
+
+// =====================================================================
+// EDITING
+// =====================================================================
+function strokesTouched(remote) { if (!remote) { sync.sv = Date.now(); Net.strokesChanged(); } rebuildSketch(); requestBuild(); scheduleSave(); ui.dirty = true; }
+function paramsTouched() { sync.pv = Date.now(); }
+function commit(strokes) { undoStack.push(state.strokes); if (undoStack.length > 80) undoStack.shift(); redoStack.length = 0; state.strokes = strokes; strokesTouched(); }
+function undo() { if (!undoStack.length) return; redoStack.push(state.strokes); state.strokes = undoStack.pop(); strokesTouched(); }
+function redo() { if (!redoStack.length) return; undoStack.push(state.strokes); state.strokes = redoStack.pop(); strokesTouched(); }
+function clearAll() { if (state.strokes.length) commit([]); }
+const packStrokes = (S) => S.map((pts) => { const f = new Float32Array(pts.length * 3); pts.forEach((p, i) => f.set(p, i * 3)); return f; });
+// every tap draws the example again with a fresh sloppy hand
+function loadExample(name, seed = 1 + Math.floor(Math.random() * 1e6), mess = state.exMess) { const S = QE.makeExample(name, seed, mess); commit(packStrokes(S)); return S.expect; }
+function setTool(t) { state.tool = t; ui.dirty = true; refreshTags(); }
+function setTol(v) { v = clamp(v, TOL_MIN, TOL_MAX); if (v === state.tol) return; state.tol = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; refreshTags(); }
+function setParam(k, v) { if (state[k] === v) return; state[k] = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; }
+function finishStroke(flat, ws) {
+  let len = 0; for (let i = 3; i < flat.length; i += 3) len += Math.hypot(flat[i] - flat[i - 3], flat[i + 1] - flat[i - 2], flat[i + 2] - flat[i - 1]);
+  if (flat.length >= 9 && len * ws > 0.012) commit(state.strokes.concat([Float32Array.from(flat)]));
+}
+// remove every raw point for which pred is true; strokes split where points go
+function eraseWhere(pred) {
+  let changed = false; const out = [];
+  for (const s of state.strokes) {
+    const n = s.length / 3; let hit = false; const keep = new Uint8Array(n);
+    for (let i = 0; i < n; i++) { if (pred(s[3 * i], s[3 * i + 1], s[3 * i + 2])) hit = true; else keep[i] = 1; }
+    if (!hit) { out.push(s); continue; }
+    changed = true; let start = -1;
+    for (let i = 0; i <= n; i++) {
+      if (i < n && keep[i]) { if (start < 0) start = i; }
+      else if (start >= 0) { if (i - start >= 3) out.push(s.slice(start * 3, i * 3)); start = -1; }
+    }
+  }
+  if (changed) state.strokes = out;
+  return changed;
+}
+const eraserRadiusModel = (ws) => Math.max(state.tol, 0.018 / ws);
+// Bend: soft-drag the raw sketch. Points near where you grab follow the hand, fading out to nothing at the reach.
+function startBend(p, R) {
+  const items = [];
+  state.strokes.forEach((s, idx) => {
+    const n = s.length / 3; let w = null;
+    for (let i = 0; i < n; i++) { const d2 = (s[3 * i] - p.x) ** 2 + (s[3 * i + 1] - p.y) ** 2 + (s[3 * i + 2] - p.z) ** 2; if (d2 < R * R) { if (!w) w = new Float32Array(n); const u = 1 - d2 / (R * R); w[i] = u * u; } }
+    if (w) items.push({ idx, base: s, w });
+  });
+  return { x: p.x, y: p.y, z: p.z, before: state.strokes, items, moved: false };
+}
+function applyBend(b, p) {
+  if (!b.items.length) return;
+  const dx = p.x - b.x, dy = p.y - b.y, dz = p.z - b.z; if (!b.moved && dx * dx + dy * dy + dz * dz < 1e-8) return;
+  const out = b.before.slice();
+  for (const it of b.items) { const f = new Float32Array(it.base.length), n = it.w.length; for (let i = 0; i < n; i++) { const w = it.w[i]; f[3 * i] = it.base[3 * i] + dx * w; f[3 * i + 1] = it.base[3 * i + 1] + dy * w; f[3 * i + 2] = it.base[3 * i + 2] + dz * w; } out[it.idx] = f; }
+  state.strokes = out; b.moved = true; strokesTouched();
+}
+function endBend(b) { if (b.moved) { undoStack.push(b.before); if (undoStack.length > 80) undoStack.shift(); redoStack.length = 0; ui.dirty = true; } }
+
+let saveTimer = 0;
+function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 600); }
+function save() {
+  try {
+    localStorage.setItem('quadrille.v1', JSON.stringify({ v: 3, sv: sync.sv, pv: sync.pv, tidy: state.tidy, bendR: state.bendR, show: state.show, tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, exMess: state.exMess,
+      strokes: state.strokes.map((s) => Array.from(s, (v) => Math.round(v * 10000))) }));
+  } catch (e) { /* storage is a convenience only */ }
+}
+function load() {
+  try {
+    const d = JSON.parse(localStorage.getItem('quadrille.v1'));
+    if (!d || !Array.isArray(d.strokes)) return false;
+    state.strokes = d.strokes.map((a) => Float32Array.from(a, (v) => v / 10000));
+    if (d.tol > 0) state.tol = clamp(d.tol, TOL_MIN, TOL_MAX);
+    if (d.autoLoops >= 0) state.autoLoops = clamp(d.autoLoops | 0, 0, 6);
+    if (d.smooth >= 0) state.smooth = clamp(d.smooth | 0, 0, 3);
+    if (d.fit >= 0) state.fit = clamp(+d.fit, 0, 1);
+    if (d.exMess >= 0) state.exMess = clamp(+d.exMess, 0, 1.5);
+    if (d.tidy >= 0) state.tidy = clamp(+d.tidy, 0, 1);
+    if (d.bendR > 0) state.bendR = clamp(+d.bendR, 0.03, 0.5);
+    if (d.show) for (const k of Object.keys(state.show)) if (typeof d.show[k] === 'boolean') state.show[k] = d.show[k];
+    sync.sv = +d.sv || 0; sync.pv = +d.pv || 0;
+    return true;
+  } catch (e) { return false; }
+}
+
+// ---------- OBJ export (zipped, because the save dialog has no .obj type) ----------
+function crc32(u8) { let c, crc = ~0; for (let i = 0; i < u8.length; i++) { c = (crc ^ u8[i]) & 255; for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1; crc = (crc >>> 8) ^ c; } return ~crc >>> 0; }
+function zipStore(name, data) {
+  const nm = new TextEncoder().encode(name), crc = crc32(data), n = data.length;
+  const out = new Uint8Array(30 + nm.length + n + 46 + nm.length + 22), dv = new DataView(out.buffer);
+  let o = 0;
+  dv.setUint32(o, 0x04034b50, true); dv.setUint16(o + 4, 20, true); dv.setUint16(o + 6, 0, true); dv.setUint16(o + 8, 0, true); dv.setUint16(o + 10, 0, true); dv.setUint16(o + 12, 0x21, true);
+  dv.setUint32(o + 14, crc, true); dv.setUint32(o + 18, n, true); dv.setUint32(o + 22, n, true); dv.setUint16(o + 26, nm.length, true); dv.setUint16(o + 28, 0, true);
+  out.set(nm, 30); out.set(data, 30 + nm.length); o = 30 + nm.length + n; const cd = o;
+  dv.setUint32(o, 0x02014b50, true); dv.setUint16(o + 4, 20, true); dv.setUint16(o + 6, 20, true); dv.setUint16(o + 8, 0, true); dv.setUint16(o + 10, 0, true); dv.setUint16(o + 12, 0, true); dv.setUint16(o + 14, 0x21, true);
+  dv.setUint32(o + 16, crc, true); dv.setUint32(o + 20, n, true); dv.setUint32(o + 24, n, true); dv.setUint16(o + 28, nm.length, true);
+  dv.setUint16(o + 30, 0, true); dv.setUint16(o + 32, 0, true); dv.setUint16(o + 34, 0, true); dv.setUint16(o + 36, 0, true); dv.setUint32(o + 38, 0, true); dv.setUint32(o + 42, 0, true);
+  out.set(nm, o + 46); o += 46 + nm.length; const cdSize = o - cd;
+  dv.setUint32(o, 0x06054b50, true); dv.setUint16(o + 4, 0, true); dv.setUint16(o + 6, 0, true); dv.setUint16(o + 8, 1, true); dv.setUint16(o + 10, 1, true);
+  dv.setUint32(o + 12, cdSize, true); dv.setUint32(o + 16, cd, true); dv.setUint16(o + 20, 0, true);
+  return out;
+}
+let dlCap = null;
+function probeDownloads() { try { if (window.claude && window.claude.use) return window.claude.use('downloads').then((d) => { dlCap = d; return d; }).catch(() => null); } catch (e) { /* none */ } return Promise.resolve(null); }
+async function saveOBJ() {
+  const text = await Engine.obj(1000);            // millimetres
+  if (!text || !built || !built.quads) { toast('Nothing to save yet'); return; }
+  if (!IN_CLAUDE) {   // ordinary web page (GitHub Pages): a plain download works
+    try { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' })); a.download = 'quadrille.obj'; document.body.appendChild(a); a.click(); a.remove(); toast('Saved quadrille.obj (quads, millimetres)'); return; } catch (e) { /* fall through */ }
+  }
+  try {
+    const dl = dlCap || (await probeDownloads());
+    if (dl) { await dl.save({ filename: 'quadrille-obj.zip', data: zipStore('quadrille.obj', new TextEncoder().encode(text)) }); toast('Saved quadrille-obj.zip (quads, millimetres)'); return; }
+  } catch (e) { if (e && e.code === 'declined') return; }
+  try { await navigator.clipboard.writeText(text); toast('OBJ text copied. Paste it into a .obj file'); }
+  catch (e) { toast('Saving is not available in this view'); }
+}
+
+// =====================================================================
+// PANEL UI  (one canvas: shown as a DOM overlay on flat screens and on the left controller in VR)
+// =====================================================================
+const UIW = 900, UIH = 600, RAIL = 128;
+const uiCanvas = $('panel'), g = uiCanvas.getContext('2d');
+const uiTex = new THREE.CanvasTexture(uiCanvas); uiTex.colorSpace = THREE.SRGBColorSpace; uiTex.anisotropy = 8;
+const TABS = [{ name: 'Draw', icon: 'pencil' }, { name: 'Surface', icon: 'grid' }, { name: 'View', icon: 'eye' }, { name: 'File', icon: 'folder' }];
+const ui = { tab: 0, widgets: [], hover: null, press: null, drag: null, dirty: true, collapsed: false, toast: '', toastUntil: 0 };
+const tabRect = (i) => ({ x: 12, y: 12 + i * 114, w: RAIL - 24, h: 106 });
+const swapRect = { x: 12, y: 472, w: RAIL - 24, h: 114 };
+const canSwap = () => (spect ? spect.ar : inXR && xrMode === 'immersive-ar');
+const mrOn = () => (spect ? spect.mr : state.mr);
+const tolToT = (v) => Math.log(v / TOL_MIN) / Math.log(TOL_MAX / TOL_MIN);
+const tToTol = (t) => TOL_MIN * Math.pow(TOL_MAX / TOL_MIN, t);
+
+function rrect(c, x, y, w, h, r) {
+  c.beginPath();
+  if (c.roundRect) { c.roundRect(x, y, w, h, r); return; }
+  c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+function icon(c, name, cx, cy, s, col) {
+  c.save(); c.translate(cx, cy); c.lineWidth = Math.max(3, s * 0.11); c.lineCap = 'round'; c.lineJoin = 'round'; c.strokeStyle = col; c.fillStyle = col;
+  if (name === 'pencil') {
+    c.rotate(Math.PI / 4); c.beginPath(); c.moveTo(-s * 0.14, -s * 0.46); c.lineTo(s * 0.14, -s * 0.46); c.lineTo(s * 0.14, s * 0.2); c.lineTo(0, s * 0.5); c.lineTo(-s * 0.14, s * 0.2); c.closePath(); c.stroke();
+    c.beginPath(); c.moveTo(-s * 0.14, -s * 0.26); c.lineTo(s * 0.14, -s * 0.26); c.stroke();
+  } else if (name === 'eraser') {
+    c.rotate(-Math.PI / 5); rrect(c, -s * 0.44, -s * 0.21, s * 0.88, s * 0.42, s * 0.08); c.stroke(); rrect(c, -s * 0.44, -s * 0.21, s * 0.34, s * 0.42, s * 0.08); c.fill();
+  } else if (name === 'eye') {
+    c.beginPath(); c.moveTo(-s * 0.5, 0); c.quadraticCurveTo(0, -s * 0.46, s * 0.5, 0); c.quadraticCurveTo(0, s * 0.46, -s * 0.5, 0); c.closePath(); c.stroke();
+    c.beginPath(); c.arc(0, 0, s * 0.13, 0, Math.PI * 2); c.fill();
+  } else if (name === 'grid') {
+    for (let i = 0; i < 3; i++) {
+      const t = -0.38 + i * 0.38;
+      c.beginPath(); c.moveTo(-s * 0.46, s * (t + 0.1)); c.quadraticCurveTo(0, s * (t - 0.18), s * 0.46, s * (t + 0.1)); c.stroke();
+      c.beginPath(); c.moveTo(s * t * 0.9, -s * (0.4 - (i === 1 ? 0.14 : 0))); c.lineTo(s * t * 1.2, s * (0.48 - (i === 1 ? 0.14 : 0))); c.stroke();
+    }
+  } else if (name === 'folder') {
+    c.beginPath(); c.moveTo(-s * 0.46, -s * 0.32); c.lineTo(-s * 0.1, -s * 0.32); c.lineTo(0.02 * s, -s * 0.16); c.lineTo(s * 0.46, -s * 0.16); c.lineTo(s * 0.46, s * 0.36); c.lineTo(-s * 0.46, s * 0.36); c.closePath(); c.stroke();
+  } else if (name === 'undo' || name === 'redo') {
+    if (name === 'redo') c.scale(-1, 1);
+    const r = s * 0.3, a0 = Math.PI * 1.12, a1 = Math.PI * 2.45, oy = s * 0.06;
+    c.beginPath(); c.arc(0, oy, r, a0, a1); c.stroke();
+    const px = r * Math.cos(a0), py = oy + r * Math.sin(a0), tx = Math.sin(a0), ty = -Math.cos(a0), h = s * 0.2;
+    c.beginPath(); c.moveTo(px + tx * h, py + ty * h); c.lineTo(px - ty * h * 0.75, py + tx * h * 0.75); c.lineTo(px + ty * h * 0.75, py - tx * h * 0.75); c.closePath(); c.fill();
+  } else if (name === 'bend') {
+    c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.bezierCurveTo(-s * 0.1, s * 0.3, -s * 0.1, -s * 0.34, s * 0.14, -s * 0.34); c.stroke();
+    c.beginPath(); c.arc(s * 0.3, -s * 0.34, s * 0.13, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.lineTo(s * 0.46, s * 0.3); c.setLineDash([s * 0.08, s * 0.14]); c.stroke(); c.setLineDash([]);
+  } else if (name === 'menu') {
+    for (const y of [-0.26, 0, 0.26]) { c.beginPath(); c.moveTo(-s * 0.34, s * y); c.lineTo(s * 0.34, s * y); c.stroke(); }
+  } else if (name === 'check') {
+    c.beginPath(); c.moveTo(-s * 0.3, 0); c.lineTo(-s * 0.06, s * 0.26); c.lineTo(s * 0.34, -s * 0.26); c.stroke();
+  }
+  c.restore();
+}
+
+function layoutUI() {
+  const W = [], x0 = RAIL + 28, cw = UIW - x0 - 28, gap = 16;
+  const btn = (x, y, w, h, label, o) => W.push(Object.assign({ type: 'btn', x, y, w, h, label }, o));
+  const row = (y, h, items) => { const bw = (cw - gap * (items.length - 1)) / items.length; items.forEach((it, i) => btn(x0 + i * (bw + gap), y, bw, h, it[0], it[1])); };
+  const sld = (y, label, o) => W.push(Object.assign({ type: 'sld', x: x0, y, w: cw, h: 118, label }, o));
+  if (ui.tab === 0) {
+    const tl = (name, key, ic) => [name, { icon: ic, on: () => setTool(key), active: () => shownTool() === key }];
+    const tools = [tl('Draw', 'draw', 'pencil'), tl('Erase', 'erase', 'eraser'), tl('Bend', 'bend', 'bend')];
+    if (!xrLike()) tools.push(tl('Look', 'look', 'eye'));
+    row(22, 92, tools);
+    sld(120, 'Join distance', { get: () => tolToT(state.tol), set: (t) => setTol(tToTol(t)), fmt: () => (state.tol * 100).toFixed(1) + ' cm' });
+    sld(240, 'Tidy squiggles', { steps: 10, get: () => state.tidy, set: (t) => setParam('tidy', Math.round(t * 10) / 10), fmt: () => String(Math.round(state.tidy * 10)) });
+    row(364, 84, [['Undo', { icon: 'undo', on: undo, disabled: () => !undoStack.length }], ['Redo', { icon: 'redo', on: redo, disabled: () => !redoStack.length }], ['Clear', { kind: 'danger', on: clearAll }]]);
+    W.push({ type: 'status', x: x0, y: 458, w: cw, h: 130 });
+  } else if (ui.tab === 1) {
+    sld(22, 'Auto loops between curves', { steps: 6, get: () => state.autoLoops / 6, set: (t) => setParam('autoLoops', Math.round(t * 6)), fmt: () => String(state.autoLoops) });
+    sld(150, 'Smooth level', { steps: 3, get: () => state.smooth / 3, set: (t) => setParam('smooth', Math.round(t * 3)), fmt: () => String(state.smooth) });
+    sld(278, 'Fit to curves', { steps: 10, get: () => state.fit, set: (t) => setParam('fit', Math.round(t * 10) / 10), fmt: () => Math.round(state.fit * 100) + '%' });
+    W.push({ type: 'status', x: x0, y: 420, w: cw, h: 160 });
+  } else if (ui.tab === 2) {
+    const tg = (k, label) => [label, { kind: 'toggle', on: () => { state.show[k] = !state.show[k]; paramsTouched(); applyShow(); refreshTags(); scheduleSave(); ui.dirty = true; }, active: () => state.show[k] }];
+    W.push({ type: 'label', x: x0, y: 20, text: 'white = raw sketch   red = clean curves   black = edge loops', small: true });
+    row(58, 92, [tg('sketch', 'Raw sketch'), tg('curves', 'Clean curves')]);
+    row(166, 92, [tg('surface', 'Surface'), tg('wire', 'Edge loops')]);
+    if (xrLike()) {
+      row(274, 92, [tg('labels', 'Button labels')]);
+    }
+  } else {
+    W.push({ type: 'label', x: x0, y: 26, text: 'Examples: tap again for a new messy take' });
+    row(66, 92, [['Sheet', { on: () => loadExample('sheet') }], ['Tube', { on: () => loadExample('tube') }], ['Wormhole', { on: () => loadExample('wormhole') }], ['Donut', { on: () => loadExample('donut') }]]);
+    sld(176, 'How messy the examples are', { steps: 10, get: () => state.exMess / 1.5, set: (t) => { state.exMess = Math.round(t * 10) * 0.15; scheduleSave(); ui.dirty = true; }, fmt: () => String(Math.round(state.exMess / 0.15)) });
+    if (xrLike()) { row(318, 92, [['Exit VR', { kind: 'primary', on: () => { const s = renderer.xr.getSession(); if (s) s.end(); } }]]); W.push({ type: 'label', x: x0, y: 486, text: 'Save OBJ is on the flat page after you exit.', small: true }); }
+    else row(318, 92, [['Save OBJ (quads)', { kind: 'primary', on: saveOBJ }]]);
+    W.push({ type: 'label', x: x0, y: 436, text: () => Net.label(), small: true });
+  }
+  ui.widgets = W; ui.dirty = true;
+}
+function drawWidget(c, w) {
+  c.textBaseline = 'middle';
+  if (w.type === 'btn') {
+    const act = w.active && w.active(), dis = w.disabled && w.disabled(), pressed = ui.press === w;
+    let fill = C.white, ink = C.ink;
+    if (w.kind === 'danger') { fill = C.red; ink = C.white; } else if (w.kind === 'primary') { fill = C.blue; ink = C.white; }
+    if (act && w.kind !== 'toggle') fill = C.yellow;
+    if (ui.hover === w && !dis && fill === C.white) fill = '#FFF3B0';
+    const dy = pressed ? 5 : 0;
+    c.globalAlpha = dis ? 0.35 : 1;
+    rrect(c, w.x, w.y + 7, w.w, w.h - 7, 20); c.fillStyle = C.ink; c.fill();
+    rrect(c, w.x, w.y + dy, w.w, w.h - 7, 20); c.fillStyle = fill; c.fill(); c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke();
+    const cy = w.y + dy + (w.h - 7) / 2;
+    let fs = 31; c.font = `800 ${fs}px ${FONT}`;
+    const lead = w.icon ? 50 : w.kind === 'toggle' ? 52 : 0;
+    while (c.measureText(w.label).width + lead > w.w - 28 && fs > 18) { fs -= 2; c.font = `800 ${fs}px ${FONT}`; }
+    const tw = c.measureText(w.label).width, x = w.x + (w.w - tw - lead) / 2;
+    if (w.icon) icon(c, w.icon, x + 18, cy, 38, ink);
+    if (w.kind === 'toggle') {
+      rrect(c, x, cy - 19, 38, 38, 9); c.fillStyle = act ? C.yellow : C.white; c.fill(); c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke();
+      if (act) icon(c, 'check', x + 19, cy, 30, C.ink);
+    }
+    c.fillStyle = ink; c.textAlign = 'left'; c.fillText(w.label, x + lead, cy + 1);
+    c.globalAlpha = 1;
+  } else if (w.type === 'sld') {
+    const t = clamp(w.get(), 0, 1), tx = w.x + 30, tw = w.w - 60, ty = w.y + 82;
+    c.font = `800 30px ${FONT}`; c.textAlign = 'left'; c.fillStyle = C.ink; c.fillText(w.label, w.x, w.y + 22);
+    c.textAlign = 'right'; c.fillStyle = C.blue; c.fillText(w.fmt(), w.x + w.w, w.y + 22);
+    rrect(c, tx - 14, ty - 14, tw + 28, 28, 14); c.fillStyle = C.grey; c.fill(); c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke();
+    rrect(c, tx - 14, ty - 14, tw * t + 28, 28, 14); c.fillStyle = C.yellow; c.fill(); c.stroke();
+    if (w.steps) { c.fillStyle = C.ink; for (let i = 0; i <= w.steps; i++) { c.beginPath(); c.arc(tx + (tw * i) / w.steps, ty, 4, 0, 6.3); c.fill(); } }
+    c.beginPath(); c.arc(tx + tw * t, ty, ui.drag === w ? 30 : 26, 0, Math.PI * 2); c.fillStyle = ui.drag === w ? C.yellow : C.white; c.fill(); c.lineWidth = 6; c.stroke();
+  } else if (w.type === 'label') {
+    c.font = `800 ${w.small ? 24 : 30}px ${FONT}`; c.textAlign = 'left'; c.fillStyle = C.ink; c.fillText(typeof w.text === 'function' ? w.text() : w.text, w.x, w.y + 16, UIW - w.x - 24);
+  } else if (w.type === 'status') {
+    c.textAlign = 'left';
+    let big, small, col = C.ink;
+    if (!state.strokes.length) { big = 'Draw U lines, then V lines across them.'; small = 'Lines closer than the join distance connect.'; }
+    else if (!stats.patches) { big = 'No closed patches yet'; small = 'Cross more lines, or raise the join distance.'; }
+    else if (stats.flagged) { big = `${stats.patches} patches, ${stats.flagged} flagged`; small = 'Pink = not 4-sided. Add or erase a line there.'; col = C.pink; }
+    else { big = `${stats.patches} patches, all quads`; small = built ? `${built.quads} quads in the mesh` : ''; col = C.green; }
+    c.fillStyle = col; c.beginPath(); c.arc(w.x + 16, w.y + 34, 14, 0, Math.PI * 2); c.fill(); c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke();
+    let fs = 32; c.font = `800 ${fs}px ${FONT}`; while (c.measureText(big).width > w.w - 50 && fs > 20) { fs -= 2; c.font = `800 ${fs}px ${FONT}`; }
+    c.fillStyle = C.ink; c.fillText(big, w.x + 44, w.y + 36);
+    c.font = `600 24px ${FONT}`; c.fillStyle = '#333'; c.fillText(small, w.x + 44, w.y + 76);
+  }
+}
+function drawUI() {
+  const c = g; c.clearRect(0, 0, UIW, UIH);
+  c.save(); rrect(c, 3, 3, UIW - 6, UIH - 6, 34); c.clip();
+  c.fillStyle = C.white; c.fillRect(0, 0, UIW, UIH); c.fillStyle = C.red; c.fillRect(0, 0, RAIL, UIH); c.restore();
+  c.lineWidth = 6; c.strokeStyle = C.ink; rrect(c, 3, 3, UIW - 6, UIH - 6, 34); c.stroke();
+  c.beginPath(); c.moveTo(RAIL, 3); c.lineTo(RAIL, UIH - 3); c.stroke();
+  TABS.forEach((t, i) => {
+    const r = tabRect(i), act = ui.tab === i && !ui.collapsed;
+    rrect(c, r.x, r.y, r.w, r.h, 22); c.fillStyle = act ? C.yellow : ui.hover === 'tab' + i ? '#F4666D' : C.red; c.fill();
+    if (act) { c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke(); }
+    icon(c, t.icon, r.x + r.w / 2, r.y + 40, 48, act ? C.ink : C.white);
+    c.fillStyle = act ? C.ink : C.white; c.font = `800 20px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(t.name, r.x + r.w / 2, r.y + 86);
+  });
+  if (canSwap()) {   // VR / MR swap lives at the bottom-left of the menu
+    const r = swapRect; c.font = `800 26px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+    [['VR', !mrOn()], ['MR', mrOn()]].forEach(([name, on], i) => {
+      const y = r.y + i * 58; rrect(c, r.x, y, r.w, 52, 16); c.fillStyle = on ? C.yellow : '#B5151E'; c.fill(); c.lineWidth = 5; c.strokeStyle = on ? C.ink : C.white; c.stroke();
+      c.fillStyle = on ? C.ink : C.white; c.fillText(name, r.x + r.w / 2, y + 27);
+    });
+  }
+  for (const w of ui.widgets) drawWidget(c, w);
+  if (ui.toast) {
+    c.font = `700 26px ${FONT}`; const tw = Math.min(UIW - RAIL - 60, c.measureText(ui.toast).width + 44), x = RAIL + (UIW - RAIL - tw) / 2;
+    rrect(c, x, UIH - 78, tw, 56, 28); c.fillStyle = C.ink; c.fill(); c.fillStyle = C.white; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(ui.toast, x + tw / 2, UIH - 49, tw - 30);
+  }
+}
+function uiHit(x, y) {
+  if (x < RAIL) {
+    for (let i = 0; i < TABS.length; i++) { const r = tabRect(i); if (y >= r.y && y <= r.y + r.h) return 'tab' + i; }
+    return canSwap() && y >= swapRect.y ? 'swap' : null;
+  }
+  for (const w of ui.widgets) if ((w.type === 'btn' || w.type === 'sld') && x >= w.x && x <= w.x + w.w && y >= w.y && y <= w.y + w.h) return w;
+  return null;
+}
+function sliderSet(w, x) { w.set(clamp((x - (w.x + 30)) / (w.w - 60), 0, 1)); ui.dirty = true; }
+function uiPointer(kind, x, y) {
+  if (kind === 'leave') { if (ui.hover) { ui.hover = null; ui.dirty = true; } return; }
+  const h = uiHit(x, y);
+  if (kind === 'down') {
+    if (typeof h === 'string') ui.press = h;
+    else if (h && h.type === 'sld') { ui.drag = h; sliderSet(h, x); }
+    else if (h && h.type === 'btn' && !(h.disabled && h.disabled())) ui.press = h;
+    ui.dirty = true;
+  } else if (kind === 'move') {
+    if (ui.drag) sliderSet(ui.drag, x);
+    if (h !== ui.hover) { ui.hover = h; ui.dirty = true; }
+  } else if (kind === 'up') {
+    const p = ui.press; ui.press = null; ui.drag = null; ui.dirty = true;
+    if (p && p === h) {
+      if (p === 'swap') { state.mr = !state.mr; applyMR(); }
+      else if (typeof p === 'string') {
+        const i = +p.slice(3);
+        if (i === ui.tab && !xrLike()) { ui.collapsed = !ui.collapsed; fitPanel(); } else { ui.tab = i; if (ui.collapsed) { ui.collapsed = false; fitPanel(); } layoutUI(); }
+      } else p.on();
+    }
+  }
+}
+function toast(msg) {
+  ui.toast = msg; ui.toastUntil = performance.now() + 3600; ui.dirty = true;
+  const t = $('toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => { t.hidden = true; }, 3600);
+}
+// DOM placement of the panel
+function fitPanel() {
+  const w = clamp(window.innerWidth * 0.58, 290, 440), h = (w * UIH) / UIW;
+  uiCanvas.style.width = w + 'px'; uiCanvas.style.height = h + 'px';
+  const wrap = $('panelWrap'); wrap.style.width = (ui.collapsed ? (w * RAIL) / UIW : w) + 'px'; wrap.style.height = h + 'px';
+}
+{
+  const xy = (e) => { const r = uiCanvas.getBoundingClientRect(); return [((e.clientX - r.left) * UIW) / r.width, ((e.clientY - r.top) * UIH) / r.height]; };
+  uiCanvas.addEventListener('pointerdown', (e) => { e.preventDefault(); try { uiCanvas.setPointerCapture(e.pointerId); } catch (_) {} uiPointer('down', ...xy(e)); });
+  uiCanvas.addEventListener('pointermove', (e) => uiPointer('move', ...xy(e)));
+  uiCanvas.addEventListener('pointerup', (e) => uiPointer('up', ...xy(e)));
+  uiCanvas.addEventListener('pointercancel', () => { ui.press = null; ui.drag = null; ui.dirty = true; });
+  uiCanvas.addEventListener('pointerleave', () => uiPointer('leave', 0, 0));
+}
+
+// =====================================================================
+// FLAT-SCREEN INPUT (mouse / touch): draw on a view-facing plane, orbit, zoom
+// =====================================================================
+const orbit = { theta: 0.65, phi: 1.02, r: 1.4 }, orbitTarget = HOME.clone();
+function applyOrbit() {
+  const aspect = window.innerWidth / window.innerHeight, r = orbit.r * Math.max(1, 0.72 / aspect), s = Math.sin(orbit.phi);
+  const T = orbitTarget;
+  camera.position.set(T.x + r * s * Math.sin(orbit.theta), T.y + r * Math.cos(orbit.phi), T.z + r * s * Math.cos(orbit.theta));
+  camera.lookAt(T); camera.updateMatrixWorld();
+}
+const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2(), plane = new THREE.Plane();
+const tA = new THREE.Vector3(), tB = new THREE.Vector3(), tC = new THREE.Vector3();
+const ptrs = new Map(); let gest = null;
+function toScreen(v, rect) { v.project(camera); return [(v.x * 0.5 + 0.5) * rect.width + rect.left, (-v.y * 0.5 + 0.5) * rect.height + rect.top, v.z]; }
+function deskAnchor(cx, cy) {
+  // start on the nearest existing line under the pointer, otherwise on the plane through the model centre
+  const rect = glCanvas.getBoundingClientRect(); let best = 26 * 26, found = false;
+  world.updateMatrixWorld(true);
+  for (const s of state.strokes) for (let i = 0; i < s.length; i += 3) {
+    tA.set(s[i], s[i + 1], s[i + 2]).applyMatrix4(world.matrixWorld); tB.copy(tA);
+    const p = toScreen(tB, rect); if (p[2] > 1) continue;
+    const d = (p[0] - cx) ** 2 + (p[1] - cy) ** 2; if (d < best) { best = d; tC.copy(tA); found = true; }
+  }
+  return found ? tC.clone() : orbitTarget.clone();
+}
+function deskPoint(e) {
+  const rect = glCanvas.getBoundingClientRect();
+  ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const hit = raycaster.ray.intersectPlane(plane, tA); if (!hit) return null;
+  return world.worldToLocal(hit.clone());
+}
+function deskErase(e) {
+  const rect = glCanvas.getBoundingClientRect(), cx = e.clientX, cy = e.clientY, R2 = 20 * 20;
+  world.updateMatrixWorld(true);
+  if (eraseWhere((x, y, z) => { tA.set(x, y, z).applyMatrix4(world.matrixWorld); const p = toScreen(tA, rect); return p[2] < 1 && (p[0] - cx) ** 2 + (p[1] - cy) ** 2 < R2; })) strokesTouched();
+}
+function endGesture(cancel) {
+  if (!gest) return;
+  if (gest.type === 'draw') { if (!cancel) finishStroke(gest.pts, 1); setLive(null); }
+  if (gest.type === 'erase' && state.strokes !== gest.before) { undoStack.push(gest.before); redoStack.length = 0; ui.dirty = true; }
+  if (gest.type === 'bend') endBend(gest.b);
+  gest = null;
+}
+glCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
+glCanvas.addEventListener('pointerdown', (e) => {
+  if (inXR) return;
+  try { glCanvas.setPointerCapture(e.pointerId); } catch (_) {}
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (ptrs.size === 2) {
+    endGesture(true);
+    const [a, b] = [...ptrs.values()];
+    gest = { type: 'two', d: Math.hypot(a.x - b.x, a.y - b.y), cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 };
+  } else if (ptrs.size === 1) {
+    if (e.button === 2 || e.button === 1 || state.tool === 'look' || spect) gest = { type: 'orbit', x: e.clientX, y: e.clientY };
+    else if (state.tool === 'bend') {
+      camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
+      const p = deskPoint(e); if (p) gest = { type: 'bend', b: startBend(p, state.bendR) };
+    }
+    else if (state.tool === 'draw') {
+      camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
+      const p = deskPoint(e); gest = { type: 'draw', pts: p ? [p.x, p.y, p.z] : [] };
+    } else { gest = { type: 'erase', before: state.strokes }; deskErase(e); }
+  }
+});
+glCanvas.addEventListener('pointermove', (e) => {
+  const p = ptrs.get(e.pointerId); if (!p || !gest) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y; p.x = e.clientX; p.y = e.clientY;
+  if (gest.type === 'orbit') { orbit.theta -= dx * 0.008; orbit.phi = clamp(orbit.phi - dy * 0.008, 0.12, 3.0); applyOrbit(); }
+  else if (gest.type === 'two' && ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()], d = Math.hypot(a.x - b.x, a.y - b.y), cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+    orbit.r = clamp((orbit.r * gest.d) / Math.max(1, d), 0.25, 8); orbit.theta -= (cx - gest.cx) * 0.008; orbit.phi = clamp(orbit.phi - (cy - gest.cy) * 0.008, 0.12, 3.0);
+    gest.d = d; gest.cx = cx; gest.cy = cy; applyOrbit();
+  } else if (gest.type === 'draw') {
+    const q = deskPoint(e); if (!q) return; const n = gest.pts.length;
+    if (!n || Math.hypot(q.x - gest.pts[n - 3], q.y - gest.pts[n - 2], q.z - gest.pts[n - 1]) > 0.004) { gest.pts.push(q.x, q.y, q.z); setLive(gest.pts); }
+  } else if (gest.type === 'erase') deskErase(e);
+  else if (gest.type === 'bend') { const q = deskPoint(e); if (q) applyBend(gest.b, q); }
+});
+const ptrEnd = (e) => { if (!ptrs.has(e.pointerId)) return; ptrs.delete(e.pointerId); endGesture(e.type === 'pointercancel'); if (ptrs.size === 1 && (state.tool === 'look' || spect)) { const p = [...ptrs.values()][0]; gest = { type: 'orbit', x: p.x, y: p.y }; } };
+glCanvas.addEventListener('pointerup', ptrEnd); glCanvas.addEventListener('pointercancel', ptrEnd);
+glCanvas.addEventListener('wheel', (e) => { e.preventDefault(); if (inXR) return; orbit.r = clamp(orbit.r * Math.exp(e.deltaY * 0.0012), 0.25, 8); applyOrbit(); }, { passive: false });
+window.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); } });
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(ev, (e) => e.preventDefault());
+document.addEventListener('dblclick', (e) => e.preventDefault());
+
+// =====================================================================
+// XR: controllers (drawn with labelled buttons), left-hand menu, draw / erase / grab
+// =====================================================================
+const PANEL_W = 0.30, PANEL_H = 0.20, PEN_LOCAL = new THREE.Vector3(0, 0, -0.04);
+const vrPanel = new THREE.Mesh(new THREE.PlaneGeometry(PANEL_W, PANEL_H), new THREE.MeshBasicMaterial({ map: uiTex, transparent: true, side: THREE.DoubleSide }));
+vrPanel.position.set(0, 0.15, -0.04); vrPanel.rotation.x = -0.6;
+const cursorDot = new THREE.Mesh(new THREE.RingGeometry(0.0035, 0.0065, 20), new THREE.MeshBasicMaterial({ color: 0xE8212B, depthTest: false })); cursorDot.renderOrder = 10; cursorDot.visible = false; vrPanel.add(cursorDot);
+const laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xFFD400 })); laser.visible = false; laser.frustumCulled = false;
+const tolBall = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.MeshBasicMaterial({ color: 0xFFD400, transparent: true, opacity: 0.16, depthWrite: false })); tolBall.visible = false; scene.add(tolBall);
+
+function capTexture(name, bg, fg) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 96; const c = cv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  tex.userData.set = (n, b, f) => { c.fillStyle = b; c.fillRect(0, 0, 96, 96); if (n === 'x') { c.strokeStyle = f; c.lineWidth = 12; c.lineCap = 'round'; c.beginPath(); c.moveTo(28, 28); c.lineTo(68, 68); c.moveTo(68, 28); c.lineTo(28, 68); c.stroke(); } else icon(c, n, 48, 48, 62, f); tex.needsUpdate = true; };
+  tex.userData.set(name, bg, fg); return tex;
+}
+function makeTag(key, text, keyCol) {
+  const cv = document.createElement('canvas'); cv.width = 640; cv.height = 112; const c = cv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+  const H = 0.0165; sprite.scale.set((H * 640) / 112, H, 1);
+  let cur = '';
+  const set = (k, t, col) => {
+    if (cur === k + t + col) return; cur = k + t + col;
+    c.clearRect(0, 0, 640, 112); c.font = `800 50px ${FONT}`; const kw = c.measureText(k).width + 34; c.font = `700 48px ${FONT}`; const tw = c.measureText(t).width;
+    const W = Math.min(632, kw + tw + 54), x0 = (640 - W) / 2;
+    rrect(c, x0, 6, W, 100, 30); c.fillStyle = '#fff'; c.fill(); c.lineWidth = 7; c.strokeStyle = '#0b0b0b'; c.stroke();
+    rrect(c, x0 + 12, 18, kw, 76, 20); c.fillStyle = col; c.fill();
+    c.textBaseline = 'middle'; c.textAlign = 'center'; c.fillStyle = col === C.yellow ? '#0b0b0b' : '#fff'; c.font = `800 50px ${FONT}`; c.fillText(k, x0 + 12 + kw / 2, 58);
+    c.textAlign = 'left'; c.fillStyle = '#0b0b0b'; c.font = `700 48px ${FONT}`; c.fillText(t, x0 + 12 + kw + 16, 58, 632 - kw - 60);
+    tex.needsUpdate = true;
+  };
+  set(key, text, keyCol); return { sprite, set };
+}
+function buildController(hand) {
+  const sx = hand === 'right' ? 1 : -1, grp = new THREE.Group();
+  const white = new THREE.MeshLambertMaterial({ color: 0xf2f2f2 }), mk = (c) => new THREE.MeshLambertMaterial({ color: c });
+  const body = new THREE.Mesh(new THREE.SphereGeometry(1, 22, 16), white); body.scale.set(0.027, 0.021, 0.034); body.position.set(0, -0.011, 0.03); grp.add(body);
+  const plate = new THREE.Group(); plate.position.set(0, 0.002, 0.046); plate.rotation.x = 0.35; grp.add(plate);
+  plate.add(new THREE.Mesh(new THREE.CylinderGeometry(0.029, 0.027, 0.012, 30), white));
+  const top = 0.006, parts = {};
+  const stickPos = new THREE.Vector3(-sx * 0.0095, top, -0.007);
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.005, 0.0065, 0.009, 16), mk(0x202020)); stem.position.copy(stickPos).y += 0.0045; plate.add(stem);
+  parts.stick = new THREE.Mesh(new THREE.CylinderGeometry(0.0098, 0.0098, 0.0045, 22), mk(0x202020)); parts.stick.position.copy(stickPos).y += 0.011; plate.add(parts.stick);
+  const faceBtn = (x, z, name, bg, fg) => {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.004, 22), mk(0x202020)); m.position.set(x, top + 0.002, z); plate.add(m);
+    const tex = capTexture(name, bg, fg);
+    const cap = new THREE.Mesh(new THREE.CircleGeometry(0.0056, 22), new THREE.MeshBasicMaterial({ map: tex })); cap.rotation.x = -Math.PI / 2; cap.position.set(x, top + 0.0042, z); plate.add(cap);
+    return { m, cap, tex, pos: new THREE.Vector3(x, top + 0.004, z) };
+  };
+  parts.lower = hand === 'right' ? faceBtn(sx * 0.011, 0.012, 'pencil', C.yellow, C.ink) : faceBtn(sx * 0.011, 0.012, 'menu', '#202020', '#fff');
+  parts.upper = hand === 'right' ? faceBtn(sx * 0.0165, -0.005, 'undo', '#202020', '#fff') : faceBtn(sx * 0.0165, -0.005, 'redo', '#202020', '#fff');
+  const meta = new THREE.Mesh(new THREE.CylinderGeometry(0.0036, 0.0036, 0.002, 16), mk(0x9a9a9a)); meta.position.set(-sx * 0.006, top + 0.001, 0.017); plate.add(meta);
+  parts.trigger = new THREE.Mesh(new THREE.BoxGeometry(0.017, 0.02, 0.024), mk(0x202020)); parts.trigger.position.set(0, -0.031, 0.012); parts.trigger.rotation.x = -0.35; grp.add(parts.trigger);
+  const hdir = new THREE.Vector3(0, -0.07, 0.05), hlen = hdir.length(), hn = hdir.clone().normalize();
+  const handle = new THREE.Mesh(new THREE.CapsuleGeometry(0.0175, hlen, 6, 18), white); handle.position.set(0, -0.022, 0.058).addScaledVector(hdir, 0.5); handle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), hn); grp.add(handle);
+  parts.grip = new THREE.Mesh(new THREE.CapsuleGeometry(0.0062, 0.02, 4, 12), mk(0x202020)); parts.grip.position.set(-sx * 0.005, -0.058, 0.066); parts.grip.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), hn); grp.add(parts.grip);
+  if (hand === 'right') { parts.nib = new THREE.Mesh(new THREE.ConeGeometry(0.0055, 0.026, 14), new THREE.MeshBasicMaterial({ color: 0xFFD400 })); parts.nib.rotation.x = -Math.PI / 2; parts.nib.position.set(0, 0, -0.027); grp.add(parts.nib); }
+  // labels with leader lines
+  plate.updateMatrix();
+  const P = (v) => v.clone().applyMatrix4(plate.matrix), tags = new THREE.Group(), lead = [];
+  const tag = (name, anchor, pos, key, text, col) => {
+    const t = makeTag(key, text, col); t.sprite.position.copy(pos); tags.add(t.sprite); parts['tag_' + name] = t;
+    lead.push(anchor.x, anchor.y, anchor.z, pos.x - Math.sign(pos.x) * 0.036, pos.y, pos.z);
+  };
+  if (hand === 'right') {
+    tag('lower', P(parts.lower.pos), new THREE.Vector3(0.105, 0.016, 0.062), 'A', 'draw / erase', C.yellow);
+    tag('upper', P(parts.upper.pos), new THREE.Vector3(0.105, 0.042, 0.04), 'B', 'undo', C.ink);
+    tag('trigger', new THREE.Vector3(0.009, -0.03, 0.008), new THREE.Vector3(0.105, -0.012, -0.012), 'TRIGGER', 'draw', C.yellow);
+    tag('grip', new THREE.Vector3(0, -0.058, 0.064), new THREE.Vector3(0.105, -0.06, 0.07), 'GRIP', 'grab, both = scale', C.blue);
+    tag('stick', P(parts.stick.position), new THREE.Vector3(-0.105, 0.04, 0.032), 'STICK', 'join 3.0 cm', C.blue);
+  } else {
+    tag('lower', P(parts.lower.pos), new THREE.Vector3(-0.105, 0.016, 0.062), 'X', 'menu', C.ink);
+    tag('upper', P(parts.upper.pos), new THREE.Vector3(-0.105, 0.042, 0.04), 'Y', 'redo', C.ink);
+    tag('grip', new THREE.Vector3(0, -0.058, 0.064), new THREE.Vector3(-0.105, -0.06, 0.07), 'GRIP', 'grab, both = scale', C.blue);
+  }
+  const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(lead, 3));
+  tags.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0xffffff })));
+  grp.add(tags); grp.userData = { parts, tags, hand };
+  grp.traverse((o) => { o.frustumCulled = false; });
+  return grp;
+}
+const models = { left: buildController('left'), right: buildController('right') };
+models.left.add(vrPanel); models.right.add(laser);
+function refreshTags() {
+  const r = models.right.userData.parts, t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0;
+  const col = tool === 'erase' ? C.red : tool === 'bend' ? C.blue : C.yellow, hex = tool === 'erase' ? 0xE8212B : tool === 'bend' ? 0x2A7BFF : 0xFFD400;
+  r.tag_trigger.set('TRIGGER', tool, col);
+  r.tag_lower.set('A', 'next tool: ' + (tool === 'draw' ? 'erase' : tool === 'erase' ? 'bend' : 'draw'), col);
+  const reach = spect ? spect.bendR : state.bendR;
+  r.tag_stick.set('STICK', tool === 'bend' ? 'reach ' + Math.round(reach * 100) + ' cm' : 'join ' + (state.tol * 100).toFixed(1) + ' cm', C.blue);
+  if (r.capTool !== tool) {
+    r.capTool = tool;
+    if (tool === 'erase') r.lower.tex.userData.set('x', C.red, '#fff'); else if (tool === 'bend') r.lower.tex.userData.set('bend', C.blue, '#fff'); else r.lower.tex.userData.set('pencil', C.yellow, C.ink);
+    r.nib.material.color.set(hex);
+  }
+  tolBall.material.color.set(hex);
+  models.left.userData.tags.visible = models.right.userData.tags.visible = state.show.labels;
+}
+
+const hands = { left: null, right: null };
+for (let i = 0; i < 2; i++) {
+  const ray = renderer.xr.getController(i); scene.add(ray);
+  ray.addEventListener('connected', (e) => {
+    const src = e.data; if (!src || src.hand || !src.gamepad) return;
+    const h = src.handedness; if (h !== 'left' && h !== 'right') return;
+    hands[h] = { obj: ray, src }; ray.userData.hand = h; ray.add(models[h]);
+  });
+  ray.addEventListener('disconnected', () => { const h = ray.userData.hand; if (h && hands[h] && hands[h].obj === ray) { ray.remove(models[h]); hands[h] = null; } ray.userData.hand = null; });
+}
+const readPad = (src) => {
+  const gp = src.gamepad, b = gp.buttons;
+  return { trigger: b[0] ? b[0].value : 0, grip: b[1] ? b[1].value : 0, a: !!(b[4] && b[4].pressed), b: !!(b[5] && b[5].pressed), stickX: gp.axes.length > 2 ? gp.axes[2] : 0 };
+};
+const pulse = (h, strength, ms) => { try { const a = h.src && h.src.gamepad && h.src.gamepad.hapticActuators; if (a && a[0]) a[0].pulse(strength, ms); } catch (e) { /* no haptics */ } };
+
+const xs = { trig: false, uiCap: false, hadOver: false, ux: 0, uy: 0, drawing: false, erasing: false, bending: null, eraseStart: null, live: [], pa: false, pb: false, px: false, py: false, grab: 0 };
+const grab = { rel: new THREE.Matrix4(), w0: new THREE.Matrix4(), mid0: new THREE.Vector3(), d0: 1, dir0: new THREE.Vector3(), s0: 1 };
+const pen = new THREE.Vector3(), penM = new THREE.Vector3(), vO = new THREE.Vector3(), vD = new THREE.Vector3(), q1 = new THREE.Quaternion(), m1 = new THREE.Matrix4(), m2 = new THREE.Matrix4();
+function updateGrab(L, R) {
+  const mode = (L && L.pad.grip > 0.5 ? 1 : 0) | (R && R.pad.grip > 0.5 ? 2 : 0);
+  if (mode !== xs.grab) {
+    world.updateMatrix();
+    if (mode === 3) {
+      tA.setFromMatrixPosition(L.obj.matrixWorld); tB.setFromMatrixPosition(R.obj.matrixWorld);
+      grab.mid0.addVectors(tA, tB).multiplyScalar(0.5); grab.d0 = Math.max(0.02, tA.distanceTo(tB)); grab.dir0.subVectors(tB, tA).normalize(); grab.w0.copy(world.matrix); grab.s0 = world.scale.x;
+    } else if (mode) grab.rel.copy((mode === 1 ? L : R).obj.matrixWorld).invert().multiply(world.matrix);
+    else if (Math.abs(world.scale.x / dispScale - 1) > 0.06) refreshDisplayScale();
+    xs.grab = mode;
+  }
+  if (mode === 3) {
+    tA.setFromMatrixPosition(L.obj.matrixWorld); tB.setFromMatrixPosition(R.obj.matrixWorld);
+    const s = clamp(Math.max(0.02, tA.distanceTo(tB)) / grab.d0, 0.03 / grab.s0, 60 / grab.s0);
+    vD.subVectors(tB, tA).normalize(); q1.setFromUnitVectors(grab.dir0, vD); tC.addVectors(tA, tB).multiplyScalar(0.5);
+    m1.makeTranslation(tC.x, tC.y, tC.z); m2.makeRotationFromQuaternion(q1); m1.multiply(m2); m2.makeScale(s, s, s); m1.multiply(m2);
+    m2.makeTranslation(-grab.mid0.x, -grab.mid0.y, -grab.mid0.z); m1.multiply(m2).multiply(grab.w0);
+    m1.decompose(world.position, world.quaternion, world.scale);
+  } else if (mode) {
+    m1.copy((mode === 1 ? L : R).obj.matrixWorld).multiply(grab.rel); m1.decompose(world.position, world.quaternion, world.scale);
+  }
+}
+function setPressed(part, on) { if (part && part.material && part.material.color) part.material.color.set(on ? 0xFFD400 : 0x202020); }
+// one frame of XR interaction. L / R = { obj (ray-space Object3D), pad, src } or null
+function xrFrame(dt, L, R) {
+  if (L) L.obj.updateMatrixWorld(true); if (R) R.obj.updateMatrixWorld(true);
+  lastXR.L = L; lastXR.R = R;
+  updateGrab(L, R);
+  world.updateMatrixWorld(true);
+  const ws = world.scale.x;
+  if (R) {
+    pen.copy(PEN_LOCAL).applyMatrix4(R.obj.matrixWorld); penM.copy(pen); world.worldToLocal(penM);
+    let over = false, hitDist = 0;
+    if (vrPanel.visible && L) {
+      vO.setFromMatrixPosition(R.obj.matrixWorld); vD.set(0, 0, -1).transformDirection(R.obj.matrixWorld);
+      raycaster.set(vO, vD); raycaster.near = 0; raycaster.far = 0.9;
+      const hit = raycaster.intersectObject(vrPanel, false)[0];
+      if (hit && hit.uv && tA.set(0, 0, 1).transformDirection(vrPanel.matrixWorld).dot(vD) < 0) { over = true; xs.ux = hit.uv.x * UIW; xs.uy = (1 - hit.uv.y) * UIH; hitDist = hit.distance; }
+    }
+    const trig = xs.trig ? R.pad.trigger > 0.2 : R.pad.trigger > 0.45, down = trig && !xs.trig, up = !trig && xs.trig; xs.trig = trig;
+    const penBusy = xs.drawing || xs.erasing || !!xs.bending;
+    if ((over || xs.uiCap) && !penBusy) {
+      if (down && over) { xs.uiCap = true; uiPointer('down', xs.ux, xs.uy); } else uiPointer('move', xs.ux, xs.uy);
+      if (up && xs.uiCap) { xs.uiCap = false; uiPointer('up', xs.ux, xs.uy); pulse(R, 0.3, 20); }
+    } else {
+      if (xs.hadOver) uiPointer('leave', 0, 0);
+      if (down) {
+        if (state.tool === 'erase') { xs.erasing = true; xs.eraseStart = state.strokes; }
+        else if (state.tool === 'bend') xs.bending = startBend(penM, state.bendR / ws);
+        else { xs.drawing = true; xs.live = [penM.x, penM.y, penM.z]; }
+      }
+    }
+    xs.hadOver = over;
+    laser.visible = over && !penBusy; cursorDot.visible = laser.visible;
+    if (laser.visible) { laser.scale.z = hitDist; cursorDot.position.set((xs.ux / UIW - 0.5) * PANEL_W, (0.5 - xs.uy / UIH) * PANEL_H, 0.001); }
+    if (xs.drawing) {
+      const n = xs.live.length, dx = penM.x - xs.live[n - 3], dy = penM.y - xs.live[n - 2], dz = penM.z - xs.live[n - 1], step = 0.003 / ws;
+      if (dx * dx + dy * dy + dz * dz > step * step && n < liveBuf.length - 3) { xs.live.push(penM.x, penM.y, penM.z); setLive(xs.live); Net.live(xs.live); }
+      if (!trig) { xs.drawing = false; Net.liveEnd(); finishStroke(xs.live, ws); xs.live = []; setLive(null); pulse(R, 0.5, 30); }
+    }
+    if (xs.erasing) {
+      const r2 = eraserRadiusModel(ws) ** 2, px = penM.x, py = penM.y, pz = penM.z;
+      if (eraseWhere((x, y, z) => (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < r2)) { strokesTouched(); pulse(R, 0.25, 12); }
+      if (!trig) { xs.erasing = false; if (state.strokes !== xs.eraseStart) { undoStack.push(xs.eraseStart); redoStack.length = 0; ui.dirty = true; } xs.eraseStart = null; }
+    }
+    if (xs.bending) { applyBend(xs.bending, penM); if (!trig) { endBend(xs.bending); xs.bending = null; } }
+    if (R.pad.a && !xs.pa && !penBusy) setTool(state.tool === 'draw' ? 'erase' : state.tool === 'erase' ? 'bend' : 'draw');
+    if (R.pad.b && !xs.pb) undo();
+    xs.pa = R.pad.a; xs.pb = R.pad.b;
+    if (Math.abs(R.pad.stickX) > 0.5 && !penBusy) {
+      if (state.tool === 'bend') { state.bendR = clamp(state.bendR * Math.exp(R.pad.stickX * dt * 1.1), 0.03, 0.5); refreshTags(); scheduleSave(); }
+      else setTol(state.tol * Math.exp(R.pad.stickX * dt * 1.1));
+    }
+    tolBall.visible = !laser.visible; tolBall.position.copy(pen);
+    tolBall.scale.setScalar(state.tool === 'erase' ? eraserRadiusModel(ws) * ws : state.tool === 'bend' ? state.bendR : state.tol * ws);
+    const p = models.right.userData.parts; setPressed(p.trigger, trig); setPressed(p.grip, R.pad.grip > 0.5); setPressed(p.lower.m, R.pad.a); setPressed(p.upper.m, R.pad.b); setPressed(p.stick, Math.abs(R.pad.stickX) > 0.5);
+  } else {
+    if (xs.drawing) { Net.liveEnd(); finishStroke(xs.live, ws); setLive(null); }
+    if (xs.bending) { endBend(xs.bending); xs.bending = null; }
+    if (xs.erasing && state.strokes !== xs.eraseStart) { undoStack.push(xs.eraseStart); redoStack.length = 0; }
+    xs.drawing = xs.erasing = xs.trig = xs.uiCap = false; tolBall.visible = laser.visible = cursorDot.visible = false;
+  }
+  if (L) {
+    if (L.pad.a && !xs.px) { vrPanel.visible = !vrPanel.visible; pulse(L, 0.3, 20); }
+    if (L.pad.b && !xs.py) redo();
+    xs.px = L.pad.a; xs.py = L.pad.b;
+    const p = models.left.userData.parts; setPressed(p.trigger, L.pad.trigger > 0.45); setPressed(p.grip, L.pad.grip > 0.5); setPressed(p.lower.m, L.pad.a); setPressed(p.upper.m, L.pad.b);
+  }
+}
+function xrTick(dt) {
+  const get = (h) => (hands[h] && hands[h].src && hands[h].src.gamepad ? { obj: hands[h].obj, src: hands[h].src, pad: readPad(hands[h].src) } : null);
+  xrFrame(dt, get('left'), get('right'));
+}
+
+async function enterXR() {
+  if (!navigator.xr || inXR) return;
+  const mode = xrSupport.ar ? 'immersive-ar' : 'immersive-vr';
+  try {
+    const session = await navigator.xr.requestSession(mode, { optionalFeatures: ['local-floor', 'bounded-floor'] });
+    renderer.xr.setReferenceSpaceType('local-floor');
+    try { await renderer.xr.setSession(session); }
+    catch (e) { renderer.xr.setReferenceSpaceType('local'); await renderer.xr.setSession(session); HOME.set(0, -0.15, -0.5); floor.position.y = -1.3; }
+    xrMode = mode; inXR = true; state.mr = false; ui.collapsed = false; if (state.tool === 'look') state.tool = 'draw';
+    sync.sv = Date.now(); Net.strokesChanged();   // the headset's sketch is the one everybody follows
+    world.position.copy(HOME); world.quaternion.identity(); world.scale.setScalar(1); refreshDisplayScale();
+    vrPanel.visible = true; applyMR(); refreshTags(); layoutUI(); $('enter').hidden = true; $('hint').hidden = true;
+    session.addEventListener('end', () => {
+      inXR = false; xrMode = null; xs.grab = 0; tolBall.visible = false;
+      world.position.copy(HOME); world.quaternion.identity(); world.scale.setScalar(1); refreshDisplayScale();
+      applyMR(); layoutUI(); $('enter').hidden = false; $('hint').hidden = false; onResize();
+    });
+  } catch (e) { toast('VR could not start: ' + (e && e.message ? e.message : e)); }
+}
+$('enter').addEventListener('click', enterXR);
+
+// =====================================================================
+// MULTIPLAYER  (artifact `room` capability; everything degrades to single-player when it is absent)
+//  - sketch: every raw stroke has an id. A change sends the new strokes ('stk', chunked, 16-bit packed) and then
+//    the ordered id list ('ord') stamped with sync.sv. Receivers apply a list once they hold every stroke in it,
+//    and ask ('need') for anything that got dropped. The newest stamp wins.
+//  - settings + poses ride in presence (small, high-rate, handed to late joiners): P = settings stamped sync.pv,
+//    and for the headset its head / controllers / model transform / menu state; for flat views their camera.
+//  - a flat view that sees a headset peer becomes its spectator: same model transform, controllers with labels,
+//    left-hand menu, pen, live stroke. The headset draws each flat view's camera as a frustum outline.
+// =====================================================================
+const r4 = (v) => Math.round(v * 1e4) / 1e4;
+const b64enc = (u8) => { let t = ''; for (let i = 0; i < u8.length; i += 4096) t += String.fromCharCode.apply(null, u8.subarray(i, i + 4096)); return btoa(t); };
+const b64dec = (str) => { const t = atob(str), u = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) u[i] = t.charCodeAt(i); return u; };
+function packPts(f, from, to) {
+  const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  for (let i = from; i < to; i++) for (let k = 0; k < 3; k++) { const v = f[3 * i + k]; if (v < mn[k]) mn[k] = v; if (v > mx[k]) mx[k] = v; }
+  const o = mn.map((v) => Math.floor(v * 1e4) / 1e4), q = Math.max(1e-4, Math.max(mx[0] - o[0], mx[1] - o[1], mx[2] - o[2]) / 65000);
+  const a = new Uint16Array((to - from) * 3);
+  for (let i = from; i < to; i++) for (let k = 0; k < 3; k++) a[(i - from) * 3 + k] = Math.round((f[3 * i + k] - o[k]) / q);
+  return { o, q, b: b64enc(new Uint8Array(a.buffer)) };
+}
+function unpackPts(d) {
+  if (!d || typeof d.b !== 'string' || !Array.isArray(d.o) || d.o.length !== 3 || !(d.q > 0) || d.b.length > 6000) return null;
+  const u = b64dec(d.b), n = u.length >> 1, a = new Uint16Array(u.buffer.slice(0, n * 2)), f = new Float32Array(n);
+  for (let i = 0; i < n; i++) f[i] = +d.o[i % 3] + a[i] * d.q;
+  return n % 3 === 0 && f.every(Number.isFinite) ? f : null;
+}
+const proxyL = new THREE.Group(), proxyR = new THREE.Group(); proxyL.visible = proxyR.visible = false; scene.add(proxyL, proxyR);
+const headMark = (() => {   // the headset itself, shown to spectators
+  const g = new THREE.Group(), wht = new THREE.MeshLambertMaterial({ color: 0xf2f2f2 }), drk = new THREE.MeshLambertMaterial({ color: 0x202020 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.095, 0.085), wht); body.position.z = -0.045; g.add(body);
+  const face = new THREE.Mesh(new THREE.BoxGeometry(0.165, 0.078, 0.012), drk); face.position.z = -0.092; g.add(face);
+  const strap = new THREE.Mesh(new THREE.TorusGeometry(0.095, 0.011, 8, 28), drk); strap.rotation.x = Math.PI / 2; strap.position.z = 0.06; g.add(strap);
+  g.traverse((o) => { o.frustumCulled = false; }); g.visible = false; scene.add(g); return g;
+})();
+const frusta = new Map();
+function frustumFor(peer) {
+  let g = frusta.get(peer); if (g) return g;
+  g = new THREE.Group();
+  const lines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xFFD400 }));
+  lines.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(16 * 3), 3));
+  const box = new THREE.BoxGeometry(1, 1, 0.009), body = new THREE.Mesh(box, new THREE.MeshBasicMaterial({ color: 0x0b0b0b }));
+  body.add(new THREE.LineSegments(new THREE.EdgesGeometry(box), new THREE.LineBasicMaterial({ color: 0xFFD400 })));
+  g.add(lines, body); g.userData = { lines, body, key: '', fresh: true }; g.traverse((o) => { o.frustumCulled = false; });
+  scene.add(g); frusta.set(peer, g); return g;
+}
+function shapeFrustum(g, fov, aspect) {
+  const key = fov + '/' + aspect; if (g.userData.key === key) return; g.userData.key = key;
+  const D = 0.3, hh = D * Math.tan((clamp(fov, 10, 120) * Math.PI) / 360), hw = hh * clamp(aspect, 0.2, 5);
+  const c = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]], a = g.userData.lines.geometry.attributes.position; let o = 0;
+  for (let i = 0; i < 4; i++) { a.setXYZ(o++, 0, 0, 0); a.setXYZ(o++, c[i][0], c[i][1], -D); }
+  for (let i = 0; i < 4; i++) { const j = (i + 1) % 4; a.setXYZ(o++, c[i][0], c[i][1], -D); a.setXYZ(o++, c[j][0], c[j][1], -D); }
+  a.needsUpdate = true;
+  if (aspect < 1) g.userData.body.scale.set(0.074, 0.154, 1); else g.userData.body.scale.set(0.154, 0.074, 1);
+}
+const nP = new THREE.Vector3(), nQ = new THREE.Quaternion(), nS = new THREE.Vector3();
+const pose7 = (o) => { o.matrixWorld.decompose(nP, nQ, nS); return [r4(nP.x), r4(nP.y), r4(nP.z), r4(nQ.x), r4(nQ.y), r4(nQ.z), r4(nQ.w)]; };
+const okPose = (a, n) => Array.isArray(a) && a.length === n && a.every((v) => typeof v === 'number' && Number.isFinite(v));
+function setPose(obj, a, k) {
+  nP.set(a[0], a[1], a[2]); nQ.set(a[3], a[4], a[5], a[6]).normalize();
+  if (k >= 1) { obj.position.copy(nP); obj.quaternion.copy(nQ); } else { obj.position.lerp(nP, k); obj.quaternion.slerp(nQ, k); }
+}
+// The same little interface as the artifact room, carried over PeerJS for when the page lives on GitHub Pages.
+// One device claims the id for the room code and relays between the others; if it leaves, someone else claims it.
+function peerRoom(code, onStatus) {
+  const HOST = 'quadrille-xr-' + code, me = Math.random().toString(36).slice(2, 12), conns = new Map(), subs = {}, others = new Map();
+  let peer = null, host = false, hostConn = null, mine = {}, snap = [], alive = true, retryT = 0;
+  const rebuild = () => { snap = [{ peer: me, sameTab: true, presence: mine }].concat([...others].map(([p, q]) => ({ peer: p, sameTab: false, presence: q }))); };
+  const deliver = (m) => {
+    if (m.t === 'e') (subs[m.topic] || []).forEach((fn) => { try { fn({ topic: m.topic, data: m.data, peer: m.from, sameTab: false }); } catch (e) { console.error(e); } });
+    else if (m.t === 'p') { others.set(m.from, m.presence || {}); rebuild(); } else if (m.t === 'bye') { others.delete(m.from); rebuild(); }
+  };
+  const send = (m) => { try { if (host) { for (const c of conns.values()) if (c.open) c.send(m); } else if (hostConn && hostConn.open) hostConn.send(m); } catch (e) { /* dropped */ } };
+  const retry = () => {
+    if (!alive || retryT) return; onStatus('connecting');
+    retryT = setTimeout(() => { retryT = 0; try { if (peer) peer.destroy(); } catch (e) {} others.clear(); conns.clear(); hostConn = null; rebuild(); beHost(); }, 1200 + Math.random() * 1800);
+  };
+  function beHost() {
+    if (!alive) return; host = false; const p = peer = new window.Peer(HOST);
+    p.on('open', () => { host = true; onStatus('open'); });
+    p.on('connection', (c) => {
+      c.on('open', () => { conns.set(c.peer, c); c.send({ t: 'p', from: me, presence: mine }); for (const [o, q] of others) c.send({ t: 'p', from: o, presence: q }); });
+      c.on('data', (m) => { if (!m || typeof m !== 'object' || typeof m.from !== 'string') return; c.who = m.from; deliver(m); for (const o of conns.values()) if (o !== c && o.open) o.send(m); });
+      c.on('close', () => { conns.delete(c.peer); if (c.who) { const b = { t: 'bye', from: c.who }; deliver(b); for (const o of conns.values()) if (o.open) o.send(b); } });
+    });
+    p.on('error', (e) => { if (p !== peer) return; if (e && e.type === 'unavailable-id') { try { p.destroy(); } catch (x) {} beClient(); } else retry(); });
+    p.on('disconnected', () => { try { p.reconnect(); } catch (e) {} });
+  }
+  function beClient() {
+    if (!alive) return; const p = peer = new window.Peer();
+    p.on('open', () => {
+      const c = hostConn = p.connect(HOST, { reliable: true });
+      c.on('open', () => { onStatus('open'); c.send({ t: 'p', from: me, presence: mine }); });
+      c.on('data', (m) => { if (m && typeof m === 'object' && typeof m.from === 'string') deliver(m); });
+      c.on('close', () => { if (p === peer) retry(); });
+    });
+    p.on('error', () => { if (p === peer) retry(); });
+  }
+  rebuild(); beHost();
+  return {
+    emit(topic, data) { send({ t: 'e', topic, data, from: me }); return Promise.resolve(); },
+    on(topic, fn) { (subs[topic] = subs[topic] || []).push(fn); return () => {}; },
+    presence(patch) { mine = Object.assign({}, mine, patch); rebuild(); send({ t: 'p', from: me, presence: mine }); return Promise.resolve(); },
+    peers: () => snap,
+    leave() { alive = false; clearTimeout(retryT); try { if (peer) peer.destroy(); } catch (e) {} },
+  };
+}
+const Net = (() => {
+  const CH = 400;
+  let code = '', status = 'off';
+  let room = null, queue = [], tokens = 20, lastPres = '', presAcc = 0, needAt = 0, ordTimer = 0, pend = null, ordIn = null;
+  let liveSeq = 1, liveSent = 0, liveLast = 0;
+  const cache = new Map(), sent = new Set(), parts = new Map();
+  const sid = (st) => st.id || (st.id = Math.random().toString(36).slice(2, 9) + (st.length % 97).toString(36));
+  const enqueue = (topic, data) => queue.push({ topic, data });
+  function strokeMsgs(st) { const n = st.length / 3; for (let i = 0; i < n; i += CH) enqueue('stk', Object.assign({ id: st.id, n, i }, packPts(st, i, Math.min(n, i + CH)))); }
+  function orderMsgs() { const ids = state.strokes.map(sid); if (!ids.length) enqueue('ord', { sv: sync.sv, n: 0, i: 0, ids: [] }); for (let i = 0; i < ids.length; i += 300) enqueue('ord', { sv: sync.sv, n: ids.length, i, ids: ids.slice(i, i + 300) }); }
+  function pushOrder() {
+    ordTimer = 0; if (!room) return;
+    const keep = new Set(state.strokes.map(sid)); state.strokes.forEach((st) => cache.set(st.id, st));
+    queue = queue.filter((m) => m.topic !== 'ord' && !(m.topic === 'stk' && !keep.has(m.data.id)));
+    for (const st of state.strokes) if (!sent.has(st.id)) { sent.add(st.id); strokeMsgs(st); }
+    orderMsgs();
+    if (cache.size > 4000) { cache.clear(); state.strokes.forEach((st) => cache.set(st.id, st)); }
+  }
+  function tryApply() {
+    if (!pend) return;
+    if (pend.sv <= sync.sv) { pend = null; return; }
+    if (!pend.ids.every((id) => cache.has(id))) return;
+    state.strokes = pend.ids.map((id) => cache.get(id)); sync.sv = pend.sv; pend = null;
+    if (spect) { spect.live = []; spect.liveEndAt = 0; setLive(null); }
+    strokesTouched(true);
+  }
+  function onStroke(d) {
+    if (!d || typeof d.id !== 'string' || d.id.length > 16 || !Number.isInteger(d.n) || d.n < 1 || d.n > 40000 || !Number.isInteger(d.i) || d.i < 0) return;
+    if (cache.has(d.id)) return;
+    const pts = unpackPts(d); if (!pts) return;
+    let e = parts.get(d.id); if (!e || e.n !== d.n) { e = { n: d.n, f: new Float32Array(d.n * 3), got: 0, seen: new Set() }; parts.set(d.id, e); }
+    if (d.i * 3 + pts.length > e.f.length || e.seen.has(d.i)) return;
+    e.f.set(pts, d.i * 3); e.seen.add(d.i); e.got += pts.length / 3;
+    if (e.got >= e.n) { e.f.id = d.id; cache.set(d.id, e.f); sent.add(d.id); parts.delete(d.id); tryApply(); }
+    if (parts.size > 400) parts.clear();
+  }
+  function onOrder(d) {
+    if (!d || typeof d.sv !== 'number' || !Number.isInteger(d.n) || d.n < 0 || d.n > 6000 || !Number.isInteger(d.i) || !Array.isArray(d.ids)) return;
+    if (d.sv <= sync.sv || (pend && d.sv <= pend.sv)) return;
+    if (!ordIn || ordIn.sv !== d.sv) ordIn = { sv: d.sv, n: d.n, ids: new Array(d.n), got: 0, seen: new Set() };
+    if (ordIn.seen.has(d.i) || d.i + d.ids.length > d.n) return;
+    d.ids.forEach((id, k) => { ordIn.ids[d.i + k] = String(id).slice(0, 16); }); ordIn.seen.add(d.i); ordIn.got += d.ids.length;
+    if (ordIn.got >= ordIn.n) { pend = { sv: ordIn.sv, ids: ordIn.ids, at: performance.now() }; ordIn = null; tryApply(); }
+  }
+  function onNeed(d) {
+    if (!d) return;
+    if (Array.isArray(d.ids)) for (const id of d.ids.slice(0, 300)) { const st = cache.get(id) || state.strokes.find((x) => x.id === id); if (st) { sid(st); strokeMsgs(st); } }
+    if (d.ord && sync.sv > 0 && sync.sv >= d.sv) { state.strokes.forEach((st) => cache.set(sid(st), st)); orderMsgs(); }
+  }
+  function onLive(m) {
+    if (!spect || m.peer !== spect.peer) return; const d = m.data; if (!d) return;
+    if (d.end) { spect.liveEndAt = performance.now(); return; }
+    const pts = unpackPts(d); if (!pts || !Number.isInteger(d.i) || d.i < 0 || d.i > 8000) return;
+    if (d.k !== spect.liveK) { spect.liveK = d.k; spect.live = []; }
+    spect.liveEndAt = 0;
+    while (spect.live.length < d.i * 3) spect.live.push(pts[0], pts[1], pts[2]);
+    spect.live.length = d.i * 3; for (let i = 0; i < pts.length; i++) spect.live.push(pts[i]);
+    setLive(spect.live);
+  }
+  function applyParams(q) {
+    const P = q.P; if (!okPose(P, 6)) return;
+    state.tol = clamp(P[0], TOL_MIN, TOL_MAX); state.autoLoops = clamp(P[1] | 0, 0, 6); state.smooth = clamp(P[2] | 0, 0, 3); state.fit = clamp(P[3], 0, 1); state.tidy = clamp(P[4], 0, 1);
+    const b = P[5] | 0; state.show.sketch = !!(b & 1); state.show.curves = !!(b & 2); state.show.surface = !!(b & 4); state.show.wire = !!(b & 8); state.show.labels = !!(b & 16);
+    sync.pv = q.pv; applyShow(); refreshTags(); requestBuild(); scheduleSave(); ui.dirty = true;
+  }
+  function myPresence() {
+    const b = (state.show.sketch ? 1 : 0) | (state.show.curves ? 2 : 0) | (state.show.surface ? 4 : 0) | (state.show.wire ? 8 : 0) | (state.show.labels ? 16 : 0);
+    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b], c: null, h: null, w: null, L: null, R: null, u: null };
+    if (isPresenter()) {
+      const hand = (H) => (H ? pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickX || 0) > 0.5 ? 16 : 0)]) : null);
+      world.updateMatrixWorld(); camera.updateMatrixWorld();
+      p.h = pose7(camera); p.w = pose7(world).concat([r4(world.scale.x)]); p.L = hand(lastXR.L); p.R = hand(lastXR.R);
+      p.u = [TOOLS.indexOf(state.tool), ui.tab, vrPanel.visible ? 1 : 0, state.mr ? 1 : 0, xrMode === 'immersive-ar' ? 1 : 0, laser.visible ? 1 : 0, Math.round(xs.ux), Math.round(xs.uy), r4(laser.scale.z), r4(state.bendR)];
+    } else { camera.updateMatrixWorld(); p.c = pose7(camera).concat([Math.round(camera.fov), r4(camera.aspect)]); }
+    return p;
+  }
+  function watch(peer, dt) {
+    const q = peer.presence, first = !spect || spect.peer !== peer.peer;
+    if (first) {
+      spect = { peer: peer.peer, tool: 'draw', tab: -1, mr: false, ar: false, bendR: 0.12, panel: true, live: [], liveK: -1, liveEndAt: 0 };
+      proxyL.add(models.left); proxyR.add(models.right); $('panelWrap').hidden = true; $('watch').hidden = false; $('roomBox').hidden = true; endGesture(true);
+    }
+    const k = first ? 1 : 1 - Math.exp(-dt * 16), u = Array.isArray(q.u) ? q.u : [];
+    const tool = TOOLS[u[0]] || 'draw', tab = clamp(u[1] | 0, 0, 3), mr = !!u[3], ar = !!u[4], bendR = clamp(+u[9] || 0.12, 0.03, 0.5);
+    const relayout = first || tab !== spect.tab || mr !== spect.mr || ar !== spect.ar, retag = first || tool !== spect.tool || bendR !== spect.bendR;
+    spect.tool = tool; spect.tab = tab; spect.mr = mr; spect.ar = ar; spect.bendR = bendR; spect.panel = !!u[2];
+    if (relayout) { ui.tab = tab; ui.collapsed = false; layoutUI(); }
+    if (retag) { refreshTags(); ui.dirty = true; }
+    if (okPose(q.w, 8)) {
+      setPose(world, q.w, k); const sc = clamp(q.w[7], 0.03, 60); world.scale.setScalar(k >= 1 ? sc : world.scale.x + (sc - world.scale.x) * k);
+      if (Math.abs(world.scale.x / dispScale - 1) > 0.06) refreshDisplayScale();
+    }
+    headMark.visible = okPose(q.h, 7); if (headMark.visible) setPose(headMark, q.h, k);
+    for (const [prox, a, key] of [[proxyL, q.L, 'left'], [proxyR, q.R, 'right']]) {
+      prox.visible = okPose(a, 8); if (!prox.visible) continue;
+      setPose(prox, a, k); const pr = models[key].userData.parts, bits = a[7] | 0;
+      setPressed(pr.trigger, bits & 1); setPressed(pr.grip, bits & 2); setPressed(pr.lower.m, bits & 4); setPressed(pr.upper.m, bits & 8); setPressed(pr.stick, bits & 16);
+    }
+    vrPanel.visible = spect.panel;
+    if (proxyR.visible) {
+      proxyR.updateMatrixWorld(true); pen.copy(PEN_LOCAL).applyMatrix4(proxyR.matrixWorld);
+      laser.visible = cursorDot.visible = !!u[5] && spect.panel && proxyL.visible;
+      if (laser.visible) { laser.scale.z = clamp(+u[8] || 0.2, 0.01, 2); cursorDot.position.set(((+u[6] || 0) / UIW - 0.5) * PANEL_W, (0.5 - (+u[7] || 0) / UIH) * PANEL_H, 0.001); }
+      const ws = world.scale.x; tolBall.visible = !laser.visible; tolBall.position.copy(pen);
+      tolBall.scale.setScalar(tool === 'erase' ? eraserRadiusModel(ws) * ws : tool === 'bend' ? bendR : state.tol * ws);
+    } else tolBall.visible = laser.visible = cursorDot.visible = false;
+    if (spect.liveEndAt && performance.now() - spect.liveEndAt > 1500) { spect.live = []; spect.liveEndAt = 0; setLive(null); }
+    orbitTarget.lerp(world.position, first ? 1 : 1 - Math.exp(-dt * 3)); applyOrbit();
+  }
+  function unwatch() {
+    spect = null; proxyL.visible = proxyR.visible = headMark.visible = false; tolBall.visible = laser.visible = cursorDot.visible = false; vrPanel.visible = true; setLive(null);
+    if (!inXR) { world.position.copy(HOME); world.quaternion.identity(); world.scale.setScalar(1); refreshDisplayScale(); orbitTarget.copy(HOME); applyOrbit(); }
+    $('panelWrap').hidden = false; $('watch').hidden = true; $('roomBox').hidden = IN_CLAUDE; layoutUI(); refreshTags();
+  }
+  function showFrusta(list, dt) {
+    const seen = new Set();
+    for (const p of list) {
+      const c = p.presence.c; if (!okPose(c, 9)) continue;
+      const g = frustumFor(p.peer); seen.add(p.peer); shapeFrustum(g, c[7], c[8]); setPose(g, c, g.userData.fresh ? 1 : 1 - Math.exp(-dt * 14)); g.userData.fresh = false;
+    }
+    for (const [peer, g] of frusta) if (!seen.has(peer)) { scene.remove(g); frusta.delete(peer); }
+  }
+  function hook(r) {
+    room = r; const quiet = () => {};
+    r.on('stk', (m) => { if (!m.sameTab) onStroke(m.data); }, quiet);
+    r.on('ord', (m) => { if (!m.sameTab) onOrder(m.data); }, quiet);
+    r.on('need', (m) => { if (!m.sameTab) onNeed(m.data); }, quiet);
+    r.on('lv', (m) => { if (!m.sameTab) onLive(m); }, quiet);
+  }
+  let seenN = -1;
+  function frame(dt) {
+    if (!room) return;
+    { const n = (room.peers() || []).length; if (n !== seenN) { seenN = n; ui.dirty = true; if (!IN_CLAUDE) $('roomN').textContent = n > 1 ? '\u00d7' + n : ''; } }
+    tokens = Math.min(30, tokens + dt * 22);
+    while (queue.length && tokens >= 1) { const m = queue.shift(); tokens--; try { room.emit(m.topic, m.data).catch(() => {}); } catch (e) { /* dropped */ } }
+    let peers = []; try { peers = room.peers() || []; } catch (e) { peers = []; }
+    let pres = null, best = null, wantSv = 0; const flats = [];
+    for (const p of peers) {
+      const q = p.presence; if (p.sameTab || !q || q.v !== 1) continue;
+      if (q.r === 'xr' && !pres) pres = p; else if (q.r === 'flat') flats.push(p);
+      if (typeof q.pv === 'number' && q.pv > sync.pv && (!best || q.pv > best.presence.pv)) best = p;
+      if (typeof q.sv === 'number' && q.sv > sync.sv && q.sv > wantSv) wantSv = q.sv;
+    }
+    if (best) applyParams(best.presence);
+    const now = performance.now();
+    if (now > needAt) {
+      if (pend && now - pend.at > 600) { needAt = now + 700; pend.at = now; queue.unshift({ topic: 'need', data: { ids: pend.ids.filter((id) => !cache.has(id)).slice(0, 300) } }); }
+      else if (wantSv && (!pend || pend.sv < wantSv)) { needAt = now + 700; queue.unshift({ topic: 'need', data: { ord: 1, sv: wantSv } }); }
+    }
+    if (!isPresenter() && pres) watch(pres, dt); else if (spect) unwatch();
+    showFrusta(isPresenter() ? flats : [], dt);
+    presAcc += dt;
+    if (presAcc > 0.066) { presAcc = 0; const t = JSON.stringify(myPresence()); if (t !== lastPres) { lastPres = t; try { room.presence(JSON.parse(t)).catch(() => {}); } catch (e) { /* later */ } } }
+  }
+  return {
+    start() {
+      if (IN_CLAUDE) { window.claude.use('room').then((r) => { if (r) { status = 'open'; hook(r); } }).catch(() => {}); return; }
+      // a plain web page: devices meet by a 4-digit room code (in the address after #, typed in the corner box, or remembered)
+      let saved = ''; try { saved = localStorage.getItem('quadrille.room') || ''; } catch (e) { /* none */ }
+      const fromHash = (location.hash || '').replace(/\D/g, '').slice(0, 4);
+      this.join(fromHash.length === 4 ? fromHash : saved.length === 4 ? saved : String(1000 + Math.floor(Math.random() * 9000)));
+      const box = $('roomBox'), inp = $('roomIn'); box.hidden = false; inp.value = code;
+      inp.addEventListener('input', () => { const v = inp.value.replace(/\D/g, '').slice(0, 4); inp.value = v; if (v.length === 4 && v !== code) { this.join(v); inp.blur(); } });
+      for (const ev of ['pointerdown', 'touchstart']) box.addEventListener(ev, (e) => e.stopPropagation());
+    },
+    join(c) {
+      code = c; status = 'connecting'; try { localStorage.setItem('quadrille.room', c); } catch (e) { /* fine */ }
+      if (room && room.leave) room.leave(); room = null; sent.clear(); lastPres = ''; queue = []; pend = null; ui.dirty = true;
+      const go = () => { if (code !== c) return; if (!window.Peer) { status = 'off'; ui.dirty = true; return; } hook(peerRoom(c, (st) => { status = st; ui.dirty = true; })); };
+      if (window.Peer) return go();
+      const sc = document.createElement('script'); sc.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'; sc.onload = go; sc.onerror = () => { status = 'off'; ui.dirty = true; }; document.head.appendChild(sc);
+    },
+    label() {
+      const n = room ? (room.peers() || []).length : 0, here = n > 1 ? n + ' devices here' : 'only this device so far';
+      if (IN_CLAUDE) return room ? 'Together: ' + here : 'Together: open this page on another device';
+      return status === 'open' ? 'Room ' + code + ': ' + here : status === 'off' ? 'Room ' + code + ': offline' : 'Room ' + code + ': connecting';
+    },
+    frame,
+    strokesChanged() { if (room && !ordTimer) ordTimer = setTimeout(pushOrder, 200); },
+    live(flat) {
+      if (!room) return; const now = performance.now(), n = flat.length / 3;
+      if (n < liveSent) { liveSeq++; liveSent = 0; }
+      if (now - liveLast < 110 || n <= liveSent) return;
+      liveLast = now; const to = Math.min(n, liveSent + CH); enqueue('lv', Object.assign({ k: liveSeq, i: liveSent }, packPts(flat, liveSent, to))); liveSent = to;
+    },
+    liveEnd() { if (!room) return; enqueue('lv', { k: liveSeq, end: 1 }); liveSeq++; liveSent = 0; },
+    online: () => !!room && status === 'open', frustumCount: () => frusta.size,
+    peersDebug: () => (room ? room.peers().map((p) => (p.sameTab ? 'me' : p.peer.slice(0, 4)) + ':' + (p.presence && p.presence.r)) : []),
+  };
+})();
+
+// =====================================================================
+// LOOP + INIT
+// =====================================================================
+function onResize() {
+  if (renderer.xr.isPresenting) return;
+  camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight, false); applyOrbit(); fitPanel();
+}
+window.addEventListener('resize', onResize);
+window.addEventListener('pagehide', save);
+document.addEventListener('visibilitychange', () => { if (document.hidden) save(); });
+let lastT = 0;
+renderer.setAnimationLoop((t) => {
+  const dt = Math.min(0.05, Math.max(0.001, (t - lastT) / 1000)); lastT = t;
+  if (renderer.xr.isPresenting) xrTick(dt);
+  Net.frame(dt);
+  if (ui.toast && performance.now() > ui.toastUntil) { ui.toast = ''; ui.dirty = true; }
+  if (ui.dirty) { ui.dirty = false; drawUI(); uiTex.needsUpdate = true; }
+  renderer.render(scene, camera);
+});
+
+Engine.start(); Net.start();
+if (!load()) state.strokes = packStrokes(QE.makeExample('sheet', 1 + Math.floor(Math.random() * 1e6), state.exMess));
+layoutUI(); refreshTags(); applyShow(); onResize(); rebuildSketch(); requestBuild(); probeDownloads();
+const coarse = window.matchMedia('(pointer: coarse)').matches;
+if (coarse) setTool('look');
+$('hint').textContent = coarse ? '2 fingers: orbit + zoom' : 'right-drag: orbit \u00b7 wheel: zoom';
+if (navigator.xr) {
+  Promise.all([navigator.xr.isSessionSupported('immersive-vr').catch(() => false), navigator.xr.isSessionSupported('immersive-ar').catch(() => false)])
+    .then(([vr, ar]) => { xrSupport.vr = !!vr; xrSupport.ar = !!ar; $('enter').hidden = !(vr || ar); });
+}
+// handle for tests and tinkering
+window.QX = { THREE, state, commit, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
+</script>
+<script src="../updated.js"></script>
+</body>
+</html>
