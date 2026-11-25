@@ -78,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '544';
+const VERSION = '545';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2691,7 +2691,7 @@ function controlledKeys(){
   const set = new Set();
   if (exporting) return set;   // a film is made from the recording alone
   for (const g of [show.grab, show.grabL]) if (g){ set.add(g.T ? 't'+g.T.id : g.c ? 'r'+g.c.id : String(g.L.id)); if (g.c && g.blinked) set.add('e'+g.c.id); }   // blinking a puppet you hold
-  if (show.embodied){ const ride = riding(show.embodied); for (const part of show.embodied.parts) set.add(String(part.L.id)); if (show.embodied.rootMoved || (ride && !show.embodied.upright)) set.add('r'+show.embodied.c.id); /* riding: the body's walk is re-recorded with your steps in it */ set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
+  if (show.embodied){ const ride = riding(show.embodied); for (const part of show.embodied.parts) set.add(String(part.L.id)); if (show.embodied.rootMoved || ride) set.add('r'+show.embodied.c.id); /* riding: the body's walk is re-recorded with your steps in it */ set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
   if (show.rec && show.rec.voiceFor) set.add('m'+show.rec.voiceFor);
   for (const sd of ['left','right']) if (embGrab[sd]) set.add('r'+embGrab[sd].c.id);
   for (const c of show.chars) if (c.type === 'sock' && c.sockLive){ set.add('r'+c.id); set.add('m'+c.id); }   // socks on your hands
@@ -2726,7 +2726,6 @@ function applyShowPose(t){
     for (const k of ['e','m']){ const key = k+c.id, o = k==='e' ? c.look : c.mouthO; if (!ctl.has(key)){ o.userData.auto = !show.tracks[key]; poseFromTrack(o, key, t, ZERO_POSE); } else o.userData.auto = false; }
     if (ctl.has('r'+c.id)) continue;
     poseFromTrack(c.root, 'r'+c.id, t, c.place);
-    const em = show.embodied; if (em && em.c === c && em.upright){ c.root.updateWorldMatrix(true, false); setObjMatrix(c.root, c.root.parent.matrixWorld.clone().invert().multiply(uprightM(em.upright, c.root.matrixWorld.clone()))); }   // worn: it stands up straight
   }
   if (!st) for (const c of show.chars){ followHead(c, ctl); followBody(c, ctl); }
 }
@@ -3158,11 +3157,13 @@ function stepIn(c){
   c.root.updateMatrixWorld(true);
   for (const P of partsOf(c)){ if (!P.rest) P.rest = {p:[0,0,0], q:[0,0,0,1], s:1}; setPoseObj(P.group, P.rest); }   // start from the pose you made in Characters
   c.root.updateMatrixWorld(true);
-  // a puppet left tilted or lying down stands up straight where it lay while you wear it (you never tip over).
-  // Your moves are kept relative to its body, so the take plays back tilted, just the way you placed it.
+  // a puppet left tilted or lying down: you step in at its angle, so its "down" is your "down" (the world looks tipped around you).
+  // Everything is first worked out as if it stood up straight, then you and it are tipped back together in one move.
   const upP = new THREE.Vector3(0,1,0).applyQuaternion(c.root.getWorldQuaternion(new THREE.Quaternion())), tilted = !!c.guide && !studioTry && (upP.y < 0.9 || walkTips(c));   // leaning more than ~25°, now or anywhere in its recorded walk
-  let upBox = null;
-  if (tilted){ upBox = rootBoxLocal(c); c.root.updateWorldMatrix(true, false); setObjMatrix(c.root, c.root.parent.matrixWorld.clone().invert().multiply(uprightM(upBox, c.root.matrixWorld.clone()))); c.root.updateMatrixWorld(true); }
+  let tipT = null, rootL0 = null;
+  if (tilted){ c.root.updateMatrix(); rootL0 = c.root.matrix.clone(); c.root.updateWorldMatrix(true, false); const M0 = c.root.matrixWorld.clone(), MU = uprightM(rootBoxLocal(c), M0);
+    tipT = M0.clone().multiply(MU.clone().invert());   // the move that tips the stood-up puppet back to how it was placed
+    setObjMatrix(c.root, c.root.parent.matrixWorld.clone().invert().multiply(MU)); c.root.updateMatrixWorld(true); }
   const H = partLayer(c,'head'), LH = partLayer(c,'lh'), RH = partLayer(c,'rh');
   const eyeY = Math.max(0.6, camera.position.y), gHead = c.guide ? c.guide.head[1] : 1.5;   // your real eye height in the room
   const rootS = c.root.getWorldScale(V()).x || (c.place.s || 1);   // its size right now (a recorded walk can have grown or shrunk it)
@@ -3206,8 +3207,11 @@ function stepIn(c){
   }
   rig.updateMatrixWorld(true); c.root.updateMatrixWorld(true);
   for (const sd of ['left','right']){ embGripHeld[sd] = false; climb[sd] = null; }
-  show.embodied = {c, parts, upright: upBox, studio: studioTry, rigRel: c.root.matrixWorld.clone().invert().multiply(rig.matrix.clone())};
-  if (tilted) toast(c.name+' stands up while you wear it, and plays back tilted the way you placed it');
+  show.embodied = {c, parts, tip: !!tipT, studio: studioTry, rigRel: c.root.matrixWorld.clone().invert().multiply(rig.matrix.clone())};
+  if (tipT){   // tip the puppet back, and you with it: same move for both, so your eyes and hands stay exactly in its head and hands
+    setObjMatrix(c.root, rootL0); c.root.updateMatrixWorld(true);
+    rig.updateMatrix(); tipT.multiply(rig.matrix).decompose(rig.position, rig.quaternion, rig.scale); rig.updateMatrixWorld(true);
+    updateBodyFollow(true); updateEmbodied(); }
   if (!state.mic){ state.mic = true; ensureMic(); }   // in a puppet your voice is on
   placeMirror(); if (studioTry){ state.win.preview = true; toast('Trying on '+c.name+': look in the mirror'); } else toast('You are '+c.name+' — B records, A plays'); requestUI();
 }
@@ -3219,7 +3223,7 @@ function stepOut(){
 }
 const bodyFollow = new THREE.Object3D(); scene.add(bodyFollow);
 const NECK_TO_EYE = new THREE.Vector3(0, 0.11, -0.09);   // eyes sit about this far above and in front of the neck
-const upVec = () => state.freeTurn ? new THREE.Vector3(0,1,0).applyQuaternion(rig.quaternion) : new THREE.Vector3(0,1,0);
+const upVec = () => state.freeTurn || (show.embodied && show.embodied.tip) ? new THREE.Vector3(0,1,0).applyQuaternion(rig.quaternion) : new THREE.Vector3(0,1,0);   // your own up: tipped when you wear a tipped puppet
 function updateBodyFollow(snap){
   // the body faces between your head and your hands, so you can shake your head "no" while it stays put
   const up = upVec(), flat = v => v.addScaledVector(up, -v.dot(up));
@@ -3269,15 +3273,15 @@ function uprightM(box, M){
 const _rbP = V(), _rbQ = new THREE.Quaternion();
 function ridingBase(e){
   const par = e.c.root.parent; par.updateMatrixWorld(true); const tr = show.tracks['r'+e.c.id];
-  if (tr && tr.samples && tr.samples.length){ const s = trackAt(tr, show.t || 0, _rbP, _rbQ), M = par.matrixWorld.clone().multiply(new THREE.Matrix4().compose(_rbP, _rbQ, new THREE.Vector3(s, s, s))); return e.upright ? uprightM(e.upright, M) : M; }
+  if (tr && tr.samples && tr.samples.length){ const s = trackAt(tr, show.t || 0, _rbP, _rbQ), M = par.matrixWorld.clone().multiply(new THREE.Matrix4().compose(_rbP, _rbQ, new THREE.Vector3(s, s, s))); return M; }
   if (!e.base0){ e.c.root.updateMatrixWorld(true); e.base0 = e.c.root.matrixWorld.clone(); } return e.base0;
 }
 function followRoot(dt){
   const e = show.embodied;
   if (riding(e)){
     const Mv = ridingBase(e).multiply(e.rigRel), vp = V(), vq = new THREE.Quaternion(), vs = V(); Mv.decompose(vp, vq, vs);
-    let qT = vq;   // you stay level and turn with it (a tilted walk stands up while you wear it)
-    if (!state.freeTurn){ const f = new THREE.Vector3(0,0,-1).applyQuaternion(vq); f.y = 0;
+    let qT = vq;   // you stay level and turn with it, unless it is tipped: then you tip with it
+    if (!state.freeTurn && !e.tip){ const f = new THREE.Vector3(0,0,-1).applyQuaternion(vq); f.y = 0;
       qT = f.lengthSq() > 1e-4 ? new THREE.Quaternion().setFromAxisAngle(_y, Math.atan2(-f.x, -f.z)) : rig.quaternion.clone(); }
     if (rig.quaternion.dot(qT) < 0) qT = new THREE.Quaternion(-qT.x, -qT.y, -qT.z, -qT.w);   // the short way round
     const eyeW = camera.position.clone().applyMatrix4(Mv);   // where the puppet's eyes are now
@@ -3304,7 +3308,7 @@ function updateEmbodied(){
     for (const part of e.parts){ if (part.body) continue; const w = part.L.part==='head' ? 1 : 0; if (!w) continue;   // your head leads the body; waving your hands doesn't drag it
       const tr = part.side ? ctrl[part.side]?.grip : part.tracker; if (!tr) continue;
       const p = V().setFromMatrixPosition(Binv.clone().multiply(unscaled(tr).multiply(part.off))); tgt.addScaledVector(p.sub(V().fromArray(part.L.rest.p)), w); ws += w; }
-    if (ws && !e.upright){ tgt.divideScalar(ws); tgt.y = 0; const dz = 0.05/Math.max(1e-3, root.scale.x); const dd = tgt.clone().sub(e.drift); if (dd.length() > dz){ dd.setLength(dd.length() - dz); e.drift.addScaledVector(dd, 0.08); } }   // small sways leave it be
+    if (ws){ tgt.divideScalar(ws); tgt.y = 0; const dz = 0.05/Math.max(1e-3, root.scale.x); const dd = tgt.clone().sub(e.drift); if (dd.length() > dz){ dd.setLength(dd.length() - dz); e.drift.addScaledVector(dd, 0.08); } }   // small sways leave it be
     root.parent.updateMatrixWorld(true); setObjMatrix(root, root.parent.matrixWorld.clone().invert().multiply(Bm).multiply(new THREE.Matrix4().makeTranslation(e.drift.x, 0, e.drift.z))); root.updateMatrixWorld(true);
   }
   const inv = root.matrixWorld.clone().invert();   // head, hands and face go exactly where your real head and hands are
@@ -3953,9 +3957,9 @@ function placeBigScreen(){
 function placeMirror(){
   if (!renderer.xr.isPresenting) return;
   const s = rig.scale.x; const head = V(); camera.getWorldPosition(head);
-  const fwd = V(); camera.getWorldDirection(fwd); fwd.y = 0; if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1); fwd.normalize();
-  mirrorCam.position.copy(head).addScaledVector(fwd, 1.6*s).add(new THREE.Vector3(0,0.05*s,0));
-  mirrorCam.lookAt(head.x, head.y - 0.15*s, head.z); mirrorCam.near = 0.01*s; mirrorCam.far = 5000*s;
+  const up = upVec(), fwd = V(); camera.getWorldDirection(fwd); fwd.addScaledVector(up, -fwd.dot(up)); if (fwd.lengthSq()<1e-6) fwd.set(0,0,-1).applyQuaternion(rig.quaternion); fwd.normalize();
+  mirrorCam.position.copy(head).addScaledVector(fwd, 1.6*s).addScaledVector(up, 0.05*s);
+  mirrorCam.up.copy(up); mirrorCam.lookAt(head.clone().addScaledVector(up, -0.15*s)); mirrorCam.near = 0.01*s; mirrorCam.far = 5000*s;
 }
 
 const shotHidden = [];
@@ -4919,7 +4923,15 @@ async function openWorld(id){
 async function newWorld(kind){
   await saveLocal(true);
   state.worldId = Math.max(0, ...worldList.map(w=>w.id)) + 1; worldList.push({id:state.worldId, name:'World '+state.worldId, saved:Date.now()});
-  state.worldGid = null; newScene(kind); await saveLocal(true); requestUI();
+  state.worldGid = null; newScene(kind); await saveLocal(true); openRename('world', state.worldId); requestUI();
+}
+// a copy of this whole world (sculpting, lights, sky, characters, show): you carry on in the copy
+async function dupWorld(){
+  if (NET.guest) return; await saveLocal(true);
+  const src = worldList.find(w=>w.id===state.worldId), data = await idbGet('world:'+state.worldId); if (!data){ toast('Save it first'); return; }
+  const id = Math.max(0, ...worldList.map(w=>w.id)) + 1, name = ((src && src.name) || 'World').slice(0, 22)+' copy';
+  await idbSet('world:'+id, data); worldList.push({id, name, saved:Date.now()}); await idbSet('worlds', JSON.stringify(worldList));
+  state.worldId = id; state.worldGid = null; await idbSet('cur', id); toast('Made "'+name+'". You are working in the copy now'); requestUI();
 }
 /* GitHub: worlds and MP4s go to your xr repo, so every device can open them.
    Paste a token once per device (outside VR: ☁ GitHub at the top). The one Dwindle Doodle uses works here too. */
@@ -5000,7 +5012,7 @@ function drawGHWorlds(X,W){
   if (state.ghList == null) ghLoadList();
   if (state.ghList === 'loading' || state.ghList == null) para(['Loading the list…'], X, 136, 15);
   else if (!state.ghList.length) para(['Nothing saved to GitHub yet.','Files → Save to GitHub sends the open world.'], X, 136, 15);
-  else state.ghList.slice(0,9).forEach((w,i)=>{ const y = 122+i*48, d = new Date(w.saved||0);
+  else scrollList('gh', X, 122, W, UIH-180, 48, state.ghList.length, (i, y, W) => { const w = state.ghList[i], d = new Date(w.saved||0);
     rr(X,y,W,42,10,'#2a3060'); txt(w.name.length>20 ? w.name.slice(0,19)+'…' : w.name, X+12, y+21, 16, '#fff');
     txt((d.getMonth()+1)+'/'+d.getDate()+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'), X+W-12, y+21, 12, '#8f97c7','right',700);
     hit(X,y,W,42,()=>ghOpen(w)); });
@@ -5058,9 +5070,47 @@ const UIW=480, UIH=680;
 const uiCanvas = document.getElementById('ui');
 const menuCtx = uiCanvas.getContext('2d');
 let g = menuCtx;
-let hits = [], uiNeeds = true, drag = null;
+let hits = [], uiNeeds = true, drag = null, xrHoverUI = null, listStickAcc = 0;
 function requestUI(){ uiNeeds = true; }
 const hit = (x,y,w,h,fn,dragFn,upFn) => hits.push({x,y,w,h,fn,drag:dragFn,up:upFn});
+/* anything that runs out of room scrolls: ▲n / ▼n say how many rows are hidden up or down, the yellow bar drags,
+   and the right stick (pointing at it) or a mouse wheel scrolls it too */
+const SCR = () => state.scr || (state.scr = {});
+function scrollArrows(key, X, top, W, bot, sc, max, above, below, page, total, shown){
+  const S = SCR(), bx = X + W - 40, tT = top + 50, tB = bot - 50, th = Math.max(26, (tB - tT)*Math.min(1, shown/Math.max(1, total))), ty = tT + (tB - tT - th)*(max ? sc/max : 0);
+  button(bx, top, 40, 44, above ? '▲'+above : '▲', above > 0, ()=>{ S[key] = Math.max(0, sc - page); requestUI(); }, '#1e6bff');
+  button(bx, bot - 44, 40, 44, below ? '▼'+below : '▼', below > 0, ()=>{ S[key] = Math.min(max, sc + page); requestUI(); }, '#1e6bff');
+  if (tB - tT > 20){ rr(bx + 12, tT, 16, tB - tT, 8, '#2a3060'); rr(bx + 6, ty, 28, th, 12, '#ffd400');
+    const setS = (px, py) => { S[key] = Math.round(clamp((py - tT - th/2)/Math.max(1, tB - tT - th), 0, 1)*max); requestUI(); }; hit(bx - 4, tT, 48, tB - tT, setS, setS); }
+  if (above) rr(X, top - 3, W - 46, 4, 2, '#ffd400');   // a yellow edge: more up there
+  if (below) rr(X, bot - 1, W - 46, 4, 2, '#ffd400');   // more down there
+}
+// rows of the same height: drawRow(i, y, rowWidth)
+function scrollList(key, X, top, W, bot, RH, n, drawRow){
+  const S = SCR(), fit = Math.max(1, Math.floor((bot - top)/RH)), max = Math.max(0, n - fit), scrolls = n > fit;
+  const sc = S[key] = clamp(Math.round(S[key] || 0), 0, max), RW = scrolls ? W - 46 : W;
+  if (scrolls) hits.push({x:X, y:top, w:W, h:fit*RH, list:key, max, step:1});   // under the rows, so a row's own tap wins
+  for (let i = sc; i < Math.min(n, sc + fit); i++) drawRow(i, top + (i - sc)*RH, RW);
+  if (scrolls) scrollArrows(key, X, top, W, top + fit*RH, sc, max, sc, max - sc, Math.max(1, fit - 1), n, fit);
+  return {fit, sc, RW, scrolls};
+}
+// a whole page section taller than its room: body(width) draws it from y = top as usual and returns where it ended
+function pageScroll(key, X, top, W, bot, body){
+  const S = SCR(), visH = bot - top, max = Math.max(0, Math.ceil((S['h:'+key] || 0) - visH)), was = max > 4, W2 = was ? W - 46 : W;
+  const s = S[key] = clamp(S[key] || 0, 0, max), h0 = hits.length;
+  g.save(); g.beginPath(); g.rect(X - 6, top - 4, W + 12, visH + 8); g.clip(); g.translate(0, -s);
+  const end = body(W2); g.restore();
+  S['h:'+key] = end - top + 12;
+  const mine = hits.splice(h0); hits.push({x:X, y:top, w:W, h:visH, list:key, max, step:44});
+  for (const h of mine){ const y0 = Math.max(h.y - s, top - 4), y1 = Math.min(h.y - s + h.h, bot + 4); if (y1 - y0 < 8) continue; hits.push({...h, y:y0, h:y1 - y0}); }
+  const max2 = Math.max(0, Math.ceil(S['h:'+key] - visH));
+  if ((max2 > 4) !== was) requestUI();
+  if (max2 > 4) scrollArrows(key, X, top, W, bot, s, max2, Math.ceil(s/44), Math.ceil((max2 - s)/44), Math.max(44, visH - 60), S['h:'+key], visH);
+}
+function scrollAt(win, x, y, d){   // stick or wheel over a list
+  const h = (win.hits || []).find(h => h.list && x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h); if (!h) return false;
+  const S = SCR(); S[h.list] = clamp((S[h.list] || 0) + d*h.step, 0, h.max); requestUI(); return true;
+}
 function makeWin(id, canvas, metersW, slot, title){
   const ctx = canvas.getContext('2d');
   const tex = new THREE.CanvasTexture(canvas); tex.colorSpace = THREE.SRGBColorSpace;
@@ -5428,7 +5478,7 @@ function drawTransWin(){
     button(64,by,b3,48, show.playing ? '■ Stop (A)' : '▶ Play (A)', show.playing, ()=>{ show.playing ? stopShow() : playShow(); requestUI(); }, '#34c759');
     button(64+b3+8,by,b3,48, show.rec ? '■ Cut (B)' : punch ? '● Redo (B)' : '● Record (B)', !!show.rec, ()=>{ show.rec ? cutShowRec() : startShowRec(); requestUI(); }, '#ff3b30');
     button(64+2*(b3+8),by,b3,48, '🎤 Voice only', false, ()=>voiceOnlyRec(), '#ff9500');
-    button(64+3*(b3+8),by,90,48, '🎞 Takes'+((show.takes||[]).length ? ' '+show.takes.length : ''), false, ()=>{ state.page = 'tracks'; state.motionScroll = 0; state.panelOpen = true; requestUI(); }, '#5e2bff');
+    button(64+3*(b3+8),by,90,48, '🎞 Takes'+((show.takes||[]).length ? ' '+show.takes.length : ''), false, ()=>{ state.page = 'tracks'; SCR().motionScroll = 0; state.panelOpen = true; requestUI(); }, '#5e2bff');
   }
   win.hits = hits; win.tex.needsUpdate = true; g = menuCtx;
 }
@@ -5465,7 +5515,7 @@ function drawUI(){
   const step = Math.min(80, (UIH-84-64)/Math.max(1, rail.length)), bh = Math.min(72, step-4);
   rail.forEach(([id,label],i) => {
     const y = 84 + i*step;
-    const on = id==='layers' ? state.win.layers : id==='cpanel' ? state.win.chars!==false : state.page===id || (id==='world' && state.page==='sky') || (id==='takes' && state.page==='facecam');
+    const on = id==='layers' ? state.win.layers : id==='cpanel' ? state.win.chars!==false : state.page===id || (id==='world' && state.page==='sky') || (id==='takes' && ['facecam','path','keys'].includes(state.page));
     const disabled = id==='soon';
     if (on) rr(16,y,72,bh,14, id==='layers' || id==='cpanel' ? '#00c7be' : '#ffd400');
     icon(id==='cpanel' ? 'tools' : id, 52, y+bh*0.36, on ? '#111' : disabled ? '#4a5080' : '#fff');
@@ -5520,14 +5570,10 @@ function drawLayersWin(){
   if (pup){ const tw = (W-32)/2; button(12,52,tw,32,'Drawing',diag,()=>{ state.partView='body'; requestUI(); },'#ff9500'); button(20+tw,52,tw,32,'List',!diag,()=>{ state.partView='list'; requestUI(); },'#ff9500'); }
   if (diag){ E.length = 0; drawPartsDiagram(sc, 12, top, W-24, bottom-top-6); }
   const dupName = L => { const same = E.filter(e=>e.L && e.L.part===L.part); return same.length > 1 ? ' '+(same.findIndex(e=>e.L===L)+1) : ''; };
-  const fits = E.reduce((a,e)=>a+rowH(e),0) <= bottom-top;
-  state.layScroll = fits ? 0 : clamp(state.layScroll||0, 0, Math.max(0, E.length-2));
-  if (!fits){ rr(118,8,34,32,10,'#2a3060'); txt('▲',135,25,15,'#fff','center'); hit(118,8,34,32,()=>{ state.layScroll = Math.max(0,state.layScroll-3); requestUI(); });
-              rr(156,8,34,32,10,'#2a3060'); txt('▼',173,25,15,'#fff','center'); hit(156,8,34,32,()=>{ state.layScroll += 3; requestUI(); }); }
-  const tr = (t,n) => t.length>n ? t.slice(0,n-1)+'…' : t;
-  let y = top;
-  for (let i=state.layScroll; i<E.length; i++){
-    const e = E[i], h = rowH(e); if (y + h > bottom) break;
+  const tr = (t,n) => t.length>n ? t.slice(0,n-1)+'…' : t, Wwin = W;
+  if (E.length) pageScroll('layers'+(studioMode ? 'S' : ''), 12, top, W-24, bottom, RW => { const W = RW + 24; let y = top;   // the rows scroll when there are more than fit
+  for (let i=0; i<E.length; i++){
+    const e = E[i], h = rowH(e);
     if (e.h) txt(e.h, 16, y+13, 12, '#ffd400','left',800);
     else if (e.L){
       const L = e.L, on = activeLayer()===L;
@@ -5554,6 +5600,7 @@ function drawLayersWin(){
     }
     y += h;
   }
+  return y; });
   const hw = (W-24-8)/2, yb = bottom + 6, nd = detailFor(0.025*yourScale());
   if (!studioMode || sc){
     button(12,yb,hw,42, studioMode?'+ Extra part':'+ New layer',false,()=>{
@@ -5905,26 +5952,28 @@ async function checkUpdate(){
 async function updateNow(){ await saveLocal(true); location.replace(location.pathname+'?v='+Date.now()); }
 function drawFiles(X,W){
   txt('Files', X, 100, 26);
-  button(X,UIH-150,W,46, state.updateTo ? 'Update to v'+state.updateTo : 'Reload the newest version', !!state.updateTo, updateNow, '#34c759');
-  const hw=(W-8)/2;
-  button(X,124,hw,52,'Save',false,()=>saveLocal(false),'#34c759');
-  button(X+hw+8,124,hw,52,'Download',false,downloadFile,'#1e6bff');
-  button(X,184,W,48,'Load a scene file',false,loadFile,'#1e6bff');
-  txt('Worlds on this device', X, 256, 16, '#cfd6ff','left',700);
-  const ws = worldList.slice().sort((a,b)=>(b.saved||0)-(a.saved||0)).slice(0,4);
-  ws.forEach((w,i)=>{ const y = 270+i*44, on = w.id===state.worldId;
-    rr(X,y,W,38,10,on?'#00c7be':'#2a3060'); txt((w.name.length>18?w.name.slice(0,17)+'…':w.name)+(on?'  (open)':''), X+12, y+19, 15, on?'#111':'#fff');
-    hit(X,y,W,38,()=>{ if (on) openRename('world', w.id); else openWorld(w.id); }); });
-  if (worldList.length > 4) button(X+W-150, 242, 150, 30, 'All '+worldList.length+' ▸', false, ()=>{ state.worldScroll = 0; state.page='allworlds'; requestUI(); }, '#1e6bff');
-  const yb = 270+Math.max(1,ws.length)*44+4;
-  button(X,yb,hw,42,'+ Island world',false,()=>newWorld('island'),'#ff9500');
-  button(X+hw+8,yb,hw,42,'+ Empty world',false,()=>newWorld('empty'),'#ff9500');
-  const gy = yb+54;
-  if (GHS.ok){ txt('GitHub · '+GHS.login, X, gy+10, 14, '#34c759','left',700);
-    button(X,gy+22,hw,44,ghBusy ? 'Saving…' : 'Save to GitHub',ghBusy,()=>ghPushWorld(),'#34c759');
-    button(X+hw+8,gy+22,hw,44,'From GitHub ▸',false,()=>{ state.ghList = null; state.page='ghworlds'; requestUI(); },'#34c759'); }
-  else para(['Saves on this device every 20 s. To open worlds','on every device: outside VR, tap ☁ GitHub at','the top and paste your token (Dwindle Doodle\'s works).'], X, gy+10, 13);
-  txt('ChikiMovieMagic v'+VERSION, X, UIH-40, 15, '#4a5080','left',700);
+  const hw=(W-8)/2, t3=(W-16)/3;
+  button(X,118,t3,44,'Save',false,async ()=>{ await saveLocal(false); const w = worldList.find(w=>w.id===state.worldId); if (w && /^World \d+$/.test(w.name)) openRename('world', w.id); },'#34c759');
+  button(X+t3+8,118,t3,44,'Download',false,downloadFile,'#1e6bff');
+  button(X+2*(t3+8),118,t3,44,'Load file',false,loadFile,'#1e6bff');
+  // this world: its name (tap to rename) and a copy of it
+  const cw = worldList.find(w=>w.id===state.worldId), cn = cw ? cw.name : 'This world';
+  rr(X,170,W-138,42,10,'#00c7be'); txt('✎ '+(cn.length>16 ? cn.slice(0,15)+'…' : cn), X+12, 191, 16, '#111'); hit(X,170,W-138,42,()=>{ if (cw) openRename('world', cw.id); });
+  button(X+W-130,170,130,42,'⧉ Duplicate',false,()=>dupWorld(),'#5e2bff');
+  button(X,220,hw,40,'+ Island world',false,()=>newWorld('island'),'#ff9500');
+  button(X+hw+8,220,hw,40,'+ Empty world',false,()=>newWorld('empty'),'#ff9500');
+  const ws = worldList.slice().sort((a,b)=>(b.saved||0)-(a.saved||0));
+  txt('Worlds on this device · '+ws.length+' · newest first', X, 280, 15, '#cfd6ff','left',700);
+  scrollList('worlds', X, 294, W, UIH-158, 44, ws.length, (i, y, RW) => { const w = ws[i], on = w.id===state.worldId;
+    rr(X,y,RW,38,10,on?'#00c7be':'#2a3060'); txt((w.name.length>18?w.name.slice(0,17)+'…':w.name)+(on?'  (open)':''), X+12, y+19, 15, on?'#111':'#fff');
+    if (w.saved) txt(new Date(w.saved).toLocaleString('en-US', {timeZone:'America/Toronto', month:'short', day:'numeric'}), X+RW-10, y+19, 11, on?'#0b3a3a':'#8f97c7','right',700);
+    hit(X,y,RW,38,()=>{ if (on) openRename('world', w.id); else openWorld(w.id); }); });
+  const gy = UIH-144;
+  if (GHS.ok){ txt('GitHub · '+GHS.login, X, gy, 13, '#34c759','left',700);
+    button(X,gy+12,hw,38,ghBusy ? 'Saving…' : 'Save to GitHub',ghBusy,()=>ghPushWorld(),'#34c759');
+    button(X+hw+8,gy+12,hw,38,'From GitHub ▸',false,()=>{ state.ghList = null; state.page='ghworlds'; requestUI(); },'#34c759'); }
+  else para(['Saves on this device every 20 s. For every device:','outside VR, tap ☁ GitHub at the top and paste','your token (Dwindle Doodle\'s works).'], X, gy, 12, '#8f97c7', 19);
+  button(X,UIH-56,W,40, state.updateTo ? 'Update to v'+state.updateTo : 'Reload the newest version', !!state.updateTo, updateNow, '#34c759');
 }
 // every world saved on this device, newest first
 function drawAllWorlds(X, W){
@@ -6015,27 +6064,27 @@ function drawTakes(X,W){
   // the show's timeline, same as in Perform: see where the puppets move and talk, tap to look at a moment
   txt(rec || play ? 'Show time' : 'Tap where filming should start', X, 284, 14, '#cfd6ff','left',700); txt(fmtTime(show.t)+' / '+fmtTime(showLength()), X+W, 284, 14, '#ffd400','right',700);
   drawPerformTimeline(X, 298, W, true);
-  const list = sceneTakes().slice(-2);
+  const list = sceneTakes();   // every take, the first one on top
   if (!list.length) para(['No shots yet. Your right hand is a','camera: hold the trigger to film.'], X, 352, 15);
-  slider(X,440,W,'Smoothing for new takes', state.autoSmooth, 0, 1, v=>state.autoSmooth=+v.toFixed(2), '#34c759', state.autoSmooth < 0.05 ? 'keeps the shake' : Math.round(state.autoSmooth*100)+'%');
-  list.forEach((tk,i)=>{ const y=342+i*46, on=tk.id===shots.sel;
-    rr(X,y,W,40,10,on?'#1e6bff':'#2a3060'); txt(tk.name, X+12, y+20, 17, '#fff');
-    txt(clipLen(tk).toFixed(1)+' s'+(tk.edited?' · edited':'')+(tk.fovTrack?' · zoom':''), X+W-12, y+20, 14, on?'#fff':'#8f97c7','right',700);
-    hit(X,y,W,40,()=>{ shots.sel=tk.id; shots.keySel=-1; stopPlay(); pathDirty=true; requestUI(); }); });
-  const a = state.confirm==='deltake';
-  if (selTake()) button(X,UIH-118,W,44,a?'Tap to confirm':'Delete '+selTake().name,a,()=>{
-    if(!a){state.confirm='deltake';requestUI();return;} state.confirm=null;
-    const before=snapShots(); const id=shots.sel; shots.takes=shots.takes.filter(t=>t.id!==id); removeTakeEverywhere(id);
-    shots.sel = shots.takes.length ? shots.takes[shots.takes.length-1].id : null; pushShotsUndo(before); stopPlay(); pathDirty=true; sceneDirty=true; requestUI(); },'#ff3b30');
+  else { if (state._camSel !== shots.sel){ state._camSel = shots.sel; const i = list.findIndex(t=>t.id===shots.sel), S = SCR(), fit = Math.floor((UIH-100-342)/46); if (i >= 0 && (i < (S.camTakes||0) || i >= (S.camTakes||0) + fit)) S.camTakes = Math.max(0, i - 1); }   // the picked take is always in view
+    scrollList('camTakes', X, 342, W, UIH-100, 46, list.length, (i, y, RW) => { const tk = list[i], on = tk.id===shots.sel, a = on && state.confirm==='deltake';
+    rr(X,y,RW,40,10,on?'#1e6bff':'#2a3060'); txt(tk.name.length > 9 ? tk.name.slice(0,8)+'…' : tk.name, X+10, y+20, 15, '#fff');
+    hit(X,y,on ? RW-196 : RW,40,()=>{ shots.sel=tk.id; shots.keySel=-1; state.confirm=null; stopPlay(); pathDirty=true; requestUI(); });
+    if (on){ button(X+RW-194, y+4, 66, 32, 'Path ▸', false, ()=>{ state.page='path'; requestUI(); }, '#34c759'); button(X+RW-124, y+4, 66, 32, 'Keys ▸', false, ()=>{ state.page='keys'; shots.keyT = 0; requestUI(); }, '#5e2bff');
+      button(X+RW-54, y+4, 50, 32, a ? 'Sure?' : '✕', a, ()=>{ if(!a){state.confirm='deltake';requestUI();return;} state.confirm=null;
+        const before=snapShots(); const id=shots.sel; shots.takes=shots.takes.filter(t=>t.id!==id); removeTakeEverywhere(id);
+        shots.sel = shots.takes.length ? shots.takes[shots.takes.length-1].id : null; pushShotsUndo(before); stopPlay(); pathDirty=true; sceneDirty=true; requestUI(); }, '#ff3b30'); }
+    else txt(clipLen(tk).toFixed(1)+' s'+(tk.edited?' · edited':'')+(tk.fovTrack?' · zoom':''), X+RW-12, y+20, 13, '#8f97c7','right',700); }); }
+  slider(X,UIH-92,W,'Smoothing for new takes', state.autoSmooth, 0, 1, v=>state.autoSmooth=+v.toFixed(2), '#34c759', state.autoSmooth < 0.05 ? 'keeps the shake' : Math.round(state.autoSmooth*100)+'%');
 }
 function nextTake(){ stopPlay(); cycleTake(1); }
 function drawPath(X,W){
-  txt('Path', X, 100, 26);
+  txt('Path', X, 100, 26); button(X+70, 80, 100, 36, '◀ Camera', false, ()=>{ state.page='takes'; requestUI(); }, '#2a3060');
   const tk = selTake();
   if (!tk){ para(['Film a take first.'], X, 140, 16); return; }
   txt(tk.name, X+W, 100, 17, '#ffd400','right');
   const remake = ()=>{ makeKeys(tk); pathDirty=true; sceneDirty=true; };
-  slider(X,130,W,'Smooth out the shake', tk.smooth, 0, 1, v=>{ tk.smooth=v; remake(); }, '#34c759');
+  slider(X,130,W,'Smooth out the shake (0 = as filmed)', tk.smooth, 0, 1, v=>{ tk.smooth=v; remake(); }, '#34c759');
   slider(X,196,W,'Keys every', tk.every, 0.25, 4, v=>{ tk.every=v; remake(); }, '#ffd400', tk.every.toFixed(1)+' s');
   slider(X,262,W,'Corners: round ↔ sharp', tk.sharp, 0, 1, v=>{ tk.sharp=v; pathDirty=true; sceneDirty=true; }, '#ff2d95');
   toggle(X,326,W,46,'Show all paths',shots.showAll,()=>{ shots.showAll=!shots.showAll; pathDirty=true; requestUI(); },'#1e6bff');
@@ -6043,7 +6092,7 @@ function drawPath(X,W){
   para(['Right grip on a yellow dot grabs that key:','your hand sets its spot and aim.','Moving Smooth or Keys re-makes the dots', '(your dot edits get replaced).'], X, 462, 14);
 }
 function drawKeysPage(X,W){
-  txt('Keys', X, 100, 26);
+  txt('Keys', X, 100, 26); button(X+70, 80, 100, 36, '◀ Camera', false, ()=>{ state.page='takes'; requestUI(); }, '#2a3060');
   const tk = selTake();
   if (!tk){ para(['Film a take first.'], X, 140, 16); return; }
   txt(tk.name, X+W, 100, 17, '#ffd400','right');
@@ -6121,7 +6170,7 @@ function drawFromLayer(X,W){
   txt('Prop from a layer', X, 100, 24);
   para(['Pick a BUILD layer. It leaves the scenery','and becomes a prop you can grab and move.'], X, 132, 14);
   const list = worldLayers();
-  list.slice(0,8).forEach((L,i)=>{ const y = 172+i*48;
+  scrollList('fromL', X, 172, W, UIH-130, 48, list.length, (i, y, W) => { const L = list[i];
     button(X,y,W,42,L.name,false,()=>{ if (worldLayers().length<=1){ toast('Keep at least one world layer: make a new one in BUILD first'); return; } layerToProp(L); state.page='chars'; requestUI(); },'#ff2d95'); });
   button(X,UIH-118,W,44,'◀ Back',false,()=>{ state.page='chars'; requestUI(); },'#1e6bff');
 }
@@ -6302,7 +6351,8 @@ function drawChars(X,W){
   rr(X+46,176,W-92,44,10,'#34c759'); txt(c.name.length>16 ? c.name.slice(0,15)+'…' : c.name, X+58, 198, 17, '#111'); hit(X+46,176,W-92,44,()=>openRename('char', c.id));
   txt((pups.indexOf(c)+1)+'/'+pups.length, X+W-56, 198, 12, '#0b3a17','right',700);
   button(X+W-40,176,40,44,'▶',false,()=>pickC(1),'#34c759');
-  const aL = activeLayer(); let y = 230;
+  const aL = activeLayer();
+  pageScroll('chars', X, 230, W, UIH-66, W => { let y = 230; const hw = (W-8)/2;   // everything below the name scrolls, so nothing falls off the bottom
   if (c.type==='puppet'){
     const pw = state.win.layers ? (W-8)/2 : (W-16)/3, on = !!(show.embodied && show.embodied.c === c);
     button(X,y,pw,44, poseT > 0 ? 'Hold still… '+Math.ceil(poseT) : '🧍 Pose my hands', poseT > 0, ()=>startPoseCapture(), '#ff9500');
@@ -6355,8 +6405,9 @@ function drawChars(X,W){
     para(['Put that controller down: your bare hand works','it. Fingers on top, thumb below: open your','hand to open its mouth. One on each hand.','In PERFORM, tap the red ball to record.'], X, y+8, 14); y += 96;
   }
   drawWeight(X, y+4, W, c);
+  return y + 40; });
   const ac2 = state.confirm==='clearpart', a = state.confirm==='delchar';
-  const t4 = (W-24)/4, by4 = Math.max(UIH-56, y+8);   // one row at the bottom, below whatever the character needed
+  const t4 = (W-24)/4, by4 = UIH-56;   // one row at the bottom, below whatever the character needed
   button(X,by4,t4,42,ac2?'Tap again':'Clear part',ac2,()=>{ if(!ac2){state.confirm='clearpart';requestUI();return;} state.confirm=null; clearPart(activeLayer()); },'#ff9500');
   button(X+t4+8,by4,t4,42,'⧉ Duplicate',false,()=>dupChar(c),'#34c759');
   button(X+2*(t4+8),by4,t4,42,'Rename',false,()=>openRename('char', c.id),'#5e2bff');
@@ -6380,9 +6431,7 @@ function charRow(c, x, y, w){
 function drawCast(X,W){
   txt('On stage', X, 100, 26);
   if (!show.chars.length){ para(['Make puppets and props in CHARACTERS.'], X, 140, 15); return; }
-  const per = 9, pages = Math.ceil(show.chars.length/per), pg = clamp(state.castPage||0, 0, pages-1);
-  show.chars.slice(pg*per, pg*per+per).forEach((c,i)=>charRow(c, X, 118+i*48, W));
-  if (pages > 1){ button(X,UIH-110,(W-8)/2,40,'◀ More',false,()=>{ state.castPage = (pg-1+pages)%pages; requestUI(); },'#1e6bff'); button(X+(W-8)/2+8,UIH-110,(W-8)/2,40,'More ▶',false,()=>{ state.castPage = (pg+1)%pages; requestUI(); },'#1e6bff'); }
+  scrollList('cast', X, 118, W, UIH-20, 48, show.chars.length, (i, y, RW) => charRow(show.chars[i], X, y, RW));
 }
 const voiceOnlyRec = async ()=>{ if (show.rec) return; state.mic = true; const m = await ensureMic(); if (m){ startShowRec(); const sc0 = selChar(); if (show.rec && sc0 && partsOf(sc0).some(L=>L.part==='mouth')){ show.rec.voiceFor = sc0.id; toast(sc0.name+"'s mouth moves with your voice"); } else toast('Just your voice: the show plays while you talk'); } };
 function drawPerform(X,W){
@@ -6414,10 +6463,10 @@ function drawPerform(X,W){
     if (cc) button(X+96,y,W-96,42,'In '+cc.name+' · take out',true,()=>netUnassign(p.id),'#00c7be');
     else if (sc0 && sc0.type==='puppet' && !assignedTo(sc0)) button(X+96,y,W-96,42,'Put in '+sc0.name,false,()=>netAssign(sc0, p.id),'#00c7be');
     else txt(sc0 && sc0.type==='puppet' ? 'pick a free puppet ◀ ▶' : 'pick a puppet ◀ ▶', X+96, y+21, 13, '#8f97c7','left',700); });
-  let cy2 = ty + 52 + gps.length*48;
+  let cy2 = ty + 96 + gps.length*48;   // below the 'Hear old take' row
   if (sc0 && sc0.type==='puppet' && cy2 + 40 < UIH-12){ toggle(X, cy2, W, 40, sc0.name.slice(0,14)+'’s eyes follow a ✛ you move', !!sc0.lookOn, ()=>{ sc0.lookOn = !sc0.lookOn; sceneDirty = true; if (sc0.lookOn) toast('Grab the yellow ✛ with the right grip and move it: the eyes follow. Record while you move it.'); requestUI(); }, '#ffd400'); cy2 += 48; }
   if (cy2 + 40 < UIH-12) toggle(X, cy2, W, 40, 'In a puppet, grip a surface to climb', state.climb !== false, ()=>{ state.climb = state.climb === false; toast(state.climb ? 'Climbing on: grip a wall, the ground or a block and pull' : 'Climbing off'); requestUI(); }, '#34c759');
-  if (!gps.length && cy2+110 < UIH-10) para(['Grip a character to move it; add the left grip to','stretch and turn it. Right stick: ↕ size, ↔ turn.'], X, cy2+60, 13);
+  if (!gps.length && cy2+100 < UIH-10) para(['Either grip grabs a puppet, prop or ✛: one in each hand.','Right stick: ↕ size, ↔ turn.'], X, cy2+60, 13);
 }
 function drawWave(clip, x, y, w, h){
   const buf = audioBufs.get(clip.id);
@@ -6575,30 +6624,22 @@ function drawShowRows(X,W,aud){
       rows.push(...list);
     }
   }
-  if (!aud && (show.takes || []).length){ const tks = show.takes.slice().reverse(); rows.unshift({kind:'th', n:tks.length}, ...tks.map(tk => ({kind:'tk', tk}))); }
+  if (!aud && (show.takes || []).length){ const tks = show.takes.slice(); rows.unshift({kind:'th', n:tks.length}, ...tks.map(tk => ({kind:'tk', tk}))); }
   if (aud) for (const a of show.audio) rows.push({kind:'a', a, name:(a.name||'Voice '+a.id), len:a.dur||0});
   const vs = aud ? show.audio.find(x=>x.id===state.voiceSel) : null, SK = aud ? 'audioScroll' : 'motionScroll';
   let top = 124;
   if (aud && !vs){ showClockRow(X, 112, W); top = 176; }
   if (!rows.length) para(aud ? ['No voices yet. Turn the mic on in Perform','and record, or use Voice only.'] : ['Nothing recorded yet.','Go to Perform and press Record.'], X, top+16, 15);
   else if (!vs) para([aud ? 'Tap a voice to change how it sounds.' : 'Tap a row to see its path and play the show.'], X, UIH-154, 14);
-  const fit = Math.max(1, Math.floor((UIH-176-top)/48)), scrolls = !vs && rows.length > fit, maxS = Math.max(0, rows.length-fit);
-  state[SK] = clamp(state[SK]||0, 0, maxS);
-  const sc = scrolls ? state[SK] : 0, RW = scrolls ? W-44 : W;
-  if (scrolls){   // ▲ ▼ and a bar you can drag
-    const bx = X+W-36, bot = top+fit*48-6, trackT = top+46, trackB = bot-46, th = Math.max(30, (trackB-trackT)*fit/rows.length), ty = trackT + (trackB-trackT-th)*(sc/maxS);
-    button(bx,top,36,40,'▲',false,()=>{ state[SK] = Math.max(0, sc-3); requestUI(); },'#1e6bff');
-    button(bx,bot-40,36,40,'▼',false,()=>{ state[SK] = Math.min(maxS, sc+3); requestUI(); },'#1e6bff');
-    rr(bx+8,trackT,20,trackB-trackT,10,'#2a3060'); rr(bx+4,ty,28,th,12,'#ffd400');
-    const setS = (px,py)=>{ state[SK] = Math.round(clamp((py-trackT-th/2)/Math.max(1,trackB-trackT-th),0,1)*maxS); requestUI(); };
-    hit(bx-6,trackT,48,trackB-trackT,setS,setS);
-    txt((sc+1)+'–'+Math.min(rows.length, sc+fit)+' of '+rows.length, X+W, UIH-170, 13, '#8f97c7','right',700);
-  }
-  const X_ = X; (vs ? rows.filter(r=>r.a===vs) : rows.slice(sc, sc+fit)).forEach((r,i)=>{ const y=top+i*48; let W = RW, X = X_;
-    if (r.kind==='th'){ txt('🎞 Takes · newest first · ✕ deletes one (X undoes)', X+4, y+28, 15, '#ffd400','left',800); return; }
+  const X_ = X, W_ = W, drawR = (r, y, RW) => { let W = RW, X = X_;
+    if (r.kind==='th'){ txt('🎞 Takes · first one on top · tap to jump there', X+4, y+28, 15, '#ffd400','left',800); return; }
     if (r.kind==='tk'){ const tk = r.tk, len = tk.t1 - tk.t0, who = takeWho(tk);
-      rr(X, y+6, W, 36, 10, '#0d1029'); rr(X, y+6, 10, 36, 5, takeColor(tk));
-      txt('T'+tk.id+' · '+(who.length > 16 ? who.slice(0,15)+'…' : who)+' · '+fmtTime(tk.t0)+'–'+fmtTime(tk.t1)+' · '+(len < 10 ? len.toFixed(1) : Math.round(len))+' s'+((tk.clips||[]).length ? ' 🎤' : ''), X+18, y+24, 14, len < 4 ? '#ff9500' : '#fff','left',700);
+      const ton = state.takeSel === tk.id; rr(X, y+6, W, 36, 10, ton ? '#5e2bff' : '#0d1029'); rr(X, y+6, 10, 36, 5, takeColor(tk));
+      hit(X, y+6, W-96, 36, () => { state.takeSel = tk.id; show.t = tk.t0; stopShow(); const cid = (tk.who || [])[0];
+        if (cid != null && charById(cid)){ state.selChar = cid; for (const P of partsOf(charById(cid))) P.flashT = 0.9; const k = ['r'+cid, ...partsOf(charById(cid)).map(L=>String(L.id))].find(k => show.tracks[k]); if (k){ state.motionSel = k; motionDirty = true; } }
+        applyShowPose(show.t); toast('T'+tk.id+': '+fmtTime(tk.t0)+'–'+fmtTime(tk.t1)+'. Camera keys are in the Camera tab'); requestUI(); });
+      g.save(); g.beginPath(); g.rect(X, y, W-98, 48); g.clip();
+      txt('T'+tk.id+((tk.clips||[]).length ? ' 🎤' : '')+' · '+fmtTime(tk.t0)+'–'+fmtTime(tk.t1)+' · '+who, X+18, y+24, 14, len < 4 ? '#ff9500' : '#fff','left',700); g.restore();
       rr(X+W-92, y+8, 40, 32, 10, '#34c759'); txt('▶', X+W-72, y+24, 15, '#111','center'); hit(X+W-92, y+8, 40, 32, () => { show.t = tk.t0; state.punchAt = tk.t0 > 0.05 ? tk.t0 : null; stopShow(); applyShowPose(show.t); playShow(); requestUI(); });
       rr(X+W-46, y+8, 40, 32, 10, '#ff3b30'); txt('✕', X+W-26, y+24, 16, '#fff','center'); hit(X+W-46, y+8, 40, 32, () => deleteTake(tk));
       return; }
@@ -6620,7 +6661,9 @@ function drawShowRows(X,W,aud){
     txt(r.len.toFixed(1)+' s', X+W-60, y+21, 14, '#8f97c7','right',700);
     rr(X+W-46,y+4,40,34,10,'#ff3b30'); txt('✕', X+W-26, y+21, 16, '#fff','center');
     hit(X+W-46,y+4,40,34,()=>{ const b=snapShow(); if (r.kind==='t') delete show.tracks[r.key]; else { if (state.voiceSel===r.a.id) state.voiceSel = null; show.audio=show.audio.filter(x=>x!==r.a); if (show.playing) audioPlayFrom(show.t); else audioStop(); } pushUndo({type:'show',snap:b}); sceneDirty=true; requestUI(); });
-  });
+  };
+  if (vs) rows.filter(r=>r.a===vs).forEach(r => drawR(r, top, W_));
+  else scrollList(SK, X, top, W, UIH-176, 48, rows.length, (i, y, RW) => drawR(rows[i], y, RW));
   if (vs){
     // the voice's own strip: tap or drag to pick where to listen from
     const sy = 124 + 48, a0 = vs.at || 0, d0 = Math.max(0.1, vs.dur || 0.1);
@@ -6742,6 +6785,7 @@ function attachPanel(win){
   win.canvas.addEventListener('pointermove', e => { if (pend && Math.hypot(e.clientX-pend.x, e.clientY-pend.y) > 10) pend = null; if (down) uiPointer(win, 'move', ...xy(e)); });
   win.canvas.addEventListener('pointerup', e => { if (pend){ const p = pend.p; pend = null; uiPointer(win, 'down', ...p); uiPointer(win, 'up', ...p); return; } if (down){ down = false; uiPointer(win, 'up', ...xy(e)); } });
   win.canvas.addEventListener('pointercancel', e => { pend = null; if (down){ down = false; uiPointer(win, 'up', -1e4, -1e4); } });
+  win.canvas.addEventListener('wheel', e => { const [x, y] = xy(e); if (scrollAt(win, x, y, Math.sign(e.deltaY))) e.preventDefault(); }, {passive:false});
 }
 for (const win of [menuWin, layersWin, charsWin, transWin]) attachPanel(win);
 
@@ -7377,7 +7421,9 @@ function xrUpdate(dt){
       pulse('right',0.3,20);
     }
     if (screenGrab) moveScreenGrab(L, R, pl);
-    if (screenGrab && !screenGrab.corner && Math.abs(pr.sy) > 0.2){ bigScreen.scale.multiplyScalar(Math.exp(-pr.sy*dt*1.5)); }
+    const stickList = !winGrab && !screenGrab && xrHoverUI && Math.abs(pr.sy) > 0.4 && (xrHoverUI.win.hits || []).some(h => h.list && xrHoverUI.x >= h.x && xrHoverUI.x <= h.x + h.w && xrHoverUI.y >= h.y && xrHoverUI.y <= h.y + h.h);
+    if (stickList){ listStickAcc += pr.sy*dt*7; if (Math.abs(listStickAcc) >= 1){ scrollAt(xrHoverUI.win, xrHoverUI.x, xrHoverUI.y, Math.sign(listStickAcc)); listStickAcc = 0; } }   // pointing at a list: the stick scrolls it
+    else if (screenGrab && !screenGrab.corner && Math.abs(pr.sy) > 0.2){ bigScreen.scale.multiplyScalar(Math.exp(-pr.sy*dt*1.5)); }
     else if (winGrab && Math.abs(pr.sy) > 0.2){ const m = winGrab.win.mesh; m.scale.setScalar(clamp(m.scale.x*Math.exp(-pr.sy*dt*1.5), 0.25, 6)); }
     else if (show.embodied && (Math.abs(pr.sx) > 0.2 || Math.abs(pr.sy) > 0.2)){ const lk = show.embodied.c.look.position; lk.x = clamp(lk.x + pr.sx*dt*1.4, -0.7, 0.7); lk.y = clamp(lk.y - pr.sy*dt*1.1, -0.5, 0.5); }
     else if (show.grab){
@@ -7394,8 +7440,8 @@ function xrUpdate(dt){
       if (Math.abs(pr.sx) > 0.7 && !flickHeld){ flickHeld = true; cycleFamily(pr.sx > 0 ? 1 : -1); }
     }
     if (Math.abs(pr.sx) < 0.35) flickHeld = false;
-    if (shoot && !winGrab && !camAdj && Math.abs(pr.sy) > 0.3) lensNudge(pr.sy*dt*75);
-    if (ph==='edit' && !winGrab && !screenGrab && Math.abs(pr.sy) > 0.5){ audScrollAcc += pr.sy*dt*6; if (Math.abs(audScrollAcc) >= 1){ state.audScroll = Math.max(0, (state.audScroll||0) + Math.sign(audScrollAcc)); audScrollAcc = 0; requestUI(); } }   // scroll the sound lanes
+    if (shoot && !stickList && !winGrab && !camAdj && Math.abs(pr.sy) > 0.3) lensNudge(pr.sy*dt*75);
+    if (ph==='edit' && !stickList && !winGrab && !screenGrab && Math.abs(pr.sy) > 0.5){ audScrollAcc += pr.sy*dt*6; if (Math.abs(audScrollAcc) >= 1){ state.audScroll = Math.max(0, (state.audScroll||0) + Math.sign(audScrollAcc)); audScrollAcc = 0; requestUI(); } }   // scroll the sound lanes
     // right grip: a window you point at, else the thing under your hand, else the world
     if (edge(R,pr,'grip')){
       const tipW = V().set(0,-0.01,-0.07); R.grip.updateMatrixWorld(true); R.grip.localToWorld(tipW);
@@ -7468,12 +7514,12 @@ function xrUpdate(dt){
       pointerDot.visible = true; pointerDot.position.copy(h.point); pointerDot.scale.setScalar(rig.scale.x);
       pointer.visible = true; pointer.scale.z = h.distance / rig.scale.x;
       if (!hover.screen){
-        const x = h.uv.x*hover.win.cw, y = (1-h.uv.y)*hover.win.ch;
+        const x = h.uv.x*hover.win.cw, y = (1-h.uv.y)*hover.win.ch; xrHoverUI = {win:hover.win, x, y};
         if (pr && edge(R,pr,'trigP') && !(stroke && stroke.kind!=='angle') && !rec){ uiCapture = hover.win; uiPointer(hover.win, 'down', x, y); }
         else if (uiCapture===hover.win && pr?.trigP) uiPointer(hover.win, 'move', x, y);
       }
     }
-    if (!onPanel){ pointer.visible = !shoot && (menuWin.mesh.visible || layersWin.mesh.visible); pointer.scale.z = 0.25; pointerDot.visible = false; }
+    if (!onPanel){ xrHoverUI = null; pointer.visible = !shoot && (menuWin.mesh.visible || layersWin.mesh.visible); pointer.scale.z = 0.25; pointerDot.visible = false; }
     if (uiCapture && !pr?.trigP){ uiPointer(uiCapture, 'up',0,0); uiCapture = null; }
 
     R.grip.updateMatrixWorld(true);
@@ -8682,21 +8728,18 @@ function drawMusicPage(X, W){
   let top = drawMusicRow(X, 188, W) + 6;
   const mood = state.songMood || 'All', cw6 = (W - 5*5)/6;
   MOODS.forEach((md, k) => { const r6 = Math.floor(k/6), c6 = k % 6, w6 = r6 ? (W - 4*5)/5 : cw6, x = X + c6*(w6 + 5);
-    button(x, top + r6*34, w6, 30, md, mood === md, () => { state.songMood = md; state.songScroll = 0; requestUI(); }, md === 'Mellow' ? '#5e2bff' : '#ff2d95'); });
+    button(x, top + r6*34, w6, 30, md, mood === md, () => { state.songMood = md; SCR().songs = 0; requestUI(); }, md === 'Mellow' ? '#5e2bff' : '#ff2d95'); });
   top += 72;
   // the list: every upbeat song first, mellow ones last (or one mood); tap one to hear it under this scene
   const ids = SONGS.map((S, i) => i).filter(i => mood === 'All' || SONGS[i].mood === mood);
-  if (mood === 'All') ids.sort((a, b) => (SONGS[a].mood === 'Mellow') - (SONGS[b].mood === 'Mellow') || (a >= SONGS.length - SONGS3.length ? -1 : 0) - (b >= SONGS.length - SONGS3.length ? -1 : 0) || a - b);
-  const RH = 46, fit = Math.max(1, Math.floor((UIH - 60 - top)/RH)), n = ids.length, max = Math.max(0, n - fit);
-  state.songScroll = clamp(state.songScroll ?? Math.max(0, Math.min(max, ids.indexOf(m.song) - 1)), 0, max);
-  ids.slice(state.songScroll, state.songScroll + fit).forEach((i, j) => { const S = SONGS[i], y = top + j*RH, on = i === m.song;
+  const age = i => i >= SONGS.length - SONGS4.length ? 0 : i >= SONGS.length - SONGS4.length - SONGS3.length ? 1 : 2;   // newest songs first
+  if (mood === 'All') ids.sort((a, b) => (SONGS[a].mood === 'Mellow') - (SONGS[b].mood === 'Mellow') || age(a) - age(b) || a - b);
+  const RH = 46; if (SCR().songs === undefined) SCR().songs = Math.max(0, ids.indexOf(m.song) - 1);
+  scrollList('songs', X, top, W, UIH - 12, RH, ids.length, (i0, y, W) => { const i = ids[i0], S = SONGS[i], on = i === m.song;
     rr(X, y, W, RH-5, 10, on ? '#ffd400' : '#2a3060');
     txt(S.name + (songBusy.has(i) ? '  · composing…' : ''), X+10, y+14, 14, on ? '#111' : '#fff', 'left', 800); txt(S.mood, X+W-10, y+14, 10.5, on ? '#4a3b00' : '#ff7ab8', 'right', 800);
     const tg = S.tag || ''; txt(tg.length > 52 ? tg.slice(0, 51)+'…' : tg, X+10, y+31, 10.5, on ? '#4a3b00' : '#8f97c7', 'left', 600);
     hit(X, y, W, RH-5, ()=>{ m.song = i; sceneDirty = true; audioStop(); musicStop(); if (show.playing) audioPlayFrom(show.t); else musicPlayFrom(show.t || 0); requestUI(); }); });
-  const bw = (W-8)/2, by = UIH - 52;
-  button(X, by, bw, 40, '▲', false, ()=>{ state.songScroll = Math.max(0, state.songScroll - fit + 1); requestUI(); }, '#1e6bff');
-  button(X+bw+8, by, bw, 40, '▼', false, ()=>{ state.songScroll = Math.min(max, state.songScroll + fit - 1); requestUI(); }, '#1e6bff');
 }
 
 // ---- arms that join the hands to the body: string, elbow, or bellows
@@ -8953,7 +8996,7 @@ function drawCharImport(X,W){
   const others = worldList.filter(w=>w.id!==state.worldId);
   if (!others.length){ para(['No other worlds on this device yet.'], X, 136, 15); }
   const iw = state.impWorld;
-  if (!iw){ others.slice(0,9).forEach((w,i)=>{ const y = 122+i*48; rr(X,y,W,42,10,'#2a3060'); txt(w.name, X+12, y+21, 16, '#fff'); txt('▸', X+W-16, y+21, 18, '#ffd400','right'); hit(X,y,W,42,()=>importListWorld(w.id)); }); }
+  if (!iw){ scrollList('impw', X, 122, W, UIH-130, 48, others.length, (i, y, W) => { const w = others[i]; rr(X,y,W,42,10,'#2a3060'); txt(w.name, X+12, y+21, 16, '#fff'); txt('▸', X+W-16, y+21, 18, '#ffd400','right'); hit(X,y,W,42,()=>importListWorld(w.id)); }); }
   else { const w = worldList.find(x=>x.id===iw.id); txt(w ? w.name : '', X, 136, 16, '#ffd400','left',800);
     const pages = Math.max(1, Math.ceil(iw.chars.length/4)); iw.page = clamp(iw.page||0, 0, pages-1);
     if (pages > 1){ button(X+W-84,118,40,32,'◀',false,()=>{ iw.page--; requestUI(); },'#ff2d95'); button(X+W-40,118,40,32,'▶',false,()=>{ iw.page++; requestUI(); },'#ff2d95'); }
@@ -10128,7 +10171,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, mirrorOnly, aacFromMP4, blendJoins, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, updateRecording, riding, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, mirrorOnly, aacFromMP4, blendJoins, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, updateRecording, riding, saveLocal, dupWorld, scrollAt, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
