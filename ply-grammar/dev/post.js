@@ -1861,7 +1861,7 @@ function panelObject(p,b){
 /* ---------------- rebuild ---------------- */
 let lastPanels=[],allScrews=[],allFixes=[];
 const PERF={};
-const XR={tool:'push',step:null,base:null,floorH:0,hover:-1,W:[],navN:0,nav:null,price:null};   /* headset state (the code is in the VR / XR section) */
+const XR={tool:'push',step:null,page:null,base:null,floorH:0,hover:-1,W:[],navN:0,nav:null,price:null};   /* headset state (the code is in the VR / XR section) */
 /* ---------------- keeping things up to date, cheaply ----------------
    Each box remembers its panelized result until the box or a build setting really changes, so an edit only reworks the box you touched.
    Panel meshes are only made for the Panels view, sheets are only nested when a price or the Sheets view needs them, and in the
@@ -3910,8 +3910,8 @@ function setFloor(h){XR.floorH=Math.round(Math.max(-.3,Math.min(1.8,h))*100)/100
 function floorStep(on){XR.step=on?'floor':null;floorGrid.visible=on;menu.visible=true;
   if(!on)menuMsg=view!=='mass'?'Panels view: tap a joint to change it, or pull a face or an edge to reshape.':XR.tool==='push'?'Point at a face, an edge or a corner and pull the trigger to drag it.':'Pen: hold the trigger and draw a line in the air.';drawMenu()}
 /* the menu: one canvas on the left controller */
-const MW=1024,MH=1360;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
-const menu=new THREE.Mesh(new THREE.PlaneGeometry(.335*MW/1230,.335*MH/1230),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
+const PG_VERSION='1.25',MW=1200,MH=1500;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
+const menu=new THREE.Mesh(new THREE.PlaneGeometry(.27,.27*MH/MW),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
 let menuMsg='Point at a face, an edge or a corner and pull the trigger to drag it.';
 const MX=menuCv.getContext('2d');
 function mText(s,x,y,size=34,col='#E9ECF1',al='left',wt=600){MX.fillStyle=col;MX.font=`${wt} ${size}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;MX.textAlign=al;MX.textBaseline='middle';MX.fillText(s,x,y)}
@@ -3919,62 +3919,135 @@ function mWrap(s,x,y,w,size=30,col='#C9CED8',lh=40,max=4){MX.font=`500 ${size}px
   for(const wd of words){const t=line?line+' '+wd:wd;if(MX.measureText(t).width>w&&line){mText(line,x,y+n*lh,size,col,'left',500);n++;line=wd;if(n>=max)return y+n*lh}else line=t}if(line){mText(line,x,y+n*lh,size,col,'left',500);n++}return y+n*lh}
 function mBtn(x,y,w,h,label,o={}){const id=XR.W.length,hov=XR.hover===id;MX.fillStyle=o.on?(o.col||'#2E5BFF'):hov?'#3B3F49':(o.col&&o.solid?o.col:'#2A2D34');MX.beginPath();MX.roundRect(x,y,w,h,20);MX.fill();
   if(hov){MX.strokeStyle='#FFFFFF';MX.lineWidth=5;MX.stroke()}mText(label,x+w/2,y+h/2+2,o.fs||36,o.on||o.solid?'#FFFFFF':'#E9ECF1','center',700);XR.W.push({x,y,w,h,click:o.click})}
-function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.beginPath();MX.roundRect(0,0,MW,MH,36);MX.fill();
-  mText('Ply Grammar',48,64,52,'#FFFFFF','left',800);const sb=figSel?'figure · '+ftIn(figSel.h):sel?sel.name+(selCut?(selCut.userData.isCarve?' · cut-out':' · cut'):''):'nothing selected';mText(sb,MW-48,64,30,'#F2A01F','right',700);
-  const B=(x,y,w,label,o)=>mBtn(x,y,w,104,label,o),c3=[48,356,664],w3=296,c2=[48,510],w2=450;
-  if(XR.step==='room')netKeypad(B,c3,w3);
-  else if(XR.step==='floor'){const cm=Math.round(XR.floorH*100);
-    mText('Set the floor',48,160,46,'#FFFFFF','left',800);
-    let y=mWrap(`The orange grid is the floor: ${cm===0?'right on your real floor':Math.abs(cm)+' cm '+(cm>0?'above':'below')+' your real floor'}. Pull the right trigger to put the floor where your controller is, or nudge it. Raise it to a table to model standing up.`,48,226,MW-96,32,'#C9CED8',44,5);
-    y+=30;B(c3[0],y,w3,'\u25B2  Up 2 cm',{click:()=>setFloor(XR.floorH+.02)});B(c3[1],y,w3,'\u25BC  Down 2 cm',{click:()=>setFloor(XR.floorH-.02)});B(c3[2],y,w3,'Real floor',{click:()=>setFloor(0)});
-    y+=140;B(48,y,MW-96,'Done',{solid:true,col:'#2FBF5B',fs:44,click:()=>floorStep(false)});
-  }else{let y=120;
-    B(c3[0],y,w3,'Massing',{on:view==='mass',click:()=>{setView('mass');drawMenu()}});B(c3[1],y,w3,'Panels',{on:view==='panels',click:()=>{if(view==='panels')return;menuMsg='Building the panels…';drawMenu();setTimeout(()=>{setView('panels');menuMsg='Panels view. Tap a joint to change it, or pull a face or an edge to reshape.';drawMenu()},50)}});B(c3[2],y,w3,'Build',{on:view==='build',click:()=>{if(view==='build')return;menuMsg='Working out how it goes together…';drawMenu();setTimeout(()=>{freshen();setView('build');xrStepMsg();drawMenu()},50)}});y+=124;
-    const jt=view==='panels'&&selEdge?selEdge.b.joints?.find(j=>j.key===selEdge.key):null,later=(f,msg)=>()=>{menuMsg='Rebuilding…';drawMenu();setTimeout(()=>{f();rebuild();save();menuMsg=typeof msg==='function'?msg():msg;drawMenu()},30)};
-    if(figSel&&view!=='build'){const F=figSel,i=FIG_KEYS.indexOf(F.pose),step=d=>()=>{const k=FIG_KEYS[(Math.max(0,i)+d+FIG_KEYS.length)%FIG_KEYS.length];figSetPose(F,k);menuMsg='Pose: '+FIG_POSES[k].name+'.';drawMenu()};
-      B(c3[0],y,w3,'\u25C0  Pose',{click:step(-1)});B(c3[1],y,w3,FIG_POSES[F.pose]?.name||'Own pose',{solid:true,col:'#6C3BFF',fs:32,click:step(1)});B(c3[2],y,w3,'Pose  \u25B6',{click:step(1)});y+=124;
-      const hh=d=>()=>{F.h=Math.max(30,Math.min(80,F.h+d));const keep=F.ang,cu=F.pose==='custom';figRebuild(F);if(cu){F.ang=keep;figApply(F);figAnchor(F)}save();menuMsg=`Height ${ftIn(F.h)} (${Math.round(F.h*2.54)} cm).`;drawMenu()};
-      B(c3[0],y,w3,'Shorter',{click:hh(-2)});B(c3[1],y,w3,ftIn(F.h),{fs:38});B(c3[2],y,w3,'Taller',{click:hh(2)})}
-    else if(jt){/* a joint is picked: the same choices as the joint card on the computer */
-      const b=selEdge.b,o=b.edgeOpts[jt.key]||{},[fA,fB]=jt.faces,cur=o.joint||'auto',put=(k,v,def)=>later(()=>{const c=b.edgeOpts[jt.key]||{};if(v===def)delete c[k];else c[k]=v;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},()=>{const j=b.joints?.find(x=>x.key===jt.key);return j?`${b.name} · ${j.label}: now ${j.joint==='meet'?'meet':j.joint?.startsWith?.('over')?'overlap':j.joint||'fingers'}.`:'Joint changed.'});
-      B(c3[0],y,w3,'Auto',{on:cur==='auto',col:'#19B5A1',click:put('joint','auto','auto')});B(c3[1],y,w3,'Fingers',{on:cur==='fingers',col:'#19B5A1',click:put('joint','fingers','auto')});B(c3[2],y,w3,'Meet',{on:cur==='meet',col:'#19B5A1',click:put('joint','meet','auto')});y+=124;
-      B(c3[0],y,w3,fA.num+' over '+fB.num,{on:cur==='over:'+fA.id,col:'#19B5A1',fs:34,click:put('joint','over:'+fA.id,'auto')});B(c3[1],y,w3,fB.num+' over '+fA.num,{on:cur==='over:'+fB.id,col:'#19B5A1',fs:34,click:put('joint','over:'+fB.id,'auto')});
-      const en=o.ends||jt.ends;B(c3[2],y,w3,'Ends: '+en,{fs:32,click:put('ends',en==='proud'?'flush':'proud',null)})}
-    else if(view==='build'){const pl=AS.plan,n=pl?pl.steps.length:0,k=AS.step||0,st=pl&&pl.steps[k];
-      B(c3[0],y,w3,'\u25C0  Back',{click:()=>{AS.playing=false;$('#aPlay').textContent='Play';showStep(k-1)}});B(c3[1],y,w3,AS.playing?'Pause':'Play',{on:AS.playing,col:'#2E5BFF',click:()=>{$('#aPlay').click();drawMenu()}});
-      B(c3[2],y,w3,'Next  \u25B6',{click:()=>{AS.playing=false;$('#aPlay').textContent='Play';showStep(k+1)}});y+=124;
-      B(c3[0],y,w3,'Start over',{fs:34,click:()=>{AS.playing=false;$('#aPlay').textContent='Play';showStep(0)}});
-      if(blocks.length>1)B(c3[1],y,w3,'Box '+(AS.b?.name||'')+'  \u25B8',{fs:34,click:()=>{const i=blocks.indexOf(AS.b);select(blocks[(i+1)%blocks.length]);AS.b=sel;buildAsm(true);xrStepMsg();drawMenu()}});
-      if(pl&&pl.steps.some(x=>x.stuck))B(c3[2],y,w3,'Find a fix',{fs:34,solid:true,col:'#E5392B',click:()=>{menuMsg='Looking for a fix…';drawMenu();findBuildFix(AS.b).then(m=>{setTimeout(()=>{buildAsm(true);menuMsg=m||'';drawMenu()},400)})}})}
-    else if(view==='panels'){const tb=sel||blocks[0];
-      B(c3[0],y,w3,S.explode?'Explode on':'Explode',{on:!!S.explode,col:'#19B5A1',fs:34,click:()=>{$('#explodeBtn').click();drawMenu()}});B(c3[1],y,w3,S.showScrews?'Screws on':'Screws',{on:!!S.showScrews,col:'#19B5A1',fs:34,click:()=>{$('#screwBtn').click();drawMenu()}});
-      const ra=()=>(tb&&tb.ribAxis)||S.ribAxis||'long';B(c3[2],y,w3,'Ribs: '+({long:'length',short:'width',vertical:'shelves'}[ra()]||'length'),{fs:30,click:later(()=>{if(tb)tb.ribAxis=ra()==='short'?'vertical':ra()==='vertical'?'long':'short'},()=>tb?`Ribs in ${tb.name} now run `+({long:'across the length',short:'across the width',vertical:'flat, like shelves'}[ra()])+'.':'')});y+=124;
-      const step=f=>later(()=>{if(tb)tb.ribMax=Math.max(6,Math.min(48,Math.round((tb.ribMax||S.ribMax)*f)))},()=>tb?`Ribs in ${tb.name}: one every ${tb.ribMax}" at most.`:'');
-      B(c3[0],y,w3,'Ribs closer',{fs:34,click:step(.8)});B(c3[1],y,w3,'Ribs wider',{fs:34,click:step(1.25)});B(c3[2],y,w3,'Auto fix',{fs:34,click:()=>{menuMsg='Looking for parts that cannot go together, and weak spots…';drawMenu();fixAll();Promise.all(blocks.map(b=>findBuildFix(b))).then(r=>{const m=r.filter(x=>x&&x.startsWith('Fixed'));menuMsg=m.length?m.join(' '):'Every part goes together. Weak joints and panels got glue, blocks or closer ribs where that helps.';drawMenu()})}})}
-    else{B(c3[0],y,w3,'Push / pull',{on:XR.tool==='push',col:'#19B5A1',click:()=>skTool('push')});B(c3[1],y,w3,'Pen',{on:XR.tool==='pen',col:'#E5392B',click:()=>skTool('pen')});B(c3[2],y,w3,'Eraser',{on:XR.tool==='erase',col:'#FF2D95',click:()=>skTool('erase')});y+=124;
-    if(XR.tool==='push'){B(c3[0],y,w3,'Add box',{click:()=>menuDo('box')});B(c3[1],y,w3,'Add cut',{click:()=>menuDo('cut')});B(c3[2],y,w3,'Add cut-out',{click:()=>menuDo('carve')})}
-    else{B(c3[0],y,w3,S.skSquare!==false?'Square up on':'Square up off',{on:S.skSquare!==false,col:'#19B5A1',fs:32,click:()=>{S.skSquare=S.skSquare===false;menuMsg=S.skSquare?'Square up: lines that are nearly upright, level or square to the rest become exactly so.':'Square up is off: lines stay as you draw them.';save();drawMenu()}});
-      B(c3[1],y,w3,S.skTilt!==false?'Wrist tilt on':'Wrist tilt off',{on:S.skTilt!==false,col:'#19B5A1',fs:32,click:()=>{S.skTilt=S.skTilt===false;menuMsg=S.skTilt?'A face you hold tilts with your wrist.':'A face you hold only moves in and out.';save();drawMenu()}});
-      B(c3[2],y,w3,'Clear loose',{fs:32,click:()=>{skClearLoose();menuMsg='Loose lines removed. Solids stay.';drawMenu()}})}}y+=124;
-    if(jt){const b=selEdge.b,bl=(b.edgeOpts[jt.key]||{}).blocks||'auto';B(c3[0],y,w3,'Blocks: '+bl,{fs:32,click:later(()=>{const c=b.edgeOpts[jt.key]||{},nx=bl==='auto'?'on':bl==='on'?'off':'auto';if(nx==='auto')delete c.blocks;else c.blocks=nx;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},'Corner blocks on this joint changed.')})}
-    else if(view==='build');else if(figSel)B(c3[0],y,w3,'Remove figure',{fs:32,col:'#E5392B',click:()=>{figRemove(figSel);save();menuMsg='Figure removed.';drawMenu()}});else B(c3[0],y,w3,'Delete',{click:()=>menuDo('del')});B(c3[1],y,w3,'Undo  (X)',{click:()=>menuDo('undo')});B(c3[2],y,w3,'Redo  (Y)',{click:()=>menuDo('redo')});y+=124;
-    B(c3[0],y,w3,'Tabletop 1:12',{fs:34,on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}});B(c3[1],y,w3,'Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}});
-    B(c3[2],y,w3,'Add figure',{col:'#6C3BFF',click:()=>{const cam=renderer.xr.getCamera(),p=new V().setFromMatrixPosition(cam.matrixWorld),f=new V(0,0,-1).transformDirection(cam.matrixWorld);f.y=0;f.normalize();
-      const at=world.worldToLocal(p.addScaledVector(f,S.xrScale==='table'?.35:1.1)),F=figNew({p:[at.x,figGroundAt(at.x,at.z),at.z],h:69,pose:'stand',ry:Math.atan2(-f.x,-f.z)*180/Math.PI});figSelect(F);save();menuMsg='Figure added in front of you, facing you. Trigger a hand or foot to pose it; grip to carry it.';drawMenu()}});y+=124;
-    B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=124;
-    netMenuRow(B,y,c3,w3);y+=150;
-    {const c=XR.price;B(48,y-26,MW-96,c?`≈ ${money(c.cost)}  ·  ${c.sheets} sheet${c.sheets===1?'':'s'}  ·  ${hours(c.mins)} cutting`:'Price: tap to work it out',{solid:!!c,col:'#15181D',fs:c?38:34,click:()=>{menuMsg='Working out the price…';drawMenu();setTimeout(()=>{freshen();updateSheetsPanel(true);menuMsg='Price updated.';drawMenu()},50)}});y+=124}
-    MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,view==='build'?4:2)+18;
-    /* the how-to stays folded away until the ? is pressed */
-    B(MW-48-110,y-6,110,'?',{on:!!XR.help,col:'#2E5BFF',click:()=>{XR.help=!XR.help;drawMenu()}});
-    if(XR.help)mWrap(view==='mass'&&XR.tool==='push'?'Trigger the middle of a face: push or pull it. Near an edge or a corner: drag that edge or corner. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly.'
+/* the wrist menu, laid out the Pentimento Park way. The steps are numbered tiles down the left side (Massing, Panels, Build,
+   Settings). The panel beside them has the name with Room and ? on every step, Undo / Redo arrows and a few quiet switches,
+   then the step's name and only its own controls, grouped in labelled cards, and the message and the controller hints at the
+   bottom. The panel is only as tall as what it shows, and it lies along the controller, reaching forward from it. */
+const MRAIL=150,MTG=12,MPX=MRAIL+16,MP=34,MIW=MW-MPX-2*MP,MG=14,MENU_TILT=-1.2,MENU_BASE=[0,.035,-.035];
+const XR_STEPS=[{id:'mass',name:'Massing',sub:'shape the boxes',col:'#4FC3FF',icon:['M12 3 20 7.5v9L12 21 4 16.5v-9z','M4 7.5 12 12l8-4.5M12 12v9']},
+  {id:'panels',name:'Panels',sub:'parts and joints',col:'#FF8A1F',icon:['M3 13h4v-3h3v3h4v-3h3v3h4v7H3z','M3 4h18v4']},
+  {id:'build',name:'Build',sub:'how it goes together',col:'#FFD23F',icon:['M3 20h18','M5 14h14v6H5z','M8 8h8v6H8z','M12 2.5v3.5M10 4.5l2 2 2-2']},
+  {id:'settings',name:'Settings',sub:'the same on every step',col:'#C9CED6',icon:'gear'}];
+let menuCropH=MH;
+const xrStepNow=()=>XR.page==='settings'||XR.step==='floor'||XR.step==='room'?'settings':view==='panels'?'panels':view==='build'?'build':'mass';
+const mFont=(wt,px,fam)=>`${wt} ${px}px ${fam==='mono'?'"JetBrains Mono",ui-monospace,Menlo,monospace':fam==='disp'?'"Chakra Petch",system-ui,sans-serif':'Inter,system-ui,-apple-system,sans-serif'}`;
+function mFit(s,x,y,maxW,px,wt=700){MX.font=mFont(wt,px);let k=px;while(k>18&&MX.measureText(s).width>maxW){k-=2;MX.font=mFont(wt,k)}MX.fillText(s,x,y)}
+function mLines(s,w,font){MX.font=font;const out=[];let line='';for(const wd of String(s||'').split(' ')){const t=line?line+' '+wd:wd;if(MX.measureText(t).width>w&&line){out.push(line);line=wd}else line=t}if(line)out.push(line);return out}
+/* one button: dark; white when on; orange for the main action; blue arrows for undo and redo; a coloured tick on top for a kind */
+function pB(x,y,w,h,label,o={}){const id=XR.W.length,hov=XR.hover===id;
+  MX.fillStyle=o.on?'#F2F4F7':o.primary?'#FF8A1F':o.danger?'#C62828':o.blue?'#2E5BFF':o.quiet?'#20242B':'#2C3038';MX.beginPath();
+  if(o.arrow){const t=h*.42;if(o.arrow<0){MX.moveTo(x+t,y);MX.lineTo(x+w,y);MX.lineTo(x+w,y+h);MX.lineTo(x+t,y+h);MX.lineTo(x,y+h/2)}else{MX.moveTo(x,y);MX.lineTo(x+w-t,y);MX.lineTo(x+w,y+h/2);MX.lineTo(x+w-t,y+h);MX.lineTo(x,y+h)}MX.closePath()}
+  else MX.roundRect(x,y,w,h,14);
+  MX.fill();if(hov){MX.strokeStyle=o.on?'#2E5BFF':'#FFFFFF';MX.lineWidth=5;MX.stroke()}
+  if(o.tick){MX.fillStyle=o.tick;MX.beginPath();MX.roundRect(x+w/2-28,y+9,56,8,4);MX.fill()}
+  const dark=o.on||o.primary;MX.fillStyle=dark?'#15181D':'#F2F4F7';MX.textAlign='center';MX.textBaseline='middle';
+  mFit(label,x+w/2,y+h/2-(o.sub?12:0)+(o.tick?6:0),w-24,o.fs||32);
+  if(o.sub){MX.font=mFont(500,20,'mono');MX.fillStyle=dark?'rgba(21,24,29,.68)':'#9AA2AD';MX.fillText(o.sub,x+w/2,y+h/2+(o.tick?27:21))}
+  XR.W.push({x,y,w,h,click:o.click,label})}
+/* a labelled card: rows of buttons (each row [label, options] pairs, shared out across the width), then a note */
+function mCard(y,label,col,rows,note){const x=MPX+MP,w=MIW,pad=18,rh=88,nl=note?mLines(note,w-2*pad,mFont(500,24)).slice(0,3):[];
+  const h=52+rows.length*(rh+12)-(rows.length?12:0)+(nl.length?12+nl.length*34:0)+pad;
+  MX.fillStyle='#1C1F26';MX.beginPath();MX.roundRect(x,y,w,h,18);MX.fill();
+  MX.fillStyle=col||'#9AA2AD';MX.fillRect(x+pad,y+22,6,22);MX.font=mFont(600,21,'mono');MX.fillStyle='#AEB5C0';MX.textAlign='left';MX.textBaseline='middle';MX.fillText(String(label).toUpperCase(),x+pad+18,y+34);
+  let yy=y+52;for(const row of rows){const n=row.length,cw=(w-2*pad-(n-1)*MG)/n;row.forEach(([lb,o],i)=>pB(x+pad+i*(cw+MG),yy,cw,rh,lb,o||{}));yy+=rh+12}
+  if(nl.length){yy+=(rows.length?0:12);MX.font=mFont(500,24);MX.fillStyle='#AEB5C0';MX.textAlign='left';MX.textBaseline='middle';nl.forEach((l,i)=>MX.fillText(l,x+pad,yy+14+i*34))}
+  return y+h+16}
+function mGear(cx,cy,r){MX.beginPath();MX.arc(cx,cy,r*.42,0,7);MX.stroke();for(let i=0;i<8;i++){const a=i*Math.PI/4;MX.beginPath();MX.moveTo(cx+Math.cos(a)*r*.62,cy+Math.sin(a)*r*.62);MX.lineTo(cx+Math.cos(a)*r,cy+Math.sin(a)*r);MX.stroke()}}
+function mTiles(){const now=xrStepNow();XR_STEPS.forEach((s,i)=>{const y=i*(MRAIL+MTG),on=s.id===now,id=XR.W.length,hov=XR.hover===id;
+    MX.fillStyle=on?s.col:'#1C1F26';MX.beginPath();MX.roundRect(0,y,MRAIL,MRAIL,22);MX.fill();if(hov){MX.strokeStyle='#FFFFFF';MX.lineWidth=5;MX.stroke()}
+    const ink=on?'#15181D':s.col;MX.font=mFont(600,22,'mono');MX.fillStyle=on?'#15181D':'#7D8591';MX.textAlign='left';MX.textBaseline='top';MX.fillText(String(i+1),14,y+10);
+    MX.save();MX.translate(MRAIL/2-30,y+30);MX.scale(2.5,2.5);MX.strokeStyle=ink;MX.lineWidth=1.8;MX.lineJoin='round';MX.lineCap='round';
+    if(s.icon==='gear')mGear(12,12,9);else s.icon.forEach(d=>MX.stroke(new Path2D(d)));MX.restore();
+    MX.font=mFont(700,25);MX.fillStyle=on?'#15181D':'#E9ECF1';MX.textAlign='center';MX.textBaseline='middle';MX.fillText(s.name,MRAIL/2,y+MRAIL-24);
+    XR.W.push({x:0,y,w:MRAIL,h:MRAIL,label:'step-'+s.id,click:()=>xrGoStep(s.id)})});
+  return XR_STEPS.length*(MRAIL+MTG)}
+function xrGoStep(id){if(XR.step==='floor')floorStep(false);if(XR.step==='room')XR.step=null;
+  if(id==='settings'){XR.page=XR.page==='settings'?null:'settings';drawMenu();return}XR.page=null;
+  if(id==='mass'){setView('mass');menuMsg=XR.tool==='push'?'Point at a face, an edge or a corner and pull the trigger to drag it.':menuMsg;drawMenu()}
+  else if(id==='panels'){if(view==='panels'){drawMenu();return}menuMsg='Building the panels…';drawMenu();setTimeout(()=>{setView('panels');menuMsg='Tap a joint to change it, or pull a face or an edge to reshape.';drawMenu()},50)}
+  else if(id==='build'){if(view==='build'){drawMenu();return}menuMsg='Working out how it goes together…';drawMenu();setTimeout(()=>{freshen();setView('build');xrStepMsg();drawMenu()},50)}}
+const xrHint=()=>{const st=xrStepNow();return st==='mass'?(XR.tool==='push'?'trigger: push / pull · grip: move it · A: pen · B: menu · X / Y: undo / redo · left stick: fly':XR.tool==='pen'?'trigger: draw a line · grip: move a corner · A: eraser · B: menu · X / Y: undo / redo':'trigger: rub out lines · A: push / pull · B: menu · X / Y: undo / redo')
+  :st==='panels'?'trigger: tap a joint, or pull a face · grip: move the model · B: menu · X / Y: undo / redo':st==='build'?'trigger a part: its step · grip: move the model · B: menu':'B: menu · X / Y: undo / redo'};
+function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);const later=(f,msg)=>()=>{menuMsg='Rebuilding…';drawMenu();setTimeout(()=>{f();rebuild();save();menuMsg=typeof msg==='function'?msg():msg;drawMenu()},30)};
+  const tilesH=mTiles(),L=MPX+MP,R=MW-MP;
+  /* ---- the header: the same on every step */
+  MX.textAlign='left';MX.textBaseline='middle';MX.font=mFont(700,42,'disp');MX.fillStyle='#FFFFFF';MX.fillText('PLY',L,58);const w1=MX.measureText('PLY ').width;MX.fillStyle='#FF8A1F';MX.fillText('GRAMMAR',L+w1,58);
+  const w2=MX.measureText('GRAMMAR ').width;MX.font=mFont(500,20,'mono');MX.fillStyle='#7D8591';MX.fillText('v'+PG_VERSION,L+w1+w2,62);
+  const rl=netRoomLabel();pB(R-74-MG-250,24,250,66,rl[0],{quiet:true,fs:26,sub:rl[1],on:XR.step==='room',click:()=>{if(rl[2]){NET.typed='';XR.step='room';XR.page=null}else XR.page='settings';drawMenu()}});
+  pB(R-74,24,74,66,'?',{quiet:!XR.help,on:!!XR.help,fs:34,click:()=>{XR.help=!XR.help;drawMenu()}});
+  {const aw=186,y=108,h=80,x0=L+2*aw+12+28,qw=(R-x0-2*10)/3;
+    pB(L,y,aw,h,'Undo',{arrow:-1,blue:true,sub:'X',click:()=>menuDo('undo')});pB(L+aw+12,y,aw,h,'Redo',{arrow:1,blue:true,sub:'Y',click:()=>menuDo('redo')});
+    pB(x0,y,qw,h,'Snap',{quiet:!snap,on:snap,fs:28,sub:snap?'1 in · 15°':'off',click:()=>menuDo('snap')});
+    pB(x0+qw+10,y,qw,h,'Section',{quiet:!S.secOn,on:!!S.secOn,fs:28,sub:S.secOn?'on':'off',click:()=>{$('#secBtn').click();drawMenu()}});
+    pB(x0+2*(qw+10),y,qw,h,'Scale',{quiet:true,fs:28,sub:S.xrScale==='table'?'tabletop 1:12':'life size',click:()=>{S.xrScale=S.xrScale==='table'?'life':'table';scaleLabel();placeWorld();save();drawMenu()}})}
+  /* ---- the step's name */
+  const st=xrStepNow(),SI=XR_STEPS.findIndex(s=>s.id===st),SD=XR_STEPS[SI];let y=222;
+  const title=(name,sub)=>{MX.fillStyle=SD.col;MX.beginPath();MX.arc(L+26,y+4,26,0,7);MX.fill();MX.font=mFont(700,28);MX.fillStyle='#15181D';MX.textAlign='center';MX.textBaseline='middle';MX.fillText(String(SI+1),L+26,y+5);
+    MX.textAlign='left';MX.font=mFont(700,38,'disp');MX.fillStyle='#FFFFFF';MX.fillText(name,L+68,y);const nw=MX.measureText(name+'  ').width;MX.font=mFont(500,21,'mono');MX.fillStyle='#8B93A1';MX.fillText(sub,L+68+nw,y+4);y+=50};
+  if(XR.step==='room'){title('Room number','same 4 digits as your phone');const d=NET?.typed||'';
+    const key=s=>()=>{if(s==='del')NET.typed=d.slice(0,-1);else if(s==='done'){XR.step=null;XR.page='settings'}else if(d.length<4)NET.typed=d+s;
+      if(NET.typed.length===4&&s!=='del'&&s!=='done'){netJoin(NET.typed);XR.step=null;XR.page='settings';menuMsg='Room '+NET.typed+'. Type the same number in the Together tab on your phone.'}drawMenu()};
+    MX.fillStyle='#1C1F26';MX.beginPath();MX.roundRect(L,y,MIW,120,18);MX.fill();MX.font=mFont(700,84,'mono');MX.fillStyle='#FF8A1F';MX.textAlign='center';MX.textBaseline='middle';MX.fillText((d+'····').slice(0,4).split('').join(' '),L+MIW/2,y+64);y+=136;
+    y=mCard(y,'Keypad','#FF8A1F',[[['1',{click:key('1'),fs:44}],['2',{click:key('2'),fs:44}],['3',{click:key('3'),fs:44}]],[['4',{click:key('4'),fs:44}],['5',{click:key('5'),fs:44}],['6',{click:key('6'),fs:44}]],
+      [['7',{click:key('7'),fs:44}],['8',{click:key('8'),fs:44}],['9',{click:key('9'),fs:44}]],[['⌫',{click:key('del'),fs:40}],['0',{click:key('0'),fs:44}],['Done',{primary:true,click:key('done')}]]])}
+  else if(XR.step==='floor'){title('Set the floor','where the model stands');const cm=Math.round(XR.floorH*100);
+    y=mCard(y,'Floor','#C9CED6',[[['▲ Up 2 cm',{click:()=>setFloor(XR.floorH+.02)}],['▼ Down 2 cm',{click:()=>setFloor(XR.floorH-.02)}],['Real floor',{on:cm===0,click:()=>setFloor(0)}]],[['Done',{primary:true,click:()=>floorStep(false)}]]],
+      `The orange grid is the floor: ${cm===0?'right on your real floor':Math.abs(cm)+' cm '+(cm>0?'above':'below')+' your real floor'}. Pull the right trigger to put it where your controller is. Raise it to a table to model standing up.`)}
+  else{title(SD.name,SD.sub);
+    if(st==='settings'){
+      y=mCard(y,'Scale','#C9CED6',[[['Tabletop 1:12',{on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}}],['Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}}]]]);
+      y=mCard(y,'Floor and place','#C9CED6',[[['Set floor',{click:()=>{XR.page=null;floorStep(true)}}],['Recenter',{click:()=>{placeWorld();drawMenu()}}]]]);
+      y=mCard(y,'Together','#2FBF5B',[[[rl[0],{sub:rl[1],click:rl[2]?()=>{NET.typed='';XR.step='room';drawMenu()}:undefined}],['Phone view',{on:!!NET?.pv,sub:NET?.pv?'beside this menu':'hidden',click:()=>{NET.pv=!NET.pv;try{localStorage.setItem('pgPv',NET.pv?'1':'0')}catch(e){}drawMenu()}}]]],
+        rl[2]?'Open Ply Grammar on your phone, Together tab, and type the same room.':null);
+      const c=XR.price;y=mCard(y,'Price','#FF8A1F',[[[c?`≈ ${money(c.cost)}`:'Work it out',{sub:c?`${c.sheets} sheet${c.sheets===1?'':'s'} · ${hours(c.mins)} cutting`:'sheets and cutting time',click:()=>{menuMsg='Working out the price…';drawMenu();setTimeout(()=>{freshen();updateSheetsPanel(true);menuMsg='Price updated.';drawMenu()},50)}}]]])}
+    else if(st==='mass'){
+      y=mCard(y,'Tool','#4FC3FF',[[['Push / pull',{on:XR.tool==='push',tick:'#19B5A1',click:()=>skTool('push')}],['Pen',{on:XR.tool==='pen',tick:'#E5392B',click:()=>skTool('pen')}],['Eraser',{on:XR.tool==='erase',tick:'#FF2D95',click:()=>skTool('erase')}]]],
+        XR.tool==='push'?'Trigger a face, an edge or a corner and drag. Grip a box, cut or cut-out to move it.':XR.tool==='pen'?'Each stroke is one straight line. A closed flat loop is a face; faces that close up are a solid.':'Rub over a line to take it out. Solids made from it open up again.');
+      if(XR.tool==='push')y=mCard(y,'Add','#4FC3FF',[[['Box',{click:()=>menuDo('box')}],['Cut',{click:()=>menuDo('cut')}],['Cut-out',{click:()=>menuDo('carve')}],['Figure',{tick:'#6C3BFF',click:xrAddFigure}]]]);
+      else y=mCard(y,'Pen','#E5392B',[[['Square up',{on:S.skSquare!==false,sub:S.skSquare!==false?'on':'off',click:()=>{S.skSquare=S.skSquare===false;menuMsg=S.skSquare?'Square up: lines that are nearly upright, level or square to the rest become exactly so.':'Square up is off: lines stay as you draw them.';save();drawMenu()}}],
+        ['Wrist tilt',{on:S.skTilt!==false,sub:S.skTilt!==false?'on':'off',click:()=>{S.skTilt=S.skTilt===false;menuMsg=S.skTilt?'A face you hold tilts with your wrist.':'A face you hold only moves in and out.';save();drawMenu()}}],['Clear loose',{click:()=>{skClearLoose();menuMsg='Loose lines removed. Solids stay.';drawMenu()}}]]]);
+      if(figSel){const F=figSel,i=FIG_KEYS.indexOf(F.pose),step=d=>()=>{const k=FIG_KEYS[(Math.max(0,i)+d+FIG_KEYS.length)%FIG_KEYS.length];figSetPose(F,k);menuMsg='Pose: '+FIG_POSES[k].name+'.';drawMenu()};
+        const hh=d=>()=>{F.h=Math.max(30,Math.min(80,F.h+d));const keep=F.ang,cu=F.pose==='custom';figRebuild(F);if(cu){F.ang=keep;figApply(F);figAnchor(F)}save();menuMsg=`Height ${ftIn(F.h)} (${Math.round(F.h*2.54)} cm).`;drawMenu()};
+        y=mCard(y,'Figure','#6C3BFF',[[['◀ Pose',{click:step(-1)}],[FIG_POSES[F.pose]?.name||'Own pose',{on:true,click:step(1)}],['Pose ▶',{click:step(1)}]],[['Shorter',{click:hh(-2)}],[ftIn(F.h),{quiet:true}],['Taller',{click:hh(2)}]],[['Remove figure',{danger:true,click:()=>{figRemove(figSel);save();menuMsg='Figure removed.';drawMenu()}}]]])}
+      else if(sel)y=mCard(y,'Picked · box '+sel.name+(selCut?(selCut.userData.isCarve?' · cut-out':' · cut'):''),'#4FC3FF',[[['Delete',{danger:true,click:()=>menuDo('del')}]]])}
+    else if(st==='panels'){const tb=sel||blocks[0],jt=selEdge?selEdge.b.joints?.find(j=>j.key===selEdge.key):null;
+      if(jt){const b=selEdge.b,o=b.edgeOpts[jt.key]||{},[fA,fB]=jt.faces,cur=o.joint||'auto',put=(k,v,def)=>later(()=>{const c=b.edgeOpts[jt.key]||{};if(v===def)delete c[k];else c[k]=v;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},()=>{const j=b.joints?.find(x=>x.key===jt.key);return j?`${b.name} · ${j.label}: now ${j.joint==='meet'?'meet':j.joint?.startsWith?.('over')?'overlap':j.joint||'fingers'}.`:'Joint changed.'});
+        const en=o.ends||jt.ends,bl=o.blocks||'auto';
+        y=mCard(y,'Joint · '+b.name+' · '+jt.label,'#19B5A1',[[['Auto',{on:cur==='auto',click:put('joint','auto','auto')}],['Fingers',{on:cur==='fingers',click:put('joint','fingers','auto')}],['Meet',{on:cur==='meet',click:put('joint','meet','auto')}]],
+          [[fA.num+' over '+fB.num,{on:cur==='over:'+fA.id,click:put('joint','over:'+fA.id,'auto')}],[fB.num+' over '+fA.num,{on:cur==='over:'+fB.id,click:put('joint','over:'+fB.id,'auto')}],['Ends',{sub:en,click:put('ends',en==='proud'?'flush':'proud',null)}]],
+          [['Corner blocks',{sub:bl,click:later(()=>{const c=b.edgeOpts[jt.key]||{},nx=bl==='auto'?'on':bl==='on'?'off':'auto';if(nx==='auto')delete c.blocks;else c.blocks=nx;if(Object.keys(c).length)b.edgeOpts[jt.key]=c;else delete b.edgeOpts[jt.key]},'Corner blocks on this joint changed.')}]]])}
+      y=mCard(y,'Show','#FF8A1F',[[['Explode',{on:!!S.explode,click:()=>{$('#explodeBtn').click();drawMenu()}}],['Screws',{on:!!S.showScrews,click:()=>{$('#screwBtn').click();drawMenu()}}]]]);
+      const ra=()=>(tb&&tb.ribAxis)||S.ribAxis||'long',step=f=>later(()=>{if(tb)tb.ribMax=Math.max(6,Math.min(48,Math.round((tb.ribMax||S.ribMax)*f)))},()=>tb?`Ribs in ${tb.name}: one every ${tb.ribMax}" at most.`:'');
+      y=mCard(y,'Ribs'+(tb?' · box '+tb.name:''),'#FF8A1F',[[['Direction',{sub:{long:'along the length',short:'across the width',vertical:'flat, like shelves'}[ra()]||'along the length',click:later(()=>{if(tb)tb.ribAxis=ra()==='short'?'vertical':ra()==='vertical'?'long':'short'},()=>tb?`Ribs in ${tb.name} now run `+({long:'across the length',short:'across the width',vertical:'flat, like shelves'}[ra()])+'.':'')}],
+        ['Closer',{click:step(.8)}],['Wider',{click:step(1.25)}]]]);
+      y=mCard(y,'Check','#FF8A1F',[[['Auto fix',{primary:true,sub:'parts that won’t go in, weak spots',click:()=>{menuMsg='Looking for parts that cannot go together, and weak spots…';drawMenu();fixAll();Promise.all(blocks.map(b=>findBuildFix(b))).then(r=>{const m=r.filter(x=>x&&x.startsWith('Fixed'));menuMsg=m.length?m.join(' '):'Every part goes together. Weak joints and panels got glue, blocks or closer ribs where that helps.';drawMenu()})}}]]])}
+    else{const pl=AS.plan,n=pl?pl.steps.length:0,k=AS.step||0,stop=()=>{AS.playing=false;$('#aPlay').textContent='Play'};
+      const rows=[[['◀ Back',{click:()=>{stop();showStep(k-1)}}],[AS.playing?'Pause':'Play',{primary:!AS.playing,on:AS.playing,click:()=>{$('#aPlay').click();drawMenu()}}],['Next ▶',{click:()=>{stop();showStep(k+1)}}]]],r2=[['Start over',{click:()=>{stop();showStep(0)}}]];
+      if(blocks.length>1)r2.push(['Box '+(AS.b?.name||'')+' ▸',{click:()=>{const i=blocks.indexOf(AS.b);select(blocks[(i+1)%blocks.length]);AS.b=sel;buildAsm(true);xrStepMsg();drawMenu()}}]);
+      if(pl&&pl.steps.some(x=>x.stuck))r2.push(['Find a fix',{danger:true,click:()=>{menuMsg='Looking for a fix…';drawMenu();findBuildFix(AS.b).then(m=>{setTimeout(()=>{buildAsm(true);menuMsg=m||'';drawMenu()},400)})}}]);rows.push(r2);
+      y=mCard(y,n?`Step ${k+1} of ${n}`+(blocks.length>1?' · box '+(AS.b?.name||''):''):'Steps','#FFD23F',rows)}}
+  /* ---- the message, the how-to when ? is on, and what the buttons do */
+  y+=6;MX.textAlign='left';MX.textBaseline='middle';const ml=mLines(menuMsg,MIW,mFont(500,28)).slice(0,st==='build'&&!XR.step?5:3);MX.fillStyle='#FFFFFF';ml.forEach((l,i)=>MX.fillText(l,L,y+18+i*38));y+=ml.length*38+10;
+  if(XR.help){const hl=mLines(view==='mass'&&XR.tool==='push'?'Trigger the middle of a face: push or pull it. Near an edge or a corner: drag that edge or corner. Grip a box, cut or cut-out: move it. Grip empty space: move the model; both grips: turn and scale it. Left stick: fly.'
       :view==='build'?'Back and Next step through how it goes together; Play runs it with the drill. Trigger a part: jump to the step it goes on. Grip: move the model.'
       :view==='panels'?'Tap a joint with the trigger: its choices come up here (fingers, meet, which panel laps over, ends, corner blocks). Pull the trigger on a face, an edge or a corner and move your hand: reshape it, as in massing. Grip: move the model.'
-      :'Hold the trigger and draw: each stroke is one straight line. Join lines at their corners; a closed flat loop is a face, and faces that close up are a solid you can build. Grip at the pen tip: move a corner, line or face. Grip a loop drawn on a face and pull: it comes out as a block.',48,y,MW-96-130,26,'#8B93A1',36,5)}
-  menuTex.needsUpdate=true}
-function placeMenu(){const g=leftC().userData.grip;if(menu.parent!==g){menu.parent?.remove(menu);g.add(menu)}menu.position.set(0,.08,-.13);menu.rotation.set(-.35-Math.PI/2,0,0);drawMenu()}
+      :'Hold the trigger and draw: each stroke is one straight line. Join lines at their corners; a closed flat loop is a face, and faces that close up are a solid you can build. Grip at the pen tip: move a corner, line or face. Grip a loop drawn on a face and pull: it comes out as a block.',MIW,mFont(500,24)).slice(0,5);
+    MX.fillStyle='#AEB5C0';hl.forEach((l,i)=>MX.fillText(l,L,y+14+i*32));y+=hl.length*32+10}
+  const hn=mLines(xrHint(),MIW,mFont(500,19,'mono')).slice(0,2);MX.fillStyle='#7D8591';hn.forEach((l,i)=>MX.fillText(l,L,y+14+i*26));y+=hn.length*26+MP-4;
+  /* the panel behind it all, only as tall as what it shows */
+  const H=Math.min(MH,Math.max(tilesH,Math.ceil(y)));MX.globalCompositeOperation='destination-over';MX.fillStyle='#15181D';MX.beginPath();MX.roundRect(MPX,0,MW-MPX,H,30);MX.fill();MX.globalCompositeOperation='source-over';
+  XR.menuPanel={x:MPX,y:0,w:MW-MPX,h:H};menuCrop(H);menuTex.needsUpdate=true}
+function xrAddFigure(){const cam=renderer.xr.getCamera(),p=new V().setFromMatrixPosition(cam.matrixWorld),f=new V(0,0,-1).transformDirection(cam.matrixWorld);f.y=0;f.normalize();
+  const at=world.worldToLocal(p.addScaledVector(f,S.xrScale==='table'?.35:1.1)),F=figNew({p:[at.x,figGroundAt(at.x,at.z),at.z],h:69,pose:'stand',ry:Math.atan2(-f.x,-f.z)*180/Math.PI});figSelect(F);save();menuMsg='Figure added in front of you, facing you. Trigger a hand or foot to pose it; grip to carry it.';drawMenu()}
+/* show only the top H pixels of the canvas, and keep the menu's near edge on the controller */
+function menuCrop(H){if(H===menuCropH&&menu.scale.y===H/MH)return;menuCropH=H;const f=H/MH;menu.scale.y=f;menuTex.repeat.set(1,f);menuTex.offset.set(0,1-f);menuSeat()}
+function menuSeat(){const g=menu.geometry.parameters,Hm=g.height*menu.scale.y,dx=(MPX/2/MW)*g.width;menu.rotation.set(MENU_TILT,0,0);
+  menu.position.set(MENU_BASE[0]+dx,MENU_BASE[1]+Hm/2*Math.cos(MENU_TILT),MENU_BASE[2]+Hm/2*Math.sin(MENU_TILT))}
+function placeMenu(){const g=leftC().userData.grip;if(menu.parent!==g){menu.parent?.remove(menu);g.add(menu)}drawMenu();menuSeat()}
 function menuHit(c){if(!menu.visible||menu.parent===c.userData.grip)return null;ctrlRay(c);menu.updateWorldMatrix(true,false);const h=xray.intersectObject(menu,false)[0];if(!h)return null;
-  const px=h.uv.x*MW,py=(1-h.uv.y)*MH,i=XR.W.findIndex(w=>px>=w.x&&px<=w.x+w.w&&py>=w.y&&py<=w.y+w.h);
+  const px=h.uv.x*MW,py=(1-h.uv.y)*menuCropH,P=XR.menuPanel,i=XR.W.findIndex(w=>px>=w.x&&px<=w.x+w.w&&py>=w.y&&py<=w.y+w.h);
+  /* the see-through gap and the space under the tiles are not the menu */
+  if(i<0&&!(P&&px>=P.x&&py<=P.h))return null;
   /* with the pen or eraser out, the menu only takes the trigger when you point at one of its buttons from close by: anywhere else you are drawing */
   if(XR.tool!=='push'&&view==='mass'&&(i<0||h.distance>.7))return null;return {i,point:h.point,dist:h.distance}}
 function menuDo(k){if(typeof k==='number')k=['box','cut','carve','del','undo','redo','view','snap'][k];

@@ -16,7 +16,7 @@ async def main():
         await pg.evaluate("()=>{localStorage.clear()}");await pg.reload();await pg.wait_for_timeout(2500);await pg.evaluate(JS);await pg.evaluate(AIM)
         await pg.evaluate("()=>{xr(1);__xp.floorStep(false);__sk.menu.visible=true;__xp.drawMenu()}")
         # Add figure from the menu (camera stand-in: renderer.xr.getCamera falls back to the normal camera here)
-        r=await pg.evaluate("()=>{const w=__xp.XR.W.find(w=>w.x===664&&w.click&&String(w.click).includes('figNew'));if(!w)return 'no button';w.click();const F=__fig.figs()[0];return F?F.p.map(x=>+x.toFixed(1))+' ry '+F.ry.toFixed(0):'none'}")
+        r=await pg.evaluate("()=>{const w=__xp.XR.W.find(w=>w.label==='Figure');if(!w)return 'no button';w.click();const F=__fig.figs()[0];return F?F.p.map(x=>+x.toFixed(1))+' ry '+F.ry.toFixed(0):'none'}")
         print('add',r)
         async def menu(n):
             d=await pg.evaluate("()=>{__xp.drawMenu();return __xp.menuCv.toDataURL('image/png')}");open(SP+n+'.png','wb').write(base64.b64decode(d.split(',')[1]))

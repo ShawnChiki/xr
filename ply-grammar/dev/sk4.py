@@ -16,7 +16,7 @@ async def main():
         await pg.evaluate("document.querySelector('[data-view=panels]').click()");await pg.wait_for_timeout(5000)
         await pg.evaluate("()=>{xr(1);__xp.floorStep(false);__sk.menu.visible=false}");await menu('sk4_m0')
         r=await pg.evaluate("""()=>{const c=__xp.ctrls[1];c.position.set(0,.75,1.2);c.updateMatrix();c.updateMatrixWorld(true);const j=__sk.xrJoint(c);__xp.xrTrigger(c);__xp.xrTriggerEnd(c);const e=__sk.getSelEdge();return [j?j.jt.label+' d='+j.d.toFixed(2):null,e&&e.key]}""");print('pick',r);await menu('sk4_m1')
-        r=await pg.evaluate("""()=>{const W=__xp.XR.W;const names=W.map(w=>w.label||'');const b=__blocks[0];const k=__sk.getSelEdge().key;W[4].click();return new Promise(res=>setTimeout(()=>res([JSON.stringify(b.edgeOpts[k]),b.joints.find(j=>j.key===k).joint]),2500))}""");print('meet',r);await menu('sk4_m2')
+        r=await pg.evaluate("""()=>{const W=__xp.XR.W;const names=W.map(w=>w.label||'');const b=__blocks[0];const k=__sk.getSelEdge().key;W.find(w=>w.label==='Fingers').click();return new Promise(res=>setTimeout(()=>res([JSON.stringify(b.edgeOpts[k]),b.joints.find(j=>j.key===k).joint]),2500))}""");print('meet',r);await menu('sk4_m2')
         r=await pg.evaluate("""()=>{const c=__xp.ctrls[1];c.position.set(3,3,3);c.updateMatrix();c.updateMatrixWorld(true);__xp.xrTrigger(c);__xp.xrTriggerEnd(c);return __sk.getSelEdge()}""");print('let go',r)
         print('errors',errs);await b.close()
     srv.shutdown()

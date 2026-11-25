@@ -61,7 +61,7 @@ function netInit(){
   let pv=true;try{pv=localStorage.getItem('pgPv')!=='0'}catch(e){}
   NET={me,st,lastJ:j,ready:false,room:null,status:'off',code:'',queue:[],tokens:20,inbox:new Map(),pending:null,needAt:0,
     presAcc:0,lastPres:'',liveAt:0,liveJ:'',sentLive:false,wasBusy:false,finalAt:0,livePrev:false,spect:null,mode:'third',so:null,fr:new Map(),pv,pvTick:0,typed:'',
-    peersN:1,uiKey:'',toastAt:0,respondAt:0,xrPeer:null,flats:[]};
+    peersN:1,uiKey:'',follow:true,look:false,lookAuto:false,liveBuildAt:0,liveBuildDue:false,toastAt:0,respondAt:0,xrPeer:null,flats:[]};
   setTimeout(()=>{NET.ready=true;NET.lastJ=JSON.stringify(serModel())},1500);
   tgWire();netStart()}
 function netPersist(){try{localStorage.setItem('pgSync',JSON.stringify({t:NET.st.t,by:NET.st.by,h:netHash(NET.lastJ)}))}catch(e){}}
@@ -85,13 +85,17 @@ function netApply(p){let d;try{d=JSON.parse(p.j)}catch(e){return}if(!d||d.app!==
   const sn=sel?.name,lite=p.live||(xrMode&&view==='mass');
   restoreModel(d,{lite,live:p.live,remote:true});
   if(sn){const b=blocks.find(x=>x.name===sn);if(b)select(b)}
-  if(p.live){if(!NET.livePrev&&view==='panels'){massGroup.visible=true;panelGroup.visible=false;if(gapMesh)gapMesh.visible=false}NET.livePrev=true;return}
-  if(NET.livePrev){NET.livePrev=false;if(view==='panels'){massGroup.visible=false;panelGroup.visible=true;if(gapMesh)gapMesh.visible=true}}
+  if(p.live){NET.livePrev=true;
+    /* a flat screen in Panels keeps showing parts: they are worked out again a couple of times a second while the headset drags */
+    if(view==='panels'&&!xrMode){NET.liveBuildDue=true;netLiveBuild()}else if(view==='panels'){massGroup.visible=true;panelGroup.visible=false;if(gapMesh)gapMesh.visible=false}
+    return}
+  if(NET.livePrev){NET.livePrev=false;NET.liveBuildDue=false;if(view==='panels'){massGroup.visible=false;panelGroup.visible=true;if(gapMesh)gapMesh.visible=true}}
   NET.st=p.st;NET.lastJ=JSON.stringify(serModel());netPersist();pushUndo(NET.lastJ);
   if(view==='build')buildAsm(true);
   const now=performance.now();if(!NET.spect&&now>NET.toastAt){NET.toastAt=now+4000;const q=(NET.room?.peers()||[]).find(x=>x.peer===p.from)?.presence;
     toast(q?.r==='xr'?'Design updated from the headset':q?.dv==='phone'?'Design updated from the phone':'Design updated from your other device')}}
 
+function netLiveBuild(){const now=performance.now();if(!NET.liveBuildDue||now-NET.liveBuildAt<650)return;NET.liveBuildDue=false;try{rebuild()}catch(e){console.error(e)}NET.liveBuildAt=performance.now()}
 function netStart(){
   if(IN_CLAUDE_ROOM){window.claude.use('room').then(r=>{if(!r)return;NET.status='open';netHookRoom(r);tgUI()}).catch(()=>{});return}
   let saved='';try{saved=localStorage.getItem('pgRoom')||''}catch(e){}
@@ -116,7 +120,7 @@ function netPresence(){
       const o={g:netPose(U.grip.matrixWorld),a:netPose(c.matrixWorld),b:g?[nr(bt(0)?.value||0,100),nr(bt(1)?.value||0,100),(bt(3)?.pressed?1:0)|(bt(4)?.pressed?2:0)|(bt(5)?.pressed?4:0),nr(g.axes?.[2]||0,100),nr(g.axes?.[3]||0,100)]:null,
         ln:U.line.visible?nr(U.line.scale.z,1000):0,f:(U.dot.visible?1:0)|(U.tip.visible?2:0)|(XR.tool==='erase'?4:0),pf:(U.src.profiles||[]).slice(0,4)};
       p[hand==='left'?'L':'R']=o}
-    p.m={on:menu.visible?1:0,x:String(menuMsg||'').slice(0,280),t:XR.tool,s:XR.step||'',h:XR.hover|0};
+    p.m={on:menu.visible?1:0,x:String(menuMsg||'').slice(0,280),t:XR.tool,s:XR.step||'',p:XR.page||'',h:XR.hover|0};
     const st=ctrls.find(c=>c.userData.stroke)?.userData.stroke;if(st&&st.pts.length){const P=st.pts,n=P.length,k=Math.max(1,Math.ceil(n/60)),o=[];for(let i=0;i<n;i+=k)o.push(P[i].map(z=>nr(z,10)));if((n-1)%k)o.push(P[n-1].map(z=>nr(z,10)));p.ls=o}}
   else{camera.updateMatrixWorld();world.updateMatrixWorld();_nM.copy(world.matrixWorld).invert().multiply(camera.matrixWorld);p.c=netPose(_nM,100).concat([Math.round(camera.fov),nr(camera.aspect,100)])}
   return p}
@@ -135,6 +139,8 @@ function netFrame(dt){if(!NET)return;
   /* someone has a newer design: ask for it (again, if it got lost) */
   if(r&&want&&now>NET.needAt&&!NET.pending){NET.needAt=now+1500;NET.queue.unshift({topic:'need',data:{t:want.t,b:want.by}})}
   if(NET.pending&&!busy){const p=NET.pending;NET.pending=null;netApply(p)}
+  if(NET.liveBuildDue)netLiveBuild();
+  if(NET.look&&NET_LOOK){NET_LOOK.oc.update();orbit.target.copy(NET_LOOK.oc.target)}
   /* while dragging here, the others see it move */
   if(r&&busy&&peers.length>1&&now-NET.liveAt>260){NET.liveAt=now;const j=JSON.stringify(serModel());if(j!==NET.liveJ&&j!==NET.lastJ){NET.liveJ=j;NET.sentLive=true;netSend(true)}}
   if(NET.wasBusy&&!busy)NET.finalAt=now+900;NET.wasBusy=busy;
@@ -166,7 +172,7 @@ function netSpectObjs(){if(NET.so)return NET.so;
   const W={p:new V(),q:new THREE.Quaternion(),s:1};
   return NET.so={hs,head,hands,W}}
 function netWatch(p,dt){const q=p.presence,so=netSpectObjs(),first=!NET.spect||NET.spect.peer!==p.peer;
-  if(first){NET.spect={peer:p.peer,vw:null,as:'',mk:'',ls:'',keep:{tool:XR.tool,step:XR.step}};so.hs.visible=true;tgUI()}
+  if(first){NET.spect={peer:p.peer,vw:null,as:'',mk:'',ls:'',keep:{tool:XR.tool,step:XR.step,page:XR.page}};so.hs.visible=true;if(netDev==='phone'&&!NET.look){NET.lookAuto=true;netLook(true)}tgUI()}
   const sp=NET.spect,k=first?1:1-Math.exp(-dt*14);
   if(nOk(q.w,8)){_nP.set(q.w[0],q.w[1],q.w[2]);_nQ.set(q.w[3],q.w[4],q.w[5],q.w[6]).normalize();const s=nClamp(q.w[7],1e-5,10);
     if(k>=1){so.W.p.copy(_nP);so.W.q.copy(_nQ);so.W.s=s}else{so.W.p.lerp(_nP,k);so.W.q.slerp(_nQ,k);so.W.s+=(s-so.W.s)*k}
@@ -183,25 +189,35 @@ function netWatch(p,dt){const q=p.presence,so=netSpectObjs(),first=!NET.spect||N
     xrDecorate(H.fake)}
   /* the wrist menu, as the headset has it */
   const m=q.m||{},L=so.hands.left;
-  if(menu.parent!==L.grip){menu.parent?.remove(menu);L.grip.add(menu);menu.position.set(0,.08,-.13);menu.rotation.set(-.35-Math.PI/2,0,0)}
+  if(menu.parent!==L.grip){menu.parent?.remove(menu);L.grip.add(menu);menuSeat()}
   netMenuBack(true);
   menu.visible=!!m.on&&L.grip.visible;
-  const mk=[m.x,m.t,m.s,m.h,view,q.vw].join('|');if(menu.visible&&mk!==sp.mk){sp.mk=mk;menuMsg=String(m.x||'');XR.tool=['push','pen','erase'].includes(m.t)?m.t:'push';XR.step=m.s==='floor'||m.s==='room'?m.s:null;XR.hover=m.h|0;drawMenu()}
+  const mk=[m.x,m.t,m.s,m.p,m.h,view,q.vw].join('|');if(menu.visible&&mk!==sp.mk){sp.mk=mk;menuMsg=String(m.x||'');XR.tool=['push','pen','erase'].includes(m.t)?m.t:'push';XR.step=m.s==='floor'||m.s==='room'?m.s:null;XR.page=m.p==='settings'?'settings':null;XR.hover=m.h|0;drawMenu()}
   /* the line being drawn with the pen */
   const ls=Array.isArray(q.ls)?q.ls.filter(x=>nOk(x,3)).slice(0,80):null,lk=ls?ls.length+':'+(ls[ls.length-1]||[]).join():'';
   if(lk!==sp.ls){sp.ls=lk;skLive(ls||[])}
   /* follow the headset's view and build step when it changes (you can still look around in between) */
-  if(q.vw!==sp.vw){sp.vw=q.vw;if(['mass','panels','build'].includes(q.vw)&&q.vw!==view)setView(q.vw)}
+  if(q.vw!==sp.vw){sp.vw=q.vw;if(NET.follow&&['mass','panels','build'].includes(q.vw)&&q.vw!==view)setView(q.vw)}
   if(view==='build'&&Array.isArray(q.as)&&q.as.length===2){const key=q.as.join('|');if(key!==sp.as){sp.as=key;const b=blocks.find(x=>x.name===String(q.as[0]));
       if(b&&AS.b!==b){select(b);AS.b=b;buildAsm(true)}if(Number.isInteger(q.as[1])&&q.as[1]!==AS.step)showStep(q.as[1])}}}
 function netUnwatch(){const so=NET.so,sp=NET.spect;NET.spect=null;if(so)so.hs.visible=false;
   netMenuBack(false);
   if(!xrMode){menu.visible=false;if(so&&menu.parent===so.hands.left.grip)so.hands.left.grip.remove(menu)}
-  if(sp){XR.tool=sp.keep.tool;XR.step=sp.keep.step;if(sp.ls)skLive([])}
+  if(sp){XR.tool=sp.keep.tool;XR.step=sp.keep.step;XR.page=sp.keep.page;if(sp.ls)skLive([])}
+  if(NET.lookAuto){NET.lookAuto=false;netLook(false)}NET.follow=true;
   if(NET.mode!=='third'){NET.mode='third';resize()}tgUI()}
 
 /* seen from a phone the wrist menu can face away: its back is a dark slate, like the back of a tablet */
 var NET_MB=null;function netMenuBack(on){if(!NET_MB){const g=menu.geometry.parameters;NET_MB=new THREE.Mesh(new THREE.PlaneGeometry(g.width,g.height),new THREE.MeshBasicMaterial({color:0x2A2D34,side:THREE.BackSide}));NET_MB.position.z=-.0005;menu.add(NET_MB)}NET_MB.visible=on}
+/* look only: a clear pad over the 3D view takes every touch, so one finger turns the view, two pan and zoom, and nothing
+   gets picked or pushed by accident (its own orbit controls drive the same camera) */
+var NET_LOOK=null;
+function netLook(on){NET.look=!!on;
+  if(on){if(!NET_LOOK){const el=document.createElement('div');el.className='lookpad';el.hidden=true;$('#stage').insertBefore(el,$('#stage .top'));
+      const oc=new OrbitControls(camera,el);oc.enableDamping=true;oc.screenSpacePanning=true;oc.touches={ONE:THREE.TOUCH.ROTATE,TWO:THREE.TOUCH.DOLLY_PAN};oc.mouseButtons={LEFT:THREE.MOUSE.ROTATE,MIDDLE:THREE.MOUSE.DOLLY,RIGHT:THREE.MOUSE.PAN};NET_LOOK={el,oc}}
+    NET_LOOK.oc.target.copy(orbit.target);NET_LOOK.oc.update();NET_LOOK.el.hidden=false;NET_LOOK.oc.enabled=true;tc.detach?.()}
+  else if(NET_LOOK){NET_LOOK.el.hidden=true;NET_LOOK.oc.enabled=false;orbit.target.copy(NET_LOOK.oc.target);orbit.update()}
+  tgUI()}
 /* their eyes: the headset's view drawn on this screen, whole or in the bottom half */
 const fpCam=new THREE.PerspectiveCamera(80,1,.5,20000),_nV2=new THREE.Vector2();
 function netRender(){const sp=NET&&NET.spect;if(!sp||xrMode||NET.mode==='third'||view==='sheets'||!NET.so.head.visible)return false;
@@ -236,8 +252,8 @@ const pvRT=new THREE.WebGLRenderTarget(360,360),pvCam=new THREE.PerspectiveCamer
   const fr=new THREE.Mesh(new THREE.PlaneGeometry(1,1),new THREE.MeshBasicMaterial({color:0xFFD400,side:THREE.DoubleSide}));fr.scale.set(1.06,1.06,1);fr.position.z=-.001;pv.add(fr);
   pv.visible=false;pv.renderOrder=15;pv.traverse(o=>{o.frustumCulled=false});menu.add(pv);NET_PV=pv}
 function netPreview(){const pv=NET_PV;if(!NET)return;const f=NET.flats[0],c=f?.presence?.c,on=xrMode&&NET.pv&&menu.visible&&nOk(c,9)&&!XR.step;pv.visible=!!on;if(!on)return;
-  const asp=nClamp(c[8],.3,3),mw=menu.geometry.parameters.width,mh=menu.geometry.parameters.height,w=asp<1?.17*asp:.17,h=asp<1?.17:.17/asp;
-  pv.scale.set(w,h,1);pv.position.set(mw/2+.014+w/2,mh/2-h/2,0);
+  const asp=nClamp(c[8],.3,3),mw=menu.geometry.parameters.width,mh=menu.geometry.parameters.height,fy=Math.max(.05,menu.scale.y),w=asp<1?.15*asp:.15,h=asp<1?.15:.15/asp;
+  pv.scale.set(w,h/fy,1);pv.position.set(mw/2+.012+w/2,mh/2-h/2/fy,0);
   if((NET.pvTick++)%3)return;
   const key=asp.toFixed(2);if(key!==_pvKey){_pvKey=key;pvRT.setSize(asp<1?Math.round(360*asp):360,asp<1?360:Math.round(360/asp))}
   world.updateMatrixWorld();_nP.set(c[0],c[1],c[2]);_nQ.set(c[3],c[4],c[5],c[6]).normalize();_nM.compose(_nP,_nQ,_nS.set(1,1,1)).premultiply(world.matrixWorld);
@@ -247,19 +263,11 @@ function netPreview(){const pv=NET_PV;if(!NET)return;const f=NET.flats[0],c=f?.p
   const xe=renderer.xr.enabled,rt=renderer.getRenderTarget();renderer.xr.enabled=false;renderer.setRenderTarget(pvRT);renderer.clear();renderer.render(scene,pvCam);renderer.setRenderTarget(rt);renderer.xr.enabled=xe;
   pvHead.visible=false;pv.visible=true;for(const g of NET.fr.values())g.visible=true}
 
-/* ---- the wrist menu: one row, and a number pad for the room ---- */
-function netMenuRow(B,y,c3,w3){const n=NET?NET.peersN:1,more=Math.max(0,n-1),wide=c3[1]+w3-c3[0];
-  const who=more?(NET.flats.length?NET.flats.map(p=>p.presence.dv==='phone'?'phone':p.presence.dv==='quest'?'Quest':'computer').join(' + ')+' here':more+' more here'):'only you so far';
-  if(IN_CLAUDE_ROOM)B(c3[0],y,wide,'Together: '+who,{fs:32});
-  else B(c3[0],y,wide,NET?.status==='open'?`Room ${NET.code} · ${who}`:`Room ${NET?.code||'----'} · ${NET?.status==='off'?'offline':'connecting'}`,{fs:32,click:()=>{NET.typed='';XR.step='room';drawMenu()}});
-  B(c3[2],y,w3,'Phone view',{on:!!NET?.pv,col:'#19B5A1',fs:32,click:()=>{NET.pv=!NET.pv;try{localStorage.setItem('pgPv',NET.pv?'1':'0')}catch(e){}menuMsg=NET.pv?'What the phone sees shows beside this menu.':'Phone view hidden.';drawMenu()}})}
-function netKeypad(B,c3,w3){const d=NET.typed||'';mText('Room number',48,160,46,'#FFFFFF','left',800);
-  mWrap('Type the 4 digits shown in the Together tab on your phone.',48,226,MW-96,32,'#C9CED8',44,2);
-  mText((d+'····').slice(0,4).split('').join('  '),MW/2,350,92,'#F2A01F','center',800);
-  const key=s=>()=>{if(s==='del')NET.typed=d.slice(0,-1);else if(s==='done'){XR.step=null}else if(d.length<4)NET.typed=d+s;
-    if(NET.typed.length===4&&s!=='del'&&s!=='done'){netJoin(NET.typed);XR.step=null;menuMsg='Room '+NET.typed+'. Type the same number on your phone.'}drawMenu()};
-  let y=430;for(const row of [['1','2','3'],['4','5','6'],['7','8','9'],['del','0','done']]){row.forEach((s,i)=>B(c3[i],y,w3,s==='del'?'⌫':s==='done'?'Done':s,{fs:s==='done'?38:48,solid:s==='done',col:s==='done'?'#2FBF5B':undefined,click:key(s)}));y+=124}}
-
+/* ---- what the wrist menu says about the room: [label, under it, can you type a room number] ---- */
+function netRoomLabel(){if(!NET)return ['Together','',false];const more=Math.max(0,NET.peersN-1);
+  const who=more?(NET.flats.length?NET.flats.map(p=>p.presence.dv==='phone'?'phone':p.presence.dv==='quest'?'Quest':'computer').join(' + ')+' here':more+' more here'):'just you';
+  if(IN_CLAUDE_ROOM)return ['Together',who,false];
+  return ['Room '+(NET.code||'----'),NET.status==='open'?who:NET.status==='off'?'offline':'connecting',true]}
 /* ---- the Together tab and the little pill on the stage ---- */
 const TG_MODES={third:'Around it',first:'Their eyes',split:'Both'};
 function tgWire(){const inp=$('#tgRoom');if(!inp)return;
@@ -267,7 +275,13 @@ function tgWire(){const inp=$('#tgRoom');if(!inp)return;
   inp.addEventListener('input',()=>{const v=inp.value.replace(/\D/g,'').slice(0,4);inp.value=v;if(v.length===4&&v!==NET.code){netJoin(v);inp.blur()}});
   inp.addEventListener('keydown',e=>e.stopPropagation());
   $$('#tgMode button').forEach(b=>b.onclick=()=>tgSetMode(b.dataset.m));
-  $('#tgPill').onclick=()=>tgSetMode(NET.mode==='third'?'first':NET.mode==='first'?'split':'third');tgUI()}
+  $('#tgPill').onclick=()=>tgSetMode(NET.mode==='third'?'first':NET.mode==='first'?'split':'third');
+  $('#tgFollow').onclick=()=>tgFollow(!NET.follow);$('#tgLook').onclick=()=>{NET.lookAuto=false;netLook(!NET.look)};
+  $('#tgLookBox').onchange=e=>{NET.lookAuto=false;netLook(e.target.checked)};$('#tgFollowBox').onchange=e=>tgFollow(e.target.checked);
+  /* picking a view yourself while watching keeps it (Panels here while the headset masses) */
+  const mine=()=>setTimeout(()=>{if(!NET.spect)return;const hv=NET.xrPeer?.presence?.vw;NET.follow=!hv||view===hv;tgUI()},0);
+  $$('#viewSeg button').forEach(b=>b.addEventListener('click',mine));$$('.tab').forEach(b=>b.addEventListener('click',mine));tgUI()}
+function tgFollow(on){NET.follow=!!on;const hv=NET.xrPeer?.presence?.vw;if(on&&NET.spect&&['mass','panels','build'].includes(hv)&&hv!==view)setView(hv);tgUI()}
 function tgSetMode(m){if(!NET.spect)return;NET.mode=m;resize();tgUI()}
 function tgUI(){if(!NET||!$('#tgStat'))return;const peers=NET.room?.peers()||[],others=peers.filter(p=>!p.sameTab&&p.kind!=='agent'),xp=NET.xrPeer;
   if(document.activeElement!==$('#tgRoom'))$('#tgRoom').value=NET.code;
@@ -278,6 +292,9 @@ function tgUI(){if(!NET||!$('#tgStat'))return;const peers=NET.room?.peers()||[],
   for(const [t,me] of rows){const d=document.createElement('div');d.className='tgdev'+(me?' me':'');d.textContent=t;L.appendChild(d)}
   if(!others.length){const d=document.createElement('div');d.className='tgdev none';d.textContent=IN_CLAUDE_ROOM?'Nobody else yet.':'Nobody else in room '+NET.code+' yet.';L.appendChild(d)}
   const w=!!NET.spect;$('#tgWatch').hidden=!w;$$('#tgMode button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.m===NET.mode));
-  $('#tgPill').hidden=!w;$('#tgPillTxt').textContent='Headset · '+TG_MODES[NET.mode];
+  $('#tgPill').hidden=!w;$('#tgPillTxt').textContent=TG_MODES[NET.mode];
+  $('#tgFollow').hidden=!w;$('#tgFollow').textContent=NET.follow?'Same view':'Own view';$('#tgFollow').setAttribute('aria-pressed',!NET.follow);
+  $('#tgLook').hidden=!w;$('#tgLook').textContent=NET.look?'Look only':'Editing';$('#tgLook').setAttribute('aria-pressed',NET.look);
+  $('#tgLookBox').checked=NET.look;$('#tgFollowBox').checked=NET.follow;$('#tgFollowRow').hidden=!w;
   $('.tab[data-tab=together]')?.classList.toggle('live',others.length>0)}
 netInit();

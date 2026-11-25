@@ -85,6 +85,30 @@ async def main():
         # B opens the Together tab
         await Bp.evaluate("()=>document.querySelector('.tab[data-tab=together]').click()");await Bp.wait_for_timeout(700);await Bp.screenshot(path=SP+'tg_b_tab.png')
         await Bp.evaluate("()=>document.querySelector('.tab[data-tab=together]').click()")
+        # look only on the phone: a drag turns the view and edits nothing
+        await Bp.evaluate("()=>__net.tgSetMode('third')")
+        print('8 look only on phone:',await Bp.evaluate("()=>__net.NET.look"),'pad shown:',await Bp.evaluate("()=>!document.querySelector('.lookpad').hidden"))
+        c0=await Bp.evaluate("()=>__cam.position.toArray().map(Math.round)");s0=await Bp.evaluate(SIG)
+        await Bp.mouse.move(200,450);await Bp.mouse.down();await Bp.mouse.move(260,420,steps=8);await Bp.mouse.up();await Bp.wait_for_timeout(800)
+        print('  camera',c0,'->',await Bp.evaluate("()=>__cam.position.toArray().map(Math.round)"),'design same:',s0==await Bp.evaluate(SIG))
+        # own view: headset masses, phone shows parts
+        await Bp.evaluate("()=>{__hsp={...__hsp,vw:'mass'};__room.inject('hs1',__hsp)}");await Bp.wait_for_timeout(1500)
+        print('9 headset to massing, phone follows:',await Bp.evaluate("()=>__net.view"))
+        await Bp.evaluate("()=>document.querySelector('#viewSeg [data-view=panels]').click()");await Bp.wait_for_timeout(2500)
+        print('  phone picks Panels: follow',await Bp.evaluate("()=>__net.NET.follow"),'pill',await Bp.evaluate("()=>document.querySelector('#tgFollow').textContent"))
+        await Bp.evaluate("()=>{__hsp={...__hsp,vw:'panels'};__room.inject('hs1',__hsp)}");await Bp.wait_for_timeout(600);await Bp.evaluate("()=>{__hsp={...__hsp,vw:'mass'};__room.inject('hs1',__hsp)}");await Bp.wait_for_timeout(1200)
+        print('  headset changes view, phone stays:',await Bp.evaluate("()=>__net.view"))
+        # a drag on the other device: the phone's parts are worked out again while it moves
+        await Bp.evaluate("()=>{window.__lp=__xp.getPanels()}")
+        await A.evaluate("()=>{__tc.dragging=true}")
+        for k in range(5):
+            await A.evaluate("()=>{const b=__blocks[0];b.sizer.scale.y+=2;__net.updateMass(b)}");await A.wait_for_timeout(350)
+        print('  mid-drag on phone: parts rebuilt',await Bp.evaluate("()=>__xp.getPanels()!==window.__lp"),'parts visible',await Bp.evaluate("()=>__sk.panelGroup.visible"),'size',await Bp.evaluate(SIG))
+        await A.evaluate("()=>{__tc.dragging=false;__net.save()}");await A.wait_for_timeout(2500)
+        print('  after drag phone:',await Bp.evaluate(SIG),'A:',await A.evaluate(SIG))
+        await Bp.screenshot(path=SP+'tg_own_panels.png')
+        await Bp.evaluate("()=>document.querySelector('#tgFollow').click()");await Bp.wait_for_timeout(1500)
+        print('  Same view again:',await Bp.evaluate("()=>[__net.view,__net.NET.follow]"))
         # the headset switches to Build: B follows
         await Bp.evaluate("()=>{__hsp={...__hsp,vw:'build',as:['A',3]};__room.inject('hs1',__hsp)}");await Bp.wait_for_timeout(2500)
         print('  follows build:',await Bp.evaluate("()=>({view:__net.view,step:__xp.AS.step})"))
