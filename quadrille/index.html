@@ -5,10 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Quadrille XR</title>
 <link rel="icon" href="data:,">
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script src="../turn-config.js"></script>
 <!--
   QUADRILLE XR : sketch quad SubD topology in VR / MR (Quest), with a desktop + phone fallback.
-  One file: UI, WebXR, rendering, and the engine inside <script id="engine">. three.js r170 loads from a CDN.
+  One file: UI, WebXR, rendering, and the engine inside <script id="engine">. three.js r170 loads from a CDN (import map).
   Engine pipeline: raw strokes -> blended curves -> curve network (join distance) -> quad cage -> Catmull-Clark.
   It runs in a Web Worker built from the text of <script id="engine">, with a main-thread fallback.
   Multiplayer uses the artifact `room` capability (see MULTIPLAYER): strokes travel as messages, poses and settings as presence.
@@ -31,6 +32,9 @@
     font-size: 14px; padding: 10px 16px; border-radius: 999px; pointer-events: none; max-width: 80vw; text-align: center; }
   #watch { position: fixed; left: 10px; top: 10px; background: #E8212B; color: #fff; font-weight: 800; font-size: 13px; padding: 8px 14px;
     border: 3px solid #0b0b0b; border-radius: 999px; pointer-events: none; }
+  #viewBtn { position: fixed; left: 10px; bottom: 10px; padding: 10px 14px; font: 800 13px/1 inherit; font-family: inherit; color: #0b0b0b; background: #FFD400;
+    border: 3px solid #0b0b0b; border-radius: 999px; box-shadow: 0 4px 0 #0b0b0b; }
+  #splitLine { position: fixed; left: 0; right: 0; top: 50%; height: 4px; margin-top: -2px; background: #0b0b0b; pointer-events: none; }
   #roomBox { position: fixed; left: 10px; bottom: 10px; background: #fff; color: #0b0b0b; font-weight: 800; font-size: 13px; padding: 6px 10px;
     border: 3px solid #0b0b0b; border-radius: 12px; display: flex; gap: 6px; align-items: center; }
   #roomIn { width: 4.2em; font: inherit; font-weight: 800; text-align: center; border: 2px solid #0b0b0b; border-radius: 8px; padding: 3px 2px; background: #FFD400; -webkit-user-select: text; user-select: text; }
@@ -44,6 +48,8 @@
 <div id="hint"></div>
 <div id="toast" hidden></div>
 <div id="watch" hidden>WATCHING VR</div>
+<button id="viewBtn" hidden>VIEW: 3RD PERSON</button>
+<div id="splitLine" hidden></div>
 <label id="roomBox" hidden>room <input id="roomIn" inputmode="numeric" maxlength="4" autocomplete="off"> <span id="roomN"></span></label>
 
 <script id="engine">
@@ -1096,13 +1102,9 @@ self.QE = { buildAll, makeExample, toOBJ, pack, strokeSpacing };
 </script>
 
 <script type="module">
-// three.js r170, from the CDNs the artifact sandbox allows (the same build on both)
-let THREE;
-try { THREE = await import('https://cdnjs.cloudflare.com/ajax/libs/three.js/0.170.0/three.module.min.js'); }
-catch (e1) {
-  try { THREE = await import('https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js'); }
-  catch (e2) { const t = document.getElementById('toast'); t.textContent = 'Could not load the 3D library. Check the connection and reload.'; t.hidden = false; throw e2; }
-}
+import * as THREE from 'three';
+let GLTFLoader = null;   // only needed for the real Quest controller models; the page works without it
+try { ({ GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js')); } catch (e) { GLTFLoader = null; }
 
 const QE = self.QE;
 const $ = (id) => document.getElementById(id);
@@ -1123,7 +1125,8 @@ const state = {
   bendR: 0.12,               // reach of the Bend tool, metres in your hand space
   tol: 0.04, autoLoops: 0, smooth: 2, fit: 1,   // fit: how far the smooth surface is pulled onto the drawn curves
   exMess: 1,                                    // how sloppy the built-in examples are drawn (0..1.5)
-  show: { sketch: true, curves: true, surface: true, wire: true, labels: true },
+  show: { sketch: true, curves: true, surface: true, wire: true, labels: true, preview: true },
+  view: 'third',             // what a watching phone shows: third | first | split (local to that device)
   mr: false,
 };
 const undoStack = [], redoStack = [];
@@ -1425,7 +1428,7 @@ const UIW = 900, UIH = 600, RAIL = 128;
 const uiCanvas = $('panel'), g = uiCanvas.getContext('2d');
 const uiTex = new THREE.CanvasTexture(uiCanvas); uiTex.colorSpace = THREE.SRGBColorSpace; uiTex.anisotropy = 8;
 const TABS = [{ name: 'Draw', icon: 'pencil' }, { name: 'Surface', icon: 'grid' }, { name: 'View', icon: 'eye' }, { name: 'File', icon: 'folder' }];
-const ui = { tab: 0, widgets: [], hover: null, press: null, drag: null, dirty: true, collapsed: false, toast: '', toastUntil: 0 };
+const ui = { tab: 0, widgets: [], hover: null, press: null, drag: null, dirty: true, collapsed: false, toast: '', toastUntil: 0, keypad: null };
 const tabRect = (i) => ({ x: 12, y: 12 + i * 114, w: RAIL - 24, h: 106 });
 const swapRect = { x: 12, y: 472, w: RAIL - 24, h: 114 };
 const canSwap = () => (spect ? spect.ar : inXR && xrMode === 'immersive-ar');
@@ -1479,6 +1482,15 @@ function layoutUI() {
   const btn = (x, y, w, h, label, o) => W.push(Object.assign({ type: 'btn', x, y, w, h, label }, o));
   const row = (y, h, items) => { const bw = (cw - gap * (items.length - 1)) / items.length; items.forEach((it, i) => btn(x0 + i * (bw + gap), y, bw, h, it[0], it[1])); };
   const sld = (y, label, o) => W.push(Object.assign({ type: 'sld', x: x0, y, w: cw, h: 118, label }, o));
+  if (ui.keypad !== null) {   // number pad: type the room code with the laser
+    W.push({ type: 'label', x: x0, y: 34, text: () => 'Room code:  ' + (ui.keypad + '____').slice(0, 4).split('').join(' ') });
+    const key = (d) => [d, { on: () => { ui.keypad += d; if (ui.keypad.length >= 4) { const c = ui.keypad.slice(0, 4); ui.keypad = null; Net.join(c); toast('Joining room ' + c); } layoutUI(); } }];
+    row(96, 108, [key('1'), key('2'), key('3'), ['Back', { on: () => { ui.keypad = ui.keypad.slice(0, -1); ui.dirty = true; } }]]);
+    row(220, 108, [key('4'), key('5'), key('6'), key('0')]);
+    row(344, 108, [key('7'), key('8'), key('9'), ['Cancel', { kind: 'danger', on: () => { ui.keypad = null; layoutUI(); } }]]);
+    W.push({ type: 'label', x: x0, y: 486, text: () => 'Now: ' + Net.label(), small: true });
+    ui.widgets = W; ui.dirty = true; return;
+  }
   if (ui.tab === 0) {
     const tl = (name, key, ic) => [name, { icon: ic, on: () => setTool(key), active: () => shownTool() === key }];
     const tools = [tl('Draw', 'draw', 'pencil'), tl('Erase', 'erase', 'eraser'), tl('Bend', 'bend', 'bend')];
@@ -1499,15 +1511,16 @@ function layoutUI() {
     row(58, 92, [tg('sketch', 'Raw sketch'), tg('curves', 'Clean curves')]);
     row(166, 92, [tg('surface', 'Surface'), tg('wire', 'Edge loops')]);
     if (xrLike()) {
-      row(274, 92, [tg('labels', 'Button labels')]);
+      row(274, 92, [tg('labels', 'Button labels'), tg('preview', 'Phone preview')]);
     }
   } else {
     W.push({ type: 'label', x: x0, y: 26, text: 'Examples: tap again for a new messy take' });
     row(66, 92, [['Sheet', { on: () => loadExample('sheet') }], ['Tube', { on: () => loadExample('tube') }], ['Wormhole', { on: () => loadExample('wormhole') }], ['Donut', { on: () => loadExample('donut') }]]);
     sld(176, 'How messy the examples are', { steps: 10, get: () => state.exMess / 1.5, set: (t) => { state.exMess = Math.round(t * 10) * 0.15; scheduleSave(); ui.dirty = true; }, fmt: () => String(Math.round(state.exMess / 0.15)) });
-    if (xrLike()) { row(318, 92, [['Exit VR', { kind: 'primary', on: () => { const s = renderer.xr.getSession(); if (s) s.end(); } }]]); W.push({ type: 'label', x: x0, y: 486, text: 'Save OBJ is on the flat page after you exit.', small: true }); }
-    else row(318, 92, [['Save OBJ (quads)', { kind: 'primary', on: saveOBJ }]]);
-    W.push({ type: 'label', x: x0, y: 436, text: () => Net.label(), small: true });
+    const last = [xrLike() ? ['Exit VR', { kind: 'primary', on: () => { const s = renderer.xr.getSession(); if (s) s.end(); } }] : ['Save OBJ (quads)', { kind: 'primary', on: saveOBJ }]];
+    if (!IN_CLAUDE) last.push(['Type room code', { on: () => { ui.keypad = ''; layoutUI(); } }]);
+    row(318, 92, last);
+    W.push({ type: 'label', x: x0, y: 444, text: () => Net.label(), small: true });
   }
   ui.widgets = W; ui.dirty = true;
 }
@@ -1639,7 +1652,7 @@ function fitPanel() {
 // =====================================================================
 const orbit = { theta: 0.65, phi: 1.02, r: 1.4 }, orbitTarget = HOME.clone();
 function applyOrbit() {
-  const aspect = window.innerWidth / window.innerHeight, r = orbit.r * Math.max(1, 0.72 / aspect), s = Math.sin(orbit.phi);
+  const aspect = viewAspect(), r = orbit.r * Math.max(1, 0.72 / aspect), s = Math.sin(orbit.phi);
   const T = orbitTarget;
   camera.position.set(T.x + r * s * Math.sin(orbit.theta), T.y + r * Math.cos(orbit.phi), T.z + r * s * Math.cos(orbit.theta));
   camera.lookAt(T); camera.updateMatrixWorld();
@@ -1728,6 +1741,42 @@ const vrPanel = new THREE.Mesh(new THREE.PlaneGeometry(PANEL_W, PANEL_H), new TH
 vrPanel.position.set(0, 0.15, -0.04); vrPanel.rotation.x = -0.6;
 const cursorDot = new THREE.Mesh(new THREE.RingGeometry(0.0035, 0.0065, 20), new THREE.MeshBasicMaterial({ color: 0xE8212B, depthTest: false })); cursorDot.renderOrder = 10; cursorDot.visible = false; vrPanel.add(cursorDot);
 const laser = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0xFFD400 })); laser.visible = false; laser.frustumCulled = false;
+// what a watching phone sees, shown to the headset wearer on a small screen beside the menu
+const pvRT = new THREE.WebGLRenderTarget(240, 480), pvCam = new THREE.PerspectiveCamera(55, 0.5, 0.005, 1500);
+const pvPanel = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: pvRT.texture, side: THREE.DoubleSide }));
+{ const fr = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: 0xFFD400, side: THREE.DoubleSide })); fr.scale.set(1.08, 1.04, 1); fr.position.z = -0.001; pvPanel.add(fr); }
+pvPanel.position.set(0, 0.15, -0.04); pvPanel.rotation.x = -0.6; pvPanel.visible = false; pvPanel.traverse((o) => { o.frustumCulled = false; });
+const fpCam = new THREE.PerspectiveCamera(90, 1, 0.005, 1500);   // first-person view for a watching phone
+let pvTick = 0, pvKey = '';
+function renderPhonePreview() {
+  const c = Net.flatCam(), on = isPresenter() && state.show.preview && okPose(c, 9) && !!lastXR.L;
+  pvPanel.visible = on; if (!on) return;
+  const asp = clamp(c[8], 0.3, 3), w = asp < 1 ? 0.2 * asp : 0.2, h = asp < 1 ? 0.2 : 0.2 / asp;
+  pvPanel.scale.set(w, h, 1); pvPanel.position.x = PANEL_W / 2 + 0.016 + w / 2;
+  if (pvTick++ & 1) return;                                   // every other frame is plenty
+  const key = asp.toFixed(2); if (key !== pvKey) { pvKey = key; pvRT.setSize(asp < 1 ? Math.round(480 * asp) : 480, asp < 1 ? 480 : Math.round(480 / asp)); }
+  pvCam.position.set(c[0], c[1], c[2]); pvCam.quaternion.set(c[3], c[4], c[5], c[6]).normalize(); pvCam.fov = clamp(c[7], 10, 120); pvCam.aspect = asp; pvCam.updateProjectionMatrix(); pvCam.updateMatrixWorld();
+  // the phone sees your headset, the sky and floor, and neither this screen nor its own outline
+  const keep = [headMark.visible, sky.visible, floor.visible];
+  camera.updateMatrixWorld(); camera.matrixWorld.decompose(headMark.position, headMark.quaternion, nS); headMark.visible = true; sky.visible = floor.visible = true; pvPanel.visible = false; Net.showFrustaNow(false);
+  const xe = renderer.xr.enabled, rt = renderer.getRenderTarget();
+  renderer.xr.enabled = false; renderer.setRenderTarget(pvRT); renderer.clear(); renderer.render(scene, pvCam); renderer.setRenderTarget(rt); renderer.xr.enabled = xe;
+  headMark.visible = keep[0]; sky.visible = keep[1]; floor.visible = keep[2]; pvPanel.visible = true; Net.showFrustaNow(true);
+}
+const viewAspect = () => (spect && state.view === 'split' ? window.innerWidth / (window.innerHeight / 2) : window.innerWidth / window.innerHeight);
+function renderAll() {
+  const fp = !renderer.xr.isPresenting && spect && state.view !== 'third' && headMark.visible;
+  if (!fp) { renderer.render(scene, camera); return; }
+  const w = window.innerWidth, h = window.innerHeight, split = state.view === 'split', hh = Math.floor(h / 2);
+  fpCam.position.copy(headMark.position); fpCam.quaternion.copy(headMark.quaternion);
+  fpCam.aspect = split ? w / hh : w / h; fpCam.fov = clamp((2 * Math.atan(Math.tan(0.74) / fpCam.aspect) * 180) / Math.PI, 60, 112); fpCam.updateProjectionMatrix();
+  if (split) { renderer.setScissorTest(true); renderer.setViewport(0, hh, w, h - hh); renderer.setScissor(0, hh, w, h - hh); renderer.render(scene, camera); renderer.setViewport(0, 0, w, hh); renderer.setScissor(0, 0, w, hh); }
+  headMark.visible = false; renderer.render(scene, fpCam); headMark.visible = true;
+  if (split) { renderer.setScissorTest(false); renderer.setViewport(0, 0, w, h); }
+}
+const VIEW_NAMES = { third: 'VIEW: 3RD PERSON', first: 'VIEW: THEIR EYES', split: 'VIEW: BOTH' };
+$('viewBtn').addEventListener('click', () => { state.view = state.view === 'third' ? 'first' : state.view === 'first' ? 'split' : 'third'; $('viewBtn').textContent = VIEW_NAMES[state.view]; $('splitLine').hidden = state.view !== 'split'; onResize(); });
+for (const ev of ['pointerdown', 'touchstart']) $('viewBtn').addEventListener(ev, (e) => e.stopPropagation());
 const tolBall = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), new THREE.MeshBasicMaterial({ color: 0xFFD400, transparent: true, opacity: 0.16, depthWrite: false })); tolBall.visible = false; scene.add(tolBall);
 
 function capTexture(name, bg, fg) {
@@ -1755,10 +1804,10 @@ function makeTag(key, text, keyCol) {
   set(key, text, keyCol); return { sprite, set };
 }
 function buildController(hand) {
-  const sx = hand === 'right' ? 1 : -1, grp = new THREE.Group();
+  const sx = hand === 'right' ? 1 : -1, grp = new THREE.Group(), proc = [];
   const white = new THREE.MeshLambertMaterial({ color: 0xf2f2f2 }), mk = (c) => new THREE.MeshLambertMaterial({ color: c });
-  const body = new THREE.Mesh(new THREE.SphereGeometry(1, 22, 16), white); body.scale.set(0.027, 0.021, 0.034); body.position.set(0, -0.011, 0.03); grp.add(body);
-  const plate = new THREE.Group(); plate.position.set(0, 0.002, 0.046); plate.rotation.x = 0.35; grp.add(plate);
+  const body = new THREE.Mesh(new THREE.SphereGeometry(1, 22, 16), white); body.scale.set(0.027, 0.021, 0.034); body.position.set(0, -0.011, 0.03); grp.add(body); proc.push(body);
+  const plate = new THREE.Group(); plate.position.set(0, 0.002, 0.046); plate.rotation.x = 0.35; grp.add(plate); proc.push(plate);
   plate.add(new THREE.Mesh(new THREE.CylinderGeometry(0.029, 0.027, 0.012, 30), white));
   const top = 0.006, parts = {};
   const stickPos = new THREE.Vector3(-sx * 0.0095, top, -0.007);
@@ -1770,13 +1819,13 @@ function buildController(hand) {
     const cap = new THREE.Mesh(new THREE.CircleGeometry(0.0056, 22), new THREE.MeshBasicMaterial({ map: tex })); cap.rotation.x = -Math.PI / 2; cap.position.set(x, top + 0.0042, z); plate.add(cap);
     return { m, cap, tex, pos: new THREE.Vector3(x, top + 0.004, z) };
   };
-  parts.lower = hand === 'right' ? faceBtn(sx * 0.011, 0.012, 'pencil', C.yellow, C.ink) : faceBtn(sx * 0.011, 0.012, 'menu', '#202020', '#fff');
-  parts.upper = hand === 'right' ? faceBtn(sx * 0.0165, -0.005, 'undo', '#202020', '#fff') : faceBtn(sx * 0.0165, -0.005, 'redo', '#202020', '#fff');
+  parts.lower = hand === 'right' ? faceBtn(sx * 0.011, 0.012, 'pencil', C.yellow, C.ink) : faceBtn(sx * 0.011, 0.012, 'undo', '#202020', '#fff');
+  parts.upper = hand === 'right' ? faceBtn(sx * 0.0165, -0.005, 'menu', '#202020', '#202020') : faceBtn(sx * 0.0165, -0.005, 'redo', '#202020', '#fff');
   const meta = new THREE.Mesh(new THREE.CylinderGeometry(0.0036, 0.0036, 0.002, 16), mk(0x9a9a9a)); meta.position.set(-sx * 0.006, top + 0.001, 0.017); plate.add(meta);
-  parts.trigger = new THREE.Mesh(new THREE.BoxGeometry(0.017, 0.02, 0.024), mk(0x202020)); parts.trigger.position.set(0, -0.031, 0.012); parts.trigger.rotation.x = -0.35; grp.add(parts.trigger);
+  parts.trigger = new THREE.Mesh(new THREE.BoxGeometry(0.017, 0.02, 0.024), mk(0x202020)); parts.trigger.position.set(0, -0.031, 0.012); parts.trigger.rotation.x = -0.35; grp.add(parts.trigger); proc.push(parts.trigger);
   const hdir = new THREE.Vector3(0, -0.07, 0.05), hlen = hdir.length(), hn = hdir.clone().normalize();
-  const handle = new THREE.Mesh(new THREE.CapsuleGeometry(0.0175, hlen, 6, 18), white); handle.position.set(0, -0.022, 0.058).addScaledVector(hdir, 0.5); handle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), hn); grp.add(handle);
-  parts.grip = new THREE.Mesh(new THREE.CapsuleGeometry(0.0062, 0.02, 4, 12), mk(0x202020)); parts.grip.position.set(-sx * 0.005, -0.058, 0.066); parts.grip.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), hn); grp.add(parts.grip);
+  const handle = new THREE.Mesh(new THREE.CapsuleGeometry(0.0175, hlen, 6, 18), white); handle.position.set(0, -0.022, 0.058).addScaledVector(hdir, 0.5); handle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), hn); grp.add(handle); proc.push(handle);
+  parts.grip = new THREE.Mesh(new THREE.CapsuleGeometry(0.0062, 0.02, 4, 12), mk(0x202020)); parts.grip.position.set(-sx * 0.005, -0.058, 0.066); parts.grip.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), hn); grp.add(parts.grip); proc.push(parts.grip);
   if (hand === 'right') { parts.nib = new THREE.Mesh(new THREE.ConeGeometry(0.0055, 0.026, 14), new THREE.MeshBasicMaterial({ color: 0xFFD400 })); parts.nib.rotation.x = -Math.PI / 2; parts.nib.position.set(0, 0, -0.027); grp.add(parts.nib); }
   // labels with leader lines
   plate.updateMatrix();
@@ -1787,23 +1836,47 @@ function buildController(hand) {
   };
   if (hand === 'right') {
     tag('lower', P(parts.lower.pos), new THREE.Vector3(0.105, 0.016, 0.062), 'A', 'draw / erase', C.yellow);
-    tag('upper', P(parts.upper.pos), new THREE.Vector3(0.105, 0.042, 0.04), 'B', 'undo', C.ink);
     tag('trigger', new THREE.Vector3(0.009, -0.03, 0.008), new THREE.Vector3(0.105, -0.012, -0.012), 'TRIGGER', 'draw', C.yellow);
     tag('grip', new THREE.Vector3(0, -0.058, 0.064), new THREE.Vector3(0.105, -0.06, 0.07), 'GRIP', 'grab, both = scale', C.blue);
     tag('stick', P(parts.stick.position), new THREE.Vector3(-0.105, 0.04, 0.032), 'STICK', 'join 3.0 cm', C.blue);
   } else {
-    tag('lower', P(parts.lower.pos), new THREE.Vector3(-0.105, 0.016, 0.062), 'X', 'menu', C.ink);
+    tag('lower', P(parts.lower.pos), new THREE.Vector3(-0.105, 0.016, 0.062), 'X', 'undo', C.ink);
+    tag('trigger', new THREE.Vector3(-0.009, -0.03, 0.008), new THREE.Vector3(-0.105, -0.012, -0.012), 'TRIGGER', 'menu', C.red);
     tag('upper', P(parts.upper.pos), new THREE.Vector3(-0.105, 0.042, 0.04), 'Y', 'redo', C.ink);
     tag('grip', new THREE.Vector3(0, -0.058, 0.064), new THREE.Vector3(-0.105, -0.06, 0.07), 'GRIP', 'grab, both = scale', C.blue);
   }
   const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(lead, 3));
-  tags.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0xffffff })));
-  grp.add(tags); grp.userData = { parts, tags, hand };
+  const leadLines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0xffffff })); tags.add(leadLines);
+  const gripHolder = new THREE.Group(); grp.add(gripHolder);   // grip space as seen from the pointing ray: the real controller model lives here
+  grp.add(tags); grp.userData = { parts, tags, hand, proc, gripHolder, leadLines, sx };
   grp.traverse((o) => { o.frustumCulled = false; });
   return grp;
 }
 const models = { left: buildController('left'), right: buildController('right') };
-models.left.add(vrPanel); models.right.add(laser);
+// The real Meta Quest Touch Plus models (the same files the headset's own browser uses), like in ChikiMovieMagic.
+// When one loads it replaces the stand-in shapes, and the button labels re-anchor to the model's own button parts.
+function adoptGLB(hand, glb) {
+  const U = models[hand].userData; glb.traverse((o) => { o.frustumCulled = false; });
+  for (const o of U.proc) o.visible = false;
+  U.gripHolder.add(glb); U.gripHolder.add(U.tags); U.glb = glb; U.gripHolder.updateMatrixWorld(true);
+  const names = { trigger: 'xr_standard_trigger_pressed_value', grip: 'xr_standard_squeeze_pressed_value', stick: 'xr_standard_thumbstick_pressed_value',
+    lower: hand === 'right' ? 'a_button_pressed_value' : 'x_button_pressed_value', upper: hand === 'right' ? 'b_button_pressed_value' : 'y_button_pressed_value' };
+  const items = [];
+  for (const key of Object.keys(names)) {
+    const t = U.parts['tag_' + key]; if (!t) continue;
+    const n = glb.getObjectByName(names[key]); if (!n) { t.sprite.visible = false; continue; }
+    items.push({ t, a: U.gripHolder.worldToLocal(n.getWorldPosition(new THREE.Vector3())) });
+  }
+  items.sort((p, q) => q.a.y - p.a.y);
+  const lead = [], top = items.length ? items[0].a.y + 0.03 : 0;
+  items.forEach((it, i) => { const x = U.sx * 0.105, y = top - i * 0.026; it.t.sprite.position.set(x, y, it.a.z); lead.push(it.a.x, it.a.y, it.a.z, x - U.sx * 0.036, y, it.a.z); });
+  U.leadLines.geometry.dispose(); U.leadLines.geometry = new THREE.BufferGeometry(); U.leadLines.geometry.setAttribute('position', new THREE.Float32BufferAttribute(lead, 3));
+}
+if (GLTFLoader) {
+  const base = 'https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/meta-quest-touch-plus/', ld = new GLTFLoader();
+  for (const h of ['left', 'right']) ld.loadAsync(base + h + '.glb').then((g) => adoptGLB(h, g.scene)).catch(() => { /* keep the stand-in */ });
+}
+models.left.add(vrPanel, pvPanel); models.right.add(laser);
 function refreshTags() {
   const r = models.right.userData.parts, t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0;
   const col = tool === 'erase' ? C.red : tool === 'bend' ? C.blue : C.yellow, hex = tool === 'erase' ? 0xE8212B : tool === 'bend' ? 0x2A7BFF : 0xFFD400;
@@ -1822,11 +1895,11 @@ function refreshTags() {
 
 const hands = { left: null, right: null };
 for (let i = 0; i < 2; i++) {
-  const ray = renderer.xr.getController(i); scene.add(ray);
+  const ray = renderer.xr.getController(i), gripObj = renderer.xr.getControllerGrip(i); scene.add(ray, gripObj);
   ray.addEventListener('connected', (e) => {
     const src = e.data; if (!src || src.hand || !src.gamepad) return;
     const h = src.handedness; if (h !== 'left' && h !== 'right') return;
-    hands[h] = { obj: ray, src }; ray.userData.hand = h; ray.add(models[h]);
+    hands[h] = { obj: ray, src, grip: gripObj }; ray.userData.hand = h; ray.add(models[h]);
   });
   ray.addEventListener('disconnected', () => { const h = ray.userData.hand; if (h && hands[h] && hands[h].obj === ray) { ray.remove(models[h]); hands[h] = null; } ray.userData.hand = null; });
 }
@@ -1836,7 +1909,7 @@ const readPad = (src) => {
 };
 const pulse = (h, strength, ms) => { try { const a = h.src && h.src.gamepad && h.src.gamepad.hapticActuators; if (a && a[0]) a[0].pulse(strength, ms); } catch (e) { /* no haptics */ } };
 
-const xs = { trig: false, uiCap: false, hadOver: false, ux: 0, uy: 0, drawing: false, erasing: false, bending: null, eraseStart: null, live: [], pa: false, pb: false, px: false, py: false, grab: 0 };
+const xs = { ltrig: false, trig: false, uiCap: false, hadOver: false, ux: 0, uy: 0, drawing: false, erasing: false, bending: null, eraseStart: null, live: [], pa: false, pb: false, px: false, py: false, grab: 0 };
 const grab = { rel: new THREE.Matrix4(), w0: new THREE.Matrix4(), mid0: new THREE.Vector3(), d0: 1, dir0: new THREE.Vector3(), s0: 1 };
 const pen = new THREE.Vector3(), penM = new THREE.Vector3(), vO = new THREE.Vector3(), vD = new THREE.Vector3(), q1 = new THREE.Quaternion(), m1 = new THREE.Matrix4(), m2 = new THREE.Matrix4();
 function updateGrab(L, R) {
@@ -1906,7 +1979,6 @@ function xrFrame(dt, L, R) {
     }
     if (xs.bending) { applyBend(xs.bending, penM); if (!trig) { endBend(xs.bending); xs.bending = null; } }
     if (R.pad.a && !xs.pa && !penBusy) setTool(state.tool === 'draw' ? 'erase' : state.tool === 'erase' ? 'bend' : 'draw');
-    if (R.pad.b && !xs.pb) undo();
     xs.pa = R.pad.a; xs.pb = R.pad.b;
     if (Math.abs(R.pad.stickX) > 0.5 && !penBusy) {
       if (state.tool === 'bend') { state.bendR = clamp(state.bendR * Math.exp(R.pad.stickX * dt * 1.1), 0.03, 0.5); refreshTags(); scheduleSave(); }
@@ -1922,14 +1994,21 @@ function xrFrame(dt, L, R) {
     xs.drawing = xs.erasing = xs.trig = xs.uiCap = false; tolBall.visible = laser.visible = cursorDot.visible = false;
   }
   if (L) {
-    if (L.pad.a && !xs.px) { vrPanel.visible = !vrPanel.visible; pulse(L, 0.3, 20); }
-    if (L.pad.b && !xs.py) redo();
+    const lt = xs.ltrig ? L.pad.trigger > 0.2 : L.pad.trigger > 0.45;
+    if (lt && !xs.ltrig) { vrPanel.visible = !vrPanel.visible; pulse(L, 0.3, 20); }   // left trigger: menu
+    xs.ltrig = lt;
+    if (L.pad.a && !xs.px) undo();                                                   // X: undo
+    if (L.pad.b && !xs.py) redo();                                                   // Y: redo
     xs.px = L.pad.a; xs.py = L.pad.b;
     const p = models.left.userData.parts; setPressed(p.trigger, L.pad.trigger > 0.45); setPressed(p.grip, L.pad.grip > 0.5); setPressed(p.lower.m, L.pad.a); setPressed(p.upper.m, L.pad.b);
   }
 }
 function xrTick(dt) {
   const get = (h) => (hands[h] && hands[h].src && hands[h].src.gamepad ? { obj: hands[h].obj, src: hands[h].src, pad: readPad(hands[h].src) } : null);
+  for (const h of ['left', 'right']) if (hands[h] && hands[h].grip) {
+    hands[h].obj.updateMatrixWorld(true); hands[h].grip.updateMatrixWorld(true);
+    const G = models[h].userData.gripHolder; m1.copy(hands[h].obj.matrixWorld).invert().multiply(hands[h].grip.matrixWorld); m1.decompose(G.position, G.quaternion, nS);
+  }
   xrFrame(dt, get('left'), get('right'));
 }
 
@@ -2063,7 +2142,7 @@ function peerRoom(code, onStatus) {
 }
 const Net = (() => {
   const CH = 400;
-  let code = '', status = 'off';
+  let code = '', status = 'off', flatCam = null;
   let room = null, queue = [], tokens = 20, lastPres = '', presAcc = 0, needAt = 0, ordTimer = 0, pend = null, ordIn = null;
   let liveSeq = 1, liveSent = 0, liveLast = 0;
   const cache = new Map(), sent = new Set(), parts = new Map();
@@ -2130,9 +2209,11 @@ const Net = (() => {
     const b = (state.show.sketch ? 1 : 0) | (state.show.curves ? 2 : 0) | (state.show.surface ? 4 : 0) | (state.show.wire ? 8 : 0) | (state.show.labels ? 16 : 0);
     const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b], c: null, h: null, w: null, L: null, R: null, u: null };
     if (isPresenter()) {
-      const hand = (H) => (H ? pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickX || 0) > 0.5 ? 16 : 0)]) : null);
+      const hand = (H, key) => { if (!H) return null; const G = models[key].userData.gripHolder;
+        return pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickX || 0) > 0.5 ? 16 : 0),
+          r4(G.position.x), r4(G.position.y), r4(G.position.z), r4(G.quaternion.x), r4(G.quaternion.y), r4(G.quaternion.z), r4(G.quaternion.w)]); };
       world.updateMatrixWorld(); camera.updateMatrixWorld();
-      p.h = pose7(camera); p.w = pose7(world).concat([r4(world.scale.x)]); p.L = hand(lastXR.L); p.R = hand(lastXR.R);
+      p.h = pose7(camera); p.w = pose7(world).concat([r4(world.scale.x)]); p.L = hand(lastXR.L, 'left'); p.R = hand(lastXR.R, 'right');
       p.u = [TOOLS.indexOf(state.tool), ui.tab, vrPanel.visible ? 1 : 0, state.mr ? 1 : 0, xrMode === 'immersive-ar' ? 1 : 0, laser.visible ? 1 : 0, Math.round(xs.ux), Math.round(xs.uy), r4(laser.scale.z), r4(state.bendR)];
     } else { camera.updateMatrixWorld(); p.c = pose7(camera).concat([Math.round(camera.fov), r4(camera.aspect)]); }
     return p;
@@ -2141,7 +2222,7 @@ const Net = (() => {
     const q = peer.presence, first = !spect || spect.peer !== peer.peer;
     if (first) {
       spect = { peer: peer.peer, tool: 'draw', tab: -1, mr: false, ar: false, bendR: 0.12, panel: true, live: [], liveK: -1, liveEndAt: 0 };
-      proxyL.add(models.left); proxyR.add(models.right); $('panelWrap').hidden = true; $('watch').hidden = false; $('roomBox').hidden = true; endGesture(true);
+      proxyL.add(models.left); proxyR.add(models.right); $('panelWrap').hidden = true; $('watch').hidden = false; $('roomBox').hidden = true; $('viewBtn').hidden = false; endGesture(true);
     }
     const k = first ? 1 : 1 - Math.exp(-dt * 16), u = Array.isArray(q.u) ? q.u : [];
     const tool = TOOLS[u[0]] || 'draw', tab = clamp(u[1] | 0, 0, 3), mr = !!u[3], ar = !!u[4], bendR = clamp(+u[9] || 0.12, 0.03, 0.5);
@@ -2155,8 +2236,9 @@ const Net = (() => {
     }
     headMark.visible = okPose(q.h, 7); if (headMark.visible) setPose(headMark, q.h, k);
     for (const [prox, a, key] of [[proxyL, q.L, 'left'], [proxyR, q.R, 'right']]) {
-      prox.visible = okPose(a, 8); if (!prox.visible) continue;
-      setPose(prox, a, k); const pr = models[key].userData.parts, bits = a[7] | 0;
+      prox.visible = okPose(a, 15); if (!prox.visible) continue;
+      setPose(prox, a, k); const pr = models[key].userData.parts, bits = a[7] | 0, G = models[key].userData.gripHolder;
+      G.position.set(a[8], a[9], a[10]); G.quaternion.set(a[11], a[12], a[13], a[14]).normalize();
       setPressed(pr.trigger, bits & 1); setPressed(pr.grip, bits & 2); setPressed(pr.lower.m, bits & 4); setPressed(pr.upper.m, bits & 8); setPressed(pr.stick, bits & 16);
     }
     vrPanel.visible = spect.panel;
@@ -2173,7 +2255,7 @@ const Net = (() => {
   function unwatch() {
     spect = null; proxyL.visible = proxyR.visible = headMark.visible = false; tolBall.visible = laser.visible = cursorDot.visible = false; vrPanel.visible = true; setLive(null);
     if (!inXR) { world.position.copy(HOME); world.quaternion.identity(); world.scale.setScalar(1); refreshDisplayScale(); orbitTarget.copy(HOME); applyOrbit(); }
-    $('panelWrap').hidden = false; $('watch').hidden = true; $('roomBox').hidden = IN_CLAUDE; layoutUI(); refreshTags();
+    $('panelWrap').hidden = false; $('watch').hidden = true; $('roomBox').hidden = IN_CLAUDE; $('viewBtn').hidden = true; $('splitLine').hidden = true; onResize(); layoutUI(); refreshTags();
   }
   function showFrusta(list, dt) {
     const seen = new Set();
@@ -2204,6 +2286,7 @@ const Net = (() => {
       if (typeof q.pv === 'number' && q.pv > sync.pv && (!best || q.pv > best.presence.pv)) best = p;
       if (typeof q.sv === 'number' && q.sv > sync.sv && q.sv > wantSv) wantSv = q.sv;
     }
+    flatCam = flats.length ? flats[0].presence.c : null;
     if (best) applyParams(best.presence);
     const now = performance.now();
     if (now > needAt) {
@@ -2228,6 +2311,7 @@ const Net = (() => {
     },
     join(c) {
       code = c; status = 'connecting'; try { localStorage.setItem('quadrille.room', c); } catch (e) { /* fine */ }
+      $('roomIn').value = c;
       if (room && room.leave) room.leave(); room = null; sent.clear(); lastPres = ''; queue = []; pend = null; ui.dirty = true;
       const go = () => { if (code !== c) return; if (!window.Peer) { status = 'off'; ui.dirty = true; return; } hook(peerRoom(c, (st) => { status = st; ui.dirty = true; })); };
       if (window.Peer) return go();
@@ -2247,7 +2331,8 @@ const Net = (() => {
       liveLast = now; const to = Math.min(n, liveSent + CH); enqueue('lv', Object.assign({ k: liveSeq, i: liveSent }, packPts(flat, liveSent, to))); liveSent = to;
     },
     liveEnd() { if (!room) return; enqueue('lv', { k: liveSeq, end: 1 }); liveSeq++; liveSent = 0; },
-    online: () => !!room && status === 'open', frustumCount: () => frusta.size,
+    online: () => !!room && status === 'open', frustumCount: () => frusta.size, flatCam: () => flatCam, code: () => code,
+    showFrustaNow(v) { for (const g of frusta.values()) g.visible = v; },
     peersDebug: () => (room ? room.peers().map((p) => (p.sameTab ? 'me' : p.peer.slice(0, 4)) + ':' + (p.presence && p.presence.r)) : []),
   };
 })();
@@ -2257,7 +2342,7 @@ const Net = (() => {
 // =====================================================================
 function onResize() {
   if (renderer.xr.isPresenting) return;
-  camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+  camera.aspect = viewAspect(); camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight, false); applyOrbit(); fitPanel();
 }
 window.addEventListener('resize', onResize);
@@ -2270,7 +2355,8 @@ renderer.setAnimationLoop((t) => {
   Net.frame(dt);
   if (ui.toast && performance.now() > ui.toastUntil) { ui.toast = ''; ui.dirty = true; }
   if (ui.dirty) { ui.dirty = false; drawUI(); uiTex.needsUpdate = true; }
-  renderer.render(scene, camera);
+  renderPhonePreview();
+  renderAll();
 });
 
 Engine.start(); Net.start();
@@ -2284,7 +2370,7 @@ if (navigator.xr) {
     .then(([vr, ar]) => { xrSupport.vr = !!vr; xrSupport.ar = !!ar; $('enter').hidden = !(vr || ar); });
 }
 // handle for tests and tinkering
-window.QX = { THREE, state, commit, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
+window.QX = { THREE, state, commit, pvPanel, adoptGLB, setView: (v) => { state.view = v; $('splitLine').hidden = v !== 'split'; onResize(); }, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
 </script>
 <script src="../updated.js"></script>
 </body>
