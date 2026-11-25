@@ -78,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '543';
+const VERSION = '544';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -90,7 +90,7 @@ const PALETTE = ['#ff3b30','#ff9500','#ffd400','#34c759','#00c7be','#1e6bff',
                  '#5e2bff','#ff2d95','#ffffff','#9aa0a6','#2b2b2b','#a0522d'];
 const PHASES = [
   {id:'build',      name:'BUILD',      col:'#ff9500'},
-  {id:'light',      name:'LIGHT',      col:'#ffd400'},
+  {id:'light',      name:'BUILD',      col:'#ff9500', inDial:false},   // BUILD's sky and light tabs: same phase on the dial
   {id:'characters', name:'CHARACTERS', col:'#34c759'},
   {id:'perform',    name:'ACTION',     col:'#ff2d95'},
   {id:'shoot',      name:'ACTION',     col:'#ff2d95', inDial:false},   // ACTION's camera tabs: same phase on the dial
@@ -99,8 +99,8 @@ const PHASES = [
 ];
 const PLANNED = {};
 const RAILS = {
-  build:      [['tools','Sculpt'],['doodle','Doodle'],['blocks','Blocks'],['layers','Layers'],['color','Color']],
-  light:      [['world','Sky'],['sun','Sun'],['lights','Lights'],['materials','Materials']],
+  build:      [['tools','Sculpt'],['doodle','Doodle'],['blocks','Blocks'],['color','Color'],['materials','Material'],['lights','Lights'],['sun','Sun'],['world','Sky'],['layers','Layers']],
+  light:      [['tools','Sculpt'],['doodle','Doodle'],['blocks','Blocks'],['color','Color'],['materials','Material'],['lights','Lights'],['sun','Sun'],['world','Sky'],['layers','Layers']],
   characters: [['chars','Puppet'],['clook','Look'],['cvoice','Voice'],['layers','Parts'],['cpanel','Tools']],
   perform:    [['perform','Puppets'],['cast','On stage'],['tracks','Motion'],['audio','Voices'],['music','Music'],['takes','Camera'],['lens','Lens']],
   shoot:      [['perform','Puppets'],['cast','On stage'],['tracks','Motion'],['audio','Voices'],['music','Music'],['takes','Camera'],['lens','Lens']],
@@ -2691,7 +2691,7 @@ function controlledKeys(){
   const set = new Set();
   if (exporting) return set;   // a film is made from the recording alone
   for (const g of [show.grab, show.grabL]) if (g){ set.add(g.T ? 't'+g.T.id : g.c ? 'r'+g.c.id : String(g.L.id)); if (g.c && g.blinked) set.add('e'+g.c.id); }   // blinking a puppet you hold
-  if (show.embodied){ const ride = riding(show.embodied); for (const part of show.embodied.parts) if (!(ride && part.body)) set.add(String(part.L.id)); if (show.embodied.rootMoved || (ride && !show.embodied.upright)) set.add('r'+show.embodied.c.id); /* riding: the body's walk is re-recorded with your steps in it */ set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
+  if (show.embodied){ const ride = riding(show.embodied); for (const part of show.embodied.parts) set.add(String(part.L.id)); if (show.embodied.rootMoved || (ride && !show.embodied.upright)) set.add('r'+show.embodied.c.id); /* riding: the body's walk is re-recorded with your steps in it */ set.add('e'+show.embodied.c.id); set.add('m'+show.embodied.c.id); }
   if (show.rec && show.rec.voiceFor) set.add('m'+show.rec.voiceFor);
   for (const sd of ['left','right']) if (embGrab[sd]) set.add('r'+embGrab[sd].c.id);
   for (const c of show.chars) if (c.type === 'sock' && c.sockLive){ set.add('r'+c.id); set.add('m'+c.id); }   // socks on your hands
@@ -2744,6 +2744,7 @@ const _fh = {p:new THREE.Vector3(), q:new THREE.Quaternion(), s:new THREE.Vector
 function hasMoves(key){ const tr = show.tracks[key]; if (tr && tr.samples && tr.samples.length) return true; const rk = show.rec && show.rec.phase==='rec' ? show.rec.keys.get(key) : null; return !!(rk && rk.length >= 9); }
 function followHead(c, ctl){
   const H = partLayer(c,'head'); if (!H) return; const hk = String(H.id);
+  keepNeck(c, H, ctl);
   if (!ctl.has(hk) && !hasMoves(hk)) return;   // the head never moved: everything rests where it was made (live or recorded, the rest rides on it)
   const Hm = new THREE.Matrix4().compose(H.group.position, H.group.quaternion, H.group.scale), D = Hm.clone().multiply(restM(H).invert());
   for (const L of partsOf(c)){ if (L === H || ctl.has(String(L.id))) continue;
@@ -2755,6 +2756,17 @@ function followHead(c, ctl){
       new THREE.Matrix4().makeTranslation(hC.x, hC.y, hC.z).multiply(new THREE.Matrix4().makeRotationY(yaw)).multiply(new THREE.Matrix4().makeTranslation(-hR.x, -hR.y, -hR.z)).multiply(restM(L))
         .decompose(L.group.position, L.group.quaternion, L.group.scale);
     } }
+}
+// the head and body never come apart: takes recorded at different times (or a walk that went past the end of an older take)
+// can leave the body's moves somewhere else, so when the head is further than a neck's stretch from where the body carries it,
+// the body slides over to it (legs follow the body). Close-up nods and leans are left exactly as recorded.
+function keepNeck(c, H, ctl){
+  const B = partLayer(c,'body'); if (!B || B === H || ctl.has(String(B.id)) || !hasMoves(String(B.id))) return;
+  const ctr = partCenter(H); if (!ctr) return;
+  const hC = ctr.clone().applyMatrix4(new THREE.Matrix4().compose(H.group.position, H.group.quaternion, H.group.scale));
+  const bH = ctr.clone().applyMatrix4(restM(H)).applyMatrix4(new THREE.Matrix4().compose(B.group.position, B.group.quaternion, B.group.scale).multiply(restM(B).invert()));
+  const gap = hC.sub(bH), d = gap.length(), slack = 0.1 * ((c.guide || GUIDE).head[1] || 1.5);
+  if (d > slack) B.group.position.addScaledVector(gap, 1 - slack/d);
 }
 // where a character's look target sits when nothing is recorded: set by grabbing it, or in front of its face
 function lookRestOf(c){
@@ -3296,7 +3308,7 @@ function updateEmbodied(){
     root.parent.updateMatrixWorld(true); setObjMatrix(root, root.parent.matrixWorld.clone().invert().multiply(Bm).multiply(new THREE.Matrix4().makeTranslation(e.drift.x, 0, e.drift.z))); root.updateMatrixWorld(true);
   }
   const inv = root.matrixWorld.clone().invert();   // head, hands and face go exactly where your real head and hands are
-  for (const part of show.embodied.parts){ if (ride && part.body) continue; const tr = part.side ? ctrl[part.side]?.grip : part.tracker; if (!tr){ if (!part.warned){ part.warned = true; toast('Your '+part.side+' controller is asleep: press any of its buttons'); } continue; } part.warned = false;
+  for (const part of show.embodied.parts){ const tr = part.side ? ctrl[part.side]?.grip : part.tracker; if (!tr){ if (!part.warned){ part.warned = true; toast('Your '+part.side+' controller is asleep: press any of its buttons'); } continue; } part.warned = false;
     setObjMatrix(part.L.group, inv.clone().multiply(unscaled(tr).multiply(part.off))); }
 }
 
@@ -5613,7 +5625,10 @@ function pickToolTab(id){   // a tab in the CHARACTERS side panel, same as tappi
   requestUI();
 }
 const CAM_PAGES = ['takes','path','keys','lens'], ACTION_PAGES = ['perform','cast','tracks','audio','music'];
+const LIGHT_PAGES = ['lights','sun','world','sky'], MAKE_PAGES = ['tools','doodle','blocks','color','materials'];
 function openPage(id){
+  if ((state.phase==='build' && LIGHT_PAGES.includes(id)) || (state.phase==='light' && MAKE_PAGES.includes(id))){   // one BUILD rail: sculpting tabs and lighting tabs
+    setPhase(state.phase==='build' ? 'light' : 'build'); state.page = id; state.confirm = null; requestUI(); return; }
   if ((state.phase==='perform' && CAM_PAGES.includes(id)) || (state.phase==='shoot' && ACTION_PAGES.includes(id))){
     const t = show.t; setPhase(state.phase==='perform' ? 'shoot' : 'perform'); show.t = t; state.page = id; requestUI(); return; }
   if (id==='cpanel'){ state.win.chars = state.win.chars===false; if (state.win.chars && renderer.xr.isPresenting && charsWin.dock==='hand') dockWin(charsWin); requestUI(); return; }
@@ -6643,7 +6658,7 @@ function drawDial(){
   g.fillStyle='rgba(8,10,30,0.92)'; g.fillRect(0,0,UIW,UIH);
   const cx=UIW/2, cy=UIH/2, R=200, r0=62;
   hits.length = 0;
-  const DIAL = PHASES.filter(p=>p.inDial!==false), cur = state.phase==='shoot' ? 'perform' : state.phase;
+  const DIAL = PHASES.filter(p=>p.inDial!==false), cur = state.phase==='shoot' ? 'perform' : state.phase==='light' ? 'build' : state.phase;
   const n=DIAL.length;
   DIAL.forEach((p,i)=>{
     const a0=-Math.PI/2 + (i-0.5)*2*Math.PI/n, a1=a0+2*Math.PI/n;
@@ -6666,7 +6681,7 @@ function drawDial(){
 function setPhase(id){
   if (id==='edit' || id==='perform') autoSortOnce();
   if (stroke) endStroke(true); if (rec) stopRecording(true); if (show.rec) cutShowRec(true); stopPlay(); stopShow();
-  if (blockGrab) endBlockGrab(); if (show.grab) endCharGrab();
+  if (blockGrab) endBlockGrab(); if (show.grab) endCharGrab(); if (show.grabL) endCharGrab('grabL');
   if (show.embodied && (show.embodied.studio || (id!=='perform' && !(NET.guest && id==='shoot')))) stepOut();   // a try-on ends when you leave Characters   // a player can stay in a puppet while you film
   if (id==='app' && state.phase!=='app') state.appStage = stageName(state.phase);   // APP keeps whatever stage you were on
   const from = stageName(state.phase), to = stageName(id);
@@ -8363,6 +8378,161 @@ const SONGS3 = [
   } },
 ];
 SONGS.push(...SONGS3);
+// more songs: each one has a musical trick in it (key changes, odd meters, tritone swaps, polyrhythms, hemiola)
+const SONGS4 = [
+{ name:'Key Change Carousel', mood:'Pop', tag:'Merry-go-round pop · the chorus climbs up a key, then another, then slides home', bpm:122, beats:64, room:1.6,
+  compose(K){ const {n, line, P} = K;
+    const VB = [['C2','E4 G4 C5'],['A1','E4 A4 C5'],['F1','F4 A4 C5'],['G1','D4 G4 B4'],['C2','E4 G4 C5'],['E2','E4 G4 B4'],['F1','F4 A4 C5'],['G1','F4 G4 B4']];
+    const CB = [['C2','E4 G4 C5'],['A1','E4 A4 C5'],['F1','F4 A4 C5'],['G1','D4 G4 B4']];
+    const VM = mel(`E5/.5 G5/.5 C6/1 B5/.5 A5/.5 G5/1 | E5/.5 E5/.5 A5/1 G5/.5 E5/.5 C5/1 | F5/.5 A5/.5 C6/1 A5/.5 F5/.5 A5/1 | G5/1.5 F5/.5 D5/2 |
+      E5/.5 G5/.5 C6/1 D6/.5 C6/.5 B5/1 | G5/.5 B5/.5 E6/1 D6/.5 B5/.5 G5/1 | A5/.5 C6/.5 F6/1 E6/.5 C6/.5 A5/1 | B5/1 D6/1 F6/1 r/1`);
+    const HK = mel(`C6/.5 C6/.5 E6/1 G6/1 E6/1 | D6/.5 C6/.5 A5/1 C6/1.5 E6/.5 | F6/.5 E6/.5 C6/1 A5/.5 C6/.5 F6/1 | E6/1 D6/1 B5/.5 D6/.5 G6/1`);
+    const TAG = mel('D6/1 F6/1 D6/.5 B5/.5 G5/1', 60);
+    line('whistle', VM, {pan:-0.1}, 0.7);
+    for (const [o, k, upTo] of [[32, 1, 16], [48, 2, 12]]){ const h = HK.filter(x => x.b < upTo).map(x=>({...x, b:x.b+o}));
+      line('saw', h, {pan:-0.1, tr:k}, 0.8); line('glock', h, {pan:0.35, tr:k}, 0.55); }
+    line('saw', TAG, {pan:-0.1}, 0.8); line('glock', TAG, {pan:0.35}, 0.55);
+    for (let i=0; i<16; i++){ const b0 = i*4, ch = i >= 8;
+      const segs = i < 8 ? [[...VB[i], 0, 4]] : i < 15 ? [[...CB[(i-8) % 4], i < 12 ? 1 : 2, 4]] : [['Bb1','D4 F4 Bb4', 0, 2], ['G1','F4 B4 D5', 0, 2]];
+      let o = 0; for (const [bs, vc, k, len] of segs){ const r = pm(bs) + k, V = chd(vc).map(m=>m+k), s0 = b0 + o;
+        for (let e=0; e<len*2; e++){ n('bass', s0 + e*0.5, r + (e % 4 === 3 ? 12 : 0), 0.4, e % 2 ? 0.6 : 0.8); if (e % 2) n('piano', s0 + e*0.5, V, 0.35, 0.42, {pan:-0.2}); }
+        if (ch) n('strings', s0, V, len, 0.36, {pan:0.25}); o += len; }
+      P.kick(b0, 0.9); P.kick(b0 + 2, 0.85); if (ch) P.kick(b0 + 2.5, 0.6); P.snare(b0 + 1, 0.55); P.snare(b0 + 3, 0.55); P.clap(b0 + 1, ch ? 0.5 : 0.3); P.clap(b0 + 3, ch ? 0.5 : 0.3);
+      for (let s=0; s<(ch ? 16 : 8); s++) P.hat(b0 + s*(ch ? 0.25 : 0.5), s % 2 ? 0.12 : 0.24); if (ch) for (let e=0; e<4; e++) P.tamb(b0 + e + 0.5, 0.22);
+      if (i === 7 || i === 11){ for (let s=0; s<8; s++) P.tom(b0 + 2 + s*0.25, 230 - s*15, 0.5); P.reverse(b0 + 2, 2, 0.45); }
+      if (i === 15) for (let s=0; s<8; s++) P.snare(b0 + 2 + s*0.25, 0.25 + s*0.06);
+      if (i === 0 || i === 8 || i === 12) P.crash(b0, 0.45); }
+  } },
+
+{ name:'Seven-Eight Skate Sprint', mood:'Race', tag:'Downhill in 7/8 · the beat trips over itself on purpose: two, two, three', bpm:168, beats:63, room:1.2,
+  compose(K){ const {n, P} = K, BAR = 3.5;
+    const CH = [['E2','E3 G3 B3 D4'],['E2','E3 G3 B3 D4'],['C2','E3 G3 C4'],['D2','D3 F#3 A3'],['E2','E3 G3 B3'],['G1','D3 G3 B3'],['A1','E3 A3 C#4'],['B1','D#3 F#3 A3 B3']];
+    const MOT = [[0,2],[1,0],[2,4],[2.5,3],[3,2]];   // [beat in the bar, chord tone]: lands on each group of the 2+2+3
+    for (let i=0; i<18; i++){ const b0 = i*BAR, tag = i >= 16, [bs, vc] = tag ? ['E2','E3 B3 E4'] : CH[i % 8], r = pm(bs), V = chd(vc), T = [...V.map(m=>m+12), ...V.map(m=>m+24)];
+      [[0,0,0.95],[0.5,12,0.55],[1,0,0.85],[1.5,12,0.55],[2,0,0.9],[2.5,7,0.6],[3,12,0.6]].forEach(([o, iv, v]) => n('synthbass', b0 + o, r + iv, 0.35, v));
+      n('saw', b0, V.map(m=>m+12), 0.9, 0.3, {pan:0.25}); n('saw', b0 + 1, V.map(m=>m+12), 0.9, 0.26, {pan:-0.25}); n('saw', b0 + 2, V.map(m=>m+12), 1.4, 0.3, {pan:0.25});
+      if (i >= 4 && !tag){ const sh = Math.floor(i/4) % 2; MOT.forEach(([o, k], j) => n('sqlead', b0 + o, T[(k + sh + (i % 2 ? j % 2 : 0)) % T.length], o === 3 ? 0.5 : 0.45, o === 0 ? 0.55 : 0.42, {pan:-0.1, echo:0.2})); }
+      P.kick(b0, 1); P.kick(b0 + 1, 0.85); P.snare(b0 + 2, 0.7); P.clap(b0 + 2, 0.35); if (i % 2) P.kick(b0 + 3, 0.6);
+      for (let e=0; e<7; e++) P.hat(b0 + e*0.5, e === 0 || e === 2 || e === 4 ? 0.3 : 0.15, e === 6);
+      if (i % 4 === 0) P.crash(b0, 0.35);
+      if (tag) for (let s=0; s<7; s++) P.tom(b0 + s*0.5, 200 - s*16, 0.55); }
+  } },
+
+{ name:'Tritone Taxi', mood:'Jazz', tag:'Bebop cab ride · ii-V-Is with sneaky tritone swaps, walking bass, vibes', bpm:184, beats:64, room:1.7,
+  compose(K){ const {n, P} = K, sw = b => Math.floor(b) + (Math.abs(b % 1 - 0.5) < 1e-6 ? 2/3 : b % 1);
+    const BARS = [ [['D2','F3 A3 C4 E4',4]], [['G1','F3 B3 E4',2],['Db2','F3 B3 Eb4',2]], [['C2','E3 G3 B3 D4',4]], [['A1','G3 C#4 Bb4',2],['Eb2','G3 Db4 F4',2]],
+      [['D2','F3 A3 C4 E4',4]], [['G1','F3 B3 E4',2],['Db2','F3 B3 Eb4',2]], [['E2','D3 G3 B3',2],['A1','G3 C#4 F#4',2]], [['Eb2','Db3 Gb3 Bb3',2],['Ab1','Gb3 C4 Eb4',2]],
+      [['Db2','F3 Ab3 C4',4]], [['Gb1','E3 Bb3 Eb4',4]], [['F1','E3 A3 C4',2],['Bb1','Ab3 D4 G4',2]], [['E2','D3 G3 B3',2],['Eb2','Db3 G3 C4',2]],
+      [['D2','F3 A3 C4',2],['Db2','F3 B3 Eb4',2]], [['C2','E3 G3 B3 D4',2],['Ab1','Gb3 C4 F4',2]], [['D2','F3 A3 C4',2],['G1','F3 B3 E4',2]], [['A1','G3 C#4 F4',4]] ];
+    const C = []; BARS.forEach((bar, i) => { let o = 0; for (const [bs, vc, len] of bar){ C.push({b:i*4 + o, len, bar:i, r:pm(bs), V:chd(vc)}); o += len; } });
+    let prev = C[0].r;
+    C.forEach((c, k) => { const nx = C[(k+1) % C.length];
+      for (let q=0; q<c.len; q++){ let m;   // walking bass: root, chord tones, then a half step into the next root
+        if (q === 0) m = c.r; else if (q === c.len-1) m = nx.r + (K.rnd() < 0.5 ? 1 : -1); else m = c.r + [7, 12, 3 + (c.V.some(x => (x - c.r) % 12 === 4) ? 1 : 0)][Math.floor(K.rnd()*3)];
+        while (m - prev > 7) m -= 12; while (prev - m > 7) m += 12; while (m > 52) m -= 12; while (m < 28) m += 12;
+        n('upright', c.b + q, m, 0.95, q === 0 ? 0.9 : 0.72); prev = m; }
+      n('vibes', c.b, c.V.map(m=>m+12), 0.5, 0.45, {pan:0.3}); if (c.len >= 2) n('vibes', sw(c.b + 1.5), c.V.map(m=>m+12), 0.3, 0.36, {pan:0.3});   // Charleston comp
+      if (c.bar % 4 === 3 && c.len === 4) return;   // the horn breathes
+      // the line: swung eighths along the chord, then an enclosure (above, below) into the next chord's guide tone
+      const tg = nx.V[0] + 12, dir = c.bar % 2 ? -1 : 1, T = c.V.map(m=>m+12).sort((a, b) => a - b), st = c.len*2;
+      for (let e=0; e<st; e++){ let m;
+        if (e === st-2) m = tg + 1; else if (e === st-1) m = tg - 1;
+        else { const j = dir > 0 ? e : -e, L = T.length; m = T[((j % L) + L) % L] + 12*Math.floor(j / L); }
+        while (m > 84) m -= 12; while (m < 62) m += 12;
+        n('sax', sw(c.b + e*0.5), m, 0.4, e % 2 ? 0.5 : 0.66, {pan:-0.15}); }
+    });
+    for (let b=0; b<64; b++){ P.ride(b, 0.33); if (b % 2){ P.hat(b, 0.25); P.ride(sw(b + 0.5), 0.24); } P.kick(b, 0.16); if (K.rnd() < 0.25) P.snare(sw(b + 0.5), 0.14); }
+    P.crash(0, 0.3); for (const o of [61, 61 + 2/3, 62, 62 + 2/3, 63, 63 + 2/3]) P.snare(o, 0.4);
+  } },
+
+{ name:'Popcorn Polyrhythm', mood:'Wonky', tag:'Kernels popping in threes and fives over a steady four · Lydian sparkle', bpm:120, beats:64, room:1.5,
+  compose(K){ const {n, P} = K;
+    const CH = [['F1','A3 C4 E4 B4'],['F1','G3 B3 D4 A4'],['E2','G3 B3 D4 F#4'],['A1','G3 C4 E4 B4'],['D2','F3 A3 C4 E4'],['B1','G3 B3 D4 F#4'],['C2','E3 G3 B3 D4'],['E2','A3 B3 D4 E4']];
+    const at = b => { const i = Math.min(7, Math.floor(b/8)); return i === 7 && b >= 60 ? {r:pm('E2'), V:chd('G#3 B3 D4 E4')} : {r:pm(CH[i][0]), V:chd(CH[i][1])}; };
+    for (let i=0; i<8; i++){ const b0 = i*8, c = at(b0); n('strings', b0, c.V, 8, 0.3, {pan:-0.2});
+      for (let bar=0; bar<2; bar++){ const s0 = b0 + bar*4, cc = at(s0 + 3);
+        [[0,0,0.9],[0.75,7,0.6],[1.5,12,0.7],[2.5,0,0.75],[3,10,0.55],[3.5,12,0.5]].forEach(([o, iv, v]) => n('synthbass', s0 + o, cc.r + iv, 0.35, v)); } }
+    for (let k=0, b=0; b < 64; k++, b += 0.75){ const c = at(b), T = c.V.map(m=>m+12); n('marimba', b, T[k % T.length] + (k % 8 >= 4 ? 12 : 0), 0.3, k % 4 ? 0.45 : 0.65, {pan:0.35}); }   // threes
+    for (let k=0, b=16; b < 64; k++, b += 1.25){ const c = at(b), T = c.V.map(m=>m+24); n('kalimba', b, T[(k*2) % T.length], 0.4, 0.5, {pan:-0.4, echo:0.2}); }   // fives
+    for (let b=34; b < 64; b += 3.5) n('boing', b, at(b).V[0] + 12, 0.3, 0.3, {pan:0.5});   // sevens
+    for (let b=0; b<64; b++){ P.kick(b, 0.9); P.hat(b + 0.5, 0.28, true); if (b % 2) P.clap(b, 0.5); P.shaker(b + 0.25, 0.15); P.shaker(b + 0.75, 0.12); }
+    P.crash(0, 0.35); P.crash(32, 0.4); P.reverse(30, 2, 0.4);
+  } },
+
+{ name:'Comet Kids', mood:'Anime', tag:'Anime opening at full speed · royal-road chords, piano runs, the last chorus jumps up a key', bpm:172, beats:96, room:1.6,
+  compose(K){ const {n, line, P} = K;
+    const R4 = [['G1','F#3 A3 B3 D4'],['A1','G3 A3 C#4 E4'],['F#1','E3 A3 C#4'],['B1','D3 F#3 A3 B3']];
+    const VSE = [...R4, ['E2','D3 G3 B3'],['F#1','E3 A#3 C#4'],['B1','D3 F#3 A3 B3'],['A1','G3 C#4 E4']];
+    const CHO = [...R4, ['G1','F#3 A3 B3 D4'],['A1','G3 A3 C#4 E4'],['B1','D3 F#3 A3 B3']];
+    const bar = i => i < 8 ? [...VSE[i], 0] : i === 15 ? ['B1','A3 D#4 F#4', 0] : i === 23 ? ['A1','G3 C#4 E4', 0] : [...CHO[(i-8) % 8], i < 16 ? 0 : 2];
+    const VM = mel(`B4/.5 D5/.5 F#5/1 E5/.5 D5/.5 B4/1 | C#5/.5 E5/.5 A5/1 G5/1 E5/1 | A4/.5 C#5/.5 E5/1 F#5/.5 E5/.5 C#5/1 | D5/2 B4/2 |
+      E5/.5 G5/.5 B5/1 A5/.5 G5/.5 E5/1 | A#4/.5 C#5/.5 F#5/1 E5/1 C#5/1 | D5/.5 F#5/.5 B5/1 A5/.5 F#5/.5 D5/1 | E5/1 G5/1 A5/1 C#6/1`);
+    const HK = mel(`F#5/.5 A5/.5 D6/1 C#6/.5 B5/.5 A5/1 | G5/.5 A5/.5 C#6/1 E6/1 C#6/1 | A5/.5 C#6/.5 E6/1 D6/.5 C#6/.5 A5/1 | B5/1.5 A5/.5 F#5/2 |
+      D6/.5 D6/.5 F#6/1 E6/.5 D6/.5 B5/1 | C#6/.5 D6/.5 E6/1 G6/1 E6/1 | F#6/1.5 E6/.5 D6/1 B5/1`);
+    line('sqlead', VM, {pan:-0.1, echo:0.2}, 0.6);
+    for (const [o, k] of [[32, 0], [64, 2]]){ const h = HK.map(x=>({...x, b:x.b+o})); line('saw', h, {pan:-0.1, tr:k}, 0.8); if (k) line('glock', h, {pan:0.35, tr:k}, 0.55); }
+    line('saw', mel('D#6/1 F#6/1 A6/1 B6/1', 60), {pan:-0.1}, 0.8); line('saw', mel('C#6/1 E6/1 G6/1 A6/1', 92), {pan:-0.1}, 0.8);
+    for (let i=0; i<24; i++){ const b0 = i*4, ch = i >= 8, [bs, vc, k] = bar(i), r = pm(bs) + k, V = chd(vc).map(m=>m+k), T = V.map(m=>m+12);
+      if (ch){ for (let s=0; s<16; s++) n('piano', b0 + s*0.25, T[s % T.length] + (s >= 8 ? 12 : 0), 0.2, s % 4 ? 0.3 : 0.45, {pan:0.3}); n('strings', b0, T, 4, 0.36, {pan:-0.25}); }
+      else for (let e=0; e<8; e++) if (e % 2) n('piano', b0 + e*0.5, T, 0.3, 0.38, {pan:0.3});
+      for (let e=0; e<8; e++) n('bass', b0 + e*0.5, r + (ch && e % 2 ? 12 : 0), 0.4, e % 2 ? 0.6 : 0.85);
+      P.kick(b0, 0.95); if (ch){ P.kick(b0 + 1.5, 0.7); P.kick(b0 + 2, 0.85); } else P.kick(b0 + 2.5, 0.75); P.snare(b0 + 1, 0.6); P.snare(b0 + 3, 0.6);
+      for (let s=0; s<(ch ? 16 : 8); s++) P.hat(b0 + s*(ch ? 0.25 : 0.5), s % 2 ? 0.12 : 0.24);
+      if (i === 7 || i === 15 || i === 23) for (let s=0; s<8; s++) P.snare(b0 + 2 + s*0.25, 0.25 + s*0.06);
+      if (i % 8 === 0) P.crash(b0, 0.5); }
+  } },
+
+{ name:'Samba Supernova', mood:'Dance', tag:'Carnival in orbit · full batucada, a chromatic bass line walking down, flute and whistles', bpm:104, beats:64, room:1.4,
+  compose(K){ const {n, line, P} = K;
+    const CH = [['A1','G3 C4 E4 B4'],['G#1','A3 C4 E4'],['G1','A3 C4 E4'],['F#1','C4 E4 A4'],['F1','E3 A3 C4'],['E1','G#3 D4 F4'],['A1','G3 C4 E4'],['E1','G#3 D4 E4 B4']];
+    const M = mel(`E5/.75 A5/.75 C6/.5 B5/.5 A5/.5 E5/1 | G#5/.75 B5/.75 E6/1.5 D6/1 | G5/.75 C6/.75 E6/.5 D6/.5 C6/.5 A5/1 | F#5/.75 A5/.75 D6/1 C6/.5 A5/.5 F#5/.5 |
+      F5/.75 A5/.75 C6/.5 E6/1 C6/1 | B5/.75 G#5/.75 F5/.5 D5/.5 E5/1.5 | r/.5 A5/.25 B5/.25 C6/.5 E6/.75 D6/.75 C6/.75 B5/.25 | G#5/1 B5/1 E6/2`);
+    line('flute', M, {pan:-0.15}, 0.75); line('flute', M.map(x=>({...x, b:x.b+32})), {pan:-0.15, tr:12}, 0.6); line('brass', M.map(x=>({...x, b:x.b+32})), {pan:0.2}, 0.6);
+    const TAMB = [1,0,1,0,0,1,0,1,0,1,0,0,1,0,1,0], AGO = {0:1, 3:1, 6:0, 8:1, 11:1, 14:0};
+    for (let i=0; i<16; i++){ const b0 = i*4, two = i >= 8, [bs, vc] = CH[i % 8], r = pm(bs), V = chd(vc);
+      [[0,0,0.9],[1.5,0,0.6],[2,7,0.75],[3.5,12,0.6]].forEach(([o, iv, v]) => n('bass', b0 + o, r + iv + 12, 0.4, v));
+      for (let s=0; s<16; s++){ const b = b0 + s*0.25;
+        if (TAMB[s]){ n('mandolin', b, V.map(m=>m+12), 0.08, 0.32, {pan:0.35}); P.wood(b, 0.32, true, {pan:-0.35}); }
+        P.shaker(b, s % 4 === 3 ? 0.3 : 0.14); P.snare(b, s % 4 === 3 ? 0.22 : 0.06);
+        if (AGO[s] != null) P.cowbell(b, AGO[s] ? 0.28 : 0.2, {pan:0.5}); }
+      P.tom(b0, 75, 0.35); P.tom(b0 + 1, 70, 0.85); P.tom(b0 + 2, 75, 0.35); P.tom(b0 + 3, 62, 0.95);   // surdos
+      P.kick(b0, 0.7); if (two){ P.kick(b0 + 1, 0.6); P.kick(b0 + 2, 0.7); P.kick(b0 + 3, 0.6); n('whistle', b0, 98, 0.12, 0.35, {pan:0.4}); n('whistle', b0 + 0.25, 98, 0.12, 0.3, {pan:0.4}); }
+      if (i % 8 === 0) P.crash(b0, 0.4); if (i === 7) for (let s=0; s<8; s++) P.snare(b0 + 2 + s*0.25, 0.3 + s*0.07); }
+  } },
+
+{ name:'Acid Phase Drift', mood:'Acid', tag:'Two squelchy lines in sevens and fives drifting against a steady four · the filter breathes', bpm:132, beats:64, room:1.3, echo:0.3,
+  compose(K){ const {n, P} = K;
+    const A = [0,12,3,0,15,7,10], AC = [1,0,0,1,0,1,0], SL = [0,1,0,0,1,0,0], B = [7,19,10,7,22];
+    const root = b => Math.floor(b/16) % 2 ? pm('Db2') : pm('F2');
+    for (let s=0; s<256; s++){ const b = s*0.25, k = s % 7, r = root(b), cut = 320 + 2400*Math.pow(Math.sin(Math.PI*b/64), 2), pk = (s+6) % 7;
+      n('acid', b, r + A[k], SL[k] ? 0.32 : 0.18, AC[k] ? 0.95 : 0.6, {cut, glideFrom: SL[pk] ? root(b - 0.25) + A[pk] : null, gt:0.06, pan:-0.15});
+      if (b >= 16 && s % 2 === 0){ const j = (s/2) % 5; n('acid', b, r + B[j] + 12, 0.18, j === 0 ? 0.7 : 0.45, {cut:cut*0.7 + 300, q:16, pan:0.45, echo:0.3}); } }
+    for (let i=0; i<16; i++){ const b0 = i*4, V = chd(Math.floor(b0/16) % 2 ? 'F3 Ab3 C4 G4' : 'Ab3 C4 Eb4 G4');
+      if (i >= 4) for (const o of [0.5, 1.75, 3]) n('saw', b0 + o, V, 0.2, 0.3, {pan:0.2, echo:0.35, cut:2400});
+      for (let q=0; q<4; q++){ P.kick(b0 + q, 1); P.hat(b0 + q + 0.5, 0.3, true); } P.clap(b0 + 1, 0.6); P.clap(b0 + 3, 0.6);
+      if (i >= 8) for (let s=0; s<16; s += 3) P.rim(b0 + s*0.25, 0.3, {pan:0.4});
+      if (i === 0 || i === 8) P.crash(b0, 0.35); if (i === 7) P.reverse(b0 + 2, 2, 0.5); }
+  } },
+
+{ name:'Boss Battle Hemiola', mood:'Action', tag:'Final boss in 3/4 · strings push in twos against the drums in threes, plus a sneaky Neapolitan chord', bpm:150, beats:60, room:1.9,
+  compose(K){ const {n, line, P} = K;
+    const PROG = [['D2','D3 F3 A3'],['D2','D3 F3 A3'],['Bb1','D3 F3 Bb3'],['Bb1','D3 F3 Bb3'],['G1','D3 G3 Bb3'],['A1','C#3 E3 G3 A3'],['Eb2','Eb3 G3 Bb3'],['A1','C#3 E3 A3']];
+    const OUT = [['D2','D3 F3 A3'],['Bb1','D3 F3 Bb3'],['Eb2','Eb3 G3 Bb3'],['A1','C#3 E3 G3 A3']];
+    const at = i => i < 16 ? PROG[i % 8] : OUT[Math.min(3, i - 16)];
+    const M = mel(`D5/1 F5/.5 E5/.5 D5/.5 A5/.5 | A5/1.5 G5/.5 F5/1 | Bb5/1 A5/.5 G5/.5 F5/.5 D5/.5 | F5/2 D5/1 | G5/.5 Bb5/.5 D6/1 C6/.5 Bb5/.5 | C#6/1.5 E6/.5 A5/1 | Eb6/1 D6/.5 C6/.5 Bb5/.5 G5/.5 | A5/1 C#6/1 E6/1`);
+    line('brass', M, {pan:-0.1}, 0.8); line('brass', M.map(x=>({...x, b:x.b+24})), {pan:-0.1}, 0.85); line('choir', M.map(x=>({...x, b:x.b+24})), {pan:0.2, tr:-12}, 0.5);
+    for (let i=0; i<20; i++){ const b0 = i*3, [bs, vc] = at(i), r = pm(bs), V = chd(vc);
+      for (let e=0; e<6; e++) n('pizz', b0 + e*0.5, (e % 2 ? V[2] : V[0]) + 12, 0.3, e === 0 ? 0.7 : 0.5, {pan:0.3});
+      for (let q=0; q<3; q++) n('bass', b0 + q, r, 0.9, q === 0 ? 0.9 : 0.6);
+      if (i % 2 === 0) for (const o of [0, 2, 4]){ const ch = o < 3 ? V : chd(at(i+1)[1]); n('strings', b0 + o, ch.map(m=>m+12), 1.8, 0.5, {pan:-0.25}); }   // hemiola: twos across two bars of three
+      if (i >= 8) n('choir', b0, V.map(m=>m+12), 3, 0.3, {pan:0.1});
+      P.kick(b0, 1); P.snare(b0 + 1, 0.45); P.snare(b0 + 2, 0.55); P.tom(b0 + 2.5, 95, 0.45); P.tom(b0, 65, 0.7);
+      for (let e=0; e<6; e++) P.hat(b0 + e*0.5, e % 2 ? 0.12 : 0.22);
+      if (i % 4 === 0) P.crash(b0, 0.45);
+      if (i === 15 || i === 19) for (let s=0; s<6; s++) P.tom(b0 + s*0.5, 180 - s*18, 0.6); }
+  } },
+];
+SONGS.push(...SONGS4);
 // moods for the songs already here, so the list can be filtered
 const SONG_MOODS = {'Bouncy Pop':'Pop', 'Sneaky Spy':'Jazz', 'Spooky Night':'Mellow', 'Chase!':'Race', 'Lullaby':'Mellow', 'Circus':'Wonky', 'Lo-fi Nap':'Mellow', 'Chip Quest':'Action', 'Snack March':'Pop',
   'Space Float':'Mellow', 'Snail Waltz in Seven':'Wonky', 'Picnic, Three Against Two':'Pop', 'Tiny Feet Bebop':'Jazz', 'Clockwork Round':'Mellow', 'Phase Garden':'Mellow', 'Moon of Seven':'Wonky',
