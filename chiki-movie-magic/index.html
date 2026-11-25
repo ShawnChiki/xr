@@ -78,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '547';
+const VERSION = '548';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -2977,7 +2977,15 @@ function micLevel(){
 }
 // eyes turn around their own center to look (at you by default, or where you steer / recorded); mouths open with your voice
 const _fc = V();
-function partCenter(L){ if (L.pivot){ if (L._pvk !== L.pivot){ L._pvk = L.pivot; L._pv = new THREE.Vector3(...L.pivot); } return L._pv; } const now = performance.now(); if (!L._ctr || now - L._ctrT > 1000){ L._ctrT = now; const b = new THREE.Box3(); for (const ch of L.chunks.values()) if (ch.mesh){ ch.mesh.geometry.computeBoundingBox(); b.union(ch.mesh.geometry.boundingBox); } for (const st of L.strokes) if (st._mesh){ const bb = new THREE.Box3().setFromObject(st._mesh); L.group.updateMatrixWorld(true); bb.applyMatrix4(L.group.matrixWorld.clone().invert()); b.union(bb); } L._ctr = b.isEmpty() ? null : b.getCenter(V()); } return L._ctr; }
+// a doodle's size inside its own layer, from its own shape only. (Measuring it in the world mixed in whatever pose the
+// puppet had last frame: while a film was being made in the headset that was a different moment, and bodies jumped.)
+function boxInLayer(o, M, box){
+  if (o.userData.isOutline) return; if (o.matrixAutoUpdate) o.updateMatrix(); const m = M.clone().multiply(o.matrix);
+  if (o.isInstancedMesh){ if (o.count > 0){ o.computeBoundingBox(); if (o.boundingBox && !o.boundingBox.isEmpty()) box.union(o.boundingBox.clone().applyMatrix4(m)); } }
+  else if ((o.isMesh || o.isLine || o.isPoints) && o.geometry && o.geometry.attributes.position){ if (!o.geometry.boundingBox) o.geometry.computeBoundingBox(); box.union(o.geometry.boundingBox.clone().applyMatrix4(m)); }
+  for (const ch of o.children) boxInLayer(ch, m, box);
+}
+function partCenter(L){ if (L.pivot){ if (L._pvk !== L.pivot){ L._pvk = L.pivot; L._pv = new THREE.Vector3(...L.pivot); } return L._pv; } const now = performance.now(); if (!L._ctr || now - L._ctrT > 1000){ L._ctrT = now; const b = new THREE.Box3(); for (const ch of L.chunks.values()) if (ch.mesh){ ch.mesh.geometry.computeBoundingBox(); b.union(ch.mesh.geometry.boundingBox); } for (const st of L.strokes) if (st._mesh) boxInLayer(st._mesh, new THREE.Matrix4(), b); L._ctr = b.isEmpty() ? null : b.getCenter(V()); } return L._ctr; }
 // soft parts (the Extra parts: ears, antennae, tails, hats…) swing a little on a spring when the puppet moves. Shown and filmed, never recorded:
 // it is added just before drawing and taken off again at the start of the next frame.
 const wobMain = new Map(); let wobUndo = [];
@@ -3008,7 +3016,7 @@ function dangleLegs(dt, wob){
     } } }
 function partBox(L){ const now = performance.now(); if (L._wbx !== undefined && now - L._wbxT < 1500) return L._wbx; L._wbxT = now;
   const b = new THREE.Box3(); for (const ch of L.chunks.values()) if (ch.mesh){ ch.mesh.geometry.computeBoundingBox(); b.union(ch.mesh.geometry.boundingBox); }
-  for (const st of L.strokes) if (st._mesh){ const bb = new THREE.Box3().setFromObject(st._mesh); L.group.updateMatrixWorld(true); bb.applyMatrix4(L.group.matrixWorld.clone().invert()); b.union(bb); }
+  for (const st of L.strokes) if (st._mesh) boxInLayer(st._mesh, new THREE.Matrix4(), b);
   return (L._wbx = b.isEmpty() ? null : b); }
 function wobbleRestore(){ for (const [L, p, q, sc] of wobUndo){ L.group.position.copy(p); L.group.quaternion.copy(q); L.group.scale.copy(sc); L.group.updateMatrixWorld(true); } wobUndo = []; }
 function wobbleApply(dt, wob = wobMain){
@@ -4363,12 +4371,16 @@ async function exportMP4(fresh){
     const {Muxer, ArrayBufferTarget} = await import(MUXER_URL);
     const big = Math.max(W,H) > 2000, small = !!shots.small, fpsK = fps > 30 ? 1.35 : 1;
     const avc = big ? ['avc1.640034','avc1.640033','avc1.4d0034','avc1.420034'] : (fps > 30 ? ['avc1.64002a','avc1.640028'] : ['avc1.640028','avc1.64002a']).concat(['avc1.4d0028','avc1.42002a','avc1.42001f']);
-    const tries = (small ? HEVC_CANDS(big).map(codec => ({codec, bitrate:(big ? 16e6 : 4.5e6)*fpsK, hevc:true})) : [])
-      .concat(avc.map(codec => ({codec, bitrate: small ? (big ? 20e6 : 6e6)*fpsK : (big ? 40e6 : 12e6)})));   // smaller: HEVC if it can, else a lighter H.264. Always the fps you picked
+    // enough data for every pixel of every frame (60 fps needs twice what 30 does), so fast, busy moments stay sharp
+    const px = W*H*fps, rate = (bpp, floor) => Math.round(clamp(Math.max(px*bpp, floor), 4e6, 90e6));   // never less than before
+    const tries = (small ? HEVC_CANDS(big).map(codec => ({codec, bitrate:rate(0.07, (big ? 16e6 : 4.5e6)*fpsK), hevc:true})) : [])
+      .concat(avc.map(codec => ({codec, bitrate: small ? rate(0.1, (big ? 20e6 : 6e6)*fpsK) : rate(0.22, big ? 40e6 : 12e6)})));   // smaller: HEVC if it can, else a lighter H.264. Always the fps you picked
     let config = null, isHevc = false;
     for (const tr of tries){
-      const cfg = {codec:tr.codec, width:W, height:H, bitrate:Math.round(tr.bitrate), framerate:fps};
-      try { const s = await VideoEncoder.isConfigSupported(cfg); if (s.supported){ config = cfg; isHevc = !!tr.hevc; break; } } catch(e){}
+      const base = {codec:tr.codec, width:W, height:H, bitrate:Math.round(tr.bitrate), framerate:fps};
+      for (const cfg of [{...base, bitrateMode:'variable', latencyMode:'quality'}, {...base, bitrateMode:'variable'}, base]){   // variable: busy moments get more, still ones less
+        try { const s = await VideoEncoder.isConfigSupported(cfg); if (s.supported){ config = cfg; isHevc = !!tr.hevc; break; } } catch(e){} }
+      if (config) break;
     }
     if (!config) throw new Error('no video encoder for '+W+'×'+H);
     const target = new ArrayBufferTarget();
@@ -10295,7 +10307,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, mirrorOnly, aacFromMP4, blendJoins, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, updateRecording, riding, saveLocal, dupWorld, scrollAt, newClip, visibleK, setEditorTall, navUpdate, setLayerDown, renderFocused, rt, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, mirrorOnly, aacFromMP4, blendJoins, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, updateRecording, riding, saveLocal, dupWorld, scrollAt, newClip, visibleK, setEditorTall, navUpdate, setLayerDown, renderFocused, rt, activateScene, updatePlay, keepNeck, get exporting(){ return exporting; }, trackAt, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
