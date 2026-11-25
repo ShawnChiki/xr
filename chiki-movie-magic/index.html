@@ -78,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '551';
+const VERSION = '552';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
@@ -117,6 +117,8 @@ const SKIES = {
   toxic:  {name:'Toxic',  top:'#34c759', hor:'#ffd400', low:'#5e2bff', light:0.95},
   deep:   {name:'Deep',   top:'#001a5c', hor:'#00c7be', low:'#002a8f', light:0.75, stars:true},
   lava:   {name:'Lava',   top:'#2b0000', hor:'#ff3b30', low:'#ff9500', light:0.8},
+  bryce:  {name:'Bryce',  top:'#16338a', hor:'#ffb27a', low:'#5a3f36', light:1},
+  alien:  {name:'Alien',  top:'#24063f', hor:'#ff6ad5', low:'#0f3a3a', light:0.85},
   white:  {name:'White',  top:'#ffffff', hor:'#ffffff', low:'#e4e4e4', light:1.05},
   black:  {name:'Black',  top:'#000000', hor:'#000000', low:'#000000', light:0.9},
   custom: {name:'Mine'},
@@ -1021,6 +1023,7 @@ const water = new THREE.Mesh(new THREE.CircleGeometry(600, 64),
   new THREE.MeshStandardMaterial({color:'#1e6bff', roughness:0.35, metalness:0.0}));
 water.rotation.x = -Math.PI/2; water.position.y = -0.02; scene.add(water);
 
+const chromeMats = new Set();   // shiny 90s doodles: they reflect whatever sky you pick
 const world = new THREE.Group(); scene.add(world);       // scenery layers
 const actors = new THREE.Group(); scene.add(actors);     // character roots
 const studio = new THREE.Group(); scene.add(studio); studio.visible = false;
@@ -1096,10 +1099,33 @@ function applyWorld(){
   const el = (w.sunH ?? 55)*Math.PI/180, az = (w.sunA ?? 35)*Math.PI/180;
   sun.position.set(Math.cos(el)*Math.sin(az)*50, Math.sin(el)*50, Math.cos(el)*Math.cos(az)*50); sun.userData.wp = sun.position.clone();
   if (window.__envReady) for (const L of layers) if (L.matProps && L.matProps.metal > 0.05){ L.mat.envMap = skyTex; L.mat.needsUpdate = true; }
+  { const M = water.material, mir = !!w.mirror;   // the chrome sea: water that mirrors the sky
+    M.color.set(mir ? '#d8ecff' : '#1e6bff'); M.metalness = mir ? 1 : 0; M.roughness = mir ? 0.06 : 0.35; M.envMap = mir ? skyTex : null; M.needsUpdate = true; }
+  for (const m of chromeMats) if (m.envMap !== skyTex){ m.envMap = skyTex; m.needsUpdate = true; }
   applySkyPat();
 }
+/* ---------------- 90s lens flare: rings and glows strung from the sun through the middle of the picture ---------------- */
+const flare = new THREE.Group(); flare.visible = false; scene.add(flare);
+{ const parts = [[1.0, 0.55, 0, '#fff3c4', 0.9], [1.0, 0.16, 1, '#ffffff', 1.0], [0.62, 0.07, 1, '#ffd36a', 0.45], [0.35, 0.12, 2, '#7affd6', 0.35], [0.1, 0.05, 1, '#ff9ad5', 0.4],
+    [-0.2, 0.18, 2, '#a8c8ff', 0.3], [-0.45, 0.09, 1, '#ffb066', 0.4], [-0.8, 0.26, 2, '#ff6ad5', 0.25], [-1.1, 0.06, 1, '#ffffff', 0.35]];
+  for (const [k, sz, shape, col, a] of parts){
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({uniforms:{uDir:{value:new THREE.Vector3(0,1,0)}, uK:{value:k}, uS:{value:sz}, uShape:{value:shape}, uCol:{value:new THREE.Color(col)}, uA:{value:a}},
+      vertexShader:`uniform vec3 uDir; uniform float uK, uS; varying vec2 vUv; varying float vFade;
+        void main(){ vUv = position.xy; vec4 sp = projectionMatrix*vec4(mat3(viewMatrix)*uDir, 0.0); vFade = 0.0;
+          if (sp.w <= 0.0){ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+          vec2 n = sp.xy/sp.w, c = n*uK; float asp = projectionMatrix[1][1]/projectionMatrix[0][0];
+          vFade = 1.0 - smoothstep(0.85, 1.35, max(abs(n.x), abs(n.y)));
+          gl_Position = vec4(c + position.xy*uS*vec2(1.0/asp, 1.0), 0.0, 1.0); }`,
+      fragmentShader:`uniform float uShape, uA; uniform vec3 uCol; varying vec2 vUv; varying float vFade;
+        void main(){ float r = length(vUv), a = uShape < 0.5 ? pow(max(0.0, 1.0 - r), 2.2) : uShape < 1.5 ? smoothstep(1.0, 0.75, r) : smoothstep(0.08, 0.0, abs(r - 0.85))*0.8 + smoothstep(1.0, 0.0, r)*0.12;
+          gl_FragColor = vec4(uCol*a*uA*vFade, 1.0); }`,
+      transparent:true, depthTest:false, depthWrite:false, blending:THREE.AdditiveBlending, toneMapped:false}));
+    m.frustumCulled = false; m.renderOrder = 1e6; flare.add(m); } }
+function updateFlare(){ const on = !!state.world.flare && !inStudio() && sun.position.y > 0.5; flare.visible = on; if (!on) return;
+  const d = sun.position.clone().normalize(); for (const m of flare.children) m.material.uniforms.uDir.value.copy(d); }
 /* ---------------- sky patterns: a dome drawn at infinity over the sky colours (clouds, twinkly stars, swirl, aurora, confetti) ---------------- */
-const SKY_PATS = [['none','Plain'],['clouds','Clouds'],['stars','Twinkly stars'],['swirl','Swirl'],['aurora','Aurora'],['confetti','Confetti']];
+const SKY_PATS = [['none','Plain'],['clouds','Clouds'],['bryce','Big clouds'],['stars','Twinkly stars'],['swirl','Swirl'],['aurora','Aurora'],['confetti','Confetti']];
+const SKY_KIND = {none:0, clouds:1, stars:2, swirl:3, aurora:4, confetti:5, bryce:6};
 const GLSL_NOISE = `
 float h31(vec3 p){ p = fract(p*vec3(.1031,.1030,.0973)); p += dot(p, p.yxz+33.33); return fract((p.x+p.y)*p.z); }
 vec3 h33(vec3 p){ p = fract(p*vec3(.1031,.1030,.0973)); p += dot(p, p.yxz+33.33); return fract((p.xxy+p.yxx)*p.zyx); }
@@ -1131,12 +1157,18 @@ const skyDome = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 32), new THREE.Sh
       if (h > 0.55){ vec3 j = (h33(i)-0.5)*0.5; vec3 e = f - j; float r = h > 0.8 ? max(abs(e.x), abs(e.y)) : length(e);
         int k = int(h*97.0) - 6*int(h*97.0/6.0); vec3 col = k==0 ? vec3(1.0,0.18,0.58) : k==1 ? vec3(1.0,0.83,0.0) : k==2 ? vec3(0.0,0.78,0.75) : k==3 ? vec3(0.12,0.42,1.0) : k==4 ? vec3(0.37,0.17,1.0) : vec3(1.0);
         c = vec4(col, ss(0.17, 0.13, r)); } }
+    else if (uKind==6){   // big Bryce cumulus: lit tops, shaded bellies, warm haze low down
+      vec2 q = d.xz/(0.16 + max(d.y, 0.0))*0.8 + vec2(t*0.012, 0.0), q2 = q + vec2(0.0, 0.05);
+      float n = fbm(vec3(q*1.1, 0.0)) + 0.5*fbm(vec3(q*3.1, 4.0)), n2 = fbm(vec3(q2*1.1, 0.0)) + 0.5*fbm(vec3(q2*3.1, 4.0));
+      float a = smoothstep(0.6, 0.86, n)*up*smoothstep(0.0, 0.1, d.y), lit = clamp(0.5 + (n - n2)*7.0, 0.0, 1.0);
+      vec3 col = mix(mix(uTop, uHor, 0.45)*0.8, mix(vec3(1.0), uHor, 0.25), lit) + uHor*0.3*pow(1.0 - max(d.y, 0.0), 5.0);
+      c = vec4(col, a); }
     gl_FragColor = vec4(c.rgb, c.a*uAmt);
     #include <colorspace_fragment>
   }`,
   depthTest:false, depthWrite:false, blending:THREE.CustomBlending, blendSrc:THREE.SrcAlphaFactor, blendDst:THREE.OneMinusSrcAlphaFactor, side:THREE.BackSide}));
 skyDome.frustumCulled = false; skyDome.renderOrder = -1e9; skyDome.visible = false; scene.add(skyDome);
-function applySkyPat(){ const w = state.world, k = SKY_PATS.findIndex(p => p[0]===(w.pat||'none')), u = skyDome.material.uniforms, Sk = skyColors();
+function applySkyPat(){ const w = state.world, k = SKY_KIND[w.pat||'none'] ?? 0, u = skyDome.material.uniforms, Sk = skyColors();
   u.uKind.value = Math.max(0,k); u.uAmt.value = w.patAmt ?? 0.75; u.uSpeed.value = w.patSpeed ?? 1; u.uTop.value.set(Sk.top || '#1e6bff'); u.uHor.value.set(Sk.hor || '#aee9ff'); }
 let _xrFog = null;
 function xrFogObj(){ const Sk = skyColors(); if (!_xrFog) _xrFog = new THREE.Fog(Sk.hor, 60, 300); _xrFog.color.set(Sk.hor); const s = rig.scale.x; _xrFog.near = 60/s; _xrFog.far = 300/s; return _xrFog; }
@@ -1166,8 +1198,9 @@ function sizeGuides(c){ const k = guideScale(c); for (const o of [guideHead, ...
 let layers = []; let layerSeq = 1;
 // per-layer clay material (LIGHT > Materials). Glow lights the clay up in its own colors.
 // finishes: grains, flakes and sheens worked out in the layer's own space, so they ride along on a moving puppet
-const FINISHES = [['none','Plain'],['sand','Sand'],['glitter','Glitter'],['pearl','Pearl'],['velvet','Velvet'],['terrazzo','Terrazzo'],['marble','Marble'],['lava','Lava']];
-const finIndex = f => Math.max(0, FINISHES.findIndex(x => x[0]===(f||'none')));
+const FINISHES = [['none','Plain'],['sand','Sand'],['glitter','Glitter'],['pearl','Pearl'],['velvet','Velvet'],['terrazzo','Terrazzo'],['marble','Marble'],['lava','Lava'],['checker','Checker'],['strata','Rock bands'],['kpt','Trippy']];
+const FINISH_ID = {none:0, sand:1, glitter:2, pearl:3, velvet:4, terrazzo:5, marble:6, lava:7, checker:8, strata:9, kpt:10};
+const finIndex = f => Math.max(0, FINISH_ID[f||'none'] ?? 0);
 let finTime = {value:0};
 function makeClayMat(){
   const m = new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.85, metalness:0, emissive:'#ffffff', emissiveIntensity:0});
@@ -1190,7 +1223,11 @@ function makeClayMat(){
   else if (uFin==5){ vec3 q = fp*40.0, i = floor(q); float h = h31(i); vec3 e = fract(q)-0.5-(h33(i)-0.5)*0.4; if (h > 0.45 && length(e) < 0.12 + 0.12*h){ int k = int(h*97.0) - 6*int(h*97.0/6.0);
       diffuseColor.rgb = k==0 ? vec3(1.0,0.18,0.58) : k==1 ? vec3(1.0,0.83,0.0) : k==2 ? vec3(0.0,0.78,0.75) : k==3 ? vec3(0.12,0.42,1.0) : k==4 ? vec3(0.1) : vec3(1.0); } }
   else if (uFin==6){ float v = fbm(fp*5.0) + 0.5*turb(fp*11.0); float vein = pow(1.0 - abs(sin(fp.x*4.0 + fp.y*2.0 + v*7.0)), 5.0); diffuseColor.rgb = mix(diffuseColor.rgb*(0.93 + 0.07*v), vec3(0.35,0.36,0.42), vein*0.6); }
-  else if (uFin==7){ diffuseColor.rgb *= 0.25; }`)
+  else if (uFin==7){ diffuseColor.rgb *= 0.25; }
+  else if (uFin==8){ vec3 q = floor(fp*8.0 + 0.001); diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.96), mod(q.x + q.y + q.z, 2.0)); }
+  else if (uFin==9){ float b = fp.y*12.0 + fbm(fp*2.5)*3.5, k = floor(b); vec3 tint = mix(vec3(0.72,0.42,0.28), vec3(1.0,0.86,0.62), h31(vec3(k, 1.0, 2.0)));
+    diffuseColor.rgb *= tint*(0.78 + 0.28*smoothstep(0.0, 0.18, fract(b))); }
+  else if (uFin==10){ vec3 p = fp*2.0; vec3 w = vec3(fbm(p + uFT*0.05), fbm(p + 5.2), fbm(p + 9.1)); diffuseColor.rgb = hue3(turb(p + 3.0*w)*2.0 + uFT*0.03)*0.9 + 0.08; }`)
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
   if (uFin==1){ normal = normalize(normal + 0.35*(h33(floor(vLP/uFinS*420.0))-0.5)); }
   else if (uFin==2){ normal = normalize(normal + 0.12*(h33(floor(vLP/uFinS*300.0))-0.5)); }`)
@@ -1207,7 +1244,7 @@ totalEmissiveRadiance *= vColor.rgb;
     else if (uFin==7){ vec3 q = vLP/uFinS*5.0; float c = turb(q + vec3(0.0, uFT*0.15, 0.0)); float glow = ss(0.18, 0.02, c)*(0.7 + 0.3*sin(uFT*2.0 + q.x*3.0));
       totalEmissiveRadiance += mix(vec3(1.0,0.25,0.0), vec3(1.0,0.9,0.2), glow)*glow*2.5 + vColor.rgb*0.0; } }`)
       .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
-  if (uFin==1) roughnessFactor = 1.0; else if (uFin==3) roughnessFactor = min(roughnessFactor, 0.25); else if (uFin==4) roughnessFactor = 1.0; else if (uFin==6) roughnessFactor = min(roughnessFactor, 0.2);`);
+  if (uFin==1) roughnessFactor = 1.0; else if (uFin==3) roughnessFactor = min(roughnessFactor, 0.25); else if (uFin==4) roughnessFactor = 1.0; else if (uFin==6) roughnessFactor = min(roughnessFactor, 0.2); else if (uFin==8 || uFin==10) roughnessFactor = min(roughnessFactor, 0.3);`);
   };
   return m;
 }
@@ -1656,6 +1693,78 @@ const barkTex = () => BARK_TEX || (BARK_TEX = canvasTex(64, 128, (x, w, h) => { 
 const grainTex = () => GRAIN_TEX || (GRAIN_TEX = canvasTex(64, 64, (x, w, h) => { x.fillStyle = '#e9c48c'; x.fillRect(0, 0, w, h); x.strokeStyle = 'rgba(120,70,30,0.5)';
   for (let r2 = 4; r2 < 32; r2 += 3 + (r2 % 5)){ x.lineWidth = 1 + (r2 % 3)*0.5; x.beginPath(); x.ellipse(32, 32, r2, r2*0.94, 0.3, 0, 7); x.stroke(); } x.fillStyle = 'rgba(110,60,25,0.8)'; x.beginPath(); x.arc(32, 32, 2.5, 0, 7); x.fill(); }));   // tree rings on the cut ends
 
+/* ---------- the 90s family: Bryce mountains, chrome balls, a raytracer checker path, Kid Pix stamps, zigzag, leaky pen ---------- */
+function vnoise2(x, y, seed){ const h = (i, j) => { let n = (i*374761393 + j*668265263 + seed*1442695041) | 0; n = Math.imul(n ^ (n >>> 13), 1274126177); return ((n ^ (n >>> 16)) >>> 0)/4294967296; };
+  const i = Math.floor(x), j = Math.floor(y), fx = x - i, fy = y - j, u = fx*fx*(3 - 2*fx), v = fy*fy*(3 - 2*fy);
+  return (h(i,j)*(1-u) + h(i+1,j)*u)*(1-v) + (h(i,j+1)*(1-u) + h(i+1,j+1)*u)*v; }
+function ridged(x, y, seed){ let a = 0.5, f = 1, s = 0; for (let o=0;o<5;o++){ const n = 1 - Math.abs(vnoise2(x*f, y*f, seed + o*17)*2 - 1); s += a*n*n; a *= 0.5; f *= 2.1; } return s; }
+function buildMountain(P, s){   // fractal peaks along the line: sand at the bottom, grass, rock, snow on top (flat-shaded like Bryce)
+  const r = s.r, W = r*22, H = r*18, {A, fr} = pathFrames(smoothPath(P, r*2), r*1.2, s, true), N = fr.length, Q = 22, seed = (s.seed || 1) % 100000;
+  const taper = d => { const e = Math.min(d, A.len - d)/(r*9); return e >= 1 ? 1 : e*e*(3 - 2*e); }, sp = A.len/Math.max(1, N-1);
+  const BANDS = s.tint ? [[0, new THREE.Color(s.col).multiplyScalar(0.55)], [0.5, new THREE.Color(s.col)], [0.85, new THREE.Color('#ffffff')]] : [[0, new THREE.Color('#d9b77a')], [0.12, new THREE.Color('#4f8f3a')], [0.42, new THREE.Color('#7d6d5f')], [0.72, new THREE.Color('#ffffff')]];
+  const colAt = f => { let c = BANDS[0][1]; for (const [k, cc] of BANDS) if (f >= k) c = cc; return c; };
+  const pos = [], col = [], idx = [];
+  for (let i=0;i<N;i++){ const f = fr[i], k = taper(i*sp);
+    for (let q=0;q<=Q;q++){ const u = q/Q*2 - 1, x = u*W*(0.4 + 0.6*k), prof = Math.pow(Math.max(0, 1 - u*u), 1.3);
+      const n = ridged(i*sp/(r*6), u*2.2, seed), h = H*k*prof*(0.25 + 0.95*n);
+      const p = f.p.clone().addScaledVector(f.side, x).addScaledVector(UPY, h - r*0.6*(1 - prof)); pos.push(p.x, p.y, p.z);
+      const c = colAt(h/H + (vnoise2(i*0.7, q*0.7, seed+5) - 0.5)*0.08); col.push(c.r, c.g, c.b); }
+    if (i) for (let q=0;q<Q;q++){ const a0 = (i-1)*(Q+1) + q, b0 = a0 + Q + 1; idx.push(a0, b0, a0+1, a0+1, b0, b0+1); } }
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3)); geo.setIndex(idx);
+  const ng = geo.toNonIndexed(); ng.computeVertexNormals(); geo.dispose();
+  return new THREE.Mesh(ng, new THREE.MeshStandardMaterial({vertexColors:true, roughness:0.95, flatShading:true, side:THREE.DoubleSide}));
+}
+function buildChrome(P, s){   // perfect mirror balls floating along the line (they reflect your sky)
+  const r = s.r, A = along(P, r*3.2), R = rng(s.seed || 1), list = A.pts.map(p => { const k = r*(1.1 + R()*0.8); return {p:p.clone(), q:new THREE.Quaternion(), s:new THREE.Vector3(k,k,k), col:'#ffffff'}; });
+  const m = new THREE.MeshStandardMaterial({color:s.tint ? s.col : '#ffffff', metalness:1, roughness:0.03, envMap:skyTex}); chromeMats.add(m);
+  return instancedList(new THREE.SphereGeometry(1, 32, 20), m, list);
+}
+let _checkTex = null;
+function checkTex(){ return _checkTex || (_checkTex = (() => { const t = canvasTex(64, 64, (x, w, h) => { x.fillStyle = '#ffffff'; x.fillRect(0,0,w,h); x.fillStyle = '#000000'; x.fillRect(0,0,w/2,h/2); x.fillRect(w/2,h/2,w/2,h/2); });
+  t.magFilter = THREE.NearestFilter; t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; return t; })()); }
+function buildChecker(P, s){   // a shiny checkerboard path, straight out of a 90s raytracer
+  const r = s.r, W = r*8, {A, fr} = pathFrames(smoothPath(P, r*2), r*0.8, s, true), N = fr.length, sq = r*4, pos = [], uv = [], idx = []; let d = 0;
+  for (let i=0;i<N;i++){ const f = fr[i]; if (i) d += f.p.distanceTo(fr[i-1].p);
+    for (const u of [-1, 1]){ const p = f.p.clone().addScaledVector(f.side, u*W); pos.push(p.x, p.y, p.z); uv.push(d/sq/2, (u+1)*W/sq/2); }
+    if (i){ const a0 = (i-1)*2; idx.push(a0, a0+2, a0+1, a0+1, a0+2, a0+3); } }
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2)); geo.setIndex(idx); geo.computeVertexNormals();
+  const tex = checkTex().clone(); tex.needsUpdate = true;
+  return new THREE.Mesh(geo, new THREE.MeshStandardMaterial({map:tex, color:s.col, roughness:0.22, side:THREE.DoubleSide}));
+}
+const STAMP_GEOS = (() => { const ex = sh => { const g = new THREE.ExtrudeGeometry(sh, {depth:0.35, bevelEnabled:true, bevelThickness:0.08, bevelSize:0.06, bevelSegments:2, curveSegments:10}); g.center(); return g; };
+  const star = new THREE.Shape(); for (let i=0;i<10;i++){ const a = Math.PI/2 + i*Math.PI/5, rr2 = i%2 ? 0.42 : 1; i ? star.lineTo(Math.cos(a)*rr2, Math.sin(a)*rr2) : star.moveTo(Math.cos(a)*rr2, Math.sin(a)*rr2); }
+  const heart = new THREE.Shape(); heart.moveTo(0, -0.9); heart.bezierCurveTo(-1.3, 0, -0.9, 1.1, 0, 0.45); heart.bezierCurveTo(0.9, 1.1, 1.3, 0, 0, -0.9);
+  const moon = new THREE.Shape(); moon.absarc(0, 0, 1, Math.PI*0.25, Math.PI*1.75, false); moon.absarc(0.45, 0, 0.75, Math.PI*1.6, Math.PI*0.4, true);
+  const bolt = new THREE.Shape(); [[0.2,1],[-0.6,-0.05],[-0.05,-0.05],[-0.3,-1],[0.6,0.15],[0.05,0.15]].forEach(([x,y],i) => i ? bolt.lineTo(x,y) : bolt.moveTo(x,y));
+  const smile = new THREE.Shape(); smile.absarc(0, 0, 1, 0, Math.PI*2, false);
+  for (const [x, y, rr2] of [[-0.35, 0.3, 0.14], [0.35, 0.3, 0.14]]){ const h = new THREE.Path(); h.absarc(x, y, rr2, 0, Math.PI*2, true); smile.holes.push(h); }
+  { const h = new THREE.Path(); h.absarc(0, -0.05, 0.55, Math.PI*1.15, Math.PI*1.85, false); h.absarc(0, -0.05, 0.38, Math.PI*1.85, Math.PI*1.15, true); smile.holes.push(h); }
+  return [ex(star), ex(heart), ex(smile), ex(moon), ex(bolt)]; })();
+function buildStamps(P, s){   // Kid Pix rubber stamps standing along the line: stars, hearts, smileys, moons, lightning
+  const r = s.r, {fr} = pathFrames(smoothPath(P, r*2), r*3.2, s, true), R = rng(s.seed || 1), lists = STAMP_GEOS.map(() => []), g = new THREE.Group();
+  fr.forEach((f, i) => { const k = Math.floor(R()*STAMP_GEOS.length), sc = r*(1.4 + R()*0.6), tan = new THREE.Vector3().crossVectors(UPY, f.side).normalize();
+    const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(f.side, UPY, tan)).multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), (R()-0.5)*0.5));
+    lists[k].push({p:f.p.clone().addScaledVector(UPY, sc*0.9), q, s:new THREE.Vector3(sc, sc, sc), col: s.tint ? s.col : PALETTE[(i*3 + k) % 8]}); });
+  lists.forEach((l, k) => { if (l.length) g.add(instancedList(STAMP_GEOS[k], new THREE.MeshStandardMaterial({roughness:0.4}), l)); });
+  return g;
+}
+function buildZigzag(P, s){   // a wacky zigzag line with sharp corners
+  const r = s.r, {fr} = pathFrames(smoothPath(P, r*2), r*3, s, false), pts = fr.map((f, i) => f.p.clone().addScaledVector(f.side, (i%2 ? 1 : -1)*r*2.2));
+  if (pts.length < 2) return null; const path = new THREE.CurvePath(); for (let i=1;i<pts.length;i++) path.add(new THREE.LineCurve3(pts[i-1], pts[i]));
+  const mat = new THREE.MeshStandardMaterial({color:s.col, roughness:0.4}), m = new THREE.Mesh(new THREE.TubeGeometry(path, Math.min(1600, pts.length*6), r*0.7, 8, false), mat);
+  const ball = new THREE.SphereGeometry(r*0.7, 10, 8); for (const p of pts){ const b = new THREE.Mesh(ball, mat); b.position.copy(p); m.add(b); }
+  return m;
+}
+function buildDrips(P, s){   // a leaky pen: a wet line with paint dripping down off it
+  const r = s.r, A = along(smoothPath(P, r*2), r*0.5), R = rng(s.seed || 1), mat = new THREE.MeshStandardMaterial({color:s.col, roughness:0.15});
+  const m = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(A.pts), Math.min(800, A.pts.length*2), r, 10, false), mat), drips = [], blobs = [];
+  for (const p of along(A.pts.length > 1 ? A.pts : P, r*2.5).pts){ if (R() < 0.45) continue; const len = r*(2 + R()*9);
+    drips.push({p:p.clone().addScaledVector(UPY, -len/2), q:new THREE.Quaternion(), s:new THREE.Vector3(r*0.55, len, r*0.55), col:s.col});
+    blobs.push({p:p.clone().addScaledVector(UPY, -len), q:new THREE.Quaternion(), s:new THREE.Vector3(r*0.85, r*1.05, r*0.85), col:s.col}); }
+  if (drips.length){ m.add(instancedList(new THREE.CylinderGeometry(1, 1, 1, 8), mat, drips)); m.add(instancedList(new THREE.SphereGeometry(1, 10, 8), mat, blobs)); }
+  for (const p of [A.pts[0], A.pts[A.pts.length-1]]){ const b = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), mat); b.position.copy(p); m.add(b); }
+  return m;
+}
 function buildSand(P, s){   // a soft heap of sand along the line, tapering at the ends, with loose grains on top
   const r = s.r, W = r*5, H = r*1.5, {A, fr} = pathFrames(smoothPath(P, r*2), r*0.8, s, true), N = fr.length, Q = 14, R = rng(s.seed || 1);
   const col = s.tint ? s.col : '#e2c08a', taper = d => { const e = Math.min(d, A.len - d)/(r*5); return e >= 1 ? 1 : e*e*(3 - 2*e); };
@@ -1841,6 +1950,12 @@ function buildStrokeMesh(s){
   else if (s.type==='tentacle') mesh = buildTentacle(P, s);
   else if (s.type==='rope') mesh = buildRope(P, s);
   else if (s.type==='logs') mesh = buildLogs(P, s);
+  else if (s.type==='mountain') mesh = buildMountain(P, s);
+  else if (s.type==='chrome') mesh = buildChrome(P, s);
+  else if (s.type==='checker') mesh = buildChecker(P, s);
+  else if (s.type==='stamps') mesh = buildStamps(P, s);
+  else if (s.type==='zigzag') mesh = buildZigzag(P, s);
+  else if (s.type==='drips') mesh = buildDrips(P, s);
   else if (s.type==='tube' || s.type==='neon'){
     const curve = new THREE.CatmullRomCurve3(P);
     const geo = new THREE.TubeGeometry(curve, Math.min(800, n*3), r, 8, false);
@@ -2004,7 +2119,7 @@ function prepAnim(s){
 const _ax = V(), _vv = V();
 function rotAbout(v, k, a){ const c = Math.cos(a), sn = Math.sin(a); _ax.crossVectors(k, v); return v.multiplyScalar(c).addScaledVector(_ax, sn).addScaledVector(k, k.dot(v)*(1-c)); }
 function animateDoodles(time){
-  skyDome.material.uniforms.uTime.value = time; finishTick(time); updateOutlines(); updateCharLights(); updateBendyArms();
+  skyDome.material.uniforms.uTime.value = time; finishTick(time); updateFlare(); updateOutlines(); updateCharLights(); updateBendyArms();
   for (const L of layers) for (const s of L.strokes){
     if (!s.pts || !s._mesh) continue;
     const an = s.anim, m = s._mesh;
@@ -4772,10 +4887,10 @@ function drawMaterials(X,W){
   txt('Finish', X, 296, 16, '#cfd6ff','left',700);
   const fw = (W-24)/4, fin = L.matProps.fin || 'none';
   FINISHES.forEach(([k,n],j)=>button(X+(j%4)*(fw+8), 308+Math.floor(j/4)*46, fw, 40, n, fin===k, ()=>{ setLayerMat(L,{fin:k}); sceneDirty=true; requestUI(); }, '#ff2d95'));
-  slider(X,424,W,'Shiny', 1-L.matProps.rough, 0, 1, v=>{ setLayerMat(L,{rough:1-v}); sceneDirty=true; }, '#00c7be');
-  slider(X,480,W,'Metal', L.matProps.metal, 0, 1, v=>{ setLayerMat(L,{metal:v}); sceneDirty=true; }, '#9aa0a6');
-  slider(X,536,W,'Glow', L.matProps.glow, 0, 2, v=>{ setLayerMat(L,{glow:v}); sceneDirty=true; }, '#ff2d95');
-  para(['Changes the clay on this layer. Glitter sparkles','as you move around it; Lava glows by itself.'], X, 600, 13);
+  slider(X,468,W,'Shiny', 1-L.matProps.rough, 0, 1, v=>{ setLayerMat(L,{rough:1-v}); sceneDirty=true; }, '#00c7be');
+  slider(X,524,W,'Metal', L.matProps.metal, 0, 1, v=>{ setLayerMat(L,{metal:v}); sceneDirty=true; }, '#9aa0a6');
+  slider(X,580,W,'Glow', L.matProps.glow, 0, 2, v=>{ setLayerMat(L,{glow:v}); sceneDirty=true; }, '#ff2d95');
+  para(['Glitter sparkles as you move around it; Lava and Trippy','move by themselves. Checker: a 90s raytracer floor.'], X, 640, 12);
 }
 function drawSun(X,W){
   txt('Sun', X, 100, 26);
@@ -4787,7 +4902,8 @@ function drawSun(X,W){
   txt('Sun color', X, 372, 16, '#cfd6ff','left',700);
   const cols = ['#ffffff','#ffe2a8','#ffb066','#ff6a3d','#ff9ad5','#a8c8ff','#7affd6'], cw = (W-6*6)/7;
   cols.forEach((c,i)=>{ const x = X+i*(cw+6); rr(x,386,cw,34,9,c); if ((w.sunCol||'#ffffff')===c) rr(x-2,384,cw+4,38,10,null,'#ffd400'); hit(x,386,cw,34,()=>{ w.sunCol=c; upd(); requestUI(); }); });
-  para(['Pick the sky itself in BUILD > World.'], X, 450, 14);
+  toggle(X, 444, W, 44, 'Lens flare ✨ (90s style)', !!w.flare, ()=>{ w.flare = !w.flare; sceneDirty = true; requestUI(); }, '#ffd400');
+  para(['Glows and rings strung from the sun across the','picture, in the headset, the camera and the film.','Pick the sky itself in BUILD > Sky.'], X, 512, 13);
 }
 
 /* ---------------- motion path of the picked Motion row ---------------- */
@@ -5820,14 +5936,14 @@ function drawColor(X,W){
     [['wheel','Wheel'],['hsv','Sliders'],['dots','Ball'],['chips','Chips']].forEach(([id,l],i)=> button(X+i*(tw+8),532,tw,40,l,state.pickStyle===id,()=>{ state.pickStyle=id; requestUI(); },'#ff2d95'));
   }
 }
-const DOODLES = [['road','Road'],['flowers','Flowers'],['vines','Vines'],['water','Floating water'],['tentacle','Tentacle'],['sand','Sand'],['rope','Knotted rope'],['logs','Logs & sticks'],['bricks','Bricks'],['tube','Doodle'],['slide','Slide'],['ptube','Tube'],['picket','Picket'],['chainlink','Chain link'],['barbed','Barbed'],['victorian','Victorian'],['rocks','Rocks'],['rainbow','Rainbow'],['ribbon','Ribbon'],['neon','Neon'],['coil','Coil'],['chain','Chain'],['beads','Beads'],['cubes','Cubes'],['dashes','Dashes'],['fuzz','Fuzz'],['stars','Stars'],['dots','Balls'],['confetti','Confetti'],['flames','Flames'],['snow','Snow'],['crystal','Crystal'],['holes','Black holes']];
+const DOODLES = [['mountain','Mountains'],['chrome','Chrome balls'],['checker','Checker path'],['stamps','Stamps'],['zigzag','Zigzag'],['drips','Leaky pen'],['road','Road'],['flowers','Flowers'],['vines','Vines'],['water','Floating water'],['tentacle','Tentacle'],['sand','Sand'],['rope','Knotted rope'],['logs','Logs & sticks'],['bricks','Bricks'],['tube','Doodle'],['slide','Slide'],['ptube','Tube'],['picket','Picket'],['chainlink','Chain link'],['barbed','Barbed'],['victorian','Victorian'],['rocks','Rocks'],['rainbow','Rainbow'],['ribbon','Ribbon'],['neon','Neon'],['coil','Coil'],['chain','Chain'],['beads','Beads'],['cubes','Cubes'],['dashes','Dashes'],['fuzz','Fuzz'],['stars','Stars'],['dots','Balls'],['confetti','Confetti'],['flames','Flames'],['snow','Snow'],['crystal','Crystal'],['holes','Black holes']];
 const DOODLE_CATS = [['lines','Lines',['tube','ribbon','neon','coil','rainbow','dashes','rope'],'#ff2d95'], ['build','Build',['road','logs','sand','bricks','rocks','picket','chainlink','barbed','victorian','slide','ptube'],'#ff9500'],
-  ['bits','Bits',['flowers','vines','tentacle','chain','beads','cubes','dots','stars','confetti','fuzz','snow'],'#00c7be'], ['magic','Magic',['water','flames','crystal','holes'],'#8e44ff']];   // each family has its own colour
-const TINTABLE = new Set(['bricks','rocks','picket','chainlink','barbed','sand','rope','logs','vines','water']);   // brushes with their own colours that can take yours instead
+  ['bits','Bits',['flowers','vines','tentacle','chain','beads','cubes','dots','stars','confetti','fuzz','snow'],'#00c7be'], ['magic','Magic',['water','flames','crystal','holes'],'#8e44ff'], ['retro','90s',['mountain','chrome','checker','stamps','zigzag','drips'],'#ffd400']];   // each family has its own colour
+const TINTABLE = new Set(['mountain','chrome','bricks','rocks','picket','chainlink','barbed','sand','rope','logs','vines','water']);   // brushes with their own colours that can take yours instead
 const catOf = id => (DOODLE_CATS.find(c => c[2].includes(id)) || DOODLE_CATS[0])[0];
 function drawDoodle(X,W){
   txt('Doodle', X, 100, 26);
-  const cat = state.doodleCat || catOf(state.doodle), tw = (W-24)/4, names = Object.fromEntries(DOODLES);
+  const cat = state.doodleCat || catOf(state.doodle), tw = (W-8*(DOODLE_CATS.length-1))/DOODLE_CATS.length, names = Object.fromEntries(DOODLES);
   DOODLE_CATS.forEach(([id,l,,col],i) => { const x = X+i*(tw+8); button(x, 112, tw, 36, l, cat===id, ()=>{ state.doodleCat = id; requestUI(); }, col); if (cat!==id){ g.fillStyle = col; g.fillRect(x+8, 112+31, tw-16, 4); } });   // a stripe of its colour, so you can tell the families apart
   const C = DOODLE_CATS.find(c => c[0]===cat), list = C[2], ccol = C[3], cols = 4, bw = (W-8*(cols-1))/cols;
   g.fillStyle = ccol; g.fillRect(X, 152, W, 3);
@@ -5951,8 +6067,8 @@ function skySwatch(x,y,w,h,Sk){
 function drawWorld(X,W){
   txt('Sky & world', X, 100, 26);
   txt('Sky colors', X, 130, 16, '#cfd6ff','left',700);
-  const keys = Object.keys(SKIES), bw=(W-4*6)/5;
-  keys.forEach((k,i)=>{ const x=X+(i%5)*(bw+6), y=144+Math.floor(i/5)*84;
+  const keys = Object.keys(SKIES), bw=(W-5*6)/6;
+  keys.forEach((k,i)=>{ const x=X+(i%6)*(bw+6), y=144+Math.floor(i/6)*84;
     const Sk = k==='custom' ? (()=>{ const c=state.world.custom; return {top:hsl(...c.top), hor:hsl(...c.hor), low:hsl(...c.low)}; })() : SKIES[k];
     skySwatch(x,y,bw,56,Sk);
     if (state.world.sky===k) rr(x-3,y-3,bw+6,62,12,null,'#ffd400');
@@ -5965,11 +6081,13 @@ function drawWorld(X,W){
         state.world.upq = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), u.normalize()).toArray().map(x => +x.toFixed(4)); toast('The sky and horizon now stand the way you are standing'); }
       applyWorld(); sceneDirty = true; requestUI(); }, '#ff2d95'); }
   const hw = (W-8)/2;
-  toggle(X,372,hw,42,'Water floor',state.world.water,()=>{ state.world.water=!state.world.water; sceneDirty=true; requestUI(); },'#1e6bff');
-  toggle(X+hw+8,372,hw,42,'Fog',state.world.fog,()=>{ state.world.fog=!state.world.fog; sceneDirty=true; requestUI(); },'#00c7be');
+  const t3 = (W-16)/3;
+  button(X,372,t3,42,'🌊 Water',state.world.water,()=>{ state.world.water=!state.world.water; sceneDirty=true; requestUI(); },'#1e6bff');
+  button(X+t3+8,372,t3,42,'🪞 Mirror sea',!!state.world.mirror,()=>{ state.world.mirror=!state.world.mirror; if (state.world.mirror){ state.world.water = true; toast('A chrome sea: the water mirrors the sky, Bryce style'); } applyWorld(); sceneDirty=true; requestUI(); },'#9aa0a6');
+  button(X+2*(t3+8),372,t3,42,'🌫 Fog',state.world.fog,()=>{ state.world.fog=!state.world.fog; sceneDirty=true; requestUI(); },'#00c7be');
   txt('Pattern in the sky', X, 438, 16, '#cfd6ff','left',700);
-  const pw3 = (W-16)/3, pat = state.world.pat || 'none', setP = patch => { Object.assign(state.world, patch); applySkyPat(); sceneDirty = true; requestUI(); };
-  SKY_PATS.forEach(([k,n],i)=>button(X+(i%3)*(pw3+8), 450+Math.floor(i/3)*48, pw3, 42, n, pat===k, ()=>setP({pat:k}), '#5e2bff'));
+  const pw3 = (W-24)/4, pat = state.world.pat || 'none', setP = patch => { Object.assign(state.world, patch); applySkyPat(); sceneDirty = true; requestUI(); };
+  SKY_PATS.forEach(([k,n],i)=>button(X+(i%4)*(pw3+8), 450+Math.floor(i/4)*48, pw3, 42, n, pat===k, ()=>setP({pat:k}), '#5e2bff'));
   if (pat !== 'none'){
     slider(X,560,W,'Amount', state.world.patAmt ?? 0.75, 0.05, 1, v=>setP({patAmt:+v.toFixed(2)}), '#ff2d95', Math.round((state.world.patAmt ?? 0.75)*100)+'%');
     slider(X,616,W,'Speed', state.world.patSpeed ?? 1, 0, 4, v=>setP({patSpeed:+v.toFixed(2)}), '#00c7be', (state.world.patSpeed ?? 1).toFixed(1)+'×');
