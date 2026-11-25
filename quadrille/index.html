@@ -1019,6 +1019,34 @@ function applyGuides(mesh, gcurves, tol) {
   return anchors.length;
 }
 
+// Creases follow where the creased strokes actually are, so a crease can cover just part of a line.
+// Returns test(p, t): true when a creased stroke runs alongside point p with tangent t; null when nothing is creased.
+function creaseMarker(strokes, tol) {
+  if (!strokes.length) return null;
+  const r = Math.max(0.8 * tol, 0.008), inv = 1 / r, grid = new Map();
+  const key = (x, y, z) => ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791)) >>> 0;
+  for (const s of strokes) {
+    const n = s.length;
+    for (let i = 0; i < n; i++) {
+      const t = norm(sub(s[Math.min(n - 1, i + 2)], s[Math.max(0, i - 2)])), p = s[i];
+      const k = key(Math.floor(p[0] * inv), Math.floor(p[1] * inv), Math.floor(p[2] * inv));
+      let a = grid.get(k); if (!a) grid.set(k, (a = [])); a.push({ p, t });
+    }
+  }
+  return (p, t) => {
+    const cx = Math.floor(p[0] * inv), cy = Math.floor(p[1] * inv), cz = Math.floor(p[2] * inv);
+    for (let x = cx - 1; x <= cx + 1; x++) for (let y = cy - 1; y <= cy + 1; y++) for (let z = cz - 1; z <= cz + 1; z++) {
+      const a = grid.get(key(x, y, z)); if (!a) continue;
+      for (const q of a) if (dist(p, q.p) < r && Math.abs(dot(t, q.t)) > 0.7) return true;
+    }
+    return false;
+  };
+}
+const ptFlags = (P, closed, test) => P.map((p, i) => {
+  const n = P.length, a = closed ? P[(i - 2 + n) % n] : P[Math.max(0, i - 2)], b = closed ? P[(i + 2) % n] : P[Math.min(n - 1, i + 2)];
+  return test(p, norm(sub(b, a))) ? 1 : 0;
+});
+
 // full pipeline. params: {tol, autoLoops, smooth, fit, tidy, kinds, patch}   fit 0..1 = how far the smooth surface is pulled onto the curves
 function buildAll(strokes, params) {
   const tol = params.tol;
@@ -1026,14 +1054,22 @@ function buildAll(strokes, params) {
   const kinds = params.kinds || [], topo = [], cr = [], gs = [];
   strokes.forEach((st, i) => { const k = kinds[i] | 0; if (k & 1) gs.push(st); else { topo.push(st); cr.push(!!(k & 2)); } });
   const hT = strokeSpacing(tol), tidy = (list) => (params.tidy > 0 ? list.map((c) => tidyCurve(c, params.tidy, hT)) : list);
-  let curves = tidy(buildCurves(topo, tol, cr));
-  const gcurves = gs.length ? tidy(buildCurves(gs, tol)) : [];
+  let curves = tidy(buildCurves(topo, tol, null));
+  const creaseTest = creaseMarker(topo.filter((_, i) => cr[i]), tol);
+  // loose guides stay exactly where they were drawn: evenly spaced points, no blending, tidying or closing up
+  const gcurves = gs.map((st) => { const P = st.filter((p, i) => i === 0 || dist(p, st[i - 1]) > 1e-6); return P.length < 2 ? null : finalize(Object.assign(resampleOpen(P, null, hT), { closed: false })); }).filter(Boolean);
   const opt = { ext: params.patch ? +(params.patchExt || 1.25) : 0.75, maxSides: params.patch ? 24 : 12, patch: !!params.patch };
   let net = buildNetwork(curves, tol, opt), virtual = [];
   if (opt.patch && net.virtual.length) {   // second pass with the guessed pieces added as curves of their own
     virtual = net.virtual.map((pts) => finalize({ pts, w: pts.map(() => 1), closed: false, cr: false, virtual: true }));
     curves = curves.concat(virtual); net = buildNetwork(curves, tol, Object.assign({}, opt, { patch: false }));
   }
+  // a span between two crossings folds sharp when most of it runs along a creased stroke
+  for (const e of net.edges) { e.cr = false; if (creaseTest && e.pts.length > 1) { const f = ptFlags(e.pts, false, creaseTest), inner = f.length > 2 ? f.slice(1, -1) : f; e.cr = inner.reduce((a, b) => a + b, 0) >= 0.5 * inner.length; } }
+  // black on the clean curves exactly where a span folds
+  const sharpPts = []; for (const e of net.edges) if (e.cr) sharpPts.push(e.pts);
+  const sharpTest = sharpPts.length ? creaseMarker(sharpPts, 0.75 * hT) : null;
+  for (const c of curves) c.crw = sharpTest ? ptFlags(c.pts, c.closed, sharpTest) : null;
   let mesh = buildCage(net, gcurves.length ? Math.max(1, params.autoLoops | 0) : params.autoLoops);
   if (gcurves.length && mesh.F.length) applyGuides(mesh, gcurves, tol);
   const cageFaces = mesh.F.length;
@@ -1050,6 +1086,26 @@ function buildAll(strokes, params) {
     curves, gcurves, net, mesh, wire: cageWire(mesh), levels, cageP,
     stats: { curves: curves.length, nodes: net.nodes.filter((n) => n.alive).length, patches: fills.length, flagged: fills.filter((f) => f.flagged).length },
   };
+}
+
+// Auto join distance: read the sketch at a range of join distances and keep the one with the most clean quads
+// (filled patches, minus flagged ones). Among equally good ones it takes the middle of the run, which is the steadiest.
+function suggestTol(strokes, params = {}) {
+  const kinds = params.kinds || [], topo = strokes.filter((_, i) => !((kinds[i] | 0) & 1));
+  if (!topo.length) return 0;
+  const lo = Math.max(params.min || 0.003, 0.005), hi = Math.min(params.max || 0.15, 0.12), N = 14, res = [];
+  for (let k = 0; k < N; k++) {
+    const tol = lo * Math.pow(hi / lo, k / (N - 1)), hT = strokeSpacing(tol);
+    let curves = buildCurves(topo, tol, null); if (params.tidy > 0) curves = curves.map((c) => tidyCurve(c, params.tidy, hT));
+    const fills = buildNetwork(curves, tol, {}).faces.filter((f) => f.fill), flagged = fills.filter((f) => f.flagged).length;
+    res.push({ tol, score: fills.length - 2 * flagged });
+  }
+  const best = Math.max(...res.map((r) => r.score)); if (best <= 0) return 0;
+  // longest run of best scores, then its middle
+  let run = null, cur = null;
+  res.forEach((r, i) => { if (r.score === best) { if (!cur) cur = { a: i, b: i }; else cur.b = i; if (!run || cur.b - cur.a > run.b - run.a) run = Object.assign({}, cur); } else cur = null; });
+  const m = (run.a + run.b) / 2, i0 = Math.floor(m), i1 = Math.ceil(m);
+  return Math.sqrt(res[i0].tol * res[i1].tol);
 }
 
 function flaggedCenters(net) {
@@ -1180,19 +1236,20 @@ function pack(r) {
   for (let i = 0; i < r.wire.length; i++) { const v = r.wire[i] * 3; wire[3 * i] = m.P[v]; wire[3 * i + 1] = m.P[v + 1]; wire[3 * i + 2] = m.P[v + 2]; }
   const all = r.curves.concat(r.gcurves || []), nTopo = r.curves.length;
   let total = 0; for (const c of all) total += c.pts.length + (c.closed ? 1 : 0);
-  const curvePts = new Float32Array(total * 3), curveLens = new Uint32Array(all.length), curveKind = new Uint8Array(all.length); let o = 0;
+  const curvePts = new Float32Array(total * 3), curveLens = new Uint32Array(all.length), curveKind = new Uint8Array(all.length), curvePtKind = new Uint8Array(total); let o = 0, q = 0;
   all.forEach((c, ci) => {
-    curveKind[ci] = ci >= nTopo ? 1 : c.virtual ? 3 : c.cr ? 2 : 0;
+    const crw = ci < nTopo && c.crw ? c.crw : null;
+    curveKind[ci] = ci >= nTopo ? 1 : c.virtual ? 3 : crw && crw.reduce((a, b) => a + b, 0) > 0.5 * crw.length ? 2 : 0;   // mostly creased curves count as creases
     const P = c.closed ? c.pts.concat([c.pts[0]]) : c.pts; curveLens[ci] = P.length;
-    for (const p of P) { curvePts[o++] = p[0]; curvePts[o++] = p[1]; curvePts[o++] = p[2]; }
+    P.forEach((p, i) => { curvePts[o++] = p[0]; curvePts[o++] = p[1]; curvePts[o++] = p[2]; curvePtKind[q++] = crw && crw[i % c.pts.length] ? 2 : curveKind[ci] === 2 ? 0 : curveKind[ci]; });
   });
   const usedN = new Set(); for (const e of r.net.edges) { usedN.add(e.a); usedN.add(e.b); }
   const nodes = new Float32Array(usedN.size * 3); o = 0;
   for (const ni of usedN) { const p = r.net.nodes[ni].pos; nodes[o++] = p[0]; nodes[o++] = p[1]; nodes[o++] = p[2]; }
-  return { pos, idx, nMain, nFlag, wire, curvePts, curveLens, curveKind, nodes, stats: r.stats, levels: r.levels, S: m.S, quads: m.F.length };
+  return { pos, idx, nMain, nFlag, wire, curvePts, curveLens, curveKind, curvePtKind, nodes, stats: r.stats, levels: r.levels, S: m.S, quads: m.F.length };
 }
 
-self.QE = { buildAll, makeExample, toOBJ, pack, strokeSpacing, eig3: smallestEigenvector };
+self.QE = { buildAll, makeExample, toOBJ, pack, strokeSpacing, eig3: smallestEigenvector, suggestTol };
 })();
 </script>
 
@@ -1210,10 +1267,13 @@ const TOOLINFO = {
   draw: { name: 'Draw', icon: 'pencil', col: C.yellow, hex: 0xFFD400, ink: C.ink }, redraw: { name: 'Redraw', icon: 'redraw', col: C.orange, hex: 0xFF7A00, ink: C.ink },
   erase: { name: 'Erase', icon: 'eraser', col: C.red, hex: 0xE8212B, ink: '#fff' }, bend: { name: 'Bend', icon: 'bend', col: C.blue, hex: 0x2A7BFF, ink: '#fff' },
   iron: { name: 'Iron', icon: 'iron', col: C.violet, hex: 0x7B2FF7, ink: '#fff' }, loosen: { name: 'Loosen', icon: 'loosen', col: C.steel, hex: 0x8A8D93, ink: '#fff' },
-  crease: { name: 'Crease', icon: 'crease', col: C.ink, hex: 0x111111, ink: '#fff' }, look: { name: 'Look', icon: 'eye', col: C.yellow, hex: 0xFFD400, ink: C.ink },
+  crease: { name: 'Crease', icon: 'crease', col: C.ink, hex: 0x111111, ink: '#fff' }, smooth: { name: 'Smooth', icon: 'smooth', col: '#00A6B4', hex: 0x00A6B4, ink: '#fff' },
+  heal: { name: 'Heal', icon: 'heal', col: C.green, hex: 0x0E9F4A, ink: '#fff' }, look: { name: 'Look', icon: 'eye', col: C.yellow, hex: 0xFFD400, ink: C.ink },
 };
-const BRUSH = { erase: 1, iron: 1, loosen: 1 };
-const ballRadius = (tool, ws, reach) => (tool === 'erase' || tool === 'loosen' ? eraserRadiusModel(ws) * ws : tool === 'bend' || tool === 'iron' ? reach : tool === 'crease' ? Math.max(2 * state.tol * ws, 0.03) : state.tol * ws);
+const BRUSH = { erase: 1, iron: 1, loosen: 1, crease: 1, smooth: 1, heal: 1 }, SIZED = Object.assign({ bend: 1 }, BRUSH);
+// the sphere on the pen: brush tools show their size; Draw shows only a small dot at the tip
+const ballRadius = (tool, ws, size) => (SIZED[tool] ? size : 0.0035);
+const sizeOf = (tool) => state.size[tool] || 0.03;
 const IN_CLAUDE = (() => { try { return !!(window.claude && window.claude.use); } catch (e) { return false; } })();   // artifact, or a plain web page?
 const HOME = new THREE.Vector3(0, 1.05, -0.5);   // where the model sits in front of you
 const TOL_MIN = 0.003, TOL_MAX = 0.15;
@@ -1230,9 +1290,8 @@ const state = {
   tool: 'draw',              // draw | redraw | erase | bend | iron | loosen | crease | look. Local to each device.
   lastTool: 'erase',         // what A swaps with Draw
   line: 'topo',              // what Draw makes: 'topo' (red, becomes edge loops) or 'guide' (gray, loose surface hint)
-  patch: false,              // Fill holes: guess missing pieces
   tidy: 0.3,                 // how hard squiggles are ironed out of the clean curves (0..1)
-  bendR: 0.12,               // reach of Bend and Iron, metres in your hand space
+  size: { erase: 0.025, loosen: 0.03, crease: 0.02, heal: 0.07, smooth: 0.05, iron: 0.1, bend: 0.12 },   // brush size per tool, metres in your hand space (right stick)
   tol: 0.04, autoLoops: 0, smooth: 2, fit: 1,   // fit: how far the smooth surface is pulled onto the drawn curves
   exMess: 1,                                    // how sloppy the built-in examples are drawn (0..1.5)
   show: { sketch: true, curves: true, surface: true, wire: true, labels: true, preview: true },
@@ -1249,7 +1308,7 @@ const sync = { sv: 0, pv: 0 };     // "last edited" stamps for the sketch and fo
 let spect = null;                  // set while this flat view is watching a headset: that peer's tool, menu tab, poses...
 let debugXR = false;               // tests: behave as the headset without a real XR session
 const lastXR = { L: null, R: null };
-const TOOLS = ['draw', 'erase', 'bend', 'look', 'redraw', 'iron', 'loosen', 'crease'];
+const TOOLS = ['draw', 'erase', 'bend', 'look', 'redraw', 'iron', 'loosen', 'crease', 'smooth', 'heal'];
 const isPresenter = () => inXR || debugXR;
 const xrLike = () => inXR || !!spect;                       // lay the menu out the way the headset sees it
 const shownTool = () => (spect ? spect.tool : state.tool);
@@ -1266,11 +1325,12 @@ onmessage = (e) => { const m = e.data;
     try { const s = m.strokes.map((f) => { const o = []; for (let i = 0; i < f.length; i += 3) o.push([f[i], f[i + 1], f[i + 2]]); return o; });
       const r = QE.buildAll(s, m.params); last[m.li] = r.mesh; out = QE.pack(r); }
     catch (err) { postMessage({ type: 'error', li: m.li, message: String((err && err.stack) || err) }); return; }
-    postMessage({ type: 'built', li: m.li, out }, [out.pos.buffer, out.idx.buffer, out.wire.buffer, out.curvePts.buffer, out.curveLens.buffer, out.curveKind.buffer, out.nodes.buffer]);
+    postMessage({ type: 'built', li: m.li, out }, [out.pos.buffer, out.idx.buffer, out.wire.buffer, out.curvePts.buffer, out.curveLens.buffer, out.curveKind.buffer, out.curvePtKind.buffer, out.nodes.buffer]);
+  } else if (m.type === 'auto') { let tol = 0; try { tol = QE.suggestTol(m.strokes.map((f) => { const o = []; for (let i = 0; i < f.length; i += 3) o.push([f[i], f[i + 1], f[i + 2]]); return o; }), m.params); } catch (err) {} postMessage({ type: 'auto', tol });
   } else if (m.type === 'obj') postMessage({ type: 'obj', text: last[m.li] ? QE.toOBJ(last[m.li], m.scale) : '' });
 };`;
 const Engine = (() => {
-  let worker = null, busy = null, objResolve = null; const pending = new Map(), lastMain = {};
+  let worker = null, busy = null, objResolve = null, autoResolve = null; const pending = new Map(), lastMain = {};
   const toArrays = (strokes) => strokes.map((f) => { const o = []; for (let i = 0; i < f.length; i += 3) o.push([f[i], f[i + 1], f[i + 2]]); return o; });
   function pump() {
     if (busy || !pending.size) return;
@@ -1290,6 +1350,7 @@ const Engine = (() => {
           const m = e.data;
           if (m.type === 'built') { busy = null; applyBuilt(m.out, m.li); pump(); }
           else if (m.type === 'error') { busy = null; console.error(m.message); toast('Could not build that surface'); pump(); }
+          else if (m.type === 'auto' && autoResolve) { autoResolve(m.tol); autoResolve = null; }
           else if (m.type === 'obj' && objResolve) { objResolve(m.text); objResolve = null; }
         };
         worker.onerror = () => { worker = null; if (busy) { if (!pending.has(busy.li)) pending.set(busy.li, busy.job); busy = null; } pump(); };
@@ -1297,6 +1358,10 @@ const Engine = (() => {
     },
     request(li, strokes, params) { pending.set(li, { strokes, params }); pump(); },
     mode: () => (worker ? 'worker' : 'main'),
+    auto(strokes, params) {
+      if (worker) return new Promise((res) => { autoResolve = res; worker.postMessage({ type: 'auto', strokes, params }); });
+      try { return Promise.resolve(QE.suggestTol(toArrays(strokes), params)); } catch (e) { return Promise.resolve(0); }
+    },
     obj(scale, li) {
       if (worker) return new Promise((res) => { objResolve = res; worker.postMessage({ type: 'obj', scale, li }); });
       return Promise.resolve(lastMain[li] ? QE.toOBJ(lastMain[li], scale) : '');
@@ -1305,7 +1370,7 @@ const Engine = (() => {
 })();
 function requestBuild(li = state.active) {
   const S = state.layers[li].strokes;
-  Engine.request(li, S, { tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, tidy: state.tidy, patch: state.patch, kinds: Array.from(S, (f) => f.k | 0) });
+  Engine.request(li, S, { tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, tidy: state.tidy, patch: false, kinds: Array.from(S, (f) => f.k | 0) });
 }
 
 // =====================================================================
@@ -1369,15 +1434,16 @@ function rebuildSketch(li = state.active) {   // raw strokes: white = topology, 
 }
 // clean curves as thin tubes. kinds: 0 topology (red), 1 loose guide (gray), 2 crease (black, thicker), 3 guessed by Fill holes (blue)
 const KIND_COL = [[0.94, 0.13, 0.18], [0.62, 0.62, 0.64], [0.03, 0.03, 0.03], [0.16, 0.48, 1]], KIND_R = [1, 0.8, 1.6, 1];
-function tubeGeometry(pts, lens, radius, kinds) {
+function tubeGeometry(pts, lens, radius, kinds, ptKinds) {
   const RS = 5; let nPts = 0, nIdx = 0;
   for (const l of lens) { nPts += l; nIdx += Math.max(0, l - 1) * RS * 6; }
   const pos = new Float32Array(nPts * RS * 3), col = new Float32Array(nPts * RS * 3), idx = new Uint32Array(nIdx);
   const T = new THREE.Vector3(), N = new THREE.Vector3(), B = new THREE.Vector3(), a = new THREE.Vector3(), b = new THREE.Vector3();
   let p = 0, vi = 0, ii = 0;
   for (let ci = 0; ci < lens.length; ci++) {
-    const l = lens[ci], base = vi, kd = kinds ? kinds[ci] : 0, cc = KIND_COL[kd] || KIND_COL[0], rad = radius * (KIND_R[kd] || 1);
+    const l = lens[ci], base = vi, kc = kinds ? kinds[ci] : 0;
     for (let i = 0; i < l; i++) {
+      const kd = ptKinds ? ptKinds[p + i] : kc, cc = KIND_COL[kd] || KIND_COL[0], rad = radius * (KIND_R[kd] || 1);
       a.fromArray(pts, (p + Math.max(0, i - 1)) * 3); b.fromArray(pts, (p + Math.min(l - 1, i + 1)) * 3); T.subVectors(b, a).normalize();
       if (i === 0) N.set(0, 1, 0);
       N.addScaledVector(T, -N.dot(T));
@@ -1403,7 +1469,7 @@ function tubeGeometry(pts, lens, radius, kinds) {
 function rebuildCurveDisplay(li = state.active) {
   const v = views[li], o = v.built; if (!o) return;
   const r = 0.0026 / dispScale;
-  v.tubes.geometry.dispose(); v.tubes.geometry = tubeGeometry(o.curvePts, o.curveLens, r, o.curveKind);
+  v.tubes.geometry.dispose(); v.tubes.geometry = tubeGeometry(o.curvePts, o.curveLens, r, o.curveKind, o.curvePtKind);
   const n = o.nodes.length / 3;
   if (n > v.dots.instanceMatrix.count) { v.g.remove(v.dots); v.dots.dispose(); v.dots = new THREE.InstancedMesh(dotGeo, dotMat, Math.max(64, n * 2)); v.dots.frustumCulled = false; v.g.add(v.dots); }
   const m = new THREE.Matrix4(), sc = r * 2.4;
@@ -1454,7 +1520,13 @@ function clearAll() { if (state.strokes.length) commit([]); }
 const packStrokes = (S) => S.map((pts) => { const f = new Float32Array(pts.length * 3); pts.forEach((p, i) => f.set(p, i * 3)); f.k = 0; return f; });
 // every tap draws the example again with a fresh sloppy hand
 function loadExample(name, seed = 1 + Math.floor(Math.random() * 1e6), mess = state.exMess) { const S = QE.makeExample(name, seed, mess); commit(packStrokes(S)); return S.expect; }
-function setTool(t) { if (t !== 'draw' && t !== 'look') state.lastTool = t; state.tool = t; ui.dirty = true; refreshTags(); }
+function setTool(t) { if (t !== 'draw' && t !== 'look') state.lastTool = t; const re = SIZED[t] !== SIZED[state.tool]; state.tool = t; if (re && ui.tab === 0) layoutUI(); ui.dirty = true; refreshTags(); }
+let autoBusy = false;
+async function autoTol() {
+  const S = state.strokes; if (autoBusy || !S.length) return; autoBusy = true; ui.dirty = true; toast('Trying join distances...');
+  const tol = await Engine.auto(S, { tidy: state.tidy, kinds: Array.from(S, (f) => f.k | 0), min: TOL_MIN, max: TOL_MAX }); autoBusy = false;
+  if (tol > 0) { setTol(tol); toast('Join distance ' + (tol * 100).toFixed(1) + ' cm reads the most clean quads'); } else toast('Could not find a better join distance');
+}
 function setLine(k) { state.line = k; ui.dirty = true; refreshTags(); }
 function setTol(v) { v = clamp(v, TOL_MIN, TOL_MAX); if (v === state.tol) return; state.tol = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; refreshTags(); }
 function setParam(k, v) { if (state[k] === v) return; state[k] = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; }
@@ -1503,24 +1575,172 @@ function withoutAlong(strokes, f) {
   }
   return out;
 }
-// Loosen: the brushed parts of topology strokes become loose guides (gray), so you can redraw that section.
-// One brush gesture keeps a mask over the strokes as they were when it began, so a section comes out as one piece.
-function startLoosen() { return { before: state.strokes, masks: new Map() }; }
-function loosenWhere(pred, L = startLoosen()) {
-  let changed = false;
-  L.before.forEach((s, si) => {
-    if (s.k & 1) return; const n = s.length / 3; let m = L.masks.get(si);
-    for (let i = 0; i < n; i++) if (!(m && m[i]) && pred(s[3 * i], s[3 * i + 1], s[3 * i + 2])) { if (!m) { m = new Uint8Array(n); L.masks.set(si, m); } m[i] = 1; changed = true; }
-  });
-  if (!changed) return false;
+// Painting on topology lines. One gesture keeps a mask over the strokes as they were when it began,
+// so a painted section comes out as one piece. Loosen and Heal turn it gray; Crease folds (or unfolds) it.
+function startPaint(tool) { return { tool, before: state.strokes, masks: new Map(), mode: null, spans: null, hit: new Set() }; }
+function applyMasks(P, kOf) {
   const out = [];
-  L.before.forEach((s, si) => {
-    const m = L.masks.get(si); if (!m) { out.push(s); return; }
+  P.before.forEach((s, si) => {
+    const m = P.masks.get(si); if (!m) { out.push(s); return; }
     const n = m.length;
-    for (let a = 0, i = 1; i <= n; i++) if (i === n || m[i] !== m[a]) { const b = Math.min(n, i + 1); if (b - a >= 2) { const piece = s.slice(a * 3, b * 3); piece.k = m[a] ? 1 : s.k | 0; out.push(piece); } a = i; }
+    for (let a = 0, i = 1; i <= n; i++) if (i === n || m[i] !== m[a]) { const b = Math.min(n, i + 1); if (b - a >= 2) { const piece = s.slice(a * 3, b * 3); piece.k = m[a] ? kOf(s) : s.k | 0; out.push(piece); } a = i; }
   });
   state.strokes = out;
+}
+function paintWhere(pred, P) {   // Loosen and Heal
+  let changed = false;
+  P.before.forEach((s, si) => {
+    if (s.k & 1) return; const n = s.length / 3; let m = P.masks.get(si);
+    for (let i = 0; i < n; i++) if (!(m && m[i]) && pred(s[3 * i], s[3 * i + 1], s[3 * i + 2])) { if (!m) { m = new Uint8Array(n); P.masks.set(si, m); } m[i] = 1; changed = true; }
+  });
+  if (changed) applyMasks(P, () => 1);
+  return changed;
+}
+function loosenWhere(pred, P = startPaint('loosen')) { return paintWhere(pred, P); }
+// The clean topology curves cut at their crossings: each span runs from one yellow dot to the next.
+function spanIndex(o) {
+  const spans = [], nn = o.nodes.length / 3, near = Math.max(0.5 * state.tol, 0.006) ** 2; let off = 0;
+  for (let c = 0; c < o.curveLens.length; c++) {
+    const len = o.curveLens[c], kd = o.curveKind[c];
+    if (kd === 0 || kd === 2) {
+      let cur = [];
+      for (let i = off; i < off + len; i++) {
+        let atNode = false;
+        for (let j = 0; j < nn && !atNode; j++) atNode = (o.curvePts[3 * i] - o.nodes[3 * j]) ** 2 + (o.curvePts[3 * i + 1] - o.nodes[3 * j + 1]) ** 2 + (o.curvePts[3 * i + 2] - o.nodes[3 * j + 2]) ** 2 < near;
+        cur.push(i);
+        if (atNode && cur.length > 2) { spans.push(cur); cur = [i]; }
+        else if (atNode) cur = [i];
+      }
+      if (cur.length > 2) spans.push(cur);
+    }
+    off += len;
+  }
+  return spans;
+}
+// Crease brush: touch a red line and the span between its two nearest crossings folds sharp (touch a black one to unfold it)
+function creasePaint(p, r, P) {
+  const o = views[state.active].built; if (!o) return false;
+  if (!P.spans) P.spans = spanIndex(o);
+  const C = o.curvePts, r2 = r * r, fresh = [];
+  P.spans.forEach((sp, k) => {
+    if (P.hit.has(k)) return;
+    for (const i of sp) if ((C[3 * i] - p.x) ** 2 + (C[3 * i + 1] - p.y) ** 2 + (C[3 * i + 2] - p.z) ** 2 < r2) {
+      if (P.mode === null) P.mode = o.curvePtKind[sp[sp.length >> 1]] !== 2;   // first span touched decides: fold or unfold
+      P.hit.add(k); fresh.push(sp); break;
+    }
+  });
+  if (!fresh.length) return false;
+  const reach = Math.max(0.9 * state.tol, 0.008), R2 = reach * reach, tg = (A, i, lo, hi) => { const a = Math.max(lo, i - 2), b = Math.min(hi, i + 2); return [A[3 * b] - A[3 * a], A[3 * b + 1] - A[3 * a + 1], A[3 * b + 2] - A[3 * a + 2]]; };
+  const cosOK = (u, v) => { const d = u[0] * v[0] + u[1] * v[1] + u[2] * v[2], l = Math.hypot(...u) * Math.hypot(...v); return l > 0 && Math.abs(d) > 0.6 * l; };
+  let changed = false;
+  for (const sp of fresh) {
+    const lo = sp[0], hi = sp[sp.length - 1], bb = [1e9, 1e9, 1e9, -1e9, -1e9, -1e9];
+    for (const i of sp) for (let k = 0; k < 3; k++) { bb[k] = Math.min(bb[k], C[3 * i + k] - reach); bb[k + 3] = Math.max(bb[k + 3], C[3 * i + k] + reach); }
+    P.before.forEach((s, si) => {
+      if (s.k & 1) return; const n = s.length / 3;
+      for (let j = 0; j < n; j++) {
+        const x = s[3 * j], y = s[3 * j + 1], z = s[3 * j + 2];
+        if (x < bb[0] || y < bb[1] || z < bb[2] || x > bb[3] || y > bb[4] || z > bb[5]) continue;
+        let best = R2, bi = -1;
+        for (const i of sp) { const d = (C[3 * i] - x) ** 2 + (C[3 * i + 1] - y) ** 2 + (C[3 * i + 2] - z) ** 2; if (d < best) { best = d; bi = i; } }
+        if (bi < 0 || bi === lo || bi === hi || !cosOK(tg(s, j, 0, n - 1), tg(C, bi, lo, hi))) continue;
+        let m = P.masks.get(si); if (!m) { m = new Uint8Array(n); P.masks.set(si, m); }
+        if (!m[j]) { m[j] = 1; changed = true; }
+      }
+    });
+  }
+  if (changed) applyMasks(P, (s) => (P.mode ? (s.k | 0) | 2 : (s.k | 0) & ~2));
   return true;
+}
+// Heal: when you let go, the painted messy lines go, and new clean lines carry on the lines that come into the area:
+// each line coming in is joined to the one across from it that points back at it, laid on the surface that was there.
+function healFinish(P) {
+  if (!P.masks.size) return false;
+  const out = [], stubs = [], tol = state.tol;
+  P.before.forEach((s, si) => {
+    const m = P.masks.get(si); if (!m) { out.push(s); return; }
+    const n = m.length;
+    for (let a = 0, i = 1; i <= n; i++) if (i === n || m[i] !== m[a]) {
+      if (!m[a] && i - a >= 2) {
+        const piece = s.slice(a * 3, i * 3); piece.k = s.k | 0; const idx = out.push(piece) - 1, pn = i - a;
+        const stub = (end) => {   // the end of a kept piece, pointing into the healed area
+          const e = end ? pn - 1 : 0, st = end ? -1 : 1; let j = e, len = 0;
+          while (j + st >= 0 && j + st < pn && len < 0.025) { j += st; len += Math.hypot(piece[3 * j] - piece[3 * (j - st)], piece[3 * j + 1] - piece[3 * (j - st) + 1], piece[3 * j + 2] - piece[3 * (j - st) + 2]); }
+          const p = [piece[3 * e], piece[3 * e + 1], piece[3 * e + 2]], d = [p[0] - piece[3 * j], p[1] - piece[3 * j + 1], p[2] - piece[3 * j + 2]], l = Math.hypot(...d);
+          if (l > 1e-6) stubs.push({ idx, end, p, d: d.map((v) => v / l), k: s.k | 0, used: false });
+        };
+        if (a > 0) stub(false); if (i < n) stub(true);
+      }
+      a = i;
+    }
+  });
+  // pair the stubs that point at each other
+  const cand = [];
+  for (let i = 0; i < stubs.length; i++) for (let j = i + 1; j < stubs.length; j++) {
+    const A = stubs[i], B = stubs[j], c = [B.p[0] - A.p[0], B.p[1] - A.p[1], B.p[2] - A.p[2]], L = Math.hypot(...c); if (L < 1e-4 || L > 0.8) continue;
+    const u = c.map((v) => v / L), a = A.d[0] * u[0] + A.d[1] * u[1] + A.d[2] * u[2], b = -(B.d[0] * u[0] + B.d[1] * u[1] + B.d[2] * u[2]), opp = -(A.d[0] * B.d[0] + A.d[1] * B.d[1] + A.d[2] * B.d[2]);
+    if (a > 0.45 && b > 0.45 && opp > 0.2) cand.push({ i, j, L, score: a + b + 0.5 * opp });
+  }
+  cand.sort((x, y) => y.score - x.score);
+  const o = views[state.active].built, grid = new Map(), cell = 0.015, key = (x, y, z) => x + ',' + y + ',' + z;
+  if (o) for (let v = 0; v < o.pos.length; v += 3) { const k = key(Math.floor(o.pos[v] / cell), Math.floor(o.pos[v + 1] / cell), Math.floor(o.pos[v + 2] / cell)); let a = grid.get(k); if (!a) grid.set(k, (a = [])); a.push(v); }
+  const onSurface = (q, maxD) => {   // the point on the surface straight below/above q: fit a plane to the surface around q, move along its normal only
+    const R = Math.min(4, Math.ceil(maxD / cell)), cx = Math.floor(q[0] / cell), cy = Math.floor(q[1] / cell), cz = Math.floor(q[2] / cell), r2 = maxD * maxD, rad2 = (2.2 * cell) ** 2;
+    let best = r2, bv = -1;
+    for (let x = cx - R; x <= cx + R; x++) for (let y = cy - R; y <= cy + R; y++) for (let z = cz - R; z <= cz + R; z++) { const a = grid.get(key(x, y, z)); if (a) for (const v of a) { const d = (o.pos[v] - q[0]) ** 2 + (o.pos[v + 1] - q[1]) ** 2 + (o.pos[v + 2] - q[2]) ** 2; if (d < best) { best = d; bv = v; } } }
+    if (bv < 0) return null;
+    const c0 = [o.pos[bv], o.pos[bv + 1], o.pos[bv + 2]], bx = Math.floor(c0[0] / cell), by = Math.floor(c0[1] / cell), bz = Math.floor(c0[2] / cell);
+    let sw = 0; const m = [0, 0, 0], C6 = [0, 0, 0, 0, 0, 0], pts = [];
+    for (let x = bx - 2; x <= bx + 2; x++) for (let y = by - 2; y <= by + 2; y++) for (let z = bz - 2; z <= bz + 2; z++) { const a = grid.get(key(x, y, z)); if (a) for (const v of a) { const d = (o.pos[v] - c0[0]) ** 2 + (o.pos[v + 1] - c0[1]) ** 2 + (o.pos[v + 2] - c0[2]) ** 2; if (d < rad2) { pts.push(v); m[0] += o.pos[v]; m[1] += o.pos[v + 1]; m[2] += o.pos[v + 2]; sw++; } } }
+    if (sw < 4) return c0;
+    for (let k = 0; k < 3; k++) m[k] /= sw;
+    for (const v of pts) { const x = o.pos[v] - m[0], y = o.pos[v + 1] - m[1], z = o.pos[v + 2] - m[2]; C6[0] += x * x; C6[1] += x * y; C6[2] += x * z; C6[3] += y * y; C6[4] += y * z; C6[5] += z * z; }
+    const n = QE.eig3(C6), d = (m[0] - q[0]) * n[0] + (m[1] - q[1]) * n[1] + (m[2] - q[2]) * n[2];
+    return [q[0] + n[0] * d, q[1] + n[1] * d, q[2] + n[2] * d];
+  };
+  const bridges = [];
+  for (const c of cand) {
+    const A = stubs[c.i], B = stubs[c.j]; if (A.used || B.used) continue; A.used = B.used = true;
+    const N = Math.max(4, Math.ceil(c.L / 0.004)), pts = [];
+    for (let k = 0; k <= N; k++) {   // a smooth curve leaving A along its direction and arriving at B along B's
+      const t = k / N, h00 = 2 * t * t * t - 3 * t * t + 1, h10 = t * t * t - 2 * t * t + t, h01 = -2 * t * t * t + 3 * t * t, h11 = t * t * t - t * t;
+      pts.push([0, 1, 2].map((ax) => h00 * A.p[ax] + h10 * A.d[ax] * c.L + h01 * B.p[ax] - h11 * B.d[ax] * c.L));
+    }
+    if (o) for (let k = 1; k < N; k++) { const q = onSurface(pts[k], 0.35 * c.L + 0.01), w = Math.sin(Math.PI * k / N); if (q) for (let ax = 0; ax < 3; ax++) pts[k][ax] += (q[ax] - pts[k][ax]) * w; }
+    for (let it = 0; it < 3; it++) for (let k = 1; k < N; k++) for (let ax = 0; ax < 3; ax++) pts[k][ax] += ((pts[k - 1][ax] + pts[k + 1][ax]) / 2 - pts[k][ax]) * 0.5;
+    const f = new Float32Array(pts.flat()); f.k = A.k & B.k & 2; bridges.push(f);
+  }
+  // a line that found no partner stops short of the area, so it does not end on a new line and make a pole there
+  const trims = new Map();
+  for (const st of stubs) if (!st.used) { const t = trims.get(st.idx) || [0, 0]; t[st.end ? 1 : 0] = 1.5 * tol; trims.set(st.idx, t); }
+  for (const [idx, [t0, t1]] of trims) {
+    const f = out[idx], n = f.length / 3, cum = [0]; for (let i = 1; i < n; i++) cum.push(cum[i - 1] + Math.hypot(f[3 * i] - f[3 * i - 3], f[3 * i + 1] - f[3 * i - 2], f[3 * i + 2] - f[3 * i - 1]));
+    let a = 0, b = n; while (a < n && cum[a] < t0) a++; while (b > a && cum[n - 1] - cum[b - 1] < t1) b--;
+    if (b - a >= 3) { const g = f.slice(a * 3, b * 3); g.k = f.k; out[idx] = g; } else out[idx] = null;
+  }
+  state.strokes = out.filter(Boolean).concat(bridges);
+  return true;
+}
+// Smooth brush: evens out the raw lines along their length (ends stay put)
+function smoothAt(p, R, rate) {
+  const S = state.strokes, R2 = R * R; let any = false; const out = S.slice();
+  S.forEach((s, si) => {
+    const n = s.length / 3; if (n < 5) return;
+    let hit = false; for (let i = 0; i < n && !hit; i++) hit = (s[3 * i] - p.x) ** 2 + (s[3 * i + 1] - p.y) ** 2 + (s[3 * i + 2] - p.z) ** 2 < R2;
+    if (!hit) return;
+    let len = 0; for (let i = 1; i < n; i++) len += Math.hypot(s[3 * i] - s[3 * i - 3], s[3 * i + 1] - s[3 * i - 2], s[3 * i + 2] - s[3 * i - 1]);
+    const m = clamp(Math.round((R * 0.35) / Math.max(1e-5, len / (n - 1))), 2, 24), cs = new Float64Array((n + 1) * 3);
+    for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) cs[3 * (i + 1) + k] = cs[3 * i + k] + s[3 * i + k];
+    const f = new Float32Array(s); f.k = s.k | 0;
+    for (let i = 1; i < n - 1; i++) {
+      const d2 = (s[3 * i] - p.x) ** 2 + (s[3 * i + 1] - p.y) ** 2 + (s[3 * i + 2] - p.z) ** 2; if (d2 >= R2) continue;
+      const u = 1 - d2 / R2, w = u * u * rate, h = Math.min(m, i, n - 1 - i), cnt = 2 * h + 1;
+      for (let k = 0; k < 3; k++) f[3 * i + k] = s[3 * i + k] + ((cs[3 * (i + h + 1) + k] - cs[3 * (i - h) + k]) / cnt - s[3 * i + k]) * w;
+    }
+    out[si] = f; any = true;
+  });
+  if (any) state.strokes = out;
+  return any;
 }
 // Iron: press the raw lines near the pen onto one smooth sheet fitted through them, and relax each line along its length
 function ironAt(p, R, rate) {
@@ -1547,24 +1767,6 @@ function ironAt(p, R, rate) {
   state.strokes = S.map((s, si) => copies.get(si) || s);
   return true;
 }
-// Crease: the clean topology curve nearest to `p` (model space) flips between sharp and smooth, by re-marking the strokes that make it up
-function toggleCreaseNear(p, maxD) {
-  const o = built; if (!o) return false;
-  let best = maxD * maxD, bc = -1, off = 0; const offs = [];
-  for (let c = 0; c < o.curveLens.length; c++) { offs.push(off); const kd = o.curveKind[c];
-    if (kd === 0 || kd === 2) for (let i = off; i < off + o.curveLens[c]; i++) { const d = (o.curvePts[3 * i] - p.x) ** 2 + (o.curvePts[3 * i + 1] - p.y) ** 2 + (o.curvePts[3 * i + 2] - p.z) ** 2; if (d < best) { best = d; bc = c; } }
-    off += o.curveLens[c]; }
-  if (bc < 0) return false;
-  const want = o.curveKind[bc] === 2 ? 0 : 2, a = offs[bc], b = a + o.curveLens[bc], r2 = (1.6 * state.tol) ** 2; let any = false;
-  const next = state.strokes.map((s) => {
-    if (s.k & 1) return s; const n = s.length / 3; let near = 0;
-    for (let i = 0; i < n; i += 2) { for (let j = a; j < b; j++) if ((s[3 * i] - o.curvePts[3 * j]) ** 2 + (s[3 * i + 1] - o.curvePts[3 * j + 1]) ** 2 + (s[3 * i + 2] - o.curvePts[3 * j + 2]) ** 2 < r2) { near++; break; } }
-    if (near < 0.5 * Math.ceil(n / 2) || (s.k | 0) === want) return s;
-    const f = new Float32Array(s); f.k = want; any = true; return f;
-  });
-  if (any) commit(next);
-  return any;
-}
 // Bend: soft-drag the raw sketch. Points near where you grab follow the hand, fading out to nothing at the reach.
 function startBend(p, R) {
   const items = [];
@@ -1588,8 +1790,8 @@ let saveTimer = 0;
 function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 600); }
 function save() {
   try {
-    localStorage.setItem('quadrille.v1', JSON.stringify({ v: 4, sv: sync.sv, pv: sync.pv, tidy: state.tidy, bendR: state.bendR, show: state.show, tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, exMess: state.exMess,
-      active: state.active, ghost: state.ghost, patch: state.patch, line: state.line,
+    localStorage.setItem('quadrille.v1', JSON.stringify({ v: 4, sv: sync.sv, pv: sync.pv, tidy: state.tidy, size: state.size, show: state.show, tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, exMess: state.exMess,
+      active: state.active, ghost: state.ghost, line: state.line,
       layers: state.layers.map((l) => ({ vis: l.vis, k: l.strokes.map((s) => s.k | 0), s: l.strokes.map((s) => Array.from(s, (v) => Math.round(v * 10000))) })) }));
   } catch (e) { /* storage is a convenience only */ }
 }
@@ -1601,14 +1803,15 @@ function load() {
     if (Array.isArray(d.layers)) d.layers.slice(0, NL).forEach((l, i) => { state.layers[i].strokes = (l.s || []).map((a, j) => un(a, (l.k || [])[j])); state.layers[i].vis = l.vis !== false; });
     else state.layers[0].strokes = d.strokes.map((a) => un(a, 0));
     if (d.active >= 0) state.active = clamp(d.active | 0, 0, NL - 1);
-    state.ghost = d.ghost !== false; state.patch = !!d.patch; if (d.line === 'guide') state.line = 'guide';
+    state.ghost = d.ghost !== false; if (d.line === 'guide') state.line = 'guide';
     if (d.tol > 0) state.tol = clamp(d.tol, TOL_MIN, TOL_MAX);
     if (d.autoLoops >= 0) state.autoLoops = clamp(d.autoLoops | 0, 0, 6);
     if (d.smooth >= 0) state.smooth = clamp(d.smooth | 0, 0, 3);
     if (d.fit >= 0) state.fit = clamp(+d.fit, 0, 1);
     if (d.exMess >= 0) state.exMess = clamp(+d.exMess, 0, 1.5);
     if (d.tidy >= 0) state.tidy = clamp(+d.tidy, 0, 1);
-    if (d.bendR > 0) state.bendR = clamp(+d.bendR, 0.03, 0.5);
+    if (d.bendR > 0) state.size.bend = clamp(+d.bendR, 0.008, 0.5);
+    if (d.size) for (const k of Object.keys(state.size)) if (d.size[k] > 0) state.size[k] = clamp(+d.size[k], 0.008, 0.5);
     if (d.show) for (const k of Object.keys(state.show)) if (typeof d.show[k] === 'boolean') state.show[k] = d.show[k];
     sync.sv = +d.sv || 0; sync.pv = +d.pv || 0;
     return true;
@@ -1709,6 +1912,11 @@ function icon(c, name, cx, cy, s, col) {
   } else if (name === 'crease') {
     c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.lineTo(0, -s * 0.34); c.lineTo(s * 0.46, s * 0.3); c.stroke();
     c.beginPath(); c.moveTo(0, -s * 0.34); c.lineTo(0, s * 0.4); c.setLineDash([s * 0.06, s * 0.12]); c.stroke(); c.setLineDash([]);
+  } else if (name === 'smooth') {
+    c.beginPath(); c.moveTo(-s * 0.46, 0); c.lineTo(-s * 0.36, -s * 0.18); c.lineTo(-s * 0.26, s * 0.16); c.lineTo(-s * 0.16, -s * 0.14); c.lineTo(-s * 0.06, s * 0.1); c.quadraticCurveTo(s * 0.04, -s * 0.06, s * 0.2, 0); c.lineTo(s * 0.46, 0); c.stroke();
+  } else if (name === 'heal') {
+    c.rotate(-Math.PI / 4); rrect(c, -s * 0.46, -s * 0.18, s * 0.92, s * 0.36, s * 0.18); c.stroke();
+    c.beginPath(); c.moveTo(-s * 0.1, 0); c.lineTo(s * 0.1, 0); c.moveTo(0, -s * 0.1); c.lineTo(0, s * 0.1); c.stroke();
   } else if (name === 'layers') {
     for (const y of [0.2, -0.02, -0.24]) { c.beginPath(); c.moveTo(0, s * (y - 0.2)); c.lineTo(s * 0.46, s * y); c.lineTo(0, s * (y + 0.2)); c.lineTo(-s * 0.46, s * y); c.closePath(); if (y < -0.2) c.fill(); else c.stroke(); }
   } else if (name === 'menu') {
@@ -1733,25 +1941,33 @@ function layoutUI() {
     W.push({ type: 'label', x: x0, y: 486, text: () => 'Now: ' + Net.label(), small: true });
     ui.widgets = W; ui.dirty = true; return;
   }
+  const tolRow = (y, h) => {   // join distance + Auto: tries a range of distances and keeps the one that reads the most clean quads
+    W.push({ type: 'sld', x: x0, y, w: cw - 156, h, label: 'Join distance', get: () => tolToT(state.tol), set: (t) => setTol(tToTol(t)), fmt: () => (state.tol * 100).toFixed(1) + ' cm' });
+    btn(x0 + cw - 140, y + h - 72, 140, 66, () => (autoBusy ? '...' : 'Auto'), { on: autoTol, disabled: () => autoBusy || !state.strokes.length });
+  };
   if (ui.tab === 0) {
     const tl = (key) => [TOOLINFO[key].name, { icon: TOOLINFO[key].icon, on: () => setTool(key), active: () => shownTool() === key }];
-    row(14, 80, ['draw', 'redraw', 'erase', 'bend'].map(tl));
-    row(100, 80, ['iron', 'loosen', 'crease'].concat(xrLike() ? [] : ['look']).map(tl));
+    row(10, 70, ['draw', 'redraw', 'erase', 'bend'].map(tl));
+    row(86, 70, ['iron', 'smooth', 'loosen', 'crease'].map(tl));
+    row(162, 70, (xrLike() ? ['heal'] : ['heal', 'look']).map(tl));
     const ln = (key, label, col) => [label, { chip: col, on: () => setLine(key), active: () => shownLine() === key }];
-    row(190, 72, [ln('topo', 'Topology line', C.red), ln('guide', 'Loose guide line', C.steel)]);
-    sld(270, 'Join distance', { get: () => tolToT(state.tol), set: (t) => setTol(tToTol(t)), fmt: () => (state.tol * 100).toFixed(1) + ' cm' });
-    row(378, 76, [['Undo', { icon: 'undo', on: undo, disabled: () => !undoS().length }], ['Redo', { icon: 'redo', on: redo, disabled: () => !redoS().length }], ['Clear layer', { kind: 'danger', on: clearAll }]]);
-    W.push({ type: 'status', x: x0, y: 466, w: cw, h: 124 });
+    row(240, 64, [ln('topo', 'Topology line', C.red), ln('guide', 'Loose guide line', C.steel)]);
+    const t = shownTool();
+    if (SIZED[t]) W.push({ type: 'sld', x: x0, y: 310, w: cw, h: 96, label: t === 'bend' ? 'Bend reach' : TOOLINFO[t].name + ' brush size', get: () => Math.log(sizeOf(t) / 0.008) / Math.log(0.5 / 0.008),
+      set: (v) => { state.size[t] = 0.008 * Math.pow(0.5 / 0.008, v); refreshTags(); scheduleSave(); ui.dirty = true; }, fmt: () => (sizeOf(t) * 100).toFixed(sizeOf(t) < 0.1 ? 1 : 0) + ' cm' });
+    else tolRow(310, 96);
+    row(414, 66, [['Undo', { icon: 'undo', on: undo, disabled: () => !undoS().length }], ['Redo', { icon: 'redo', on: redo, disabled: () => !redoS().length }], ['Clear layer', { kind: 'danger', on: clearAll }]]);
+    W.push({ type: 'status', x: x0, y: 490, w: cw, h: 100 });
   } else if (ui.tab === 1) {
-    sld(10, 'Auto loops between curves', { steps: 6, get: () => state.autoLoops / 6, set: (t) => setParam('autoLoops', Math.round(t * 6)), fmt: () => String(state.autoLoops) });
-    sld(108, 'Smooth level', { steps: 3, get: () => state.smooth / 3, set: (t) => setParam('smooth', Math.round(t * 3)), fmt: () => String(state.smooth) });
-    sld(206, 'Fit to curves', { steps: 10, get: () => state.fit, set: (t) => setParam('fit', Math.round(t * 10) / 10), fmt: () => Math.round(state.fit * 100) + '%' });
-    sld(304, 'Tidy squiggles', { steps: 10, get: () => state.tidy, set: (t) => setParam('tidy', Math.round(t * 10) / 10), fmt: () => String(Math.round(state.tidy * 10)) });
-    row(408, 72, [['Fill holes: guess the missing bits (blue)', { kind: 'toggle', on: () => setParam('patch', !state.patch), active: () => state.patch }]]);
-    W.push({ type: 'status', x: x0, y: 488, w: cw, h: 100 });
+    tolRow(6, 92);
+    sld(102, 'Auto loops between curves', { h: 92, steps: 6, get: () => state.autoLoops / 6, set: (t) => setParam('autoLoops', Math.round(t * 6)), fmt: () => String(state.autoLoops) });
+    sld(198, 'Smooth level', { h: 92, steps: 3, get: () => state.smooth / 3, set: (t) => setParam('smooth', Math.round(t * 3)), fmt: () => String(state.smooth) });
+    sld(294, 'Fit to curves', { h: 92, steps: 10, get: () => state.fit, set: (t) => setParam('fit', Math.round(t * 10) / 10), fmt: () => Math.round(state.fit * 100) + '%' });
+    sld(390, 'Tidy squiggles', { h: 92, steps: 10, get: () => state.tidy, set: (t) => setParam('tidy', Math.round(t * 10) / 10), fmt: () => String(Math.round(state.tidy * 10)) });
+    W.push({ type: 'status', x: x0, y: 490, w: cw, h: 100 });
   } else if (ui.tab === 2) {
     const tg = (k, label) => [label, { kind: 'toggle', on: () => { state.show[k] = !state.show[k]; paramsTouched(); applyShow(); refreshTags(); scheduleSave(); ui.dirty = true; }, active: () => state.show[k] }];
-    W.push({ type: 'legend', x: x0, y: 14, w: cw, items: [['Topology', C.red], ['Loose guide', C.steel], ['Crease', C.ink], ['Guessed', '#2A7BFF']] });
+    W.push({ type: 'legend', x: x0, y: 14, w: cw, items: [['Topology', C.red], ['Loose guide', C.steel], ['Crease', C.ink]] });
     row(64, 88, [tg('sketch', 'Raw sketch'), tg('curves', 'Clean curves')]);
     row(168, 88, [tg('surface', 'Surface'), tg('wire', 'Edge loops')]);
     if (xrLike()) row(272, 88, [tg('labels', 'Button labels'), tg('preview', 'Phone preview')]);
@@ -1936,20 +2152,35 @@ function deskPoint(e) {
   const hit = raycaster.ray.intersectPlane(plane, tA); if (!hit) return null;
   return world.worldToLocal(hit.clone());
 }
+// pixels per metre at the model, for sizing brushes on a flat screen
+const pxPerM = (rect) => rect.height / (2 * camera.position.distanceTo(orbitTarget) * Math.tan((camera.fov * Math.PI) / 360));
 function deskBrush(e, tool) {
-  const rect = glCanvas.getBoundingClientRect(), cx = e.clientX, cy = e.clientY, R2 = 20 * 20;
+  const rect = glCanvas.getBoundingClientRect(), cx = e.clientX, cy = e.clientY, size = sizeOf(tool), Rp = Math.max(6, size * pxPerM(rect)), R2 = Rp * Rp, ws = world.scale.x;
   world.updateMatrixWorld(true);
-  if (tool === 'iron') {
+  if (tool === 'iron' || tool === 'smooth' || tool === 'crease') {
     const a = deskAnchor(cx, cy); if (!deskAnchor.found) return;
-    if (ironAt(world.worldToLocal(a), state.bendR / world.scale.x, 0.35)) strokesTouched();
+    const q = world.worldToLocal(a);
+    if (tool === 'iron' ? ironAt(q, size / ws, 0.35) : tool === 'smooth' ? smoothAt(q, size / ws, 0.5) : creasePaint(q, size / ws, gest.paint)) strokesTouched();
     return;
   }
   const pred = (x, y, z) => { tA.set(x, y, z).applyMatrix4(world.matrixWorld); const p = toScreen(tA, rect); return p[2] < 1 && (p[0] - cx) ** 2 + (p[1] - cy) ** 2 < R2; };
-  if (tool === 'loosen' ? loosenWhere(pred, gest.loosen) : eraseWhere(pred)) strokesTouched();
+  if (tool === 'erase' ? eraseWhere(pred) : paintWhere(pred, gest.paint)) strokesTouched();
 }
+// a ring under the mouse shows the brush size on flat screens
+const brushRing = document.createElement('div');
+brushRing.style.cssText = 'position:fixed;pointer-events:none;border:3px solid #0b0b0b;border-radius:50%;box-shadow:0 0 0 2px #fff;display:none;z-index:5';
+document.body.appendChild(brushRing);
+function showBrushRing(e) {
+  const t = state.tool, on = !inXR && !spect && SIZED[t] && t !== 'bend' && e && e.pointerType !== 'touch';
+  brushRing.style.display = on ? 'block' : 'none'; if (!on) return;
+  const R = Math.max(6, sizeOf(t) * pxPerM(glCanvas.getBoundingClientRect()));
+  Object.assign(brushRing.style, { width: 2 * R + 'px', height: 2 * R + 'px', left: e.clientX - R + 'px', top: e.clientY - R + 'px', borderColor: TOOLINFO[t].col });
+}
+glCanvas.addEventListener('pointermove', showBrushRing); glCanvas.addEventListener('pointerleave', () => { brushRing.style.display = 'none'; });
 function endGesture(cancel) {
   if (!gest) return;
   if (gest.type === 'draw') { if (!cancel) finishStroke(gest.pts, 1); setLive(null); }
+  if (gest.type === 'brush' && gest.tool === 'heal' && !cancel && healFinish(gest.paint)) strokesTouched();
   if (gest.type === 'brush' && state.strokes !== gest.before) { undoS().push(gest.before); redoS().length = 0; ui.dirty = true; }
   if (gest.type === 'bend') endBend(gest.b);
   gest = null;
@@ -1967,16 +2198,12 @@ glCanvas.addEventListener('pointerdown', (e) => {
     if (e.button === 2 || e.button === 1 || state.tool === 'look' || spect) gest = { type: 'orbit', x: e.clientX, y: e.clientY };
     else if (state.tool === 'bend') {
       camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
-      const p = deskPoint(e); if (p) gest = { type: 'bend', b: startBend(p, state.bendR) };
-    }
-    else if (state.tool === 'crease') {
-      const a = deskAnchor(e.clientX, e.clientY); world.updateMatrixWorld(true);
-      if (!deskAnchor.found || !toggleCreaseNear(world.worldToLocal(a), 2.5 * state.tol)) toast('Tap a red topology line to fold it');
+      const p = deskPoint(e); if (p) gest = { type: 'bend', b: startBend(p, sizeOf('bend')) };
     }
     else if (state.tool === 'draw' || state.tool === 'redraw') {
       camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
       const p = deskPoint(e); gest = { type: 'draw', pts: p ? [p.x, p.y, p.z] : [] };
-    } else { gest = { type: 'brush', tool: state.tool, before: state.strokes, loosen: startLoosen() }; deskBrush(e, gest.tool); }
+    } else { gest = { type: 'brush', tool: state.tool, before: state.strokes, paint: startPaint(state.tool) }; deskBrush(e, gest.tool); }
   }
 });
 glCanvas.addEventListener('pointermove', (e) => {
@@ -2105,7 +2332,7 @@ function buildController(hand) {
     tag('lower', P(parts.lower.pos), new THREE.Vector3(0.105, 0.016, 0.062), 'A', 'draw / erase', C.yellow);
     tag('trigger', new THREE.Vector3(0.009, -0.03, 0.008), new THREE.Vector3(0.105, -0.012, -0.012), 'TRIGGER', 'draw', C.yellow);
     tag('grip', new THREE.Vector3(0, -0.058, 0.064), new THREE.Vector3(0.105, -0.06, 0.07), 'GRIP', 'grab, both = scale', C.blue);
-    tag('stick', P(parts.stick.position), new THREE.Vector3(-0.105, 0.04, 0.032), 'STICK', 'join 3.0 cm', C.blue);
+    tag('stick', P(parts.stick.position), new THREE.Vector3(-0.105, 0.04, 0.032), 'STICK', 'brush size', C.blue);
     tag('upper', P(parts.upper.pos), new THREE.Vector3(0.105, 0.048, 0.03), 'B', 'line: topology', C.red);
   } else {
     tag('lower', P(parts.lower.pos), new THREE.Vector3(-0.105, 0.016, 0.062), 'X', 'undo', C.ink);
@@ -2148,12 +2375,11 @@ if (GLTFLoader) {
 models.left.add(vrPanel, pvPanel); models.right.add(laser);
 function refreshTags() {
   const r = models.right.userData.parts, t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0, info = TOOLINFO[tool], guide = shownLine() === 'guide';
-  const last = spect ? 'draw' : state.lastTool, hex = info.hex, drawish = tool === 'draw' || tool === 'redraw';
+  const last = spect ? 'draw' : state.lastTool, hex = info.hex, drawish = tool === 'draw' || tool === 'redraw', size = spect ? spect.size : sizeOf(tool);
   r.tag_trigger.set('TRIGGER', info.name.toLowerCase() + (drawish ? (guide ? ' gray guide' : ' red line') : ''), info.col);
   r.tag_lower.set('A', tool === 'draw' ? 'tool: ' + TOOLINFO[last].name.toLowerCase() : 'back to draw', info.col);
   r.tag_upper.set('B', guide ? 'line: loose guide' : 'line: topology', guide ? C.steel : C.red);
-  const reach = spect ? spect.bendR : state.bendR;
-  r.tag_stick.set('STICK', tool === 'bend' || tool === 'iron' ? 'reach ' + Math.round(reach * 100) + ' cm' : 'join ' + (state.tol * 100).toFixed(1) + ' cm', C.blue);
+  r.tag_stick.set('STICK', SIZED[tool] ? (tool === 'bend' ? 'reach ' : 'brush ') + (size * 100).toFixed(size < 0.1 ? 1 : 0) + ' cm' : 'brush size (brush tools)', C.blue);
   const capKey = tool + (guide ? 'g' : 't');
   if (r.capTool !== capKey) {
     r.capTool = capKey;
@@ -2161,7 +2387,7 @@ function refreshTags() {
     r.upper.tex.userData.set('loosen', guide ? C.steel : C.red, '#fff');
     r.nib.material.color.set(drawish && guide ? 0x8A8D93 : hex);
   }
-  tolBall.material.color.set(hex);
+  tolBall.material.color.set(hex); tolBall.material.opacity = SIZED[tool] ? 0.16 : 0.9;
   models.left.userData.tags.visible = models.right.userData.tags.visible = state.show.labels;
 }
 
@@ -2231,9 +2457,8 @@ function xrFrame(dt, L, R) {
     } else {
       if (xs.hadOver) uiPointer('leave', 0, 0);
       if (down) {
-        if (BRUSH[state.tool]) { xs.erasing = true; xs.brushTool = state.tool; xs.eraseStart = state.strokes; xs.loosen = startLoosen(); }
-        else if (state.tool === 'bend') xs.bending = startBend(penM, state.bendR / ws);
-        else if (state.tool === 'crease') { if (toggleCreaseNear(penM, Math.max(2 * state.tol, 0.03 / ws))) pulse(R, 0.7, 40); else { pulse(R, 0.15, 10); toast('Touch a red topology line to fold it'); } }
+        if (BRUSH[state.tool]) { xs.erasing = true; xs.brushTool = state.tool; xs.eraseStart = state.strokes; xs.paint = startPaint(state.tool); }
+        else if (state.tool === 'bend') xs.bending = startBend(penM, sizeOf('bend') / ws);
         else { xs.drawing = true; xs.live = [penM.x, penM.y, penM.z]; }
       }
     }
@@ -2246,25 +2471,26 @@ function xrFrame(dt, L, R) {
       if (!trig) { xs.drawing = false; Net.liveEnd(); finishStroke(xs.live, ws); xs.live = []; setLive(null); pulse(R, 0.5, 30); }
     }
     if (xs.erasing) {
-      const r2 = eraserRadiusModel(ws) ** 2, px = penM.x, py = penM.y, pz = penM.z, bt = xs.brushTool, near = (x, y, z) => (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < r2;
-      if (bt === 'iron' ? ironAt(penM, state.bendR / ws, Math.min(1, dt * 7)) : bt === 'loosen' ? loosenWhere(near, xs.loosen) : eraseWhere(near)) { strokesTouched(); pulse(R, bt === 'iron' ? 0.08 : 0.25, 12); }
-      if (!trig) { xs.erasing = false; if (state.strokes !== xs.eraseStart) { undoS().push(xs.eraseStart); redoS().length = 0; ui.dirty = true; } xs.eraseStart = null; }
+      const bt = xs.brushTool, rad = sizeOf(bt) / ws, r2 = rad * rad, px = penM.x, py = penM.y, pz = penM.z, near = (x, y, z) => (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < r2;
+      const did = bt === 'iron' ? ironAt(penM, rad, Math.min(1, dt * 7)) : bt === 'smooth' ? smoothAt(penM, rad, Math.min(1, dt * 8)) : bt === 'crease' ? creasePaint(penM, rad, xs.paint)
+        : bt === 'erase' ? eraseWhere(near) : paintWhere(near, xs.paint);
+      if (did) { strokesTouched(); pulse(R, bt === 'iron' || bt === 'smooth' ? 0.08 : 0.25, 12); }
+      if (!trig) { xs.erasing = false; if (xs.brushTool === 'heal' && healFinish(xs.paint)) { strokesTouched(); pulse(R, 0.6, 40); } if (state.strokes !== xs.eraseStart) { undoS().push(xs.eraseStart); redoS().length = 0; ui.dirty = true; } xs.eraseStart = null; }
     }
     if (xs.bending) { applyBend(xs.bending, penM); if (!trig) { endBend(xs.bending); xs.bending = null; } }
     if (R.pad.a && !xs.pa && !penBusy) setTool(state.tool === 'draw' ? state.lastTool : 'draw');              // A: Draw <-> the last other tool
     if (R.pad.b && !xs.pb && !penBusy) setLine(state.line === 'guide' ? 'topo' : 'guide');                  // B: red topology line <-> gray loose guide
     xs.pa = R.pad.a; xs.pb = R.pad.b;
     if (Math.abs(R.pad.stickX) > 0.5 && !penBusy) {
-      if (state.tool === 'bend' || state.tool === 'iron') { state.bendR = clamp(state.bendR * Math.exp(R.pad.stickX * dt * 1.1), 0.03, 0.5); refreshTags(); scheduleSave(); }
-      else setTol(state.tol * Math.exp(R.pad.stickX * dt * 1.1));
+      if (SIZED[state.tool]) { state.size[state.tool] = clamp(sizeOf(state.tool) * Math.exp(R.pad.stickX * dt * 1.3), 0.008, 0.5); refreshTags(); scheduleSave(); if (ui.tab === 0) ui.dirty = true; }   // stick: brush size only
     }
     tolBall.visible = !laser.visible; tolBall.position.copy(pen);
-    tolBall.scale.setScalar(ballRadius(state.tool, ws, state.bendR));
+    tolBall.scale.setScalar(ballRadius(state.tool, ws, sizeOf(state.tool)));
     const p = models.right.userData.parts; setPressed(p.trigger, trig); setPressed(p.grip, R.pad.grip > 0.5); setPressed(p.lower.m, R.pad.a); setPressed(p.upper.m, R.pad.b); setPressed(p.stick, Math.abs(R.pad.stickX) > 0.5);
   } else {
     if (xs.drawing) { Net.liveEnd(); finishStroke(xs.live, ws); setLive(null); }
     if (xs.bending) { endBend(xs.bending); xs.bending = null; }
-    if (xs.erasing && state.strokes !== xs.eraseStart) { undoS().push(xs.eraseStart); redoS().length = 0; }
+    if (xs.erasing) { if (xs.brushTool === 'heal' && healFinish(xs.paint)) strokesTouched(); if (state.strokes !== xs.eraseStart) { undoS().push(xs.eraseStart); redoS().length = 0; } }
     xs.drawing = xs.erasing = xs.trig = xs.uiCap = false; tolBall.visible = laser.visible = cursorDot.visible = false;
   }
   if (L) {
@@ -2484,33 +2710,33 @@ const Net = (() => {
     const P = q.P; if (!okPose(P, 8)) return;
     state.tol = clamp(P[0], TOL_MIN, TOL_MAX); state.autoLoops = clamp(P[1] | 0, 0, 6); state.smooth = clamp(P[2] | 0, 0, 3); state.fit = clamp(P[3], 0, 1); state.tidy = clamp(P[4], 0, 1);
     const b = P[5] | 0; state.show.sketch = !!(b & 1); state.show.curves = !!(b & 2); state.show.surface = !!(b & 4); state.show.wire = !!(b & 8); state.show.labels = !!(b & 16);
-    const lb = P[7] | 0; state.layers.forEach((l, i) => { l.vis = !!(lb & (1 << i)); }); state.ghost = !!(lb & 16); state.patch = !!(lb & 32);
+    const lb = P[7] | 0; state.layers.forEach((l, i) => { l.vis = !!(lb & (1 << i)); }); state.ghost = !!(lb & 16);
     const act = clamp(P[6] | 0, 0, NL - 1); if (act !== state.active) setActiveLayer(act, true);
     sync.pv = q.pv; applyShow(); refreshTags(); requestBuild(); scheduleSave(); ui.dirty = true;
   }
   function myPresence() {
     const b = (state.show.sketch ? 1 : 0) | (state.show.curves ? 2 : 0) | (state.show.surface ? 4 : 0) | (state.show.wire ? 8 : 0) | (state.show.labels ? 16 : 0);
-    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b, state.active, state.layers.reduce((a, l, i) => a | (l.vis ? 1 << i : 0), 0) | (state.ghost ? 16 : 0) | (state.patch ? 32 : 0)], c: null, h: null, w: null, L: null, R: null, u: null };
+    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b, state.active, state.layers.reduce((a, l, i) => a | (l.vis ? 1 << i : 0), 0) | (state.ghost ? 16 : 0)], c: null, h: null, w: null, L: null, R: null, u: null };
     if (isPresenter()) {
       const hand = (H, key) => { if (!H) return null; const G = models[key].userData.gripHolder;
         return pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickX || 0) > 0.5 ? 16 : 0),
           r4(G.position.x), r4(G.position.y), r4(G.position.z), r4(G.quaternion.x), r4(G.quaternion.y), r4(G.quaternion.z), r4(G.quaternion.w)]); };
       world.updateMatrixWorld(); camera.updateMatrixWorld();
       p.h = pose7(camera); p.w = pose7(world).concat([r4(world.scale.x)]); p.L = hand(lastXR.L, 'left'); p.R = hand(lastXR.R, 'right');
-      p.u = [TOOLS.indexOf(state.tool), ui.tab, vrPanel.visible ? 1 : 0, state.mr ? 1 : 0, xrMode === 'immersive-ar' ? 1 : 0, laser.visible ? 1 : 0, Math.round(xs.ux), Math.round(xs.uy), r4(laser.scale.z), r4(state.bendR), state.line === 'guide' ? 1 : 0];
+      p.u = [TOOLS.indexOf(state.tool), ui.tab, vrPanel.visible ? 1 : 0, state.mr ? 1 : 0, xrMode === 'immersive-ar' ? 1 : 0, laser.visible ? 1 : 0, Math.round(xs.ux), Math.round(xs.uy), r4(laser.scale.z), r4(sizeOf(state.tool)), state.line === 'guide' ? 1 : 0];
     } else { camera.updateMatrixWorld(); p.c = pose7(camera).concat([Math.round(camera.fov), r4(camera.aspect)]); }
     return p;
   }
   function watch(peer, dt) {
     const q = peer.presence, first = !spect || spect.peer !== peer.peer;
     if (first) {
-      spect = { peer: peer.peer, tool: 'draw', line: 'topo', tab: -1, mr: false, ar: false, bendR: 0.12, panel: true, live: [], liveK: -1, liveEndAt: 0 };
+      spect = { peer: peer.peer, tool: 'draw', line: 'topo', tab: -1, mr: false, ar: false, size: 0.03, panel: true, live: [], liveK: -1, liveEndAt: 0 };
       proxyL.add(models.left); proxyR.add(models.right); $('panelWrap').hidden = true; $('watch').hidden = false; $('roomBox').hidden = true; $('viewBtn').hidden = false; endGesture(true);
     }
     const k = first ? 1 : 1 - Math.exp(-dt * 16), u = Array.isArray(q.u) ? q.u : [];
-    const tool = TOOLS[u[0]] || 'draw', line = u[10] ? 'guide' : 'topo', tab = clamp(u[1] | 0, 0, TABS.length - 1), mr = !!u[3], ar = !!u[4], bendR = clamp(+u[9] || 0.12, 0.03, 0.5);
-    const relayout = first || tab !== spect.tab || mr !== spect.mr || ar !== spect.ar, retag = first || tool !== spect.tool || bendR !== spect.bendR || line !== spect.line;
-    spect.tool = tool; spect.line = line; spect.tab = tab; spect.mr = mr; spect.ar = ar; spect.bendR = bendR; spect.panel = !!u[2];
+    const tool = TOOLS[u[0]] || 'draw', line = u[10] ? 'guide' : 'topo', tab = clamp(u[1] | 0, 0, TABS.length - 1), mr = !!u[3], ar = !!u[4], size = clamp(+u[9] || 0.03, 0.008, 0.5);
+    const relayout = first || tab !== spect.tab || mr !== spect.mr || ar !== spect.ar || tool !== spect.tool, retag = first || tool !== spect.tool || size !== spect.size || line !== spect.line;
+    spect.tool = tool; spect.line = line; spect.tab = tab; spect.mr = mr; spect.ar = ar; spect.size = size; spect.panel = !!u[2];
     if (relayout) { ui.tab = tab; ui.collapsed = false; layoutUI(); }
     if (retag) { refreshTags(); ui.dirty = true; }
     if (okPose(q.w, 8)) {
@@ -2530,7 +2756,7 @@ const Net = (() => {
       laser.visible = cursorDot.visible = !!u[5] && spect.panel && proxyL.visible;
       if (laser.visible) { laser.scale.z = clamp(+u[8] || 0.2, 0.01, 2); cursorDot.position.set(((+u[6] || 0) / UIW - 0.5) * PANEL_W, (0.5 - (+u[7] || 0) / UIH) * PANEL_H, 0.001); }
       const ws = world.scale.x; tolBall.visible = !laser.visible; tolBall.position.copy(pen);
-      tolBall.scale.setScalar(ballRadius(tool, ws, bendR));
+      tolBall.scale.setScalar(ballRadius(tool, ws, size));
     } else tolBall.visible = laser.visible = cursorDot.visible = false;
     if (spect.liveEndAt && performance.now() - spect.liveEndAt > 1500) { spect.live = []; spect.liveEndAt = 0; setLive(null); }
     orbitTarget.lerp(world.position, first ? 1 : 1 - Math.exp(-dt * 3)); applyOrbit();
@@ -2653,7 +2879,7 @@ if (navigator.xr) {
     .then(([vr, ar]) => { xrSupport.vr = !!vr; xrSupport.ar = !!ar; $('enter').hidden = !(vr || ar); });
 }
 // handle for tests and tinkering
-window.QX = { THREE, state, views, setActiveLayer, setLine, ironAt, loosenWhere, toggleCreaseNear, strokesTouched, withoutAlong, commit, pvPanel, adoptGLB, setView: (v) => { state.view = v; $('splitLine').hidden = v !== 'split'; onResize(); }, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
+window.QX = { THREE, state, views, tolBall, setActiveLayer, setLine, ironAt, loosenWhere, smoothAt, startPaint, paintWhere, creasePaint, healFinish, autoTol, spanIndex, strokesTouched, withoutAlong, commit, pvPanel, adoptGLB, setView: (v) => { state.view = v; $('splitLine').hidden = v !== 'split'; onResize(); }, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
 </script>
 <script src="../updated.js"></script>
 </body>
