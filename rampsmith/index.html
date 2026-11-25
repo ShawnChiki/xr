@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="description" content="Rampsmith: carve a skate ramp from a block with cylinders, cones, bowls and fillets, pick the coping, and get a buildable plywood frame with a cut list and DXF. Works in VR on Quest.">
 <style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}[hidden]{display:none!important}</style>
+<script src="../turn-config.js"></script>
 </head>
 <body>
 <title>Rampsmith</title>
@@ -73,6 +74,15 @@ main{display:grid;grid-template-columns:minmax(0,1fr) 400px;min-height:0}
 .hint{position:absolute;left:50%;transform:translateX(-50%);bottom:44px;background:var(--raise);border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;white-space:nowrap;max-width:calc(100% - 32px);overflow:hidden;text-overflow:ellipsis}
 .dims{position:absolute;left:12px;bottom:12px;font-family:var(--f-mono);font-size:12px;color:var(--muted);background:color-mix(in srgb,var(--scene) 80%,transparent);padding:3px 8px;border-radius:5px;max-width:calc(100% - 24px)}
 .axes{position:absolute;right:12px;bottom:12px;font-family:var(--f-mono);font-size:11px;color:var(--muted);display:flex;gap:10px}
+[hidden]{display:none!important}
+.watchbar{position:absolute;left:12px;bottom:42px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:2}
+.wtag{background:#E5261F;color:#fff;font-family:var(--f-disp);font-weight:700;font-size:13px;letter-spacing:.06em;text-transform:uppercase;padding:6px 10px;border-radius:7px}
+#panelBtn{display:none}
+/* while watching, the headset chooses Model or Framing, so those switches step aside */
+body.watching #viewmode,body.watching .vtools label.chip{display:none}
+#splitLine{position:absolute;left:0;right:0;top:50%;height:2px;background:var(--ink);opacity:.6;pointer-events:none}
+.roombox{position:absolute;right:12px;bottom:36px;cursor:default;font-family:var(--f-mono);font-size:12px;gap:6px}
+.roombox input{width:4.4em;font:inherit;font-weight:600;text-align:center;border:1px solid var(--line);border-radius:5px;padding:3px 2px;background:var(--bg);color:var(--ink)}
 .axes b{font-weight:500}.ax-x{color:#c4473c}.ax-y{color:#2c8a55}.ax-z{color:#2e6fb5}
 .fail{position:absolute;inset:0;display:grid;place-items:center;padding:24px;text-align:center;color:var(--muted)}
 
@@ -209,6 +219,11 @@ ol.steps li::marker{font-family:var(--f-mono);color:var(--muted)}
   .tabbody{overflow:visible}
   .brand .bs{display:none}
   .axes{display:none}
+  .roombox{bottom:42px}
+  #panelBtn{display:inline-flex}
+  /* watching a headset on a phone: the 3D view takes the whole screen until the panel is asked for */
+  body.watching:not(.panelopen) header.bar,body.watching:not(.panelopen) #panel{display:none}
+  body.watching:not(.panelopen) #view{height:100dvh}
 }
 @media (max-width: 420px){
   .fld{grid-template-columns:78px minmax(0,1fr) 80px;gap:8px}
@@ -256,6 +271,9 @@ ol.steps li::marker{font-family:var(--f-mono);color:var(--muted)}
       </div>
       <div id="hint" class="hint" hidden>Tap a blue edge to add or remove coping</div>
       <div id="partChip" class="pchip" hidden></div>
+      <div class="watchbar" id="watchBar" hidden><span class="wtag">Watching VR</span><button type="button" class="chip" id="viewBtn">View: floating</button><button type="button" class="chip" id="panelBtn">Show panel</button></div>
+      <div id="splitLine" hidden></div>
+      <label class="chip roombox" id="roomBox" hidden title="Open this page on another device and type the same code to watch or work together">Room <input id="roomIn" inputmode="numeric" maxlength="4" autocomplete="off" aria-label="Room code"><span id="roomN"></span></label>
       <div id="dims" class="dims"></div>
       <div class="axes" aria-hidden="true"><b class="ax-x">X length</b><b class="ax-y">Y height</b><b class="ax-z">Z width</b></div>
     </section>
@@ -988,7 +1006,7 @@ function applyTheme(){
 function resize(){const r=view.getBoundingClientRect();renderer.setSize(r.width,r.height,false);camera.aspect=r.width/Math.max(1,r.height);camera.updateProjectionMatrix();}
 new ResizeObserver(resize).observe(view);
 let needs=true;controls.addEventListener('change',()=>needs=true);
-renderer.setAnimationLoop((t,frame)=>{if(!(vrHook.tick&&vrHook.tick(t,frame)))controls.update();renderer.render(scene,camera);});
+renderer.setAnimationLoop((t,frame)=>{dimTick();if(!(vrHook.tick&&vrHook.tick(t,frame)))controls.update();if(vrHook.net)vrHook.net(t);else renderer.render(scene,camera);});
 
 /* ---------- geometry worker ---------- */
 let worker=null;
@@ -1048,6 +1066,33 @@ function matchRuns(){
     CANDS.forEach((c,i)=>{if(used.has(i)||c.fa!==run.fa||c.fb!==run.fb)return;const m=chainMid(c),d=Math.hypot(m[0]-run.mid[0],m[1]-run.mid[1],m[2]-run.mid[2]);if(d<bd){bd=d;best=i;}});
     if(best>=0){used.add(best);run.ci=best;run.mid=chainMid(CANDS[best]);}else run.ci=-1;
   }
+  // a fillet that rounds the corner between two coped lips carries the pipe round with it: its own lip edge is coped too
+  const fil=new Set(state.ops.filter(o=>o.type==='fillet'&&o.on).map(o=>o.uid)),skip=state.cop.skip||[];if(!fil.size)return;
+  const ends=c=>{const p=c.pts,n=p.length/3;return[[p[0],p[1],p[2]],[p[3*n-3],p[3*n-2],p[3*n-1]]];},near=(p,q)=>Math.hypot(p[0]-q[0],p[1]-q[1],p[2]-q[2])<1.5;
+  for(let pass=0;pass<3;pass++){let added=0;const coped=state.cop.runs.filter(r=>r.ci>=0&&CANDS[r.ci]&&!CANDS[r.ci].closed).map(r=>({r,e:ends(CANDS[r.ci])}));
+    CANDS.forEach((c,i)=>{if(used.has(i)||c.closed||!(fil.has(c.fa>>4)||fil.has(c.fb>>4))||skip.includes(c.fa+'/'+c.fb))return;const e=ends(c),hit=k=>coped.find(q=>q.e.some(p=>near(p,e[k]))),A=hit(0),B=hit(1);
+      if(A&&B&&A!==B){state.cop.runs.push({fa:c.fa,fb:c.fb,mid:chainMid(c),type:A.r.type,ci:i});used.add(i);added++;}});
+    if(!added)break;}
+}
+// pipes that meet end to end and run on smoothly are one pipe: each group is a list of runs and the points of its centre line
+function copingGroups(off){
+  const R=[];for(const run of state.cop.runs){if(run.ci<0||!CANDS[run.ci]||run.type==='angle')continue;const c=CANDS[run.ci],P=copingPath(c,off);if(P.length<2)continue;
+    if(c.closed){R.push({run,c,P,closed:true,link:[null,null]});continue;}
+    R.push({run,c,P,closed:false,link:[null,null],out:[P[0].clone().sub(P[1]).normalize(),P[P.length-1].clone().sub(P[P.length-2]).normalize()],end:[P[0],P[P.length-1]]});}
+  const open=R.filter(q=>!q.closed);
+  for(const a of open)for(let ea=0;ea<2;ea++){if(a.link[ea])continue;let best=null,bd=1.5;
+    for(const b of open){if(b===a)continue;for(let eb=0;eb<2;eb++){if(b.link[eb])continue;const d=a.end[ea].distanceTo(b.end[eb]);if(d<bd&&a.out[ea].dot(b.out[eb])<-.76){bd=d;best=[b,eb];}}}
+    if(best){a.link[ea]=best;best[0].link[best[1]]=[a,ea];}}
+  const seen=new Set(),G=[];
+  for(const q of R){if(seen.has(q))continue;if(q.closed){seen.add(q);G.push({runs:[q.run],pts:q.P,closed:true,len:q.c.len,curved:true});continue;}
+    // walk back to one end of the string, then forward along it
+    let s=q,se=0,guard=0;while(s.link[se]&&guard++<200){const[nb,ne]=s.link[se];if(nb===q){break;}s=nb;se=1-ne;}
+    const loop=!!s.link[se]&&guard<200&&s.link[se][0]===q&&false,pts=[],runs=[];let cur=s,ce=se,len=0,curved=false;guard=0;
+    while(cur&&!seen.has(cur)&&guard++<200){seen.add(cur);const P=ce===0?cur.P:cur.P.slice().reverse();for(let i=pts.length?1:0;i<P.length;i++)pts.push(P[i]);runs.push(cur.run);len+=cur.c.len;curved=curved||!!cur.c.curved;const nx=cur.link[1-ce];if(!nx)break;cur=nx[0];ce=nx[1];}
+    if(runs.length>1)curved=true;
+    const closed=pts.length>3&&pts[0].distanceTo(pts[pts.length-1])<1.5&&runs.length>1;if(closed)pts.pop();
+    G.push({runs,pts,closed,len,curved});}
+  return G;
 }
 function autoLips(){
   if(!RES)return 0;const top=RES.bbox[4];let n=0;
@@ -1067,7 +1112,10 @@ function copingPath(c,off){
   for(let i=0;i<n;i++){const p=new THREE.Vector3(c.pts[3*i],c.pts[3*i+1],c.pts[3*i+2]);const a=new THREE.Vector3(c.nA[3*i],c.nA[3*i+1],c.nA[3*i+2]),b=new THREE.Vector3(c.nB[3*i],c.nB[3*i+1],c.nB[3*i+2]);
     // the pipe's centre sits the same distance under both faces, so it stands proud of each by exactly the reveal
     P.push(p.add(a.clone().add(b).multiplyScalar(off/Math.max(.35,1+a.dot(b)))));}
-  return c.closed?P:rdp3(P,.04);
+  if(c.closed)return P;
+  // a pipe stops short of the floor: an end that dives into the ground is cut back to where the pipe still has wood under it
+  const yMin=parseFloat(state.cop.od)/2+1,cut=A=>{let i=0;while(i<A.length&&A[i].y<yMin)i++;if(i===0)return A;if(i>=A.length)return[];const p=A[i-1],q=A[i];return[p.clone().lerp(q,(yMin-p.y)/(q.y-p.y)),...A.slice(i)];};
+  return rdp3(cut(cut(P).reverse()).reverse(),.04);
 }
 function tubeFor(c,r,off,mat){
   const P=copingPath(c,off);if(P.length<2)return null;
@@ -1088,14 +1136,17 @@ function angleFor(c){
 }
 function buildCoping(){
   disposeGroup(copGroup);const r=parseFloat(state.cop.od)/2,off=state.cop.reveal-r;
-  for(const run of state.cop.runs){if(run.ci<0||!CANDS[run.ci])continue;const c=CANDS[run.ci];const m=run.type==='angle'?angleFor(c):tubeFor(c,r,off,pipeMat);if(m)copGroup.add(m);}
+  for(const run of state.cop.runs){if(run.ci<0||!CANDS[run.ci]||run.type!=='angle')continue;const m=angleFor(CANDS[run.ci]);if(m)copGroup.add(m);}
+  for(const g of copingGroups(off)){const P=g.pts;if(P.length<2)continue;const curve=P.length===2?new THREE.LineCurve3(P[0],P[1]):new THREE.CatmullRomCurve3(P,g.closed,'centripetal');
+    const m=new THREE.Mesh(new THREE.TubeGeometry(curve,Math.max(4,Math.min(900,Math.round(g.len/1.5))),r,16,g.closed),pipeMat);m.castShadow=true;copGroup.add(m);}
   $('#copCnt').textContent=state.cop.runs.length?String(state.cop.runs.length):'';
 }
 let hovered=-1;
 function setHover(i){if(i===hovered)return;hovered=i;disposeGroup(hoverGroup);if(i>=0&&edgeSet()[i]){const m=tubeFor(edgeSet()[i],.9,0,hoverMat);if(m){m.castShadow=false;hoverGroup.add(m);}}renderer.domElement.style.cursor=i>=0?'pointer':'';}
 function toggleRun(ci){
   const k=state.cop.runs.findIndex(r=>r.ci===ci);const c=CANDS[ci];
-  if(k>=0){state.cop.runs.splice(k,1);toast('Coping removed');}
+  const key=c?c.fa+'/'+c.fb:'';state.cop.skip=(state.cop.skip||[]).filter(s=>s!==key);
+  if(k>=0){state.cop.runs.splice(k,1);if(key)state.cop.skip.push(key);toast('Coping removed');}
   else{state.cop.runs.push({fa:c.fa,fb:c.fb,mid:chainMid(c),type:'pipe',ci});toast('Coping added · '+fft(c.len));}
   copChanged();refreshTab();pushHist();
 }
@@ -1243,12 +1294,12 @@ function buildHF(t){
 let COPE=[];
 function carveCoping(){
   COPE=[];if(!HF||!state.cop||!state.cop.runs.length)return;const{g,nx,nz,x0,z0,O}=HF,r=parseFloat(state.cop.od)/2,R=r+1/16;
-  for(const run of state.cop.runs){if(run.type==='angle'||run.ci<0||!CANDS[run.ci])continue;const c=CANDS[run.ci],P=copingPath(c,state.cop.reveal-r).map(p=>[p.x,p.y,p.z]);if(c.closed&&P.length>2)P.push(P[0]);
+  for(const run of state.cop.runs){if(run.type==='angle'||run.ci<0||!CANDS[run.ci])continue;const c=CANDS[run.ci],P=copingPath(c,state.cop.reveal-r).map(p=>[p.x,p.y,p.z]);if(P.length<2)continue;if(c.closed&&P.length>2)P.push(P[0]);
     COPE.push(P);
-    for(let k=0;k<P.length-1;k++){const a=P[k],b=P[k+1],dx=b[0]-a[0],dz=b[2]-a[2],L2=dx*dx+dz*dz;
+    for(let k=0;k<P.length-1;k++){const a=P[k],b=P[k+1],dx=b[0]-a[0],dz=b[2]-a[2],L2=dx*dx+dz*dz,cs=Math.max(.3,Math.sqrt(L2/(L2+(b[1]-a[1])**2||1))); // a pipe running downhill cuts a deeper seat, straight down, than its radius
       const i0=Math.max(0,Math.floor((Math.min(a[0],b[0])-R-x0)/g)),i1=Math.min(nx-1,Math.ceil((Math.max(a[0],b[0])+R-x0)/g)),j0=Math.max(0,Math.floor((Math.min(a[2],b[2])-R-z0)/g)),j1=Math.min(nz-1,Math.ceil((Math.max(a[2],b[2])+R-z0)/g));
       for(let i=i0;i<=i1;i++)for(let j=j0;j<=j1;j++){const x=x0+i*g,z=z0+j*g,t=L2>1e-9?Math.max(0,Math.min(1,((x-a[0])*dx+(z-a[2])*dz)/L2)):0,d2=(x-a[0]-dx*t)**2+(z-a[2]-dz*t)**2;if(d2>=R*R)continue;
-        const y=a[1]+(b[1]-a[1])*t-Math.sqrt(R*R-d2),cc=i*nz+j;if(O[cc]>y)O[cc]=Math.max(.75,y);}}}
+        const y=a[1]+(b[1]-a[1])*t-Math.sqrt(R*R-d2)/cs,cc=i*nz+j;if(O[cc]>y)O[cc]=Math.max(.75,y);}}}
 }
 // plan distance from a point to the nearest pipe
 function copeDist(x,z){let best=1e9;for(const P of COPE)for(let k=0;k<P.length-1;k++){const d=segDist(x,z,[P[k][0],P[k][2]],[P[k+1][0],P[k+1][2]]);if(d<best)best=d;}return best;}
@@ -1457,7 +1508,10 @@ const Y3=[0,1,0];
 function blockPart(m,a,b,nvec,mA,mB,lum,sag,sagCut,kind){
   const dMax=Math.min(lum.d,Math.min(a[1],b[1])-1.5-.25);if(dMax<1.5)return{kind,mod:m,tris:[],ends:[[1,0,0],[1,0,0]],X:[1,0,0],W:[0,1,0],Tk:[0,0,1]};
   const X=V.norm(V.sub(b,a)),L=Math.hypot(b[0]-a[0],b[1]-a[1],b[2]-a[2]);let Wv=V.sub(nvec,V.mul(X,V.dot(nvec,X)));Wv=V.norm(Wv);const Tk=V.cross(X,Wv);
-  const F={O:a,e:X,v:Wv,w:Tk},M=4,NS=Math.max(16,Math.ceil(L/(kind==='joist'?3:8))),hw=lum.w/2,xs=[];for(let i=0;i<=NS;i++)xs.push(-M+(L+2*M)*i/NS);
+  const F={O:a,e:X,v:Wv,w:Tk},M=4,hw=lum.w/2;let NS=Math.max(16,Math.ceil(L/(kind==='joist'?3:8))),xs=[];for(let i=0;i<=NS;i++)xs.push(-M+(L+2*M)*i/NS);
+  // where a coping pipe crosses or ends the board, its top is read every quarter inch, so the pipe's seat is cut into the board as a small scoop
+  if(HF&&COPE.length){const lim=parseFloat(state.cop.od)/2+hw+.5,ex=[];for(let x=-M;x<=L+M;x+=.25)if(copeDist(a[0]+X[0]*x,a[2]+X[2]*x)<lim)ex.push(x);
+    if(ex.length){xs=xs.concat(ex).sort((p,q)=>p-q).filter((x,i,A)=>!i||x-A[i-1]>.05);NS=xs.length-1;}}
   let topA,topB,cutDepth=0,bev=0,ripTo=0;
   if(HF){const f=w=>{let last=0;return xs.map(x=>{const v=solveTopV(F,x,w,last);if(v!=null)last=v;return v;});};topA=f(-hw);topB=f(hw);
     const fill=arr=>{const ok=arr.map((v,i)=>v!=null?i:-1).filter(i=>i>=0);if(!ok.length)return arr.map(()=>0);return arr.map((v,i)=>{if(v!=null)return v;let n=ok[0];for(const k of ok)if(Math.abs(k-i)<Math.abs(n-i))n=k;return arr[n];});};
@@ -1473,7 +1527,7 @@ function blockPart(m,a,b,nvec,mA,mB,lum,sag,sagCut,kind){
   const clampT=arr=>arr.map(v=>Math.min(vmax,Math.max(bot+1,v)));
   const mk=arr=>{const o=[[-M,bot],[L+M,bot]];for(let i=NS;i>=0;i--)o.push([xs[i],arr[i]]);return o;};
   const part={kind,mod:m,stock:lum.label,rip:bev,ripTo,X,W:Wv,Tk,tris:loftSolid(F,mk(clampT(topA)),mk(clampT(topB)),-hw,hw),ends:[X,X],sag:cutDepth>=1/16?cutDepth:0,shim:0,thin:vmin-bot<1.5};
-  part.fr={a,Wv,Tk,bot,d,hw};
+  part.fr={a,Wv,Tk,bot,d,hw};part.over=cutDepth>d-1+.06; // the surface drops further than the board can be cut down: its top would poke through the skin
   clipBy(part,V.mul(mA,-1),a);clipBy(part,mB,b);
   return part;
 }
@@ -1830,7 +1884,7 @@ function makeBlocks(m,B,lum){
     const a=[a2[0],ya,a2[1]],b=[b2[0],yb,b2[1]];
     let part=blockPart(m,a,b,nvec,mA,mB,lum,0,false,kind);
     if(part.thin&&lum.d<big.d){const p2=blockPart(m,a,b,nvec,mA,mB,big,0,false,kind);if(p2.tris.length>=4&&!p2.thin)part=p2;}
-    if(part.tris.length<4)return false;
+    if(part.tris.length<4||part.over)return false;
     segs.push([sa,sb]);out.push(part);return true;};
   // coping backer: a 2× on edge hard against the inside of the lip rim, bay by bay between the ribs, for the coping screws to bite into
   for(const pan of m.rims){if(!pan.backer)continue;const e=pan.e,mi=pan.mInto,w=pan.off+pan.T+.75,O0=[pan.O[0]+mi[0]*w,0,pan.O[2]+mi[2]*w],at=u=>[O0[0]+e[0]*u,O0[2]+e[2]*u];
@@ -1885,7 +1939,7 @@ function makeBlocks(m,B,lum){
   const joist=(A,mA,E,mB,nvec,cross)=>{const ya=hfAt(A[0],A[2]),yb=hfAt(E[0],E[2]);if(ya==null||yb==null)return null;const L=Math.hypot(E[0]-A[0],E[2]-A[2]);if(L<2.5)return null;
     const k=Math.min(1,L/4),sa=[A[0]+(E[0]-A[0])*k/L,A[2]+(E[2]-A[2])*k/L],sb=[E[0]-(E[0]-A[0])*k/L,E[2]-(E[2]-A[2])*k/L];for(const g of segs)if(sd(sa,sb,g[0],g[1])<1.6)return null;
     if(bsegs.length){const k2=Math.min(2.3,L/3),ta=[A[0]+(E[0]-A[0])*k2/L,A[2]+(E[2]-A[2])*k2/L],tb=[E[0]-(E[0]-A[0])*k2/L,E[2]-(E[2]-A[2])*k2/L];for(const g of bsegs)if(sd(ta,tb,g[0],g[1])<1.6)return null;}
-    const part=blockPart(m,[A[0],ya,A[2]],[E[0],yb,E[2]],nvec,mA,mB,lum,0,false,'joist');if(part.tris.length<4||!part.fr||part.fr.d<2.5)return null;
+    const part=blockPart(m,[A[0],ya,A[2]],[E[0],yb,E[2]],nvec,mA,mB,lum,0,false,'joist');if(part.tris.length<4||!part.fr||part.fr.d<2.5||part.over)return null;
     part.cross=cross.slice();segs.push([sa,sb]);out.push(part);return part;};
   for(let k=0;k<nSt;k++){const ub=uOf((k+.5)*St/nSt);let flip=false,i=0,from=null; // from: the rib the next run starts on, on its far face
     const R=m.ribs.filter(rb=>covers(rb,ub,1)&&covers(rb,ub+2.25,1));
@@ -1894,7 +1948,7 @@ function makeBlocks(m,B,lum){
       else{const hb=cast(rb,face(rb,u,-1),V.mul(mm,-1));
         if(hb&&hb.rim){const P=face(rb,u,-1);A=[P[0]-mm[0]*hb.s,0,P[2]-mm[2]*hb.s];mA=V.mul(hb.n,-1);}
         else{A=face(rb,u,1);mA=mm;started=true;}}
-      let cur=i,E=null,mB=null,endTg=null,endU=0,len=0,ok=true;
+      let cur=i,E=null,mB=null,endTg=null,endU=0,len=0,ok=true,restart=null;
       // the run may pass through its first rib only if it began behind it
       if(!started){const P=face(rb,u,1);len=Math.hypot(P[0]-A[0],P[2]-A[2]);const h=hfAt(P[0],P[2]);
         if(window.__jd&&(!straight(A,P,.5)||!level(A,P)||h==null||h<5.5||busy(rb,u,1)||busy(rb,u,-1))){const w=window.__jd,k=m.letter+m.type[0]+':first-'+(!straight(A,P,.5)?'straight':!level(A,P)?'level':h==null||h<5.5?'low':'busy');w[k]=(w[k]||0)+1;}
@@ -1905,6 +1959,10 @@ function makeBlocks(m,B,lum){
         if(!hit||hit.bad||(!hit.rim&&!R.includes(hit.tg))){E=P;mB=rc.pl.m;if(cross[cross.length-1]!==rc&&!(started&&rc===rb)){}break;}
         const Q=[P[0]+rc.pl.m[0]*hit.s,0,P[2]+rc.pl.m[2]*hit.s],mx=(P[0]+Q[0])/2,mz=(P[2]+Q[2])/2;
         if(!(inPlan(m.pidx,mx,mz)||inPlan(m.pidx,P[0]*.75+Q[0]*.25,P[2]*.75+Q[2]*.25)||inPlan(m.pidx,P[0]*.25+Q[0]*.75,P[2]*.25+Q[2]*.75))){E=P;mB=rc.pl.m;break;}
+        // the bay beyond a rib the joist has just passed through must run as straight as the rest: if the surface rolls away there (a rounded hip, a roll-in),
+        // the joist stops flush with this rib's far face and that bay gets its own block, cut to the curve
+        const pb=Math.min(1.5,hit.s/3),Qs=[Q[0]-rc.pl.m[0]*pb,0,Q[2]-rc.pl.m[2]*pb],bayOK=straight(P,Qs,.5)&&level(P,Qs);
+        if(!bayOK&&cross.includes(rc)){E=P;mB=rc.pl.m;restart=rc;break;}
         if(hit.rim){E=Q;mB=hit.n;len+=hit.s;break;}
         // on to the next rib: through it if the surface runs straight, the rib is tall enough for the notch and the stick is still short enough
         const nx=R.indexOf(hit.tg),F2=face(hit.tg,u,1),hN=hfAt(F2[0],F2[2]),nextHit=cast(hit.tg,F2,hit.tg.pl.m);
@@ -1921,7 +1979,7 @@ function makeBlocks(m,B,lum){
         if(j){if(first)attOf(first).push({u,side:1});if(endTg)attOf(endTg).push({u:endU,side:-1});for(const c of cross)attOf(c).push({u,side:1},{u,side:-1});}
         else{ // no joist fits: fall back to a block in every bay of this run
           let q=0;if(!first){const cb=mkAt(cross[0],u,-1);if(cb&&!cb.bad)put(cross[0],cb,-1);q=1;}for(const c of(first?[first]:[]).concat(cross)){const cc=mkAt(c,u+(q++%2?2.25:0),1);if(cc&&!cc.bad)put(c,cc,1);}}}
-      if(endTg){from=endTg;flip=!flip;i=R.indexOf(endTg);}else{from=null;i=cur+1;}}}
+      if(restart){from=restart;flip=!flip;i=R.indexOf(restart);}else if(endTg){from=endTg;flip=!flip;i=R.indexOf(endTg);}else{from=null;i=cur+1;}}}
   return out;
 }
 
@@ -2111,7 +2169,11 @@ function computeFraming(){
   F.joints=buildRims(F,B,t);
   // a lip that carries a pipe gets a 2× backer inside one of its two rims: the flatter side, which is the deck
   if(COPE.length&&plyRibs(B)){const near=p=>[.2,.5,.8].every(f=>copeDist(p.ends[0][0]+(p.ends[1][0]-p.ends[0][0])*f,p.ends[0][1]+(p.ends[1][1]-p.ends[0][1])*f)<2),flat=m=>m&&m.patch&&m.patch.N?m.patch.N[1]:0,seen=new Set();
-    for(const j of F.joints){if(!j.pa||!j.pb)continue;seen.add(j.pa);seen.add(j.pb);if(!near(j.pa))continue;(flat(j.a)>=flat(j.b)?j.pa:j.pb).backer=true;}
+    // the pipe's centre sits back from the lip, in under the deck: the backer goes on that side, where the pipe is, so the pipe lands on it
+    const side=j=>{const e=j.pa.ends,mx=(e[0][0]+e[1][0])/2,mz=(e[0][1]+e[1][1])/2;let best=1e9,vx=0,vz=0;
+      for(const P of COPE)for(let k=0;k<P.length-1;k++){const a=P[k],c=P[k+1],dx=c[0]-a[0],dz=c[2]-a[2],l=dx*dx+dz*dz,t=l>1e-9?Math.max(0,Math.min(1,((mx-a[0])*dx+(mz-a[2])*dz)/l)):0,ox=a[0]+dx*t-mx,oz=a[2]+dz*t-mz,d=Math.hypot(ox,oz);if(d<best){best=d;vx=ox;vz=oz;}}
+      if(best<.12||best>3)return 0;for(const r of[2.5,1.5,4]){const x=mx+vx/best*r,z=mz+vz/best*r,ia=inPlan(j.a.pidx,x,z),ib=inPlan(j.b.pidx,x,z);if(ia!==ib)return ia?1:-1;}return 0;};
+    for(const j of F.joints){if(!j.pa||!j.pb)continue;seen.add(j.pa);seen.add(j.pb);if(!near(j.pa))continue;const sd=side(j)||(flat(j.a)>=flat(j.b)?1:-1);(sd>0?j.pa:j.pb).backer=true;}
     for(const m of F.mods)for(const p of m.rims)if(!seen.has(p)&&near(p))p.backer=true;}
   const cfg={W:ch.w,meat:3.5,Lmax:140,plate:1.5,postGap:24};let minR=Infinity;
   for(const m of F.mods){
@@ -2366,6 +2428,8 @@ const ICON={
   nurbs:'<svg viewBox="0 0 26 18"><path d="M2 14c5 0 6-10 11-10s6 6 11 6"/><path d="M2 14l3 2M24 10l-2 3" opacity=".5"/><circle cx="2" cy="14" r="1.2"/><circle cx="13" cy="4" r="1.2"/><circle cx="24" cy="10" r="1.2"/></svg>',
   box:'<svg viewBox="0 0 26 18"><path d="M6 6h14v10H6z"/><path d="M6 6l4-4h14l-4 4M24 2v10l-4 4"/></svg>'
 };
+// which runs meet smoothly and so are bent and fitted as one length of pipe
+function joinNote(runs){const G=copingGroups(0).filter(g=>g.runs.length>1);if(!G.length)return'';return`<p class="note">${G.map(g=>`Runs ${g.runs.map(r=>runs.indexOf(r)+1).sort((a,b)=>a-b).join(', ').replace(/, (\d+)$/,' and $1')} meet smoothly and make one continuous pipe, ${fft(g.len)} long${g.closed?', a closed loop':''}.`).join(' ')}</p>`;}
 function fld(path,label,o={}){
   const v=getP(path)??0,min=o.min??-400,max=o.max??400,st=o.step??.25,unit=o.unit??'in';
   const ft=unit==='in'&&!o.noft?`<small data-ft="${path}">${fft(v)}</small>`:'';
@@ -2414,7 +2478,8 @@ function opBody(op){
   const p='op.'+op.uid;
   if(op.type==='fillet')return`<input class="opname" data-name="${op.uid}" value="${esc(op.name)}" placeholder="Fillet name" aria-label="Name">${fld(p+'.r','Radius',{min:.5,max:120})}<p class="note">${filletLost(op)?'The edge this fillet was on has moved or gone. Delete it and pick the edge again in the Edges tab.':'Rounds one edge with a ball of this radius rolled along it, touching both faces. It works on the shape made by everything above it in the list, so keep fillets at the bottom.'}</p>`;const modes=op.type==='nurbs'?[['cut','Cut above'],['fill','Fill below']]:op.type==='bowl'?[['sub','Bowl, cut in'],['add','Mound, added on']]:[['sub','Subtract'],['add','Add']];
   let h=`<input class="opname" data-name="${op.uid}" value="${esc(op.name)}" placeholder="${typeName(op)} name" aria-label="Name">
-  <div class="seg" role="group" aria-label="Mode">${modes.map(([k,l])=>`<button type="button" data-mode="${k}" class="${op.mode===k?'on':''}">${l}</button>`).join('')}</div>`;
+  <div class="seg" role="group" aria-label="Mode">${modes.map(([k,l])=>`<button type="button" data-mode="${k}" class="${op.mode===k?'on':''}">${l}</button>`).join('')}</div>
+  <p class="note">In the view, drag a yellow arrow to stretch it and the yellow ball to slide it.</p>`;
   const rot=`<div class="grp"><h4>Rotation</h4>${fld(p+'.rx','Tilt X',{min:-180,max:180,step:1,unit:'°'})}${fld(p+'.ry','Spin Y',{min:-180,max:180,step:1,unit:'°'})}${fld(p+'.rz','Tilt Z',{min:-180,max:180,step:1,unit:'°'})}
     <div class="row"><span class="note">Lay axis along</span><button type="button" class="sbtn" data-axis="x">X</button><button type="button" class="sbtn" data-axis="y">Y</button><button type="button" class="sbtn" data-axis="z">Z</button></div></div>`;
   const posf=`<div class="grp"><h4>Center</h4>${fld(p+'.x','X',{min:-400,max:400})}${fld(p+'.y','Y (height)',{min:-120,max:400})}${fld(p+'.z','Z',{min:-400,max:400})}</div>`;
@@ -2459,7 +2524,7 @@ function copingTab(){
   return `<section class="sec">${tools}<div class="sechead"><h3>Coping runs</h3><small>${CANDS.length} pickable edges</small></div>
     <p class="note">Blue lines in the view are convex edges that can take coping. Tap one to add it; tap again to remove it.</p>
     <div class="row"><button type="button" class="sbtn primary" data-cop="auto">Pick the lips for me</button><button type="button" class="sbtn" data-cop="clear">Clear all</button></div>
-    ${runs.length?`<ul class="runs">${runs.map((r,i)=>{const c=CANDS[r.ci];return c?`<li class="run"><span class="sw"></span><span class="rl"><b>${fft(c.len)}</b><span>${c.closed?'closed loop, roll to fit':c.curved?'curved, needs bending':'straight'}</span></span>
+    ${joinNote(runs)}${runs.length?`<ul class="runs">${runs.map((r,i)=>{const c=CANDS[r.ci];return c?`<li class="run"><span class="sw"></span><span class="rl"><b>${fft(c.len)}</b><span>${c.closed?'closed loop, roll to fit':c.curved?'curved, needs bending':'straight'}</span></span>
       <select data-runtype="${i}" aria-label="Coping type"><option value="pipe" ${r.type!=='angle'?'selected':''}>Pipe</option><option value="angle" ${r.type==='angle'?'selected':''}>Angle iron</option></select>
       <button type="button" class="ib" data-rmrun="${i}" aria-label="Remove">${ICON.del}</button></li>`:`<li class="run lost"><span class="sw"></span><span class="rl"><b>Edge moved</b><span>The shape changed under this run. Pick the edge again.</span></span><span></span><button type="button" class="ib" data-rmrun="${i}" aria-label="Remove">${ICON.del}</button></li>`}).join('')}</ul>`
       :'<div class="empty">No coping yet. Tap a lip edge in the view, or let Rampsmith pick the top edges.</div>'}
@@ -2629,7 +2694,7 @@ ${B.ribs==='stick'?`<label class="sel">Rims<select data-bsel="rim">${Object.entr
     <li>Screw the first surface layer to each module on its own, trimmed flush with the outside face of the rim. Label every module with its letter.</li>
     <li>Set the modules in place, clamp mating rims face to face and drill through both at the bolt marks. Bolt them with the hardware in the seam table.</li>
     <li>Lay the remaining layers across the modules with every joint at least 12″ away from a module seam. On bowls, mounds and cones, cut the radial strips listed under each module.</li>
-    ${state.cop.runs.length?`<li>Lay each pipe in the round seat cut along the top of its lip rims, standing ${fin(state.cop.reveal)} proud, and screw it down into the 2×4 backer every 24″ before the top sheet goes on. The skin butts up to the pipe from both sides.</li>`:''}
+    ${state.cop.runs.length?`<li>Lay each pipe in the round seat cut along the top of its lip rims, standing ${fin(state.cop.reveal)} proud, and screw it down into the 2×4 backer every 24″ before the top sheet goes on. The skin butts up to the pipe from both sides. Where a joist or block ends under the pipe with no backer in between, its top corner is scooped to the same round seat: the model shows the scoop.</li>`:''}
     <li>Screw the final skin with countersunk screws and sand the seams flush.</li></ol></section>`;
 }
 function stickSVGFile(){
@@ -2735,7 +2800,7 @@ function vrTagInfo(h,id){
   const main=h.hand===VR.main,op=vrSel();
   if(main){
     if(id==='trigger')return['Trigger: press · pick',VCOL.yel];
-    if(id==='grip')return['Grip: grab a shape or the model',VCOL.blue];
+    if(id==='grip'){const H=h.held;if(H&&H.kind==='dim')return[dimLabel(H.op,H.hd.key)+' '+fin(H.op[H.hd.key]),VCOL.yel];return[VR.hovH&&VR.hovH.startsWith('dim')?'Grip: pull the arrow to stretch':'Grip: grab a shape or the model',VCOL.blue];}
     if(id==='stick')return[VR.tool==='fillet'?'Stick ↕ fillet radius':op?'Stick '+vrStickText(op):'Stick: size the picked shape','#ffffff'];
     if(id==='a')return['Tool → '+vrToolName[vrTools[(vrTools.indexOf(VR.tool)+1)%3]],VCOL.grn];
     if(id==='b')return['↶ Undo',VCOL.yel];
@@ -2794,7 +2859,7 @@ function vrParamRows(op){
 function vrOpChanged(soft){vrHook.dirty=true;VR.ghostAt=0;scheduleRebuild();pushHist();if(!soft)refreshTab();}
 function vrNudge(op,key,d,lo,hi){op[key]=Math.max(lo,Math.min(hi,Math.round((op[key]+d)*4)/4));updateGhost();vrOpChanged();}
 function vrAdd(kind){const type=kind==='mound'?'bowl':kind,o=newOpDefaults(type);if(kind==='mound')Object.assign(o,{mode:'add',r:6,R:20,ang:30,roll:5,h:Math.max(6,Math.round(state.stock.H*.2)),y:state.stock.H});
-  const op=mkOp(type,o);state.ops.push(op);state.ui.sel=op.uid;vrSetTool('shape');updateGhost();vrOpChanged();toast((kind==='mound'?'Mound':TYPE_NAMES[type])+' added · squeeze its ball to move it');}
+  const op=mkOp(type,o);state.ops.push(op);state.ui.sel=op.uid;vrSetTool('shape');updateGhost();vrOpChanged();toast((kind==='mound'?'Mound':TYPE_NAMES[type])+' added · grip its ball to move it, an arrow to stretch it');}
 function vrSetTool(t){VR.tool=t;state.ui.tab=t==='shape'?'shape':'coping';state.ui.etool=t==='fillet'?'fillet':'coping';if(t!=='shape')VR.tab='edges';buildEdges();setHover(-1);VR.hovEdge=-1;refreshTab();vrHook.dirty=true;}
 function vrDelete(){const op=vrSel();if(!op)return toast('Pick a shape first');state.ops.splice(state.ops.indexOf(op),1);state.ui.sel=null;updateGhost();vrOpChanged();toast('Shape deleted · B to undo');}
 function vrView(v){if(v==='framing'&&state.ui.view!=='framing'){toast('Cutting the framing…');vrDrawMenu();setTimeout(()=>{state.ui.view='framing';syncView();vrHook.dirty=true;},90);}else{state.ui.view=v;syncView();vrHook.dirty=true;}}
@@ -2822,7 +2887,7 @@ function vrDrawMenu(){
       if(op.type!=='nurbs'&&op.type!=='bowl'){vrText('Lay it along',X,y+26,22);['x','y','z'].forEach((a,i)=>vrBtn(X+W-250+i*86,y,78,52,a.toUpperCase(),()=>{Object.assign(op,a==='x'?{rx:0,ry:0,rz:90}:a==='y'?{rx:0,ry:0,rz:0}:{rx:90,ry:0,rz:0});updateGhost();vrOpChanged();}));y+=62;}
       vrBtn(X,y+4,W/2-6,56,'Copy',()=>{const c=JSON.parse(JSON.stringify(op));c.uid=uidSeq++;c.x=(c.x||0)+12;state.ops.push(c);state.ui.sel=c.uid;updateGhost();vrOpChanged();});
       vrBtn(X+W/2+6,y+4,W/2-6,56,'✕ Delete',vrDelete,{col:VCOL.red});y+=74;
-    }else{vrText('Point at a ball and pull the trigger to pick a shape.',X,y+14,20,'#444');vrText('Squeeze the grip on a ball to move and turn it.',X,y+44,20,'#444');vrText('Blue cubes resize the stock box.',X,y+74,20,'#444');}
+    }else{vrText('Point at a ball and pull the trigger to pick a shape.',X,y+14,20,'#444');vrText('Squeeze the grip on a ball to move and turn it.',X,y+44,20,'#444');vrText('Squeeze a yellow arrow and pull to stretch it.',X,y+74,20,'#444');vrText('Blue cubes resize the stock box.',X,y+104,20,'#444');}
   }else if(VR.tab==='edges'){
     H3('Edge tool');vrBtn(X,y,W/2-6,64,'Coping',()=>vrSetTool('coping'),{col:VR.tool==='coping'?VCOL.blue:'#fff'});vrBtn(X+W/2+6,y,W/2-6,64,'Fillet',()=>vrSetTool('fillet'),{col:VR.tool==='fillet'?VCOL.blue:'#fff'});y+=84;
     if(VR.tool==='fillet'){const F=state.ops.filter(o=>o.type==='fillet'),f=vrFil();
@@ -2834,7 +2899,7 @@ function vrDrawMenu(){
       const len=state.cop.runs.reduce((s,r)=>s+(CANDS[r.ci]?.len||0),0);H3(state.cop.runs.length+' run'+(state.cop.runs.length===1?'':'s')+(len?' · '+fft(len):''));
       vrBtn(X,y,W,60,'Pick the lips for me',()=>{const n=autoLips();copChanged();refreshTab();pushHist();vrHook.dirty=true;toast(n?`Added ${n} lip run${n>1?'s':''}`:'No new lips found');},{col:VCOL.yel});y+=74;
       vrBtn(X,y,W,48,'Pipe: '+PIPES[state.cop.od].split(' (')[0],()=>{const ks=Object.keys(PIPES);state.cop.od=ks[(ks.indexOf(state.cop.od)+1)%ks.length];buildCoping();refreshTab();pushHist();vrHook.dirty=true;},{fs:20});y+=58;
-      vrBtn(X,y,W,56,'Clear all coping',()=>{state.cop.runs=[];copChanged();refreshTab();pushHist();vrHook.dirty=true;});y+=70;}
+      vrBtn(X,y,W,56,'Clear all coping',()=>{state.cop.runs=[];state.cop.skip=[];copChanged();refreshTab();pushHist();vrHook.dirty=true;});y+=70;}
   }else if(VR.tab==='build'){
     const B=state.build,bolts=FR&&state.ui.view==='framing'?FR.joints.reduce((q,j)=>q+j.bolts.length,0):0,chg=k=>{framingDirty=true;if(k==='layup'&&state.stock.liftOn)scheduleRebuild();pushHist();refreshTab();vrHook.dirty=true;if(state.ui.view==='framing'){toast('Cutting the framing…');setTimeout(()=>{ensureFraming();buildFrameMeshes();vrHook.dirty=true;},90);}};
     const cyc=(lab,key,T)=>{vrBtn(X,y,W,48,lab+': '+T[B[key]].label,()=>{const ks=Object.keys(T);B[key]=ks[(ks.indexOf(B[key])+1)%ks.length];chg(key);},{fs:20});y+=56;};
@@ -2854,7 +2919,7 @@ function vrDrawMenu(){
     H3('Show');vrBtn(X,y,W/2-6,64,'Model',()=>vrView('model'),{col:state.ui.view!=='framing'?VCOL.blue:'#fff'});vrBtn(X+W/2+6,y,W/2-6,64,'Framing',()=>vrView('framing'),{col:state.ui.view==='framing'?VCOL.blue:'#fff'});y+=78;
     vrBtn(X,y,W,54,'Cutter shapes: '+(state.ui.showCut?'all shown':'only the picked one'),()=>{state.ui.showCut=!state.ui.showCut;$('#showCut').checked=state.ui.showCut;updateGhost();vrHook.dirty=true;});y+=72;
     vrBtn(X,y,W,54,'Floor frame under it: '+(state.stock.liftOn?'raised '+fin((RES&&RES.lift)||0):'off'),()=>{state.stock.liftOn=!state.stock.liftOn;if(!(state.stock.lift>0))state.stock.lift=3.5;refreshTab();scheduleRebuild();pushHist();vrHook.dirty=true;},{col:state.stock.liftOn?VCOL.grn:'#fff',fs:22});y+=72;
-    H3('Model size');const cur=Math.round(IN/world.scale.x*100)/100;[1,5,10,20].forEach((n,i)=>vrBtn(X+i*(W/4+3),y,W/4-9,60,'1:'+n,()=>vrPlace(n),{col:Math.abs(cur-n)<.02?VCOL.grn:'#fff'}));y+=78;
+    H3('Model size');const cur=Math.round(IN/(VR.wsOver||world.scale.x)*100)/100;[1,5,10,20].forEach((n,i)=>vrBtn(X+i*(W/4+3),y,W/4-9,60,'1:'+n,()=>vrPlace(n),{col:Math.abs(cur-n)<.02?VCOL.grn:'#fff'}));y+=78;
     H3('Headset');vrBtn(X,y,W/2-6,56,VR.mr?'Room view: on':'Room view: off',()=>{if(!VR.canMR)return toast('This headset session has no room view');VR.mr=!VR.mr;vrBackdrop();vrHook.dirty=true;},{col:VR.mr?VCOL.grn:'#fff'});
     vrBtn(X+W/2+6,y,W/2-6,56,'Labels: '+(VR.labels?'on':'off'),()=>{VR.labels=!VR.labels;vrHook.dirty=true;},{col:VR.labels?VCOL.grn:'#fff'});y+=68;
     vrBtn(X,y,W/2-6,56,'Snap: '+(VR.snap?'on':'off'),()=>{VR.snap=!VR.snap;vrHook.dirty=true;},{col:VR.snap?VCOL.grn:'#fff'});
@@ -2862,7 +2927,13 @@ function vrDrawMenu(){
     vrBtn(X,y,W,56,'Leave VR',()=>{const s=renderer.xr.getSession&&renderer.xr.getSession();if(s)s.end();else vrExit();},{col:VCOL.ink});y+=70;
   }else{
     H3('Start from a template');const ks=Object.keys(PRESETS);ks.forEach((k,i)=>vrBtn(X+(i%2)*(W/2+6),y+Math.floor(i/2)*66,W/2-6,56,PRESETS[k].label,()=>vrLoad(k),{fs:21}));y+=Math.ceil(ks.length/2)*66+14;
-    vrText('Loading a template replaces the design. B brings it back.',X,y+10,19,'#444');
+    vrText('Loading a template replaces the design. B brings it back.',X,y+10,19,'#444');y+=40;
+    if(Net.has()){H3('Watch on a phone');
+      if(VR.keypad!=null){vrText('Room code:  '+(VR.keypad+'____').slice(0,4).split('').join(' '),X,y+12,26,VCOL.ink,true);y+=40;
+        '1234567890'.split('').forEach((d,i)=>vrBtn(X+(i%5)*(W/5+2),y+Math.floor(i/5)*58,W/5-8,50,d,()=>{VR.keypad+=d;if(VR.keypad.length>=4){const c=VR.keypad.slice(0,4);VR.keypad=null;Net.join(c);toast('Joining room '+c);}},{fs:26}));y+=122;
+        vrBtn(X,y,W/2-6,46,'Cancel',()=>{VR.keypad=null;},{fs:20});}
+      else{vrText(Net.label(),X,y+12,22,VCOL.ink,true);vrText('Open this page on a phone and type the same code.',X,y+40,18,'#444');y+=62;
+        vrBtn(X,y,W/2-6,48,'Type room code',()=>{VR.keypad='';},{fs:20});}}
   }
   if(VR.msg){g.font='bold 22px system-ui,sans-serif';rrect(g,X,MH-78,W,52,14);g.fillStyle=VCOL.ink;g.fill();g.fillStyle='#fff';g.textAlign='center';g.textBaseline='middle';g.fillText(VR.msg,X+W/2,MH-51,W-20);}
   M.t.needsUpdate=true;
@@ -2871,20 +2942,25 @@ function vrDock(){const off=VR.hands.find(h=>h.hand&&h.hand!==VR.main)||VR.hands
   off.grip.add(VR.menu);VR.menu.position.set(0,.035+.362*MENU_H/2,-.035-.932*MENU_H/2);VR.menu.rotation.set(-1.2,0,0);for(const h of VR.hands)vrDress(h);vrHook.dirty=true;}
 
 /* set-up, entering and leaving */
+// the hand menu, the grab handles and the base slab: made once, for the headset and for any screen that watches one
+function vrProps(){
+  if(VR.M)return;
+  VR.M=vrCanvasTex(MW,MH);VR.menu=new THREE.Mesh(new THREE.PlaneGeometry(MENU_W,MENU_H),new THREE.MeshBasicMaterial({map:VR.M.t,transparent:true,side:THREE.DoubleSide}));VR.menu.renderOrder=10;VR.menu.frustumCulled=false;
+  VR.handles=new THREE.Group();VR.handles.visible=false;world.add(VR.handles);VR.hm=new Map();
+  VR.slab=new THREE.Mesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshStandardMaterial({color:0x1F5FE0,roughness:.9}));VR.slab.visible=false;world.add(VR.slab);
+}
 function vrInit(sim){
   if(VR.ready)return;VR.ready=true;
   for(const i of[0,1]){const h={i,grip:sim?new THREE.Group():renderer.xr.getControllerGrip(i),ray:sim?new THREE.Group():renderer.xr.getController(i),source:null,hand:null,was:{},tags:{}};
     if(!sim){h.ray.addEventListener('connected',e=>{h.source=e.data;h.hand=e.data.handedness;vrDock();});h.ray.addEventListener('disconnected',()=>{h.source=null;if(h.held)vrGrabEnd(h);});}
     scene.add(h.grip,h.ray);VR.hands.push(h);}
-  VR.M=vrCanvasTex(MW,MH);VR.menu=new THREE.Mesh(new THREE.PlaneGeometry(MENU_W,MENU_H),new THREE.MeshBasicMaterial({map:VR.M.t,transparent:true,side:THREE.DoubleSide}));VR.menu.renderOrder=10;VR.menu.frustumCulled=false;
+  vrProps();
   VR.line=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(),new V3(0,0,-1)]),new THREE.LineBasicMaterial({color:0xE5261F}));VR.line.frustumCulled=false;scene.add(VR.line);
   VR.dot=new THREE.Mesh(new THREE.SphereGeometry(.006,12,8),new THREE.MeshBasicMaterial({color:0xFFC914}));VR.dot.frustumCulled=false;scene.add(VR.dot);
   // a room floor for VR (hidden in room view)
   const fl=new THREE.Group(),disc=new THREE.Mesh(new THREE.CircleGeometry(7,48),new THREE.MeshBasicMaterial({color:0x26303a}));disc.rotation.x=-Math.PI/2;disc.position.y=-.004;fl.add(disc);
   const lv=[];for(let i=-7;i<=7;i++){lv.push(-7,0,i,7,0,i,i,0,-7,i,0,7);}const lg=new THREE.BufferGeometry();lg.setAttribute('position',new THREE.Float32BufferAttribute(lv,3));fl.add(new THREE.LineSegments(lg,new THREE.LineBasicMaterial({color:0x4a5a68})));
   VR.floor=fl;scene.add(fl);
-  VR.handles=new THREE.Group();world.add(VR.handles);VR.hm=new Map();
-  VR.slab=new THREE.Mesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshStandardMaterial({color:0x1F5FE0,roughness:.9}));world.add(VR.slab);
 }
 function vrBackdrop(){if(!VR.on)return;const room=VR.mr&&VR.canMR;scene.background=room?null:new THREE.Color(0x10161c);renderer.setClearColor(0x000000,room?0:1);VR.floor.visible=!room;}
 function vrPlace(n){
@@ -2897,6 +2973,7 @@ function vrPlace(n){
 }
 function vrRescaled(){VR.scaleBuilt=world.scale.x;buildEdges();if(state.ui.tab==='coping')setHover(-1);}
 function vrEnter(sim){
+  if(vrHook.pre)vrHook.pre();
   vrInit(sim);VR.on=vrHook.on=true;VR.sim=!!sim;VR.keep={pos:camera.position.clone(),tgt:controls.target.clone(),near:camera.near,far:camera.far,tab:state.ui.tab,view:state.ui.view};
   controls.enabled=false;camera.near=.005;camera.far=400;camera.updateProjectionMatrix();sun.castShadow=false;ground.visible=false;if(gridLines)gridLines.visible=false;
   for(const o of[VR.line,VR.dot,VR.floor,VR.handles,VR.slab,VR.menu])o.visible=true;for(const h of VR.hands){h.grip.visible=h.ray.visible=true;}
@@ -2944,12 +3021,14 @@ vrHook.edges=()=>{
 const vrLift=()=>(RES&&RES.lift)||0;
 const vrOpPos=op=>op.type==='nurbs'?new V3(op.x||0,(op.lift||0)+Math.max(op.hi||0,6)+vrLift(),op.z||0):new V3(op.x||0,(op.y||0)+vrLift(),op.z||0);
 function vrHandles(){
-  const show=VR.tool==='shape',want=new Set(),k=1/world.scale.x,sel=state.ui.sel;VR.handles.visible=show;if(!show)return;
-  const put=(id,kind,p,colr)=>{want.add(id);let m=VR.hm.get(id);if(!m){m=new THREE.Mesh(kind==='stock'?new THREE.BoxGeometry(1,1,1):new THREE.SphereGeometry(.6,18,12),new THREE.MeshBasicMaterial({color:colr}));m.frustumCulled=false;m.userData={id,kind};VR.handles.add(m);VR.hm.set(id,m);}
-    m.position.copy(p);m.material.color.set(colr);m.scale.setScalar((kind==='stock'?.028:.034)*k*(VR.hovH===id?1.35:1));return m;};
+  const show=VR.tool==='shape',want=new Set(),k=1/(VR.wsOver||world.scale.x),sel=state.ui.sel;VR.handles.visible=show;if(!show)return;
+  const put=(id,kind,p,colr)=>{want.add(id);let m=VR.hm.get(id);if(!m){m=kind==='dim'?dimArrow():new THREE.Mesh(kind==='stock'?new THREE.BoxGeometry(1,1,1):new THREE.SphereGeometry(.6,18,12),new THREE.MeshBasicMaterial({color:colr}));m.frustumCulled=false;m.userData={id,kind};VR.handles.add(m);VR.hm.set(id,m);}
+    m.position.copy(p);m.material.color.set(colr);m.scale.setScalar((kind==='stock'?.028:kind==='dim'?.032:.034)*k*(VR.hovH===id?1.35:1));return m;};
   for(const op of state.ops){if(!op.on||op.type==='fillet')continue;put('op'+op.uid,'op',vrOpPos(op),op.uid===sel?0xFFC914:(op.mode==='add'||op.mode==='fill')?0x1FA64A:0xE5261F).userData.op=op;}
+  const so=state.ops.find(o=>o.uid===sel&&o.on&&o.type!=='fillet');
+  if(so){const F=dimFrame(so),lf=vrLift();dimHandles(so).forEach((hd,i)=>{const id='dim'+i+hd.key,P=dimPose(so,hd,.055*k,F);P.p.y+=lf;const m=put(id,'dim',P.p,0xFFC914);m.quaternion.copy(P.q);m.userData.op=so;m.userData.hd=hd;});}
   const s=state.stock;const lf=vrLift();put('sx','stock',new V3(s.L/2,s.H/2+lf,0),0x1F5FE0);put('sz','stock',new V3(0,s.H/2+lf,s.W/2),0x1F5FE0);put('sy','stock',new V3(s.L/2,s.H+lf,s.W/2),0x1F5FE0);
-  for(const[id,m]of VR.hm)if(!want.has(id)){VR.handles.remove(m);m.geometry.dispose();VR.hm.delete(id);}
+  for(const[id,m]of VR.hm)if(!want.has(id)){VR.handles.remove(m);m.geometry.dispose();m.material.dispose();VR.hm.delete(id);}
   for(const m of cpMeshes){m.scale.setScalar(.012*k/2.4);m.frustumCulled=false;}
   VR.slab.scale.set(s.L+10,1.2,s.W+10);VR.slab.position.set(0,-.7,0);
 }
@@ -2961,7 +3040,7 @@ function vrPick(h,what){
     if((dist<rad*1.6||sc<.045)&&(!best||sc<best.sc||(sc===best.sc&&tr<best.t)))best=Object.assign({sc,t:tr},item);};
   if(what.menu&&VR.menu.parent){vrRay.set(o,d);const hit=vrRay.intersectObject(VR.menu,false)[0];if(hit&&hit.distance<2&&hit.uv){const px=hit.uv.x*MW,py=(1-hit.uv.y)*MH,bi=VR.btn.findIndex(b=>px>=b.x&&px<=b.x+b.w&&py>=b.y&&py<=b.y+b.h);return{kind:'menu',bi,t:hit.distance};}}
   if(what.handles&&VR.tool==='shape'){for(const m of cpMeshes){const cp=m.position.clone();cp.y+=vrLift();test(cp,.014,{kind:'cp',uid:m.userData.uid,k:m.userData.k,p:cp});}
-    for(const[id,m]of VR.hm)test(m.position,.02,{kind:m.userData.kind,id,op:m.userData.op,p:m.position});}
+    for(const[id,m]of VR.hm)test(m.position,.02,{kind:m.userData.kind,id,op:m.userData.op,hd:m.userData.hd,p:m.position});}
   if(what.edges&&VR.tool!=='shape'){const E=edgeSet(),a=new V3(),b=new V3(),w0=new V3();
     E.forEach((c,ci)=>{const n=c.pts.length/3;for(let i=1;i<n;i++){a.set(c.pts[3*i-3],c.pts[3*i-2],c.pts[3*i-1]);b.set(c.pts[3*i],c.pts[3*i+1],c.pts[3*i+2]);
       // closest approach of the pointing ray and this piece of edge
@@ -2992,6 +3071,7 @@ function vrGrabStart(h){
   if(p&&p.kind==='op'){const op=p.op;state.ui.sel=op.uid;updateGhost();h.grip.updateMatrixWorld(true);
     const M0=new THREE.Matrix4().compose(op.type==='nurbs'?new V3(op.x||0,(op.lift||0)+vrLift(),op.z||0):new V3(op.x,op.y+vrLift(),op.z),new THREE.Quaternion().setFromEuler(op.type==='nurbs'?new THREE.Euler(0,(op.ry||0)*Math.PI/180,0,'YXZ'):eul(op)),new V3(1,1,1));
     h.held={kind:'op',op,G0i:h.grip.matrixWorld.clone().invert(),W0:world.matrixWorld.clone(),M0};vrPulse(h);}
+  else if(p&&p.kind==='dim'){const tip=h.o.clone().addScaledVector(h.d,p.t).applyMatrix4(_m1.copy(world.matrixWorld).invert());h.held=Object.assign(dimStart(p.op,p.hd),{tip0:tip,t:p.t,id:p.id});vrPulse(h);}
   else if(p&&p.kind==='stock'){const tip=h.o.clone().addScaledVector(h.d,p.t).applyMatrix4(_m1.copy(world.matrixWorld).invert());h.held={kind:'stock',id:p.id,off:p.p.clone().sub(tip),t:p.t};vrPulse(h);}
   else if(p&&p.kind==='cp'){const tip=h.o.clone().addScaledVector(h.d,p.t).applyMatrix4(_m1.copy(world.matrixWorld).invert());const op=state.ops.find(o=>o.uid===p.uid);if(op){h.held={kind:'cp',op,k:p.k,off:p.p.y-tip.y,t:p.t};state.ui.selPt[op.uid]=p.k;vrPulse(h);}}
   if(!h.held){h.held={kind:'world'};vrWorldGrabReset();}
@@ -3004,7 +3084,8 @@ function vrHeld(h,now){
     const p=new V3(),q=new THREE.Quaternion(),sc=new V3();_m1.decompose(p,q,sc);const e=new THREE.Euler().setFromQuaternion(q,'YXZ'),op=H.op;
     p.y-=vrLift();op.x=snapP(p.x);op.z=snapP(p.z);if(op.type==='nurbs'){op.lift=snapP(p.y);op.ry=snapA(e.y);}else{op.y=snapP(p.y);if(op.type==='bowl'){op.rx=0;op.rz=0;op.ry=snapA(e.y);}else{op.rx=snapA(e.x);op.ry=snapA(e.y);op.rz=snapA(e.z);}}}
   else{const tip=h.o.clone().addScaledVector(h.d,H.t).applyMatrix4(_m1.copy(world.matrixWorld).invert());
-    if(H.kind==='stock'){const s=state.stock;if(H.id==='sx')s.L=Math.max(12,Math.min(600,Math.round(2*Math.abs(tip.x+H.off.x))));else if(H.id==='sz')s.W=Math.max(12,Math.min(480,Math.round(2*Math.abs(tip.z+H.off.z))));else s.H=Math.max(1,Math.min(240,Math.round(tip.y+H.off.y-vrLift())));}
+    if(H.kind==='dim'){if(dimApply(H,tip.sub(H.tip0).dot(H.dw),VR.snap?.5:.125))vrPulse(h,.15,8);}
+    else if(H.kind==='stock'){const s=state.stock;if(H.id==='sx')s.L=Math.max(12,Math.min(600,Math.round(2*Math.abs(tip.x+H.off.x))));else if(H.id==='sz')s.W=Math.max(12,Math.min(480,Math.round(2*Math.abs(tip.z+H.off.z))));else s.H=Math.max(1,Math.min(240,Math.round(tip.y+H.off.y-vrLift())));}
     else{const pt=H.op.pts[H.k];if(pt)pt.h=Math.round((tip.y+H.off-vrLift()-(H.op.lift||0))*4)/4;}}
   if(now-(VR.ghostAt||0)>70){VR.ghostAt=now;updateGhost();scheduleRebuild();vrHook.dirty=true;}
 }
@@ -3071,6 +3152,285 @@ function vrTickBody(){const now=performance.now(),dt=Math.min(.05,(now-(VR.t0||n
     dirty:()=>{vrHook.dirty=true;},
     btn:(i,k,on)=>{const b=VR.hands[i].source.gamepad.buttons[k];b.pressed=!!on;b.value=on?1:0;},axes:(i,x,y)=>{const a=VR.hands[i].source.gamepad.axes;a[2]=x;a[3]=y;}};
 })();
+/* ---------- watching together ----------
+   Devices that open this page with the same 4-digit room code share one design. When one of them is a headset in VR,
+   every flat screen in the room becomes its spectator: a floating view you can orbit, the wearer's own eyes, or both.
+   Same pattern as Quadrille XR: on a plain web page the room runs over PeerJS; one device holds the room id and relays. */
+function peerRoom(code,onStatus){
+  const HOST='rampsmith-xr-'+code,me=Math.random().toString(36).slice(2,12),conns=new Map(),subs={},others=new Map();
+  let peer=null,host=false,hostConn=null,mine={},snap=[],alive=true,retryT=0;
+  const rebuild=()=>{snap=[{peer:me,sameTab:true,presence:mine}].concat([...others].map(([p,q])=>({peer:p,sameTab:false,presence:q})));};
+  const deliver=m=>{
+    if(m.t==='e')(subs[m.topic]||[]).forEach(fn=>{try{fn({topic:m.topic,data:m.data,peer:m.from,sameTab:false});}catch(e){console.error(e);}});
+    else if(m.t==='p'){others.set(m.from,m.presence||{});rebuild();}else if(m.t==='bye'){others.delete(m.from);rebuild();}
+  };
+  const send=m=>{try{if(host){for(const c of conns.values())if(c.open)c.send(m);}else if(hostConn&&hostConn.open)hostConn.send(m);}catch(e){}};
+  const retry=()=>{
+    if(!alive||retryT)return;onStatus('connecting');
+    retryT=setTimeout(()=>{retryT=0;try{if(peer)peer.destroy();}catch(e){}others.clear();conns.clear();hostConn=null;rebuild();beHost();},1200+Math.random()*1800);
+  };
+  function beHost(){
+    if(!alive)return;host=false;const p=peer=new window.Peer(HOST);
+    p.on('open',()=>{host=true;onStatus('open');});
+    p.on('connection',c=>{
+      c.on('open',()=>{conns.set(c.peer,c);c.send({t:'p',from:me,presence:mine});for(const[o,q]of others)c.send({t:'p',from:o,presence:q});});
+      c.on('data',m=>{if(!m||typeof m!=='object'||typeof m.from!=='string')return;c.who=m.from;deliver(m);for(const o of conns.values())if(o!==c&&o.open)o.send(m);});
+      c.on('close',()=>{conns.delete(c.peer);if(c.who){const b={t:'bye',from:c.who};deliver(b);for(const o of conns.values())if(o.open)o.send(b);}});
+    });
+    p.on('error',e=>{if(p!==peer)return;if(e&&e.type==='unavailable-id'){try{p.destroy();}catch(x){}beClient();}else retry();});
+    p.on('disconnected',()=>{try{p.reconnect();}catch(e){}});
+  }
+  function beClient(){
+    if(!alive)return;const p=peer=new window.Peer();
+    p.on('open',()=>{
+      const c=hostConn=p.connect(HOST,{reliable:true});
+      c.on('open',()=>{onStatus('open');c.send({t:'p',from:me,presence:mine});});
+      c.on('data',m=>{if(m&&typeof m==='object'&&typeof m.from==='string')deliver(m);});
+      c.on('close',()=>{if(p===peer)retry();});
+    });
+    p.on('error',()=>{if(p===peer)retry();});
+  }
+  rebuild();beHost();
+  return{
+    emit(topic,data){send({t:'e',topic,data,from:me});return Promise.resolve();},
+    on(topic,fn){(subs[topic]=subs[topic]||[]).push(fn);return()=>{};},
+    presence(p){mine=Object.assign({},mine,p);rebuild();send({t:'p',from:me,presence:mine});return Promise.resolve();},
+    peers:()=>snap,
+    leave(){alive=false;clearTimeout(retryT);try{if(peer)peer.destroy();}catch(e){}}
+  };
+}
+const Net=(()=>{
+  // rooms need a plain web page: inside a Claude artifact the page cannot reach other devices this way
+  const HAS=(()=>{try{return !!window.__roomFactory||!(window.claude&&window.claude.use);}catch(e){return true;}})();
+  const TABS=['shapes','edges','build','view','start'],CH=12000,LSR='rampsmith.room';
+  const r4=v=>Math.round(v*1e4)/1e4,r7=v=>Math.round(v*1e7)/1e7,clampN=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const nP=new V3(),nQ=new THREE.Quaternion(),nS=new V3();
+  const pose7=o=>{o.matrixWorld.decompose(nP,nQ,nS);return[r4(nP.x),r4(nP.y),r4(nP.z),r4(nQ.x),r4(nQ.y),r4(nQ.z),r4(nQ.w)];};
+  const okPose=(a,n)=>Array.isArray(a)&&a.length>=n&&a.every(v=>typeof v==='number'&&Number.isFinite(v));
+  const setPose=(o,a,k)=>{nP.set(a[0],a[1],a[2]);nQ.set(a[3],a[4],a[5],a[6]).normalize();if(k>=1){o.position.copy(nP);o.quaternion.copy(nQ);}else{o.position.lerp(nP,k);o.quaternion.slerp(nQ,k);}};
+  let code='',status='off',room=null,sv=0,sentSnap=null,snapAt=0,quietUntil=0,lastInput=-1e9,lastPres='',presAcc=0,needAt=0,askedAt=0,seenN=-1,inbox=null,adopted=false,t0=0,wasVR=false;
+  let spect=null;            // set while this flat screen is watching a headset
+  const S={view:'third',panel:false,drawn:0};
+  // ---- what a watching screen draws: the wearer's headset, hands, menu, pointer and floor, all inside one rig that maps their room onto the model
+  const rig=new THREE.Group();rig.matrixAutoUpdate=false;rig.visible=false;scene.add(rig);
+  S.hw=new THREE.Object3D();
+  S.head=(()=>{const g=new THREE.Group(),wht=new THREE.MeshStandardMaterial({color:0xf2f2f2,roughness:.6}),drk=new THREE.MeshStandardMaterial({color:0x202020,roughness:.7});
+    const body=new THREE.Mesh(new THREE.BoxGeometry(.18,.095,.085),wht);body.position.z=-.045;g.add(body);
+    const face=new THREE.Mesh(new THREE.BoxGeometry(.165,.078,.012),drk);face.position.z=-.092;g.add(face);
+    const strap=new THREE.Mesh(new THREE.TorusGeometry(.095,.011,8,28),drk);strap.rotation.x=Math.PI/2;strap.position.z=.06;g.add(strap);
+    g.traverse(o=>{o.frustumCulled=false;});g.visible=false;rig.add(g);return g;})();
+  S.hands=['right','left'].map((hand,i)=>{const h={i,hand,grip:new THREE.Group(),ray:new THREE.Group(),source:null,was:{},tags:{}};h.grip.visible=false;rig.add(h.grip);return h;});
+  S.line=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(),new V3(0,0,-1)]),new THREE.LineBasicMaterial({color:0xE5261F}));S.line.frustumCulled=false;S.line.visible=false;rig.add(S.line);
+  S.dot=new THREE.Mesh(new THREE.SphereGeometry(.006,12,8),new THREE.MeshBasicMaterial({color:0xFFC914}));S.dot.frustumCulled=false;S.dot.visible=false;rig.add(S.dot);
+  S.floor=(()=>{const fl=new THREE.Group(),disc=new THREE.Mesh(new THREE.CircleGeometry(4,48),new THREE.MeshBasicMaterial({color:0x26303a,transparent:true,opacity:.55,depthWrite:false}));disc.rotation.x=-Math.PI/2;disc.position.y=-.004;fl.add(disc);
+    const lv=[];for(let i=-4;i<=4;i++){const w=Math.sqrt(16-i*i);lv.push(-w,0,i,w,0,i,i,0,-w,i,0,w);}const lg=new THREE.BufferGeometry();lg.setAttribute('position',new THREE.Float32BufferAttribute(lv,3));fl.add(new THREE.LineSegments(lg,new THREE.LineBasicMaterial({color:0x4a5a68})));
+    fl.traverse(o=>{o.frustumCulled=false;});rig.add(fl);return fl;})();
+  const fpCam=new THREE.PerspectiveCamera(90,1,.01,400);   // the wearer's eyes, placed in the model's own units each frame
+  // ---- what the headset draws: each watching screen as a little phone with its view cone
+  const frusta=new Map();
+  function frustumFor(id){let g=frusta.get(id);if(g)return g;g=new THREE.Group();
+    const lines=new THREE.LineSegments(new THREE.BufferGeometry(),new THREE.LineBasicMaterial({color:0xFFC914}));lines.geometry.setAttribute('position',new THREE.BufferAttribute(new Float32Array(48),3));
+    const box=new THREE.BoxGeometry(1,1,.009),body=new THREE.Mesh(box,new THREE.MeshBasicMaterial({color:0x111317}));body.add(new THREE.LineSegments(new THREE.EdgesGeometry(box),new THREE.LineBasicMaterial({color:0xFFC914})));
+    g.add(lines,body);g.userData={lines,body,key:'',fresh:true};g.traverse(o=>{o.frustumCulled=false;});world.add(g);frusta.set(id,g);return g;}
+  function shapeFrustum(g,fov,aspect){const key=fov+'/'+aspect;if(g.userData.key===key)return;g.userData.key=key;
+    const D=.3,hh=D*Math.tan(clampN(fov,10,120)*Math.PI/360),hw=hh*clampN(aspect,.2,5),c=[[-hw,-hh],[hw,-hh],[hw,hh],[-hw,hh]],a=g.userData.lines.geometry.attributes.position;let o=0;
+    for(let i=0;i<4;i++){a.setXYZ(o++,0,0,0);a.setXYZ(o++,c[i][0],c[i][1],-D);}
+    for(let i=0;i<4;i++){const j=(i+1)%4;a.setXYZ(o++,c[i][0],c[i][1],-D);a.setXYZ(o++,c[j][0],c[j][1],-D);}
+    a.needsUpdate=true;if(aspect<1)g.userData.body.scale.set(.074,.154,1);else g.userData.body.scale.set(.154,.074,1);}
+  function showFrusta(list,dt){const seen=new Set();
+    for(const p of list){const c=p.presence.c;if(!okPose(c,9)||p.presence.f)continue;const g=frustumFor(p.peer);seen.add(p.peer);shapeFrustum(g,c[7],c[8]);
+      setPose(g,c,g.userData.fresh?1:1-Math.exp(-dt*14));g.userData.fresh=false;g.scale.setScalar(1/world.scale.x);}
+    for(const[id,g]of frusta)if(!seen.has(id)){world.remove(g);frusta.delete(id);}}
+  // ---- the design travels whole: it is small, and the newest edit wins
+  const emit=(topic,data)=>{try{room.emit(topic,data).catch(()=>{});}catch(e){}};
+  function pushState(){if(!room)return;const s=snapshot();sentSnap=s;const n=Math.max(1,Math.ceil(s.length/CH));for(let i=0;i<n;i++)emit('st',{sv,i,n,s:s.slice(i*CH,(i+1)*CH)});}
+  function applyState(json,v){
+    const before=lastSnap;try{restore(json,true);}catch(e){return;}
+    if(!adopted){adopted=true;if(before&&before!==json){hist.push(before);toast('Loaded the room’s design. Undo brings yours back');}}
+    if(state.ui.sel!=null&&!state.ops.some(o=>o.uid===state.ui.sel))state.ui.sel=state.ops.length?state.ops[0].uid:null;
+    sv=v;lastSnap=snapshot();sentSnap=lastSnap;quietUntil=performance.now()+2500;persist();
+    refreshTab();updateGhost();scheduleRebuild();vrHook.dirty=true;
+  }
+  function onState(d){
+    if(!d||typeof d.sv!=='number'||!Number.isInteger(d.n)||d.n<1||d.n>60||!Number.isInteger(d.i)||d.i<0||d.i>=d.n||typeof d.s!=='string'||d.s.length>CH)return;
+    if(d.sv<=sv)return;if(!inbox||inbox.sv!==d.sv)inbox={sv:d.sv,n:d.n,parts:[],got:0};
+    if(inbox.parts[d.i]==null){inbox.parts[d.i]=d.s;inbox.got++;}
+    if(inbox.got>=inbox.n){const json=inbox.parts.join(''),v=inbox.sv;inbox=null;applyState(json,v);}
+  }
+  function onNeed(d){const now=performance.now();if(!d||typeof d.sv!=='number'||sv<=0||sv<d.sv||now-askedAt<500)return;askedAt=now;pushState();}
+  function myPresence(){
+    const p={v:1,r:VR.on?'xr':'flat',sv,h:null,w:null,L:null,R:null,u:null,z:null,m:'',c:null,f:0};
+    if(VR.on){const hc=renderer.xr.isPresenting?renderer.xr.getCamera(camera):camera;hc.updateMatrixWorld();world.updateMatrixWorld();
+      p.h=pose7(hc);p.w=pose7(world).concat([r7(world.scale.x)]);
+      for(const h of VR.hands){if(!h.source||(h.hand!=='left'&&h.hand!=='right'))continue;h.grip.updateMatrixWorld();const gp=h.source.gamepad,B=i=>gp&&gp.buttons[i]&&gp.buttons[i].pressed?1:0;
+        p[h.hand==='left'?'L':'R']=pose7(h.grip).concat([B(0)|B(1)<<1|B(4)<<2|B(5)<<3]);}
+      if(VR.line.visible){const a=VR.line.geometry.attributes.position;p.z=[a.getX(0),a.getY(0),a.getZ(0),a.getX(1),a.getY(1),a.getZ(1)].map(r4).concat([VR.dot.visible?1:0]);}
+      p.u=[TABS.indexOf(VR.tab),vrTools.indexOf(VR.tool),state.ui.view==='framing'?1:0,state.ui.showCut?1:0,state.ui.showFast!==false?1:0,VR.hov,VR.main==='right'?1:0,VR.labels?1:0,state.ui.sel==null?-1:state.ui.sel,VR.hovH?1:0];
+      p.m=VR.msg?String(VR.msg).slice(0,90):'';
+    }else{camera.updateMatrixWorld();p.c=pose7(camera).concat([Math.round(camera.fov),r4(camera.aspect)]);p.f=spect&&S.view==='first'?1:0;}
+    return p;
+  }
+  // ---- a flat screen that finds a headset in the room follows it
+  function startWatch(id){
+    spect={peer:id,key:'',keep:{hands:VR.hands,main:VR.main,tab:VR.tab,tool:VR.tool,labels:VR.labels,far:camera.far,view:state.ui.view},fit:false};
+    vrProps();VR.hands=S.hands;rig.visible=true;VR.menu.visible=true;VR.slab.visible=true;
+    document.body.classList.add('watching');$('#watchBar').hidden=false;$('#roomBox').hidden=true;setView(S.view);resize();
+  }
+  function stopWatch(){
+    if(!spect)return;const k=spect.keep;spect=null;
+    if(VR.menu.parent)VR.menu.parent.remove(VR.menu);VR.hands=k.hands;VR.main=k.main;VR.tab=k.tab;VR.tool=k.tool;VR.labels=k.labels;VR.wsOver=0;VR.hov=-1;VR.msg='';
+    rig.visible=false;S.head.visible=false;VR.handles.visible=false;VR.slab.visible=false;ground.visible=true;if(gridLines)gridLines.visible=true;camera.far=k.far;
+    document.body.classList.remove('watching','panelopen');$('#watchBar').hidden=true;$('#roomBox').hidden=false;$('#panelBtn').textContent='Show panel';$('#splitLine').hidden=true;resize();updateGhost();
+  }
+  function watch(peer,dt){
+    const q=peer.presence,first=!spect||spect.peer!==peer.peer;if(first){stopWatch();startWatch(peer.peer);}
+    const k=first?1:1-Math.exp(-dt*16),u=Array.isArray(q.u)?q.u:[];
+    if(okPose(q.w,8)){const sc=clampN(q.w[7],1e-5,10);setPose(S.hw,q.w,k);S.hw.scale.setScalar(k>=1?sc:S.hw.scale.x+(sc-S.hw.scale.x)*k);S.hw.updateMatrix();rig.matrix.copy(S.hw.matrix).invert();rig.matrixWorldNeedsUpdate=true;VR.wsOver=S.hw.scale.x;}
+    S.head.visible=okPose(q.h,7);if(S.head.visible)setPose(S.head,q.h,k);
+    const main=u[6]===0?'left':'right',tab=TABS[u[0]]||'shapes',tool=vrTools[u[1]]||'shape',key=[main,tab,tool,u[5],u[7],u[9],q.m||'',state.ui.sel,state.ui.view].join('|');
+    for(const[h,a]of[[S.hands[0],q.R],[S.hands[1],q.L]]){const on=okPose(a,8);if(on)setPose(h.grip,a,h.grip.visible?k:1);h.grip.visible=on;}
+    if(main!==VR.main||VR.menu.parent!==S.hands[main==='right'?1:0].grip){VR.main=main;vrDock();}
+    VR.tab=tab;VR.tool=tool;VR.hov=Number.isInteger(u[5])?u[5]:-1;VR.labels=!!u[7];VR.hovH=null;VR.msg=typeof q.m==='string'?q.m.slice(0,90):'';
+    // their view of the model: Model or Framing, cutters, screws, the picked shape
+    const view=u[2]?'framing':'model';if(view!==state.ui.view){state.ui.view=view;syncView();}
+    if(!!u[3]!==!!state.ui.showCut){state.ui.showCut=!!u[3];$('#showCut').checked=state.ui.showCut;updateGhost();}
+    if(!!u[4]!==(state.ui.showFast!==false)){state.ui.showFast=!!u[4];$('#showFast').checked=state.ui.showFast;buildFrameMeshes();}
+    if(Number.isInteger(u[8])&&u[8]>=0&&u[8]!==state.ui.sel&&state.ops.some(o=>o.uid===u[8])){state.ui.sel=u[8];updateGhost();}
+    const now=performance.now();if((key!==spect.key||vrHook.dirty)&&now-S.drawn>110){spect.key=key;S.drawn=now;vrDrawMenu();vrTags();}
+    S.line.visible=okPose(q.z,7);S.dot.visible=S.line.visible&&!!q.z[6];
+    if(S.line.visible){const a=S.line.geometry.attributes.position;a.setXYZ(0,q.z[0],q.z[1],q.z[2]);a.setXYZ(1,q.z[3],q.z[4],q.z[5]);a.needsUpdate=true;S.dot.position.set(q.z[3],q.z[4],q.z[5]);}
+    vrHandles();ground.visible=false;if(gridLines)gridLines.visible=false;
+    // the first time, pull back far enough to see the person as well as the model
+    if(!spect.fit&&S.head.visible&&RES){spect.fit=true;rig.updateMatrixWorld(true);const b=RES.bbox,c=new V3((b[0]+b[3])/2,(b[1]+b[4])/2,(b[2]+b[5])/2),hp=S.head.getWorldPosition(new V3());
+      const mid=c.clone().lerp(hp,.45),rad=Math.max(c.distanceTo(hp)*.7,Math.hypot(b[3]-b[0],b[5]-b[2])*.6),dir=camera.position.clone().sub(controls.target).normalize();if(dir.y<.25){dir.y=.35;dir.normalize();}
+      const hv=camera.fov*Math.PI/360,half=camera.aspect<1?Math.atan(Math.tan(hv)*camera.aspect):hv,dist=rad/Math.tan(half)*1.1;controls.target.copy(mid);camera.position.copy(mid).addScaledVector(dir,dist);camera.far=Math.max(spect.keep.far,dist*8);camera.updateProjectionMatrix();controls.update();}
+  }
+  const VIEW={third:'View: floating',first:'View: their eyes',split:'View: both'};
+  function setView(v){S.view=v;$('#viewBtn').textContent=VIEW[v];$('#splitLine').hidden=v!=='split'||!spect;}
+  function render(){
+    const fp=!renderer.xr.isPresenting&&spect&&S.view!=='third'&&S.head.visible;
+    const sz=renderer.getSize(new THREE.Vector2()),w=sz.x,h=sz.y,split=fp&&S.view==='split',hh=Math.floor(h/2);
+    if(!renderer.xr.isPresenting){const asp=w/Math.max(1,split?h-hh:h);if(Math.abs(camera.aspect-asp)>1e-3){camera.aspect=asp;camera.updateProjectionMatrix();}}
+    if(!fp){renderer.render(scene,camera);return;}
+    rig.updateMatrixWorld(true);S.head.matrixWorld.decompose(fpCam.position,fpCam.quaternion,nS);fpCam.near=.02*nS.x;fpCam.far=600*nS.x;fpCam.aspect=split?w/hh:w/h;fpCam.fov=clampN(2*Math.atan(Math.tan(.74)/fpCam.aspect)*180/Math.PI,60,112);fpCam.updateProjectionMatrix();
+    if(split){renderer.setScissorTest(true);renderer.setViewport(0,hh,w,h-hh);renderer.setScissor(0,hh,w,h-hh);renderer.render(scene,camera);renderer.setViewport(0,0,w,hh);renderer.setScissor(0,0,w,hh);}
+    S.head.visible=false;renderer.render(scene,fpCam);S.head.visible=true;
+    if(split){renderer.setScissorTest(false);renderer.setViewport(0,0,w,h);}
+  }
+  function hook(r){room=r;r.on('st',m=>{if(!m.sameTab)onState(m.data);});r.on('need',m=>{if(!m.sameTab)onNeed(m.data);});}
+  function frame(t){
+    const dt=Math.min(.1,Math.max(0,(t-(t0||t))/1000));t0=t;
+    if(!room){if(spect)stopWatch();return;}
+    const now=performance.now();let peers=[];try{peers=room.peers()||[];}catch(e){peers=[];}
+    if(peers.length!==seenN){seenN=peers.length;$('#roomN').textContent=seenN>1?'×'+seenN:'';vrHook.dirty=true;}
+    // a headset going into VR speaks for the room
+    if(VR.on&&!wasVR){if(!sv)sv=Date.now();pushState();}wasVR=VR.on;
+    // did this device change the design? In VR every change is the wearer's; on a screen it has to follow a touch or a key
+    if(now-snapAt>300){snapAt=now;const s=snapshot();
+      if(sentSnap===null||now<quietUntil)sentSnap=s;
+      else if(s!==sentSnap){if(VR.on||now-lastInput<4000){sv=Math.max(sv+1,Date.now());pushState();}else sentSnap=s;}}
+    let pres=null,want=0;const flats=[];
+    for(const p of peers){const q=p.presence;if(p.sameTab||!q||q.v!==1)continue;if(q.r==='xr'&&!pres)pres=p;else if(q.r==='flat')flats.push(p);if(typeof q.sv==='number'&&q.sv>sv&&q.sv>want)want=q.sv;}
+    if(want&&now>needAt&&!(inbox&&inbox.sv>=want)){needAt=now+900;emit('need',{sv:want});}
+    if(!VR.on&&pres)watch(pres,dt);else if(spect)stopWatch();
+    showFrusta(VR.on?flats:[],dt);
+    presAcc+=dt;if(presAcc>.066){presAcc=0;const s=JSON.stringify(myPresence());if(s!==lastPres){lastPres=s;try{room.presence(JSON.parse(s)).catch(()=>{});}catch(e){}}}
+  }
+  function join(c){
+    code=c;status='connecting';try{localStorage.setItem(LSR,c);}catch(e){}$('#roomIn').value=c;
+    if(room&&room.leave)room.leave();room=null;lastPres='';inbox=null;seenN=-1;vrHook.dirty=true;
+    const st=s=>{status=s;vrHook.dirty=true;};
+    const go=()=>{if(code!==c)return;if(window.__roomFactory)return hook(window.__roomFactory(c,st));if(!window.Peer){st('off');return;}hook(peerRoom(c,st));};
+    if(window.Peer||window.__roomFactory)return go();
+    const sc=document.createElement('script');sc.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';sc.onload=go;sc.onerror=()=>st('off');document.head.appendChild(sc);
+  }
+  function start(){
+    if(!HAS)return;let saved='';try{saved=localStorage.getItem(LSR)||'';}catch(e){}
+    const fromHash=(location.hash||'').replace(/\D/g,'').slice(0,4);
+    join(fromHash.length===4?fromHash:saved.length===4?saved:String(1000+Math.floor(Math.random()*9000)));
+    const box=$('#roomBox'),inp=$('#roomIn');box.hidden=false;inp.value=code;
+    inp.addEventListener('input',()=>{const v=inp.value.replace(/\D/g,'').slice(0,4);inp.value=v;if(v.length===4&&v!==code){join(v);inp.blur();toast('Room '+v);}});
+    for(const ev of['pointerdown','keydown','input','change','wheel'])document.addEventListener(ev,()=>{lastInput=performance.now();},true);
+    $('#viewBtn').addEventListener('click',()=>{setView(S.view==='third'?'first':S.view==='first'?'split':'third');});
+    $('#panelBtn').addEventListener('click',()=>{const on=!document.body.classList.contains('panelopen');document.body.classList.toggle('panelopen',on);$('#panelBtn').textContent=on?'Hide panel':'Show panel';resize();});
+    vrHook.pre=stopWatch;
+  }
+  vrHook.net=t=>{try{frame(t);}catch(e){if(!S.err){S.err=1;console.error(e);}}render();};
+  window.__net={get S(){return S;},get rig(){return rig;},get fp(){return fpCam;},dbg:()=>JSON.stringify(Object.assign(Net.debug(),{ops:state.ops.length,L:state.stock.L,ui:state.ui.view}))};
+  return{start,join,has:()=>HAS,watching:()=>!!spect,code:()=>code,
+    label(){const n=room?(room.peers()||[]).length:0,here=n>1?n+' devices here':'only this device so far';return status==='open'?'Room '+code+': '+here:status==='off'?'Room '+code+': offline':'Room '+code+': connecting';},
+    debug:()=>({sv,status,spect:!!spect,view:S.view,peers:room?room.peers().map(p=>(p.sameTab?'me':p.peer.slice(0,4))+':'+(p.presence&&p.presence.r)):[],frusta:frusta.size})};
+})();
+/* ---------- stretch a shape by hand ----------
+   Yellow arrows sit on the picked shape. Pull one and that size follows the pull. The same handles work in the headset
+   (grip) and on a flat screen (mouse or finger).
+   Each handle: key = which number it changes, p = where it sits and d = which way it pulls, both in the shape's own frame,
+   sh = how much of the change the middle moves (½ keeps the far end where it is), gain 2 = grows both ways about the middle,
+   ax = sits on the axis, so it is drawn a little way off the end to stay clear of a radius arrow. */
+function dimHandles(op){
+  const H=[],a=(key,p,d,o)=>H.push(Object.assign({key,p,d,sh:0,gain:1,ax:false},o));
+  if(op.type==='cyl'){a('r',[op.r,0,0],[1,0,0]);a('len',[0,op.len/2,0],[0,1,0],{sh:.5,ax:true});a('len',[0,-op.len/2,0],[0,-1,0],{sh:.5,ax:true});}
+  else if(op.type==='cone'){a('r1',[op.r1,-op.h/2,0],[1,0,0]);a('r2',[op.r2,op.h/2,0],[1,0,0]);a('h',[0,op.h/2,0],[0,1,0],{sh:.5,ax:true});a('h',[0,-op.h/2,0],[0,-1,0],{sh:.5,ax:true});}
+  else if(op.type==='box'){[['sx',0],['sy',1],['sz',2]].forEach(([k,i])=>{for(const s of[1,-1]){const p=[0,0,0],d=[0,0,0];p[i]=s*op[k]/2;d[i]=s;a(k,p,d,{sh:.5});}});}
+  else if(op.type==='bowl'){const rg=ENG.bowlRings(op),lo=rg[0],hi=rg[rg.length-1],add=op.mode==='add',flat=add?hi:lo,rim=add?lo:hi;
+    a('r',[flat[0],flat[1],0],[1,0,0]);a('R',[rim[0],rim[1],0],[0,0,1],{at:[0,rim[1],rim[0]]});a('h',[0,hi[1],0],[0,1,0],{ax:true});}
+  else if(op.type==='nurbs'){const hs=f=>{let s=0,n=0;op.pts.forEach((p,k)=>{if(f(k%op.nu,Math.floor(k/op.nu))){s+=p.h||0;n++;}});return n?s/n:0;};
+    a('sx',[op.sx/2,hs(x=>x===op.nu-1),0],[1,0,0],{gain:2});a('sz',[0,hs((x,z)=>z===op.nv-1),op.sz/2],[0,0,1],{gain:2});}
+  for(const h of H)if(h.at){h.p=h.at;delete h.at;}
+  return H;
+}
+function dimFrame(op){const nb=op.type==='nurbs';return{c:new V3(op.x||0,nb?(op.lift||0):(op.y||0),op.z||0),q:new THREE.Quaternion().setFromEuler(nb?new THREE.Euler(0,(op.ry||0)*Math.PI/180,0,'YXZ'):eul(op))};}
+// where a handle is drawn, in model inches (no floor lift), and which way its arrow points
+function dimPose(op,hd,gap,F){F=F||dimFrame(op);const p=new V3(...hd.p),d=new V3(...hd.d);if(hd.ax)p.addScaledVector(d,gap);
+  return{p:p.applyQuaternion(F.q).add(F.c),q:F.q.clone().multiply(new THREE.Quaternion().setFromUnitVectors(new V3(0,1,0),d)),d:d.applyQuaternion(F.q)};}
+function dimLabel(op,key){const r=vrParamRows(op).find(r=>r[1]===key);return r?r[0]:key;}
+function dimStart(op,hd){const F=dimFrame(op),r=vrParamRows(op).find(r=>r[1]===hd.key)||[0,0,0,1e4];
+  return{kind:'dim',op,hd,v0:+op[hd.key]||0,c0:F.c,dw:new V3(...hd.d).applyQuaternion(F.q),lo:r[2],hi:r[3]};}
+// delta = how far the pull has gone along the arrow, in inches
+function dimApply(H,delta,step){const op=H.op,hd=H.hd;let v=Math.round((H.v0+delta*hd.gain)/step)*step;v=Math.max(H.lo,Math.min(H.hi,v));if(v===op[hd.key])return false;op[hd.key]=v;
+  if(hd.sh){const w=H.dw.clone().multiplyScalar((v-H.v0)*hd.sh),r=x=>Math.round(x*1000)/1000;op.x=r(H.c0.x+w.x);op.y=r(H.c0.y+w.y);op.z=r(H.c0.z+w.z);}
+  return true;}
+function dimArrow(){const g=new THREE.ConeGeometry(.5,1.3,14);g.translate(0,.25,0);const m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0xFFC914,depthTest:false,transparent:true}));
+  const e=new THREE.LineSegments(new THREE.EdgesGeometry(g,30),new THREE.LineBasicMaterial({color:0x111317,depthTest:false,transparent:true}));e.renderOrder=31;e.frustumCulled=false;m.add(e);m.renderOrder=30;m.frustumCulled=false;return m;}
+function dimBall(){const m=new THREE.Mesh(new THREE.SphereGeometry(.6,18,12),new THREE.MeshBasicMaterial({color:0xFFC914,depthTest:false,transparent:true}));
+  const e=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.OctahedronGeometry(.62,0)),new THREE.LineBasicMaterial({color:0x111317,depthTest:false,transparent:true}));e.renderOrder=31;m.add(e);m.renderOrder=30;m.frustumCulled=false;return m;}
+
+/* ---- on a flat screen: arrows and a ball on the picked shape, sized to stay finger-big at any zoom ---- */
+const dimGroup=new THREE.Group();dimGroup.visible=false;world.add(dimGroup);
+const dimM=[];let dimHot=-1,dimDrag=null;
+function dimOp(){if(!state||VR.on||Net.watching()||state.ui.tab!=='shape'||(state.ui.view==='framing'&&!state.ui.showCut))return null;const op=state.ops.find(o=>o.uid===state.ui.sel);return op&&op.on&&op.type!=='fillet'?op:null;}
+const dimCoarse=()=>matchMedia('(pointer:coarse)').matches;
+function dimTick(){
+  const op=dimOp();dimGroup.visible=!!op;if(!op){dimHot=-1;return;}
+  const L=dimHandles(op),F=dimFrame(op),n=L.length+1,el=renderer.domElement,ws=world.scale.x,px=dimCoarse()?12:10;
+  while(dimM.length>n){const m=dimM.pop();dimGroup.remove(m);}
+  dimGroup.position.y=(RES&&RES.lift)||0;
+  const size=p=>{const d=camera.position.distanceTo(_dv.copy(p).applyMatrix4(dimGroup.matrixWorld));return 2*d*Math.tan(camera.fov*Math.PI/360)/Math.max(1,el.clientHeight)*px/.5/ws;};
+  for(let i=0;i<n;i++){const ball=i===0;let m=dimM[i];if(!m||m.userData.ball!==ball){if(m)dimGroup.remove(m);m=ball?dimBall():dimArrow();m.userData.ball=ball;dimM[i]=m;dimGroup.add(m);}
+    if(ball){m.position.copy(F.c);if(op.type==='nurbs')m.position.y+=Math.max(op.hi||0,6);m.userData.hd=null;}
+    else{const hd=L[i-1],s0=size(_dv2.copy(new V3(...hd.p)).applyQuaternion(F.q).add(F.c)),P=dimPose(op,hd,s0*1.9,F);m.position.copy(P.p);m.quaternion.copy(P.q);m.userData.hd=hd;}
+    m.userData.op=op;m.scale.setScalar(size(m.position)*(dimHot===i||(dimDrag&&dimDrag.i===i)?1.35:1));}
+}
+const _dv=new THREE.Vector3(),_dv2=new THREE.Vector3();
+// the handle under the pointer, if any (nearest on screen, with a finger-sized reach)
+function dimPickAt(ev){if(!dimGroup.visible)return-1;const r=renderer.domElement.getBoundingClientRect(),reach=ev.pointerType==='touch'?30:18;let best=-1,bd=reach;
+  dimM.forEach((m,i)=>{m.getWorldPosition(_dv).project(camera);if(_dv.z>1)return;const x=(_dv.x+1)/2*r.width+r.left,y=(1-_dv.y)/2*r.height+r.top,d=Math.hypot(ev.clientX-x,ev.clientY-y);if(d<bd){bd=d;best=i;}});return best;}
+// how far along a line (through o, unit direction u) the pointer ray comes closest; null when looking straight down the line
+function dimAlong(R,o,u){const w=o.clone().sub(R.origin),b=u.dot(R.direction),den=1-b*b;if(den<.03)return null;return(b*R.direction.dot(w)-u.dot(w))/den;}
+function dimSync(op,keys){for(const k of keys){const path='op.'+op.uid+'.'+k,v=op[k];body.querySelectorAll(`[data-path="${path}"]`).forEach(el=>el.value=el.type==='number'?numStr(v):v);const ft=body.querySelector(`[data-ft="${path}"]`);if(ft)ft.textContent=fft(v);}}
+function dimDown(ev){const i=dimPickAt(ev);if(i<0)return false;const m=dimM[i],op=m.userData.op,hd=m.userData.hd,o=m.getWorldPosition(new V3());
+  if(!hd){const pl=new THREE.Plane(new V3(0,1,0),-o.y),p=new V3();if(!ray.ray.intersectPlane(pl,p))return false;dimDrag={i,op,move:true,pl,off:new V3(op.x||0,0,op.z||0).sub(p.divideScalar(world.scale.x))};}
+  else{const H=dimStart(op,hd),u=H.dw.clone().transformDirection(world.matrixWorld),s0=dimAlong(ray.ray,o,u);if(s0==null){toast('Turn the view a little to pull this arrow');return true;}dimDrag=Object.assign(H,{i,o,u,s0});}
+  controls.enabled=false;renderer.domElement.style.cursor='grabbing';return true;}
+function dimMove(){const D=dimDrag,op=D.op;let ch=false;
+  if(D.move){const p=new V3();if(ray.ray.intersectPlane(D.pl,p)){p.divideScalar(world.scale.x).add(D.off);const x=Math.round(p.x*2)/2,z=Math.round(p.z*2)/2;if(x!==op.x||z!==op.z){op.x=x;op.z=z;ch=true;}}}
+  else{const s=dimAlong(ray.ray,D.o,D.u);if(s!=null)ch=dimApply(D,(s-D.s0)/world.scale.x,.5);}
+  if(ch){dimSync(op,D.move?['x','z']:[D.hd.key,'x','y','z']);if(!D.move)toast(dimLabel(op,D.hd.key)+' '+fin(op[D.hd.key]));updateGhost();scheduleRebuild();}}
+function dimUp(){dimDrag=null;controls.enabled=true;renderer.domElement.style.cursor='';pushHist();refreshTab();}
+function dimHover(ev){const i=dimPickAt(ev);if(i!==dimHot){dimHot=i;renderer.domElement.style.cursor=i>=0?'grab':'';}}
+window.__dim={M:dimM,G:dimGroup,frame:dimFrame,camera,sel:()=>state.ops.find(o=>o.uid===state.ui.sel),
+  add:t=>{const o=mkOp(t,newOpDefaults(t));state.ops.push(o);state.ui.sel=o.uid;state.ui.tab='shape';updateGhost();refreshTab();scheduleRebuild();return o.uid;},
+  pop:()=>{state.ops.pop();state.ui.sel=null;updateGhost();scheduleRebuild();}};
 /* ---------- events: panel ---------- */
 document.querySelector('.tabs').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(!b)return;state.ui.tab=b.dataset.tab;buildEdges();setHover(-1);body.scrollTop=0;if(state.ui.tab==='build'&&framingDirty&&RES){renderTabs();body.innerHTML='<div class="empty">Cutting every piece to the surface…</div>';const st=statusEl.textContent;setStatus('Framing…','busy');setTimeout(()=>{refreshTab();buildFrameMeshes();setStatus(st);},40);return;}refreshTab();});
 body.addEventListener('input',e=>{
@@ -3128,8 +3488,8 @@ body.addEventListener('click',e=>{
   if(t.dataset.etool){state.ui.etool=t.dataset.etool;buildEdges();setHover(-1);refreshTab();return;}
   if(t.dataset.rmfil){const i=state.ops.findIndex(o=>o.uid==t.dataset.rmfil);if(i>=0){state.ops.splice(i,1);toast('Fillet removed · Undo to restore');refreshTab();scheduleRebuild();pushHist();}return;}
   if(t.dataset.cop==='auto'){const n=autoLips();copChanged();refreshTab();pushHist();toast(n?`Added ${n} lip run${n>1?'s':''}`:'No new lips found at the top of the ramp');return;}
-  if(t.dataset.cop==='clear'){state.cop.runs=[];copChanged();refreshTab();pushHist();return;}
-  if(t.dataset.rmrun!=null){state.cop.runs.splice(+t.dataset.rmrun,1);copChanged();refreshTab();pushHist();return;}
+  if(t.dataset.cop==='clear'){state.cop.runs=[];state.cop.skip=[];copChanged();refreshTab();pushHist();return;}
+  if(t.dataset.rmrun!=null){{const rr=state.cop.runs[+t.dataset.rmrun];if(rr)(state.cop.skip=state.cop.skip||[]).push(rr.fa+'/'+rr.fb);}state.cop.runs.splice(+t.dataset.rmrun,1);copChanged();refreshTab();pushHist();return;}
   if(t.dataset.modsel){const k=t.dataset.modsel;state.ui.mod=state.ui.mod===k?null:k;if(state.ui.mod)state.ui.view='framing';syncView();refreshTab();return;}
   if(t.dataset.dl==='svg'){offer('rampsmith-rib-layouts.svg',stickSVGFile());return;}
   if(t.dataset.dl==='csv'){offer('rampsmith-cut-list.csv',stickCSV());return;}
@@ -3175,18 +3535,22 @@ let drag=null,down=null;
 view.addEventListener('pointerdown',ev=>{
   if(ev.target!==renderer.domElement)return;
   down={x:ev.clientX,y:ev.clientY};setRay(ev);
+  if(dimDown(ev)){down=null;ev.preventDefault();ev.stopPropagation();return;}
   if(cpMeshes.length){const h=ray.intersectObjects(cpMeshes,false)[0];if(h){const{uid,k}=h.object.userData;const op=state.ops.find(o=>o.uid===uid);
     const n=new THREE.Vector3();camera.getWorldDirection(n);n.y=0;if(n.lengthSq()<1e-6)n.set(0,0,1);n.normalize();
     drag={op,k,plane:new THREE.Plane().setFromNormalAndCoplanarPoint(n,h.object.position.clone()),pid:ev.pointerId};controls.enabled=false;
     selectPoint(uid,k,true);ev.preventDefault();}}
 },true);
 window.addEventListener('pointermove',ev=>{
+  if(dimDrag){setRay(ev);dimMove();return;}
   if(drag){setRay(ev);const p=new THREE.Vector3();if(ray.ray.intersectPlane(drag.plane,p)){const h=Math.round((p.y-(drag.op.lift||0))*4)/4;const pt=drag.op.pts[drag.k];if(pt.h!==h){pt.h=h;
     body.querySelectorAll(`[data-path="op.${drag.op.uid}.pts.${drag.k}.h"]`).forEach(el=>el.value=el.type==='number'?numStr(h):h);const ft=body.querySelector(`[data-ft="op.${drag.op.uid}.pts.${drag.k}.h"]`);if(ft)ft.textContent=fft(h);
     updateGhost();scheduleRebuild();}}return;}
   if(ev.target===renderer.domElement&&!ev.buttons&&state.ui.tab==='coping'){setRay(ev);setHover(pickEdge());}
+  else if(ev.target===renderer.domElement&&!ev.buttons&&ev.pointerType!=='touch')dimHover(ev);
 });
 window.addEventListener('pointerup',ev=>{
+  if(dimDrag){dimUp();return;}
   if(drag){drag=null;controls.enabled=true;pushHist();return;}
   if(!down||ev.target!==renderer.domElement){down=null;return;}
   const moved=Math.hypot(ev.clientX-down.x,ev.clientY-down.y);down=null;
@@ -3210,7 +3574,7 @@ if(saved){try{state=null;restore(saved,false);}catch(e){saved=null;}}
 if(!saved)loadPreset('mini');
 state.ui.view='model';
 lastSnap=snapshot();
-resize();applyTheme();afterLoad(true);
+resize();applyTheme();afterLoad(true);Net.start();
 })();
 
 </script>
