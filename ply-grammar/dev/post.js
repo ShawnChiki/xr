@@ -3439,18 +3439,21 @@ const serModel=()=>({app:'ply-grammar',v:3,S,blocks:blocks.map(serBlock),sketch:
 const undoS=[],redoS=[];let restoring=false;
 function pushUndo(j){if(restoring)return;if(undoS[undoS.length-1]===j)return;undoS.push(j);if(undoS.length>80)undoS.shift();redoS.length=0;updUndo()}
 function updUndo(){const u=$('#undoBtn'),r=$('#redoBtn');if(u)u.disabled=undoS.length<2;if(r)r.disabled=!redoS.length}
-function restoreModel(j){restoring=true;try{const d=typeof j==='string'?JSON.parse(j):j;tc.detach();blocks.slice().forEach(removeBlock);
-    if(d.S){Object.assign(S,d.S);syncInputs()}SK=d.sketch&&d.sketch.v?JSON.parse(JSON.stringify(d.sketch)):EW.emptySketch();SKX={};SKF=null;(d.blocks||[]).forEach(x=>makeBlock(x));skLoad();figLoad(d.figures);notes=Array.isArray(d.notes)?d.notes.filter(n=>n&&Array.isArray(n.p)).map(n=>({...n})):[];notePopClose();select(null);rebuild();drawNotes();renderNotes();
-    try{localStorage.setItem(KEY,JSON.stringify(serModel()))}catch(e){}cloudPush()}finally{restoring=false}}
+/* o.lite: leave the parts to be worked out later (a design arriving from another device mid-drag, or in headset massing);
+   o.live: a design still being dragged on another device (not saved here); o.remote: it came from another device */
+function restoreModel(j,o={}){restoring=true;try{const d=typeof j==='string'?JSON.parse(j):j;tc.detach();blocks.slice().forEach(removeBlock);
+    if(d.S){Object.assign(S,d.S);syncInputs()}SK=d.sketch&&d.sketch.v?JSON.parse(JSON.stringify(d.sketch)):EW.emptySketch();SKX={};SKF=null;(d.blocks||[]).forEach(x=>makeBlock(x));skLoad();figLoad(d.figures);notes=Array.isArray(d.notes)?d.notes.filter(n=>n&&Array.isArray(n.p)).map(n=>({...n})):[];notePopClose();select(null);if(o.lite)dirty=true;else rebuild();drawNotes();renderNotes();
+    if(!o.live){try{localStorage.setItem(KEY,JSON.stringify(serModel()))}catch(e){}cloudPush()}}finally{restoring=false}
+  if(!o.remote)netHook('saved',JSON.stringify(serModel()))}
 function undo(){if(undoS.length<2)return;redoS.push(undoS.pop());restoreModel(undoS[undoS.length-1]);updUndo();toast('Undone')}
 function redo(){if(!redoS.length)return;const j=redoS.pop();undoS.push(j);restoreModel(j);updUndo();toast('Redone')}
-function save(){clearTimeout(saveT);saveT=setTimeout(()=>{const j=JSON.stringify(serModel());try{localStorage.setItem(KEY,j)}catch(e){}pushUndo(j);cloudPush()},300)}
+function save(){clearTimeout(saveT);saveT=setTimeout(()=>{const j=JSON.stringify(serModel());try{localStorage.setItem(KEY,j)}catch(e){}pushUndo(j);cloudPush();netHook('saved',j)},300)}
 function load(){try{let d=JSON.parse(localStorage.getItem(KEY));
     if(d&&d.blocks){Object.assign(S,d.S||{});if(!S.rateSet&&S.scaleDen===1&&!S.shopRate)S.shopRate=FULL_DEF.shopRate;if(d.sketch&&d.sketch.v)SK=d.sketch;d.blocks.forEach(x=>makeBlock(x));skLoad();PG_FIGS=d.figures||null;if(Array.isArray(d.notes))notes=d.notes.filter(n=>n&&Array.isArray(n.p));return true}
     d=JSON.parse(localStorage.getItem('plyGrammar.v1'));               // earlier version: keep the model, reset names to letters
     if(d&&d.blocks){d.blocks.forEach(x=>makeBlock({...x,name:null}));return true}}catch(e){console.warn('saved design did not load',e)}return false}
 /* a fresh start is one obstacle: the app is about getting a single piece right */
-if(!load())makeBlock({p:[0,15,0],s:[40,30,30],cuts:[{p:[0,8,9],n:[0,.85,.53]}]});
+const PG_HAD=load();if(!PG_HAD)makeBlock({p:[0,15,0],s:[40,30,30],cuts:[{p:[0,8,9],n:[0,.85,.53]}]});
 setTimeout(()=>{pushUndo(JSON.stringify(serModel()));drawNotes();renderNotes()},0);
 
 /* ---------------- sketching: Edgewise inside Ply Grammar ----------------
@@ -3907,8 +3910,8 @@ function setFloor(h){XR.floorH=Math.round(Math.max(-.3,Math.min(1.8,h))*100)/100
 function floorStep(on){XR.step=on?'floor':null;floorGrid.visible=on;menu.visible=true;
   if(!on)menuMsg=view!=='mass'?'Panels view: tap a joint to change it, or pull a face or an edge to reshape.':XR.tool==='push'?'Point at a face, an edge or a corner and pull the trigger to drag it.':'Pen: hold the trigger and draw a line in the air.';drawMenu()}
 /* the menu: one canvas on the left controller */
-const MW=1024,MH=1230;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
-const menu=new THREE.Mesh(new THREE.PlaneGeometry(.335*MW/MH,.335),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
+const MW=1024,MH=1360;const menuCv=document.createElement('canvas');menuCv.width=MW;menuCv.height=MH;const menuTex=new THREE.CanvasTexture(menuCv);menuTex.colorSpace=THREE.SRGBColorSpace;menuTex.anisotropy=4;
+const menu=new THREE.Mesh(new THREE.PlaneGeometry(.335*MW/1230,.335*MH/1230),new THREE.MeshBasicMaterial({map:menuTex,transparent:true,depthWrite:false}));menu.visible=false;menu.renderOrder=15;
 let menuMsg='Point at a face, an edge or a corner and pull the trigger to drag it.';
 const MX=menuCv.getContext('2d');
 function mText(s,x,y,size=34,col='#E9ECF1',al='left',wt=600){MX.fillStyle=col;MX.font=`${wt} ${size}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;MX.textAlign=al;MX.textBaseline='middle';MX.fillText(s,x,y)}
@@ -3919,7 +3922,8 @@ function mBtn(x,y,w,h,label,o={}){const id=XR.W.length,hov=XR.hover===id;MX.fill
 function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.beginPath();MX.roundRect(0,0,MW,MH,36);MX.fill();
   mText('Ply Grammar',48,64,52,'#FFFFFF','left',800);const sb=figSel?'figure · '+ftIn(figSel.h):sel?sel.name+(selCut?(selCut.userData.isCarve?' · cut-out':' · cut'):''):'nothing selected';mText(sb,MW-48,64,30,'#F2A01F','right',700);
   const B=(x,y,w,label,o)=>mBtn(x,y,w,104,label,o),c3=[48,356,664],w3=296,c2=[48,510],w2=450;
-  if(XR.step==='floor'){const cm=Math.round(XR.floorH*100);
+  if(XR.step==='room')netKeypad(B,c3,w3);
+  else if(XR.step==='floor'){const cm=Math.round(XR.floorH*100);
     mText('Set the floor',48,160,46,'#FFFFFF','left',800);
     let y=mWrap(`The orange grid is the floor: ${cm===0?'right on your real floor':Math.abs(cm)+' cm '+(cm>0?'above':'below')+' your real floor'}. Pull the right trigger to put the floor where your controller is, or nudge it. Raise it to a table to model standing up.`,48,226,MW-96,32,'#C9CED8',44,5);
     y+=30;B(c3[0],y,w3,'\u25B2  Up 2 cm',{click:()=>setFloor(XR.floorH+.02)});B(c3[1],y,w3,'\u25BC  Down 2 cm',{click:()=>setFloor(XR.floorH-.02)});B(c3[2],y,w3,'Real floor',{click:()=>setFloor(0)});
@@ -3957,7 +3961,8 @@ function drawMenu(){XR.W=[];MX.clearRect(0,0,MW,MH);MX.fillStyle='#15181D';MX.be
     B(c3[0],y,w3,'Tabletop 1:12',{fs:34,on:S.xrScale==='table',click:()=>{S.xrScale='table';scaleLabel();placeWorld();save();drawMenu()}});B(c3[1],y,w3,'Life size',{on:S.xrScale!=='table',click:()=>{S.xrScale='life';scaleLabel();placeWorld();save();drawMenu()}});
     B(c3[2],y,w3,'Add figure',{col:'#6C3BFF',click:()=>{const cam=renderer.xr.getCamera(),p=new V().setFromMatrixPosition(cam.matrixWorld),f=new V(0,0,-1).transformDirection(cam.matrixWorld);f.y=0;f.normalize();
       const at=world.worldToLocal(p.addScaledVector(f,S.xrScale==='table'?.35:1.1)),F=figNew({p:[at.x,figGroundAt(at.x,at.z),at.z],h:69,pose:'stand',ry:Math.atan2(-f.x,-f.z)*180/Math.PI});figSelect(F);save();menuMsg='Figure added in front of you, facing you. Trigger a hand or foot to pose it; grip to carry it.';drawMenu()}});y+=124;
-    B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=150;
+    B(c3[0],y,w3,snap?'Snap on':'Snap off',{on:snap,col:'#19B5A1',click:()=>menuDo('snap')});B(c3[1],y,w3,'Set floor',{click:()=>floorStep(true)});B(c3[2],y,w3,'Recenter',{click:()=>{placeWorld();drawMenu()}});y+=124;
+    netMenuRow(B,y,c3,w3);y+=150;
     {const c=XR.price;B(48,y-26,MW-96,c?`≈ ${money(c.cost)}  ·  ${c.sheets} sheet${c.sheets===1?'':'s'}  ·  ${hours(c.mins)} cutting`:'Price: tap to work it out',{solid:!!c,col:'#15181D',fs:c?38:34,click:()=>{menuMsg='Working out the price…';drawMenu();setTimeout(()=>{freshen();updateSheetsPanel(true);menuMsg='Price updated.';drawMenu()},50)}});y+=124}
     MX.fillStyle='#2A2D34';MX.fillRect(48,y-24,MW-96,3);y=mWrap(menuMsg,48,y+14,MW-96,32,'#FFFFFF',42,view==='build'?4:2)+18;
     /* the how-to stays folded away until the ? is pressed */
@@ -3981,6 +3986,7 @@ function menuDo(k){if(typeof k==='number')k=['box','cut','carve','del','undo','r
   else if(k==='view')setView(view==='mass'?'panels':'mass');else if(k==='snap'){snap=!snap;applySnap();menuMsg=snap?'Snap on: 1 inch and 15°.':'Snap off.'}
   drawMenu()}
 function xrTrigger(c){const mh=menuHit(c);if(mh){if(mh.i>=0){buzz(c,.25,15);XR.W[mh.i].click?.()}return}
+  if(XR.step==='room')return;
   if(XR.step==='floor'){setFloor(XR.floorH+gripPos(c).y-.02);buzz(c,.5,60);return}
   if(!(XR.tool!=='push'&&view==='mass')&&xrFigTrigger(c))return;
   if(figSel){figSelect(null)}
@@ -4053,7 +4059,7 @@ function xrTick(){const now=performance.now(),dt=Math.min(.05,(now-(xrT0||now))/
     const d=U.push;if(d){const t=xrParam(c,d.P,d.n);if(t!=null&&d.t0!=null){const m=pushTo(d,t-d.t0);if(m&&m!==menuMsg){menuMsg=m;drawMenu()}}continue}
     if(!U.line.visible)continue;
     const mh=menuHit(c);if(mh){hov=mh.i;U.line.scale.z=mh.dist;U.dot.position.copy(mh.point);U.dot.visible=true;continue}
-    if(XR.step==='floor')continue;
+    if(XR.step)continue;
     /* pen and eraser work at the tip, so the pointer line only shows on the menu; the corner the tip would catch lights up */
     if(pen){U.line.visible=false;const h=skPick(skTip(c).toArray(),XR.tool==='pen'?skSnapR():.035*skK());if(h&&h.kind==='vert'&&!skHov)skHov=h;continue}
     const h=xrFace(c);if(h){U.line.scale.z=h.dist;U.dot.position.copy(h.W);U.dot.visible=true}}
@@ -4088,9 +4094,11 @@ let tT;function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on
 if(!S.sandSet)S.sanded=innerWidth>=760;
 if(!S.cncDef2){if(S.scaleDen===1){if(S.gap===.5)S.gap=1;if(S.stepdown===.25)S.stepdown=.8}S.cncDef2=true}
 syncInputs();scaleLabel();applyTheme();select(blocks.length===1?blocks[0]:null);rebuild();setView('mass');resize();syncTips();
-renderer.setAnimationLoop(()=>{
+let loopT=0;
+renderer.setAnimationLoop(()=>{const lt=performance.now(),ldt=Math.min(.05,Math.max(.001,(lt-(loopT||lt))/1000));loopT=lt;
   if(!xrMode)orbit.update();
   if(T.anim)testTick(performance.now());
   if(view==='build')asmTick(performance.now());
   if(xrMode)xrTick();
-  renderer.render(scene,camera)});
+  netFrame(ldt);netPreview();
+  if(!netRender())renderer.render(scene,camera)});
