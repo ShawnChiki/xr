@@ -395,16 +395,19 @@ function mergePair(A, B, tol, h) {
   return r;
 }
 
-function buildCurves(strokes, tol) {
+function buildCurves(strokes, tol, creaseFlags) {
+  // creaseFlags[i]: stroke i is a sharp crease; a blended curve is a crease if any stroke in it is
   const h = strokeSpacing(tol);
   TW = Math.max(2, Math.round(0.028 / h));
   const minOv = minOverlap(tol, h);
   const curves = [];
   const grid = new SegGrid(tol);
   const addCurve = (c) => { c.id = curves.length; c.alive = true; finalize(c); curves.push(c); grid.add(c.id, c.ring.P); };
-  for (const raw of strokes) {
+  for (let si = 0; si < strokes.length; si++) {
+    const raw = strokes[si];
     let B = prepStroke(raw, h, tol);
     if (!B) continue;
+    B.cr = !!(creaseFlags && creaseFlags[si]);
     const skip = new Set();
     for (let guard = 0; guard < 12 && B; guard++) {
       finalize(B);
@@ -424,9 +427,9 @@ function buildCurves(strokes, tol) {
         const A = curves[cid];
         const res = mergePair(A, B, tol, h);
         if (!res) { skip.add(cid); continue; }
-        if (res.type === 'merge') { A.alive = false; B = res.curve; }
-        else if (res.type === 'trimB') { B = res.curve; skip.add(cid); }
-        else { A.alive = false; if (res.curve) { addCurve(res.curve); skip.add(res.curve.id); } }
+        if (res.type === 'merge') { A.alive = false; res.curve.cr = A.cr || B.cr; B = res.curve; }
+        else if (res.type === 'trimB') { if (res.curve) res.curve.cr = B.cr; B = res.curve; skip.add(cid); }
+        else { A.alive = false; if (res.curve) { res.curve.cr = A.cr; addCurve(res.curve); skip.add(res.curve.id); } }
         acted = true; break;
       }
       if (!acted) break;
@@ -460,7 +463,7 @@ function buildCurves(strokes, tol) {
     if (P1.length < 2 || P2.length < 2) { A.c.linkSkip = true; break; }
     const r = resampleOpen(P1.concat(P2), W1.concat(W2), h);
     const merged = finalize(tryClose({ pts: smoothPts(r.pts, 2, false), w: r.w, closed: false }, h, tol));
-    merged.id = A.c.id; merged.alive = true;
+    merged.id = A.c.id; merged.alive = true; merged.cr = A.c.cr || B.c.cr;
     live = live.filter((c) => c !== A.c && c !== B.c); live.push(merged);
   }
   return live;
@@ -506,17 +509,19 @@ function dirAlong(P, fromEnd, r) {
   return [0, 0, 0];
 }
 
-function buildNetwork(curves, tol) {
+function buildNetwork(curves, tol, opt) {
+  opt = opt || {};
   // (inside, `curves` becomes the end-extended copies; the originals are returned for display)
   const h = strokeSpacing(tol);
   TW = Math.max(2, Math.round(0.028 / h));
   const N = curves.length;
   for (const c of curves) if (!c.ring) finalize(c);
   // open curves reach a little past their ends (in the direction they were heading) so undershoots still connect
-  const EXT = 0.75 * tol;
+  const EXT = Math.min((opt.ext || 0.75) * tol, 0.15);
   const srcCurves = curves;
   curves = srcCurves.map((c) => {
     if (c.closed) return { pts: c.pts, closed: true, ring: c.ring, s0: -Infinity, s1: Infinity };
+    if (c.virtual) return { pts: c.pts, closed: false, ring: c.ring, s0: 0, s1: c.ring.L };   // guessed pieces already end on their nodes
     const P = c.pts, d0 = endHeading(P, c.ring.cum, false, tol), d1 = endHeading(P, c.ring.cum, true, tol);
     const k = Math.max(1, Math.round(EXT / h)), pre = [], post = [];
     for (let i = k; i >= 1; i--) pre.push(add(P[0], mul(d0, (EXT * i) / k)));
@@ -555,6 +560,18 @@ function buildNetwork(curves, tol) {
       if (e === arr.length || arr[e].k - arr[e - 1].k > 2) {
         let b = arr[s];
         for (let x = s + 1; x < e; x++) if (arr[x].d < b.d) b = arr[x];
+        // two lines running along each other here (one continuing the other): join where a line actually ends, not at a random spot of the overlap
+        if (Math.abs(dot(segTangent(Ri.P, Math.min(b.k, Ri.P.length - 2)), segTangent(Rj.P, b.seg))) > 0.9) {
+          const ends = [];
+          for (const [cv, R, other] of [[curves[i], Ri, Rj], [curves[j], Rj, Ri]]) if (!cv.closed) for (const sEnd of [cv.s0, cv.s1]) {
+            const pe = sampleAt(R.P, R.cum, sEnd).p; if (closestOnPoly(pe, other.P, other.cum).d < tol) ends.push(pe);
+          }
+          if (ends.length) {
+            const tgt = [0, 0, 0]; for (const pe of ends) { tgt[0] += pe[0] / ends.length; tgt[1] += pe[1] / ends.length; tgt[2] += pe[2] / ends.length; }
+            let bd2 = Infinity;
+            for (let x = s; x < e; x++) { const d2 = dist(Ri.P[arr[x].k], tgt); if (d2 < bd2) { bd2 = d2; b = arr[x]; } }
+          }
+        }
         const pj = lerp(Rj.P[b.seg], Rj.P[b.seg + 1], b.t);
         const sj = Rj.cum[b.seg] + (Rj.cum[b.seg + 1] - Rj.cum[b.seg]) * b.t;
         // refine on curve i around sample k
@@ -620,7 +637,7 @@ function buildNetwork(curves, tol) {
     if (L < 1e-7) return;
     const oa = sub(nodes[a].pos, pts[0]), ob = sub(nodes[b].pos, pts[pts.length - 1]);
     for (let i = 0; i < pts.length; i++) { const f = cum[i] / L; pts[i] = [pts[i][0] + oa[0] * (1 - f) + ob[0] * f, pts[i][1] + oa[1] * (1 - f) + ob[1] * f, pts[i][2] + oa[2] * (1 - f) + ob[2] * f]; }
-    edges.push({ a, b, cids: [cid], pts, alive: true });
+    edges.push({ a, b, cids: [cid], pts, alive: true, cr: !!srcCurves[cid].cr });
   };
   curves.forEach((c, cid) => {
     let list = att[cid].sort((x, y) => x.s - y.s);
@@ -654,7 +671,7 @@ function buildNetwork(curves, tol) {
       const p1 = e1.b === v ? e1.pts : e1.pts.slice().reverse();
       const p2 = e2.a === v ? e2.pts : e2.pts.slice().reverse();
       e1.alive = false; e2.alive = false; nodes[v].alive = false;
-      edges.push({ a: o1, b: o2, cids: [...new Set(e1.cids.concat(e2.cids))], pts: p1.concat(p2.slice(1)), alive: true });
+      edges.push({ a: o1, b: o2, cids: [...new Set(e1.cids.concat(e2.cids))], pts: p1.concat(p2.slice(1)), alive: true, cr: e1.cr || e2.cr });
       changed = true;
     }
   }
@@ -747,10 +764,45 @@ function buildNetwork(curves, tol) {
     const c0 = E[hes[0] >> 1].cids;
     const oneRing = c0.length === 1 && curves[c0[0]].closed && hes.every((x) => E[x >> 1].cids.length === 1 && E[x >> 1].cids[0] === c0[0]);
     const distinct = new Set(fn).size === fn.length;
-    const fill = hes.length >= 3 && hes.length <= 12 && distinct && !oneRing && turning < (hes.length - 0.5) * Math.PI;
+    const fill = hes.length >= 3 && hes.length <= (opt.maxSides || 12) && distinct && !oneRing && turning < (hes.length - 0.5) * Math.PI;
     faces.push({ hes, nodes: fn, n: hes.length, turning, fill, flagged: fill && hes.length !== 4 });
   }
-  return { nodes, edges: E, faces, curves: srcCurves };
+  // --- fill holes: where a line stops at the rim of a many-sided patch and another stops opposite it, guess the missing piece between them ---
+  const virtual = [];
+  if (opt.patch) {
+    const stubs = [], seenStub = new Set(), linked = new Set();
+    for (const e of E) { linked.add(e.a * nodes.length + e.b); linked.add(e.b * nodes.length + e.a); }
+    let eLen = 0; for (const e of E) eLen += dist(nodes[e.a].pos, nodes[e.b].pos); eLen = E.length ? eLen / E.length : 0.1;
+    faces.forEach((f, fi) => {
+      if (!f.flagged || f.n < 5) return;
+      for (let x = 0; x < f.n; x++) {
+        const hv = f.hes[x], nx = f.hes[(x + 1) % f.n], e = E[hv >> 1], v = hv & 1 ? e.a : e.b, list = out[v];
+        const aN = list[pos.get(nx)].ang; let th = list[pos.get(hv ^ 1)].ang - aN; while (th <= 1e-9) th += 2 * Math.PI;
+        for (const o of list) {
+          if (o.he === nx || o.he === (hv ^ 1)) continue;
+          let rel = o.ang + Math.PI - aN; while (rel < 0) rel += 2 * Math.PI; while (rel >= 2 * Math.PI) rel -= 2 * Math.PI;
+          if (rel > 0.2 * th && rel < 0.8 * th && !seenStub.has(v + ':' + o.he)) { seenStub.add(v + ':' + o.he); stubs.push({ v, fi, into: mul(o.d, -1) }); break; }
+        }
+      }
+    });
+    const cand = [];
+    for (let a = 0; a < stubs.length; a++) for (let b = a + 1; b < stubs.length; b++) {
+      const A = stubs[a], B = stubs[b]; if (A.v === B.v || linked.has(A.v * nodes.length + B.v)) continue;
+      const d = dist(nodes[A.v].pos, nodes[B.v].pos); if (d > 3.2 * eLen) continue;
+      const u = norm(sub(nodes[B.v].pos, nodes[A.v].pos)), sa = dot(A.into, u), sb = -dot(B.into, u), need = A.fi === B.fi ? 0.5 : 0.8;
+      if (sa > need && sb > need) cand.push({ a, b, sc: sa + sb - 0.15 * (d / eLen) });
+    }
+    cand.sort((p, q) => q.sc - p.sc); const usedS = new Set();
+    for (const c of cand) {
+      if (usedS.has(c.a) || usedS.has(c.b)) continue; usedS.add(c.a); usedS.add(c.b);
+      const A = stubs[c.a], B = stubs[c.b], p0 = nodes[A.v].pos, p1 = nodes[B.v].pos, L = dist(p0, p1), n = Math.max(3, Math.round(L / h)), pts = [];
+      const t0 = mul(A.into, L * 0.6), t1 = mul(B.into, -L * 0.6);
+      for (let i = 0; i <= n; i++) { const t = i / n, t2 = t * t, t3 = t2 * t, h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t, h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
+        pts.push([0, 1, 2].map((k) => h00 * p0[k] + h10 * t0[k] + h01 * p1[k] + h11 * t1[k])); }
+      virtual.push(pts);
+    }
+  }
+  return { nodes, edges: E, faces, curves: srcCurves, virtual };
 }
 
 // =====================================================================
@@ -760,17 +812,19 @@ function buildCage(net, autoLoops) {
   const fills = net.faces.filter((f) => f.fill);
   let S = Math.max(1, (autoLoops | 0) + 1);
   if (S > 1 && S % 2 === 1 && fills.some((f) => f.n !== 4)) S += 1; // odd-sided patches need an even split
-  const P = [], F = [], flag = [];
+  const P = [], F = [], flag = [], sharp = [], onCurve = [];
   const addV = (p) => { P.push(p[0], p[1], p[2]); return P.length / 3 - 1; };
   const getP = (i) => [P[3 * i], P[3 * i + 1], P[3 * i + 2]];
   const nodeV = new Map(), edgeV = new Map();
-  const nv = (ni) => { if (!nodeV.has(ni)) nodeV.set(ni, addV(net.nodes[ni].pos)); return nodeV.get(ni); };
+  const nv = (ni) => { if (!nodeV.has(ni)) { const id = addV(net.nodes[ni].pos); nodeV.set(ni, id); onCurve[id] = 1; } return nodeV.get(ni); };
   const side = (he) => {
     const ei = he >> 1, e = net.edges[ei];
     if (!edgeV.has(ei)) {
       const ids = [nv(e.a)];
       if (S > 1) { const cum = cumLengths(e.pts), L = cum[e.pts.length - 1]; for (let k = 1; k < S; k++) ids.push(addV(sampleAt(e.pts, cum, (L * k) / S).p)); }
       ids.push(nv(e.b)); edgeV.set(ei, ids);
+      for (const id of ids) onCurve[id] = 1;
+      if (e.cr) for (let k = 0; k + 1 < ids.length; k++) sharp.push(ids[k], ids[k + 1]);
     }
     const ids = edgeV.get(ei);
     return he & 1 ? ids.slice().reverse() : ids;
@@ -803,7 +857,8 @@ function buildCage(net, autoLoops) {
       coons(sides[k].slice(0, m + 1), spokes[k], spokes[pk].slice().reverse(), sides[pk].slice(m), m, true);
     }
   }
-  return { P, F, flag, wire: null, S };
+  const oc = new Array(P.length / 3).fill(0); onCurve.forEach((v, i) => { if (v) oc[i] = 1; });
+  return { P, F, flag, wire: null, S, sharp, onCurve: oc };
 }
 
 function subdivide(mesh) {
@@ -827,6 +882,8 @@ function subdivide(mesh) {
     fedges[f] = es;
   }
   const NE = ev0.length;
+  const sharpE = new Uint8Array(NE), sharp2 = [];
+  if (mesh.sharp) for (let i = 0; i < mesh.sharp.length; i += 2) { const a = mesh.sharp[i], b = mesh.sharp[i + 1], e = emap.get(a < b ? a * NV + b : b * NV + a); if (e !== undefined && !sharpE[e]) { sharpE[e] = 1; sharp2.push(a, NV + e, NV + e, b); } }
   const Q = new Array((NV + NE + NF) * 3);
   // per-vertex accumulators
   const vF = new Float64Array(NV * 3), vFc = new Uint16Array(NV), vR = new Float64Array(NV * 3), vEc = new Uint16Array(NV);
@@ -837,7 +894,7 @@ function subdivide(mesh) {
     const mx = (P[3 * a] + P[3 * b]) / 2, my = (P[3 * a + 1] + P[3 * b + 1]) / 2, mz = (P[3 * a + 2] + P[3 * b + 2]) / 2;
     for (const v of [a, b]) { vR[3 * v] += mx; vR[3 * v + 1] += my; vR[3 * v + 2] += mz; vEc[v]++; }
     const o = (NV + e) * 3;
-    if (efc[e] === 2) { Q[o] = (P[3 * a] + P[3 * b] + efs[3 * e]) / 4; Q[o + 1] = (P[3 * a + 1] + P[3 * b + 1] + efs[3 * e + 1]) / 4; Q[o + 2] = (P[3 * a + 2] + P[3 * b + 2] + efs[3 * e + 2]) / 4; }
+    if (efc[e] === 2 && !sharpE[e]) { Q[o] = (P[3 * a] + P[3 * b] + efs[3 * e]) / 4; Q[o + 1] = (P[3 * a + 1] + P[3 * b + 1] + efs[3 * e + 1]) / 4; Q[o + 2] = (P[3 * a + 2] + P[3 * b + 2] + efs[3 * e + 2]) / 4; }
     else {
       Q[o] = mx; Q[o + 1] = my; Q[o + 2] = mz;
       sharpN[a]++; sharpN[b]++;
@@ -848,7 +905,7 @@ function subdivide(mesh) {
   for (let v = 0; v < NV; v++) {
     const o = 3 * v, n = vEc[v];
     if (n === 0 || vFc[v] === 0) { Q[o] = P[o]; Q[o + 1] = P[o + 1]; Q[o + 2] = P[o + 2]; continue; }
-    if (sharpN[v] === 0) {
+    if (sharpN[v] <= 1) {   // smooth, or the end of a crease (a dart)
       for (let k = 0; k < 3; k++) Q[o + k] = (vF[o + k] / vFc[v] + (2 * vR[o + k]) / n + (n - 3) * P[o + k]) / n;
     } else if (sharpN[v] === 2 && vFc[v] > 1) {
       for (let k = 0; k < 3; k++) Q[o + k] = (6 * P[o + k] + sharpSum[o + k]) / 8;
@@ -869,14 +926,15 @@ function subdivide(mesh) {
       if (e !== undefined) wire.push(a, NV + e, NV + e, b);
     }
   }
-  return { P: Q, F: F2, flag: flag2, wire, S: mesh.S };
+  return { P: Q, F: F2, flag: flag2, wire, S: mesh.S, sharp: sharp2 };
 }
 
 // where each vertex of an all-quad mesh ends up on the limit surface (Catmull-Clark limit masks)
 function limitPositions(mesh) {
   const P = mesh.P, F = mesh.F, NV = P.length / 3, Q = new Array(P.length);
   const sE = new Float64Array(NV * 3), sF = new Float64Array(NV * 3), nE = new Uint16Array(NV), nF = new Uint16Array(NV), sh = new Uint8Array(NV), sS = new Float64Array(NV * 3);
-  const edges = new Map();
+  const edges = new Map(), sk = new Set();
+  if (mesh.sharp) for (let i = 0; i < mesh.sharp.length; i += 2) { const a = mesh.sharp[i], b = mesh.sharp[i + 1]; sk.add(a < b ? a * NV + b : b * NV + a); }
   for (const f of F) {
     const n = f.length;
     for (let i = 0; i < n; i++) {
@@ -889,12 +947,12 @@ function limitPositions(mesh) {
     const a = Math.floor(key / NV), b = key % NV;
     for (const [u, w] of [[a, b], [b, a]]) {
       sE[3 * u] += P[3 * w]; sE[3 * u + 1] += P[3 * w + 1]; sE[3 * u + 2] += P[3 * w + 2]; nE[u]++;
-      if (cnt !== 2) { sh[u]++; sS[3 * u] += P[3 * w]; sS[3 * u + 1] += P[3 * w + 1]; sS[3 * u + 2] += P[3 * w + 2]; }
+      if (cnt !== 2 || sk.has(key)) { sh[u]++; sS[3 * u] += P[3 * w]; sS[3 * u + 1] += P[3 * w + 1]; sS[3 * u + 2] += P[3 * w + 2]; }
     }
   }
   for (let v = 0; v < NV; v++) {
     const o = 3 * v, n = nE[v];
-    if (n && nF[v] && sh[v] === 0) for (let k = 0; k < 3; k++) Q[o + k] = (n * n * P[o + k] + 4 * sE[o + k] + sF[o + k]) / (n * (n + 5));
+    if (n && nF[v] && sh[v] <= 1) for (let k = 0; k < 3; k++) Q[o + k] = (n * n * P[o + k] + 4 * sE[o + k] + sF[o + k]) / (n * (n + 5));
     else if (sh[v] === 2 && nF[v] > 1) for (let k = 0; k < 3; k++) Q[o + k] = (4 * P[o + k] + sS[o + k]) / 6;
     else { Q[o] = P[o]; Q[o + 1] = P[o + 1]; Q[o + 2] = P[o + 2]; }
   }
@@ -904,7 +962,7 @@ function limitPositions(mesh) {
 function fitCage(cage, iters = 14) {
   const T = cage.P, n = T.length; let P = T.slice();
   for (let it = 0; it < iters; it++) {
-    const L = limitPositions(subdivide({ P, F: cage.F, flag: cage.flag, wire: null, S: cage.S }));
+    const L = limitPositions(subdivide({ P, F: cage.F, flag: cage.flag, wire: null, S: cage.S, sharp: cage.sharp }));
     let worst = 0;
     for (let i = 0; i < n; i++) { const d = T[i] - L[i]; P[i] += d; if (Math.abs(d) > worst) worst = Math.abs(d); }
     if (worst < 1e-4) break;
@@ -933,16 +991,51 @@ function tidyCurve(c, amount, h) {
     return [q[0] + f * ((a[0] + b[0]) / 2 - q[0]), q[1] + f * ((a[1] + b[1]) / 2 - q[1]), q[2] + f * ((a[2] + b[2]) / 2 - q[2])];
   });
   for (let it = 0; it < 60; it++) { P = pass(P, lam); P = pass(P, mu); }
-  return finalize({ pts: P, w: c.w, closed, id: c.id, alive: true });
+  return finalize({ pts: P, w: c.w, closed, id: c.id, alive: true, cr: c.cr, virtual: c.virtual });
 }
 
-// full pipeline. params: {tol, autoLoops, smooth, fit, tidy}   fit 0..1 = how far the smooth surface is pulled onto the curves
+// Loose surface guides: lines that say roughly where the surface should be, without adding any topology.
+// Cage points that are not on a drawn topology line are pulled so the surface heads for the guides.
+function applyGuides(mesh, gcurves, tol) {
+  let m = Object.assign({}, mesh, { P: fitCage(mesh, 6) }); m = subdivide(subdivide(m)); const M = limitPositions(m);
+  const reach = Math.max(4 * tol, 0.1), inv = 1 / reach, grid = new Map(), key = (x, y, z) => ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791)) >>> 0;
+  for (let i = 0; i < M.length; i += 3) { const k = key(Math.floor(M[i] * inv), Math.floor(M[i + 1] * inv), Math.floor(M[i + 2] * inv)); let a = grid.get(k); if (!a) { a = []; grid.set(k, a); } a.push(i); }
+  const anchors = [];
+  for (const c of gcurves) for (let j = 0; j < c.pts.length; j += 2) {
+    const g = c.pts[j], cx = Math.floor(g[0] * inv), cy = Math.floor(g[1] * inv), cz = Math.floor(g[2] * inv); let best = reach * reach, bi = -1;
+    for (let x = cx - 1; x <= cx + 1; x++) for (let y = cy - 1; y <= cy + 1; y++) for (let z = cz - 1; z <= cz + 1; z++) { const a = grid.get(key(x, y, z)); if (a) for (const i of a) { const d = (M[i] - g[0]) ** 2 + (M[i + 1] - g[1]) ** 2 + (M[i + 2] - g[2]) ** 2; if (d < best) { best = d; bi = i; } } }
+    if (bi >= 0) anchors.push([M[bi], M[bi + 1], M[bi + 2], g[0] - M[bi], g[1] - M[bi + 1], g[2] - M[bi + 2]]);
+  }
+  if (!anchors.length) return 0;
+  const P = mesh.P, NV = P.length / 3, eps = (0.3 * tol) ** 2, zeros = [];
+  for (let v = 0; v < NV; v++) if (mesh.onCurve[v]) zeros.push(P[3 * v], P[3 * v + 1], P[3 * v + 2]);
+  for (let v = 0; v < NV; v++) {
+    if (mesh.onCurve[v]) continue;
+    const x = P[3 * v], y = P[3 * v + 1], z = P[3 * v + 2]; let sw = 0, sx = 0, sy = 0, sz = 0;
+    for (const a of anchors) { const r2 = (x - a[0]) ** 2 + (y - a[1]) ** 2 + (z - a[2]) ** 2 + eps, w = 1 / (r2 * r2); sw += w; sx += w * a[3]; sy += w * a[4]; sz += w * a[5]; }
+    for (let i = 0; i < zeros.length; i += 3) { const r2 = (x - zeros[i]) ** 2 + (y - zeros[i + 1]) ** 2 + (z - zeros[i + 2]) ** 2 + eps; sw += 1 / (r2 * r2); }
+    if (sw > 0) { P[3 * v] += sx / sw; P[3 * v + 1] += sy / sw; P[3 * v + 2] += sz / sw; }
+  }
+  return anchors.length;
+}
+
+// full pipeline. params: {tol, autoLoops, smooth, fit, tidy, kinds, patch}   fit 0..1 = how far the smooth surface is pulled onto the curves
 function buildAll(strokes, params) {
   const tol = params.tol;
-  let curves = buildCurves(strokes, tol);
-  if (params.tidy > 0) { const h = strokeSpacing(tol); curves = curves.map((c) => tidyCurve(c, params.tidy, h)); }
-  const net = buildNetwork(curves, tol);
-  let mesh = buildCage(net, params.autoLoops);
+  // stroke kinds: bit 0 = loose surface guide (no topology), bit 1 = sharp crease
+  const kinds = params.kinds || [], topo = [], cr = [], gs = [];
+  strokes.forEach((st, i) => { const k = kinds[i] | 0; if (k & 1) gs.push(st); else { topo.push(st); cr.push(!!(k & 2)); } });
+  const hT = strokeSpacing(tol), tidy = (list) => (params.tidy > 0 ? list.map((c) => tidyCurve(c, params.tidy, hT)) : list);
+  let curves = tidy(buildCurves(topo, tol, cr));
+  const gcurves = gs.length ? tidy(buildCurves(gs, tol)) : [];
+  const opt = { ext: params.patch ? +(params.patchExt || 1.25) : 0.75, maxSides: params.patch ? 24 : 12, patch: !!params.patch };
+  let net = buildNetwork(curves, tol, opt), virtual = [];
+  if (opt.patch && net.virtual.length) {   // second pass with the guessed pieces added as curves of their own
+    virtual = net.virtual.map((pts) => finalize({ pts, w: pts.map(() => 1), closed: false, cr: false, virtual: true }));
+    curves = curves.concat(virtual); net = buildNetwork(curves, tol, Object.assign({}, opt, { patch: false }));
+  }
+  let mesh = buildCage(net, gcurves.length ? Math.max(1, params.autoLoops | 0) : params.autoLoops);
+  if (gcurves.length && mesh.F.length) applyGuides(mesh, gcurves, tol);
   const cageFaces = mesh.F.length;
   let levels = params.smooth | 0;
   while (levels > 0 && cageFaces * Math.pow(4, levels) > 70000) levels--;
@@ -954,7 +1047,7 @@ function buildAll(strokes, params) {
   }
   const fills = net.faces.filter((f) => f.fill);
   return {
-    curves, net, mesh, wire: cageWire(mesh), levels, cageP,
+    curves, gcurves, net, mesh, wire: cageWire(mesh), levels, cageP,
     stats: { curves: curves.length, nodes: net.nodes.filter((n) => n.alive).length, patches: fills.length, flagged: fills.filter((f) => f.flagged).length },
   };
 }
@@ -1085,19 +1178,21 @@ function pack(r) {
   }
   const wire = new Float32Array(r.wire.length * 3);
   for (let i = 0; i < r.wire.length; i++) { const v = r.wire[i] * 3; wire[3 * i] = m.P[v]; wire[3 * i + 1] = m.P[v + 1]; wire[3 * i + 2] = m.P[v + 2]; }
-  let total = 0; for (const c of r.curves) total += c.pts.length + (c.closed ? 1 : 0);
-  const curvePts = new Float32Array(total * 3), curveLens = new Uint32Array(r.curves.length); let o = 0;
-  r.curves.forEach((c, ci) => {
+  const all = r.curves.concat(r.gcurves || []), nTopo = r.curves.length;
+  let total = 0; for (const c of all) total += c.pts.length + (c.closed ? 1 : 0);
+  const curvePts = new Float32Array(total * 3), curveLens = new Uint32Array(all.length), curveKind = new Uint8Array(all.length); let o = 0;
+  all.forEach((c, ci) => {
+    curveKind[ci] = ci >= nTopo ? 1 : c.virtual ? 3 : c.cr ? 2 : 0;
     const P = c.closed ? c.pts.concat([c.pts[0]]) : c.pts; curveLens[ci] = P.length;
     for (const p of P) { curvePts[o++] = p[0]; curvePts[o++] = p[1]; curvePts[o++] = p[2]; }
   });
   const usedN = new Set(); for (const e of r.net.edges) { usedN.add(e.a); usedN.add(e.b); }
   const nodes = new Float32Array(usedN.size * 3); o = 0;
   for (const ni of usedN) { const p = r.net.nodes[ni].pos; nodes[o++] = p[0]; nodes[o++] = p[1]; nodes[o++] = p[2]; }
-  return { pos, idx, nMain, nFlag, wire, curvePts, curveLens, nodes, stats: r.stats, levels: r.levels, S: m.S, quads: m.F.length };
+  return { pos, idx, nMain, nFlag, wire, curvePts, curveLens, curveKind, nodes, stats: r.stats, levels: r.levels, S: m.S, quads: m.F.length };
 }
 
-self.QE = { buildAll, makeExample, toOBJ, pack, strokeSpacing };
+self.QE = { buildAll, makeExample, toOBJ, pack, strokeSpacing, eig3: smallestEigenvector };
 })();
 </script>
 
@@ -1110,7 +1205,15 @@ const QE = self.QE;
 const $ = (id) => document.getElementById(id);
 const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
-const C = { ink: '#0b0b0b', white: '#ffffff', blue: '#1238B0', blue2: '#2A55D8', yellow: '#FFD400', red: '#E8212B', green: '#0E9F4A', pink: '#FF2D9B', grey: '#D8D8D8' };
+const C = { ink: '#0b0b0b', white: '#ffffff', blue: '#1238B0', blue2: '#2A55D8', yellow: '#FFD400', red: '#E8212B', green: '#0E9F4A', pink: '#FF2D9B', grey: '#D8D8D8', orange: '#FF7A00', violet: '#7B2FF7', steel: '#8A8D93' };
+const TOOLINFO = {
+  draw: { name: 'Draw', icon: 'pencil', col: C.yellow, hex: 0xFFD400, ink: C.ink }, redraw: { name: 'Redraw', icon: 'redraw', col: C.orange, hex: 0xFF7A00, ink: C.ink },
+  erase: { name: 'Erase', icon: 'eraser', col: C.red, hex: 0xE8212B, ink: '#fff' }, bend: { name: 'Bend', icon: 'bend', col: C.blue, hex: 0x2A7BFF, ink: '#fff' },
+  iron: { name: 'Iron', icon: 'iron', col: C.violet, hex: 0x7B2FF7, ink: '#fff' }, loosen: { name: 'Loosen', icon: 'loosen', col: C.steel, hex: 0x8A8D93, ink: '#fff' },
+  crease: { name: 'Crease', icon: 'crease', col: C.ink, hex: 0x111111, ink: '#fff' }, look: { name: 'Look', icon: 'eye', col: C.yellow, hex: 0xFFD400, ink: C.ink },
+};
+const BRUSH = { erase: 1, iron: 1, loosen: 1 };
+const ballRadius = (tool, ws, reach) => (tool === 'erase' || tool === 'loosen' ? eraserRadiusModel(ws) * ws : tool === 'bend' || tool === 'iron' ? reach : tool === 'crease' ? Math.max(2 * state.tol * ws, 0.03) : state.tol * ws);
 const IN_CLAUDE = (() => { try { return !!(window.claude && window.claude.use); } catch (e) { return false; } })();   // artifact, or a plain web page?
 const HOME = new THREE.Vector3(0, 1.05, -0.5);   // where the model sits in front of you
 const TOL_MIN = 0.003, TOL_MAX = 0.15;
@@ -1118,18 +1221,27 @@ const TOL_MIN = 0.003, TOL_MAX = 0.15;
 // =====================================================================
 // STATE
 // =====================================================================
+const NL = 4;                 // layers
 const state = {
-  strokes: [],               // raw strokes: Float32Array xyz... in model space (metres). Never edited in place.
-  tool: 'draw',              // draw | erase | bend | look (look = orbit, flat screens only). Local to each device.
+  // each layer: raw strokes (Float32Array xyz... in model space, metres; never edited in place; .k = kind bits: 1 loose guide, 2 crease)
+  layers: Array.from({ length: NL }, () => ({ strokes: [], undo: [], redo: [], vis: true })),
+  active: 0,                 // the layer you are drawing on; the others are locked
+  ghost: true,               // show the other layers see-through
+  tool: 'draw',              // draw | redraw | erase | bend | iron | loosen | crease | look. Local to each device.
+  lastTool: 'erase',         // what A swaps with Draw
+  line: 'topo',              // what Draw makes: 'topo' (red, becomes edge loops) or 'guide' (gray, loose surface hint)
+  patch: false,              // Fill holes: guess missing pieces
   tidy: 0.3,                 // how hard squiggles are ironed out of the clean curves (0..1)
-  bendR: 0.12,               // reach of the Bend tool, metres in your hand space
+  bendR: 0.12,               // reach of Bend and Iron, metres in your hand space
   tol: 0.04, autoLoops: 0, smooth: 2, fit: 1,   // fit: how far the smooth surface is pulled onto the drawn curves
   exMess: 1,                                    // how sloppy the built-in examples are drawn (0..1.5)
   show: { sketch: true, curves: true, surface: true, wire: true, labels: true, preview: true },
   view: 'third',             // what a watching phone shows: third | first | split (local to that device)
   mr: false,
 };
-const undoStack = [], redoStack = [];
+Object.defineProperty(state, 'strokes', { get() { return this.layers[this.active].strokes; }, set(v) { this.layers[this.active].strokes = v; } });
+const undoS = () => state.layers[state.active].undo, redoS = () => state.layers[state.active].redo;
+const allStrokes = () => state.layers.reduce((a, l) => a.concat(l.strokes), []);
 let stats = { curves: 0, nodes: 0, patches: 0, flagged: 0 }, built = null;
 let inXR = false, xrMode = null;
 // --- multiplayer bookkeeping (see MULTIPLAYER) ---
@@ -1137,35 +1249,36 @@ const sync = { sv: 0, pv: 0 };     // "last edited" stamps for the sketch and fo
 let spect = null;                  // set while this flat view is watching a headset: that peer's tool, menu tab, poses...
 let debugXR = false;               // tests: behave as the headset without a real XR session
 const lastXR = { L: null, R: null };
-const TOOLS = ['draw', 'erase', 'bend', 'look'];
+const TOOLS = ['draw', 'erase', 'bend', 'look', 'redraw', 'iron', 'loosen', 'crease'];
 const isPresenter = () => inXR || debugXR;
 const xrLike = () => inXR || !!spect;                       // lay the menu out the way the headset sees it
 const shownTool = () => (spect ? spect.tool : state.tool);
+const shownLine = () => (spect ? spect.line : state.line);
 const xrSupport = { vr: false, ar: false };
 
 // =====================================================================
 // ENGINE BRIDGE (worker, newest request wins)
 // =====================================================================
 const WORKER_GLUE = `
-let last = null;
+const last = {};
 onmessage = (e) => { const m = e.data;
   if (m.type === 'build') { let out;
     try { const s = m.strokes.map((f) => { const o = []; for (let i = 0; i < f.length; i += 3) o.push([f[i], f[i + 1], f[i + 2]]); return o; });
-      const r = QE.buildAll(s, m.params); last = r.mesh; out = QE.pack(r); }
-    catch (err) { postMessage({ type: 'error', message: String((err && err.stack) || err) }); return; }
-    postMessage({ type: 'built', out }, [out.pos.buffer, out.idx.buffer, out.wire.buffer, out.curvePts.buffer, out.curveLens.buffer, out.nodes.buffer]);
-  } else if (m.type === 'obj') postMessage({ type: 'obj', text: last ? QE.toOBJ(last, m.scale) : '' });
+      const r = QE.buildAll(s, m.params); last[m.li] = r.mesh; out = QE.pack(r); }
+    catch (err) { postMessage({ type: 'error', li: m.li, message: String((err && err.stack) || err) }); return; }
+    postMessage({ type: 'built', li: m.li, out }, [out.pos.buffer, out.idx.buffer, out.wire.buffer, out.curvePts.buffer, out.curveLens.buffer, out.curveKind.buffer, out.nodes.buffer]);
+  } else if (m.type === 'obj') postMessage({ type: 'obj', text: last[m.li] ? QE.toOBJ(last[m.li], m.scale) : '' });
 };`;
 const Engine = (() => {
-  let worker = null, busy = false, pending = null, lastJob = null, lastMain = null, objResolve = null;
+  let worker = null, busy = null, objResolve = null; const pending = new Map(), lastMain = {};
   const toArrays = (strokes) => strokes.map((f) => { const o = []; for (let i = 0; i < f.length; i += 3) o.push([f[i], f[i + 1], f[i + 2]]); return o; });
   function pump() {
-    if (busy || !pending) return;
-    const job = pending; pending = null; busy = true; lastJob = job;
-    if (worker) worker.postMessage({ type: 'build', strokes: job.strokes, params: job.params });
+    if (busy || !pending.size) return;
+    const li = pending.has(state.active) ? state.active : pending.keys().next().value, job = pending.get(li); pending.delete(li); busy = { li, job };
+    if (worker) worker.postMessage({ type: 'build', li, strokes: job.strokes, params: job.params });
     else setTimeout(() => {
-      try { const r = QE.buildAll(toArrays(job.strokes), job.params); lastMain = r.mesh; busy = false; applyBuilt(QE.pack(r)); }
-      catch (err) { busy = false; console.error(err); toast('Could not build that surface'); }
+      try { const r = QE.buildAll(toArrays(job.strokes), job.params); lastMain[li] = r.mesh; busy = null; applyBuilt(QE.pack(r), li); }
+      catch (err) { busy = null; console.error(err); toast('Could not build that surface'); }
       pump();
     }, 0);
   }
@@ -1175,22 +1288,25 @@ const Engine = (() => {
         worker = new Worker(URL.createObjectURL(new Blob([$('engine').textContent + WORKER_GLUE], { type: 'text/javascript' })));
         worker.onmessage = (e) => {
           const m = e.data;
-          if (m.type === 'built') { busy = false; applyBuilt(m.out); pump(); }
-          else if (m.type === 'error') { busy = false; console.error(m.message); toast('Could not build that surface'); pump(); }
+          if (m.type === 'built') { busy = null; applyBuilt(m.out, m.li); pump(); }
+          else if (m.type === 'error') { busy = null; console.error(m.message); toast('Could not build that surface'); pump(); }
           else if (m.type === 'obj' && objResolve) { objResolve(m.text); objResolve = null; }
         };
-        worker.onerror = () => { worker = null; if (busy) { busy = false; pending = pending || lastJob; } pump(); };
+        worker.onerror = () => { worker = null; if (busy) { if (!pending.has(busy.li)) pending.set(busy.li, busy.job); busy = null; } pump(); };
       } catch (e) { worker = null; }
     },
-    request(strokes, params) { pending = { strokes, params }; pump(); },
+    request(li, strokes, params) { pending.set(li, { strokes, params }); pump(); },
     mode: () => (worker ? 'worker' : 'main'),
-    obj(scale) {
-      if (worker) return new Promise((res) => { objResolve = res; worker.postMessage({ type: 'obj', scale }); });
-      return Promise.resolve(lastMain ? QE.toOBJ(lastMain, scale) : '');
+    obj(scale, li) {
+      if (worker) return new Promise((res) => { objResolve = res; worker.postMessage({ type: 'obj', scale, li }); });
+      return Promise.resolve(lastMain[li] ? QE.toOBJ(lastMain[li], scale) : '');
     },
   };
 })();
-function requestBuild() { Engine.request(state.strokes, { tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, tidy: state.tidy }); }
+function requestBuild(li = state.active) {
+  const S = state.layers[li].strokes;
+  Engine.request(li, S, { tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, tidy: state.tidy, patch: state.patch, kinds: Array.from(S, (f) => f.k | 0) });
+}
 
 // =====================================================================
 // SCENE
@@ -1219,20 +1335,24 @@ const floor = (() => {
 scene.add(floor);
 
 const world = new THREE.Group(); world.position.copy(HOME); scene.add(world);   // model space
-const surfMats = [
-  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.62, metalness: 0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
-  new THREE.MeshStandardMaterial({ color: 0xFF2D9B, roughness: 0.62, metalness: 0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
-];
-const surface = new THREE.Mesh(new THREE.BufferGeometry(), surfMats);
-const wire = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x0b0b0b }));
-const sketch = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 }));
-const tubes = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ color: 0xF0222D, side: THREE.DoubleSide }));
 const dotGeo = new THREE.SphereGeometry(1, 12, 8), dotMat = new THREE.MeshBasicMaterial({ color: 0xFFD400 });
-let dots = new THREE.InstancedMesh(dotGeo, dotMat, 64); dots.count = 0;
+// one set of display objects per layer; the active layer is drawn in full, the others as see-through ghosts
+function makeView() {
+  const mat = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.62, metalness: 0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+  const v = { built: null, g: new THREE.Group(), surfMats: [mat(0xffffff), mat(0xFF2D9B)] };
+  v.surface = new THREE.Mesh(new THREE.BufferGeometry(), v.surfMats);
+  v.wire = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x0b0b0b }));
+  v.sketch = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.7 }));
+  v.tubes = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  v.dots = new THREE.InstancedMesh(dotGeo, dotMat, 64); v.dots.count = 0;
+  for (const o of [v.surface, v.wire, v.sketch, v.tubes, v.dots]) { o.frustumCulled = false; v.g.add(o); }
+  world.add(v.g); return v;
+}
+const views = state.layers.map(makeView);
 const liveBuf = new Float32Array(3 * 8000);
 const liveLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xFFD400 }));
 liveLine.geometry.setAttribute('position', new THREE.BufferAttribute(liveBuf, 3)); liveLine.geometry.setDrawRange(0, 0);
-for (const o of [surface, wire, sketch, tubes, dots, liveLine]) { o.frustumCulled = false; world.add(o); }
+liveLine.frustumCulled = false; world.add(liveLine);
 let dispScale = 1;
 
 function setLive(flat) {
@@ -1240,20 +1360,23 @@ function setLive(flat) {
   for (let i = 0; i < n; i++) liveBuf[i] = flat[i];
   liveLine.geometry.attributes.position.needsUpdate = true; liveLine.geometry.setDrawRange(0, n / 3);
 }
-function rebuildSketch() {
-  let n = 0; for (const s of state.strokes) n += Math.max(0, s.length / 3 - 1) * 2;
-  const pos = new Float32Array(n * 3); let o = 0;
-  for (const s of state.strokes) for (let i = 0; i + 5 < s.length; i += 3) { for (let k = 0; k < 6; k++) pos[o++] = s[i + k]; }
-  sketch.geometry.dispose(); sketch.geometry = new THREE.BufferGeometry(); sketch.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+function rebuildSketch(li = state.active) {   // raw strokes: white = topology, gray = loose guide
+  const S = state.layers[li].strokes, v = views[li]; let n = 0; for (const s of S) n += Math.max(0, s.length / 3 - 1) * 2;
+  const pos = new Float32Array(n * 3), col = new Float32Array(n * 3); let o = 0;
+  for (const s of S) { const c = s.k & 1 ? 0.55 : 1; for (let i = 0; i + 5 < s.length; i += 3) for (let k = 0; k < 6; k++) { col[o] = c; pos[o++] = s[i + k]; } }
+  v.sketch.geometry.dispose(); v.sketch.geometry = new THREE.BufferGeometry();
+  v.sketch.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3)); v.sketch.geometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
 }
-function tubeGeometry(pts, lens, radius) {
+// clean curves as thin tubes. kinds: 0 topology (red), 1 loose guide (gray), 2 crease (black, thicker), 3 guessed by Fill holes (blue)
+const KIND_COL = [[0.94, 0.13, 0.18], [0.62, 0.62, 0.64], [0.03, 0.03, 0.03], [0.16, 0.48, 1]], KIND_R = [1, 0.8, 1.6, 1];
+function tubeGeometry(pts, lens, radius, kinds) {
   const RS = 5; let nPts = 0, nIdx = 0;
   for (const l of lens) { nPts += l; nIdx += Math.max(0, l - 1) * RS * 6; }
-  const pos = new Float32Array(nPts * RS * 3), nor = new Float32Array(nPts * RS * 3), idx = new Uint32Array(nIdx);
+  const pos = new Float32Array(nPts * RS * 3), col = new Float32Array(nPts * RS * 3), idx = new Uint32Array(nIdx);
   const T = new THREE.Vector3(), N = new THREE.Vector3(), B = new THREE.Vector3(), a = new THREE.Vector3(), b = new THREE.Vector3();
   let p = 0, vi = 0, ii = 0;
-  for (const l of lens) {
-    const base = vi;
+  for (let ci = 0; ci < lens.length; ci++) {
+    const l = lens[ci], base = vi, kd = kinds ? kinds[ci] : 0, cc = KIND_COL[kd] || KIND_COL[0], rad = radius * (KIND_R[kd] || 1);
     for (let i = 0; i < l; i++) {
       a.fromArray(pts, (p + Math.max(0, i - 1)) * 3); b.fromArray(pts, (p + Math.min(l - 1, i + 1)) * 3); T.subVectors(b, a).normalize();
       if (i === 0) N.set(0, 1, 0);
@@ -1263,9 +1386,8 @@ function tubeGeometry(pts, lens, radius) {
       const cx = pts[(p + i) * 3], cy = pts[(p + i) * 3 + 1], cz = pts[(p + i) * 3 + 2];
       for (let k = 0; k < RS; k++) {
         const ang = (k / RS) * Math.PI * 2, cs = Math.cos(ang), sn = Math.sin(ang);
-        const nx = N.x * cs + B.x * sn, ny = N.y * cs + B.y * sn, nz = N.z * cs + B.z * sn;
-        pos[vi * 3] = cx + nx * radius; pos[vi * 3 + 1] = cy + ny * radius; pos[vi * 3 + 2] = cz + nz * radius;
-        nor[vi * 3] = nx; nor[vi * 3 + 1] = ny; nor[vi * 3 + 2] = nz; vi++;
+        pos[vi * 3] = cx + (N.x * cs + B.x * sn) * rad; pos[vi * 3 + 1] = cy + (N.y * cs + B.y * sn) * rad; pos[vi * 3 + 2] = cz + (N.z * cs + B.z * sn) * rad;
+        col[vi * 3] = cc[0]; col[vi * 3 + 1] = cc[1]; col[vi * 3 + 2] = cc[2]; vi++;
       }
     }
     for (let i = 0; i < l - 1; i++) for (let k = 0; k < RS; k++) {
@@ -1275,56 +1397,74 @@ function tubeGeometry(pts, lens, radius) {
     p += l;
   }
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3)); geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3)); geo.setAttribute('color', new THREE.BufferAttribute(col, 3)); geo.setIndex(new THREE.BufferAttribute(idx, 1));
   return geo;
 }
-function rebuildCurveDisplay() {
-  if (!built) return;
+function rebuildCurveDisplay(li = state.active) {
+  const v = views[li], o = v.built; if (!o) return;
   const r = 0.0026 / dispScale;
-  tubes.geometry.dispose(); tubes.geometry = tubeGeometry(built.curvePts, built.curveLens, r);
-  const n = built.nodes.length / 3;
-  if (n > dots.instanceMatrix.count) { world.remove(dots); dots.dispose(); dots = new THREE.InstancedMesh(dotGeo, dotMat, Math.max(64, n * 2)); dots.frustumCulled = false; world.add(dots); }
-  const m = new THREE.Matrix4(), s = r * 2.4;
-  for (let i = 0; i < n; i++) { m.makeScale(s, s, s); m.setPosition(built.nodes[3 * i], built.nodes[3 * i + 1], built.nodes[3 * i + 2]); dots.setMatrixAt(i, m); }
-  dots.count = n; dots.instanceMatrix.needsUpdate = true;
+  v.tubes.geometry.dispose(); v.tubes.geometry = tubeGeometry(o.curvePts, o.curveLens, r, o.curveKind);
+  const n = o.nodes.length / 3;
+  if (n > v.dots.instanceMatrix.count) { v.g.remove(v.dots); v.dots.dispose(); v.dots = new THREE.InstancedMesh(dotGeo, dotMat, Math.max(64, n * 2)); v.dots.frustumCulled = false; v.g.add(v.dots); }
+  const m = new THREE.Matrix4(), sc = r * 2.4;
+  for (let i = 0; i < n; i++) { m.makeScale(sc, sc, sc); m.setPosition(o.nodes[3 * i], o.nodes[3 * i + 1], o.nodes[3 * i + 2]); v.dots.setMatrixAt(i, m); }
+  v.dots.count = n; v.dots.instanceMatrix.needsUpdate = true;
   applyShow();
 }
-function applyBuilt(o) {
-  built = o; stats = o.stats;
+function applyBuilt(o, li) {
+  const v = views[li]; v.built = o;
+  if (li === state.active) { built = o; stats = o.stats; }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(o.pos, 3)); geo.setIndex(new THREE.BufferAttribute(o.idx, 1));
   geo.addGroup(0, o.nMain, 0); geo.addGroup(o.nMain, o.nFlag, 1); geo.computeVertexNormals();
-  surface.geometry.dispose(); surface.geometry = geo;
+  v.surface.geometry.dispose(); v.surface.geometry = geo;
   const wg = new THREE.BufferGeometry(); wg.setAttribute('position', new THREE.BufferAttribute(o.wire, 3));
-  wire.geometry.dispose(); wire.geometry = wg;
-  rebuildCurveDisplay(); ui.dirty = true;
+  v.wire.geometry.dispose(); v.wire.geometry = wg;
+  rebuildCurveDisplay(li); ui.dirty = true;
 }
 function applyShow() {
-  const has = built && built.idx.length > 0;
-  surface.visible = state.show.surface && !!has; wire.visible = state.show.wire && !!has;
-  sketch.visible = state.show.sketch; tubes.visible = state.show.curves; dots.visible = state.show.curves;
+  views.forEach((v, i) => {
+    const act = i === state.active, has = !!(v.built && v.built.idx.length > 0), ghost = !act && state.ghost;
+    v.g.visible = act || state.layers[i].vis;
+    v.surface.visible = state.show.surface && has; v.wire.visible = act && state.show.wire && has;
+    v.sketch.visible = act && state.show.sketch; v.tubes.visible = state.show.curves; v.dots.visible = act && state.show.curves;
+    for (const m of v.surfMats) { if (m.transparent !== ghost) { m.transparent = ghost; m.needsUpdate = true; } m.opacity = ghost ? 0.3 : 1; m.depthWrite = !ghost; }
+    const tm = v.tubes.material; if (tm.transparent !== ghost) { tm.transparent = ghost; tm.needsUpdate = true; } tm.opacity = ghost ? 0.4 : 1;
+    v.surface.renderOrder = ghost ? 2 : 0;
+  });
 }
-function refreshDisplayScale() { dispScale = world.scale.x; rebuildCurveDisplay(); }
+function refreshDisplayScale() { dispScale = world.scale.x; views.forEach((v, i) => rebuildCurveDisplay(i)); }
+function setActiveLayer(i, remote) {
+  if (i === state.active) return;
+  state.active = i; if (!remote) paramsTouched();
+  built = views[i].built; stats = built ? built.stats : { curves: 0, nodes: 0, patches: 0, flagged: 0 };
+  rebuildSketch(i); applyShow(); requestBuild(i); scheduleSave(); ui.dirty = true;
+}
 function applyMR() { const pass = inXR && state.mr && xrMode === 'immersive-ar'; sky.visible = !pass; floor.visible = !pass; }
 
 // =====================================================================
 // EDITING
 // =====================================================================
-function strokesTouched(remote) { if (!remote) { sync.sv = Date.now(); Net.strokesChanged(); } rebuildSketch(); requestBuild(); scheduleSave(); ui.dirty = true; }
+function strokesTouched(remote, li = state.active) { if (!remote) { sync.sv = Date.now(); Net.strokesChanged(); } rebuildSketch(li); requestBuild(li); scheduleSave(); ui.dirty = true; }
 function paramsTouched() { sync.pv = Date.now(); }
-function commit(strokes) { undoStack.push(state.strokes); if (undoStack.length > 80) undoStack.shift(); redoStack.length = 0; state.strokes = strokes; strokesTouched(); }
-function undo() { if (!undoStack.length) return; redoStack.push(state.strokes); state.strokes = undoStack.pop(); strokesTouched(); }
-function redo() { if (!redoStack.length) return; undoStack.push(state.strokes); state.strokes = redoStack.pop(); strokesTouched(); }
+function commit(strokes) { undoS().push(state.strokes); if (undoS().length > 80) undoS().shift(); redoS().length = 0; state.strokes = strokes; strokesTouched(); }
+function undo() { if (!undoS().length) return; redoS().push(state.strokes); state.strokes = undoS().pop(); strokesTouched(); }
+function redo() { if (!redoS().length) return; undoS().push(state.strokes); state.strokes = redoS().pop(); strokesTouched(); }
 function clearAll() { if (state.strokes.length) commit([]); }
-const packStrokes = (S) => S.map((pts) => { const f = new Float32Array(pts.length * 3); pts.forEach((p, i) => f.set(p, i * 3)); return f; });
+const packStrokes = (S) => S.map((pts) => { const f = new Float32Array(pts.length * 3); pts.forEach((p, i) => f.set(p, i * 3)); f.k = 0; return f; });
 // every tap draws the example again with a fresh sloppy hand
 function loadExample(name, seed = 1 + Math.floor(Math.random() * 1e6), mess = state.exMess) { const S = QE.makeExample(name, seed, mess); commit(packStrokes(S)); return S.expect; }
-function setTool(t) { state.tool = t; ui.dirty = true; refreshTags(); }
+function setTool(t) { if (t !== 'draw' && t !== 'look') state.lastTool = t; state.tool = t; ui.dirty = true; refreshTags(); }
+function setLine(k) { state.line = k; ui.dirty = true; refreshTags(); }
 function setTol(v) { v = clamp(v, TOL_MIN, TOL_MAX); if (v === state.tol) return; state.tol = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; refreshTags(); }
 function setParam(k, v) { if (state[k] === v) return; state[k] = v; paramsTouched(); requestBuild(); scheduleSave(); ui.dirty = true; }
 function finishStroke(flat, ws) {
   let len = 0; for (let i = 3; i < flat.length; i += 3) len += Math.hypot(flat[i] - flat[i - 3], flat[i + 1] - flat[i - 2], flat[i + 2] - flat[i - 1]);
-  if (flat.length >= 9 && len * ws > 0.012) commit(state.strokes.concat([Float32Array.from(flat)]));
+  if (!(flat.length >= 9 && len * ws > 0.012)) return;
+  const f = Float32Array.from(flat); f.k = state.line === 'guide' ? 1 : 0;
+  let base = state.strokes;
+  if (state.tool === 'redraw' && !(f.k & 1)) base = withoutAlong(base, f);   // the new line replaces the topology lines it runs along
+  commit(base.concat([f]));
 }
 // remove every raw point for which pred is true; strokes split where points go
 function eraseWhere(pred) {
@@ -1336,13 +1476,95 @@ function eraseWhere(pred) {
     changed = true; let start = -1;
     for (let i = 0; i <= n; i++) {
       if (i < n && keep[i]) { if (start < 0) start = i; }
-      else if (start >= 0) { if (i - start >= 3) out.push(s.slice(start * 3, i * 3)); start = -1; }
+      else if (start >= 0) { if (i - start >= 3) { const piece = s.slice(start * 3, i * 3); piece.k = s.k | 0; out.push(piece); } start = -1; }
     }
   }
   if (changed) state.strokes = out;
   return changed;
 }
 const eraserRadiusModel = (ws) => Math.max(state.tol, 0.018 / ws);
+// Redraw: topology strokes that run alongside the new stroke `f` (close and roughly parallel) are removed where they do.
+function withoutAlong(strokes, f) {
+  const r2 = (1.5 * state.tol) ** 2, nf = f.length / 3, out = [];
+  for (const s of strokes) {
+    if (s.k & 1) { out.push(s); continue; }
+    const n = s.length / 3, keep = new Uint8Array(n); let hit = false;
+    for (let i = 0; i < n; i++) {
+      const x = s[3 * i], y = s[3 * i + 1], z = s[3 * i + 2]; let bd = r2, bj = -1;
+      for (let j = 0; j < nf; j++) { const d = (x - f[3 * j]) ** 2 + (y - f[3 * j + 1]) ** 2 + (z - f[3 * j + 2]) ** 2; if (d < bd) { bd = d; bj = j; } }
+      keep[i] = 1; if (bj < 0) continue;
+      const i0 = Math.max(0, i - 2), i1 = Math.min(n - 1, i + 2), j0 = Math.max(0, bj - 2), j1 = Math.min(nf - 1, bj + 2);
+      const ax = s[3 * i1] - s[3 * i0], ay = s[3 * i1 + 1] - s[3 * i0 + 1], az = s[3 * i1 + 2] - s[3 * i0 + 2], bx = f[3 * j1] - f[3 * j0], by = f[3 * j1 + 1] - f[3 * j0 + 1], bz = f[3 * j1 + 2] - f[3 * j0 + 2];
+      if (Math.abs(ax * bx + ay * by + az * bz) > 0.65 * Math.hypot(ax, ay, az) * Math.hypot(bx, by, bz)) { keep[i] = 0; hit = true; }
+    }
+    if (!hit) { out.push(s); continue; }
+    let start = -1;
+    for (let i = 0; i <= n; i++) { if (i < n && keep[i]) { if (start < 0) start = i; } else if (start >= 0) { if (i - start >= 3) { const piece = s.slice(start * 3, i * 3); piece.k = s.k | 0; out.push(piece); } start = -1; } }
+  }
+  return out;
+}
+// Loosen: the brushed parts of topology strokes become loose guides (gray), so you can redraw that section.
+// One brush gesture keeps a mask over the strokes as they were when it began, so a section comes out as one piece.
+function startLoosen() { return { before: state.strokes, masks: new Map() }; }
+function loosenWhere(pred, L = startLoosen()) {
+  let changed = false;
+  L.before.forEach((s, si) => {
+    if (s.k & 1) return; const n = s.length / 3; let m = L.masks.get(si);
+    for (let i = 0; i < n; i++) if (!(m && m[i]) && pred(s[3 * i], s[3 * i + 1], s[3 * i + 2])) { if (!m) { m = new Uint8Array(n); L.masks.set(si, m); } m[i] = 1; changed = true; }
+  });
+  if (!changed) return false;
+  const out = [];
+  L.before.forEach((s, si) => {
+    const m = L.masks.get(si); if (!m) { out.push(s); return; }
+    const n = m.length;
+    for (let a = 0, i = 1; i <= n; i++) if (i === n || m[i] !== m[a]) { const b = Math.min(n, i + 1); if (b - a >= 2) { const piece = s.slice(a * 3, b * 3); piece.k = m[a] ? 1 : s.k | 0; out.push(piece); } a = i; }
+  });
+  state.strokes = out;
+  return true;
+}
+// Iron: press the raw lines near the pen onto one smooth sheet fitted through them, and relax each line along its length
+function ironAt(p, R, rate) {
+  const S = state.strokes, R2 = R * R, hits = []; let sw = 0, cx = 0, cy = 0, cz = 0;
+  S.forEach((s, si) => { for (let i = 0; i < s.length; i += 3) { const d2 = (s[i] - p.x) ** 2 + (s[i + 1] - p.y) ** 2 + (s[i + 2] - p.z) ** 2; if (d2 < R2) { const u = 1 - d2 / R2, w = u * u; hits.push(si, i, w); sw += w; cx += w * s[i]; cy += w * s[i + 1]; cz += w * s[i + 2]; } } });
+  if (hits.length < 24) return false;
+  cx /= sw; cy /= sw; cz /= sw; const C6 = [0, 0, 0, 0, 0, 0];
+  for (let h = 0; h < hits.length; h += 3) { const s = S[hits[h]], i = hits[h + 1], w = hits[h + 2], x = s[i] - cx, y = s[i + 1] - cy, z = s[i + 2] - cz; C6[0] += w * x * x; C6[1] += w * x * y; C6[2] += w * x * z; C6[3] += w * y * y; C6[4] += w * y * z; C6[5] += w * z * z; }
+  const n = QE.eig3(C6); tA.set(n[0], n[1], n[2]); tB.set(Math.abs(n[0]) < 0.9 ? 1 : 0, Math.abs(n[0]) < 0.9 ? 0 : 1, 0).addScaledVector(tA, -tA.dot(tB)).normalize(); tC.crossVectors(tA, tB);
+  // height field over the fitted plane: h = a u^2 + b uv + c v^2 + d u + e v + f  (gentle on the curved terms)
+  const A = Array.from({ length: 6 }, () => new Float64Array(7));
+  const loc = (s, i) => { const x = s[i] - cx, y = s[i + 1] - cy, z = s[i + 2] - cz; return [x * tB.x + y * tB.y + z * tB.z, x * tC.x + y * tC.y + z * tC.z, x * n[0] + y * n[1] + z * n[2]]; };
+  for (let h = 0; h < hits.length; h += 3) { const [u, v, ht] = loc(S[hits[h]], hits[h + 1]), w = hits[h + 2], f = [u * u, u * v, v * v, u, v, 1]; for (let a = 0; a < 6; a++) { for (let b = 0; b < 6; b++) A[a][b] += w * f[a] * f[b]; A[a][6] += w * f[a] * ht; } }
+  const ridge = sw * R2 * R2 * 0.02; for (let a = 0; a < 3; a++) A[a][a] += ridge; for (let a = 3; a < 6; a++) A[a][a] += sw * 1e-9;
+  for (let c = 0; c < 6; c++) { let pv = c; for (let r = c + 1; r < 6; r++) if (Math.abs(A[r][c]) > Math.abs(A[pv][c])) pv = r; if (Math.abs(A[pv][c]) < 1e-18) return false; [A[c], A[pv]] = [A[pv], A[c]];
+    for (let r = 0; r < 6; r++) if (r !== c) { const f = A[r][c] / A[c][c]; for (let k = c; k < 7; k++) A[r][k] -= f * A[c][k]; } }
+  const q = A.map((row, a) => row[6] / row[a]), copies = new Map();
+  for (let h = 0; h < hits.length; h += 3) {
+    const si = hits[h], i = hits[h + 1], w = hits[h + 2] * rate, s = S[si]; let f = copies.get(si); if (!f) { f = new Float32Array(s); f.k = s.k | 0; copies.set(si, f); }
+    const [u, v, ht] = loc(s, i), d = (q[0] * u * u + q[1] * u * v + q[2] * v * v + q[3] * u + q[4] * v + q[5] - ht) * w;
+    f[i] += n[0] * d; f[i + 1] += n[1] * d; f[i + 2] += n[2] * d;
+    if (i >= 3 && i + 5 < s.length) for (let k = 0; k < 3; k++) f[i + k] += ((s[i - 3 + k] + s[i + 3 + k]) / 2 - s[i + k]) * w * 0.5;
+  }
+  state.strokes = S.map((s, si) => copies.get(si) || s);
+  return true;
+}
+// Crease: the clean topology curve nearest to `p` (model space) flips between sharp and smooth, by re-marking the strokes that make it up
+function toggleCreaseNear(p, maxD) {
+  const o = built; if (!o) return false;
+  let best = maxD * maxD, bc = -1, off = 0; const offs = [];
+  for (let c = 0; c < o.curveLens.length; c++) { offs.push(off); const kd = o.curveKind[c];
+    if (kd === 0 || kd === 2) for (let i = off; i < off + o.curveLens[c]; i++) { const d = (o.curvePts[3 * i] - p.x) ** 2 + (o.curvePts[3 * i + 1] - p.y) ** 2 + (o.curvePts[3 * i + 2] - p.z) ** 2; if (d < best) { best = d; bc = c; } }
+    off += o.curveLens[c]; }
+  if (bc < 0) return false;
+  const want = o.curveKind[bc] === 2 ? 0 : 2, a = offs[bc], b = a + o.curveLens[bc], r2 = (1.6 * state.tol) ** 2; let any = false;
+  const next = state.strokes.map((s) => {
+    if (s.k & 1) return s; const n = s.length / 3; let near = 0;
+    for (let i = 0; i < n; i += 2) { for (let j = a; j < b; j++) if ((s[3 * i] - o.curvePts[3 * j]) ** 2 + (s[3 * i + 1] - o.curvePts[3 * j + 1]) ** 2 + (s[3 * i + 2] - o.curvePts[3 * j + 2]) ** 2 < r2) { near++; break; } }
+    if (near < 0.5 * Math.ceil(n / 2) || (s.k | 0) === want) return s;
+    const f = new Float32Array(s); f.k = want; any = true; return f;
+  });
+  if (any) commit(next);
+  return any;
+}
 // Bend: soft-drag the raw sketch. Points near where you grab follow the hand, fading out to nothing at the reach.
 function startBend(p, R) {
   const items = [];
@@ -1357,24 +1579,29 @@ function applyBend(b, p) {
   if (!b.items.length) return;
   const dx = p.x - b.x, dy = p.y - b.y, dz = p.z - b.z; if (!b.moved && dx * dx + dy * dy + dz * dz < 1e-8) return;
   const out = b.before.slice();
-  for (const it of b.items) { const f = new Float32Array(it.base.length), n = it.w.length; for (let i = 0; i < n; i++) { const w = it.w[i]; f[3 * i] = it.base[3 * i] + dx * w; f[3 * i + 1] = it.base[3 * i + 1] + dy * w; f[3 * i + 2] = it.base[3 * i + 2] + dz * w; } out[it.idx] = f; }
+  for (const it of b.items) { const f = new Float32Array(it.base.length), n = it.w.length; for (let i = 0; i < n; i++) { const w = it.w[i]; f[3 * i] = it.base[3 * i] + dx * w; f[3 * i + 1] = it.base[3 * i + 1] + dy * w; f[3 * i + 2] = it.base[3 * i + 2] + dz * w; } f.k = it.base.k | 0; out[it.idx] = f; }
   state.strokes = out; b.moved = true; strokesTouched();
 }
-function endBend(b) { if (b.moved) { undoStack.push(b.before); if (undoStack.length > 80) undoStack.shift(); redoStack.length = 0; ui.dirty = true; } }
+function endBend(b) { if (b.moved) { undoS().push(b.before); if (undoS().length > 80) undoS().shift(); redoS().length = 0; ui.dirty = true; } }
 
 let saveTimer = 0;
 function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 600); }
 function save() {
   try {
-    localStorage.setItem('quadrille.v1', JSON.stringify({ v: 3, sv: sync.sv, pv: sync.pv, tidy: state.tidy, bendR: state.bendR, show: state.show, tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, exMess: state.exMess,
-      strokes: state.strokes.map((s) => Array.from(s, (v) => Math.round(v * 10000))) }));
+    localStorage.setItem('quadrille.v1', JSON.stringify({ v: 4, sv: sync.sv, pv: sync.pv, tidy: state.tidy, bendR: state.bendR, show: state.show, tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, exMess: state.exMess,
+      active: state.active, ghost: state.ghost, patch: state.patch, line: state.line,
+      layers: state.layers.map((l) => ({ vis: l.vis, k: l.strokes.map((s) => s.k | 0), s: l.strokes.map((s) => Array.from(s, (v) => Math.round(v * 10000))) })) }));
   } catch (e) { /* storage is a convenience only */ }
 }
 function load() {
   try {
     const d = JSON.parse(localStorage.getItem('quadrille.v1'));
-    if (!d || !Array.isArray(d.strokes)) return false;
-    state.strokes = d.strokes.map((a) => Float32Array.from(a, (v) => v / 10000));
+    if (!d || !(Array.isArray(d.strokes) || Array.isArray(d.layers))) return false;
+    const un = (a, k) => { const f = Float32Array.from(a, (v) => v / 10000); f.k = k | 0; return f; };
+    if (Array.isArray(d.layers)) d.layers.slice(0, NL).forEach((l, i) => { state.layers[i].strokes = (l.s || []).map((a, j) => un(a, (l.k || [])[j])); state.layers[i].vis = l.vis !== false; });
+    else state.layers[0].strokes = d.strokes.map((a) => un(a, 0));
+    if (d.active >= 0) state.active = clamp(d.active | 0, 0, NL - 1);
+    state.ghost = d.ghost !== false; state.patch = !!d.patch; if (d.line === 'guide') state.line = 'guide';
     if (d.tol > 0) state.tol = clamp(d.tol, TOL_MIN, TOL_MAX);
     if (d.autoLoops >= 0) state.autoLoops = clamp(d.autoLoops | 0, 0, 6);
     if (d.smooth >= 0) state.smooth = clamp(d.smooth | 0, 0, 3);
@@ -1408,7 +1635,7 @@ function zipStore(name, data) {
 let dlCap = null;
 function probeDownloads() { try { if (window.claude && window.claude.use) return window.claude.use('downloads').then((d) => { dlCap = d; return d; }).catch(() => null); } catch (e) { /* none */ } return Promise.resolve(null); }
 async function saveOBJ() {
-  const text = await Engine.obj(1000);            // millimetres
+  const text = await Engine.obj(1000, state.active);            // millimetres
   if (!text || !built || !built.quads) { toast('Nothing to save yet'); return; }
   if (!IN_CLAUDE) {   // ordinary web page (GitHub Pages): a plain download works
     try { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' })); a.download = 'quadrille.obj'; document.body.appendChild(a); a.click(); a.remove(); toast('Saved quadrille.obj (quads, millimetres)'); return; } catch (e) { /* fall through */ }
@@ -1427,10 +1654,10 @@ async function saveOBJ() {
 const UIW = 900, UIH = 600, RAIL = 128;
 const uiCanvas = $('panel'), g = uiCanvas.getContext('2d');
 const uiTex = new THREE.CanvasTexture(uiCanvas); uiTex.colorSpace = THREE.SRGBColorSpace; uiTex.anisotropy = 8;
-const TABS = [{ name: 'Draw', icon: 'pencil' }, { name: 'Surface', icon: 'grid' }, { name: 'View', icon: 'eye' }, { name: 'File', icon: 'folder' }];
+const TABS = [{ name: 'Draw', icon: 'pencil' }, { name: 'Surface', icon: 'grid' }, { name: 'View', icon: 'eye' }, { name: 'Layers', icon: 'layers' }, { name: 'File', icon: 'folder' }];
 const ui = { tab: 0, widgets: [], hover: null, press: null, drag: null, dirty: true, collapsed: false, toast: '', toastUntil: 0, keypad: null };
-const tabRect = (i) => ({ x: 12, y: 12 + i * 114, w: RAIL - 24, h: 106 });
-const swapRect = { x: 12, y: 472, w: RAIL - 24, h: 114 };
+const tabRect = (i) => ({ x: 12, y: 10 + i * 92, w: RAIL - 24, h: 86 });
+const swapRect = { x: 12, y: 476, w: RAIL - 24, h: 114 };
 const canSwap = () => (spect ? spect.ar : inXR && xrMode === 'immersive-ar');
 const mrOn = () => (spect ? spect.mr : state.mr);
 const tolToT = (v) => Math.log(v / TOL_MIN) / Math.log(TOL_MAX / TOL_MIN);
@@ -1469,6 +1696,21 @@ function icon(c, name, cx, cy, s, col) {
     c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.bezierCurveTo(-s * 0.1, s * 0.3, -s * 0.1, -s * 0.34, s * 0.14, -s * 0.34); c.stroke();
     c.beginPath(); c.arc(s * 0.3, -s * 0.34, s * 0.13, 0, Math.PI * 2); c.fill();
     c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.lineTo(s * 0.46, s * 0.3); c.setLineDash([s * 0.08, s * 0.14]); c.stroke(); c.setLineDash([]);
+  } else if (name === 'redraw') {
+    c.setLineDash([s * 0.07, s * 0.15]); c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.quadraticCurveTo(0, s * 0.42, s * 0.46, s * 0.05); c.stroke(); c.setLineDash([]);
+    c.beginPath(); c.moveTo(-s * 0.46, -s * 0.02); c.quadraticCurveTo(-s * 0.05, -s * 0.5, s * 0.4, -s * 0.3); c.stroke();
+    c.beginPath(); c.moveTo(s * 0.5, -s * 0.26); c.lineTo(s * 0.26, -s * 0.44); c.lineTo(s * 0.28, -s * 0.12); c.closePath(); c.fill();
+  } else if (name === 'iron') {
+    c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.lineTo(s * 0.46, s * 0.3); c.lineTo(s * 0.46, s * 0.1); c.quadraticCurveTo(s * 0.4, -s * 0.18, 0, -s * 0.18); c.quadraticCurveTo(-s * 0.4, -s * 0.16, -s * 0.46, s * 0.3); c.closePath(); c.fill();
+    c.beginPath(); c.moveTo(-s * 0.12, -s * 0.2); c.quadraticCurveTo(-s * 0.1, -s * 0.44, s * 0.14, -s * 0.44); c.lineTo(s * 0.4, -s * 0.44); c.stroke();
+  } else if (name === 'loosen') {
+    c.beginPath(); c.moveTo(-s * 0.46, s * 0.12); c.quadraticCurveTo(-s * 0.24, -s * 0.3, 0, 0); c.stroke();
+    c.setLineDash([s * 0.03, s * 0.17]); c.beginPath(); c.moveTo(0, 0); c.quadraticCurveTo(s * 0.24, s * 0.3, s * 0.46, -s * 0.12); c.stroke(); c.setLineDash([]);
+  } else if (name === 'crease') {
+    c.beginPath(); c.moveTo(-s * 0.46, s * 0.3); c.lineTo(0, -s * 0.34); c.lineTo(s * 0.46, s * 0.3); c.stroke();
+    c.beginPath(); c.moveTo(0, -s * 0.34); c.lineTo(0, s * 0.4); c.setLineDash([s * 0.06, s * 0.12]); c.stroke(); c.setLineDash([]);
+  } else if (name === 'layers') {
+    for (const y of [0.2, -0.02, -0.24]) { c.beginPath(); c.moveTo(0, s * (y - 0.2)); c.lineTo(s * 0.46, s * y); c.lineTo(0, s * (y + 0.2)); c.lineTo(-s * 0.46, s * y); c.closePath(); if (y < -0.2) c.fill(); else c.stroke(); }
   } else if (name === 'menu') {
     for (const y of [-0.26, 0, 0.26]) { c.beginPath(); c.moveTo(-s * 0.34, s * y); c.lineTo(s * 0.34, s * y); c.stroke(); }
   } else if (name === 'check') {
@@ -1481,7 +1723,7 @@ function layoutUI() {
   const W = [], x0 = RAIL + 28, cw = UIW - x0 - 28, gap = 16;
   const btn = (x, y, w, h, label, o) => W.push(Object.assign({ type: 'btn', x, y, w, h, label }, o));
   const row = (y, h, items) => { const bw = (cw - gap * (items.length - 1)) / items.length; items.forEach((it, i) => btn(x0 + i * (bw + gap), y, bw, h, it[0], it[1])); };
-  const sld = (y, label, o) => W.push(Object.assign({ type: 'sld', x: x0, y, w: cw, h: 118, label }, o));
+  const sld = (y, label, o) => W.push(Object.assign({ type: 'sld', x: x0, y, w: cw, h: 100, label }, o));
   if (ui.keypad !== null) {   // number pad: type the room code with the laser
     W.push({ type: 'label', x: x0, y: 34, text: () => 'Room code:  ' + (ui.keypad + '____').slice(0, 4).split('').join(' ') });
     const key = (d) => [d, { on: () => { ui.keypad += d; if (ui.keypad.length >= 4) { const c = ui.keypad.slice(0, 4); ui.keypad = null; Net.join(c); toast('Joining room ' + c); } layoutUI(); } }];
@@ -1492,42 +1734,52 @@ function layoutUI() {
     ui.widgets = W; ui.dirty = true; return;
   }
   if (ui.tab === 0) {
-    const tl = (name, key, ic) => [name, { icon: ic, on: () => setTool(key), active: () => shownTool() === key }];
-    const tools = [tl('Draw', 'draw', 'pencil'), tl('Erase', 'erase', 'eraser'), tl('Bend', 'bend', 'bend')];
-    if (!xrLike()) tools.push(tl('Look', 'look', 'eye'));
-    row(22, 92, tools);
-    sld(120, 'Join distance', { get: () => tolToT(state.tol), set: (t) => setTol(tToTol(t)), fmt: () => (state.tol * 100).toFixed(1) + ' cm' });
-    sld(240, 'Tidy squiggles', { steps: 10, get: () => state.tidy, set: (t) => setParam('tidy', Math.round(t * 10) / 10), fmt: () => String(Math.round(state.tidy * 10)) });
-    row(364, 84, [['Undo', { icon: 'undo', on: undo, disabled: () => !undoStack.length }], ['Redo', { icon: 'redo', on: redo, disabled: () => !redoStack.length }], ['Clear', { kind: 'danger', on: clearAll }]]);
-    W.push({ type: 'status', x: x0, y: 458, w: cw, h: 130 });
+    const tl = (key) => [TOOLINFO[key].name, { icon: TOOLINFO[key].icon, on: () => setTool(key), active: () => shownTool() === key }];
+    row(14, 80, ['draw', 'redraw', 'erase', 'bend'].map(tl));
+    row(100, 80, ['iron', 'loosen', 'crease'].concat(xrLike() ? [] : ['look']).map(tl));
+    const ln = (key, label, col) => [label, { chip: col, on: () => setLine(key), active: () => shownLine() === key }];
+    row(190, 72, [ln('topo', 'Topology line', C.red), ln('guide', 'Loose guide line', C.steel)]);
+    sld(270, 'Join distance', { get: () => tolToT(state.tol), set: (t) => setTol(tToTol(t)), fmt: () => (state.tol * 100).toFixed(1) + ' cm' });
+    row(378, 76, [['Undo', { icon: 'undo', on: undo, disabled: () => !undoS().length }], ['Redo', { icon: 'redo', on: redo, disabled: () => !redoS().length }], ['Clear layer', { kind: 'danger', on: clearAll }]]);
+    W.push({ type: 'status', x: x0, y: 466, w: cw, h: 124 });
   } else if (ui.tab === 1) {
-    sld(22, 'Auto loops between curves', { steps: 6, get: () => state.autoLoops / 6, set: (t) => setParam('autoLoops', Math.round(t * 6)), fmt: () => String(state.autoLoops) });
-    sld(150, 'Smooth level', { steps: 3, get: () => state.smooth / 3, set: (t) => setParam('smooth', Math.round(t * 3)), fmt: () => String(state.smooth) });
-    sld(278, 'Fit to curves', { steps: 10, get: () => state.fit, set: (t) => setParam('fit', Math.round(t * 10) / 10), fmt: () => Math.round(state.fit * 100) + '%' });
-    W.push({ type: 'status', x: x0, y: 420, w: cw, h: 160 });
+    sld(10, 'Auto loops between curves', { steps: 6, get: () => state.autoLoops / 6, set: (t) => setParam('autoLoops', Math.round(t * 6)), fmt: () => String(state.autoLoops) });
+    sld(108, 'Smooth level', { steps: 3, get: () => state.smooth / 3, set: (t) => setParam('smooth', Math.round(t * 3)), fmt: () => String(state.smooth) });
+    sld(206, 'Fit to curves', { steps: 10, get: () => state.fit, set: (t) => setParam('fit', Math.round(t * 10) / 10), fmt: () => Math.round(state.fit * 100) + '%' });
+    sld(304, 'Tidy squiggles', { steps: 10, get: () => state.tidy, set: (t) => setParam('tidy', Math.round(t * 10) / 10), fmt: () => String(Math.round(state.tidy * 10)) });
+    row(408, 72, [['Fill holes: guess the missing bits (blue)', { kind: 'toggle', on: () => setParam('patch', !state.patch), active: () => state.patch }]]);
+    W.push({ type: 'status', x: x0, y: 488, w: cw, h: 100 });
   } else if (ui.tab === 2) {
     const tg = (k, label) => [label, { kind: 'toggle', on: () => { state.show[k] = !state.show[k]; paramsTouched(); applyShow(); refreshTags(); scheduleSave(); ui.dirty = true; }, active: () => state.show[k] }];
-    W.push({ type: 'label', x: x0, y: 20, text: 'white = raw sketch   red = clean curves   black = edge loops', small: true });
-    row(58, 92, [tg('sketch', 'Raw sketch'), tg('curves', 'Clean curves')]);
-    row(166, 92, [tg('surface', 'Surface'), tg('wire', 'Edge loops')]);
-    if (xrLike()) {
-      row(274, 92, [tg('labels', 'Button labels'), tg('preview', 'Phone preview')]);
+    W.push({ type: 'legend', x: x0, y: 14, w: cw, items: [['Topology', C.red], ['Loose guide', C.steel], ['Crease', C.ink], ['Guessed', '#2A7BFF']] });
+    row(64, 88, [tg('sketch', 'Raw sketch'), tg('curves', 'Clean curves')]);
+    row(168, 88, [tg('surface', 'Surface'), tg('wire', 'Edge loops')]);
+    if (xrLike()) row(272, 88, [tg('labels', 'Button labels'), tg('preview', 'Phone preview')]);
+  } else if (ui.tab === 3) {
+    const bw = cw - 150 - gap;
+    for (let i = 0; i < NL; i++) {
+      const y = 14 + i * 94;
+      btn(x0, y, bw, 82, () => `Layer ${i + 1}   ${state.layers[i].strokes.length ? state.layers[i].strokes.length + ' lines' : 'empty'}`, { on: () => setActiveLayer(i), active: () => state.active === i });
+      btn(x0 + bw + gap, y, 150, 82, 'Show', { kind: 'toggle', on: () => { state.layers[i].vis = !state.layers[i].vis; paramsTouched(); applyShow(); scheduleSave(); ui.dirty = true; }, active: () => state.active === i || state.layers[i].vis, disabled: () => state.active === i });
     }
+    row(394, 76, [['Other layers see-through', { kind: 'toggle', on: () => { state.ghost = !state.ghost; paramsTouched(); applyShow(); scheduleSave(); ui.dirty = true; }, active: () => state.ghost }]]);
+    W.push({ type: 'label', x: x0, y: 492, text: 'You draw on the yellow layer. The others are locked', small: true });
+    W.push({ type: 'label', x: x0, y: 528, text: 'and stay put as a guide to build over.', small: true });
   } else {
     W.push({ type: 'label', x: x0, y: 26, text: 'Examples: tap again for a new messy take' });
     row(66, 92, [['Sheet', { on: () => loadExample('sheet') }], ['Tube', { on: () => loadExample('tube') }], ['Wormhole', { on: () => loadExample('wormhole') }], ['Donut', { on: () => loadExample('donut') }]]);
     sld(176, 'How messy the examples are', { steps: 10, get: () => state.exMess / 1.5, set: (t) => { state.exMess = Math.round(t * 10) * 0.15; scheduleSave(); ui.dirty = true; }, fmt: () => String(Math.round(state.exMess / 0.15)) });
     const last = [xrLike() ? ['Exit VR', { kind: 'primary', on: () => { const s = renderer.xr.getSession(); if (s) s.end(); } }] : ['Save OBJ (quads)', { kind: 'primary', on: saveOBJ }]];
     if (!IN_CLAUDE) last.push(['Type room code', { on: () => { ui.keypad = ''; layoutUI(); } }]);
-    row(318, 92, last);
-    W.push({ type: 'label', x: x0, y: 444, text: () => Net.label(), small: true });
+    row(300, 92, last);
+    W.push({ type: 'label', x: x0, y: 430, text: () => Net.label(), small: true });
   }
   ui.widgets = W; ui.dirty = true;
 }
 function drawWidget(c, w) {
   c.textBaseline = 'middle';
   if (w.type === 'btn') {
-    const act = w.active && w.active(), dis = w.disabled && w.disabled(), pressed = ui.press === w;
+    const act = w.active && w.active(), dis = w.disabled && w.disabled(), pressed = ui.press === w, label = typeof w.label === 'function' ? w.label() : w.label;
     let fill = C.white, ink = C.ink;
     if (w.kind === 'danger') { fill = C.red; ink = C.white; } else if (w.kind === 'primary') { fill = C.blue; ink = C.white; }
     if (act && w.kind !== 'toggle') fill = C.yellow;
@@ -1538,26 +1790,30 @@ function drawWidget(c, w) {
     rrect(c, w.x, w.y + dy, w.w, w.h - 7, 20); c.fillStyle = fill; c.fill(); c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke();
     const cy = w.y + dy + (w.h - 7) / 2;
     let fs = 31; c.font = `800 ${fs}px ${FONT}`;
-    const lead = w.icon ? 50 : w.kind === 'toggle' ? 52 : 0;
-    while (c.measureText(w.label).width + lead > w.w - 28 && fs > 18) { fs -= 2; c.font = `800 ${fs}px ${FONT}`; }
-    const tw = c.measureText(w.label).width, x = w.x + (w.w - tw - lead) / 2;
+    const lead = w.icon ? 50 : w.kind === 'toggle' ? 52 : w.chip ? 64 : 0;
+    while (c.measureText(label).width + lead > w.w - 28 && fs > 16) { fs -= 2; c.font = `800 ${fs}px ${FONT}`; }
+    const tw = c.measureText(label).width, x = w.x + (w.w - tw - lead) / 2;
+    if (w.chip) { rrect(c, x, cy - 8, 50, 16, 8); c.fillStyle = w.chip; c.fill(); c.lineWidth = 4; c.strokeStyle = C.ink; c.stroke(); }
     if (w.icon) icon(c, w.icon, x + 18, cy, 38, ink);
     if (w.kind === 'toggle') {
       rrect(c, x, cy - 19, 38, 38, 9); c.fillStyle = act ? C.yellow : C.white; c.fill(); c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke();
       if (act) icon(c, 'check', x + 19, cy, 30, C.ink);
     }
-    c.fillStyle = ink; c.textAlign = 'left'; c.fillText(w.label, x + lead, cy + 1);
+    c.fillStyle = ink; c.textAlign = 'left'; c.fillText(label, x + lead, cy + 1);
     c.globalAlpha = 1;
   } else if (w.type === 'sld') {
-    const t = clamp(w.get(), 0, 1), tx = w.x + 30, tw = w.w - 60, ty = w.y + 82;
-    c.font = `800 30px ${FONT}`; c.textAlign = 'left'; c.fillStyle = C.ink; c.fillText(w.label, w.x, w.y + 22);
-    c.textAlign = 'right'; c.fillStyle = C.blue; c.fillText(w.fmt(), w.x + w.w, w.y + 22);
+    const t = clamp(w.get(), 0, 1), tx = w.x + 30, tw = w.w - 60, ty = w.y + w.h - 34;
+    c.font = `800 30px ${FONT}`; c.textAlign = 'left'; c.fillStyle = C.ink; c.fillText(w.label, w.x, w.y + 20);
+    c.textAlign = 'right'; c.fillStyle = C.blue; c.fillText(w.fmt(), w.x + w.w, w.y + 20);
     rrect(c, tx - 14, ty - 14, tw + 28, 28, 14); c.fillStyle = C.grey; c.fill(); c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke();
     rrect(c, tx - 14, ty - 14, tw * t + 28, 28, 14); c.fillStyle = C.yellow; c.fill(); c.stroke();
     if (w.steps) { c.fillStyle = C.ink; for (let i = 0; i <= w.steps; i++) { c.beginPath(); c.arc(tx + (tw * i) / w.steps, ty, 4, 0, 6.3); c.fill(); } }
     c.beginPath(); c.arc(tx + tw * t, ty, ui.drag === w ? 30 : 26, 0, Math.PI * 2); c.fillStyle = ui.drag === w ? C.yellow : C.white; c.fill(); c.lineWidth = 6; c.stroke();
   } else if (w.type === 'label') {
     c.font = `800 ${w.small ? 24 : 30}px ${FONT}`; c.textAlign = 'left'; c.fillStyle = C.ink; c.fillText(typeof w.text === 'function' ? w.text() : w.text, w.x, w.y + 16, UIW - w.x - 24);
+  } else if (w.type === 'legend') {
+    c.font = `800 23px ${FONT}`; c.textAlign = 'left'; let x = w.x;
+    for (const [name, col] of w.items) { rrect(c, x, w.y + 8, 40, 16, 8); c.fillStyle = col; c.fill(); c.lineWidth = 4; c.strokeStyle = C.ink; c.stroke(); c.fillStyle = C.ink; c.fillText(name, x + 50, w.y + 17); x += 62 + c.measureText(name).width + 16; }
   } else if (w.type === 'status') {
     c.textAlign = 'left';
     let big, small, col = C.ink;
@@ -1581,8 +1837,8 @@ function drawUI() {
     const r = tabRect(i), act = ui.tab === i && !ui.collapsed;
     rrect(c, r.x, r.y, r.w, r.h, 22); c.fillStyle = act ? C.yellow : ui.hover === 'tab' + i ? '#F4666D' : C.red; c.fill();
     if (act) { c.lineWidth = 5; c.strokeStyle = C.ink; c.stroke(); }
-    icon(c, t.icon, r.x + r.w / 2, r.y + 40, 48, act ? C.ink : C.white);
-    c.fillStyle = act ? C.ink : C.white; c.font = `800 20px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(t.name, r.x + r.w / 2, r.y + 86);
+    icon(c, t.icon, r.x + r.w / 2, r.y + 31, 40, act ? C.ink : C.white);
+    c.fillStyle = act ? C.ink : C.white; c.font = `800 20px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(t.name, r.x + r.w / 2, r.y + 68);
   });
   if (canSwap()) {   // VR / MR swap lives at the bottom-left of the menu
     const r = swapRect; c.font = `800 26px ${FONT}`; c.textAlign = 'center'; c.textBaseline = 'middle';
@@ -1670,6 +1926,7 @@ function deskAnchor(cx, cy) {
     const p = toScreen(tB, rect); if (p[2] > 1) continue;
     const d = (p[0] - cx) ** 2 + (p[1] - cy) ** 2; if (d < best) { best = d; tC.copy(tA); found = true; }
   }
+  deskAnchor.found = found;
   return found ? tC.clone() : orbitTarget.clone();
 }
 function deskPoint(e) {
@@ -1679,15 +1936,21 @@ function deskPoint(e) {
   const hit = raycaster.ray.intersectPlane(plane, tA); if (!hit) return null;
   return world.worldToLocal(hit.clone());
 }
-function deskErase(e) {
+function deskBrush(e, tool) {
   const rect = glCanvas.getBoundingClientRect(), cx = e.clientX, cy = e.clientY, R2 = 20 * 20;
   world.updateMatrixWorld(true);
-  if (eraseWhere((x, y, z) => { tA.set(x, y, z).applyMatrix4(world.matrixWorld); const p = toScreen(tA, rect); return p[2] < 1 && (p[0] - cx) ** 2 + (p[1] - cy) ** 2 < R2; })) strokesTouched();
+  if (tool === 'iron') {
+    const a = deskAnchor(cx, cy); if (!deskAnchor.found) return;
+    if (ironAt(world.worldToLocal(a), state.bendR / world.scale.x, 0.35)) strokesTouched();
+    return;
+  }
+  const pred = (x, y, z) => { tA.set(x, y, z).applyMatrix4(world.matrixWorld); const p = toScreen(tA, rect); return p[2] < 1 && (p[0] - cx) ** 2 + (p[1] - cy) ** 2 < R2; };
+  if (tool === 'loosen' ? loosenWhere(pred, gest.loosen) : eraseWhere(pred)) strokesTouched();
 }
 function endGesture(cancel) {
   if (!gest) return;
   if (gest.type === 'draw') { if (!cancel) finishStroke(gest.pts, 1); setLive(null); }
-  if (gest.type === 'erase' && state.strokes !== gest.before) { undoStack.push(gest.before); redoStack.length = 0; ui.dirty = true; }
+  if (gest.type === 'brush' && state.strokes !== gest.before) { undoS().push(gest.before); redoS().length = 0; ui.dirty = true; }
   if (gest.type === 'bend') endBend(gest.b);
   gest = null;
 }
@@ -1706,10 +1969,14 @@ glCanvas.addEventListener('pointerdown', (e) => {
       camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
       const p = deskPoint(e); if (p) gest = { type: 'bend', b: startBend(p, state.bendR) };
     }
-    else if (state.tool === 'draw') {
+    else if (state.tool === 'crease') {
+      const a = deskAnchor(e.clientX, e.clientY); world.updateMatrixWorld(true);
+      if (!deskAnchor.found || !toggleCreaseNear(world.worldToLocal(a), 2.5 * state.tol)) toast('Tap a red topology line to fold it');
+    }
+    else if (state.tool === 'draw' || state.tool === 'redraw') {
       camera.getWorldDirection(tB); plane.setFromNormalAndCoplanarPoint(tB, deskAnchor(e.clientX, e.clientY));
       const p = deskPoint(e); gest = { type: 'draw', pts: p ? [p.x, p.y, p.z] : [] };
-    } else { gest = { type: 'erase', before: state.strokes }; deskErase(e); }
+    } else { gest = { type: 'brush', tool: state.tool, before: state.strokes, loosen: startLoosen() }; deskBrush(e, gest.tool); }
   }
 });
 glCanvas.addEventListener('pointermove', (e) => {
@@ -1723,7 +1990,7 @@ glCanvas.addEventListener('pointermove', (e) => {
   } else if (gest.type === 'draw') {
     const q = deskPoint(e); if (!q) return; const n = gest.pts.length;
     if (!n || Math.hypot(q.x - gest.pts[n - 3], q.y - gest.pts[n - 2], q.z - gest.pts[n - 1]) > 0.004) { gest.pts.push(q.x, q.y, q.z); setLive(gest.pts); }
-  } else if (gest.type === 'erase') deskErase(e);
+  } else if (gest.type === 'brush') deskBrush(e, gest.tool);
   else if (gest.type === 'bend') { const q = deskPoint(e); if (q) applyBend(gest.b, q); }
 });
 const ptrEnd = (e) => { if (!ptrs.has(e.pointerId)) return; ptrs.delete(e.pointerId); endGesture(e.type === 'pointercancel'); if (ptrs.size === 1 && (state.tool === 'look' || spect)) { const p = [...ptrs.values()][0]; gest = { type: 'orbit', x: p.x, y: p.y }; } };
@@ -1839,6 +2106,7 @@ function buildController(hand) {
     tag('trigger', new THREE.Vector3(0.009, -0.03, 0.008), new THREE.Vector3(0.105, -0.012, -0.012), 'TRIGGER', 'draw', C.yellow);
     tag('grip', new THREE.Vector3(0, -0.058, 0.064), new THREE.Vector3(0.105, -0.06, 0.07), 'GRIP', 'grab, both = scale', C.blue);
     tag('stick', P(parts.stick.position), new THREE.Vector3(-0.105, 0.04, 0.032), 'STICK', 'join 3.0 cm', C.blue);
+    tag('upper', P(parts.upper.pos), new THREE.Vector3(0.105, 0.048, 0.03), 'B', 'line: topology', C.red);
   } else {
     tag('lower', P(parts.lower.pos), new THREE.Vector3(-0.105, 0.016, 0.062), 'X', 'undo', C.ink);
     tag('trigger', new THREE.Vector3(-0.009, -0.03, 0.008), new THREE.Vector3(-0.105, -0.012, -0.012), 'TRIGGER', 'menu', C.red);
@@ -1869,7 +2137,8 @@ function adoptGLB(hand, glb) {
   }
   items.sort((p, q) => q.a.y - p.a.y);
   const lead = [], top = items.length ? items[0].a.y + 0.03 : 0;
-  items.forEach((it, i) => { const x = U.sx * 0.105, y = top - i * 0.026; it.t.sprite.position.set(x, y, it.a.z); lead.push(it.a.x, it.a.y, it.a.z, x - U.sx * 0.036, y, it.a.z); });
+  const zc = items.reduce((a, it) => a + it.a.z, 0) / Math.max(1, items.length);   // one tidy column, so labels never sit on top of each other
+  items.forEach((it, i) => { const x = U.sx * 0.105, y = top - i * 0.03; it.t.sprite.position.set(x, y, zc); lead.push(it.a.x, it.a.y, it.a.z, x - U.sx * 0.036, y, zc); });
   U.leadLines.geometry.dispose(); U.leadLines.geometry = new THREE.BufferGeometry(); U.leadLines.geometry.setAttribute('position', new THREE.Float32BufferAttribute(lead, 3));
 }
 if (GLTFLoader) {
@@ -1878,16 +2147,19 @@ if (GLTFLoader) {
 }
 models.left.add(vrPanel, pvPanel); models.right.add(laser);
 function refreshTags() {
-  const r = models.right.userData.parts, t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0;
-  const col = tool === 'erase' ? C.red : tool === 'bend' ? C.blue : C.yellow, hex = tool === 'erase' ? 0xE8212B : tool === 'bend' ? 0x2A7BFF : 0xFFD400;
-  r.tag_trigger.set('TRIGGER', tool, col);
-  r.tag_lower.set('A', 'next tool: ' + (tool === 'draw' ? 'erase' : tool === 'erase' ? 'bend' : 'draw'), col);
+  const r = models.right.userData.parts, t0 = shownTool(), tool = t0 === 'look' ? 'draw' : t0, info = TOOLINFO[tool], guide = shownLine() === 'guide';
+  const last = spect ? 'draw' : state.lastTool, hex = info.hex, drawish = tool === 'draw' || tool === 'redraw';
+  r.tag_trigger.set('TRIGGER', info.name.toLowerCase() + (drawish ? (guide ? ' gray guide' : ' red line') : ''), info.col);
+  r.tag_lower.set('A', tool === 'draw' ? 'tool: ' + TOOLINFO[last].name.toLowerCase() : 'back to draw', info.col);
+  r.tag_upper.set('B', guide ? 'line: loose guide' : 'line: topology', guide ? C.steel : C.red);
   const reach = spect ? spect.bendR : state.bendR;
-  r.tag_stick.set('STICK', tool === 'bend' ? 'reach ' + Math.round(reach * 100) + ' cm' : 'join ' + (state.tol * 100).toFixed(1) + ' cm', C.blue);
-  if (r.capTool !== tool) {
-    r.capTool = tool;
-    if (tool === 'erase') r.lower.tex.userData.set('x', C.red, '#fff'); else if (tool === 'bend') r.lower.tex.userData.set('bend', C.blue, '#fff'); else r.lower.tex.userData.set('pencil', C.yellow, C.ink);
-    r.nib.material.color.set(hex);
+  r.tag_stick.set('STICK', tool === 'bend' || tool === 'iron' ? 'reach ' + Math.round(reach * 100) + ' cm' : 'join ' + (state.tol * 100).toFixed(1) + ' cm', C.blue);
+  const capKey = tool + (guide ? 'g' : 't');
+  if (r.capTool !== capKey) {
+    r.capTool = capKey;
+    r.lower.tex.userData.set(tool === 'erase' ? 'x' : info.icon, info.col, info.ink);
+    r.upper.tex.userData.set('loosen', guide ? C.steel : C.red, '#fff');
+    r.nib.material.color.set(drawish && guide ? 0x8A8D93 : hex);
   }
   tolBall.material.color.set(hex);
   models.left.userData.tags.visible = models.right.userData.tags.visible = state.show.labels;
@@ -1959,8 +2231,9 @@ function xrFrame(dt, L, R) {
     } else {
       if (xs.hadOver) uiPointer('leave', 0, 0);
       if (down) {
-        if (state.tool === 'erase') { xs.erasing = true; xs.eraseStart = state.strokes; }
+        if (BRUSH[state.tool]) { xs.erasing = true; xs.brushTool = state.tool; xs.eraseStart = state.strokes; xs.loosen = startLoosen(); }
         else if (state.tool === 'bend') xs.bending = startBend(penM, state.bendR / ws);
+        else if (state.tool === 'crease') { if (toggleCreaseNear(penM, Math.max(2 * state.tol, 0.03 / ws))) pulse(R, 0.7, 40); else { pulse(R, 0.15, 10); toast('Touch a red topology line to fold it'); } }
         else { xs.drawing = true; xs.live = [penM.x, penM.y, penM.z]; }
       }
     }
@@ -1973,24 +2246,25 @@ function xrFrame(dt, L, R) {
       if (!trig) { xs.drawing = false; Net.liveEnd(); finishStroke(xs.live, ws); xs.live = []; setLive(null); pulse(R, 0.5, 30); }
     }
     if (xs.erasing) {
-      const r2 = eraserRadiusModel(ws) ** 2, px = penM.x, py = penM.y, pz = penM.z;
-      if (eraseWhere((x, y, z) => (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < r2)) { strokesTouched(); pulse(R, 0.25, 12); }
-      if (!trig) { xs.erasing = false; if (state.strokes !== xs.eraseStart) { undoStack.push(xs.eraseStart); redoStack.length = 0; ui.dirty = true; } xs.eraseStart = null; }
+      const r2 = eraserRadiusModel(ws) ** 2, px = penM.x, py = penM.y, pz = penM.z, bt = xs.brushTool, near = (x, y, z) => (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 < r2;
+      if (bt === 'iron' ? ironAt(penM, state.bendR / ws, Math.min(1, dt * 7)) : bt === 'loosen' ? loosenWhere(near, xs.loosen) : eraseWhere(near)) { strokesTouched(); pulse(R, bt === 'iron' ? 0.08 : 0.25, 12); }
+      if (!trig) { xs.erasing = false; if (state.strokes !== xs.eraseStart) { undoS().push(xs.eraseStart); redoS().length = 0; ui.dirty = true; } xs.eraseStart = null; }
     }
     if (xs.bending) { applyBend(xs.bending, penM); if (!trig) { endBend(xs.bending); xs.bending = null; } }
-    if (R.pad.a && !xs.pa && !penBusy) setTool(state.tool === 'draw' ? 'erase' : state.tool === 'erase' ? 'bend' : 'draw');
+    if (R.pad.a && !xs.pa && !penBusy) setTool(state.tool === 'draw' ? state.lastTool : 'draw');              // A: Draw <-> the last other tool
+    if (R.pad.b && !xs.pb && !penBusy) setLine(state.line === 'guide' ? 'topo' : 'guide');                  // B: red topology line <-> gray loose guide
     xs.pa = R.pad.a; xs.pb = R.pad.b;
     if (Math.abs(R.pad.stickX) > 0.5 && !penBusy) {
-      if (state.tool === 'bend') { state.bendR = clamp(state.bendR * Math.exp(R.pad.stickX * dt * 1.1), 0.03, 0.5); refreshTags(); scheduleSave(); }
+      if (state.tool === 'bend' || state.tool === 'iron') { state.bendR = clamp(state.bendR * Math.exp(R.pad.stickX * dt * 1.1), 0.03, 0.5); refreshTags(); scheduleSave(); }
       else setTol(state.tol * Math.exp(R.pad.stickX * dt * 1.1));
     }
     tolBall.visible = !laser.visible; tolBall.position.copy(pen);
-    tolBall.scale.setScalar(state.tool === 'erase' ? eraserRadiusModel(ws) * ws : state.tool === 'bend' ? state.bendR : state.tol * ws);
+    tolBall.scale.setScalar(ballRadius(state.tool, ws, state.bendR));
     const p = models.right.userData.parts; setPressed(p.trigger, trig); setPressed(p.grip, R.pad.grip > 0.5); setPressed(p.lower.m, R.pad.a); setPressed(p.upper.m, R.pad.b); setPressed(p.stick, Math.abs(R.pad.stickX) > 0.5);
   } else {
     if (xs.drawing) { Net.liveEnd(); finishStroke(xs.live, ws); setLive(null); }
     if (xs.bending) { endBend(xs.bending); xs.bending = null; }
-    if (xs.erasing && state.strokes !== xs.eraseStart) { undoStack.push(xs.eraseStart); redoStack.length = 0; }
+    if (xs.erasing && state.strokes !== xs.eraseStart) { undoS().push(xs.eraseStart); redoS().length = 0; }
     xs.drawing = xs.erasing = xs.trig = xs.uiCap = false; tolBall.visible = laser.visible = cursorDot.visible = false;
   }
   if (L) {
@@ -2148,23 +2422,29 @@ const Net = (() => {
   const cache = new Map(), sent = new Set(), parts = new Map();
   const sid = (st) => st.id || (st.id = Math.random().toString(36).slice(2, 9) + (st.length % 97).toString(36));
   const enqueue = (topic, data) => queue.push({ topic, data });
-  function strokeMsgs(st) { const n = st.length / 3; for (let i = 0; i < n; i += CH) enqueue('stk', Object.assign({ id: st.id, n, i }, packPts(st, i, Math.min(n, i + CH)))); }
-  function orderMsgs() { const ids = state.strokes.map(sid); if (!ids.length) enqueue('ord', { sv: sync.sv, n: 0, i: 0, ids: [] }); for (let i = 0; i < ids.length; i += 300) enqueue('ord', { sv: sync.sv, n: ids.length, i, ids: ids.slice(i, i + 300) }); }
+  function strokeMsgs(st) { const n = st.length / 3; for (let i = 0; i < n; i += CH) enqueue('stk', Object.assign({ id: st.id, n, i, k: st.k | 0 }, packPts(st, i, Math.min(n, i + CH)))); }
+  function orderMsgs() { const ids = allStrokes().map(sid), lc = state.layers.map((l) => l.strokes.length); if (!ids.length) enqueue('ord', { sv: sync.sv, n: 0, i: 0, ids: [], lc }); for (let i = 0; i < ids.length; i += 300) enqueue('ord', { sv: sync.sv, n: ids.length, i, ids: ids.slice(i, i + 300), lc }); }
   function pushOrder() {
     ordTimer = 0; if (!room) return;
-    const keep = new Set(state.strokes.map(sid)); state.strokes.forEach((st) => cache.set(st.id, st));
+    const all = allStrokes(), keep = new Set(all.map(sid)); all.forEach((st) => cache.set(st.id, st));
     queue = queue.filter((m) => m.topic !== 'ord' && !(m.topic === 'stk' && !keep.has(m.data.id)));
-    for (const st of state.strokes) if (!sent.has(st.id)) { sent.add(st.id); strokeMsgs(st); }
+    for (const st of all) if (!sent.has(st.id)) { sent.add(st.id); strokeMsgs(st); }
     orderMsgs();
-    if (cache.size > 4000) { cache.clear(); state.strokes.forEach((st) => cache.set(st.id, st)); }
+    if (cache.size > 4000) { cache.clear(); all.forEach((st) => cache.set(st.id, st)); }
   }
   function tryApply() {
     if (!pend) return;
     if (pend.sv <= sync.sv) { pend = null; return; }
     if (!pend.ids.every((id) => cache.has(id))) return;
-    state.strokes = pend.ids.map((id) => cache.get(id)); sync.sv = pend.sv; pend = null;
+    let o = 0; const lc = pend.lc;
+    state.layers.forEach((l, i) => {
+      const ids = pend.ids.slice(o, o + lc[i]); o += lc[i];
+      if (l.strokes.length === ids.length && l.strokes.every((st, j) => st.id === ids[j])) return;
+      l.strokes = ids.map((id) => cache.get(id)); rebuildSketch(i); requestBuild(i);
+    });
+    sync.sv = pend.sv; pend = null;
     if (spect) { spect.live = []; spect.liveEndAt = 0; setLive(null); }
-    strokesTouched(true);
+    scheduleSave(); ui.dirty = true;
   }
   function onStroke(d) {
     if (!d || typeof d.id !== 'string' || d.id.length > 16 || !Number.isInteger(d.n) || d.n < 1 || d.n > 40000 || !Number.isInteger(d.i) || d.i < 0) return;
@@ -2173,21 +2453,22 @@ const Net = (() => {
     let e = parts.get(d.id); if (!e || e.n !== d.n) { e = { n: d.n, f: new Float32Array(d.n * 3), got: 0, seen: new Set() }; parts.set(d.id, e); }
     if (d.i * 3 + pts.length > e.f.length || e.seen.has(d.i)) return;
     e.f.set(pts, d.i * 3); e.seen.add(d.i); e.got += pts.length / 3;
-    if (e.got >= e.n) { e.f.id = d.id; cache.set(d.id, e.f); sent.add(d.id); parts.delete(d.id); tryApply(); }
+    if (e.got >= e.n) { e.f.id = d.id; e.f.k = (d.k | 0) & 3; cache.set(d.id, e.f); sent.add(d.id); parts.delete(d.id); tryApply(); }
     if (parts.size > 400) parts.clear();
   }
   function onOrder(d) {
     if (!d || typeof d.sv !== 'number' || !Number.isInteger(d.n) || d.n < 0 || d.n > 6000 || !Number.isInteger(d.i) || !Array.isArray(d.ids)) return;
     if (d.sv <= sync.sv || (pend && d.sv <= pend.sv)) return;
-    if (!ordIn || ordIn.sv !== d.sv) ordIn = { sv: d.sv, n: d.n, ids: new Array(d.n), got: 0, seen: new Set() };
+    const lc = Array.isArray(d.lc) && d.lc.length === NL && d.lc.every((v) => Number.isInteger(v) && v >= 0) && d.lc.reduce((a, b) => a + b, 0) === d.n ? d.lc : [d.n].concat(new Array(NL - 1).fill(0));
+    if (!ordIn || ordIn.sv !== d.sv) ordIn = { sv: d.sv, n: d.n, ids: new Array(d.n), got: 0, seen: new Set(), lc };
     if (ordIn.seen.has(d.i) || d.i + d.ids.length > d.n) return;
     d.ids.forEach((id, k) => { ordIn.ids[d.i + k] = String(id).slice(0, 16); }); ordIn.seen.add(d.i); ordIn.got += d.ids.length;
-    if (ordIn.got >= ordIn.n) { pend = { sv: ordIn.sv, ids: ordIn.ids, at: performance.now() }; ordIn = null; tryApply(); }
+    if (ordIn.got >= ordIn.n) { pend = { sv: ordIn.sv, ids: ordIn.ids, lc: ordIn.lc, at: performance.now() }; ordIn = null; tryApply(); }
   }
   function onNeed(d) {
     if (!d) return;
-    if (Array.isArray(d.ids)) for (const id of d.ids.slice(0, 300)) { const st = cache.get(id) || state.strokes.find((x) => x.id === id); if (st) { sid(st); strokeMsgs(st); } }
-    if (d.ord && sync.sv > 0 && sync.sv >= d.sv) { state.strokes.forEach((st) => cache.set(sid(st), st)); orderMsgs(); }
+    if (Array.isArray(d.ids)) for (const id of d.ids.slice(0, 300)) { const st = cache.get(id) || allStrokes().find((x) => x.id === id); if (st) { sid(st); strokeMsgs(st); } }
+    if (d.ord && sync.sv > 0 && sync.sv >= d.sv) { allStrokes().forEach((st) => cache.set(sid(st), st)); orderMsgs(); }
   }
   function onLive(m) {
     if (!spect || m.peer !== spect.peer) return; const d = m.data; if (!d) return;
@@ -2200,34 +2481,36 @@ const Net = (() => {
     setLive(spect.live);
   }
   function applyParams(q) {
-    const P = q.P; if (!okPose(P, 6)) return;
+    const P = q.P; if (!okPose(P, 8)) return;
     state.tol = clamp(P[0], TOL_MIN, TOL_MAX); state.autoLoops = clamp(P[1] | 0, 0, 6); state.smooth = clamp(P[2] | 0, 0, 3); state.fit = clamp(P[3], 0, 1); state.tidy = clamp(P[4], 0, 1);
     const b = P[5] | 0; state.show.sketch = !!(b & 1); state.show.curves = !!(b & 2); state.show.surface = !!(b & 4); state.show.wire = !!(b & 8); state.show.labels = !!(b & 16);
+    const lb = P[7] | 0; state.layers.forEach((l, i) => { l.vis = !!(lb & (1 << i)); }); state.ghost = !!(lb & 16); state.patch = !!(lb & 32);
+    const act = clamp(P[6] | 0, 0, NL - 1); if (act !== state.active) setActiveLayer(act, true);
     sync.pv = q.pv; applyShow(); refreshTags(); requestBuild(); scheduleSave(); ui.dirty = true;
   }
   function myPresence() {
     const b = (state.show.sketch ? 1 : 0) | (state.show.curves ? 2 : 0) | (state.show.surface ? 4 : 0) | (state.show.wire ? 8 : 0) | (state.show.labels ? 16 : 0);
-    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b], c: null, h: null, w: null, L: null, R: null, u: null };
+    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b, state.active, state.layers.reduce((a, l, i) => a | (l.vis ? 1 << i : 0), 0) | (state.ghost ? 16 : 0) | (state.patch ? 32 : 0)], c: null, h: null, w: null, L: null, R: null, u: null };
     if (isPresenter()) {
       const hand = (H, key) => { if (!H) return null; const G = models[key].userData.gripHolder;
         return pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickX || 0) > 0.5 ? 16 : 0),
           r4(G.position.x), r4(G.position.y), r4(G.position.z), r4(G.quaternion.x), r4(G.quaternion.y), r4(G.quaternion.z), r4(G.quaternion.w)]); };
       world.updateMatrixWorld(); camera.updateMatrixWorld();
       p.h = pose7(camera); p.w = pose7(world).concat([r4(world.scale.x)]); p.L = hand(lastXR.L, 'left'); p.R = hand(lastXR.R, 'right');
-      p.u = [TOOLS.indexOf(state.tool), ui.tab, vrPanel.visible ? 1 : 0, state.mr ? 1 : 0, xrMode === 'immersive-ar' ? 1 : 0, laser.visible ? 1 : 0, Math.round(xs.ux), Math.round(xs.uy), r4(laser.scale.z), r4(state.bendR)];
+      p.u = [TOOLS.indexOf(state.tool), ui.tab, vrPanel.visible ? 1 : 0, state.mr ? 1 : 0, xrMode === 'immersive-ar' ? 1 : 0, laser.visible ? 1 : 0, Math.round(xs.ux), Math.round(xs.uy), r4(laser.scale.z), r4(state.bendR), state.line === 'guide' ? 1 : 0];
     } else { camera.updateMatrixWorld(); p.c = pose7(camera).concat([Math.round(camera.fov), r4(camera.aspect)]); }
     return p;
   }
   function watch(peer, dt) {
     const q = peer.presence, first = !spect || spect.peer !== peer.peer;
     if (first) {
-      spect = { peer: peer.peer, tool: 'draw', tab: -1, mr: false, ar: false, bendR: 0.12, panel: true, live: [], liveK: -1, liveEndAt: 0 };
+      spect = { peer: peer.peer, tool: 'draw', line: 'topo', tab: -1, mr: false, ar: false, bendR: 0.12, panel: true, live: [], liveK: -1, liveEndAt: 0 };
       proxyL.add(models.left); proxyR.add(models.right); $('panelWrap').hidden = true; $('watch').hidden = false; $('roomBox').hidden = true; $('viewBtn').hidden = false; endGesture(true);
     }
     const k = first ? 1 : 1 - Math.exp(-dt * 16), u = Array.isArray(q.u) ? q.u : [];
-    const tool = TOOLS[u[0]] || 'draw', tab = clamp(u[1] | 0, 0, 3), mr = !!u[3], ar = !!u[4], bendR = clamp(+u[9] || 0.12, 0.03, 0.5);
-    const relayout = first || tab !== spect.tab || mr !== spect.mr || ar !== spect.ar, retag = first || tool !== spect.tool || bendR !== spect.bendR;
-    spect.tool = tool; spect.tab = tab; spect.mr = mr; spect.ar = ar; spect.bendR = bendR; spect.panel = !!u[2];
+    const tool = TOOLS[u[0]] || 'draw', line = u[10] ? 'guide' : 'topo', tab = clamp(u[1] | 0, 0, TABS.length - 1), mr = !!u[3], ar = !!u[4], bendR = clamp(+u[9] || 0.12, 0.03, 0.5);
+    const relayout = first || tab !== spect.tab || mr !== spect.mr || ar !== spect.ar, retag = first || tool !== spect.tool || bendR !== spect.bendR || line !== spect.line;
+    spect.tool = tool; spect.line = line; spect.tab = tab; spect.mr = mr; spect.ar = ar; spect.bendR = bendR; spect.panel = !!u[2];
     if (relayout) { ui.tab = tab; ui.collapsed = false; layoutUI(); }
     if (retag) { refreshTags(); ui.dirty = true; }
     if (okPose(q.w, 8)) {
@@ -2247,7 +2530,7 @@ const Net = (() => {
       laser.visible = cursorDot.visible = !!u[5] && spect.panel && proxyL.visible;
       if (laser.visible) { laser.scale.z = clamp(+u[8] || 0.2, 0.01, 2); cursorDot.position.set(((+u[6] || 0) / UIW - 0.5) * PANEL_W, (0.5 - (+u[7] || 0) / UIH) * PANEL_H, 0.001); }
       const ws = world.scale.x; tolBall.visible = !laser.visible; tolBall.position.copy(pen);
-      tolBall.scale.setScalar(tool === 'erase' ? eraserRadiusModel(ws) * ws : tool === 'bend' ? bendR : state.tol * ws);
+      tolBall.scale.setScalar(ballRadius(tool, ws, bendR));
     } else tolBall.visible = laser.visible = cursorDot.visible = false;
     if (spect.liveEndAt && performance.now() - spect.liveEndAt > 1500) { spect.live = []; spect.liveEndAt = 0; setLive(null); }
     orbitTarget.lerp(world.position, first ? 1 : 1 - Math.exp(-dt * 3)); applyOrbit();
@@ -2361,7 +2644,7 @@ renderer.setAnimationLoop((t) => {
 
 Engine.start(); Net.start();
 if (!load()) state.strokes = packStrokes(QE.makeExample('sheet', 1 + Math.floor(Math.random() * 1e6), state.exMess));
-layoutUI(); refreshTags(); applyShow(); onResize(); rebuildSketch(); requestBuild(); probeDownloads();
+layoutUI(); refreshTags(); applyShow(); onResize(); state.layers.forEach((l, i) => { if (i === state.active || l.strokes.length) { rebuildSketch(i); requestBuild(i); } }); probeDownloads();
 const coarse = window.matchMedia('(pointer: coarse)').matches;
 if (coarse) setTool('look');
 $('hint').textContent = coarse ? '2 fingers: orbit + zoom' : 'right-drag: orbit \u00b7 wheel: zoom';
@@ -2370,7 +2653,7 @@ if (navigator.xr) {
     .then(([vr, ar]) => { xrSupport.vr = !!vr; xrSupport.ar = !!ar; $('enter').hidden = !(vr || ar); });
 }
 // handle for tests and tinkering
-window.QX = { THREE, state, commit, pvPanel, adoptGLB, setView: (v) => { state.view = v; $('splitLine').hidden = v !== 'split'; onResize(); }, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
+window.QX = { THREE, state, views, setActiveLayer, setLine, ironAt, loosenWhere, toggleCreaseNear, strokesTouched, withoutAlong, commit, pvPanel, adoptGLB, setView: (v) => { state.view = v; $('splitLine').hidden = v !== 'split'; onResize(); }, tick: (dt) => Net.frame(dt), engineMode: Engine.mode, Net, sync, getSpect: () => spect, setDebugXR: (v) => { debugXR = !!v; }, proxyL, proxyR, headMark, liveCount: () => liveLine.geometry.drawRange.count, world, ui, xs, models, hands, xrFrame, uiPointer, layoutUI, loadExample, setTol, setParam, setTool, undo, redo, zipStore, getBuilt: () => built, getStats: () => stats, camera, renderer };
 </script>
 <script src="../updated.js"></script>
 </body>
