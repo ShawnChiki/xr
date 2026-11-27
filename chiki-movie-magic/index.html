@@ -86,8 +86,9 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    Every sculpt stamp goes through applyOp(op) for future multiplayer.
    ============================================================ */
 
-const VERSION = '555';
+const VERSION = '556';
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.mjs';
+const WEBM_MUXER_URL = 'https://cdn.jsdelivr.net/npm/webm-muxer@5.1.4/build/webm-muxer.mjs';   // WebM and MKV (Matroska)
 const CN = 16, CN3 = CN*CN*CN;
 const DMAX = 1.5;
 const MAXVOX = 16;
@@ -315,7 +316,7 @@ async function bxFinish(X){
   let o = null; try { o = JSON.parse(new TextDecoder().decode(await zipU8(b64ToU8(X.parts.join('')), true))); } catch(e){ X.done = false; X.parts.fill(null); X.tries++; netStatus('A piece came in broken. Asking again…'); netSend({t:'bxneed', id:X.id, miss:bxMissing(X)}); return; }
   if (X.kind === 'trk'){ if (o.scene === curScene) show.tracks = o.tracks; else { const sc = sceneById(o.scene); if (sc) sc.tracks = o.tracks; } motionDirty = true; requestUI(); return; }
   if (X.extra && X.extra.views) o.views = X.extra.views;
-  const keepEx = {res:shots.res, fps:shots.fps, small:shots.small};
+  const keepEx = {res:shots.res, fps:shots.fps, small:shots.small, q:shots.q, fmt:shots.fmt, punch:shots.punch};
   netMute++; try { if (show.embodied) show.embodied = null; deserialize(o); } finally { netMute--; }
   const first = !NET.synced;
   NET.synced = true; netPose.clear(); netHash.clear();
@@ -1117,7 +1118,7 @@ function applyWorld(){
 /* ---------------- 90s lens flare: rings and glows strung from the sun through the middle of the picture ---------------- */
 const flare = new THREE.Group(); flare.visible = false; scene.add(flare);
 { const parts = [[1.0, 0.55, 0, '#fff3c4', 0.9], [1.0, 0.16, 1, '#ffffff', 1.0], [0.62, 0.07, 1, '#ffd36a', 0.45], [0.35, 0.12, 2, '#7affd6', 0.35], [0.1, 0.05, 1, '#ff9ad5', 0.4],
-    [-0.2, 0.18, 2, '#a8c8ff', 0.3], [-0.45, 0.09, 1, '#ffb066', 0.4], [-0.8, 0.26, 2, '#ff6ad5', 0.25], [-1.1, 0.06, 1, '#ffffff', 0.35]];
+    [-0.2, 0.18, 2, '#a8c8ff', 0.3], [-0.45, 0.09, 1, '#ffb066', 0.4], [-0.8, 0.26, 2, '#ff6ad5', 0.25], [-1.1, 0.06, 1, '#ffffff', 0.35], [1.0, 1.6, 3, '#5aa8ff', 0.9]];
   for (const [k, sz, shape, col, a] of parts){
     const m = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({uniforms:{uDir:{value:new THREE.Vector3(0,1,0)}, uK:{value:k}, uS:{value:sz}, uShape:{value:shape}, uCol:{value:new THREE.Color(col)}, uA:{value:a}},
       vertexShader:`uniform vec3 uDir; uniform float uK, uS; varying vec2 vUv; varying float vFade;
@@ -1128,11 +1129,12 @@ const flare = new THREE.Group(); flare.visible = false; scene.add(flare);
           gl_Position = vec4(c + position.xy*uS*vec2(1.0/asp, 1.0), 0.0, 1.0); }`,
       fragmentShader:`uniform float uShape, uA; uniform vec3 uCol; varying vec2 vUv; varying float vFade;
         void main(){ float r = length(vUv), a = uShape < 0.5 ? pow(max(0.0, 1.0 - r), 2.2) : uShape < 1.5 ? smoothstep(1.0, 0.75, r) : smoothstep(0.08, 0.0, abs(r - 0.85))*0.8 + smoothstep(1.0, 0.0, r)*0.12;
+          if (uShape > 2.5) a = exp(-abs(vUv.y)*28.0)*pow(max(0.0, 1.0 - abs(vUv.x)), 1.5);   // anamorphic: a long thin blue streak
           gl_FragColor = vec4(uCol*a*uA*vFade, 1.0); }`,
       transparent:true, depthTest:false, depthWrite:false, blending:THREE.AdditiveBlending, toneMapped:false}));
     m.frustumCulled = false; m.renderOrder = 1e6; flare.add(m); } }
 function updateFlare(){ const on = !!state.world.flare && !inStudio() && sun.position.y > 0.5; flare.visible = on; if (!on) return;
-  const d = sun.position.clone().normalize(); for (const m of flare.children) m.material.uniforms.uDir.value.copy(d); }
+  const d = sun.position.clone().normalize(), ana = shots.aspect === '2.39:1'; for (const m of flare.children){ m.material.uniforms.uDir.value.copy(d); if (m.material.uniforms.uShape.value > 2.5) m.visible = ana; } }
 /* ---------------- sky patterns: a dome drawn at infinity over the sky colours (clouds, twinkly stars, swirl, aurora, confetti) ---------------- */
 const SKY_PATS = [['none','Plain'],['clouds','Clouds'],['bryce','Big clouds'],['stars','Twinkly stars'],['swirl','Swirl'],['aurora','Aurora'],['confetti','Confetti']];
 const SKY_KIND = {none:0, clouds:1, stars:2, swirl:3, aurora:4, confetti:5, bryce:6};
@@ -3711,7 +3713,7 @@ function newSceneTimeline(){
 }
 function cycleScene(d){ const i = scenes.findIndex(x=>x.id===curScene); goScene(scenes[(i+d+scenes.length)%scenes.length].id); }
 const shotCam = new THREE.PerspectiveCamera(50, 16/9, 0.01, 5000);
-const ASPECTS = {'16:9':16/9, '1:1':1, '9:16':9/16};
+const ASPECTS = {'16:9':16/9, '2.39:1':2.39, '1:1':1, '9:16':9/16};   // 2.39:1 = anamorphic Scope
 const takeById = id => shots.takes.find(t=>t.id===id);
 const selTake = () => takeById(shots.sel);
 function makeKeys(tk){
@@ -3840,7 +3842,16 @@ function fovAt(tk, u){
 // the zoom is set for a square frame; wide shows more at the sides, vertical shows more above and below
 function vfov(f, aspect){ return aspect < 1 ? 2*Math.atan(Math.tan(f*Math.PI/360)/aspect)*180/Math.PI : f; }
 // lens shift: slide the picture without turning the camera. "Keep verticals straight" levels the camera and shifts instead.
+let _nextFrame = null;   // the pan & scan for the very next finishShotCam (set just before it)
+const frameOf = f => f && (f.z > 1.0001 || f.x || f.y) ? f : null;
+function clipFrameAt(c, u){
+  if (!c || !c.fr) return null; const a = {z:c.fr.z||1, x:c.fr.x||0, y:c.fr.y||0}; if (!c.frEnd) return frameOf(a);
+  const R = clipRange(c); if (!R) return frameOf(a); let t = clamp((u - R.a)/Math.max(1e-3, R.b - R.a), 0, 1); t = t*t*(3 - 2*t);
+  const b = {z:c.frEnd.z||1, x:c.frEnd.x||0, y:c.frEnd.y||0}, z = a.z*Math.pow(b.z/a.z, t);
+  return frameOf({z, x:a.x + (b.x - a.x)*t, y:a.y + (b.y - a.y)*t});
+}
 function finishShotCam(cam, fovDeg, aspect, sx, sy, straight, s){
+  cam.userData.frame = _nextFrame; _nextFrame = null;
   cam.near = 0.01*(s||1); cam.far = 5000*(s||1); cam.aspect = aspect; cam.fov = fovDeg;
   let pt = 0;
   if (straight){
@@ -3854,10 +3865,13 @@ function refov(cam, fovDeg){
   cam.fov = fovDeg; cam.updateProjectionMatrix();
   const [sx, sy, pt] = cam.userData.shift || [0,0,0];
   const e = cam.projectionMatrix.elements; e[8] += sx; e[9] += clamp(sy + pt/Math.tan(fovDeg*Math.PI/360), -3, 3);
+  const fr = cam.userData.frame;   // a clip's pan & scan: blow the picture up z times around (x, y)
+  if (fr){ const z = fr.z, m = 1 - 1/z, cx = clamp(fr.x, -m, m), cy = clamp(fr.y, -m, m);
+    for (const i of [0, 4, 8, 12]) e[i] *= z; for (const i of [1, 5, 9, 13]) e[i] *= z; e[8] += z*cx; e[9] += z*cy; }
   cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert(); cam.updateMatrixWorld();
 }
 function poseShotCam(tk, u){
-  evalTake(tk, u, shotCam.position, shotCam.quaternion);
+  evalTake(tk, u, shotCam.position, shotCam.quaternion); _nextFrame = tk._clip ? clipFrameAt(tk._clip, u) : null;
   finishShotCam(shotCam, vfov(fovAt(tk, u), ASPECTS[shots.aspect]), ASPECTS[shots.aspect], tk.shiftX, tk.shiftY, tk.straight, tk.scale);
 }
 const spd = tk => tk.speed || 1;
@@ -4375,14 +4389,15 @@ async function checkHevc(){ hevcOK = false; if (!('VideoEncoder' in window)) ret
 // on a phone the video goes out through the share sheet: "Save Video" puts it in Photos (the camera roll). The button stays until you've saved.
 const TOUCH = () => matchMedia('(pointer:coarse)').matches;
 function showSaveBtn(){ const b = document.getElementById('savemp4'), S = lastSave || lastMP4; if (!S) return; const zip = /\.zip$/.test(S.name);
-  b.textContent = TOUCH() ? (zip ? '📲 Save zip' : '📲 Save to Photos') : (zip ? 'Save zip' : 'Save MP4'); b.style.display = ''; requestUI(); }
+  const ext = (S.name.match(/\.(\w+)$/) || [,'mp4'])[1], F = FMT_EXT[ext] || 'MP4';
+  b.textContent = TOUCH() ? (zip ? '📲 Save zip' : ext === 'mp4' ? '📲 Save to Photos' : '📲 Save '+F) : (zip ? 'Save zip' : 'Save '+F); b.style.display = ''; requestUI(); }
 function saveMP4(download){
   const S = lastSave || lastMP4; if (!S) return;
   const zip = /\.zip$/.test(S.name);
   if (!download && TOUCH()){
-    try { const f = new File([S.blob], S.name, {type:S.blob.type || (zip ? 'application/zip' : 'video/mp4')});
+    try { const f = new File([S.blob], S.name, {type:S.blob.type || (zip ? 'application/zip' : 'video/mp4')}), photo = /\.mp4$/.test(S.name);
       if (navigator.canShare && navigator.canShare({files:[f]})){
-        navigator.share({files:[f]}).then(() => toast(zip ? 'Shared' : 'Done! If you picked "Save Video", it is in Photos.')).catch(e => { if (e && e.name === 'AbortError') toast('Not saved yet: tap 📲 Save to Photos again and pick "Save Video"'); else { toast('The share sheet didn\'t open, so it goes to Files instead'); saveMP4(true); } });
+        navigator.share({files:[f]}).then(() => toast(zip || !photo ? 'Shared' : 'Done! If you picked "Save Video", it is in Photos.')).catch(e => { if (e && e.name === 'AbortError') toast('Not saved yet: tap 📲 Save to Photos again and pick "Save Video"'); else { toast('The share sheet didn\'t open, so it goes to Files instead'); saveMP4(true); } });
         return; } } catch(e){}
   }
   const a = document.createElement('a'); a.href = URL.createObjectURL(S.blob); a.download = S.name;
@@ -4393,6 +4408,7 @@ function saveMP4(download){
 document.getElementById('savemp4').onclick = () => saveMP4();
 function exportSize(){
   const base = shots.res; const r = ASPECTS[shots.aspect];
+  if (r > 2) return [Math.round(base*16/9/2)*2, Math.round(base*16/9/r/2)*2];   // Scope: as wide as Wide, cut down to 2.39:1 (1920×804 at 1080)
   if (r > 1) return [Math.round(base*r/2)*2, base];
   if (r < 1) return [base, Math.round(base/r/2)*2];
   return [base, base];
@@ -4415,7 +4431,7 @@ async function soundPlays(r, sr){   // decode the first second back: if this pho
   if (err || !outs){ console.warn('sound does not decode', err, outs); return false; }
   r.loud = loud; return true;
 }
-async function encodeSoundTrack(abuf, fa, fb){
+async function encodeSoundTrack(abuf, fa, fb, opusOnly){
   const SR = abuf.sampleRate, o0 = Math.min(abuf.length, Math.round(fa*SR)), N = Math.max(0, Math.min(abuf.length, Math.round(fb*SR)) - o0);
   const L0 = abuf.getChannelData(0).subarray(o0), R0 = (abuf.numberOfChannels > 1 ? abuf.getChannelData(1) : abuf.getChannelData(0)).subarray(o0);
   const ASC = new Uint8Array([0x11, 0x90]);   // AAC-LC, 48 kHz, stereo
@@ -4440,6 +4456,7 @@ async function encodeSoundTrack(abuf, fa, fb){
     return (await soundPlays(res, SR)) ? res : null;
   };
   const base = {sampleRate:SR, numberOfChannels:2};
+  if (opusOnly){ for (const br of [192000, 160000, 128000]){ const r = await tryEnc({codec:'opus', ...base, bitrate:br}, false) || await tryEnc({codec:'opus', ...base, bitrate:br}, true); if (r) return r; } return null; }
   for (const br of [160000, 128000, 192000]) for (const il of [false, true]){
     const r = await tryEnc({codec:'mp4a.40.2', ...base, bitrate:br, aac:{format:'aac'}}, il) || await tryEnc({codec:'mp4a.40.2', ...base, bitrate:br}, il); if (r) return r; }
   const rec = await recordSoundAAC(L0, R0, N, SR); if (rec) return rec;   // no AAC encoder here: the phone records the mix as AAC in real time
@@ -4487,12 +4504,39 @@ function aacFromMP4(u8){   // find the AAC config and frames in an MP4 (fragment
   if (!frames.length && sizes.length && stco.length){ let si = 0; for (let c=0; c<stco.length; c++){ let per = 1; for (const [first, n] of stsc) if (c + 1 >= first) per = n; let p = stco[c]; for (let k=0; k<per && si < sizes.length; k++){ frames.push(u8.slice(p, p + sizes[si])); p += sizes[si++]; } } }
   if (!asc) return null; return {asc, frames, sr, ch};
 }
+const opusHead = (ch = 2, sr = 48000, pre = 312) => { const b = new Uint8Array(19), dv = new DataView(b.buffer); b.set([79,112,117,115,72,101,97,100]); b[8] = 1; b[9] = ch; dv.setUint16(10, pre, true); dv.setUint32(12, sr, true); return b; };
+function makePunch(W, H){   // ✨ richer colour (dull colours lifted most, so skin and bright toys don't go neon) + crisper edges, before the encoder smooths them
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const gl = cv.getContext('webgl', {preserveDrawingBuffer:true, antialias:false, premultipliedAlpha:false}); if (!gl) return null;
+  const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
+  const pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, 'attribute vec2 p; varying vec2 v; void main(){ v = p*0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }'));
+  gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, `precision highp float; uniform sampler2D t; uniform vec2 px; varying vec2 v;
+    void main(){ vec3 c = texture2D(t, v).rgb;
+      vec3 b = (texture2D(t, v + vec2(px.x, 0.0)).rgb + texture2D(t, v - vec2(px.x, 0.0)).rgb + texture2D(t, v + vec2(0.0, px.y)).rgb + texture2D(t, v - vec2(0.0, px.y)).rgb)*0.25;
+      c += clamp((c - b)*0.55, -0.1, 0.1);
+      float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b)), l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+      c = mix(vec3(l), c, 1.0 + 0.32*(1.0 - clamp(mx - mn, 0.0, 1.0)));
+      c = (c - 0.5)*1.04 + 0.5;
+      gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0); }`));
+  gl.linkProgram(pr); gl.useProgram(pr);
+  const bu = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bu); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const ap = gl.getAttribLocation(pr, 'p'); gl.enableVertexAttribArray(ap); gl.vertexAttribPointer(ap, 2, gl.FLOAT, false, 0, 0);
+  const tx = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tx);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+  gl.uniform2f(gl.getUniformLocation(pr, 'px'), 1/W, 1/H); gl.uniform1i(gl.getUniformLocation(pr, 't'), 0); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); gl.viewport(0, 0, W, H);
+  return {canvas:cv, draw(src){ gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); return cv; },
+    dispose(){ gl.deleteTexture(tx); gl.deleteBuffer(bu); gl.deleteProgram(pr); gl.getExtension('WEBGL_lose_context')?.loseContext(); }};
+}
+const exportFmt = () => shots.fmt === 'webm' || shots.fmt === 'mkv' ? shots.fmt : 'mp4';
+const exportQ = () => shots.q || (shots.small ? 'small' : 'std');
+const FMT_EXT = {mp4:'MP4', webm:'WebM', mkv:'MKV'};
 async function exportMP4(fresh){
   if (exporting) return;
   if (!fresh && guestExport()) return;
   if (renderer.xr.isPresenting && state.confirm!=='exportvr'){ state.confirm='exportvr'; toast('Making an MP4 in the headset can take a while (you can cancel). Tap Export again to start.'); requestUI(); return; }
   state.confirm = null;
-  if (!('VideoEncoder' in window)){ toast('This browser can’t make MP4s — try desktop Chrome'); return; }
+  if (!('VideoEncoder' in window)){ toast('This browser can’t make videos — try desktop Chrome'); return; }
   const whole = !!state.exportWhole && scenes.length > 1, startScene = curScene, keepSeq = shots.seq;
   if (whole){ ensureCuts(); shots.sceneCut = shots.sceneCut || {};   // each scene's chosen cut, in scene order
     const seq = [], mix = {}; for (const sc of scenes){ const L = shots.cuts.filter(x => x.sceneId === sc.id), c = L.find(x => x.id === shots.sceneCut[sc.id]) || L[0]; if (c){ seq.push(...c.seq); Object.assign(mix, c.mix || {}); } }
@@ -4502,15 +4546,18 @@ async function exportMP4(fresh){
   const [W,H] = exportSize(), fps = shots.fps, total = filmLength(), [fa, fb] = filmRange();
   const frames = Math.max(1, Math.round((fb-fa)*fps));
   exporting = {i:0, frames, cancel:false}; workView(); requestUI();
-  let er = null;
+  let er = null, punch = null;
+  const fmt = exportFmt(), Q = exportQ(), mkv = fmt === 'mkv', webm = fmt === 'webm';
   try {
-    const {Muxer, ArrayBufferTarget} = await import(MUXER_URL);
-    const big = Math.max(W,H) > 2000, small = !!shots.small, fpsK = fps > 30 ? 1.35 : 1;
-    const avc = big ? ['avc1.640034','avc1.640033','avc1.4d0034','avc1.420034'] : (fps > 30 ? ['avc1.64002a','avc1.640028'] : ['avc1.640028','avc1.64002a']).concat(['avc1.4d0028','avc1.42002a','avc1.42001f']);
-    // enough data for every pixel of every frame (60 fps needs twice what 30 does), so fast, busy moments stay sharp
-    const px = W*H*fps, rate = (bpp, floor) => Math.round(clamp(Math.max(px*bpp, floor), 4e6, 90e6));   // never less than before
-    const tries = (small ? HEVC_CANDS(big).map(codec => ({codec, bitrate:rate(0.07, (big ? 16e6 : 4.5e6)*fpsK), hevc:true})) : [])
-      .concat(avc.map(codec => ({codec, bitrate: small ? rate(0.1, (big ? 20e6 : 6e6)*fpsK) : rate(0.22, big ? 40e6 : 12e6)})));   // smaller: HEVC if it can, else a lighter H.264. Always the fps you picked
+    const M = await import(fmt === 'mp4' ? MUXER_URL : WEBM_MUXER_URL), {Muxer, ArrayBufferTarget} = M;
+    const big = Math.max(W,H) > 2000, small = Q === 'small', max = Q === 'max', fpsK = fps > 30 ? 1.35 : 1;
+    const avc = (max ? ['avc1.640033','avc1.640034','avc1.640032'] : []).concat(big ? ['avc1.640034','avc1.640033','avc1.4d0034','avc1.420034'] : (fps > 30 ? ['avc1.64002a','avc1.640028'] : ['avc1.640028','avc1.64002a']).concat(['avc1.4d0028','avc1.42002a','avc1.42001f']));
+    // enough data for every pixel of every frame (60 fps needs twice what 30 does), so fast, busy moments stay sharp. Max: about twice that again, so fine detail and strong colour edges survive
+    const px = W*H*fps, rate = (bpp, floor) => Math.round(clamp(Math.max(px*bpp, floor), 4e6, max ? 160e6 : 90e6));   // never less than before
+    const vp = [...(big ? ['vp09.00.51.08','vp09.00.50.08'] : ['vp09.00.41.08','vp09.00.40.08','vp09.00.31.08']), 'av01.0.12M.08', 'av01.0.08M.08', 'vp8'];
+    const tries = webm ? vp.map(codec => ({codec, bitrate: small ? rate(0.05, (big ? 10e6 : 3e6)*fpsK) : max ? rate(0.32, (big ? 60e6 : 20e6)*fpsK) : rate(0.14, (big ? 25e6 : 8e6)*fpsK)}))
+      : (small ? HEVC_CANDS(big).map(codec => ({codec, bitrate:rate(0.07, (big ? 16e6 : 4.5e6)*fpsK), hevc:true})) : [])
+      .concat(avc.map(codec => ({codec, bitrate: small ? rate(0.1, (big ? 20e6 : 6e6)*fpsK) : max ? rate(0.45, (big ? 80e6 : 25e6)*fpsK) : rate(0.22, big ? 40e6 : 12e6)})));   // smaller: HEVC if it can, else a lighter H.264. Always the fps you picked
     let config = null, isHevc = false;
     for (const tr of tries){
       const base = {codec:tr.codec, width:W, height:H, bitrate:Math.round(tr.bitrate), framerate:fps};
@@ -4523,11 +4570,14 @@ async function exportMP4(fresh){
     stashScene();
     let abuf = null, aCfg = null, snd = null, sndWhy = '';
     try { abuf = await renderFilmAudio(total); } catch(e){ console.warn('audio mix failed', e); sndWhy = 'the sound mix failed ('+(e.message||e)+')'; }
-    if (abuf){ try { snd = await encodeSoundTrack(abuf, fa, fb); } catch(e){ console.warn(e); } if (!snd) sndWhy = 'this browser could not encode sound'; }
+    if (abuf){ try { snd = await encodeSoundTrack(abuf, fa, fb, webm); } catch(e){ console.warn(e); } if (!snd) sndWhy = 'this browser could not encode '+(webm ? 'Opus ' : '')+'sound'; }
     if (snd) aCfg = {codec:snd.codec};
-    const muxer = new Muxer({target, video:{codec: isHevc ? 'hevc' : 'avc', width:W, height:H, frameRate:fps}, ...(snd ? {audio:{codec:snd.codec, numberOfChannels:snd.ch || 2, sampleRate:snd.sr || 48000}} : {}), fastStart:'in-memory'});
+    if (snd && snd.codec === 'opus' && !(snd.desc && snd.desc.length >= 19 && snd.desc[0] === 79 && snd.desc[4] === 72)) snd.desc = opusHead(snd.ch || 2, snd.sr || 48000);   // Matroska needs the OpusHead
+    const vk = config.codec.slice(0, 4), mkvV = {avc1:'V_MPEG4/ISO/AVC', hvc1:'V_MPEGH/ISO/HEVC', hev1:'V_MPEGH/ISO/HEVC', vp09:'V_VP9', av01:'V_AV1', vp8:'V_VP8'}[vk] || 'V_VP9';
+    const muxer = fmt === 'mp4' ? new Muxer({target, video:{codec: isHevc ? 'hevc' : 'avc', width:W, height:H, frameRate:fps}, ...(snd ? {audio:{codec:snd.codec, numberOfChannels:snd.ch || 2, sampleRate:snd.sr || 48000}} : {}), fastStart:'in-memory'})
+      : new Muxer({target, type: mkv ? 'matroska' : 'webm', video:{codec:mkvV, width:W, height:H, frameRate:fps}, ...(snd ? {audio:{codec: snd.codec === 'aac' ? 'A_AAC' : 'A_OPUS', numberOfChannels:snd.ch || 2, sampleRate:snd.sr || 48000}} : {}), firstTimestampBehavior:'permissive'});
     if (snd){ const meta = {decoderConfig:{codec: snd.codec === 'aac' ? 'mp4a.40.2' : 'opus', sampleRate:snd.sr || 48000, numberOfChannels:snd.ch || 2, description:snd.desc || undefined}};
-      snd.chunks.forEach((c, i) => muxer.addAudioChunkRaw(c.d, c.type || 'key', c.t, c.dur || 21333, i === 0 ? meta : undefined)); }
+      snd.chunks.forEach((c, i) => fmt === 'mp4' ? muxer.addAudioChunkRaw(c.d, c.type || 'key', c.t, c.dur || 21333, i === 0 ? meta : undefined) : muxer.addAudioChunkRaw(c.d, c.type || 'key', c.t, i === 0 ? meta : undefined)); }
     let encErr = null;
     const enc = new VideoEncoder({output:(chunk, meta)=>muxer.addVideoChunk(chunk, meta), error:e=>{ encErr = e; }});
     enc.configure(config);
@@ -4536,33 +4586,34 @@ async function exportMP4(fresh){
       exporting.shared = {pr:renderer.getPixelRatio(), size:renderer.getSize(new THREE.Vector2())}; er = renderer; er.setPixelRatio(1); er.setSize(W, H, false);
     } else { er = new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true, stencil:true}); er.setPixelRatio(1); er.setSize(W, H, false); er.outputColorSpace = THREE.SRGBColorSpace; }
     const cam = new THREE.PerspectiveCamera(50, W/H, 0.01, 5000);
+    if (shots.punch){ try { punch = makePunch(W, H); } catch(e){ console.warn('punch pass failed', e); punch = null; } }
     for (let i=0;i<frames;i++){
       if (encErr) throw encErr;
       if (exporting.cancel) throw new Error('cancelled');
       const f = filmAt(fa + i/fps); if (!f) break; activateScene(f.tk.sceneId);
       evalTake(f.tk, f.u, cam.position, cam.quaternion);
-      finishShotCam(cam, vfov(fovAt(f.tk, f.u), W/H), W/H, f.tk.shiftX, f.tk.shiftY, f.tk.straight, f.tk.scale);
+      _nextFrame = f.tk._clip ? clipFrameAt(f.tk._clip, f.u) : null; finishShotCam(cam, vfov(fovAt(f.tk, f.u), W/H), W/H, f.tk.shiftX, f.tk.shiftY, f.tk.straight, f.tk.scale);
       wobbleRestore(); if (i === 0) exporting._wob = new Map();
       applyShowPose(f.u); applyFace(1/fps, f.u); updateArms(); animateDoodles(i/fps); wobbleApply(1/fps, exporting._wob);
       withShotView(() => renderFocused(er, cam, null, focusOf(f.tk), i===0 || f.tk !== exporting._ftk)); exporting._ftk = f.tk; wobbleRestore();
-      const vf = new VideoFrame(er.domElement, {timestamp: Math.round(i*1e6/fps), duration: Math.round(1e6/fps)});
+      const vf = new VideoFrame(punch ? punch.draw(er.domElement) : er.domElement, {timestamp: Math.round(i*1e6/fps), duration: Math.round(1e6/fps)});
       enc.encode(vf, {keyFrame: i % (fps*2) === 0}); vf.close();
       while (enc.encodeQueueSize > 4) await new Promise(r=>setTimeout(r, 2));
       exporting.i = i+1;
       if (i % 4 === 0){ requestUI(); await new Promise(r=>setTimeout(r, 0)); }
     }
     await enc.flush(); enc.close(); muxer.finalize();
-    const blob = new Blob([target.buffer], {type:'video/mp4'});
+    const blob = new Blob([target.buffer], {type: fmt === 'mp4' ? 'video/mp4' : webm ? 'video/webm' : 'video/x-matroska'});
     const d = new Date(), pad=n=>String(n).padStart(2,'0');
-    lastSave = lastMP4 = {blob, name:`chikimoviemagic-${W}x${H}-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.mp4`};
-    window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec, audio: snd ? snd.codec+' ('+snd.how+')' : null, why:sndWhy}; state.lastSound = snd ? (snd.codec === 'aac' ? 'with sound (AAC · '+snd.how+' · '+Array.from(snd.desc || []).map(b => b.toString(16).padStart(2,'0')).join('')+')' : 'with sound (Opus: may be silent in iPhone Photos)') : 'NO SOUND: '+sndWhy;
-    const mb = (blob.size/1e6).toFixed(1)+' MB'+(isHevc ? ' · HEVC' : '');
-    if (renderer.xr.isPresenting || TOUCH()){ showSaveBtn(); toast(renderer.xr.isPresenting ? 'MP4 ready, '+state.lastSound+'. Exit VR and tap the green Save button.' : 'Video ready ('+mb+', '+state.lastSound+'). Tap 📲 Save to Photos, then "Save Video".'); }   // a phone needs your tap to open the share sheet
-    else { saveMP4(); toast('MP4 saved · '+W+'×'+H+' · '+mb+' · '+state.lastSound); }
+    lastSave = lastMP4 = {blob, name:`chikimoviemagic-${W}x${H}-${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.${fmt}`};
+    window.__lastExport = {bytes: blob.size, W, H, frames, codec:config.codec, fmt, bitrate:config.bitrate, punch:!!punch, audio: snd ? snd.codec+' ('+snd.how+')' : null, why:sndWhy}; state.lastSound = snd ? (snd.codec === 'aac' ? 'with sound (AAC · '+snd.how+' · '+Array.from(snd.desc || []).map(b => b.toString(16).padStart(2,'0')).join('')+')' : 'with sound (Opus: may be silent in iPhone Photos)') : 'NO SOUND: '+sndWhy;
+    const mb = (blob.size/1e6).toFixed(1)+' MB'+(isHevc ? ' · HEVC' : '')+(fmt !== 'mp4' ? ' · '+{vp09:'VP9', av01:'AV1', vp8:'VP8', avc1:'H.264', hvc1:'HEVC', hev1:'HEVC'}[vk] : '')+(punch ? ' · ✨' : ''), F = FMT_EXT[fmt];
+    if (renderer.xr.isPresenting || TOUCH()){ showSaveBtn(); toast(renderer.xr.isPresenting ? F+' ready, '+state.lastSound+'. Exit VR and tap the green Save button.' : fmt === 'mp4' ? 'Video ready ('+mb+', '+state.lastSound+'). Tap 📲 Save to Photos, then "Save Video".' : F+' ready ('+mb+'). Photos can’t hold '+F+': tap 📲 Save and pick "Save to Files".'); }   // a phone needs your tap to open the share sheet
+    else { saveMP4(); toast(F+' saved · '+W+'×'+H+' · '+mb+' · '+state.lastSound); }
   } catch(e){ console.error(e); toast(String(e.message||e)==='cancelled' ? 'Export cancelled' : 'Export failed: '+(e.message||e)); window.__lastExport = {error:String(e)}; }
   finally { if (shots._whole){ shots._whole = null; shots.seq = keepSeq; } activateScene(startScene); ensureCuts();
     if (exporting && exporting.shared){ const S = exporting.shared; renderer.setPixelRatio(S.pr); renderer.setSize(S.size.x, S.size.y, false); renderer.setRenderTarget(null); if (typeof phoneLayout === 'function') phoneLayout(); }
-    else if (er){ er.dispose(); er.forceContextLoss?.(); } exporting = null; workView(); requestUI(); }
+    else if (er){ er.dispose(); er.forceContextLoss?.(); } if (punch) punch.dispose(); exporting = null; workView(); requestUI(); }
 }
 
 /* ============================================================
@@ -4995,7 +5046,7 @@ function serialize(){
     world: state.world,
     lights: lights.map(l=>({id:l.id, p:l.p, col:l.col, bright:l.bright, range:l.range})),
     views,
-    shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, small:!!shots.small, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, sceneId:c.sceneId ?? null, seq:c.seq.slice(), mix:c.mix||{}, fin:c.fin||0, fout:c.fout ?? null}))), sceneCut:shots.sceneCut||{}, xfade:shots.xfade ?? 0.3, cut:shots.cut, clipSeq:shots.clipSeq||1},
+    shots: {takes: shots.takes.map(copyTake), seq:shots.seq, sel:shots.sel, aspect:shots.aspect, res:shots.res, fps:shots.fps, small:!!shots.small, q:shots.q, fmt:shots.fmt, punch:!!shots.punch, blackRoom:shots.blackRoom, takeSeq:shots.takeSeq, spatial:shots.spatial ?? 1, cuts:(ensureCuts(), shots.cuts.map(c=>({id:c.id, name:c.name, sceneId:c.sceneId ?? null, seq:c.seq.slice(), mix:c.mix||{}, fin:c.fin||0, fout:c.fout ?? null}))), sceneCut:shots.sceneCut||{}, xfade:shots.xfade ?? 0.3, cut:shots.cut, clipSeq:shots.clipSeq||1},
     scenes: (stashScene(), scenes.map(sc=>({id:sc.id, name:sc.name, places:sc.places||{}, music:sc.music||null, audio:(sc.audio||[]).filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null, k0:a.k0 ?? null, k1:a.k1 ?? null, bleep:!!a.bleep})), tracks:Object.fromEntries(Object.entries(sc.tracks||{}).map(([k,v])=>[k,{samples:r5(v.samples)}])), takes:(sc.takes||[]).map(t=>({...t, before:Object.fromEntries(Object.entries(t.before||{}).map(([k,v])=>[k, v ? r5(v) : null]))}))}))), curScene, sceneSeq,
     show: {music:show.music, tracks:Object.fromEntries(Object.entries(show.tracks).map(([k,v])=>[k,{samples:r5(v.samples)}])), audio:show.audio.filter(a=>a.b64).map(a=>({id:a.id, b64:a.b64, mime:a.mime, dur:a.dur, at:a.at||0, vol:a.vol??1, fx:a.fx||'none', fxp:a.fxp||null, pitch:a.pitch||0, name:a.name, cid:a.cid ?? null, mute:a.mute||null, k0:a.k0 ?? null, k1:a.k1 ?? null})),
            chars:show.chars.map(c=>({id:c.id, name:c.name, type:c.type, place:c.place, placed:c.placed, guide:c.guide||null, locked:!!c.locked, voiceFx:c.voiceFx||'none', voicePitch:c.voicePitch||0, voiceFxp:c.voiceFxp||null, arms:c.arms||null, shoulders:c.shoulders||null, lookOn:!!c.lookOn, lookRest:c.lookRest||null, sock:c.sock||null, outline:c.outline||null, light:c.light||null, bendArms:c.bendArms, bend:c.bend||null})), charSeq:show.charSeq, audioSeq:show.audioSeq},
@@ -5622,7 +5673,7 @@ const KEYS_DESK = {
   characters:'The character studio — sculpt here, it doesn’t touch the world · Left-drag: tool · Right-drag: orbit<br>A / Space: add↔carve · B: last tool · X: undo · Y: redo · [ ]: size · Tab: menu',
   perform:'Left-drag a character: move it · - / =: its size · R: record (3-2-1) / cut · Space: play the show<br>Right-drag: orbit · X: undo · Y: redo · Tab: menu',
   shoot:'R: record your view (3-2-1) · A / Space: play take · B: next take · - / =: zoom (records while playing)<br>Right-drag: orbit · Middle-drag: pan · Wheel: zoom · X: undo · Y: redo · Tab: menu',
-  edit: 'A / Space: play / stop the film · 1–9: cut to that take · B: record shot changes · F: full screen · X: undo · Y: redo · Tab: menu',
+  edit: 'Space / L: play · K: stop · Home / End: start / end · 1–9: cut to that take · G: grid · ~ or F: full screen · drag / wheel on the picture: pan & zoom the clip (Shift: its end) · B: record shot changes · X: undo · Y: redo · Tab: menu',
   light: 'Left-drag a bulb: move it · + Add a light on the Lights page · Right-drag: orbit · Tab: menu',
   app: 'Files and settings · Tab: menu',
 };
@@ -6304,9 +6355,9 @@ function drawLens(X,W){
   const z = zoomOf(state.fov);
   slider(X,130,W,'Zoom: wide ↔ close  (right stick ↕)', z, 0, 1, v=>{ state.fov = +fovOfZoom(v).toFixed(2); if (tk && !(tk.fovTrack && tk.fovTrack.length)){ tk.fov = state.fov; sceneDirty=true; } }, '#1e6bff', zoomX(state.fov)+(state.fov < 20 ? ' · steadier' : ''));
   txt('Frame shape (whole film)', X, 206, 16, '#cfd6ff','left',700);
-  const bw=(W-16)/3;
-  [['16:9','Wide'],['1:1','Square'],['9:16','Vertical']].forEach(([a,l],i)=>
-    button(X+i*(bw+8),220,bw,50,l,shots.aspect===a,()=>{ setAspect(a); sceneDirty=true; },'#ff9500'));
+  const bw=(W-24)/4;
+  [['16:9','Wide'],['2.39:1','Scope'],['1:1','Square'],['9:16','Vertical']].forEach(([a,l],i)=>
+    button(X+i*(bw+8),220,bw,50,l,shots.aspect===a,()=>{ setAspect(a); sceneDirty=true; if (a==='2.39:1') toast('Scope 2.39:1: the anamorphic movie shape. Lens flares get the blue streak'); },'#ff9500'));
   // focus blur: for the take you picked (and new takes)
   const F = focusOf(tk), setF = (k, v) => { const nf = {...F, [k]:v}; state.focus = nf; if (tk && !rec){ tk.focus = {...nf}; sceneDirty = true; } requestUI(); };
   toggle(X,280,W,40,'Thirds grid on the camera screen',!!state.thirds,()=>{ state.thirds = !state.thirds; showThirds(); requestUI(); },'#ff9500');
@@ -6320,18 +6371,20 @@ function drawLens(X,W){
 }
 function drawExport(X,W){
   txt('Export', X, 100, 26);
-  txt('Size', X, 132, 16, '#cfd6ff','left',700);
-  const hw=(W-8)/2, tw=(W-16)/3;
-  button(X,146,hw,48,'1080',shots.res===1080,()=>{ shots.res=1080; sceneDirty=true; requestUI(); },'#ff9500');
-  button(X+hw+8,146,hw,48,'2160 (4K)',shots.res===2160,()=>{ shots.res=2160; sceneDirty=true; requestUI(); },'#ff9500');
-  txt('Shape', X, 214, 16, '#cfd6ff','left',700);
-  [['16:9','Wide'],['1:1','Square'],['9:16','Vertical']].forEach(([a,l],i)=>
-    button(X+i*(tw+8),228,tw,48,l,shots.aspect===a,()=>{ setAspect(a); sceneDirty=true; },'#1e6bff'));
-  txt('Frames per second', X, 296, 16, '#cfd6ff','left',700);
-  [24,30,60].forEach((f,i)=> button(X+i*(tw+8),310,tw,48,String(f),shots.fps===f,()=>{ shots.fps=f; sceneDirty=true; requestUI(); },'#5e2bff'));
-  let y = 366;
+  txt('Size', X, 126, 16, '#cfd6ff','left',700);
+  const hw=(W-8)/2, tw=(W-16)/3, qw = (W-24)/4, fmt = exportFmt(), Q = exportQ();
+  button(X,136,hw,40,'1080',shots.res===1080,()=>{ shots.res=1080; sceneDirty=true; requestUI(); },'#ff9500');
+  button(X+hw+8,136,hw,40,'2160 (4K)',shots.res===2160,()=>{ shots.res=2160; sceneDirty=true; requestUI(); },'#ff9500');
+  txt('Shape', X, 194, 16, '#cfd6ff','left',700);
+  [['16:9','Wide'],['2.39:1','Scope'],['1:1','Square'],['9:16','Vertical']].forEach(([a,l],i)=>
+    button(X+i*(qw+8),204,qw,40,l,shots.aspect===a,()=>{ setAspect(a); sceneDirty=true; },'#1e6bff'));
+  txt('Frames per second', X, 262, 16, '#cfd6ff','left',700);
+  [24,30,60].forEach((f,i)=> button(X+i*(tw+8),272,tw,40,String(f),shots.fps===f,()=>{ shots.fps=f; sceneDirty=true; requestUI(); },'#5e2bff'));
   if (hevcOK === null) checkHevc();
-  toggle(X,y,W,40, shots.small ? (hevcOK ? 'Smaller file: HEVC (H.265)' : 'Smaller file: lighter H.264') : 'Smaller file (HEVC)', !!shots.small, ()=>{ shots.small = !shots.small; sceneDirty = true; requestUI(); }, '#00c7be'); y += 48;
+  [['mp4','MP4'],['webm','WebM'],['mkv','MKV']].forEach(([f,l],i)=> button(X+i*(tw+8),322,tw,38,l,fmt===f,()=>{ shots.fmt=f; sceneDirty=true; requestUI(); },'#ff2d95'));
+  [['small', fmt==='mp4' || fmt==='mkv' ? (hevcOK ? 'Small (HEVC)' : 'Small') : 'Small'],['std','Standard'],['max','Max']].forEach(([q,l],i)=> button(X+i*(qw+8),368,qw,38,l,Q===q,()=>{ shots.q=q; shots.small = q==='small'; sceneDirty=true; requestUI(); },'#00c7be'));
+  button(X+3*(qw+8),368,qw,38,shots.punch ? '✨ Punch ✓' : '✨ Punch',!!shots.punch,()=>{ shots.punch=!shots.punch; sceneDirty=true; if (shots.punch) toast('Punch: lifts dull colours and sharpens fine edges, so the video comes out vivid and crisp'); requestUI(); },'#ffb300');
+  let y = 414;
   if (scenes.length > 1 && !exporting){ const sc = sceneById(curScene); toggle(X,y,W,40, state.exportWhole ? 'Whole film: every scene in order' : 'Just '+(sc ? sc.name : 'this scene'), !!state.exportWhole, ()=>{ state.exportWhole = !state.exportWhole; requestUI(); }, '#ff2d95'); y += 48; }
   const [w,h] = exportSize();
   txt(w+' × '+h+'  ·  '+shots.fps+' fps  ·  '+fmtTime(filmLength()), X, y+12, 16, '#ffd400','left',700); y += 30;
@@ -6340,11 +6393,14 @@ function drawExport(X,W){
     rr(X,y,W,56,14,'#2a3060'); rr(X,y,Math.max(28,W*exporting.i/exporting.frames),56,14,'#34c759');
     txt(exporting.note || ((exporting.what==='Blender' ? 'Baking moves ' : 'Rendering ')+exporting.i+' / '+exporting.frames), X+W/2, y+28, 17, '#fff','center');
     button(X,y+64,W,44,'Cancel export',false,()=>{ exporting.cancel = true; },'#ff3b30');
-  } else button(X,y,W,56,state.confirm==='exportvr' ? 'Tap again to start' : NET.guest ? 'Export MP4 to this phone' : 'Export MP4',state.confirm==='exportvr',()=>exportMP4(),'#ff3b30');
+  } else button(X,y,W,56,state.confirm==='exportvr' ? 'Tap again to start' : NET.guest ? 'Export '+FMT_EXT[fmt]+' to this phone' : 'Export '+FMT_EXT[fmt]+(Q==='max' ? ' · max quality' : '')+(shots.punch ? ' ✨' : ''),state.confirm==='exportvr',()=>exportMP4(),'#ff3b30');
   if (!exporting) para(NET.guest ? ['Gets the latest film from the headset first,','then renders it here and saves it to this','device. The headset can go off once it says so.'] :
-    shots.small && hevcOK === false ? ['This browser has no HEVC, so Smaller uses','H.264 at a lower bitrate.'] : ['Renders every frame with your voices.','Desktop Chrome is fastest; in the headset','it works too, just slower. You can cancel.'], X, y+80, 13);
+    fmt === 'webm' ? ['WebM: VP9 picture + Opus sound. Plays in Chrome,','Firefox and VLC; iPhone Photos can’t keep it.'] :
+    fmt === 'mkv' ? ['MKV: H.264 + AAC in Matroska, for VLC, OBS,','DaVinci and other editors. Not for iPhone Photos.'] :
+    Q === 'max' ? ['Max: about twice the data, so fine detail and','strong colours hold up. Files get big.'] :
+    Q === 'small' && hevcOK === false ? ['This browser has no HEVC, so Small uses','H.264 at a lower bitrate.'] : ['Renders every frame with your voices.','Desktop Chrome is fastest; in the headset','it works too, just slower. You can cancel.'], X, y+80, 13);
   if (!exporting && TOUCH() && (lastSave || lastMP4)){ const S = lastSave || lastMP4, zip = /\.zip$/.test(S.name), hw = (W-8)/2;
-    button(X,y+138,W*0.62,48, zip ? '📲 Save the zip' : '📲 Save video to Photos', true, ()=>saveMP4(), '#34c759');
+    button(X,y+138,W*0.62,48, zip ? '📲 Save the zip' : /\.mp4$/.test(S.name) ? '📲 Save video to Photos' : '📲 Save / share', true, ()=>saveMP4(), '#34c759');
     button(X+W*0.62+8,y+138,W*0.38-8,48, 'To Files', false, ()=>saveMP4(true), '#2a3060');
     button(X,y+194,W,40,'Export for Blender (.zip)',false,()=>exportBlender(),'#ff9500'); }
   else if (!exporting) button(X,y+138,W,44,'Export for Blender (.zip)',false,()=>exportBlender(),'#ff9500');
@@ -7214,7 +7270,12 @@ addEventListener('keydown', e => {
   else if (k==='[') { { const [mn,mx] = sculptSizeRange(); state.size=clamp(state.size/1.15,mn,mx); } requestUI(); }
   else if (k===']') { { const [mn,mx] = sculptSizeRange(); state.size=clamp(state.size*1.15,mn,mx); } requestUI(); }
   else if (SCULPT_PHASES.includes(state.phase) && k>='1' && k<='7') setTool(['clay','smooth','paint','doodle','blocks','erase','magic'][+k-1]);
-  else if (k==='f' && state.phase==='edit' && !PHONE){ toggleBigPic(); e.preventDefault(); }
+  else if ((k==='f' || k==='`' || k==='~') && state.phase==='edit' && !PHONE){ toggleBigPic(); e.preventDefault(); }
+  else if (state.phase==='edit' && k==='g'){ setGrid(!state.multi); e.preventDefault(); }
+  else if (state.phase==='edit' && k==='k'){ stopPlay(); requestUI(); e.preventDefault(); }
+  else if (state.phase==='edit' && k==='l'){ if (!play) startPlay('film'); e.preventDefault(); }
+  else if (state.phase==='edit' && k==='home'){ stopPlay(); shots.playhead = 0; requestUI(); e.preventDefault(); }
+  else if (state.phase==='edit' && k==='end'){ stopPlay(); shots.playhead = Math.max(0, filmLength() - 0.01); requestUI(); e.preventDefault(); }
   else if (k==='tab'){ state.panelOpen=!state.panelOpen; uiCanvas.style.display=state.panelOpen?'block':'none'; e.preventDefault(); }
 });
 function desktopUpdate(dt){
@@ -9588,6 +9649,12 @@ function drawTimeline(X,W){
   toggle(X,338,W,40,'Grid: lighter while it plays', !!state.gridLite, ()=>{ state.gridLite = !state.gridLite; requestUI(); }, '#2a3060');
   if (renderer.xr.isPresenting) button(X,386,W,44, state.edHidden ? 'Show the big editor' : 'Bring the big editor here', false, ()=>{ state.edHidden = false; placeEditor(); requestUI(); }, '#ff9500');
   const missing = shots.takes.filter(t=>!takesInFilm().has(t.id));
+  if (!PHONE && !renderer.xr.isPresenting){ const f = clipAt(play && play.mode==='film' ? play.t : shots.playhead);   // pan & scan for the clip under the playhead
+    if (f){ const c = f.c, fz = c.fr ? c.fr.z || 1 : 1, kb = !!c.frEnd, y0 = 392, t3 = (W-12)/3;
+      txt('Pan & scan: drag / wheel the picture · '+fz.toFixed(1)+'×'+(kb ? ' → '+(c.frEnd.z||1).toFixed(1)+'×' : ''), X, y0, 13, '#cfd6ff','left',700);
+      button(X, y0+8, t3, 34, kb ? '🎞 Ken Burns ✓' : '🎞 Ken Burns', kb, ()=>{ const b = snapShots(); if (kb) delete c.frEnd; else { c.fr = c.fr || {z:1, x:0, y:0}; c.frEnd = {z:Math.min(8, (c.fr.z||1)*1.3), x:c.fr.x||0, y:c.fr.y||0}; toast('Ken Burns: the clip glides from its start framing to its end framing. Shift + drag / wheel on the picture sets the end'); } pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#5e2bff');
+      button(X+t3+6, y0+8, t3, 34, '⟲ Reset', false, ()=>{ if (!c.fr) return; const b = snapShots(); delete c.fr; delete c.frEnd; pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#2a3060');
+      button(X+2*(t3+6), y0+8, t3, 34, '⇄ Swap ends', false, ()=>{ if (!c.frEnd){ toast('Turn on Ken Burns first'); return; } const b = snapShots(); const a = c.fr; c.fr = c.frEnd; c.frEnd = a; pushShotsUndo(b); sceneDirty = true; requestUI(); }, '#2a3060'); } }
   if (scenes.some(sc => ((sc.id===curScene ? show.audio : sc.audio) || []).some(a => a.k0 != null || a.k1 != null || (a.mute && a.mute.length) || a.vol === 0))){ const armedR = state.confirm==='restorev';
     button(X,UIH-162,W,44, armedR ? 'Tap again: put them all back' : '↩ Voices back as recorded', armedR, ()=>{ if (!armedR){ state.confirm='restorev'; requestUI(); return; } state.confirm=null; restoreVoices(); }, '#ff9500'); }
   if (shots.seq.length){ const armed = state.confirm==='emptytl'; button(X,UIH-110,W,44, armed ? 'Tap again: empty the timeline' : '🧹 Empty the timeline', armed, ()=>{ if (!armed){ state.confirm='emptytl'; requestUI(); return; } state.confirm=null; emptyTimeline(); }, '#ff3b30'); }
@@ -10266,7 +10333,7 @@ function cellRect(i, cols, rows, W, H, r){
 function renderGridCell(G, i, target, W, H, flipY){
   const tk = G.lanes[i]; if (!tk) return; const r = ASPECTS[shots.aspect], c = cellRect(i, G.cols, G.rows, W, H, r);
   evalTake(tk, G.f.u, gridCam.position, gridCam.quaternion);
-  finishShotCam(gridCam, vfov(fovAt(tk, G.f.u), r), r, tk.shiftX, tk.shiftY, tk.straight, tk.scale);
+  _nextFrame = clipFrameAt(G.f.c, G.f.u); finishShotCam(gridCam, vfov(fovAt(tk, G.f.u), r), r, tk.shiftX, tk.shiftY, tk.straight, tk.scale);
   const y = flipY ? H - c.y - c.h : c.y;
   if (target){ target.viewport.set(c.x, y, c.w, c.h); target.scissor.set(c.x, y, c.w, c.h); target.scissorTest = true; renderer.setRenderTarget(target); }
   else { renderer.setViewport(c.x, y, c.w, c.h); renderer.setScissor(c.x, y, c.w, c.h); renderer.setScissorTest(true); }
@@ -10450,6 +10517,26 @@ renderer.setAnimationLoop(() => {
   } else if (!(exporting && exporting.shared)) desktopRender();   // a phone export borrows the 3D view for a moment
 });
 const edSplitEl = document.getElementById('edsplit'), bigX = document.getElementById('bigx');
+let edPic = null;   // where the film picture sits on a computer screen in EDIT
+{ // drag the picture to pan the clip under the playhead, wheel to zoom it, Shift = its end framing (a Ken Burns move), double-click resets
+  const inPic = e => edPic && state.phase==='edit' && !PHONE && !renderer.xr.isPresenting && e.clientX >= edPic.x && e.clientX <= edPic.x + edPic.w && e.clientY >= edPic.y && e.clientY <= edPic.y + edPic.h;
+  const ndc = e => [((e.clientX - edPic.x)/edPic.w)*2 - 1, 1 - ((e.clientY - edPic.y)/edPic.h)*2];
+  const target = (e, make) => { const f = clipAt(play && play.mode==='film' ? play.t : shots.playhead); if (!f) return null; const c = f.c;
+    if (make && !c.fr) c.fr = {z:1, x:0, y:0}; if (make && e.shiftKey && !c.frEnd) c.frEnd = {...c.fr};
+    shots.clipSel = c.id; return e.shiftKey ? c.frEnd : c.fr; };
+  let pd = null, wheelUndoT = 0;
+  const changed = () => { sceneDirty = true; requestUI(); };
+  renderer.domElement.addEventListener('wheel', e => { if (!inPic(e) || NET.guest) return; e.preventDefault();
+    if (performance.now() - wheelUndoT > 800) pushShotsUndo(snapShots()); wheelUndoT = performance.now();
+    const F = target(e, true); if (!F) return; const [mx, my] = ndc(e), z0 = F.z, z1 = clamp(z0*Math.exp(-e.deltaY*0.0015), 1, 8), m = 1 - 1/z1;
+    F.x = clamp(F.x + mx/z0 - mx/z1, -m, m); F.y = clamp(F.y + my/z0 - my/z1, -m, m); F.z = +z1.toFixed(3); changed(); }, {passive:false});
+  renderer.domElement.addEventListener('pointerdown', e => { if (e.button !== 0 || !inPic(e) || NET.guest) return; const F = target(e, true); if (!F) return;
+    pushShotsUndo(snapShots()); pd = {F, p:ndc(e)}; try { renderer.domElement.setPointerCapture(e.pointerId); } catch(_){} e.stopImmediatePropagation(); }, true);
+  renderer.domElement.addEventListener('pointermove', e => { if (!pd || !edPic) return; const [mx, my] = ndc(e), F = pd.F, m = 1 - 1/F.z;
+    F.x = clamp(F.x - (mx - pd.p[0])/F.z, -m, m); F.y = clamp(F.y - (my - pd.p[1])/F.z, -m, m); pd.p = [mx, my]; changed(); });
+  renderer.domElement.addEventListener('pointerup', () => { pd = null; });
+  renderer.domElement.addEventListener('dblclick', e => { if (!inPic(e)) return; const f = clipAt(shots.playhead); if (!f || !f.c.fr) return; pushShotsUndo(snapShots()); delete f.c.fr; delete f.c.frEnd; toast('Framing reset'); changed(); });
+}
 let _edl = '';
 function edLayout(on){   // returns where the picture goes (CSS px), or null when this layout is off
   const W = innerWidth, H = innerHeight;
@@ -10488,18 +10575,18 @@ function desktopRender(){
     const availW = ph ? W - 12 : A.w, availH = ph ? H - 12 : A.h, rr0 = ASPECTS[shots.aspect], r = state.multi ? (ph ? 16/9 : availW/availH) : rr0;   // the takes grid spreads across the whole band
     let vw = availW, vh = vw / r; if (vh > availH){ vh = availH; vw = vh*r; }
     const vx = (ph ? 6 : A.x) + (availW - vw)/2, vy = ph ? 6 + (availH - vh)/2 : H - (A.y + (A.h + vh)/2);   // vy: from the bottom, for the GPU
-    const G = gridState(); if (!G) drawOverlay(null);
+    const G = gridState(); if (!G) drawOverlay(null); edPic = null;
     if (G){ const [gc, gr] = gridLayout(G.lanes.length, vw, vh, rr0); G.cols = gc; G.rows = gr;
       if (!ph){ const ow = Math.round(vw), oh = Math.round(vh); if (ovCv.width !== ow || ovCv.height !== oh){ ovCv.width = ow; ovCv.height = oh; ovDrawn = ''; } }   // the labels' sheet is exactly the grid's shape
       drawOverlay(G);
       withShotView(() => { for (let i=0;i<G.lanes.length;i++){ const tk = G.lanes[i]; if (!tk) continue; const c = cellRect(i, G.cols, G.rows, vw, vh, rr0);
-        evalTake(tk, G.f.u, gridCam.position, gridCam.quaternion); finishShotCam(gridCam, vfov(fovAt(tk, G.f.u), rr0), rr0, tk.shiftX, tk.shiftY, tk.straight, tk.scale);
+        evalTake(tk, G.f.u, gridCam.position, gridCam.quaternion); _nextFrame = clipFrameAt(G.f.c, G.f.u); finishShotCam(gridCam, vfov(fovAt(tk, G.f.u), rr0), rr0, tk.shiftX, tk.shiftY, tk.straight, tk.scale);
         renderer.setScissorTest(true); renderer.setScissor(vx+c.x, vy+vh-c.y-c.h, c.w, c.h); renderer.setViewport(vx+c.x, vy+vh-c.y-c.h, c.w, c.h); renderer.render(scene, gridCam); } });
       Object.assign(ovCv.style, {display:'block', left:vx+'px', top:((ph ? 40 : 0) + H-vy-vh)+'px', width:vw+'px', height:vh+'px'});
     } else {
       ovCv.style.display = 'none';
       renderer.setScissorTest(true); renderer.setScissor(vx,vy,vw,vh); renderer.setViewport(vx,vy,vw,vh);
-      withShotView(() => renderer.render(scene, shotCam));
+      withShotView(() => renderer.render(scene, shotCam)); edPic = ph ? null : {x:vx, y:H - vy - vh, w:vw, h:vh};
     }
     renderer.setScissorTest(false); renderer.setViewport(0,0,W,H);
     return;
@@ -10548,7 +10635,7 @@ function desktopRender(){
     smoothLayer, toggleLight, buildLight, mirrorHand, punchSplice, layerTris, charTris, orbPickV18, hsvHex, hexHsv, setPivotAt, partCenter, partLayer, layerHasClay, orb, diceMesh, updateOrb,
     filmClips, clipRange, setSwitch, addTakeToFilm, removeTakeEverywhere, cutHere, showLane, audioLanes, laneGain, drawEditorWin, editorWin, placeEditor, applyShotsMsg, applyPhMsg, liveMap, applyLive, handCamera, netCamHost, get play(){return play;}, filmAt, clipAt, migrateSeq,
     fxOf, fxChain, buildFx, songBuf, SONGS, musicPlayFrom, armsOf, updateArms, drawBodyDiagram, embGrab, climb, updateEmbodiedHands, embGripStart, embGripEnd, tryEat, importChar, importListWorld, mouthWorld, loadPitchWorklet, updateMonitor, get monitor(){return monitor;}, get musicSrc(){return musicSrc;}, ctrlRef:()=>ctrl,
-    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, mirrorOnly, aacFromMP4, blendJoins, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, updateRecording, riding, saveLocal, dupWorld, scrollAt, newClip, visibleK, setEditorTall, navUpdate, setLayerDown, renderFocused, rt, activateScene, updatePlay, keepNeck, get exporting(){ return exporting; }, trackAt, fixSkips, toggleBigPic, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
+    PHASES, railNow, renderPreview, shotCam, placeChar, autoFiner, worldList:()=>worldList, startPoseCapture, tickPose, restMat, GUIDE_Q, renderer, xrUpdate, updateWins, winVisible, menuWin, updateEmbodied, followRoot, stepIn, riding, workView, toggleLight, overwriteVoice, punchSplice, sortVoices, animateDoodles, rebuildStroke, applyWorld, makeClayMat, FINISHES, finishTick, updateOutlines, faceCamPose, mirrorOnly, aacFromMP4, blendJoins, drawEditorWin, renderSong, SONGS, VC, vcLevel, bxIn, sendAllToPhone, worldName, get audioSrcs(){return audioSrcs;}, get audioPending(){return audioPending;}, exportBlender, get lastSave(){return lastSave;}, newFaceCam, poseShotCam, shotCam, partLayer, deleteTake, clearCharMotion, setSection, filmRange, limitOn, toggleLimit, offStage, deleteChar, charsWin, layersWin, drawUI, uiW:()=>UIW, hands, handFrame, updateSocks, sockVisuals, wearSock, recBall, updateRecBall, remoteTap, uiCtx, netSocks, buildSand, buildRope, buildLogs, dangleLegs, followBody, wobMain, audioDbg:()=>({n:audioSrcs.length, tok:audioToken, music:!!musicSrc, loop:!!(musicSrc && musicSrc.loop), dur:musicSrc && musicSrc.buffer ? +musicSrc.buffer.duration.toFixed(1) : 0, busy:[...songBusy]}), applyAudList, audioPlayFrom, audioStop, netAudioList, followHead, guideScale, guides, guideHands, guideHead, netGrabs, netGrabMove, netGrabEnd, endCharGrab, startCharGrab, moveCharGrab, onNet, netPoses, applyShowPose, addPart, partLayer, updateEmbodiedHands, embGripHeld, climb, updateRecording, riding, saveLocal, dupWorld, scrollAt, newClip, visibleK, setEditorTall, navUpdate, setLayerDown, renderFocused, rt, activateScene, updatePlay, keepNeck, get exporting(){ return exporting; }, trackAt, fixSkips, toggleBigPic, setAspect, exportSize, clipAt, filmLength, shotCam, stepOut, buildStrokeMesh, dupChar, lookRestOf, startTargetGrab, setEyeForward, oneToOne, previewWin, THREE, worldLayers, applyHostView, hostViewLive, netHostView, beginStroke, strokeTo, endStroke, setTool, partBox, partCenter, wobbleApply, wobbleRestore, wobMain, idleBlink, thirdsOn, snapMusic, songGrid, controlledKeys, snapShow, riding, uiPointer, cutHere, tidySwitches, shiftWalk, stepIn, updateEmbodied, show, goScene, ensureCuts, sceneCuts, get curSceneV(){return curScene;}, scenes:()=>scenes, offStage, transWin, restoreVoices, emptyTimeline, autoSortOnce, splitVoiceAt, splitByTalker, filmRange, setSwitch, renderFilmAudio, filmClips, pathFrames, touchesWorld, updateShow, inFrame, startScreenGrab, moveScreenGrab, endScreenGrab, bigScreen, get screenGrab(){return screenGrab;}, set gridHitT(v){gridHit=v;}, evalTake, autoAlignVoice, lineUpVoices, cycleChar, drawCharsWin, syncCharVoice, nearDock, pickToolTab, get hearVoice(){return hearVoice;}, updateCtrlModels, updatePivotDot, applyStage, NET, netHost, netJoin, netLeave, netAssign, netUnassign, playBuf, wsola, get netPose(){return netPose;}, drawTogether, railNow,
     deleteHeld, animateDoodles, setDoodleAnim, copyEye, applyFace, get lastDoodle(){return lastDoodle;},
     findGrabTarget, startSetGrab, startLayerGrab, moveLayerGrab, endLayerGrab, centerPart, duplicateHeld, get blockGrab(){return blockGrab;},
     get rec(){return rec;}, get play(){return play;}, get stroke(){return stroke;}};
