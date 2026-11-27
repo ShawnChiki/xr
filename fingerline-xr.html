@@ -2482,23 +2482,33 @@ function smoothCurve(p, f = 1){
     return a.clone().lerp(b, s[i] / L).add(acc.divideScalar(ws));
   });
 }
+// hand tilt -> road bank: the first ~20 degrees stay level, then it banks smoothly, reaching a wall at about 80 degrees; never past it
+const BANK_DEAD = 0.35, BANK_FULL = 1.4;
+function bankOf(a){ const m = Math.abs(a); return Math.sign(a) * clamp((m - BANK_DEAD) / (BANK_FULL - BANK_DEAD), 0, 1) * Math.PI / 2; }
 function processStroke(raw, rawUps, pu, startUp, endUp){
   const step = Math.max(8, 9 * pu);
   let p = smoothCurve(resample(raw, Math.max(2, 3 * pu)), [0.45, 1, 1.9][S.smoothLv] ?? 1);
   p = resample(p, step);
-  const ups = []; let prev = startUp ? startUp.clone() : null;
+  const ups = [], banks = [], tans = []; let prev = null;
   for (let i = 0; i < p.length; i++){
     const t = new V3().subVectors(p[Math.min(p.length - 1, i + 1)], p[Math.max(0, i - 1)]).normalize();
     let u;
-    if (S.tilt === 'hand' && rawUps.length){ const k = Math.round(i / Math.max(1, p.length - 1) * (rawUps.length - 1)); u = rawUps[k].clone(); }
-    else u = UPW.clone();
-    u.addScaledVector(t, -u.dot(t));
+    // level: straight up, squared to the road (carried along from the last point where the road goes near-vertical)
+    u = UPW.clone(); u.addScaledVector(t, -u.dot(t));
     if (u.lengthSq() < 0.09 && prev){ u.copy(prev).addScaledVector(t, -prev.dot(t)); }
     if (u.lengthSq() < 1e-6) u.set(0, 0, 1).addScaledVector(t, -t.z);
-    u.normalize(); if (prev && u.dot(prev) < 0 && S.tilt !== 'hand') u.negate();
+    u.normalize(); if (prev && u.dot(prev) < 0) u.negate();
     ups.push(u); prev = u;
+    // how far you tilted the controller around the road, turned into a bank (small tilts stay level)
+    if (S.tilt === 'hand' && rawUps.length){ const k = Math.round(i / Math.max(1, p.length - 1) * (rawUps.length - 1)), h = rawUps[k].clone().addScaledVector(t, -rawUps[k].dot(t));
+      banks.push(h.lengthSq() < 0.04 ? 0 : bankOf(Math.atan2(new V3().crossVectors(u, h).dot(t), u.dot(h)))); } else banks.push(0);
+    tans.push(t);
   }
-  if (S.tilt === 'hand') for (let k = 0; k < 12; k++) for (let i = 1; i < ups.length - 1; i++) ups[i] = ups[i - 1].clone().add(ups[i + 1]).addScaledVector(ups[i], 2).normalize();
+  if (S.tilt === 'hand'){
+    const win = Math.max(1, Math.round(S.width * 0.8 / step));          // smooth the bank over about a road-width
+    for (let pass = 0; pass < 3; pass++){ const b = banks.slice(); for (let i = 0; i < b.length; i++){ let sum = 0, n = 0; for (let j = Math.max(0, i - win); j <= Math.min(b.length - 1, i + win); j++){ sum += b[j]; n++; } banks[i] = sum / n; } }
+    for (let i = 0; i < ups.length; i++) if (banks[i]) ups[i] = ups[i].clone().applyAxisAngle(tans[i], banks[i]).normalize();
+  }
   const out = S.tilt === 'auto' ? autoBank(p, ups, flag3.y) : ups;
   // when a stroke snaps onto another ribbon's end, ease its twist into that ribbon's over the first/last few points
   const n = out.length, m = Math.min(6, n - 1), ease = (i, target, w) => {
@@ -3131,7 +3141,7 @@ function dialStep(d, k){ if (d.values){ const i = clamp(d.values.indexOf(d.get()
   for (let i = 0; i < 8; i++) text({ tab: 'net', kind: 'person', i, x: P + (i % 4) * (qw + G), y: 528 + Math.floor(i / 4) * 60, w: qw, h: 52 });
   text({ tab: 'net', kind: 'label', x: P, y: 676, text: () => 'IN THE SAME REAL ROOM?' });
   add({ tab: 'net', id: 'net-lineup', x: P, y: 696, w: W * 0.68, h: 110, style: 'big', label: () => NET.marking() ? 'TOUCH SPOT ' + (NET.ns.marks.length + 1) + ' OF 3' : NET.ns.lined ? 'LINED UP ✓' : 'LINE UP WITH 3 POINTS',
-    sub: () => NET.marking() ? 'pen tip on the spot, pull the trigger' : NET.ns.lined ? 'press to line up again' : 'touch the same 3 spots on a table, in the same order', on: () => !!NET.ns.lined, act: () => { if (!NET.marking()) NET.startMark(); } });
+    sub: () => NET.marking() ? 'pen tip on the spot, pull the trigger' : NET.ns.lined ? (NET.ns.host ? 'you place the park · press to redo' : NET.ns.shared ? 'following the host · press to redo' : 'waiting for the host to line up') : NET.ns.host ? 'you line up first, then the others' : 'touch the same 3 spots as the host, same order', on: () => !!NET.ns.lined, act: () => { if (!NET.marking()) NET.startMark(); } });
   add({ tab: 'net', id: 'net-unlink', x: P + W * 0.68 + G, y: 696, w: W * 0.32 - G, h: 110, label: () => NET.marking() ? 'Cancel' : 'Unlink', show: () => NET.marking() || !!NET.ns.lined, act: () => NET.marking() ? NET.cancelMark() : NET.unlink() });
   row('net', 822, 70, [{ id: 'net-mute', label: () => NET.muted ? 'Mic off' : 'Mic on', on: () => !NET.muted, act: () => NET.mute(!NET.muted) }, { id: 'net-leave', label: () => NET.ns.host ? 'Close room' : 'Leave room', style: 'danger', act: () => NET.leave() }]);
   text({ tab: 'net', kind: 'note', x: P, y: 934, text: () => NET.ns.status || 'Everyone draws on one park. Your riders run on your headset and learn from your drops; you see everyone\'s.' });
@@ -3361,7 +3371,7 @@ const parkGrabbers = [];
 let pg1 = null, pg2 = null;
 const gripPos = (st, v) => st.grip.getWorldPosition(v);
 function ctrlYaw(st){ const r = new THREE.Vector3(1, 0, 0).applyQuaternion(st.grip.getWorldQuaternion(new THREE.Quaternion())); return Math.atan2(-r.z, r.x); }
-function grabPark(st){ if (fly.on) return; if (!parkGrabbers.includes(st)) parkGrabbers.push(st); if (following) following = false; initParkGrab(); }
+function grabPark(st){ if (fly.on) return; if (NET.parkLocked()){ flash('Lined up: the host moves the park'); return; } if (!parkGrabbers.includes(st)) parkGrabbers.push(st); if (following) following = false; initParkGrab(); }
 function releasePark(st){ const i = parkGrabbers.indexOf(st); if (i < 0) return; parkGrabbers.splice(i, 1); initParkGrab(); save(); }
 function initParkGrab(){
   pg1 = pg2 = null;
@@ -3499,7 +3509,10 @@ function updateXRInput(dt){
     const drawing = (tool === 'pen' || isPointsTool()) && !mHit && !st.held;
     if (drawing && isRibbon(ltype)){
       st.bar.visible = true; st.bar.position.copy(_tw); st.bar.scale.set(S.width * sc(), 0.003, 0.012);
-      st.bar.quaternion.copy(qW); st.bar.material.color.setHex(TYPE_COL[ltype]);
+      const f = _dir.clone(); f.y = 0; if (f.lengthSq() < 1e-4) f.set(0, 0, -1); f.normalize();
+      const hu = new V3(0, 1, 0).applyQuaternion(qW); hu.addScaledVector(f, -hu.dot(f));
+      const up2 = new V3(0, 1, 0); if (hu.lengthSq() > 0.04) up2.applyAxisAngle(f, bankOf(Math.atan2(new V3().crossVectors(up2, hu).dot(f), up2.dot(hu))));
+      st.bar.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(new V3().crossVectors(up2, f), up2, f)); st.bar.material.color.setHex(TYPE_COL[ltype]);
     }
     if (drawing){ const e = nearEnd(p, Math.max(26 * pu, 14), isRibbon(ltype)); if (e){ snapDot.visible = true; snapDot.position.copy(track.localToWorld(e.p.clone())); snapDot.scale.setScalar(0.01); } }
     // point handles: points being placed, and every point near your hand while editing
@@ -3814,7 +3827,7 @@ const NET = (() => {
   const rosterMsg = () => ({ t: 'roster', list: ns.roster.map(p => ({ slot: p.slot, pid: p.pid })) });
   function reset(){
     voiceStop(); for (const c of ns.conns.values()) try { c.close(); } catch (e){} try { ns.conn?.close(); } catch (e){} try { ns.peer?.destroy(); } catch (e){}
-    Object.assign(ns, { on: false, host: false, guest: false, ui: 'idle', peer: null, conn: null, roster: [], slot: 0, synced: false, menuSentN: -1, shared: null, lined: null, marks: null, applied: null, dioT: 0 }); showMarks(false); ns.conns = new Map(); ns.gsSent.clear(); asm.clear();
+    Object.assign(ns, { on: false, host: false, guest: false, ui: 'idle', peer: null, conn: null, roster: [], slot: 0, synced: false, menuSentN: -1, shared: null, lined: null, marks: null, applied: null, dioT: 0 }); showMarks(false); ns.conns = new Map(); ns.gsSent.clear(); asm.clear(); heard.clear();
     for (const s of [...avatars.keys()]) dropAvatar(s); for (const k of [...ghosts.keys()]) dropGhost(k); genes.clear(); menuDirty = true;
   }
   // a park that once came from someone else's headset may have their ids: number it again before opening a room
@@ -3878,6 +3891,7 @@ const NET = (() => {
   const RELAY = ['ops', 'coins', 'flag', 'p', 'rd', 'gs', 'ev', 'mi', 'dio'];
   function onData(m, from){
     if (!m || !m.t) return;
+    heard.set(from, performance.now());
     if (m.t === 'ck') return pieceIn(m, from);
     if (ns.host && from !== 'host' && RELAY.includes(m.t)) send(m, from);   // pass it on to everyone else
     if (m.t === 'welcome') welcome(m);
@@ -3893,6 +3907,7 @@ const NET = (() => {
     else if (m.t === 'mi') menuIn(m);
     else if (m.t === 'dio') dioIn(m);
     else if (m.t === 'full-room') status('That room is full (8 people).');
+    else if (m.t === 'bye' && ns.host){ const c = ns.conns.get(from); if (c){ try { c.close(); } catch (e){} } }
     else if (m.t === 'bye' && ns.guest){ reset(); status('The host closed the room. Your copy of the park is still here.'); flash('The host closed the room'); }
   }
 
@@ -3912,13 +3927,13 @@ const NET = (() => {
     if (fresh.length){ const g = {}; for (const r of fresh){ g[r.id] = looksOf(r.g); ns.gsSent.add(r.id); } send({ t: 'gs', s: ns.slot, g }); }
     send({ t: 'rd', s: ns.slot, l: live.map(r => [r.id, ...packSnap(riderSnap(r))]) });
   }
-  const ghosts = new Map(), genes = new Map();
+  const ghosts = new Map(), genes = new Map(), heard = new Map();
   function dropGhost(k){ const G = ghosts.get(k); if (G){ disposeRider3D(G.o); ghosts.delete(k); } }
   function ridersIn(m){
     const seen = new Set();
     for (const a of m.l){ const k = m.s + ':' + a[0], g = genes.get(k); seen.add(k); if (!g) continue;
       const arr = a.slice(1); let G = ghosts.get(k);
-      if (!G){ G = { slot: m.s, id: a[0], g, o: makeRider3D({ g }), cur: arr.slice(), want: arr }; ghosts.set(k, G); } else G.want = arr; }
+      if (!G){ G = { slot: m.s, id: a[0], g, o: makeRider3D({ g }), cur: arr.slice(), want: arr }; ghosts.set(k, G); } else G.want = arr; G.t = performance.now(); }
     for (const [k, G] of ghosts) if (G.slot === m.s && !seen.has(k)) dropGhost(k);
   }
   // smooth between the updates; quaternions take the short way round
@@ -3994,7 +4009,7 @@ const NET = (() => {
   }
   function dropAvatar(slot){ const a = avatars.get(slot); if (!a) return; track.remove(a.g); for (const L of a.lines){ L.geometry.dispose(); L.material.dispose(); } a.tex.dispose(); a.mtex.dispose(); a.wheelUD.t.dispose(); a.mat.dispose(); avatars.delete(slot); }
   function poseIn(m){
-    const a = avatars.get(m.s) || makeAvatar(m.s); a.want = m; if (!a.cur) a.cur = JSON.parse(JSON.stringify(m));
+    const a = avatars.get(m.s) || makeAvatar(m.s); a.want = m; a.t = performance.now(); if (!a.cur) a.cur = JSON.parse(JSON.stringify(m));
     const txt = 'P' + (m.s + 1) + ' · ' + (m.f ? 'Flying' : (TAB_WORD[m.tab] || m.tab) + ' · ' + (TYPE_NAME[m.ty] || m.ty));
     if (txt !== a.txt){ a.txt = txt; const g = a.tc.getContext('2d'); g.clearRect(0, 0, 512, 72); g.font = '600 34px "Archivo",sans-serif'; const w = Math.min(500, g.measureText(txt).width + 84);
       g.fillStyle = 'rgba(23,25,29,.88)'; g.beginPath(); g.roundRect(256 - w / 2, 6, w, 60, 30); g.fill();
@@ -4038,42 +4053,63 @@ const NET = (() => {
     ns.marks = []; showMarks(true); status('Touch spot 1 with the pen tip and pull the trigger. Use the same 3 spots as the others, in the same order. B takes a spot back.');
   }
   function cancelMark(){ ns.marks = null; showMarks(false); status(''); }
-  function unlink(){ ns.lined = null; ns.applied = null; status('Not lined up: you can move the park on your own again.'); flash('Unlinked'); }
+  function unlink(){ if (ns.host && ns.lined) send({ t: 'dio', off: 1 }); if (ns.host) ns.shared = null; ns.lined = null; ns.applied = null; status('Not lined up: you can move the park on your own again.'); flash('Unlinked'); menuDirty = true; }
   function markBack(){ if (!ns.marks || !ns.marks.length) return; ns.marks.pop(); drawMarks(); status('Touch spot ' + (ns.marks.length + 1) + ' of 3.'); }
   function markPoint(v){
     if (!ns.marks) return; ns.marks.push(v.clone()); drawMarks(); chime(true);
     if (ns.marks.length < 3){ status('Touch spot ' + (ns.marks.length + 1) + ' of 3.'); return; }
     const P = ns.marks, sh = shapeOf(P); ns.marks = null; ns.lined = frameOf(P);
     const ref = renderer.xr.getReferenceSpace && renderer.xr.getReferenceSpace();
-    if (ref && !ref.__flReset){ ref.__flReset = true; ref.addEventListener('reset', () => { if (ns.lined){ ns.lined = null; ns.applied = null; status('You recentered the headset: line up again.'); flash('Recentered: line up again'); } }); }
+    if (ref && !ref.__flReset){ ref.__flReset = true; ref.addEventListener('reset', recentered); }
     setTimeout(() => { if (!ns.marks) showMarks(false); }, 5000);
-    if (ns.shared){
+    if (ns.host){
+      ns.shared = { ...tablePose(), sh }; ns.applied = curPose(); ns.dirty = true; ns.dioT = 0;
+      status('Lined up. You\'re the host: you place, turn and scale the park, and everyone lined up follows you.'); flash('Lined up');
+    } else if (!ns.shared){
+      status('Lined up. Waiting for the host to line up too: the host places the park.'); flash('Lined up · waiting for the host');
+    } else {
       const W = worldPose(ns.shared); setDio(W.pos, W.yaw, W.s); ns.applied = curPose(); save();
       const R = ns.shared.sh, off = R ? Math.max(...[0, 1, 2].map(i => Math.abs(R[i] - sh[i]))) : 0;
       if (R && R[3] !== sh[3]){ status('Lined up, but your spots go the other way round from theirs. Use the same order (1, 2, 3) and line up again.'); flash('Spots in a different order?'); }
       else if (off > 0.04){ status('Lined up, but your spots are ' + Math.round(off * 100) + ' cm off from theirs. Same 3 spots? Line up again to fix it.'); flash('Lined up · ' + Math.round(off * 100) + ' cm off'); }
-      else { status('Lined up with the others' + (R ? ' (spots match to ' + Math.max(1, Math.round(off * 100)) + ' cm)' : '') + '. Moving the park moves it for everyone.'); flash('Lined up'); }
-    } else {
-      ns.shared = { ...tablePose(), sh }; ns.applied = curPose(); send({ t: 'dio', ...ns.shared });
-      status('Lined up. The park stays where it is: the others line up to you with the same 3 spots.'); flash('Lined up');
+      else { status('Lined up with the host' + (R ? ' (spots match to ' + Math.max(1, Math.round(off * 100)) + ' cm)' : '') + '. The host moves the park; you follow.'); flash('Lined up with the host'); }
     }
+    ns.mySh = sh;
     menuDirty = true;
   }
-  function dioIn(m){ ns.shared = { p: m.p, y: m.y, s: m.s, sh: m.sh }; }
-  // lined up: your own moves go out to everyone; theirs glide in
+  // only the host sends the park's place; a guest who's lined up follows it
+  function dioIn(m){
+    if (ns.host) return;
+    if (m.off){ if (ns.shared && ns.lined) status('The host unlinked: you can move the park on your own.'); ns.shared = null; menuDirty = true; return; }
+    const first = !ns.shared; ns.shared = { p: m.p, y: m.y, s: m.s, sh: m.sh };
+    if (first && ns.lined){ status('The host lined up. You\'re following the host now.'); flash('Lined up with the host'); menuDirty = true; }
+  }
+  // the headset recentered: the room's coordinates moved, so move the 3 spots (and, for the host, the park) the same way
+  function recentered(e){
+    if (!ns.lined) return;
+    const T = e && e.transform;
+    if (!T){ ns.lined = null; ns.applied = null; status('You recentered the headset: line up again.'); flash('Recentered: line up again'); menuDirty = true; return; }
+    const m = new THREE.Matrix4().fromArray(T.inverse.matrix), q = new Q().setFromRotationMatrix(m), f = new V3(1, 0, 0).applyQuaternion(q), dy = Math.atan2(-f.z, f.x);
+    ns.lined.c.applyMatrix4(m); ns.lined.th += dy;
+    if (ns.host){ setDio(dio.position.clone().applyMatrix4(m), dioYaw + dy, dio.scale.x); ns.applied = curPose(); }
+  }
+  const parkLocked = () => ns.on && ns.guest && !!ns.lined && !!ns.shared;
+  // lined up. The host: every move, turn or scale goes out (and once a second anyway, so nobody misses it).
+  // A guest: glides to the host's placement and stays there.
   function dioFrame(dt){
-    if (!ns.lined || fly.on || !ns.shared) return;
-    const cur = curPose();
-    if (!samePose(cur, ns.applied)){            // you moved, turned or scaled it
-      ns.applied = cur; ns.dioT -= dt;
-      if (ns.dioT <= 0){ ns.dioT = 1 / 15; ns.shared = { ...tablePose(), sh: ns.shared.sh }; send({ t: 'dio', ...ns.shared }); }
+    if (!ns.lined || fly.on) return;
+    if (ns.host){
+      const cur = curPose(); if (!samePose(cur, ns.applied)){ ns.applied = cur; ns.dirty = true; }
+      ns.dioT -= dt; ns.beat = (ns.beat || 0) - dt;
+      if ((ns.dirty && ns.dioT <= 0) || ns.beat <= 0){ ns.dioT = 1 / 15; ns.beat = 1; ns.dirty = false; ns.shared = { ...tablePose(), sh: ns.mySh }; send({ t: 'dio', ...ns.shared }); }
       return;
     }
-    if (parkGrabbers.length) return;
-    const W = worldPose(ns.shared), tgt = { pos: W.pos, yaw: W.yaw, s: W.s };
-    if (samePose(cur, tgt)) return;
-    const k = 1 - Math.exp(-dt * 12), dy = Math.atan2(Math.sin(tgt.yaw - cur.yaw), Math.cos(tgt.yaw - cur.yaw));
-    setDio(cur.pos.lerp(tgt.pos, k), cur.yaw + dy * k, cur.s * Math.pow(tgt.s / cur.s, k)); ns.applied = curPose();
+    if (!ns.shared) return;
+    const cur = curPose(), W = worldPose(ns.shared);
+    if (samePose(cur, W)) return;
+    const k = 1 - Math.exp(-dt * 12), dy = Math.atan2(Math.sin(W.yaw - cur.yaw), Math.cos(W.yaw - cur.yaw));
+    if (cur.pos.distanceTo(W.pos) > 2 || Math.abs(Math.log(W.s / cur.s)) > 1.5) setDio(W.pos, W.yaw, W.s);   // far off: jump
+    else setDio(cur.pos.lerp(W.pos, k), cur.yaw + dy * k, cur.s * Math.pow(W.s / cur.s, k));
   }
   // the spots you've touched: numbered pink balls joined by a line, plus the number of the next spot at each pen tip
   const marksG = new THREE.Group(); marksG.visible = false; scene.add(marksG);
@@ -4107,6 +4143,12 @@ const NET = (() => {
       ns.gsT -= dt; if (ns.gsT <= 0){ ns.gsT = 4; ns.gsSent.clear(); }   // every so often, everyone's looks again (for anyone who missed them)
       menuOut();
     }
+    const now = performance.now();
+    for (const [k, G] of ghosts) if (now - (G.t || now) > 2000) dropGhost(k);
+    for (const a of avatars.values()) a.g.visible = now - (a.t || now) < 4000;
+    ns.hbT = (ns.hbT || 0) - dt; if (ns.hbT <= 0){ ns.hbT = 2; send({ t: 'hb' }); }
+    if (ns.guest && now - (heard.get('host') || now) > 12000){ reset(); status('Lost the host. Your copy of the park is still here.'); flash('Lost the host'); chime(false); return; }
+    if (ns.host) for (const [pid, c] of ns.conns) if (now - (heard.get(pid) || now) > 12000){ try { c.close(); } catch (e){} c.emit ? c.emit('close') : null; }
     stepGhosts(dt);
     for (const a of avatars.values()) poseAvatar(a, dt);
     voiceFrame();
@@ -4147,6 +4189,7 @@ const NET = (() => {
   }
   function chime(up){ const C = actx(); if (!C) return; const t = C.currentTime; [[up ? 523 : 392, 0], [up ? 784 : 262, 0.12]].forEach(([f, d]) => { const o = C.createOscillator(), g = C.createGain(); o.type = 'triangle'; o.frequency.value = f; g.gain.setValueAtTime(0.12, t + d); g.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.3); o.connect(g).connect(C.destination); o.start(t + d); o.stop(t + d + 0.32); }); }
 
+  addEventListener('pagehide', () => { if (ns.on) send({ t: 'bye' }); });
   // typing the code on a computer
   addEventListener('keydown', e => {
     if (menuTab !== 'net' || ns.on || ns.ui === 'busy' || e.ctrlKey || e.metaKey) return;
@@ -4159,7 +4202,7 @@ const NET = (() => {
     else if (ns.entry.length < 4){ ns.entry += k; if (ns.entry.length === 4) status('Press Join.'); }
     menuDirty = true;
   }
-  return { ns, host, join, leave, key, frame, startMark, cancelMark, unlink, markPoint, markBack, marking: () => !!ns.marks, tipLabels, mute, sendCallout, refigure, avatars, ghosts, get on(){ return ns.on; }, get muted(){ return voice.muted; } };
+  return { ns, host, join, leave, key, frame, parkLocked, startMark, cancelMark, unlink, markPoint, markBack, marking: () => !!ns.marks, tipLabels, mute, sendCallout, refigure, avatars, ghosts, get on(){ return ns.on; }, get muted(){ return voice.muted; } };
 })();
 
 renderer.setAnimationLoop(now => {
@@ -4200,7 +4243,7 @@ renderer.setAnimationLoop(now => {
     track.localToWorld(_rw.copy(ft.pos).add(new V3(0, 30, 0)));
     if (xr){
       if (!followPoint){ const p = new THREE.Vector3(), q = new THREE.Quaternion(); xrCam.getWorldPosition(p); xrCam.getWorldQuaternion(q); const f = new THREE.Vector3(0, 0, -1).applyQuaternion(q); f.y = 0; f.normalize(); followPoint = p.addScaledVector(f, 0.55); followPoint.y -= 0.2; }
-      const k = Math.min(1, dtReal * 4); dio.position.addScaledVector(_rw.sub(followPoint), -k); dio.updateMatrixWorld();
+      if (!NET.parkLocked()){ const k = Math.min(1, dtReal * 4); dio.position.addScaledVector(_rw.sub(followPoint), -k); dio.updateMatrixWorld(); }
     } else { const k = Math.min(1, dtReal * 4), delta = _rw.sub(orbit.target).multiplyScalar(k); orbit.target.add(delta); camera.position.add(delta); }
   }
   flyFrame(dtReal, xr, xrCam);
@@ -4220,7 +4263,7 @@ renderer.setAnimationLoop(now => {
 });
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 // handy for poking at it from the browser console
-window.__fl = { NET, setDio, getYaw: () => dioYaw, W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, BTNS: () => BTN, dialN, dialSet, addShape, addObject, saveMap, loadMap, mapsIdx: () => mapsIdx, setFly, fly, pathGroup, ratioText, sc, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
+window.__fl = { NET, processStroke, setDio, getYaw: () => dioYaw, W3, riders: () => riders, Pool, camera, orbit, dio, drawMenu, menuCanvas, BTN, toolStart, toolMove, toolEnd, track, setScalePreset, pointsClick, pointsFinish, editStart, editMove, editEnd, forgetRiders, setTool, pstate, handles, pickUp, moveHeld, dropHeld, RW, S, setPaused, spawnOne, BTNS: () => BTN, dialN, dialSet, addShape, addObject, saveMap, loadMap, mapsIdx: () => mapsIdx, setFly, fly, pathGroup, ratioText, sc, setType, addRec, placeCoin, eraseNear, toolStart, toolEnd, setTool2: t => { tool = t; }, makeRider3, randomGenome, flag3: () => flag3, setTab: t => { menuTab = t; menuDirty = true; } };
 </script>
 <script src="updated.js"></script>
 </body>
