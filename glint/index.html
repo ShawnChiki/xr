@@ -614,7 +614,7 @@ const pose7 = (o) => { o.updateMatrixWorld(); o.matrixWorld.decompose(_p, _q, _s
 // AUDIO: ka-chunk, reflection buzz, scary buzz near the other beam, sizzle in your own beam, funky music
 // =====================================================================
 const Audio = (() => {
-  let ctx = null, master, music, sfx, noise, danger, refl, sizzle, timer = 0, step = 0, nextT = 0;
+  let ctx = null, master, music, mfilt, sfx, noise, danger, refl, sizzle, timer = 0, step = 0, nextT = 0;
   const BPM = 104, S16 = 60 / BPM / 4;
   function bus(g) { const n = ctx.createGain(); n.gain.value = g; n.connect(master); return n; }
   function init() {
@@ -622,7 +622,8 @@ const Audio = (() => {
     try { ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
     master = ctx.createGain(); master.gain.value = 0.9;
     const comp = ctx.createDynamicsCompressor(); master.connect(comp); comp.connect(ctx.destination);
-    music = bus(0); sfx = bus(0); applyVolumes();
+    music = ctx.createGain(); music.gain.value = 0; mfilt = ctx.createBiquadFilter(); mfilt.type = 'lowpass'; mfilt.frequency.value = 16000; mfilt.Q.value = 0.9; music.connect(mfilt); mfilt.connect(master);
+    sfx = bus(0); applyVolumes();
     noise = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate); const d = noise.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
     // scary buzz: two detuned buzzes through a low-pass, wobbled by a fast tremolo
     { const g = ctx.createGain(); g.gain.value = 0; const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900; lp.Q.value = 4;
@@ -642,24 +643,89 @@ const Audio = (() => {
   const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
   function noiseHit(t, type, f, q, peak, dec, out) { const s = ctx.createBufferSource(); s.buffer = noise; const fl = ctx.createBiquadFilter(); fl.type = type; fl.frequency.value = f; fl.Q.value = q; const g = ctx.createGain(); env(g, t, 0.002, peak, dec); s.connect(fl); fl.connect(g); g.connect(out); s.start(t, Math.random()); s.stop(t + dec + 0.05); }
   function tone(t, type, f0, f1, peak, dec, out) { const o = ctx.createOscillator(); o.type = type; o.frequency.setValueAtTime(f0, t); if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dec); const g = ctx.createGain(); env(g, t, 0.003, peak, dec); o.connect(g); g.connect(out); o.start(t); o.stop(t + dec + 0.05); }
-  // ---- music: a little funk loop, 2 bars ----
-  const KICK = [0, 7, 10, 16, 22, 26], SNARE = [4, 12, 20, 28], GHOST = { 14: 0.22, 30: 0.25, 31: 0.18 }, OPEN = [6, 22];
-  const BASS = [40, null, 52, null, null, 40, null, 50, 52, null, 47, null, 45, null, 43, null, 40, null, 52, null, null, 40, 43, null, 45, null, 47, 50, 52, 50, 47, 45];
-  const STAB = { 6: 1, 14: 1, 22: 1, 27: 1, 30: 1 }, CHORD = [64, 67, 71, 74, 78];
+  // ---- music: a funk tune in sections (32 bars, ~75 s), so it keeps changing ----
+  //   A  groove: drums, slap bass, stabs           A2 adds clav comping + shaker
+  //   B  breakdown: no kick, the whole mix opens up from a muffled filter, snare-roll build
+  //   C  chorus: everything + cowbell + a lead melody that answers itself
+  // chords: [bass root, voicing]
+  const CH = { Em9: [40, [67, 71, 74, 78]], A13: [45, [67, 73, 76, 78]], C9: [48, [64, 67, 71, 74]], D9: [50, [66, 69, 72, 76]], B7: [47, [63, 69, 71, 74]], G6: [43, [62, 64, 67, 71]] };
+  const FORM = [['A', ['Em9', 'Em9', 'A13', 'A13']], ['A2', ['Em9', 'G6', 'A13', 'B7']], ['B', ['Em9', 'Em9', 'C9', 'B7']], ['C', ['C9', 'D9', 'Em9', 'B7']]];
+  // bass rhythms, notes as offsets from the chord root (null = rest)
+  const BASSES = [
+    [0, null, 12, null, null, 0, null, 10, 12, null, 7, null, 5, null, 3, null],
+    [0, null, null, 0, 12, null, 10, null, 0, null, 7, 10, 12, null, 10, 7],
+    [0, 0, null, 12, null, 0, 3, null, 5, null, 7, null, 10, 12, 10, 7],
+    [0, null, 12, 0, null, null, 0, 12, null, 10, null, 7, null, 5, 7, null],
+  ];
+  const PENTA = [0, 3, 5, 7, 10, 12, 15, 17];
+  let lead = [], bassPick = 0, crashNext = false;
+  function makeLead() {   // a 2-bar phrase over E minor pentatonic, played twice with a twist
+    const out = new Array(32).fill(null); let deg = 2 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < 32; i++) {
+      const strong = i % 4 === 0, p = strong ? 0.55 : i % 2 ? 0.18 : 0.32;
+      if (Math.random() < p) { deg = clamp(deg + [-2, -1, -1, 1, 1, 2, 0][Math.floor(Math.random() * 7)], 0, PENTA.length - 1); out[i] = { n: 64 + PENTA[deg], len: Math.random() < 0.3 ? 3 : 1 }; }
+    }
+    out[0] = out[0] || { n: 64 + PENTA[deg], len: 2 }; return out;
+  }
+  function voice(t, type, midi, peak, dec, out, filt) {
+    const o = ctx.createOscillator(); o.type = type; o.frequency.value = mtof(midi);
+    const g = ctx.createGain(); env(g, t, 0.004, peak, dec);
+    if (filt) { const f = ctx.createBiquadFilter(); f.type = filt[0]; f.frequency.value = filt[1]; f.Q.value = filt[2] || 1; o.connect(f); f.connect(g); } else o.connect(g);
+    g.connect(out); o.start(t); o.stop(t + dec + 0.05); return o;
+  }
   function schedule() {
     if (!ctx) return;
     while (nextT < ctx.currentTime + 0.12) {
-      const s = step % 32, t = nextT + (s % 2 ? S16 * 0.14 : 0);
+      const bar = Math.floor(step / 16), s = step % 16, t = nextT + (s % 2 ? S16 * 0.14 : 0);
+      const secI = Math.floor(bar / 8) % FORM.length, barIn = bar % 8, [sec, prog] = FORM[secI], chord = CH[prog[Math.floor(barIn / 2)]];
+      const lastBar = barIn === 7, root = chord[0];
+      if (s === 0) {
+        if (barIn === 0) { crashNext = true; if (sec === 'C') lead = makeLead(); }
+        if (barIn === 4 && sec === 'C') lead = lead.map((x, i) => (x && Math.random() < 0.3 ? { n: x.n + (Math.random() < 0.5 ? 2 : -3), len: x.len } : x));
+        bassPick = sec === 'B' ? 3 : Math.random() < 0.6 ? (bar % 2) : 2 + (bar % 2);
+        // breakdown: the mix starts muffled and opens up over 8 bars
+        const cut = sec === 'B' ? 350 * Math.pow(40, (barIn + 1) / 8) : 16000;
+        mfilt.frequency.setTargetAtTime(cut, t, sec === 'B' ? 0.4 : 0.05);
+      }
       if (local.music > 0) {
-        if (KICK.includes(s)) tone(t, 'sine', 150, 42, 0.9, 0.22, music);
-        if (SNARE.includes(s)) { noiseHit(t, 'bandpass', 1900, 0.8, 0.5, 0.16, music); tone(t, 'triangle', 200, 160, 0.25, 0.08, music); }
-        if (GHOST[s]) noiseHit(t, 'bandpass', 2200, 1, GHOST[s], 0.06, music);
-        noiseHit(t, 'highpass', 7500, 0.5, OPEN.includes(s) ? 0.16 : s % 2 ? 0.05 : 0.1, OPEN.includes(s) ? 0.2 : 0.035, music);
-        if (BASS[s]) { const o = ctx.createOscillator(), o2 = ctx.createOscillator(); o.type = 'sawtooth'; o2.type = 'square'; o.frequency.value = mtof(BASS[s]); o2.frequency.value = mtof(BASS[s] - 12);
-          const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 7; lp.frequency.setValueAtTime(2200, t); lp.frequency.exponentialRampToValueAtTime(260, t + 0.14);
-          const g = ctx.createGain(); env(g, t, 0.004, 0.42, 0.17); o.connect(lp); o2.connect(lp); lp.connect(g); g.connect(music); o.start(t); o2.start(t); o.stop(t + 0.25); o2.stop(t + 0.25); }
-        if (STAB[s]) { const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1300; bp.Q.value = 1.4; const g = ctx.createGain(); env(g, t, 0.005, 0.12, 0.13); bp.connect(g); g.connect(music);
-          for (const m of CHORD) { const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m) * (1 + (Math.random() - 0.5) * 0.004); o.connect(bp); o.start(t); o.stop(t + 0.2); } }
+        const kickOn = sec !== 'B' || barIn >= 6;
+        // drums
+        if (crashNext && s === 0) { crashNext = false; noiseHit(t, 'highpass', 4500, 0.4, 0.28, 1.4, music); }
+        if (kickOn && ([0, 7, 10].includes(s) || (bar % 2 && s === 14))) tone(t, 'sine', 150, 42, 0.9, 0.22, music);
+        if (lastBar && sec !== 'B' && s >= 8) {   // fill: toms down, then snare stutter
+          if (s < 12 && s % 2 === 0) tone(t, 'sine', [220, 180, 150, 120][(s - 8) / 2 | 0], 70, 0.45, 0.18, music);
+          if (s >= 12) noiseHit(t, 'bandpass', 1900, 0.8, 0.25 + 0.08 * (s - 12), 0.1, music);
+        } else if (sec === 'B' && barIn >= 6) {   // build: snare roll getting faster
+          if (barIn === 7 || s % 2 === 0) noiseHit(t, 'bandpass', 1900, 0.8, 0.15 + 0.35 * (s / 16) * (barIn - 5), 0.08, music);
+        } else {
+          if (s === 4 || s === 12) { noiseHit(t, 'bandpass', 1900, 0.8, 0.5, 0.16, music); tone(t, 'triangle', 200, 160, 0.25, 0.08, music); }
+          if ((s === 14 || s === 15) && Math.random() < 0.5) noiseHit(t, 'bandpass', 2200, 1, 0.2, 0.06, music);
+        }
+        const openHat = s === 6 || (sec === 'C' && s === 14);
+        if (sec !== 'B' || barIn >= 4) noiseHit(t, 'highpass', 7500, 0.5, openHat ? 0.16 : s % 2 ? 0.05 : 0.1, openHat ? 0.2 : 0.035, music);
+        if (sec === 'A2' || sec === 'C') noiseHit(t, 'bandpass', 6500, 2, s % 2 ? 0.07 : 0.03, 0.03, music);   // shaker
+        if (sec === 'C' && [0, 3, 6, 10, 12].includes(s)) { voice(t, 'square', 84, 0.05, 0.08, music, ['bandpass', 800, 3]); voice(t, 'square', 90, 0.04, 0.08, music, ['bandpass', 800, 3]); }   // cowbell
+        // slap bass, following the chord
+        const bn = BASSES[bassPick][s];
+        if (bn !== null && (sec !== 'B' || s % 4 === 0 || barIn >= 4)) {
+          const n = root + bn, o = ctx.createOscillator(), o2 = ctx.createOscillator(); o.type = 'sawtooth'; o2.type = 'square'; o.frequency.value = mtof(n); o2.frequency.value = mtof(n - 12);
+          const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 7; lp.frequency.setValueAtTime(bn >= 12 ? 3000 : 2000, t); lp.frequency.exponentialRampToValueAtTime(260, t + 0.14);
+          const g = ctx.createGain(); env(g, t, 0.004, 0.4, 0.17); o.connect(lp); o2.connect(lp); lp.connect(g); g.connect(music); o.start(t); o2.start(t); o.stop(t + 0.25); o2.stop(t + 0.25);
+        }
+        // stabs with a little wah
+        const stabAt = sec === 'B' ? [0] : bar % 2 ? [6, 11, 14] : [6, 14];
+        if (stabAt.includes(s)) {
+          const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 2; bp.frequency.setValueAtTime(700, t); bp.frequency.exponentialRampToValueAtTime(2200, t + 0.12);
+          const g = ctx.createGain(); env(g, t, 0.005, sec === 'B' ? 0.16 : 0.12, sec === 'B' ? 0.6 : 0.14); bp.connect(g); g.connect(music);
+          for (const m of chord[1]) { const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m) * (1 + (Math.random() - 0.5) * 0.004); o.connect(bp); o.start(t); o.stop(t + (sec === 'B' ? 0.7 : 0.2)); }
+        }
+        // clav comping on the off-beats
+        if ((sec === 'A2' || sec === 'C') && [2, 5, 7, 10, 13].includes(s) && Math.random() < 0.8) for (const m of chord[1].slice(1, 3)) voice(t, 'square', m, 0.035, 0.07, music, ['highpass', 900, 0.7]);
+        // lead melody in the chorus
+        if (sec === 'C' && lead.length) {
+          const x = lead[(barIn % 2) * 16 + s];
+          if (x) { const d = S16 * x.len * 0.95, o = voice(t, 'square', x.n, 0.07, d + 0.08, music, ['lowpass', 2600, 2]); const lfo = ctx.createOscillator(), lg = ctx.createGain(); lfo.frequency.value = 6; lg.gain.value = 6; lfo.connect(lg); lg.connect(o.detune); lfo.start(t); lfo.stop(t + d + 0.1); }
+        }
       }
       nextT += S16; step++;
     }
@@ -670,7 +736,7 @@ const Audio = (() => {
     p.connect(sfx); return p;
   }
   return {
-    init, applyVolumes,
+    init, applyVolumes, _jump(bar) { step = bar * 16; },
     listener(cam) {
       if (!ctx) return; const L = ctx.listener; cam.getWorldPosition(tA); tB.set(0, 0, -1).applyQuaternion(cam.getWorldQuaternion(tQ)); tC.set(0, 1, 0).applyQuaternion(tQ);
       if (L.positionX) { L.positionX.value = tA.x; L.positionY.value = tA.y; L.positionZ.value = tA.z; L.forwardX.value = tB.x; L.forwardY.value = tB.y; L.forwardZ.value = tB.z; L.upX.value = tC.x; L.upY.value = tC.y; L.upZ.value = tC.z; }
@@ -903,7 +969,7 @@ function drawRules() {
 }
 function drawSound() {
   title('Sound');
-  stepRow(120, 'Music', local.music ? String(local.music) : 'off', () => { local.music = clamp(local.music - 1, 0, 10); saveLocal(); Audio.applyVolumes(); }, () => { local.music = clamp(local.music + 1, 0, 10); saveLocal(); Audio.applyVolumes(); }, 'Funky loop, all game long.');
+  stepRow(120, 'Music', local.music ? String(local.music) : 'off', () => { local.music = clamp(local.music - 1, 0, 10); saveLocal(); Audio.applyVolumes(); }, () => { local.music = clamp(local.music + 1, 0, 10); saveLocal(); Audio.applyVolumes(); }, 'Funk tune: groove, breakdown, chorus.');
   stepRow(220, 'Effects', local.sfx ? String(local.sfx) : 'off', () => { local.sfx = clamp(local.sfx - 1, 0, 10); saveLocal(); Audio.applyVolumes(); }, () => { local.sfx = clamp(local.sfx + 1, 0, 10); saveLocal(); Audio.applyVolumes(); }, 'Ka-chunk, zap, buzz, sizzle.');
   const c = ux; c.fillStyle = '#9aa3ad'; c.font = `600 24px ${FONT}`; c.textAlign = 'left'; c.textBaseline = 'middle';
   ['Ka-chunk: a mirror locks in place.', 'Zap: a beam finds a new bounce.', 'Low scary buzz: the other beam is within arm\'s reach.', 'Sizzle: your own beam passing through you (harmless).'].forEach((t, i) => c.fillText(t, 150, 360 + i * 46));
@@ -1697,7 +1763,7 @@ function onResize() {
 }
 addEventListener('resize', onResize);
 rebuildArena(); onResize(); fillRack();
-window.__glint = { THREE, hands, ctrl, panel, wrist, pointer, scene, dolly, setRole, me, game, cfg, mirrors, upsertMirror, beamState, startMatch, setCfg, ui, setMenu, Net, local, tele, aimArc, holds, grabTile, releaseTile, fillRack, hitTile };
+window.__glint = { Audio, THREE, hands, ctrl, panel, wrist, pointer, scene, dolly, setRole, me, game, cfg, mirrors, upsertMirror, beamState, startMatch, setCfg, ui, setMenu, Net, local, tele, aimArc, holds, grabTile, releaseTile, fillRack, hitTile };
 let lastT = now(), idleA = 0, uiTick = 0;
 renderer.setAnimationLoop(() => {
   const t = now(), dt = Math.min(0.05, (t - lastT) / 1000); lastT = t;
