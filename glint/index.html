@@ -90,16 +90,16 @@ const TEAM = { r: { name: 'RED', hex: 0xff2340, css: C.red }, b: { name: 'BLUE',
 const other = (t) => (t === 'r' ? 'b' : 'r');
 const IS_TOUCH = matchMedia('(pointer: coarse)').matches;
 const EH = 1.1;              // emitter height (m)
-const BODY_R = 0.24, BEAM_R = 0.035;
+const BODY_R = 0.2, BEAM_R = 0.035;
 const MODES = {
   blank: { name: 'Blank Slate', line1: 'Empty arena.', line2: 'Move your own mirrors.' },
   khet: { name: 'Khet Board', line1: 'Mirrors scattered too.', line2: 'Move any mirror.' },
   stone: { name: 'Set in Stone', line1: 'Empty arena.', line2: 'Placed mirrors stay put.' },
 };
-const DEF = { W: 16, D: 16, col: 6, H: 4, mode: 'blank', cd: 5, stock: 12, rounds: 3, limit: 0, snap: 15, rack: 32, shape: 'disc', mix: 'mixed' };
+const DEF = { W: 16, D: 16, col: 6, H: 4, mode: 'blank', cd: 5, stock: 12, rounds: 3, limit: 0, snap: 15, rack: 32, shape: 'disc', mix: 'mixed', selfHit: false, heldBounce: true };
 const cfg = Object.assign({}, DEF);
 let cfgV = 0, cfgBy = '';
-const local = { music: 4, sfx: 7, snapOn: false, turn: 30 };
+const local = { music: 4, sfx: 7, snapOn: false, turn: 30, move: 'smooth' };
 try { Object.assign(cfg, JSON.parse(localStorage.getItem('glint.cfg') || '{}')); Object.assign(local, JSON.parse(localStorage.getItem('glint.local2') || '{}')); } catch (e) { /* fresh */ }
 const saveLocal = () => { try { localStorage.setItem('glint.cfg', JSON.stringify(cfg)); localStorage.setItem('glint.local2', JSON.stringify(local)); } catch (e) { /* fine */ } };
 function sanitizeCfg() {
@@ -108,12 +108,12 @@ function sanitizeCfg() {
   if (!MODES[cfg.mode]) cfg.mode = 'blank';
   cfg.cd = clamp(Math.round(+cfg.cd || 5), 1, 10); cfg.stock = clamp(Math.round(+cfg.stock || 12), 3, 30);
   cfg.rounds = clamp(Math.round(+cfg.rounds || 3), 1, 7); cfg.limit = [0, 2, 3, 5].includes(+cfg.limit) ? +cfg.limit : 0; cfg.snap = [15, 30, 45].includes(+cfg.snap) ? +cfg.snap : 15;
-  cfg.rack = clamp(Math.round((+cfg.rack || 32) / 4) * 4, 8, 48); if (cfg.shape !== 'square') cfg.shape = 'disc'; if (cfg.mix !== 'flat') cfg.mix = 'mixed';
-  if (![30, 45, 90].includes(+local.turn)) local.turn = 30;
+  cfg.rack = clamp(Math.round((+cfg.rack || 32) / 4) * 4, 8, 48); if (cfg.shape !== 'square') cfg.shape = 'disc'; if (cfg.mix !== 'flat') cfg.mix = 'mixed'; cfg.selfHit = cfg.selfHit === true; cfg.heldBounce = cfg.heldBounce !== false;
+  if (![30, 45, 90].includes(+local.turn)) local.turn = 30; if (local.move !== 'teleport') local.move = 'smooth';
 }
 sanitizeCfg();
 
-const me = { xrFrames: 0, needSpawn: false, id: Math.random().toString(36).slice(2, 10), role: null, team: 'r', pick: 0, alive: true, stock: 12, cdEnd: 0, feetY: 0, vy: 0, grounded: true, seat: 0, seatSet: false, hold: null, dist: 2.5, flip: false, mirN: 0, hits: 0 };
+const me = { crouch: false, crouchK: 0, xrFrames: 0, needSpawn: false, id: Math.random().toString(36).slice(2, 10), role: null, team: 'r', pick: 0, alive: true, stock: 12, cdEnd: 0, feetY: 0, vy: 0, grounded: true, seat: 0, seatSet: false, hold: null, dist: 2.5, flip: false, mirN: 0, hits: 0 };
 const game = { phase: 'lobby', match: 0, round: 0, scores: { r: 0, b: 0 }, countEnd: 0, roundStart: 0, nextAt: 0, practice: false, winner: null, finalAt: 0, overAt: 0 };
 cfgBy = me.id;
 const isPlayer = () => me.role === 'xr' || me.role === 'desk';
@@ -164,7 +164,11 @@ function emitterInfo(t) {
   const s = t === 'r' ? -1 : 1, x = s * (cfg.W / 2 - 0.55), z = s * corridorZ();
   return { origin: new THREE.Vector3(x, EH, z), dir: new THREE.Vector3(-s, 0, 0), wallX: s * cfg.W / 2 };
 }
-function spawnFor(t) { const s = t === 'r' ? -1 : 1; return { x: 0, z: s * corridorZ(), yaw: t === 'r' ? -Math.PI / 2 : Math.PI / 2 }; }
+function spawnFor(t) {
+  const s = t === 'r' ? -1 : 1;
+  if (cfg.selfHit) return { x: s * (cfg.col + cfg.W) / 4, z: 0, yaw: t === 'r' ? 0 : Math.PI };
+  return { x: 0, z: s * corridorZ(), yaw: t === 'r' ? -Math.PI / 2 : Math.PI / 2 };
+}
 
 const scoreCv = document.createElement('canvas'); scoreCv.width = 768; scoreCv.height = 256;
 const scoreTex = new THREE.CanvasTexture(scoreCv); scoreTex.colorSpace = THREE.SRGBColorSpace;
@@ -318,7 +322,8 @@ function upsertMirror(d) {
   return m;
 }
 function clearMirrors() { for (const m of mirrors.values()) tileRoot.remove(m.g, m.strut); mirrors.clear(); }
-const mirrorData = (m) => ({ id: m.id, t: m.t, p: m.p.toArray().map(r4), q: m.q.toArray().map(r5), hold: m.hold, by: m.by, rack: m.rack, k: m.kind });
+const gameKey = () => (game.phase === 'lobby' ? 'L' : game.match + '.' + game.round);
+const mirrorData = (m) => ({ g: gameKey(), id: m.id, t: m.t, p: m.p.toArray().map(r4), q: m.q.toArray().map(r5), hold: m.hold, by: m.by, rack: m.rack, k: m.kind });
 function r4(v) { return Math.round(v * 1e4) / 1e4; }
 function r5(v) { return Math.round(v * 1e5) / 1e5; }
 function animateTiles() {
@@ -442,7 +447,7 @@ function trace(team) {
     if (_d.x > 1e-7) { const t = (W2 - _o.x) / _d.x; if (t < tb) { tb = t; kind = 2; } } else if (_d.x < -1e-7) { const t = (-W2 - _o.x) / _d.x; if (t < tb) { tb = t; kind = 2; } }
     if (_d.z > 1e-7) { const t = (D2 - _o.z) / _d.z; if (t < tb) { tb = t; kind = 2; } } else if (_d.z < -1e-7) { const t = (-D2 - _o.z) / _d.z; if (t < tb) { tb = t; kind = 2; } }
     { const t = rayColumn(_o, _d, h); if (t < tb) { tb = t; kind = 2; } }
-    for (const m of mirrors.values()) { const r = hitTile(m, _o, _d, tb); if (!r) continue; tb = r.t; kind = r.refl ? 3 : 2; hm = m; _hn.copy(_hnTmp); }
+    for (const m of mirrors.values()) { if (m.hold && !cfg.heldBounce) continue; const r = hitTile(m, _o, _d, tb); if (!r) continue; tb = r.t; kind = r.refl ? 3 : 2; hm = m; _hn.copy(_hnTmp); }
     if (practice.on && practice.team === team) {
       tA.subVectors(_o, practice.pos); const bq = tA.dot(_d), cq = tA.lengthSq() - practice.r * practice.r, disc = bq * bq - cq;
       if (disc > 0) { const t = -bq - Math.sqrt(disc); if (t > 1e-4 && t < tb) { tb = t; kind = 4; } }
@@ -503,11 +508,21 @@ function segSegDist(p1, q1, p2, q2) {   // closest distance between two segments
   else { const c = d1.dot(r); if (e <= 1e-9) { t = 0; s = clamp(-c / a, 0, 1); } else { const b = d1.dot(d2), den = a * e - b * b; s = den !== 0 ? clamp((b * f - c * e) / den, 0, 1) : 0; t = (b * s + f) / e; if (t < 0) { t = 0; s = clamp(-c / a, 0, 1); } else if (t > 1) { t = 1; s = clamp((b - c) / a, 0, 1); } } }
   const c1 = p1.clone().addScaledVector(d1, s), c2 = p2.clone().addScaledVector(d2, t); return c1.distanceTo(c2);
 }
+const lastHit = { a: new THREE.Vector3(), b: new THREE.Vector3() };
 function beamHitsCapsule(team, a, b, r) {
   const st = beamState[team]; if (!st) return false; const s = st.segs, p = new THREE.Vector3(), q = new THREE.Vector3();
-  for (let i = 0; i < s.length; i += 8) { p.set(s[i], s[i + 1], s[i + 2]); q.set(s[i + 3], s[i + 4], s[i + 5]); if (segSegDist(p, q, a, b) < r + BEAM_R) return true; }
+  for (let i = 0; i < s.length; i += 8) { p.set(s[i], s[i + 1], s[i + 2]); q.set(s[i + 3], s[i + 4], s[i + 5]); if (segSegDist(p, q, a, b) < r + BEAM_R) { lastHit.a.copy(p); lastHit.b.copy(q); return true; } }
   return false;
 }
+// the stretch of beam that got you flashes thick and white for a few seconds, so you can see what happened
+const hitFlash = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 12, 1, true), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }));
+hitFlash.visible = false; hitFlash.frustumCulled = false; scene.add(hitFlash); let hitFlashUntil = 0;
+function flashHit(a, b, hex) {
+  const len = a.distanceTo(b); if (len < 1e-4) return;
+  hitFlash.position.addVectors(a, b).multiplyScalar(0.5); hitFlash.quaternion.setFromUnitVectors(UP, tC.subVectors(b, a).normalize()); hitFlash.scale.set(0.09, len, 0.09);
+  hitFlash.material.color.setHex(hex); hitFlash.visible = true; hitFlashUntil = now() + 3000;
+}
+function updateHitFlash() { if (!hitFlash.visible) return; const left = hitFlashUntil - now(); if (left <= 0) { hitFlash.visible = false; return; } hitFlash.material.opacity = 0.35 + 0.55 * Math.abs(Math.sin(left / 90)); }
 
 // =====================================================================
 // SPARKS (placement puffs, shatter when someone is out, target hits)
@@ -708,6 +723,7 @@ function icon(c, name, x, y, s, col) {
       c.beginPath(); c.arc(x, y, h * 0.6, Math.PI * 0.1, Math.PI * 0.9); c.stroke(); arrowHead(c, x + h * 0.6 * Math.cos(Math.PI * 0.9), y + h * 0.6 * Math.sin(Math.PI * 0.9), Math.PI + 0.3, h * 0.35); break;
     case 'grab': rrect(c, x - h * 0.55, y - h * 0.25, h * 1.1, h * 0.85, h * 0.25); c.fill(); for (let i = 0; i < 4; i++) { rrect(c, x - h * 0.55 + i * h * 0.29, y - h * 0.7, h * 0.24, h * 0.6, h * 0.12); c.fill(); } break;
     case 'snap': c.beginPath(); c.moveTo(x - h * 0.7, y + h * 0.6); c.lineTo(x + h * 0.75, y + h * 0.6); c.moveTo(x - h * 0.7, y + h * 0.6); c.lineTo(x + h * 0.4, y - h * 0.7); c.stroke(); c.beginPath(); c.arc(x - h * 0.7, y + h * 0.6, h * 0.75, -0.86, 0); c.stroke(); break;
+    case 'crouch': c.beginPath(); c.arc(x, y - h * 0.45, h * 0.22, 0, 7); c.fill(); c.beginPath(); c.moveTo(x - h * 0.1, y - h * 0.2); c.lineTo(x + h * 0.25, y + h * 0.15); c.lineTo(x - h * 0.3, y + h * 0.25); c.lineTo(x + h * 0.1, y + h * 0.65); c.stroke(); c.fillRect(x - h * 0.8, y + h * 0.7, h * 1.6, h * 0.12); break;
     case 'seat': c.beginPath(); c.moveTo(x, y - h * 0.5); c.lineTo(x, y + h * 0.5); c.stroke(); arrowHead(c, x, y - h * 0.6, -Math.PI / 2, h * 0.35); arrowHead(c, x, y + h * 0.6, Math.PI / 2, h * 0.35); c.fillRect(x - h * 0.75, y - h * 0.05, h * 0.4, h * 0.1); c.fillRect(x + h * 0.35, y - h * 0.05, h * 0.4, h * 0.1); break;
     case 'move': for (let i = 0; i < 4; i++) { const a = (i * Math.PI) / 2; c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.cos(a) * h * 0.55, y + Math.sin(a) * h * 0.55); c.stroke(); arrowHead(c, x + Math.cos(a) * h * 0.65, y + Math.sin(a) * h * 0.65, a, h * 0.3); } break;
     case 'dist': c.beginPath(); c.moveTo(x, y - h * 0.45); c.lineTo(x, y + h * 0.45); c.stroke(); arrowHead(c, x, y - h * 0.6, -Math.PI / 2, h * 0.35); arrowHead(c, x, y + h * 0.6, Math.PI / 2, h * 0.35); break;
@@ -740,6 +756,7 @@ function setCfg(patch, quiet) {
   Object.assign(cfg, patch); sanitizeCfg(); cfgV++; cfgBy = me.id; saveLocal();
   if ('W' in patch || 'D' in patch || 'H' in patch || 'col' in patch) { rebuildArena(); for (const m of mirrors.values()) setStrut(m); keepInside(); }
   if ('shape' in patch) remeshAll();
+  if ('selfHit' in patch && game.phase === 'lobby') spawnMe();
   if (game.phase === 'lobby' && ('W' in patch || 'D' in patch || 'H' in patch || 'col' in patch || 'rack' in patch || 'mix' in patch)) fillRack();
   ui.dirty = true; if (!quiet) Net.sendCfg();
 }
@@ -873,13 +890,16 @@ function dragCfg(patch, phase) {
 function drawRules() {
   title('Rules', game.phase === 'lobby' ? 'Shared by everyone in the room.' : 'Locked during a match.');
   const ed = game.phase === 'lobby', st = (k, d, list) => () => { if (!ed) return; if (list) { const i = list.indexOf(cfg[k]); setCfg({ [k]: list[clamp(i + d, 0, list.length - 1)] }); } else setCfg({ [k]: cfg[k] + d }); };
-  stepRow(104, 'Wait after placing', cfg.cd + ' s', st('cd', -1), st('cd', 1), 'Before you can pick up the next mirror.');
-  stepRow(190, 'Mirrors on the column', String(cfg.rack), st('rack', -4), st('rack', 4), 'Shared by both players. Go grab them.');
-  stepRow(276, 'Column mix', cfg.mix === 'mixed' ? 'mixed' : 'flat', st('mix', -1, ['flat', 'mixed']), st('mix', 1, ['flat', 'mixed']), 'Mixed adds mirror balls and curved dishes.');
-  stepRow(362, 'Flat mirror shape', cfg.shape, st('shape', -1, ['disc', 'square']), st('shape', 1, ['disc', 'square']));
-  stepRow(448, 'Rounds to win', String(cfg.rounds), st('rounds', -1), st('rounds', 1));
-  stepRow(534, 'Round time limit', cfg.limit ? cfg.limit + ' min' : 'none', st('limit', -1, [0, 2, 3, 5]), st('limit', 1, [0, 2, 3, 5]), 'Time up = a draw round.');
-  stepRow(620, 'Mirror angle snap', cfg.snap + '°', st('snap', -1, [15, 30, 45]), st('snap', 1, [15, 30, 45]), 'X button turns snapping on and off.');
+  const onoff = (v) => (v ? 'on' : 'off');
+  stepRow(96, 'Wait after placing', cfg.cd + ' s', st('cd', -1), st('cd', 1), 'Before you can pick up the next mirror.');
+  stepRow(164, 'Mirrors on the column', String(cfg.rack), st('rack', -4), st('rack', 4), 'Shared by both players. Go grab them.');
+  stepRow(232, 'Column mix', cfg.mix === 'mixed' ? 'mixed' : 'flat', st('mix', -1, ['flat', 'mixed']), st('mix', 1, ['flat', 'mixed']), 'Mixed adds mirror balls and curved dishes.');
+  stepRow(300, 'Flat mirror shape', cfg.shape, st('shape', -1, ['disc', 'square']), st('shape', 1, ['disc', 'square']));
+  stepRow(368, 'Own beam hurts you', onoff(cfg.selfHit), st('selfHit', -1, [false, true]), st('selfHit', 1, [false, true]), 'On: either beam can hit anyone.');
+  stepRow(436, 'Held mirrors bounce beams', onoff(cfg.heldBounce), st('heldBounce', -1, [false, true]), st('heldBounce', 1, [false, true]), 'On: a mirror in your hand works as a shield.');
+  stepRow(504, 'Rounds to win', String(cfg.rounds), st('rounds', -1), st('rounds', 1));
+  stepRow(572, 'Round time limit', cfg.limit ? cfg.limit + ' min' : 'none', st('limit', -1, [0, 2, 3, 5]), st('limit', 1, [0, 2, 3, 5]), 'Time up = a draw round.');
+  stepRow(640, 'Mirror angle snap', cfg.snap + '°', st('snap', -1, [15, 30, 45]), st('snap', 1, [15, 30, 45]), 'X button turns snapping on and off.');
 }
 function drawSound() {
   title('Sound');
@@ -895,15 +915,16 @@ function drawHelp() {
     [C.orange, 'grab', '#000', 'Look at a mirror, click (or G): pick it up'], [C.yellow, 'mirror', '#000', 'Click again: place it right there'], [C.slot, 'turn', '#fff', 'Q / E turn it · R / F tilt it · B flip it'],
     [C.slot, 'dist', '#fff', 'Mouse wheel: push it farther / closer'], [C.cobalt, 'jump', '#fff', 'Space: jump · WASD: move · C: duck'], [C.red, 'MENU', '#fff', 'M: this menu · Esc: free the mouse'],
   ] : [
-    [C.orange, 'grab', '#000', 'Grip (either hand): grab, let go = place'], [C.slot, 'dist', '#fff', 'Right stick ↕: push it out / pull it in'], [C.slot, 'turn', '#fff', 'Right stick flick: turn'],
+    [C.orange, 'grab', '#000', 'Grip: grab, let go to place'], [C.slot, 'dist', '#fff', 'Right stick ↕: push out / pull in'], [C.slot, 'turn', '#fff', 'Right stick flick: turn'],
     [C.cobalt, 'jump', '#fff', 'A: jump'], ['#ffffff', 'flip', '#000', 'B: flip the mirror you hold'],
-    [C.slot, 'move', '#fff', 'Left stick: move'], [C.red, 'MENU', '#fff', 'Left trigger: menu'], [C.yellow, 'snap', '#000', 'X: mirror angle snap on / off'], [C.cobalt, 'seat', '#fff', 'Y: reset seated height'], [C.orange, 'grab', '#000', 'Right trigger grabs too'],
+    [C.slot, 'move', '#fff', local.move === 'teleport' ? 'Left stick forward: teleport arc' : 'Left stick: move'], [C.red, 'MENU', '#fff', 'Left trigger: menu'], [C.yellow, 'snap', '#000', 'X: mirror angle snap on / off'], [C.cobalt, 'seat', '#fff', 'Y: reset seated height'], [C.green, 'crouch', '#000', 'Left stick click: crouch on / off'], [C.orange, 'grab', '#000', 'Right trigger grabs too'],
   ];
   const two = rows.length > 6;
-  rows.forEach((r, i) => { const col = two && i >= 5 ? 1 : 0, row = two ? i % 5 : i, x = 180 + col * 430, y = 132 + row * (two ? 62 : 56); chip(x, y, r[0], r[1], r[2]); c.fillStyle = '#fff'; c.textAlign = 'left'; c.textBaseline = 'middle'; c.font = `700 ${two ? 21 : 24}px ${FONT}`; c.fillText(r[3], x + 40, y, two ? 370 : 790); });
-  if (me.role !== 'desk') stepRow(430, 'Snap turn angle', local.turn + '°', () => { local.turn = [30, 45, 90][clamp([30, 45, 90].indexOf(local.turn) - 1, 0, 2)]; saveLocal(); }, () => { local.turn = [30, 45, 90][clamp([30, 45, 90].indexOf(local.turn) + 1, 0, 2)]; saveLocal(); }, 'How far one flick of the right stick turns you.');
+  rows.forEach((r, i) => { const col = two && i >= 6 ? 1 : 0, row = two ? i % 6 : i, x = 180 + col * 430, y = 132 + row * 54; chip(x, y, r[0], r[1], r[2]); c.fillStyle = '#fff'; c.textAlign = 'left'; c.textBaseline = 'middle'; c.font = `700 ${two ? 21 : 24}px ${FONT}`; c.fillText(r[3], x + 40, y, two ? 370 : 790); });
+  if (me.role !== 'desk') stepRow(512, 'Movement', local.move, () => { local.move = 'smooth'; saveLocal(); }, () => { local.move = 'teleport'; saveLocal(); }, 'Teleport: push the left stick forward, aim the arc, let go.');
+  if (me.role !== 'desk') stepRow(440, 'Snap turn angle', local.turn + '°', () => { local.turn = [30, 45, 90][clamp([30, 45, 90].indexOf(local.turn) - 1, 0, 2)]; saveLocal(); }, () => { local.turn = [30, 45, 90][clamp([30, 45, 90].indexOf(local.turn) + 1, 0, 2)]; saveLocal(); }, 'How far one flick of the right stick turns you.');
   c.fillStyle = C.yellow; c.font = `800 22px ${FONT}`; c.textAlign = 'left'; c.textBaseline = 'middle';
-  ['Grab mirrors off the column. Silver bounces, black blocks.', 'Mirror balls bounce every way. Dishes focus the beam.', 'Floor and ceiling bounce beams. Walls swallow them.', 'Hit the other player with your beam: one touch and they\'re out.'].forEach((t, i) => c.fillText(t, 150, 548 + i * 38));
+  ['Grab mirrors off the column. Silver bounces, black blocks.', 'Hit the other player with your beam: one touch and they\'re out.'].forEach((t, i) => c.fillText(t, 150, 628 + i * 40));
 }
 function drawAbout() {
   const c = ux; title('About Glint', 'Built on');
@@ -974,7 +995,7 @@ function adoptGLB(hand, glb) {
     if (key) { o.material = new THREE.MeshBasicMaterial({ color: 0x202020, toneMapped: false }); (C0.btn[key] = C0.btn[key] || []).push(o); }
   });
   grp.updateMatrixWorld(true);
-  for (const key of ['lower', 'upper', 'trigger']) {
+  for (const key of ['lower', 'upper', 'trigger', 'stick']) {
     const list = C0.btn[key]; if (!list || !list.length) continue;
     const o = list[0], bx = new THREE.Box3(); for (const m of list) bx.expandByObject(m);
     const ce = bx.getCenter(new THREE.Vector3()), sz = bx.getSize(new THREE.Vector3());
@@ -992,7 +1013,7 @@ function adoptGLB(hand, glb) {
   C0.look = '';
 }
 function buttonLook(hand) {
-  if (hand === 'left') return { trigger: [C.red, 'MENU', '#fff'], lower: [C.yellow, 'snap', local.snapOn ? '#000' : '#555'], upper: [C.cobalt, 'seat', '#fff'], grip: [C.orange], stick: ['#202020'] };
+  if (hand === 'left') return { trigger: [C.red, 'MENU', '#fff'], lower: [C.yellow, 'snap', local.snapOn ? '#000' : '#555'], upper: [C.cobalt, 'seat', '#fff'], grip: [C.orange], stick: [me.crouch ? C.yellow : C.green, 'crouch', '#000'] };
   return { trigger: [C.orange, 'grab', '#000'], lower: [C.cobalt, 'jump', '#fff'], upper: ['#ffffff', 'flip', '#000'], grip: [C.orange], stick: ['#202020'] };
 }
 function paintButtons(hand, bits) {
@@ -1032,13 +1053,14 @@ const wrist = new THREE.Mesh(new THREE.PlaneGeometry(0.12, 0.045), new THREE.Mes
 wrist.position.set(0.0, 0.05, 0.06); wrist.rotation.x = -1.0;
 let wristKey = '';
 function drawWrist() {
-  const left = Math.max(0, me.cdEnd - now()) / 1000, key = left.toFixed(1) + '|' + me.team + game.phase + local.snapOn + holdingAny();
+  const left = Math.max(0, me.cdEnd - now()) / 1000, key = left.toFixed(1) + '|' + me.team + game.phase + local.snapOn + holdingAny() + me.crouch;
   if (key === wristKey) return; wristKey = key;
   const c = wristCv.getContext('2d'); c.clearRect(0, 0, 320, 120); rrect(c, 2, 2, 316, 116, 22); c.fillStyle = '#000'; c.fill(); c.lineWidth = 5; c.strokeStyle = TEAM[me.team].css; c.stroke();
   icon(c, 'grab', 50, 60, 60, holdingAny() ? C.yellow : '#fff'); c.textAlign = 'left'; c.textBaseline = 'middle';
   if (left > 0) { c.fillStyle = C.yellow; c.fillRect(100, 76, 200 * (1 - left / curCooldown()), 18); c.strokeStyle = '#fff'; c.lineWidth = 3; c.strokeRect(100, 76, 200, 18); c.font = `900 38px ${FONT}`; c.fillText('WAIT ' + left.toFixed(1), 100, 42); }
   else { c.fillStyle = C.green; c.font = `900 40px ${FONT}`; c.fillText(holdingAny() ? 'HOLDING' : 'READY', 100, 62); }
   if (local.snapOn) { c.fillStyle = C.yellow; c.font = `900 22px ${FONT}`; c.fillText(cfg.snap + '°', 262, 24); }
+  if (me.crouch) { c.fillStyle = C.green; c.font = `900 20px ${FONT}`; c.fillText('CROUCH', 170, 24); }
   wristTex.needsUpdate = true;
 }
 // big message in front of your eyes (countdown, OUT!, winner)
@@ -1148,6 +1170,7 @@ function dropHoldsQuietly() { for (const k of ['left', 'right', 'desk']) holds[k
 // PLAYER BODY: move, jump, collide with walls, column and tiles (you can stand on flat tiles)
 // =====================================================================
 const headLocal = new THREE.Vector3(0, 1.6, 0);
+const eyeLift = () => (me.role === 'xr' ? me.seat - me.crouchK * 0.65 : 0);   // seated boost, minus the crouch
 function headWorld(out) { dolly.updateMatrixWorld(); return out.copy(camera.position).applyMatrix4(dolly.matrixWorld); }
 function bodyCapsule(a, b) { headWorld(b); a.set(b.x, me.feetY + 0.26, b.z); b.y -= 0.08; if (b.y < a.y) b.y = a.y; }
 function spawnMe() {
@@ -1155,7 +1178,7 @@ function spawnMe() {
   if (me.role === 'xr') {
     tE.setFromQuaternion(camera.quaternion, 'YXZ'); dolly.rotation.set(0, s.yaw - tE.y, 0); dolly.updateMatrixWorld();
     tA.set(camera.position.x, 0, camera.position.z).applyAxisAngle(UP, dolly.rotation.y);
-    dolly.position.set(s.x - tA.x, me.seat, s.z - tA.z);
+    dolly.position.set(s.x - tA.x, eyeLift(), s.z - tA.z);
   } else { desk.yaw = s.yaw; desk.pitch = 0; dolly.rotation.set(0, s.yaw, 0); dolly.position.set(s.x, 0, s.z); }
 }
 function keepInside() { if (isPlayer()) collide(); }
@@ -1198,7 +1221,7 @@ function collide() {
   // ceiling
   headWorld(tB); if (tB.y > H - 0.12) { me.feetY -= tB.y - (H - 0.12); me.vy = Math.min(0, me.vy); }
   if (me.feetY < 0) { me.feetY = 0; me.vy = 0; me.grounded = true; }
-  dolly.position.y = me.feetY + (me.role === 'xr' ? me.seat : 0);
+  dolly.position.y = me.feetY + eyeLift();
 }
 function physics(dt, moveX, moveZ, jump) {
   // moveX / moveZ: wanted horizontal velocity in world space
@@ -1210,7 +1233,7 @@ function physics(dt, moveX, moveZ, jump) {
   // standing on a tile: probe just below the feet
   if (!me.grounded && me.vy <= 0) {
     headWorld(tB); _sc.set(tB.x, me.feetY + 0.22, tB.z);
-    for (const m of mirrors.values()) if (pushSphereOBB(_sc, 0.25, m, _push) && _push.y > 0.55 * _push.length()) { me.grounded = true; me.vy = 0; me.feetY += _push.y; dolly.position.y = me.feetY + (me.role === 'xr' ? me.seat : 0); break; }
+    for (const m of mirrors.values()) if (pushSphereOBB(_sc, 0.25, m, _push) && _push.y > 0.55 * _push.length()) { me.grounded = true; me.vy = 0; me.feetY += _push.y; dolly.position.y = me.feetY + eyeLift(); break; }
   }
 }
 function turnAroundHead(angle) {
@@ -1237,6 +1260,29 @@ function handGrab(hand, H, pad, extraGrab) {
   if (holds[hand]) { if (want) carryTile(hand, M); else { releaseTile(hand); pulse(H, 0.8, 50); } }
   H.wantPrev = want;
 }
+// classic VR teleport: push the left stick forward to aim an arc at the floor, let go to jump there
+const ARC_N = 48, arcGeo = new THREE.BufferGeometry(); arcGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ARC_N * 3), 3));
+const arcLine = new THREE.Line(arcGeo, new THREE.LineBasicMaterial({ color: 0x19d36b })); arcLine.frustumCulled = false; arcLine.visible = false; scene.add(arcLine);
+const arcRing = new THREE.Mesh(new THREE.RingGeometry(0.22, 0.34, 32), new THREE.MeshBasicMaterial({ color: 0x19d36b, side: THREE.DoubleSide })); arcRing.rotation.x = -Math.PI / 2; arcRing.visible = false; scene.add(arcRing);
+const tele = { aiming: false, ok: false, p: new THREE.Vector3() };
+function floorOK(p) { const { W, D, col } = cfg, r = 0.3; return Math.abs(p.x) < W / 2 - r && Math.abs(p.z) < D / 2 - r && !(Math.abs(p.x) < col / 2 + r && Math.abs(p.z) < col / 2 + r); }
+function aimArc(o, d) {
+  const arr = arcGeo.attributes.position.array, p = o.clone(), v = d.clone().multiplyScalar(8.5), np = new THREE.Vector3(), step = 0.045; let n = 0, ok = false;
+  for (let i = 0; i < ARC_N; i++) {
+    arr[n * 3] = p.x; arr[n * 3 + 1] = p.y; arr[n * 3 + 2] = p.z; n++;
+    np.copy(p).addScaledVector(v, step); v.y -= 9.8 * step;
+    if (np.y <= 0.02) { const k = (p.y - 0.02) / Math.max(1e-6, p.y - np.y); p.lerp(np, clamp(k, 0, 1)); p.y = 0.02; ok = floorOK(p); if (n < ARC_N) { arr[n * 3] = p.x; arr[n * 3 + 1] = p.y; arr[n * 3 + 2] = p.z; n++; } break; }
+    if (np.y > cfg.H || !floorOK(new THREE.Vector3(np.x, 0, np.z))) { ok = false; break; }
+    p.copy(np);
+  }
+  arcGeo.setDrawRange(0, n); arcGeo.attributes.position.needsUpdate = true;
+  const col = ok ? 0x19d36b : 0xff2340; arcLine.material.color.setHex(col); arcRing.material.color.setHex(col);
+  arcLine.visible = true; arcRing.visible = ok; arcRing.position.copy(p); tele.ok = ok; tele.p.copy(p);
+}
+function teleportTo(p) {
+  headWorld(tB); dolly.position.x += p.x - tB.x; dolly.position.z += p.z - tB.z; me.feetY = 0; me.vy = 0;
+  dolly.position.y = me.feetY + eyeLift(); collide(); Audio.zap(p);
+}
 function xrInput(dt) {
   const L = hands.left, R = hands.right, pl = L ? readPad(L) : null, pr = R ? readPad(R) : null;
   const edge = (h, p, k, thr) => { const v = typeof p[k] === 'number' ? p[k] > (h.prev[k] ? 0.25 : thr || 0.55) : p[k]; const e = v && !h.prev[k]; h.prev[k] = v; return e; };
@@ -1244,20 +1290,27 @@ function xrInput(dt) {
   // seated height: once the headset reports a real head pose, lift you so your eyes sit at 1.6 m
   if (!me.seatSet && ++me.xrFrames > 12 && camera.position.y > 0.3) {
     me.seatSet = true; me.seat = clamp(1.6 - camera.position.y, -0.4, 1.2);
-    if (me.needSpawn) { me.needSpawn = false; spawnMe(); } else dolly.position.y = me.feetY + me.seat;
+    if (me.needSpawn) { me.needSpawn = false; spawnMe(); } else dolly.position.y = me.feetY + eyeLift();
   }
   for (const m of mirrors.values()) m.hi = false;
+  me.crouchK += ((me.crouch ? 1 : 0) - me.crouchK) * Math.min(1, dt * 10);
   let mx = 0, mz = 0, jump = false;
   if (L) {
     if (edge(L, pl, 'trigger')) { ui.open = !ui.open; Audio.click(); }
     if (edge(L, pl, 'lower')) { local.snapOn = !local.snapOn; saveLocal(); Audio.click(); }
     if (edge(L, pl, 'upper')) { me.seatSet = false; me.xrFrames = 99; Audio.click(); }
+    if (edge(L, pl, 'stick')) { me.crouch = !me.crouch; Audio.click(); }
     const dz = (v) => (Math.abs(v) < 0.15 ? 0 : v);
     camera.getWorldDirection(tA); tA.y = 0; tA.normalize(); tB.set(-tA.z, 0, tA.x);
-    const sx = dz(pl.sx), sy = dz(pl.sy); mx = tA.x * -sy + tB.x * sx; mz = tA.z * -sy + tB.z * sx;
+    const sx = dz(pl.sx), sy = dz(pl.sy);
+    if (local.move === 'teleport') {
+      if (pl.sy < -0.6 && me.alive && game.phase !== 'count') { tele.aiming = true; L.ray.updateMatrixWorld(true); tA.setFromMatrixPosition(L.ray.matrixWorld); tC.set(0, 0, -1).transformDirection(L.ray.matrixWorld); aimArc(tA, tC); }
+      else if (tele.aiming && Math.abs(pl.sy) < 0.3) { tele.aiming = false; arcLine.visible = arcRing.visible = false; if (tele.ok) teleportTo(tele.p); }
+      camera.getWorldDirection(tA); tA.y = 0; tA.normalize(); tB.set(-tA.z, 0, tA.x);
+    } else { mx = tA.x * -sy + tB.x * sx; mz = tA.z * -sy + tB.z * sx; }
     const mag = Math.hypot(mx, mz); if (mag > 1) { mx /= mag; mz /= mag; }
     handGrab('left', L, pl, false);
-    paintButtons('left', (pl.trigger > 0.5 ? 1 : 0) | (pl.grip > 0.5 ? 2 : 0) | (pl.lower ? 4 : 0) | (pl.upper ? 8 : 0));
+    paintButtons('left', (pl.trigger > 0.5 ? 1 : 0) | (pl.grip > 0.5 ? 2 : 0) | (pl.lower ? 4 : 0) | (pl.upper ? 8 : 0) | (pl.stick ? 16 : 0));
   } else if (holds.left) releaseTile('left');
   panel.visible = !!L && ui.open; wrist.visible = !!L && !ui.open;
   xs.overUI = false; pointer.visible = false; cursorDot.visible = false;
@@ -1401,7 +1454,7 @@ const Net = (() => {
         ui.dirty = true;
       }
     });
-    r.on('mir', ({ data }) => { if (!data || !data.id) return; const m = mirrors.get(data.id); if (m && m.hold === me.id && data.hold !== me.id) { if (data.hold && data.hold < me.id) return; dropHoldsQuietly(); } else if (m && m.hold === me.id) return; upsertMirror(data); });
+    r.on('mir', ({ data }) => { if (!data || !data.id || (data.g !== undefined && data.g !== gameKey())) return; const m = mirrors.get(data.id); if (m && m.hold === me.id && data.hold !== me.id) { if (data.hold && data.hold < me.id) return; dropHoldsQuietly(); } else if (m && m.hold === me.id) return; upsertMirror(data); });
     r.on('clr', () => { dropHoldsQuietly(); clearMirrors(); fillRack(); });
     r.on('go', ({ data }) => { if (data && !(data.practice && isPlayer()) && typeof data.match === 'number' && (data.match > game.match || (data.match === game.match && data.round > game.round))) startRound(data.match, data.round, !!data.practice, false); });
     r.on('out', ({ data }) => { if (data && data.match === game.match && data.round === game.round) onOut(data.team, data.pos); });
@@ -1515,6 +1568,7 @@ function startRound(match, round, practiceMode, announce) {
 }
 function onOut(team, pos) {
   if (game.phase !== 'play') return;
+  releaseAll(true);   // nobody keeps carrying a mirror into the next round
   if (pos) sparkBurst(tA.fromArray(pos), TEAM[team] ? TEAM[team].hex : 0xffffff, 140, 4), Audio.out(tA);
   if (game.practice) { shout('OUT!', C.red, 1800); game.phase = 'over'; game.nextAt = now() + 2500; return; }
   game.phase = 'over'; game.overAt = now();
@@ -1553,9 +1607,12 @@ function checkHits() {
   const enemy = other(me.team);
   const head = headWorld(new THREE.Vector3()), mid = a.clone().setY((a.y + b.y) / 2);
   dangerD = Math.min(beamDistance(enemy, head), beamDistance(enemy, mid));
-  const inOwn = beamHitsCapsule(me.team, a, b, BODY_R);
-  if (me.alive && game.phase === 'play' && beamHitsCapsule(enemy, a, b, BODY_R)) {
-    me.alive = false; const pos = [r4(b.x), r4(b.y - 0.4), r4(b.z)];
+  if (cfg.selfHit) dangerD = Math.min(dangerD, beamDistance(me.team, head), beamDistance(me.team, mid));
+  const inOwn = !cfg.selfHit && beamHitsCapsule(me.team, a, b, BODY_R);
+  const byEnemy = me.alive && game.phase === 'play' && beamHitsCapsule(enemy, a, b, BODY_R), byOwn = !byEnemy && me.alive && game.phase === 'play' && cfg.selfHit && beamHitsCapsule(me.team, a, b, BODY_R);
+  if (byEnemy || byOwn) {
+    me.alive = false; flashHit(lastHit.a, lastHit.b, TEAM[byEnemy ? enemy : me.team].hex);
+    setTimeout(() => shout(byOwn ? 'YOUR OWN BEAM!' : 'HIT BY ' + TEAM[enemy].name, TEAM[byEnemy ? enemy : me.team].css, 2200), 900); const pos = [r4(b.x), r4(b.y - 0.4), r4(b.z)];
     if (!game.practice) Net.emit('out', { match: game.match, round: game.round, team: me.team, pos });
     onOut(me.team, pos);
     releaseAll(true); if (hands.left) pulse(hands.left, 1, 300); if (hands.right) pulse(hands.right, 1, 300);
@@ -1640,7 +1697,7 @@ function onResize() {
 }
 addEventListener('resize', onResize);
 rebuildArena(); onResize(); fillRack();
-window.__glint = { THREE, hands, ctrl, panel, wrist, pointer, scene, dolly, setRole, me, game, cfg, mirrors, upsertMirror, beamState, startMatch, setCfg, ui, setMenu, Net, holds, grabTile, releaseTile, fillRack, hitTile };
+window.__glint = { THREE, hands, ctrl, panel, wrist, pointer, scene, dolly, setRole, me, game, cfg, mirrors, upsertMirror, beamState, startMatch, setCfg, ui, setMenu, Net, local, tele, aimArc, holds, grabTile, releaseTile, fillRack, hitTile };
 let lastT = now(), idleA = 0, uiTick = 0;
 renderer.setAnimationLoop(() => {
   const t = now(), dt = Math.min(0.05, (t - lastT) / 1000); lastT = t;
@@ -1658,7 +1715,7 @@ renderer.setAnimationLoop(() => {
     lastB[tm] = n;
     if (emitters[tm]) emitters[tm].userData.lens.material.color.setHex(live ? 0xffffff : 0x333338);
   }
-  drawBeams(); animateTiles(); updateSparks(dt); updatePractice(dt);
+  drawBeams(); animateTiles(); updateHitFlash(); updateSparks(dt); updatePractice(dt);
   for (const tm of ['r', 'b']) if (emitters[tm]) emitters[tm].userData.ring.rotation.x += dt * 3;
   const hit = checkHits();
   Audio.frame(isPlayer() && me.alive ? dangerD : Infinity, hit.inOwn);
