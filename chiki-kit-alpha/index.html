@@ -158,6 +158,8 @@ const SETTINGS = [
     help: () => (S.paper === 'none' ? 'No paper: parts are only split where they would overlap themselves, and all of them are laid out on one big flat drawing (for a laser or plotter bed).' : '') },
   { id: 'scaleDen', page: 'prefab', sec: 'Paper and parts', label: 'Scale', type: 'choice', def: '10', opts: [['1', '1:1'], ['5', '1:5'], ['10', '1:10'], ['20', '1:20'], ['50', '1:50']] },
   { id: 'paperSides', page: 'prefab', sec: 'Paper and parts', label: 'Sides on balls', type: 'slider', min: 4, max: 24, step: 2, def: 10, help: () => 'Balls can’t unroll flat, so they are folded from this many flat sides (fewer is easier to build). Tubes and cones unroll smoothly.' },
+  { id: 'tabMode', page: 'prefab', sec: 'Paper and parts', label: 'Glue tabs', type: 'choice', def: 'one', opts: [['one', 'One side'], ['both', 'Both sides'], ['none', 'No tabs']],
+    help: () => (S.tabMode === 'both' ? 'Both edges of every seam get a tab; the two tabs are glued to each other, standing halfway between the faces.' : S.tabMode === 'none' ? 'No tabs: edges meet edge to edge, to tape or hot-glue.' : 'One tab per seam, on the piece you build first, so the next piece rests down onto it.') },
   { id: 'tabW', page: 'prefab', sec: 'Paper and parts', label: 'Glue tab width', type: 'slider', min: 4, max: 16, step: 1, def: 8, fmt: (v) => v + ' mm' },
   { id: 'faceLabels', page: 'prefab', sec: 'Printing', label: 'Face labels', type: 'toggle', def: true, help: () => 'A label on each face (part number and letter), on the sheets and on the paper model, matching the steps on Assemble. Glued seams show their numbers on the model too.' },
   { id: 'paperCol', page: 'prefab', sec: 'Printing', label: 'Colour', type: 'choice', def: 'shape', opts: [['shape', 'Model colours'], ['part', 'One per part']] },
@@ -191,7 +193,7 @@ const S = Object.fromEntries(SETTINGS.map((s) => [s.id, s.def]));
 const touched = new Set();                // settings you changed yourself (the headset never overrides those)
 const onSet = {};                         // id -> function run after a change
 // settings that decide how the model is cut into paper parts are part of the shared model, so every player sees the same parts
-const SHARED = ['paper', 'scaleDen', 'paperSides', 'tabW', 'paperCol', 'paperPat', 'faceLabels'];
+const SHARED = ['paper', 'scaleDen', 'paperSides', 'tabMode', 'tabW', 'paperCol', 'paperPat', 'faceLabels'];
 function pfOf() { const o = {}; for (const k of SHARED) o[k] = S[k]; return o; }
 function applyPf(pf) { if (!pf || typeof pf !== 'object') return; let ch = false; for (const k of SHARED) if (k in pf && SET[k] && pf[k] !== S[k]) { const d = SET[k], v = pf[k];
   if (d.type === 'slider' ? typeof v === 'number' && isFinite(v) : d.type === 'toggle' ? typeof v === 'boolean' : (typeof d.opts === 'function' ? d.opts() : d.opts).some((o) => o[0] === v)) { S[k] = v; ch = true; } }
@@ -2666,7 +2668,7 @@ function triOverlap(A, B, eps) {   // two 2D triangles overlap (more than touchi
 }
 // ---- build: surface -> facets -> nets -> build order -> seams
 function asmBuild() {
-  const key = [S.paperSides, S.paper, S.scaleDen, S.tabW].join();
+  const key = [S.paperSides, S.paper, S.scaleDen, S.tabW, S.tabMode].join();
   asm.dirty = false; asm.key = key; asm.nets = []; asm.order = []; asm.facets = []; asm.seams = 0; asm.segs = []; asm.unmet = 0;
   const { P, col, src, grp } = paperSurface(); if (!P.length) return;
   // weld corners (0.01 mm)
@@ -2817,13 +2819,14 @@ function asmBuild() {
       return { poly, tris: [[poly[0], poly[1], poly[2]], [poly[0], poly[2], poly[3]]] };
     };
     const tabsIn = nets.map(() => []); unmet = 0; let added = 0;
-    for (let n = 1; n < seq; n++) {
-      const ss = (sides.get(n) || []).slice().sort((a, b) => nets[b.ni].rank - nets[a.ni].rank || nets[b.ni].facets.indexOf(b.f) - nets[a.ni].facets.indexOf(a.f));   // later part first
+    const tabMode = S.tabMode || 'one';
+    for (let n = 1; n < seq && tabMode !== 'none'; n++) {
+      const ss = (sides.get(n) || []).slice().sort((a, b) => nets[a.ni].rank - nets[b.ni].rank || nets[a.ni].facets.indexOf(a.f) - nets[b.ni].facets.indexOf(b.f));   // the piece built first
       let ok = false;
       for (const e of ss) {
         const t = tabTris(e); if (!t) continue;
         const clash = t.tris.some((m) => hitsAny(m, nets[e.ni].tris) || hitsAny(m, tabsIn[e.ni]));
-        if (!clash) { e.tab = t.poly; e.tabSide = true; tabsIn[e.ni].push(...t.tris); ok = true; break; }
+        if (!clash) { e.tab = t.poly; e.tabSide = true; tabsIn[e.ni].push(...t.tris); ok = true; if (tabMode !== 'both') break; }
       }
       if (ok || !ss.length || ss.every((e) => !tabTris(e))) continue;   // glued, or too short for a tab
       // nowhere for this tab: cut the part loose where it hangs on (its fold to the part it grew from)
@@ -2838,7 +2841,7 @@ function asmBuild() {
   asm.unmet = unmet;
   // curved seams (round a tube or cone): pieces too short for a tab each get curved tab strips along several of them,
   // on the part glued later if they fit there, else on the other side, else the seam is taped
-  { const minL = Math.max(tabM * 2.5, 6 / mm), key2 = (p) => p[0].toFixed(6) + ',' + p[1].toFixed(6), byLab = new Map();
+  if ((S.tabMode || 'one') !== 'none') { const minL = Math.max(tabM * 2.5, 6 / mm), key2 = (p) => p[0].toFixed(6) + ',' + p[1].toFixed(6), byLab = new Map();
     for (const net of nets) for (const e of net.edges) if (e.lab && !e.tab && !e.tabSide && !e.noRoom) (byLab.get(e.lab) || byLab.set(e.lab, []).get(e.lab)).push(e);
     const tabTrisOf = (net) => { const out = []; for (const e of net.edges) if (e.tab) { const P = e.tab; for (let i = 1; i + 1 < P.length; i++) out.push([P[0], P[i], P[i + 1]]); } return out; };
     const strips = (mine) => {   // curved tab strips along this side's pieces: [{ chunk, poly, tris, labelAt }]
@@ -2868,12 +2871,12 @@ function asmBuild() {
       const groups = new Map(); for (const e of es) { const k = e.ni + '|' + F[e.f].patch; (groups.get(k) || groups.set(k, []).get(k)).push(e); }
       const rankOf = (g) => nets[g[0].ni].rank * 1e6 + nets[g[0].ni].facets.indexOf(g[0].f);
       let done = false;
-      for (const mine of [...groups.values()].sort((a2, b2) => rankOf(b2) - rankOf(a2))) {
+      for (const mine of [...groups.values()].sort((a2, b2) => rankOf(a2) - rankOf(b2))) {   // the piece built first
         const net = nets[mine[0].ni], st = strips(mine), others = tabTrisOf(net), ok = [];
         for (const t of st) if (!t.tris.some((m) => hitsAny(m, net.tris) || hitsAny(m, others))) { ok.push(t); others.push(...t.tris); }   // a strip that would overlap is left out; the rest still hold the seam
         if (!ok.length || ok.length < st.length * 0.4) continue;
         for (const t of ok) { for (const e of t.chunk) { e.underTab = true; e.tabSide = true; } net.edges.push({ a3: t.chunk[0].a3, b3: t.chunk[t.chunk.length - 1].b3, p: t.chunk[0].p, q: t.chunk[t.chunk.length - 1].q, ic: t.chunk[0].ic, n: t.chunk[0].n, lab, nb: t.chunk[0].nb, f: t.chunk[0].f, ni: t.chunk[0].ni, tabSide: true, tab: t.poly, noLine: true, labelAt: t.labelAt }); }
-        done = true; break;
+        done = true; if (S.tabMode !== 'both') break;
       }
       if (!done) { asm.unmet++; for (const e of es) e.noRoom = true; }
     }
@@ -2897,6 +2900,13 @@ function asmBuild() {
     });
   }
   asm.steps = steps;
+  { const no = new Map(); for (const st of steps) for (const pa of st.patches) if (!no.has(pa)) no.set(pa, no.size + 1);
+    F.forEach((f) => { if (!no.has(f.patch)) no.set(f.patch, no.size + 1); }); F.forEach((f) => { f.label = String(no.get(f.patch)); });
+    const letters = new Map(), let_ = (k) => String.fromCharCode(65 + (k % 26)) + (k >= 26 ? Math.floor(k / 26) : '');
+    F.forEach((f, fi) => { let m = letters.get(f.patch); if (!m) { m = new Map(); letters.set(f.patch, m); } for (const r of f.runs) if (r.nb >= 0 && F[r.nb].patch !== f.patch && !m.has(F[r.nb].patch)) m.set(F[r.nb].patch, let_(m.size)); });
+    const name = (pa, k) => { const m = letters.get(pa); if (!m.has(k)) m.set(k, let_(m.size)); return no.get(pa) + m.get(k); };   // (a seam round a tube joins two edges of one face: each gets its own letter)
+    asm.labName = new Map();
+    for (const net of nets) for (const e of net.edges) if (e.lab && e.nb >= 0 && e.f != null) { const pa = F[e.f].patch, pb = F[e.nb].patch, self = pa === pb; e.name = name(pa, self ? 'self' + (e.f < e.nb ? 0 : 1) : pb); e.mate = name(pb, self ? 'self' + (e.f < e.nb ? 1 : 0) : pa); if (!asm.labName.has(e.lab)) asm.labName.set(e.lab, [e.name, e.mate]); } }
   asm.F = F; asm.V = V; asm.tri = tri; asm.tcol = tcol; asm.tsrc = tsrc; asm.nets = nets; asm.order = order; asm.netOf = netOf; asm.place = place; asm.parent = parent; asm.foldRun = foldRun;
   { const fit = new Set(), over = new Set(); F.forEach((f, fi) => { for (const r of f.runs) if (r.nb >= 0 && netOf[r.nb] !== netOf[fi]) { const pr = Math.min(netOf[fi], netOf[r.nb]) + '-' + Math.max(netOf[fi], netOf[r.nb]), k1 = fi + '|' + r.nb, k2 = r.nb + '|' + fi;
       if (why.fit.has(k1) || why.fit.has(k2)) fit.add(pr); else if (why.over.has(k1) || why.over.has(k2)) over.add(pr); } });
@@ -2962,15 +2972,19 @@ function asmLabelsBuild() {
   const seen = new Set(); for (const net of asm.nets) for (const e of net.edges) if (e.lab && e.a3 && !seen.has(e.lab)) { seen.add(e.lab);
     const m = e.a3.map((v, i) => (v + e.b3[i]) / 2), f = asm.F[e.f], nb = e.nb >= 0 ? asm.F[e.nb] : null; let n = [0, 0, 0];
     for (const g of [f, nb]) if (g && g.tris.length) { const [A, B, Cc] = asm.tri[g.tris[0]].map((vi) => asm.V[vi]); const cr = v3.norm(v3.cross(v3.sub(B, A), v3.sub(Cc, A))); for (let i = 0; i < 3; i++) n[i] += cr[i]; }
-    add(String(e.lab), 'seam', m, v3.norm(n), f ? f.patch : -1, H * 0.8); }
+    add(seamName(e.lab), 'seam', m, v3.norm(n), f ? f.patch : -1, H * 0.8); }
 }
 // folding: every face of a part turns about the edge it shares with the face it hangs from (the fold tree of the unwrap).
 // Faces already built are folded up, this step's faces fold up in a loop, faces still to come stay flat.
 const asmAnim = new THREE.Group(); asmAnim.visible = false; world.add(asmAnim);
 const foldA = { ni: -1, step: -1, nets: null, play: null };
+// every part started so far is shown with all its tabs: parts already built folded and glued, this step's part folding
 function foldSetup(ni) {
   for (const c of [...asmAnim.children]) { asmAnim.remove(c); c.geometry.dispose(); for (const k of c.children) k.geometry.dispose(); }
   foldA.ni = ni; foldA.step = asm.step; foldA.nets = asm.nets; if (ni < 0 || !asm.parent) return;
+  for (let n = 0; n < asm.nets.length; n++) { const first = asm.steps.findIndex((st) => st.ni === n); if (first >= 0 && first <= asm.step) foldNet(n); }
+}
+function foldNet(ni) {
   const net = asm.nets[ni], F = asm.F, V = asm.V, st = asm.steps[asm.step], curP = new Set(st ? st.patches : []);
   const nrm = (fi) => { let n = [0, 0, 0]; for (const ti of F[fi].tris) { const [A, B, Cc] = asm.tri[ti].map((vi) => V[vi]), c = v3.cross(v3.sub(B, A), v3.sub(Cc, A)); n = [n[0] + c[0], n[1] + c[1], n[2] + c[2]]; } return v3.norm(n); };
   const cenOf = (P) => { const c = [0, 0, 0]; for (const q of P) for (let i = 0; i < 3; i++) c[i] += q[i] / P.length; return c; };
@@ -2996,7 +3010,11 @@ function foldSetup(ni) {
     const to3 = (r2) => { const r = [r2[0] - q[0][0], r2[1] - q[0][1]], A = (r[0] * d2[1] - r[1] * d2[0]) / det, B = (d1[0] * r[1] - d1[1] * r[0]) / det; return [0, 1, 2].map((i) => P[0][i] + A * (P[1][i] - P[0][i]) + B * (P[2][i] - P[0][i])); };
     const poly = e.tab.map(to3), tri2 = THREE.ShapeUtils.triangulateShape(e.tab.map((t) => new THREE.Vector2(t[0], t[1])), []);
     const a = e.a3, u = v3.norm(v3.sub(e.b3, e.a3)), k = asm.steps.findIndex((st2) => st2.glue.includes(e.lab));
-    let be = swing(a, u, nrm(e.f), nrm(e.nb), cenOf(poly), cen(e.nb), true); be = Math.atan2(Math.sin(be), Math.cos(be)); be += Math.sign(be || 1) * 0.02;   // ~1° past: tucked just behind
+    let be = swing(a, u, nrm(e.f), nrm(e.nb), cenOf(poly), cen(e.nb), true); be = Math.atan2(Math.sin(be), Math.cos(be));
+    if (S.tabMode === 'both') {   // stand on the line halfway between the two faces (inside), a hair toward its own face so the pair doesn't flicker
+      const fd = v3.norm(off(cen(e.f), a, u)), nd = v3.norm(off(cen(e.nb), a, u)), bis = v3.norm([fd[0] + nd[0], fd[1] + nd[1], fd[2] + nd[2]]), x0 = v3.norm(off(cenOf(poly), a, u));
+      be = Math.atan2(v3.dot(u, v3.cross(x0, bis)), v3.dot(x0, bis)); be -= Math.sign(be || 1) * 0.012;
+    } else be += Math.sign(be || 1) * 0.02;   // ~1° past: tucked just behind the face it glues to
     tabs.push({ fi: e.f, poly, tri2, a, u, be, mode: k < 0 ? 0 : modeOf(k) });
   }
   // this step's surfaces fold one after another, nearest the first face first (a curved surface curls as it swings in); tabs tuck in last
@@ -3017,12 +3035,13 @@ function foldSetup(ni) {
   const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3)); geo.computeVertexNormals();
   const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 })); mesh.castShadow = mesh.receiveShadow = true; mesh.frustumCulled = false;
   const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3)); const ln = new THREE.LineSegments(lg, asmLineMat); ln.frustumCulled = false; mesh.add(ln);
-  mesh.userData = { base: pos.slice(), lbase: lp.slice(), key, lkey, info, tabs, order: net.facets.slice(), slots }; asmAnim.add(mesh);
+  mesh.userData = { net: ni, base: pos.slice(), lbase: lp.slice(), key, lkey, info, tabs, order: net.facets.slice(), slots }; asmAnim.add(mesh);
 }
 // where the timeline is inside the current step: 0 flat, 1 folded
 const foldS = () => { const n = asm.steps ? asm.steps.length : 0; if (!n) return 0; const t = clamp(S.asmT || 0, 0, n); return t >= n ? 1 : t - Math.floor(t); };
-function foldTick() {
-  const m = asmAnim.children[0]; if (!m) return; const U = m.userData, e = foldS(), ease = (x) => { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }, sOf = (sl) => ease(e * U.slots - (sl || 0));
+function foldTick() { for (const m of asmAnim.children) foldMesh(m); }
+function foldMesh(m) {
+  const U = m.userData, e = foldS(), ease = (x) => { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); }, sOf = (sl) => ease(e * U.slots - (sl || 0));
   const W = new Map(), I = new THREE.Matrix4(), M = new THREE.Matrix4(), tv = new THREE.Vector3(), ax = new THREE.Vector3();
   const hinge = (a, u, an) => M.makeTranslation(a[0], a[1], a[2]).multiply(new THREE.Matrix4().makeRotationAxis(ax.set(...u), an)).multiply(new THREE.Matrix4().makeTranslation(-a[0], -a[1], -a[2])).clone();
   for (const fi of U.order) { const f = U.info.get(fi); if (f.root) { W.set(fi, I); continue; } const s = f.mode === 'anim' ? sOf(f.slot) : f.mode; W.set(fi, (W.get(f.p) || I).clone().multiply(hinge(f.a, f.u, (1 - s) * f.al))); }
@@ -3069,11 +3088,11 @@ function asmLook() {
     const k = all ? -1 : stepOfPatch(m.userData.patch), now = !all && k === asm.step, picked = hl != null && m.userData.facets.includes(hl);
     m.visible = all || k <= asm.step; m.material = now || picked ? hlMat : m.userData.base;
   }
-  const curNet = !all && asm.steps[asm.step] ? asm.steps[asm.step].ni : -1;
-  for (const m of asmGroup.children) if (m.userData.net === curNet) m.visible = false;
-  for (const sp of asmLabels.children) sp.visible = (all || stepOfPatch(sp.userData.patch) <= asm.step) && (curNet < 0 || asm.netOf[asm.F.findIndex((f) => f.patch === sp.userData.patch)] !== curNet);
+  if (!all) for (const m of asmGroup.children) m.visible = false;   // Assemble shows the folding copies (with their tabs)
+  for (const sp of asmLabels.children) sp.visible = all || stepOfPatch(sp.userData.patch) < asm.step;   // names on what is already built
 }
 function asmGo(k, play = true) { k = clamp(k, 0, Math.max(0, asm.steps.length - 1)); setTimeline(k); asm.step = k; asm.pick = null; foldA.play = play ? k + 0.999 : null; asmLook(); dirtyAll(); }
+const seamName = (lab) => { const n = asm.labName && asm.labName.get(lab); return n ? n[0] + '–' + n[1] : String(lab); };
 function stepText(k) {
   const st = asm.steps[k]; if (!st) return '';
   const net = asm.nets[st.ni], labs = st.patches.map((pa) => { const fi = asm.F.findIndex((f) => f.patch === pa); return fi >= 0 ? asm.F[fi].label : '?'; });
@@ -3081,7 +3100,8 @@ function stepText(k) {
   if (st.first) { const folds = net.edges.filter((e) => e.fold && !e.smooth).length, curves = net.edges.some((e) => e.smooth);
     bits.push(`Cut out ${net.name}` + (folds ? ` and crease its ${folds} dashed fold${folds === 1 ? '' : 's'}` : '') + (curves ? (folds ? ', then' : ' and') + ' curl its smooth surface into shape' : '') + '.'); }
   const faces = st.patches.length > 1 ? `faces ${labs.slice(0, -1).join(', ')} and ${labs[labs.length - 1]}` : `face ${labs[0]}`;
-  if (st.glue.length) bits.push(`Fold ${faces} into place and glue tab${st.glue.length > 1 ? 's' : ''} ${st.glue.join(', ')} to the matching ${st.glue.length > 1 ? 'edges' : 'edge'}.`);
+  const gl = st.glue.map(seamName).join(', ');
+  if (st.glue.length) bits.push(S.tabMode === 'none' ? `Fold ${faces} into place and tape edge${st.glue.length > 1 ? 's' : ''} ${gl} together.` : S.tabMode === 'both' ? `Fold ${faces} into place and glue the two tabs of ${gl} to each other.` : `Fold ${faces} into place and glue each tab onto the edge it names: ${gl}.`);
   else if (!st.first) bits.push(`Fold ${faces} into place.`);
   return bits.join(' ');
 }
@@ -3115,7 +3135,7 @@ function setTimeline(t) {   // the Assemble timeline: whole numbers are the star
 function asmFrame() {
   foldFrame(1 / 60);
   const on = assembleOn() || seamOn() || prefabOn() || testOn() || paperViews(), mode = seamOn() ? 'seam' : assembleOn() ? 'asm' : on ? 'all' : 'off', lk = S.paperCol + S.paperPat;
-  if (on && (asm.dirty || asm.key !== [S.paperSides, S.paper, S.scaleDen, S.tabW].join())) { asmBuild(); asm.drawn = asm.nets; asm.lk = lk; seamDraw(); seamCheck(); }
+  if (on && (asm.dirty || asm.key !== [S.paperSides, S.paper, S.scaleDen, S.tabW, S.tabMode].join())) { asmBuild(); asm.drawn = asm.nets; asm.lk = lk; seamDraw(); seamCheck(); }
   if (!seamOn()) seamHi.visible = false;
   if (on && asm.lk !== lk) { asm.lk = lk; asm.lay = null; asmMeshes(); dirtyAll(); }
   if (mode !== asm.mode || asm.drawn !== asm.nets || asm.pickWas !== asm.pick) { asm.mode = mode; asm.drawn = asm.nets; asm.pickWas = asm.pick; asmLook(); seamDraw(); }
@@ -3165,7 +3185,7 @@ function hull2(P) {   // convex hull (x, z)
   return lo.slice(0, -1).concat(up.slice(0, -1));
 }
 function stability() {
-  if (asm.dirty || asm.key !== [S.paperSides, S.paper, S.scaleDen, S.tabW].join()) asmBuild();
+  if (asm.dirty || asm.key !== [S.paperSides, S.paper, S.scaleDen, S.tabW, S.tabMode].join()) asmBuild();
   if (tst.of === asm.nets && tst.r) return tst.r;
   tst.of = asm.nets; tst.r = null; if (!asm.tri || !asm.nets.length) return null;
   const V = asm.V; let A = 0, c = [0, 0, 0], y0 = Infinity, y1 = -Infinity;
@@ -3189,7 +3209,7 @@ function testDraw() {
 function testFrame() { const on = testOn(); testGroup.visible = on; if (on) stability(); }
 // flat parts with tabs, turned to fit and laid out on sheets (mm)
 function prefabSheets() {
-  if (asm.dirty || asm.key !== [S.paperSides, S.paper, S.scaleDen, S.tabW].join()) asmBuild();
+  if (asm.dirty || asm.key !== [S.paperSides, S.paper, S.scaleDen, S.tabW, S.tabMode].join()) asmBuild();
   if (asm.lay && asm.layOf === asm.nets) return asm.lay;
   return (asm.layOf = asm.nets, asm.lay = layoutSheets());
 }
@@ -3203,7 +3223,7 @@ function layoutSheets() {
       const p = e.p.map((v) => v * mm), q = e.q.map((v) => v * mm), dx = q[0] - p[0], dy = q[1] - p[1], L = Math.hypot(dx, dy) || 1, ic = e.ic.map((v) => v * mm);
       let nx = dy / L, ny = -dx / L; if ((ic[0] - p[0]) * nx + (ic[1] - p[1]) * ny > 0) { nx = -nx; ny = -ny; }   // pointing out of the part
       const tab = e.tab ? e.tab.map((t) => [t[0] * mm, t[1] * mm]) : null;
-      return { a3: e.a3, b3: e.b3, p, q, n: e.lab || 0, show: !!e.show, fold: !!e.fold, smooth: !!e.smooth, tab, tape: !!e.noRoom, underTab: !!e.underTab, noLine: !!e.noLine, labelAt: e.labelAt ? [e.labelAt[0] * mm, e.labelAt[1] * mm] : null, mid: [(p[0] + q[0]) / 2 - nx * Math.min(4, L * 0.2), (p[1] + q[1]) / 2 - ny * Math.min(4, L * 0.2)] };
+      return { a3: e.a3, b3: e.b3, p, q, n: e.lab || 0, name: e.name || String(e.lab || ''), mate: e.mate || String(e.lab || ''), show: !!e.show, fold: !!e.fold, smooth: !!e.smooth, tab, tape: !!e.noRoom, underTab: !!e.underTab, noLine: !!e.noLine, labelAt: e.labelAt ? [e.labelAt[0] * mm, e.labelAt[1] * mm] : null, mid: [(p[0] + q[0]) / 2 - nx * Math.min(4, L * 0.2), (p[1] + q[1]) / 2 - ny * Math.min(4, L * 0.2)] };
     });
     const byLook = new Map(), pats = new Map();   // the printed look of each triangle, and each surface's triangles (for its label and for picking)
     for (const fi of net.facets) { const pa = asm.F[fi].patch; let P0 = pats.get(pa); if (!P0) { P0 = { patch: pa, fi, label: asm.F[fi].label, tris: [] }; pats.set(pa, P0); }
@@ -3368,8 +3388,8 @@ function drawSheets(L, lay, vw) {   // vw: a zoomable view { s, ox, oy, clip } (
       // numbers: on a tab, plain black on grey; on the edge it glues to, white in a red circle
       const fs = Math.max(11, s * 3.2);
       if (s * 3.2 > 8) for (const e of p.edges) if (e.n && e.show && Math.hypot(e.q[0] - e.p[0], e.q[1] - e.p[1]) * s > fs * 0.9) {
-        if (e.tab) { const m = e.labelAt || [(e.tab[1][0] + e.tab[2][0] + e.p[0] + e.q[0]) / 4, (e.tab[1][1] + e.tab[2][1] + e.p[1] + e.q[1]) / 4], [X, Y] = T(m); c.font = `800 ${fs}px ${FONT}`; c.fillStyle = C.ink; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(String(e.n), X, Y); }
-        else { const [X, Y] = T(e.mid), t = (e.tape ? 'T' : '') + e.n; c.font = `800 ${fs * 0.85}px ${FONT}`; const r = Math.max(fs * 0.62, c.measureText(t).width / 2 + 4); c.beginPath(); c.arc(X, Y, r, 0, 6.3); c.fillStyle = C.red; c.fill(); c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(t, X, Y + 1); }
+        if (e.tab) { const m = e.labelAt || [(e.tab[1][0] + e.tab[2][0] + e.p[0] + e.q[0]) / 4, (e.tab[1][1] + e.tab[2][1] + e.p[1] + e.q[1]) / 4], [X, Y] = T(m); c.font = `800 ${fs}px ${FONT}`; c.fillStyle = C.ink; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('→' + e.mate, X, Y); }
+        else { const [X, Y] = T(e.mid), t = (e.tape ? 'T ' : '') + e.name; c.font = `800 ${fs * 0.85}px ${FONT}`; const r = Math.max(fs * 0.62, c.measureText(t).width / 2 + 4); c.beginPath(); c.arc(X, Y, r, 0, 6.3); c.fillStyle = C.red; c.fill(); c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(t, X, Y + 1); }
       }
       if (S.faceLabels && s * 3 > 7) for (const P0 of p.patches || []) if (p.w * s > 60) { const [X, Y] = T(P0.c); c.font = `700 ${Math.max(11, s * 3.4)}px ${FONT}`; c.fillStyle = 'rgba(11,11,11,0.55)'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(P0.label, X, Y + (P0.patch === (p.patches[0] || {}).patch ? fs * 1.1 : 0)); }
       const [X, Y] = T(p.c); c.font = `900 ${clamp(s * 6, 12, 30)}px ${FONT}`; c.fillStyle = C.ink; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(p.name, X, Y);
@@ -3406,8 +3426,8 @@ function sheetSVG(L) {
         g.push(`<line x1="${X(e.p)}" y1="${Y(e.p)}" x2="${X(e.q)}" y2="${Y(e.q)}" stroke="${fold ? '#1E5BFF' : '#000'}" stroke-width="0.3"${fold ? ' stroke-dasharray="2 1.5"' : ''}/>`);
       }
       for (const e of p.edges) if (e.n && e.show) {
-        if (e.tab) { const m = e.labelAt || [(e.tab[1][0] + e.tab[2][0] + e.p[0] + e.q[0]) / 4, (e.tab[1][1] + e.tab[2][1] + e.p[1] + e.q[1]) / 4]; g.push(`<text x="${X(m)}" y="${f2(m[1] + p.y + 1.1)}" font-size="3.2" text-anchor="middle" font-family="Arial" font-weight="bold" fill="#000">${e.n}</text>`); }
-        else { const t = (e.tape ? 'T' : '') + e.n; g.push(`<circle cx="${X(e.mid)}" cy="${Y(e.mid)}" r="${t.length > 2 ? 2.6 : 2.1}" fill="#E8212B"/><text x="${X(e.mid)}" y="${f2(e.mid[1] + p.y + 0.95)}" font-size="2.7" text-anchor="middle" font-family="Arial" font-weight="bold" fill="#fff">${t}</text>`); }
+        if (e.tab) { const m = e.labelAt || [(e.tab[1][0] + e.tab[2][0] + e.p[0] + e.q[0]) / 4, (e.tab[1][1] + e.tab[2][1] + e.p[1] + e.q[1]) / 4]; g.push(`<text x="${X(m)}" y="${f2(m[1] + p.y + 1.1)}" font-size="3.2" text-anchor="middle" font-family="Arial" font-weight="bold" fill="#000">→${e.mate}</text>`); }
+        else { const t = (e.tape ? 'T ' : '') + e.name; g.push(`<circle cx="${X(e.mid)}" cy="${Y(e.mid)}" r="${t.length > 2 ? 2.6 : 2.1}" fill="#E8212B"/><text x="${X(e.mid)}" y="${f2(e.mid[1] + p.y + 0.95)}" font-size="2.7" text-anchor="middle" font-family="Arial" font-weight="bold" fill="#fff">${t}</text>`); }
       }
       if (S.faceLabels) for (const P0 of p.patches) g.push(`<text x="${X(P0.c)}" y="${f2(P0.c[1] + p.y + 1.2 + (P0.patch === p.patches[0].patch ? 4 : 0))}" font-size="3.4" text-anchor="middle" font-family="Arial" fill="#0b0b0b" fill-opacity="0.55">${P0.label}</text>`);
       g.push(`<text x="${X(p.c)}" y="${f2(p.c[1] + p.y + 2)}" font-size="6" text-anchor="middle" font-family="Arial" font-weight="bold">${p.name}</text>`);
@@ -3538,7 +3558,7 @@ const PAGES = {
       { label: 'Fold this step', on: () => { setTimeline(asm.step); foldA.play = asm.step + 0.999; } }], 62, 12, 200);
     L.help('Drag the timeline to fold the paper up and back. Faces already built are folded, this step’s faces (yellow) fold into place with their grey glue tabs, and faces still to come hang flat. Face labels and tab numbers match the Prefab sheets.');
     L.group('All steps');
-    L.buttons(asm.steps.map((st, k) => ({ label: `${k + 1}. ${asm.nets[st.ni].name}` + (st.glue.length ? ' · glue ' + st.glue.slice(0, 3).join(',') + (st.glue.length > 3 ? '…' : '') : st.first ? ' · cut' : ''), active: () => asm.step === k, on: () => asmGo(k) })), 60, 10, 200);
+    L.buttons(asm.steps.map((st, k) => ({ label: `${k + 1}. ${asm.nets[st.ni].name}` + (st.glue.length ? ' · ' + st.glue.slice(0, 2).map(seamName).join(', ') + (st.glue.length > 2 ? '…' : '') : st.first ? ' · cut' : ''), active: () => asm.step === k, on: () => asmGo(k) })), 60, 10, 200);
   },
   test(L) {
     const r = stability();
