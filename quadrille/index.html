@@ -284,10 +284,19 @@ function curveFromPts(P, W, h) {
 
 // merge an open curve `add_` onto `base` (open or closed).
 // returns null | {type:'merge'|'trimNew'|'trimBase', curve}
-function mergeOnto(base, add_, tol, h) {
+function mergeOnto(base, add_, tol, h, mt = tol) {
   const minOv = minOverlap(tol, h);
   let run = findRun(add_, base.ring.P, base.ring.cum, tol);
   if (!run || run.len < minOv) return null;
+  if (mt < tol) {
+    // Pieces of one line overlap at their tails (one carries on from the other): those join at the join distance.
+    // Two strokes running alongside each other through their middles are two separate lines unless they are within mt.
+    const n = add_.pts.length, L = base.ring.cum[base.ring.cum.length - 1], near = Math.max(3 * h, 0.12 * L);
+    const addStart = run.j0 <= 2, addEnd = run.j1 >= n - 3, lo = Math.min(run.s0, run.s1), hi = Math.max(run.s0, run.s1);
+    const baseEnd = !base.closed && (lo < near || hi > L - near);
+    const tail = baseEnd && addStart !== addEnd;
+    if (!tail) { run = findRun(add_, base.ring.P, base.ring.cum, mt); if (!run || run.len < minOverlap(mt, h)) return null; }
+  }
   let A = base.pts, AW = base.w;
   if (base.closed) {
     // re-cut the ring so its seam is opposite the overlap
@@ -384,22 +393,24 @@ function blendRings(A, B, tol, h) {
   return { type: 'merge', curve: makeClosed(P, W, h) };
 }
 
-function mergePair(A, B, tol, h) {
-  if (A.closed && B.closed) return blendRings(A, B, tol, h);
+function mergePair(A, B, tol, h, mt = tol) {
+  if (A.closed && B.closed) return blendRings(A, B, mt, h);
   if (B.closed) {
-    const r = mergeOnto(B, A, tol, h);
+    const r = mergeOnto(B, A, tol, h, mt);
     if (!r) return null;
     if (r.type === 'trimNew') return { type: 'trimA', curve: r.curve };
     return { type: 'merge', curve: r.curve };
   }
-  const r = mergeOnto(A, B, tol, h);
+  const r = mergeOnto(A, B, tol, h, mt);
   if (!r) return null;
   if (r.type === 'trimNew') return { type: 'trimB', curve: r.curve };
   if (r.type === 'trimBase') return { type: 'trimA', curve: r.curve };
   return r;
 }
 
-function buildCurves(strokes, tol, creaseFlags) {
+function buildCurves(strokes, tol, creaseFlags, mergeTol) {
+  // tol: join distance (closing loops, linking ends). mt: how close two strokes running side by side must be to count as one line
+  const mt = Math.min(tol, mergeTol > 0 ? mergeTol : tol);
   // creaseFlags[i]: stroke i is a sharp crease; a blended curve is a crease if any stroke in it is
   const h = strokeSpacing(tol);
   TW = Math.max(2, Math.round(0.028 / h));
@@ -429,7 +440,7 @@ function buildCurves(strokes, tol, creaseFlags) {
       let acted = false;
       for (const [cid] of cand) {
         const A = curves[cid];
-        const res = mergePair(A, B, tol, h);
+        const res = mergePair(A, B, tol, h, mt);
         if (!res) { skip.add(cid); continue; }
         if (res.type === 'merge') { A.alive = false; res.curve.cr = A.cr || B.cr; B = res.curve; }
         else if (res.type === 'trimB') { if (res.curve) res.curve.cr = B.cr; B = res.curve; skip.add(cid); }
@@ -1112,7 +1123,8 @@ function buildAll(strokes, params) {
   const poles = [], softs = [];   // bit 2: a pole sphere, bit 3: a smooth-surface spot; both stored as a centre and a point on the rim
   strokes.forEach((st, i) => { const k = kinds[i] | 0; if (k & 8) { if (st.length >= 2) softs.push({ c: st[0], r: dist(st[0], st[1]) }); } else if (k & 4) { if (st.length >= 2) poles.push({ c: st[0], r: dist(st[0], st[1]) }); } else if (k & 1) gs.push(st); else { topo.push(st); cr.push(!!(k & 2)); } });
   const hT = strokeSpacing(tol), tidy = (list) => (params.tidy > 0 ? list.map((c) => tidyCurve(c, params.tidy, hT)) : list);
-  let curves = applyPoles(tidy(buildCurves(topo, tol, null)), poles, hT);
+  const mergeTol = params.mergeTol > 0 ? params.mergeTol : tol;
+  let curves = applyPoles(tidy(buildCurves(topo, tol, null, mergeTol)), poles, hT);
   const creaseTest = creaseMarker(topo.filter((_, i) => cr[i]), tol);
   // loose guides stay exactly where they were drawn: evenly spaced points, no blending, tidying or closing up
   const gcurves = gs.map((st) => { const P = st.filter((p, i) => i === 0 || dist(p, st[i - 1]) > 1e-6); return P.length < 2 ? null : finalize(Object.assign(resampleOpen(P, null, hT), { closed: false })); }).filter(Boolean);
@@ -1158,7 +1170,7 @@ function suggestTol(strokes, params = {}) {
   const lo = Math.max(params.min || 0.003, 0.005), hi = Math.min(params.max || 0.15, 0.12), N = 14, res = [];
   for (let k = 0; k < N; k++) {
     const tol = lo * Math.pow(hi / lo, k / (N - 1)), hT = strokeSpacing(tol);
-    let curves = buildCurves(topo, tol, null); if (params.tidy > 0) curves = curves.map((c) => tidyCurve(c, params.tidy, hT));
+    let curves = buildCurves(topo, tol, null, params.mergeTol); if (params.tidy > 0) curves = curves.map((c) => tidyCurve(c, params.tidy, hT));
     const fills = buildNetwork(curves, tol, {}).faces.filter((f) => f.fill), flagged = fills.filter((f) => f.flagged).length;
     res.push({ tol, score: fills.length - 2 * flagged });
   }
@@ -1356,6 +1368,7 @@ const state = {
   lastTool: 'erase',         // what A swaps with Draw
   line: 'topo',              // what Draw makes: 'topo' (red, becomes edge loops) or 'guide' (gray, loose surface hint)
   tidy: 0.3,                 // how hard squiggles are ironed out of the clean curves (0..1)
+  mergeTol: 0.015,           // two red strokes running alongside each other count as one line only when closer than this
   size: { erase: 0.025, loosen: 0.03, crease: 0.02, heal: 0.07, smooth: 0.05, iron: 0.1, bend: 0.12, pole: 0.05, soft: 0.06 },   // brush size per tool, metres in your hand space (right stick)
   tol: 0.04, autoLoops: 0, smooth: 2, fit: 1,   // fit: how far the smooth surface is pulled onto the drawn curves
   exMess: 1,                                    // how sloppy the built-in examples are drawn (0..1.5)
@@ -1436,7 +1449,7 @@ const Engine = (() => {
 })();
 function requestBuild(li = state.active) {
   const S = state.layers[li].strokes;
-  Engine.request(li, S, { tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, tidy: state.tidy, patch: false, kinds: Array.from(S, (f) => f.k | 0) });
+  Engine.request(li, S, { tol: state.tol, mergeTol: state.mergeTol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, tidy: state.tidy, patch: false, kinds: Array.from(S, (f) => f.k | 0) });
 }
 
 // =====================================================================
@@ -1637,7 +1650,7 @@ function setTool(t) { if (t !== 'draw' && t !== 'look') state.lastTool = t; cons
 let autoBusy = false;
 async function autoTol() {
   const S = state.strokes; if (autoBusy || !S.length) return; autoBusy = true; ui.dirty = true; toast('Trying join distances...');
-  const tol = await Engine.auto(S, { tidy: state.tidy, kinds: Array.from(S, (f) => f.k | 0), min: TOL_MIN, max: TOL_MAX }); autoBusy = false;
+  const tol = await Engine.auto(S, { tidy: state.tidy, mergeTol: state.mergeTol, kinds: Array.from(S, (f) => f.k | 0), min: TOL_MIN, max: TOL_MAX }); autoBusy = false;
   if (tol > 0) { setTol(tol); toast('Join distance ' + (tol * 100).toFixed(1) + ' cm reads the most clean quads'); } else toast('Could not find a better join distance');
 }
 function togglePole(p, r) {
@@ -1945,7 +1958,7 @@ function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 
 function save() {
   try {
     localStorage.setItem('quadrille.v1', JSON.stringify({ v: 4, sv: sync.sv, pv: sync.pv, tidy: state.tidy, size: state.size, show: state.show, tol: state.tol, autoLoops: state.autoLoops, smooth: state.smooth, fit: state.fit, exMess: state.exMess,
-      active: state.active, ghost: state.ghost, line: state.line, surfOp: state.surfOp,
+      active: state.active, ghost: state.ghost, line: state.line, surfOp: state.surfOp, mergeTol: state.mergeTol,
       layers: state.layers.map((l) => ({ vis: l.vis, k: l.strokes.map((s) => s.k | 0), s: l.strokes.map((s) => Array.from(s, (v) => Math.round(v * 10000))) })) }));
   } catch (e) { /* storage is a convenience only */ }
 }
@@ -1957,7 +1970,7 @@ function load() {
     if (Array.isArray(d.layers)) d.layers.slice(0, NL).forEach((l, i) => { state.layers[i].strokes = (l.s || []).map((a, j) => un(a, (l.k || [])[j])); state.layers[i].vis = l.vis !== false; });
     else state.layers[0].strokes = d.strokes.map((a) => un(a, 0));
     if (d.active >= 0) state.active = clamp(d.active | 0, 0, NL - 1);
-    state.ghost = d.ghost !== false; if (d.line === 'guide') state.line = 'guide'; if (d.surfOp >= 0) state.surfOp = clamp(+d.surfOp, 0, 1);
+    state.ghost = d.ghost !== false; if (d.line === 'guide') state.line = 'guide'; if (d.surfOp >= 0) state.surfOp = clamp(+d.surfOp, 0, 1); if (d.mergeTol > 0) state.mergeTol = clamp(+d.mergeTol, 0.003, 0.08);
     if (d.tol > 0) state.tol = clamp(d.tol, TOL_MIN, TOL_MAX);
     if (d.autoLoops >= 0) state.autoLoops = clamp(d.autoLoops | 0, 0, 6);
     if (d.smooth >= 0) state.smooth = clamp(d.smooth | 0, 0, 3);
@@ -2122,11 +2135,12 @@ function layoutUI() {
     row(414, 66, [['Undo', { icon: 'undo', on: undo, disabled: () => !undoS().length }], ['Redo', { icon: 'redo', on: redo, disabled: () => !redoS().length }], ['Clear layer', { kind: 'danger', on: clearAll }]]);
     W.push({ type: 'status', x: x0, y: 490, w: cw, h: 100 });
   } else if (ui.tab === 1) {
-    tolRow(6, 92);
-    sld(102, 'Auto loops between curves', { h: 92, steps: 6, get: () => state.autoLoops / 6, set: (t) => setParam('autoLoops', Math.round(t * 6)), fmt: () => String(state.autoLoops) });
-    sld(198, 'Smooth level', { h: 92, steps: 3, get: () => state.smooth / 3, set: (t) => setParam('smooth', Math.round(t * 3)), fmt: () => String(state.smooth) });
-    sld(294, 'Fit to curves', { h: 92, steps: 10, get: () => state.fit, set: (t) => setParam('fit', Math.round(t * 10) / 10), fmt: () => Math.round(state.fit * 100) + '%' });
-    sld(390, 'Tidy squiggles', { h: 92, steps: 10, get: () => state.tidy, set: (t) => setParam('tidy', Math.round(t * 10) / 10), fmt: () => String(Math.round(state.tidy * 10)) });
+    tolRow(4, 82);
+    sld(84, 'Same line within', { h: 80, get: () => Math.log(state.mergeTol / 0.003) / Math.log(0.08 / 0.003), set: (t) => setParam('mergeTol', Math.round(0.003 * Math.pow(0.08 / 0.003, t) * 1000) / 1000), fmt: () => (state.mergeTol * 100).toFixed(1) + ' cm' });
+    sld(164, 'Auto loops between curves', { h: 80, steps: 6, get: () => state.autoLoops / 6, set: (t) => setParam('autoLoops', Math.round(t * 6)), fmt: () => String(state.autoLoops) });
+    sld(244, 'Smooth level', { h: 80, steps: 3, get: () => state.smooth / 3, set: (t) => setParam('smooth', Math.round(t * 3)), fmt: () => String(state.smooth) });
+    sld(324, 'Fit to curves', { h: 80, steps: 10, get: () => state.fit, set: (t) => setParam('fit', Math.round(t * 10) / 10), fmt: () => Math.round(state.fit * 100) + '%' });
+    sld(404, 'Tidy squiggles', { h: 80, steps: 10, get: () => state.tidy, set: (t) => setParam('tidy', Math.round(t * 10) / 10), fmt: () => String(Math.round(state.tidy * 10)) });
     W.push({ type: 'status', x: x0, y: 490, w: cw, h: 100 });
   } else if (ui.tab === 2) {
     const tg = (k, label) => [label, { kind: 'toggle', on: () => { state.show[k] = !state.show[k]; paramsTouched(); applyShow(); refreshTags(); scheduleSave(); ui.dirty = true; }, active: () => state.show[k] }];
@@ -2935,16 +2949,16 @@ const Net = (() => {
     setLive(spect.live);
   }
   function applyParams(q) {
-    const P = q.P; if (!okPose(P, 9)) return;
+    const P = q.P; if (!okPose(P, 10)) return;
     state.tol = clamp(P[0], TOL_MIN, TOL_MAX); state.autoLoops = clamp(P[1] | 0, 0, 6); state.smooth = clamp(P[2] | 0, 0, 3); state.fit = clamp(P[3], 0, 1); state.tidy = clamp(P[4], 0, 1);
-    const b = P[5] | 0; state.show.sketch = !!(b & 1); state.show.curves = !!(b & 2); state.show.surface = !!(b & 4); state.show.wire = !!(b & 8); state.show.labels = !!(b & 16); state.show.board = !!(b & 32); state.surfOp = clamp(P[8], 0, 1);
+    const b = P[5] | 0; state.show.sketch = !!(b & 1); state.show.curves = !!(b & 2); state.show.surface = !!(b & 4); state.show.wire = !!(b & 8); state.show.labels = !!(b & 16); state.show.board = !!(b & 32); state.surfOp = clamp(P[8], 0, 1); state.mergeTol = clamp(P[9], 0.003, 0.08);
     const lb = P[7] | 0; state.layers.forEach((l, i) => { l.vis = !!(lb & (1 << i)); }); state.ghost = !!(lb & 16);
     const act = clamp(P[6] | 0, 0, NL - 1); if (act !== state.active) setActiveLayer(act, true);
     sync.pv = q.pv; applyShow(); refreshTags(); requestBuild(); scheduleSave(); ui.dirty = true;
   }
   function myPresence() {
     const b = (state.show.sketch ? 1 : 0) | (state.show.curves ? 2 : 0) | (state.show.surface ? 4 : 0) | (state.show.wire ? 8 : 0) | (state.show.labels ? 16 : 0) | (state.show.board ? 32 : 0);
-    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b, state.active, state.layers.reduce((a, l, i) => a | (l.vis ? 1 << i : 0), 0) | (state.ghost ? 16 : 0), r4(state.surfOp)], c: null, h: null, w: null, L: null, R: null, u: null };
+    const p = { v: 1, r: isPresenter() ? 'xr' : 'flat', sv: sync.sv, pv: sync.pv, P: [r4(state.tol), state.autoLoops, state.smooth, r4(state.fit), r4(state.tidy), b, state.active, state.layers.reduce((a, l, i) => a | (l.vis ? 1 << i : 0), 0) | (state.ghost ? 16 : 0), r4(state.surfOp), r4(state.mergeTol)], c: null, h: null, w: null, L: null, R: null, u: null };
     if (isPresenter()) {
       const hand = (H, key) => { if (!H) return null; const G = models[key].userData.gripHolder;
         return pose7(H.obj).concat([(H.pad.trigger > 0.45 ? 1 : 0) | (H.pad.grip > 0.5 ? 2 : 0) | (H.pad.a ? 4 : 0) | (H.pad.b ? 8 : 0) | (Math.abs(H.pad.stickY || 0) > 0.5 ? 16 : 0),
