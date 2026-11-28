@@ -3257,17 +3257,44 @@ function layoutSheets() {
     parts.push({ name: net.name, edges: edges.filter((e) => !e.smooth).map((e) => ({ ...e, p: sh(e.p), q: sh(e.q), mid: sh(e.mid), tab: e.tab && e.tab.map(sh), labelAt: e.labelAt && sh(e.labelAt) })), fills: fills.map((f) => ({ ...f, tris: f.tris.map((t) => t.map(sh)) })),
       patches: [...pats.values()].map((P0) => { const tris = P0.tris.map((t) => t.map(sh)); return { fi: P0.fi, patch: P0.patch, label: P0.label, tris, c: cOf(tris) }; }), w, h, c: sh(big.length ? bc : [cen[0] / cen[2], cen[1] / cen[2]]) });
   }
-  // shelf packing onto sheets, tallest first (no paper: one drawing, about square)
-  if (noPaper) { const area = parts.reduce((a, q) => a + (q.w + GAP) * (q.h + GAP), 0), A = Math.max(clamp(sheetAspect, 0.3, 4), 1 / clamp(sheetAspect, 0.3, 4)); PW0 = Math.max(Math.sqrt(area * A) * 1.2, ...parts.map((q) => q.w), 50) + 2 * M; }   // packed long, then turned to fit the window
-  const sheets = [], big = []; let cur = null, x = M, y = M, rowH = 0;
-  for (const p of parts.slice().sort((a, b) => b.h - a.h)) {
-    if (p.w > PW0 - 2 * M + 0.01 || p.h > PH0 - 2 * M + 0.01) { big.push(p.name); continue; }
-    if (!cur) { cur = { parts: [] }; sheets.push(cur); x = M; y = M; rowH = 0; }
-    if (x + p.w > PW0 - M) { x = M; y += rowH + GAP; rowH = 0; }
-    if (y + p.h > PH0 - M) { cur = { parts: [] }; sheets.push(cur); x = M; y = M; rowH = 0; }
-    cur.parts.push({ ...p, x, y }); x += p.w + GAP; rowH = Math.max(rowH, p.h);
+  // nesting: biggest part first, each tried in four quarter turns, dropped into the lowest, then leftmost, spot where it
+  // doesn't touch another part (checked on a 3 mm grid of the actual paper shapes, tabs included, 6 mm apart)
+  if (noPaper) { const area = parts.reduce((a, q) => a + (q.w + GAP) * (q.h + GAP), 0), A = Math.max(clamp(sheetAspect, 0.3, 4), 1 / clamp(sheetAspect, 0.3, 4)); PW0 = Math.max(Math.sqrt(area * A) * 1.1, ...parts.map((q) => Math.min(q.w, q.h)), 50) + 2 * M; }
+  const CELL = 3, DIL = 2, uw = PW0 - 2 * M, uh = noPaper ? parts.reduce((a, q) => a + Math.max(q.w, q.h) + GAP, 0) + 10 : PH0 - 2 * M, gw = Math.floor(uw / CELL), gh = Math.floor(uh / CELL);
+  const turn = (pt, k, w, h) => (k === 1 ? [h - pt[1], pt[0]] : k === 2 ? [w - pt[0], h - pt[1]] : k === 3 ? [pt[1], w - pt[0]] : pt);
+  const rotPart = (P0, k) => { if (!k) return P0; const T = (pt) => turn(pt, k, P0.w, P0.h), TT = (ts) => ts.map((t) => t.map(T));
+    return { ...P0, w: k % 2 ? P0.h : P0.w, h: k % 2 ? P0.w : P0.h, c: T(P0.c), edges: P0.edges.map((e) => ({ ...e, p: T(e.p), q: T(e.q), mid: T(e.mid), tab: e.tab && e.tab.map(T), labelAt: e.labelAt && T(e.labelAt) })),
+      fills: P0.fills.map((f) => ({ ...f, tris: TT(f.tris) })), patches: (P0.patches || []).map((q) => ({ ...q, tris: TT(q.tris), c: T(q.c) })) }; };
+  const inPoly = (x, y, P) => { let ins = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) if ((P[i][1] > y) !== (P[j][1] > y) && x < ((P[j][0] - P[i][0]) * (y - P[i][1])) / (P[j][1] - P[i][1]) + P[i][0]) ins = !ins; return ins; };
+  const maskOf = (P0) => {   // the cells the part covers, grown by the gap
+    const mw = Math.ceil(P0.w / CELL) + 1, mh = Math.ceil(P0.h / CELL) + 1, m = new Uint8Array(mw * mh);
+    const polys = P0.fills.flatMap((f) => f.tris).concat(P0.edges.filter((e) => e.tab).map((e) => e.tab));
+    for (const poly of polys) { let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity; for (const q of poly) { x0 = Math.min(x0, q[0]); y0 = Math.min(y0, q[1]); x1 = Math.max(x1, q[0]); y1 = Math.max(y1, q[1]); }
+      for (let cy = Math.max(0, Math.floor(y0 / CELL)); cy <= Math.min(mh - 1, Math.floor(y1 / CELL)); cy++) for (let cx = Math.max(0, Math.floor(x0 / CELL)); cx <= Math.min(mw - 1, Math.floor(x1 / CELL)); cx++) {
+        if (m[cy * mw + cx]) continue; const px = (cx + 0.5) * CELL, py = (cy + 0.5) * CELL;
+        if (inPoly(px, py, poly) || poly.some((q) => Math.floor(q[0] / CELL) === cx && Math.floor(q[1] / CELL) === cy)) m[cy * mw + cx] = 1; } }
+    const cells = []; for (let y = -DIL; y < mh + DIL; y++) for (let x = -DIL; x < mw + DIL; x++) { let on = false; for (let dy = -DIL; dy <= DIL && !on; dy++) for (let dx = -DIL; dx <= DIL && !on; dx++) { const X = x + dx, Y = y + dy; if (X >= 0 && Y >= 0 && X < mw && Y < mh && m[Y * mw + X]) on = true; } if (on) cells.push(x, y); }
+    return { cells, mw, mh, solid: cells.filter((_, i) => i % 2 === 0).length };
+  };
+  const fitsAt = (G, mk, x, y) => { const c = mk.cells; for (let i = 0; i < c.length; i += 2) { const X = x + c[i], Y = y + c[i + 1]; if (X < 0 || Y < 0 || X >= gw || Y >= gh) { if (X >= -DIL && Y >= -DIL && X < gw + DIL && Y < gh + DIL) continue; return false; } if (G[Y * gw + X]) return false; } return true; };
+  const place = (G, mk) => { for (let y = 0; y + mk.mh - 1 <= gh; y++) for (let x = 0; x + mk.mw - 1 <= gw; x++) if (fitsAt(G, mk, x, y)) return [x, y]; return null; };
+  const stamp = (G, mk, x, y) => { const c = mk.cells; for (let i = 0; i < c.length; i += 2) { const X = x + c[i], Y = y + c[i + 1]; if (X >= 0 && Y >= 0 && X < gw && Y < gh) G[Y * gw + X] = 1; } };
+  const sheets = [], big = [], grids = [];
+  for (const P0 of parts.slice().sort((a, b) => b.w * b.h - a.w * a.h)) {
+    const opts = [0, 1, 2, 3].map((k) => { const R2 = rotPart(P0, k); return { k, R2, mk: maskOf(R2) }; }).filter((o) => o.R2.w <= uw + 0.01 && o.R2.h <= uh + 0.01);
+    if (!opts.length) { big.push(P0.name); continue; }
+    let best = null;
+    for (let si = 0; si <= grids.length && !best; si++) {
+      if (si === grids.length) { grids.push(new Uint8Array(gw * gh)); sheets.push({ parts: [] }); }
+      for (const o of opts) { const at = place(grids[si], o.mk); if (at && (!best || at[1] * 1e4 + at[0] < best.at[1] * 1e4 + best.at[0])) best = { si, at, o }; }
+      if (!best && sheets[si].parts.length === 0) break;   // doesn't fit even an empty sheet
+    }
+    if (!best) { big.push(P0.name); if (sheets.length && !sheets[sheets.length - 1].parts.length) { sheets.pop(); grids.pop(); } continue; }
+    stamp(grids[best.si], best.o.mk, best.at[0], best.at[1]);
+    sheets[best.si].parts.push({ ...best.o.R2, x: M + best.at[0] * CELL, y: M + best.at[1] * CELL });
   }
-  if (noPaper) PH0 = Math.max(50, y + rowH + M);
+  if (sheets.length && !sheets[sheets.length - 1].parts.length) sheets.pop();
+  if (noPaper) PH0 = Math.max(50, ...sheets.flatMap((sh) => sh.parts.map((q) => q.y + q.h)), 0) + M;
   return { sheets, big, W: PW0, H: PH0, parts: parts.length, noPaper };
 }
 const lightCol = (hex) => '#' + new THREE.Color(hex).lerp(new THREE.Color('#ffffff'), 0.55).getHexString();   // printed colours, light enough to read the lines
@@ -3778,7 +3805,7 @@ renderer.setAnimationLoop((t) => {
   renderPhonePreview(); renderAll();
 });
 // handle for tests and tinkering
-window.KIT = { liveEditing, headMark, seamHi, ui, popOutXR, skNear, skFaces, asmAnim, asmGroup, setPhase, get curPhase() { return curPhase; }, seamOn, asmLabels, paperFaceAt, pickPaper, skSplitStroke, ensureSettings, findMenuArea, get layout() { return layout; }, dockSettings, renderAll, stability, seamMark, seamNear, seamPick, triOverlap, asm, asmBuild, prefabSheets, asmGo, stepText, sheetSVG_: () => sheetSVG(prefabSheets()), skAddLine, skProblems, exportAll, exportModel, goPage, exportGroup, makeZip, modelData, findArea, draw, SKF_: () => SKF, get SKF() { return SKF; }, get SKX() { return SKX; }, setSel, get sel() { return sel; }, gum, asm, prefabSheets, sheetSVG, KEYS, debugAsk: (f) => { askIn = { from: f, until: performance.now() + 20000 }; dirtyAll(); }, mayCarry, grants, netLog, setPeers: (l) => { debugPeers = l; }, applyLayout, recs, openChooser, setAreaType, splitArea, closeArea, getLayout: () => layout, startPlacing, applyPlaced, avatars, xrPlayers, hostPid, host, popOutXR, ME, drawWin, visibleWins, scene, models, hands, lastXR, THREE, S, set, scn, wins, menuWin, uiPointer, setScroll, closePop, xrFrame, xs, models, world, camera, renderer, solveCamera, applyCalibration, calib, Net, PAGES, SETTINGS, undo, redo, placeAt, layoutDOM, setDebugXR: (v) => { inXR = !!v; layoutDOM(); dirtyAll(); }, setSpect: (p) => { debugSpect = spect = p; layoutDOM(); onResize(); }, setMR, toast };
+window.KIT = { asmFrame, skGroup, liveEditing, headMark, seamHi, ui, popOutXR, skNear, skFaces, asmAnim, asmGroup, setPhase, get curPhase() { return curPhase; }, seamOn, asmLabels, paperFaceAt, pickPaper, skSplitStroke, ensureSettings, findMenuArea, get layout() { return layout; }, dockSettings, renderAll, stability, seamMark, seamNear, seamPick, triOverlap, asm, asmBuild, prefabSheets, asmGo, stepText, sheetSVG_: () => sheetSVG(prefabSheets()), skAddLine, skProblems, exportAll, exportModel, goPage, exportGroup, makeZip, modelData, findArea, draw, SKF_: () => SKF, get SKF() { return SKF; }, get SKX() { return SKX; }, setSel, get sel() { return sel; }, gum, asm, prefabSheets, sheetSVG, KEYS, debugAsk: (f) => { askIn = { from: f, until: performance.now() + 20000 }; dirtyAll(); }, mayCarry, grants, netLog, setPeers: (l) => { debugPeers = l; }, applyLayout, recs, openChooser, setAreaType, splitArea, closeArea, getLayout: () => layout, startPlacing, applyPlaced, avatars, xrPlayers, hostPid, host, popOutXR, ME, drawWin, visibleWins, scene, models, hands, lastXR, THREE, S, set, scn, wins, menuWin, uiPointer, setScroll, closePop, xrFrame, xs, models, world, camera, renderer, solveCamera, applyCalibration, calib, Net, PAGES, SETTINGS, undo, redo, placeAt, layoutDOM, setDebugXR: (v) => { inXR = !!v; layoutDOM(); dirtyAll(); }, setSpect: (p) => { debugSpect = spect = p; layoutDOM(); onResize(); }, setMR, toast };
 </script>
 <script src="../updated.js"></script>
 </body>
