@@ -2179,16 +2179,19 @@ const headMark = (() => {
   g.visible = false; scene.add(g); return g;
 })();
 const tipProxy = tip.clone(); tipProxy.material = tip.material.clone(); scene.add(tipProxy);
+const spectRoom = new THREE.Group(); spectRoom.matrixAutoUpdate = false; scene.add(spectRoom); spectRoom.add(headMark, proxies.left, proxies.right, tipProxy);
 function setPose(obj, a, k) { tA.set(a[0], a[1], a[2]); q1.set(a[3], a[4], a[5], a[6]).normalize(); if (k >= 1) { obj.position.copy(tA); obj.quaternion.copy(q1); } else { obj.position.lerp(tA, k); obj.quaternion.slerp(q1, k); } }
 function spectFrame(dt) {
+  if (!inXR && (world.position.lengthSq() || world.scale.x !== 1 || world.quaternion.w !== 1)) { world.position.set(0, 0, 0); world.quaternion.identity(); world.scale.setScalar(1); }   // screens: the model never moves with a headset
+  if (inXR && !spectRoom.matrix.equals(new THREE.Matrix4())) { spectRoom.matrix.identity(); spectRoom.matrixWorldNeedsUpdate = true; }
   const on = !!spect; headMark.visible = on && okArr(spect && spect.h, 7); tipProxy.visible = false;
   for (const h of ['left', 'right']) proxies[h].visible = false;
   if (!on) return;
   const k = Math.min(1, dt * 18);
-  if (okArr(spect.w, 8)) { tA.set(spect.w[0], spect.w[1], spect.w[2]); q1.set(spect.w[3], spect.w[4], spect.w[5], spect.w[6]).normalize(); world.position.lerp(tA, k); world.quaternion.slerp(q1, k); world.scale.setScalar(THREE.MathUtils.lerp(world.scale.x, clamp(spect.w[7], 0.001, 1000), k)); }
+  if (okArr(spect.w, 8)) { spectRoom.matrix.copy(worldM(spect.w)).invert(); spectRoom.matrixWorldNeedsUpdate = true; }
   if (headMark.visible) setPose(headMark, spect.h, k);
   for (const [h, key] of [['left', 'L'], ['right', 'R']]) if (okArr(spect[key], 7)) { proxies[h].visible = true; setPose(proxies[h], spect[key], k); if (okArr(spect[key + 'g'], 7) && proxies[h].userData.gripHolder) setPose(proxies[h].userData.gripHolder, spect[key + 'g'], 1); paintButtons(proxies[h], { tool: spect.tool, last: spect.last, shape: spect.shape, placing: !!spect.placing }); }
-  if (proxies.right.visible) { proxies.right.updateMatrixWorld(true); tipProxy.position.copy(TIP_LOCAL).applyMatrix4(proxies.right.matrixWorld); tipProxy.scale.setScalar((+spect.size || 12) / 100); tipProxy.material.color.set(spect.tool === 'place' || spect.tool === 'paint' ? spect.col : (TOOLINFO[spect.tool] || TOOLINFO.place).col); tipProxy.visible = true; }
+  if (proxies.right.visible) { proxies.right.updateMatrix(); tipProxy.position.copy(TIP_LOCAL).applyMatrix4(proxies.right.matrix); tipProxy.scale.setScalar((+spect.size || 12) / 100); tipProxy.material.color.set(spect.tool === 'place' || spect.tool === 'paint' ? spect.col : (TOOLINFO[spect.tool] || TOOLINFO.place).col); tipProxy.visible = true; }
 }
 // where phones are, drawn in the headset as a camera outline
 const frusta = [];
@@ -2208,7 +2211,7 @@ function shapeFrustum(g, fov, aspect) {
 function frustaFrame() {
   const list = inXR && S.showPhones ? flats.filter((f) => okArr(f.c, 9)) : [];
   while (frusta.length < list.length) frusta.push(frustumMesh());
-  frusta.forEach((g, i) => { const f = list[i]; g.visible = !!f; if (f) { setPose(g, f.c, 1); shapeFrustum(g, f.c[7], f.c[8]); } });
+  frusta.forEach((g, i) => { const f = list[i]; g.visible = !!f; if (f) { setPose(g, f.c, 1); if (!f.cal) { world.updateMatrixWorld(true); g.updateMatrix(); g.matrix.premultiply(world.matrixWorld).decompose(g.position, g.quaternion, g.scale); g.scale.set(1, 1, 1); } shapeFrustum(g, f.c[7], f.c[8]); } });
   for (const [pid, g] of phoneModels) { if (xs.place && xs.place.pid === pid) continue; const f = inXR && S.showPhones ? flats.find((q) => q.pid === pid) : null; g.visible = !!(f && okArr(f.ph, 7)); if (g.visible) setPose(g, f.ph, 1); }
   if (inXR && S.showPhones) for (const f of flats) if (typeof f.pid === 'string' && okArr(f.ph, 7) && !phoneModels.has(f.pid)) phoneModel(f.pid);
 }
@@ -2413,12 +2416,15 @@ addEventListener('orientationchange', () => setTimeout(() => { if (calib.mode ==
 // KIT: rendering (single view, or two views stacked on a phone)
 // =====================================================================================================
 const fpCam = new THREE.PerspectiveCamera(90, 1, 0.01, 600);
-function headCam(asp) { fpCam.position.copy(headMark.position); fpCam.quaternion.copy(headMark.quaternion); fpCam.aspect = asp; fpCam.fov = clamp((2 * Math.atan(Math.tan(0.74) / asp) * 180) / Math.PI, 60, 112); fpCam.updateProjectionMatrix(); return fpCam; }
+function headCam(asp) { headMark.updateMatrixWorld(true); headMark.getWorldPosition(fpCam.position); headMark.getWorldQuaternion(fpCam.quaternion); fpCam.aspect = asp; fpCam.fov = clamp((2 * Math.atan(Math.tan(0.74) / asp) * 180) / Math.PI, 60, 112); fpCam.updateProjectionMatrix(); return fpCam; }
 function renderCamView(x, y, w, h) {   // the phone camera picture shows through; only the shapes (and tool spheres) are drawn over it
   const hide = [sky, floor, grid, headMark, proxies.left, proxies.right, ...[...avatars.values()].map((a) => a.g)], keep = hide.map((o) => o.visible), tk = tipProxy.visible;
   for (const o of hide) o.visible = false; tipProxy.visible = tk && S.camSpheres;
   renderer.setClearColor(0x000000, 0); renderer.setViewport(x, y, w, h); renderer.setScissor(x, y, w, h); renderer.clear();
+  const roomW = spect && okArr(spect.w, 8) ? worldM(spect.w) : null, keepR = spectRoom.matrix.clone();
+  if (roomW) { roomW.decompose(world.position, world.quaternion, world.scale); spectRoom.matrix.identity(); spectRoom.matrixWorldNeedsUpdate = true; scene.updateMatrixWorld(true); }
   if (calib.ok) renderer.render(scene, calib.cam);
+  if (roomW) { world.position.set(0, 0, 0); world.quaternion.identity(); world.scale.setScalar(1); spectRoom.matrix.copy(keepR); spectRoom.matrixWorldNeedsUpdate = true; scene.updateMatrixWorld(true); }
   renderer.setClearColor(scn.sky, 1); hide.forEach((o, i) => { o.visible = keep[i]; }); tipProxy.visible = tk;
 }
 // ambient occlusion on screens: each 3D view renders through its own composer (render, GTAO, output) into its area
@@ -3703,7 +3709,7 @@ renderer.setAnimationLoop((t) => {
   renderPhonePreview(); renderAll();
 });
 // handle for tests and tinkering
-window.KIT = { seamHi, ui, popOutXR, skNear, skFaces, asmAnim, asmGroup, setPhase, get curPhase() { return curPhase; }, seamOn, asmLabels, paperFaceAt, pickPaper, skSplitStroke, ensureSettings, findMenuArea, get layout() { return layout; }, dockSettings, renderAll, stability, seamMark, seamNear, seamPick, triOverlap, asm, asmBuild, prefabSheets, asmGo, stepText, sheetSVG_: () => sheetSVG(prefabSheets()), skAddLine, skProblems, exportAll, exportModel, goPage, exportGroup, makeZip, modelData, findArea, draw, SKF_: () => SKF, get SKF() { return SKF; }, get SKX() { return SKX; }, setSel, get sel() { return sel; }, gum, asm, prefabSheets, sheetSVG, KEYS, debugAsk: (f) => { askIn = { from: f, until: performance.now() + 20000 }; dirtyAll(); }, mayCarry, grants, netLog, setPeers: (l) => { debugPeers = l; }, applyLayout, recs, openChooser, setAreaType, splitArea, closeArea, getLayout: () => layout, startPlacing, applyPlaced, avatars, xrPlayers, hostPid, host, popOutXR, ME, drawWin, visibleWins, scene, models, hands, lastXR, THREE, S, set, scn, wins, menuWin, uiPointer, setScroll, closePop, xrFrame, xs, models, world, camera, renderer, solveCamera, applyCalibration, calib, Net, PAGES, SETTINGS, undo, redo, placeAt, layoutDOM, setDebugXR: (v) => { inXR = !!v; layoutDOM(); dirtyAll(); }, setSpect: (p) => { debugSpect = spect = p; layoutDOM(); onResize(); }, setMR, toast };
+window.KIT = { headMark, seamHi, ui, popOutXR, skNear, skFaces, asmAnim, asmGroup, setPhase, get curPhase() { return curPhase; }, seamOn, asmLabels, paperFaceAt, pickPaper, skSplitStroke, ensureSettings, findMenuArea, get layout() { return layout; }, dockSettings, renderAll, stability, seamMark, seamNear, seamPick, triOverlap, asm, asmBuild, prefabSheets, asmGo, stepText, sheetSVG_: () => sheetSVG(prefabSheets()), skAddLine, skProblems, exportAll, exportModel, goPage, exportGroup, makeZip, modelData, findArea, draw, SKF_: () => SKF, get SKF() { return SKF; }, get SKX() { return SKX; }, setSel, get sel() { return sel; }, gum, asm, prefabSheets, sheetSVG, KEYS, debugAsk: (f) => { askIn = { from: f, until: performance.now() + 20000 }; dirtyAll(); }, mayCarry, grants, netLog, setPeers: (l) => { debugPeers = l; }, applyLayout, recs, openChooser, setAreaType, splitArea, closeArea, getLayout: () => layout, startPlacing, applyPlaced, avatars, xrPlayers, hostPid, host, popOutXR, ME, drawWin, visibleWins, scene, models, hands, lastXR, THREE, S, set, scn, wins, menuWin, uiPointer, setScroll, closePop, xrFrame, xs, models, world, camera, renderer, solveCamera, applyCalibration, calib, Net, PAGES, SETTINGS, undo, redo, placeAt, layoutDOM, setDebugXR: (v) => { inXR = !!v; layoutDOM(); dirtyAll(); }, setSpect: (p) => { debugSpect = spect = p; layoutDOM(); onResize(); }, setMR, toast };
 </script>
 <script src="../updated.js"></script>
 </body>
