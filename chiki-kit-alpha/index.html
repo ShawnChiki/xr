@@ -1433,6 +1433,7 @@ function buttonLook(hand, st) {
   if (hand === 'left') return { trigger: [C.red, 'MENU', '#fff'], lower: [C.blue, 'undo', '#fff'], upper: [C.blue, 'redo', '#fff'], grip: [C.blue2], stick: [C.blue] };
   const info = TOOLINFO[st.tool] || TOOLINFO.place, nxt = TOOLINFO[st.last] || TOOLINFO.move, shp = SHAPES[(SHAPES.indexOf(st.shape) + 1) % SHAPES.length];
   if (st.ask) return { trigger: [info.col, info.icon, info.ink], lower: [C.green, 'check', '#fff'], upper: [C.red, 'x', '#fff'], grip: [C.blue2], stick: ['#202020'] };
+  if (st.del) return { trigger: [info.col, info.icon, info.ink], lower: [C.red, 'x', '#fff'], upper: ['#ffffff', shp, C.ink], grip: [C.blue2], stick: ['#202020'] };   // holding a piece: A deletes it
   if (st.placing) return { trigger: [C.yellow, 'phone', C.ink], lower: [nxt.col, nxt.icon, nxt.ink], upper: [C.green, 'check', '#fff'], grip: [C.blue2], stick: ['#202020'] };
   return { trigger: [info.col, info.icon, info.ink], lower: [nxt.col, nxt.icon, nxt.ink], upper: ['#ffffff', shp, C.ink], grip: [C.blue2], stick: ['#202020'] };
 }
@@ -1448,7 +1449,8 @@ function paintButtons(model, st) {
 function pressButtons(model, bits) {
   [['trigger', 1], ['grip', 2], ['lower', 4], ['upper', 8], ['stick', 16]].forEach(([k, b]) => { for (const m of partMeshes(model, k)) if (m.material && m.material.color && m.userData.base) { m.material.color.copy(m.userData.base); if (bits & b) m.material.color.lerp(WHITE3, 0.55); } });
 }
-const myLook = () => ({ tool: S.tool, last: xs.lastTool, shape: S.shape, placing: !!xs.place, ask: !!askIn });
+const holdingSk = () => ['right', 'left'].some((h) => xs.use[h] && xs.use[h].type === 'skgrab') || !!xs.trigSk;
+const myLook = () => ({ tool: S.tool, last: xs.lastTool, shape: S.shape, placing: !!xs.place, ask: !!askIn, del: holdingSk() });
 function refreshButtons() {
   paintButtons(models.left, myLook()); paintButtons(models.right, myLook());
   tip.material.color.set(S.tool === 'place' || S.tool === 'paint' ? S.color : TOOLINFO[S.tool].col);
@@ -1608,14 +1610,14 @@ function xrFrame(dt, L, R) {
         if (under && !pl) { const o = under, lp = tipL.clone().sub(new THREE.Vector3(...o.p)).applyQuaternion(new THREE.Quaternion().fromArray(o.q).invert()), sz = sv(o); const ln = new THREE.Vector3(lp.x / sz[0], lp.y / sz[1], lp.z / sz[2]);
           xs.push = pushStart(o, ln, tipL.clone()); xs.push.n = pushNormal(xs.push); xs.push.tip0 = tipL.clone(); buzz(0.5, 30); }
         else if (under && pl && under.face) { xs.push = facePushStart(under.loop); if (xs.push) { xs.push.tip0 = tipL.clone(); buzz(0.5, 30); } }
-        else if (under && pl && EW) { xs.trigSk = skGrabStart(R, under); if (xs.trigSk) buzz(0.5, 30); }   // Ply Grammar: trigger near a corner or a line drags just that
+        else if (under && pl && EW) { xs.trigSk = skGrabStart(R, under); if (xs.trigSk) { buzz(0.5, 30); refreshButtons(); } }   // Ply Grammar: trigger near a corner or a line drags just that
         else if (under) { setSel({ kind: 'body', verts: bodyOf(under.vert) }); const base = selBase(); if (base) { beginEdit(); xs.held = { M0: R.obj.matrixWorld.clone().invert(), base }; buzz(0.5, 30); } }
         else setSel(null);
       } else if (S.tool === 'paint' || S.tool === 'erase') { beginEdit(); xs.brush = true; xs.brushDid = false; }
     }
     if (xs.gdrag) { applySel(toLocalM(gumVRDelta(xs.gdrag, tipW)), xs.gdrag.base, !trig); if (!trig) xs.gdrag = null; else liveSync(); }
     if (xs.push) { const t = tipL.clone().sub(xs.push.tip0).dot(xs.push.n); xs.push.face ? facePushApply(xs.push, t, !trig) : pushApply(xs.push, t, !trig); if (!trig) xs.push = null; }
-    if (xs.trigSk) { if (trig) skGrabMove(R, xs.trigSk); else { skGrabEnd(xs.trigSk); xs.trigSk = null; } }
+    if (xs.trigSk) { if (trig) skGrabMove(R, xs.trigSk); else { skGrabEnd(xs.trigSk); xs.trigSk = null; refreshButtons(); } }
     if (xs.held) { applySel(toLocalM(R.obj.matrixWorld.clone().multiply(xs.held.M0)), xs.held.base, !trig); if (!trig) xs.held = null; else liveSync(); }
     if (xs.stroke) {   // a stroke in the air becomes one straight edge
       const last = xs.stroke[xs.stroke.length - 1], now = tipL.toArray().map(r4);
@@ -1640,7 +1642,8 @@ function xrFrame(dt, L, R) {
   if (askIn && (aDown || bDown)) answerAsk(aDown);                                                                       // someone asked to pick you up: A yes, B no
   else if (xs.place && bDown) finishPlacing();                                                                           // placing a phone: B is done
   else {
-    if (aDown && !xs.held) { const t = S.tool; set('tool', xs.lastTool); xs.lastTool = t; refreshButtons(); }             // A: swap with the last tool
+    if (aDown && holdingSk()) { skDeleteHeld(); refreshButtons(); }                                                     // holding a corner, line or face: A deletes it
+    else if (aDown && !xs.held) { const t = S.tool; set('tool', xs.lastTool); xs.lastTool = t; refreshButtons(); }             // A: swap with the last tool
     if (bDown) set('shape', SHAPES[(SHAPES.indexOf(S.shape) + 1) % SHAPES.length]);                                     // B: next shape
   }
   xs.pa = R.pad.a; xs.pb = R.pad.b;
@@ -1761,9 +1764,9 @@ function skGrabEnd(d) {
   for (const v of scn.sk.v) if (SKX[v.id]) { const w = SKX[v.id].map(r4); v.ends = [w]; if (v.pin || d.ids.includes(v.id)) v.pin = w; }
   changed(); toast((d.drops || []).length ? 'Joined' : d.extruded ? 'Block pulled out' : d.kind === 'face' ? 'Face moved' : d.kind === 'edge' ? 'Line moved' : 'Corner moved');
 }
-function skDeleteHeld() {   // the red X while holding a corner, a line or a face: it goes
-  const hand = ['right', 'left'].find((h) => xs.use[h] && xs.use[h].type === 'skgrab'); if (!hand) return false;
-  const d = xs.use[hand]; xs.use[hand] = 'none'; skHi.visible = false; scn.sk = JSON.parse(d.before); SKX = JSON.parse(d.X0);
+function skDeleteHeld() {   // A (red X) while holding a corner, a line or a face: it goes
+  const hand = ['right', 'left'].find((h) => xs.use[h] && xs.use[h].type === 'skgrab'); if (!hand && !xs.trigSk) return false;
+  const d = hand ? xs.use[hand] : xs.trigSk; if (hand) xs.use[hand] = 'none'; else xs.trigSk = null; skHi.visible = false; scn.sk = JSON.parse(d.before); SKX = JSON.parse(d.X0);
   if (d.kind === 'vert') EW.removeVert(scn.sk, d.ids[0], SKX); else if (d.kind === 'edge') { const e = scn.sk.e.find((x) => (x.a === d.ids[0] && x.b === d.ids[1]) || (x.a === d.ids[1] && x.b === d.ids[0])); if (e) EW.removeEdges(scn.sk, [e.id]); }
   else { scn.sk.open = scn.sk.open || []; if (!scn.sk.open.includes(d.key)) scn.sk.open.push(d.key); }
   const alive = new Set(scn.sk.v.map((v) => v.id)); for (const id in SKX) if (!alive.has(+id)) delete SKX[id];
@@ -1810,11 +1813,12 @@ function gripUses(L, R, dt) {
       if (use === 'world') { const w = panelAt(H); if (w) use = { type: 'win', w, rel: H.obj.matrixWorld.clone().invert().multiply(w.mesh.matrixWorld) }; }
       if (use === 'world' && S.grabObjects) { const o = grabShapeAt(H); if (o) use = o; }
       if (use === 'world' && locked) { use = 'none'; if (performance.now() > (gripUses.told || 0)) { gripUses.told = performance.now() + 4000; toast('The host has locked the world'); } }
-      xs.use[hand] = use; if (use.type) buzz(0.5, 30, hand);
+      xs.use[hand] = use; if (use.type) buzz(0.5, 30, hand); if (use.type === 'skgrab') refreshButtons();
     } else if (!g && was) {
       if (was.type === 'crown') dropCrown(H ? H.obj : null);
       if (was.type === 'player') grants.delete(was.pid);   // one carry per yes
       if (was.type === 'skgrab') { skGrabEnd(was); buzz(0.3, 20, hand); }
+      if (was === 'none' || was.type === 'skgrab') setTimeout(refreshButtons, 0);
       if (was.type === 'obj') { if (H) applySel(toLocalM(H.obj.matrixWorld.clone().multiply(was.M0)), was.base, true); else changed(); buzz(0.3, 20, hand); }
       xs.use[hand] = null;
     }
@@ -2593,7 +2597,7 @@ const SMOOTH_N = 48, SMOOTH_DOT = Math.cos((12 * Math.PI) / 180);   // tubes and
 const paperGeo = (k, n) => (k === 'ball' ? new THREE.SphereGeometry(0.5, n, Math.max(3, Math.round(n / 2))) : k === 'cyl' ? new THREE.CylinderGeometry(0.5, 0.5, 1, SMOOTH_N) : k === 'cone' ? new THREE.ConeGeometry(0.5, 1, SMOOTH_N) : new THREE.BoxGeometry(1, 1, 1));
 // the surface to unfold: triangles in scene metres, each with a colour
 function paperSurface() {
-  const P = [], col = [], src = [];
+  const P = [], col = [], src = [], grp = [];
   const addGeo = (g, m, c, si) => { const gg = (g.index ? g.toNonIndexed() : g.clone()); if (m) gg.applyMatrix4(m); const a = gg.attributes.position.array, grp = gg.groups && gg.groups.length ? gg.groups : null;
     for (let t = 0; t < a.length / 9; t++) { P.push(a.slice(t * 9, t * 9 + 9)); let cc = c, ss = si; if (Array.isArray(c) && grp) { const gi = grp.find((q) => t * 3 >= q.start && t * 3 < q.start + q.count), k = gi ? gi.materialIndex : 0; cc = c[k]; ss = si[k]; } col.push(Array.isArray(cc) ? cc[0] : cc); src.push(Array.isArray(ss) ? ss[0] : ss); } gg.dispose(); };
   // Solids: low-poly copies of the shapes, joined and carved like on screen
@@ -2613,8 +2617,9 @@ function paperSurface() {
   }
   // Planes: every face
   if (scn.sk && SKF) { const fs = skFaces(), loops = skLoops(fs), body = new Map(); fs.forEach((f, i) => { const g = faceGeom(loops[i]); if (!g) return;
-      const vs = bodyOf(loops[i][0]), k = Math.min(...vs); if (!body.has(k)) body.set(k, body.size); addGeo(g, null, (scn.fc && scn.fc[f.key]) || '#FF7A00', 1000 + body.get(k)); g.dispose(); }); }
-  return { P, col, src };
+      const vs = bodyOf(loops[i][0]), k = Math.min(...vs); if (!body.has(k)) body.set(k, body.size); for (let t = grp.length; t < P.length; t++) grp[t] = -1; addGeo(g, null, (scn.fc && scn.fc[f.key]) || '#FF7A00', 1000 + body.get(k)); g.dispose(); for (let t = grp.length; t < P.length; t++) grp[t] = i; }); }
+  for (let t = grp.length; t < P.length; t++) grp[t] = -1;
+  return { P, col, src, grp };
 }
 // ---- small 2D / 3D helpers
 const p2 = { sub: (a, b) => [a[0] - b[0], a[1] - b[1]], len: (a) => Math.hypot(a[0], a[1]) };
@@ -2638,18 +2643,20 @@ function triOverlap(A, B, eps) {   // two 2D triangles overlap (more than touchi
 function asmBuild() {
   const key = [S.paperSides, S.paper, S.scaleDen, S.tabW].join();
   asm.dirty = false; asm.key = key; asm.nets = []; asm.order = []; asm.facets = []; asm.seams = 0; asm.segs = []; asm.unmet = 0;
-  const { P, col, src } = paperSurface(); if (!P.length) return;
+  const { P, col, src, grp } = paperSurface(); if (!P.length) return;
   // weld corners (0.01 mm)
-  const vid = new Map(), V = [], tri = [], tcol = [], tsrc = [];
+  const vid = new Map(), V = [], tri = [], tcol = [], tsrc = [], tgrp = [];
   const idOf = (x, y, z) => { const k = Math.round(x * 1e5) + ',' + Math.round(y * 1e5) + ',' + Math.round(z * 1e5); let i = vid.get(k); if (i === undefined) { i = V.length; V.push([x, y, z]); vid.set(k, i); } return i; };
-  P.forEach((t, i) => { const a = idOf(t[0], t[1], t[2]), b = idOf(t[3], t[4], t[5]), c = idOf(t[6], t[7], t[8]); if (a === b || b === c || a === c) return; if (v3.len(v3.cross(v3.sub(V[b], V[a]), v3.sub(V[c], V[a]))) < 1e-10) return; tri.push([a, b, c]); tcol.push(col[i]); tsrc.push(src[i]); });
+  P.forEach((t, i) => { const a = idOf(t[0], t[1], t[2]), b = idOf(t[3], t[4], t[5]), c = idOf(t[6], t[7], t[8]); if (a === b || b === c || a === c) return; if (v3.len(v3.cross(v3.sub(V[b], V[a]), v3.sub(V[c], V[a]))) < 1e-10) return; tri.push([a, b, c]); tcol.push(col[i]); tsrc.push(src[i]); tgrp.push(grp[i] == null ? -1 : grp[i]); });
   // facets: triangles in one plane that touch (sharing a corner is enough, so the booleans' T-junctions don't split them)
   const N = tri.map((t) => v3.norm(v3.cross(v3.sub(V[t[1]], V[t[0]]), v3.sub(V[t[2]], V[t[0]])))), off = tri.map((t, i) => v3.dot(N[i], V[t[0]]));
   const par = tri.map((_, i) => i), find = (i) => { while (par[i] !== i) i = par[i] = par[par[i]]; return i; };
   { const inc = V.map(() => []); tri.forEach((t, i) => t.forEach((v) => inc[v].push(i)));
-    for (const list of inc) for (let x = 0; x < list.length; x++) for (let y = x + 1; y < list.length; y++) { const a2 = list[x], b2 = list[y]; if (v3.dot(N[a2], N[b2]) > 0.99995 && Math.abs(off[a2] - off[b2]) < 2e-5) par[find(a2)] = find(b2); } }
+    for (const list of inc) for (let x = 0; x < list.length; x++) for (let y = x + 1; y < list.length; y++) { const a2 = list[x], b2 = list[y]; if (v3.dot(N[a2], N[b2]) > 0.9999 && Math.abs(off[a2] - off[b2]) < 1e-4) par[find(a2)] = find(b2); } }
+  { const first = new Map(); tgrp.forEach((g, i) => { if (g < 0) return; if (first.has(g)) par[find(i)] = find(first.get(g)); else first.set(g, i); }); }   // one drawn face = one flat piece
   const fmap = new Map(), F = [];
-  tri.forEach((t, i) => { const r = find(i); let f = fmap.get(r); if (f === undefined) { f = F.length; fmap.set(r, f); F.push({ tris: [], n: N[i], col: tcol[i], area: 0 }); } F[f].tris.push(i); F[f].area += v3.len(v3.cross(v3.sub(V[t[1]], V[t[0]]), v3.sub(V[t[2]], V[t[0]]))) / 2; });
+  tri.forEach((t, i) => { const r = find(i); let f = fmap.get(r); if (f === undefined) { f = F.length; fmap.set(r, f); F.push({ tris: [], n: N[i], col: tcol[i], area: 0, ns: [0, 0, 0] }); } F[f].tris.push(i); const cr = v3.cross(v3.sub(V[t[1]], V[t[0]]), v3.sub(V[t[2]], V[t[0]])); F[f].area += v3.len(cr) / 2; for (let k = 0; k < 3; k++) F[f].ns[k] += cr[k]; });
+  for (const f of F) { f.n = v3.norm(f.ns); delete f.ns; }
   // outlines: every triangle edge, broken at corners lying along it; pieces that come back the other way cancel out
   const cell = 0.02, grid = new Map(), gk = (x, y, z) => Math.floor(x / cell) + ',' + Math.floor(y / cell) + ',' + Math.floor(z / cell);
   V.forEach((p, i) => { const k = gk(...p); (grid.get(k) || grid.set(k, []).get(k)).push(i); });
