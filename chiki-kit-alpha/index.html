@@ -317,7 +317,7 @@ const maxScroll = (w) => Math.max(0, w.contentH - bodyH(w));
 function setScroll(w, v) { const n = clamp(v, 0, maxScroll(w)); if (n !== (w.sc[w.page] || 0)) { w.sc[w.page] = n; w.dirty = true; } }
 
 function makeL(w, c, x, width) {
-  const L = { y: 22, x, w: width, hits: [], c };
+  const L = { y: 22, x, w: width, hits: [], c, win: w };
   const key = () => w.page + ':' + L.hits.length;
   const hot = (k) => w.hover === k, down = (k) => w.press === k;
   L.gap = (h) => { L.y += h; };
@@ -606,12 +606,14 @@ function uiPointer(w, kind, x, y) {
     if (hd) { if (hd.id === 'move') { w.ptr = null; return 'move'; } w.press = hd.k; w.dirty = true; return; }
     if (w.bar && x >= w.bar.x && y >= w.bar.y && y <= w.bar.y + w.bar.h) { w.drag = { bar: true }; barSet(w, y); w.ptr.body = false; return; }
     const h = bodyHit(w, x, y);
+    if (h && h.pan && w.sv) { w.ptr.pan = { h, x, y, ox: w.sv.ox, oy: w.sv.oy, moved: false }; w.ptr.body = false; return; }
     if (h && h.drag && h.axis === 'x') w.ptr.pending = h;   // a slider: sideways drags it, up-down scrolls the page, a tap sets it
     else if (h && h.drag) { w.drag = h; h.set(x, toPage(w, y)); w.ptr.body = false; }
     else if (h && !h.disabled) w.press = h.k;
     w.dirty = true; return;
   }
   if (kind === 'move') {
+    if (w.ptr && w.ptr.pan && w.sv) { const P = w.ptr.pan, dx = x - P.x, dy = y - P.y; if (!P.moved && Math.hypot(dx, dy) > 8) P.moved = true; if (P.moved) { w.sv.ox = P.ox + dx; w.sv.oy = P.oy + dy; w.sv.fit = false; w.dirty = true; } return; }
     if (w.ptr && w.ptr.pending) {
       const dx = Math.abs(x - w.ptr.x), dy = Math.abs(y - w.ptr.y);
       if (dx > 10 && dx > dy) { w.drag = w.ptr.pending; w.ptr.pending = null; w.ptr.body = false; } else if (dy > 16) w.ptr.pending = null;
@@ -624,6 +626,7 @@ function uiPointer(w, kind, x, y) {
     return;
   }
   if (kind === 'up') {
+    if (w.ptr && w.ptr.pan) { const P = w.ptr.pan; w.ptr = null; w.dirty = true; if (!P.moved) P.h.set(x, toPage(w, y)); return; }
     const pk = w.press, scrolled = w.ptr && w.ptr.scrolling; if (w.ptr && w.ptr.pending && !scrolled) w.ptr.pending.set(x, toPage(w, y));
     w.press = null; w.drag = null; w.ptr = null; w.dirty = true;
     if (!pk || scrolled) return;
@@ -1328,13 +1331,18 @@ function setAreaType(n, t) {
 function splitArea(n, dir) { maxArea = null; const nu = SPLIT(dir, 0.5, null, A(n.type === 'camera' || n.type === 'menu' ? 'view3d' : n.type)); replaceNode(n, nu); nu.a = n; applyLayout(); }
 function closeArea(n) { const p = parentOf(layout, n); if (!p) return; replaceNode(p, p.a === n ? p.b : p.a); applyLayout(); }
 function hookCanvas(w) {
-  const cv = w.cv, xy = (e) => { const r = cv.getBoundingClientRect(); return [((e.clientX - r.left) * w.uw) / r.width, ((e.clientY - r.top) * w.uh) / r.height]; };
-  cv.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); try { cv.setPointerCapture(e.pointerId); } catch (_) {} uiPointer(w, 'down', ...xy(e)); });
-  cv.addEventListener('pointermove', (e) => uiPointer(w, 'move', ...xy(e)));
-  cv.addEventListener('pointerup', (e) => uiPointer(w, 'up', ...xy(e)));
-  cv.addEventListener('pointercancel', () => { w.press = null; w.drag = null; w.ptr = null; w.dirty = true; });
+  const cv = w.cv, xy = (e) => { const r = cv.getBoundingClientRect(); return [((e.clientX - r.left) * w.uw) / r.width, ((e.clientY - r.top) * w.uh) / r.height]; }, tp = new Map();
+  const pinch = () => { const [a, b] = [...tp.values()]; return { d: Math.hypot(a[0] - b[0], a[1] - b[1]), m: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2] }; };
+  cv.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); try { cv.setPointerCapture(e.pointerId); } catch (_) {} tp.set(e.pointerId, xy(e));
+    if (tp.size === 2 && w.page === 'sheets' && w.sv) { w.press = null; w.drag = null; w.ptr = null; w.pinch = pinch(); return; }
+    if (tp.size > 1) return; uiPointer(w, 'down', ...xy(e)); });
+  cv.addEventListener('pointermove', (e) => { if (tp.has(e.pointerId)) tp.set(e.pointerId, xy(e));
+    if (w.pinch && tp.size === 2) { const P = pinch(), v = w.sv; sheetZoom(w, P.m[0], toPage(w, P.m[1]), P.d / Math.max(1, w.pinch.d)); v.ox += P.m[0] - w.pinch.m[0]; v.oy += P.m[1] - w.pinch.m[1]; w.pinch = P; return; }
+    if (!w.pinch) uiPointer(w, 'move', ...xy(e)); });
+  cv.addEventListener('pointerup', (e) => { tp.delete(e.pointerId); if (w.pinch) { if (!tp.size) w.pinch = null; return; } uiPointer(w, 'up', ...xy(e)); });
+  cv.addEventListener('pointercancel', (e) => { tp.delete(e.pointerId); w.pinch = null; w.press = null; w.drag = null; w.ptr = null; w.dirty = true; });
   cv.addEventListener('pointerleave', () => uiPointer(w, 'leave', 0, 0));
-  cv.addEventListener('wheel', (e) => { e.preventDefault(); e.stopPropagation(); setScroll(w, (w.sc[w.page] || 0) + e.deltaY * (w.uh / cv.getBoundingClientRect().height)); }, { passive: false });
+  cv.addEventListener('wheel', (e) => { e.preventDefault(); e.stopPropagation(); if (w.page === 'sheets' && w.sv && w.sv.clip) { const [x, y] = xy(e), py = toPage(w, y), c = w.sv.clip; if (x >= c[0] && x <= c[0] + c[2] && py >= c[1] && py <= c[1] + c[3]) { sheetZoom(w, x, py, Math.exp(-e.deltaY * 0.0016)); return; } } setScroll(w, (w.sc[w.page] || 0) + e.deltaY * (w.uh / cv.getBoundingClientRect().height)); }, { passive: false });
 }
 
 // =====================================================================================================
@@ -3322,16 +3330,31 @@ async function exportAll() {
 function goPage(id) { if (inXR) { menuWin.page = id; menuWin.sc[id] = 0; menuWin.dirty = true; dirtyAll(); return; } setPhase(id); }
 const PAPER_NAME = () => SET.paper.opts.find((o) => o[0] === S.paper)[1];
 // the sheet preview drawn into a page
-function drawSheets(L, lay) {
-  const yStart = L.y, c = L.c, s = L.w / lay.W, pickPatch = asm.pick != null && asm.F && asm.F[asm.pick] ? asm.F[asm.pick].patch : null;
+const SHEET_GAP = 12;   // mm between sheets in the zoomable view
+// the Sheets window: fit (follows the window's size) until you zoom or pan; pinch, wheel, + / − and drag
+function sheetsView(L, lay) {
+  const w = L.win, v = w.sv || (w.sv = { fit: true, k: 1, ox: 0, oy: 0 }), top = L.y, vh = Math.max(160, bodyH(w) - top - 34), n = lay.sheets.length || 1;
+  const cw = lay.W, ch = n * lay.H + (n - 1) * SHEET_GAP, sf = Math.min(L.w / cw, vh / ch) * 0.96; v.sf = sf; v.clip = [L.x, top, L.w, vh];
+  if (v.fit) { v.k = 1; v.ox = L.x + (L.w - cw * sf) / 2; v.oy = top + (vh - ch * sf) / 2; }
+  const c = L.c; c.save(); rr(c, L.x, top, L.w, vh, 12); c.fillStyle = '#ECE7DA'; c.fill(); c.clip();
+  drawSheets(L, lay, { s: sf * v.k, ox: v.ox, oy: v.oy, clip: v.clip });
+  c.restore(); rr(c, L.x, top, L.w, vh, 12); c.lineWidth = 3; c.strokeStyle = C.ink; c.stroke();
+  L.y = top + vh;
+}
+function sheetZoom(w, px, py, f) {   // zoom about a point (page units)
+  const v = w.sv; if (!v || !v.sf) return; const s0 = v.sf * v.k, k1 = clamp(v.k * f, 0.4, 40), s1 = v.sf * k1;
+  const cx = (px - v.ox) / s0, cy = (py - v.oy) / s0; v.k = k1; v.ox = px - cx * s1; v.oy = py - cy * s1; v.fit = false; w.dirty = true;
+}
+function drawSheets(L, lay, vw) {   // vw: a zoomable view { s, ox, oy, clip } (the Sheets window); without it, sheets fill the width and stack down the page
+  const yStart = L.y, c = L.c, s = vw ? vw.s : L.w / lay.W, X0 = vw ? vw.ox : L.x, SW = lay.W * s, pickPatch = asm.pick != null && asm.F && asm.F[asm.pick] ? asm.F[asm.pick].patch : null;
   lay.sheets.forEach((sh, si) => {
-    const y0 = L.y, H = lay.H * s;
-    rr(c, L.x, y0 + 6, L.w, H, 10); c.fillStyle = C.ink; c.fill(); rr(c, L.x, y0, L.w, H, 10); c.fillStyle = '#fff'; c.fill(); c.lineWidth = 3; c.strokeStyle = C.ink; c.stroke();
-    c.font = `700 18px ${FONT}`; c.fillStyle = '#666'; c.textAlign = 'right'; c.textBaseline = 'top'; c.fillText(`Sheet ${si + 1}`, L.x + L.w - 10, y0 + 8);
+    const y0 = vw ? vw.oy + si * (lay.H + SHEET_GAP) * s : L.y, H = lay.H * s;
+    rr(c, X0, y0 + 6, SW, H, 10); c.fillStyle = C.ink; c.fill(); rr(c, X0, y0, SW, H, 10); c.fillStyle = '#fff'; c.fill(); c.lineWidth = 3; c.strokeStyle = C.ink; c.stroke();
+    c.font = `700 18px ${FONT}`; c.fillStyle = '#666'; c.textAlign = 'right'; c.textBaseline = 'top'; c.fillText(lay.noPaper ? '' : `Sheet ${si + 1}`, X0 + SW - 10, y0 + 8);
     for (const p of sh.parts) {
-      const T = (q) => [L.x + (q[0] + p.x) * s, y0 + (q[1] + p.y) * s];
+      const T = (q) => [X0 + (q[0] + p.x) * s, y0 + (q[1] + p.y) * s];
       for (const f of p.fills || []) {
-        if (f.pat) { const tile = patTile(f.col, f.pat, 48), pt = c.createPattern(tile, 'repeat'), k = (PAT_MM * s) / 48; pt.setTransform(new DOMMatrix([k, 0, 0, k, L.x + p.x * s, y0 + p.y * s])); c.fillStyle = pt; c.strokeStyle = lightCol(f.col); }
+        if (f.pat) { const tile = patTile(f.col, f.pat, 48), pt = c.createPattern(tile, 'repeat'), k = (PAT_MM * s) / 48; pt.setTransform(new DOMMatrix([k, 0, 0, k, X0 + p.x * s, y0 + p.y * s])); c.fillStyle = pt; c.strokeStyle = lightCol(f.col); }
         else { c.fillStyle = c.strokeStyle = lightCol(f.col); }
         c.lineWidth = 1.2; c.beginPath(); for (const t of f.tris) { c.moveTo(...T(t[0])); c.lineTo(...T(t[1])); c.lineTo(...T(t[2])); c.closePath(); } c.fill(); if (!f.pat) c.stroke();
       }
@@ -3354,11 +3377,12 @@ function drawSheets(L, lay) {
       for (const P0 of p.patches || []) for (const t of P0.tris) { const a = T(t[0]), b = T(t[1]), d = T(t[2]); L.tris = L.tris || []; L.tris.push({ t: [a, b, d], fi: P0.fi }); }
       for (const e of p.edges) if (e.a3 && !e.tab) { L.sedges = L.sedges || []; L.sedges.push({ a: T(e.p), b: T(e.q), a3: e.a3, b3: e.b3 }); }
     }
-    L.y += H + 18;
+    if (!vw) L.y += H + 18;
   });
   const sed = L.sedges || []; L.sedges = null;
   if (L.tris && L.tris.length) { const list = L.tris; L.tris = null;
-    L.hits.push({ k: 'sheetpick', x: L.x, y: yStart, w: L.w, h: L.y - yStart, drag: true, axis: 'x', set: (px, py) => {
+    const hb = vw ? vw.clip : [L.x, yStart, L.w, L.y - yStart];
+    L.hits.push({ k: 'sheetpick', x: hb[0], y: hb[1], w: hb[2], h: hb[3], pan: !!vw, drag: !vw, axis: 'x', set: (px, py) => {
       const inT = (q, t) => { const cr = (a, b) => (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]), d1 = cr(t[0], t[1]), d2 = cr(t[1], t[2]), d3 = cr(t[2], t[0]); return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0)); };
       let eb = null, ed = 9; for (const g of sed) { const ab = [g.b[0] - g.a[0], g.b[1] - g.a[1]], t = clamp(((px - g.a[0]) * ab[0] + (py - g.a[1]) * ab[1]) / (ab[0] * ab[0] + ab[1] * ab[1] || 1), 0, 1), d = Math.hypot(g.a[0] + ab[0] * t - px, g.a[1] + ab[1] * t - py); if (d < ed) { ed = d; eb = g; } }
       if (eb) { const mid = eb.a3.map((v, i) => (v + eb.b3[i]) / 2), g = seamNear(mid, Math.max(1e-3, v3.len(v3.sub(eb.b3, eb.a3)) * 0.2)); beginEdit(); if (seamMark(g)) { changed(); toast(S.seamKind === 'fold' ? 'Marked: fold' : S.seamKind === 'cut' ? 'Marked: glue tab' : 'Back to automatic'); } else hist.u.pop(); return; }
@@ -3473,10 +3497,13 @@ const PAGES = {
     L.help(inXR ? 'Select something, then pull its arrows (move along), rings (turn) or the yellow block (move freely) with the trigger.' : `Select something, then drag the gumball. ${keyLabel('move')} move, ${keyLabel('rotate')} turn, ${keyLabel('scale')} size, ${keyLabel('axes')} world / local.`);
   },
   sheets(L) {
-    const lay = prefabSheets();
+    const lay = prefabSheets(), w = L.win;
     if (!lay.parts) return L.text('Make something on the Design page first. Its paper parts show here.', { size: 23 });
-    L.text(lay.noPaper ? `${lay.parts} part${lay.parts === 1 ? '' : 's'}, laid out flat (${Math.round(lay.W)} × ${Math.round(lay.H)} mm)` : `${lay.parts} part${lay.parts === 1 ? '' : 's'} on ${lay.sheets.length} sheet${lay.sheets.length === 1 ? '' : 's'} of ${PAPER_NAME()}`, { size: 22, weight: 700, col: '#444', after: 6 });
-    drawSheets(L, lay);
+    L.buttons([{ label: 'Fit', icon: 'popout', active: () => !!(w.sv && w.sv.fit), on: () => { if (w.sv) w.sv.fit = true; w.dirty = true; } },
+      { label: 'Zoom out', on: () => { const v = w.sv; if (v && v.clip) sheetZoom(w, v.clip[0] + v.clip[2] / 2, v.clip[1] + v.clip[3] / 2, 1 / 1.5); } },
+      { label: 'Zoom in', on: () => { const v = w.sv; if (v && v.clip) sheetZoom(w, v.clip[0] + v.clip[2] / 2, v.clip[1] + v.clip[3] / 2, 1.5); } }], 56, 10, 120);
+    L.text(lay.noPaper ? `${lay.parts} part${lay.parts === 1 ? '' : 's'}, laid out flat (${Math.round(lay.W)} × ${Math.round(lay.H)} mm)` : `${lay.parts} part${lay.parts === 1 ? '' : 's'} on ${lay.sheets.length} sheet${lay.sheets.length === 1 ? '' : 's'} of ${PAPER_NAME()}`, { size: 20, weight: 700, col: '#444', after: 4 });
+    sheetsView(L, lay);
   },
   prefab(L) {
     const lay = prefabSheets();
